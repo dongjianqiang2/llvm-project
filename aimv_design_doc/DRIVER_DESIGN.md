@@ -443,29 +443,29 @@ def _check_target_loop_passed(vstatus: VectorizationStatus, target_loop: Optiona
     return not any(target_loop in d.get("loop_location", "")
                    for d in vstatus.missed_details)
 
-    @staticmethod
-    def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
-        """解析测试输出中的 pass/fail 计数。"""
-        import re
 
-        combined = stdout + stderr
+def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
+    """解析测试输出中的 pass/fail 计数。"""
+    import re
 
-        # CTest: "100% tests passed, 0 tests failed out of 5"
-        m = re.search(r"(\d+)% tests passed.*?(\d+) tests? failed.*?out of (\d+)", combined)
-        if m:
-            total = int(m.group(3))
-            failed = int(m.group(2))
-            return (total - failed, failed)
+    combined = stdout + stderr
 
-        # GoogleTest: "[  PASSED  ] 5 tests."
-        # GoogleTest: "[  FAILED  ] 1 test."
-        passed = len(re.findall(r"\[\s*PASSED\s*\]", combined))
-        failed = len(re.findall(r"\[\s*FAILED\s*\]", combined))
-        if passed + failed > 0:
-            return (passed, failed)
+    # CTest: "100% tests passed, 0 tests failed out of 5"
+    m = re.search(r"(\d+)% tests passed.*?(\d+) tests? failed.*?out of (\d+)", combined)
+    if m:
+        total = int(m.group(3))
+        failed = int(m.group(2))
+        return (total - failed, failed)
 
-        # 无法解析，根据 returncode 粗略判断
-        return (1, 1)  # 未知格式，保守假设有测试
+    # GoogleTest: "[  PASSED  ] 5 tests."
+    # GoogleTest: "[  FAILED  ] 1 test."
+    passed = len(re.findall(r"\[\s*PASSED\s*\]", combined))
+    failed = len(re.findall(r"\[\s*FAILED\s*\]", combined))
+    if passed + failed > 0:
+        return (passed, failed)
+
+    # 无法解析，根据 returncode 粗略判断
+    return (1, 1)  # 未知格式，保守假设有测试
 ```
 
 ### 3.2 超时与信号处理

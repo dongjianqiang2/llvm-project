@@ -172,6 +172,13 @@ LoopVectorize::processLoop()
 ///   -aimv-enable / -aimv-output 由 AIMVFeedbackPass 自身消费（不影响此函数）。
 ///   不使用跨组件的 cl::opt 共享变量，避免动态库构建模式下的链接和初始化顺序问题。
 ///
+/// 重要: 由于此函数仅通过 getLLVMRemarkStreamer() 判断是否写入 !aimv.diag，
+///   用户必须通过以下任一选项激活 remark streamer，否则 !aimv.diag 不会被写入：
+///     -fsave-optimization-record=<file>   (推荐)
+///     -Rpass-missed=loop-vectorize
+///   仅使用 -aimv-enable + -aimv-output 而不激活 remark streamer 时，
+///   AIMVFeedbackPass 会运行但读不到任何诊断数据（空 !aimv.diag）。
+///
 /// @param M        Module
 /// @param F        被编译的函数
 /// @param L        被分析的循环
@@ -854,6 +861,12 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
 `-aimv-output` 和 `-aimv-enable` 在 `clang/lib/CodeGen/BackendUtil.cpp` 中解析后，
 通过 `AIMVFeedbackPass::setOutputPath()` / `AIMVFeedbackPass::setEnabled()` 注入 pass 实例。
 
+**注意（激活条件不一致问题）**: `emitAIMVDiagnostic()` 仅检查 `getLLVMRemarkStreamer()` 来
+决定是否写入 `!aimv.diag`。因此，仅使用 `-aimv-enable` + `-aimv-output` 而不激活 remark streamer 时，
+`AIMVFeedbackPass` 会运行但读不到诊断数据——因为 `emitAIMVDiagnostic()` 根本没写入。
+正确用法必须同时指定 `-fsave-optimization-record` 或 `-Rpass-missed=loop-vectorize` 之一。
+这是有意的取舍：避免在 `emitAIMVDiagnostic()` 中引入跨组件依赖。
+
 ### 4.3 与现有 Remark 基础设施的关系
 
 ```
@@ -930,7 +943,7 @@ add_subdirectory(AIMV)
 |------|------|
 | `-aimv-output=<path>` | 指定 AIMV JSON 诊断输出路径 |
 | `-aimv-target-function=<name>` | 只分析指定函数 |
-| `-aimv-enable` | 显式启用 AIMV 诊断收集（即使无 remark streamer） |
+| `-aimv-enable` | 显式启用 AIMV 诊断收集（**必须与 `-fsave-optimization-record` 或 `-Rpass-missed` 配合使用**，单独使用无效——见 §4.2 注意事项） |
 
 ### 6.2 使用示例
 
