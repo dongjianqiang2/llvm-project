@@ -63,8 +63,10 @@ def _find_baseline(baseline: dict, func_name: str) -> Optional[dict]:
 
 
 def _path_matches(file_path: str, pattern: str) -> bool:
-    import fnmatch
-    return fnmatch.fnmatch(file_path, pattern)
+    from pathlib import PurePosixPath
+    p = PurePosixPath(file_path)
+    # Try full ** pattern first, then without ** (zero-level match)
+    return p.match(pattern) or p.match(pattern.replace("**/", ""))
 
 
 def main():
