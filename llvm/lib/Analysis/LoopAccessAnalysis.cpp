@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/LoopAccessAnalysis.h"
+#include "llvm/Transforms/Vectorize/AIMVDiagnostic.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -2825,6 +2826,22 @@ void LoopAccessInfo::emitUnsafeDependenceRemark() {
     if (SourceLoc)
       R << " Memory location is the same as accessed at "
         << ore::NV("Location", SourceLoc);
+  }
+
+  // [BiSheng] AIMV T1.5: emit structured diagnostic for UnsafeDep
+  // This function runs during legality analysis; no CM/VF/IC available.
+  {
+    Function *Fn = TheLoop->getHeader()->getParent();
+    Module *Mod = Fn->getParent();
+    int RtChkCount = (int)getNumRuntimePointerChecks();
+    // TheLoop=nullptr guard not needed — this is a member function called
+    // with a valid LoopAccessInfo. PSE is always initialized.
+    emitAIMVDiagnostic(*Mod, *Fn, *TheLoop,
+                       this, /*CM=*/nullptr,
+                       ElementCount::getFixed(0), /*IC=*/0,
+                       "UnsafeDep", Info,
+                       &PSE.getSE(),
+                       /*RtCheckCost=*/-1, RtChkCount);
   }
 }
 
