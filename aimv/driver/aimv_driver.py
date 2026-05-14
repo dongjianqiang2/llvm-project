@@ -32,15 +32,18 @@ def extract_function_source(source_file: str, func_name: str) -> Optional[str]:
     Uses regex to find the function body. Falls back to None if not found.
     """
     text = Path(source_file).read_text()
-    # Simple regex: match function definition header then brace-balanced body
+    # Regex: match return type + function name + params + opening brace
+    # Captures from the start of the line (or type qualifiers) through the opening {
     pattern = re.compile(
-        r'\b' + re.escape(func_name) + r'\s*\([^)]*\)\s*\{',
+        r'(?:^|\n)\s*((?:static\s+|inline\s+|extern\s+)*[\w\s*]+'
+        + re.escape(func_name)
+        + r'\s*\([^)]*\)\s*\{)',
         re.MULTILINE,
     )
     m = pattern.search(text)
     if not m:
         return None
-    start = m.start()
+    start = m.start() + 1 if m.start() > 0 else 0  # skip the leading \n
     brace_start = m.end() - 1  # position of {
     depth = 0
     i = brace_start

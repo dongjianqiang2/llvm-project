@@ -47,6 +47,17 @@ def _check_pip() -> bool:
     return _PIP_AVAILABLE
 
 
+def _skip_if_externally_managed() -> None:
+    """Skip if pip is externally managed (e.g. PEP 668)."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--dry-run",
+         "--ignore-installed", "--no-deps", "-r", "/dev/null"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if "externally-managed-environment" in result.stderr:
+        pytest.skip("PEP 668: externally-managed-environment, pip --dry-run blocked")
+
+
 def _skip_if_no_network() -> None:
     """Skip the current test when CI_NO_NETWORK is set."""
     if os.environ.get("CI_NO_NETWORK"):
@@ -76,6 +87,7 @@ class TestRequirementsInstall:
     def test_pip_install_requirements(self, rel_path: str) -> None:
         _skip_if_no_pip()
         _skip_if_no_network()
+        _skip_if_externally_managed()
 
         full = _aimv_root() / rel_path
         assert full.is_file(), f"Requirements file not found: {full}"

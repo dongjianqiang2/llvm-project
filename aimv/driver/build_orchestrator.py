@@ -153,8 +153,9 @@ def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
     if m:
         total, failed = int(m.group(3)), int(m.group(2))
         return (total - failed, failed)
-    passed = len(re.findall(r"\[\s*PASSED\s*\]", combined))
+    # GoogleTest: "[       OK ] TestName" or "[  PASSED  ] TestName"
+    ok_passed = len(re.findall(r"\[\s*(?:OK|PASSED)\s*\]", combined))
     failed = len(re.findall(r"\[\s*FAILED\s*\]", combined))
-    if passed + failed > 0:
-        return (passed, failed)
+    if ok_passed + failed > 0:
+        return (ok_passed, failed)
     return (1, 1)
