@@ -22,7 +22,7 @@ aimv/                                    # 项目根目录
 │   ├── aimv_driver.py                   # 主入口：编排编译-诊断-MCP-patch 流程
 │   ├── opt_info_parser.py               # 解析 YAML/JSON opt-records
 │   ├── mcp_client.py                    # MCP REST API 客户端
-│   ├── source_patcher.py               # 源码 patch 应用与回滚
+│   ├── source_manager.py               # 源码 patch + 回滚 + 工作目录管理
 │   ├── build_orchestrator.py            # 编译/测试 编排（迭代控制）
 │   ├── iteration_tracker.py             # 迭代状态追踪与日志
 │   └── requirements.txt
@@ -35,14 +35,13 @@ aimv/                                    # 项目根目录
 │   ├── cache.py                         # 诊断模式缓存（避免重复请求）
 │   └── requirements.txt
 │
-├── llvm/                                # LLVM 侧组件
+├── llvm/                                # LLVM 侧组件（直接在 llvm/ 目录下）
 │   ├── lib/Transforms/AIMV/
-│   │   ├── AIMVFeedbackPass.cpp         # Pass: 收集 opt-info 诊断信息
-│   │   ├── OptInfoCollector.cpp         # 诊断信息提取与 JSON 序列化
-│   │   ├── CostModelExporter.cpp        # VPlan 代价模型数据导出
+│   │   ├── AIMVFeedbackPass.cpp         # Function Pass 主实现
+│   │   ├── AIMVDiagnosticParser.cpp     # !aimv.diag Metadata → RawDiagnostic 解析
 │   │   └── CMakeLists.txt
 │   │
-│   └── include/llvm/Transforms/
+│   └── include/llvm/Transforms/AIMV/
 │       └── AIMVFeedback.h               # Pass 公共头文件
 │
 ├── tools/
@@ -112,17 +111,21 @@ aimv/                                    # 项目根目录
 │ (LLVM Pass)    │     │  (Python 编排)   │     │  (REST API)      │
 │                │     │                 │     │                  │
 │ · 收集 missed  │     │ · 迭代循环控制   │     │ · prompt 构造    │
-│   remarks      │     │ · 源码 patch     │     │ · LLM 调用       │
-│ · VPlan 代价   │     │ · 编译/测试编排  │     │ · 响应解析       │
-│   模型导出     │     │ · 回滚管理       │     │ · 模式缓存       │
-│ · IR 上下文    │     │ · 日志/追溯      │     │                  │
+│   + passed     │     │ · 源码 patch     │     │ · LLM 调用       │
+│   remarks      │     │ · 编译/测试编排  │     │ · 响应解析       │
+│ · VPlan 代价   │     │ · 回滚管理       │     │ · 模式缓存       │
+│   模型导出     │     │ · 日志/追溯      │     │                  │
+│ · IR 上下文    │     │                 │     │                  │
 └────────────────┘     └─────────────────┘     └──────────────────┘
         ↑                       │                       │
-        │ 读 opt-records        │ HTTP POST             │ HTTP
+        │ Pass 模式              │ HTTP POST             │ HTTP
    ┌────┴─────┐          ┌──────┴──────┐         ┌──────┴──────┐
-   │ opt.yaml │          │  source.c   │         │ GPT/Claude  │
-   │ (磁盘)    │          │  (磁盘)      │         │ API         │
-   └──────────┘          └─────────────┘         └─────────────┘
+   │aimv.json │          │  source.c   │         │ GPT/Claude  │
+   └──────────┘          └─────────────┘         │ API         │
+        ↑                                        └─────────────┘
+   ┌────┴─────┐
+   │ opt.yaml │  ← YAML 模式（零侵入，诊断信息较少）
+   └──────────┘    直接解析 -fsave-optimization-record 输出
 ```
 
 ### 2.3 Driver 迭代状态机
@@ -197,8 +200,8 @@ class CostModelDetail(BaseModel):
     interleave_count: int = Field(..., ge=0)
 
 class DependencyInfo(BaseModel):
-    """内存依赖分析结果"""
-    dep_type: str = Field(..., pattern="^(RAW|WAR|WAW|MayAlias|PartialAlias|Unknown)$")
+    """内存依赖分析结果 — dep_type 与 LLVM 21 Dependence::DepType 对应"""
+    dep_type: str = Field(..., pattern=r"^(RAW|WAR|IndirectUnsafe|BackwardVectorizable|BackwardVectorizableButPreventsForwarding|ForwardButPreventsForwarding|Unknown)$")
     source_ptr: str
     sink_ptr: str
     alias_result: str
@@ -335,6 +338,7 @@ class SessionRecord:
     source_file: str
     aimv_level: str
     max_rounds: int
+    target_loop_line: Optional[str] = None  # 目标循环源码位置（首轮自动选定）
     rounds: list = field(default_factory=list)
     termination_reason: Optional[TerminationReason] = None
     final_patch_path: Optional[str] = None
@@ -345,30 +349,30 @@ class SessionRecord:
 ### 3.3 源码 Patch 模型
 
 ```python
-# [BiSheng] driver/source_patcher.py
+# [BiSheng] driver/source_manager.py
 
 @dataclass
-class PatchResult:
-    """patch 应用结果"""
-    success: bool
-    original_file: str
-    backup_file: str           # 回滚用的备份路径
-    applied_diff: str
-    error_message: Optional[str] = None
+class PatchRecord:
+    """一次源码修改的完整记录"""
+    source_file: str
+    backup_path: str           # 回滚用的备份文件路径
+    diff_text: str
+    original_hash: str         # sha256 of original file
+    applied_at: float
 
-class SourcePatcher:
-    """源码 patch 管理器"""
+class SourceManager:
+    """源码 patch 管理器（详细实现见 DRIVER_DESIGN.md）"""
 
-    def apply_diff(self, source_file: str, diff_text: str) -> PatchResult:
-        """应用 unified diff，创建回滚备份"""
+    def apply_patch(self, source_file: str, diff_text: str) -> PatchRecord:
+        """应用 unified diff，创建回滚备份。失败时抛异常并从备份恢复。"""
         ...
 
-    def rollback(self, backup_file: str) -> bool:
-        """回滚到备份版本"""
+    def rollback(self, patch: PatchRecord) -> bool:
+        """从备份恢复原始文件"""
         ...
 
-    def get_modified_files(self) -> List[str]:
-        """获取当前迭代中所有修改过的文件"""
+    def rollback_all(self):
+        """按反序回滚所有 patch，单条失败不中断后续回滚"""
         ...
 ```
 
@@ -404,17 +408,17 @@ Base URL: http://<mcp-host>:<port>/api/v1
 ### 4.2 LLVM Pass 接口
 
 ```cpp
-// [BiSheng] llvm/include/llvm/Transforms/AIMVFeedback.h
+// [BiSheng] llvm/include/llvm/Transforms/AIMV/AIMVFeedback.h
 
 namespace llvm {
 
-/// [BiSheng] AIMVFeedbackPass - 收集向量化相关的 opt-info 诊断信息
+/// [BiSheng] AIMVFeedbackPass — 收集向量化诊断信息并导出 JSON
 ///
-/// 在 LoopVectorize / SLPVectorize 等 pass 之后运行，
-/// 从 optimization remarks 中提取 missed/analysis 级别的诊断，
-/// 序列化为 JSON 供 driver 脚本或 MCP 服务使用。
+/// 类型: Function Pass。在 LoopVectorize / SLPVectorize 之后运行，
+/// 从 Module 的 !aimv.diag Named Metadata 中读取诊断（通过 F.getParent()），
+/// 筛选当前函数的诊断，补充 IR 上下文后序列化为 JSON。
 ///
-/// 输出：写入 -aimv-output=<path> 指定的 JSON 文件
+/// 输出：追加写入 -aimv-output=<path> 指定的 JSON 文件
 class AIMVFeedbackPass : public PassInfoMixin<AIMVFeedbackPass> {
 public:
     /// [BiSheng] 配置 JSON 输出路径
@@ -423,7 +427,7 @@ public:
     /// [BiSheng] 配置只收集指定函数的诊断
     void setTargetFunction(const std::string& funcName);
 
-    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
     static StringRef name() { return "aimv-feedback"; }
 };
 
@@ -433,22 +437,26 @@ public:
 **Pass 工作流程**:
 
 ```
-输入: 优化后的 Module (LoopVectorize/SLPVectorize 已运行)
+输入: Function (LoopVectorize/SLPVectorize 已在当前函数上运行)
 
-1. 遍历 Module 中所有函数的 remark metadata
-   - 从 !annotation metadata 读取 optimization-remark 信息
+1. 通过 F.getParent() 获取 Module，读取 !aimv.diag Named Metadata
+   - 无 !aimv.diag → 直接返回
 
-2. 对每条 remark:
-   a. 过滤: 仅保留 LoopVectorize / SLPVectorize 相关的 missed/analysis
-   b. 提取: 使用 !dbg metadata 将 IR 指令映射回源码行号
-   c. 构建: SingleDiagnostic 结构（含源码上下文、IR 片段）
-   d. 附加: 从 VPlan 注释或辅助 metadata 提取代价模型数据
+2. 解析 !aimv.diag 为 RawDiagnostic 向量
+   - 筛选: 仅保留 FunctionName 匹配当前函数的诊断
+   - 为空 → 直接返回
 
-3. 收集目标平台信息: Module 的 target triple, target-cpu, target-features
+3. 对每条匹配的诊断:
+   a. 获取函数级分析: AAResults, ScalarEvolution, LoopInfo
+   b. 按 !dbg metadata 映射源码行号（含回退链）
+   c. 提取 IR 片段和源码上下文
+   d. 推断 severity（按 RemarkID 匹配规则）
 
-4. 序列化: 输出为 JSON 文件到 --aimv-output 路径
+4. 收集目标平台信息: Module 的 target triple, TargetIRAnalysis
 
-输出: JSON 文件，供 aimv-driver 或 aimv-analyze 使用
+5. 序列化: 追加写入 --aimv-output 指定的 JSON 文件
+
+输出: JSON 文件（diagnostics 部分），供 aimv-driver 补充 function/target 后发送 MCP
 ```
 
 ### 4.3 Driver CLI 接口
@@ -680,7 +688,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 | `!dbg` 反向映射不精确（优化后 IR 行号漂移） | AI 建议无法精确定位源码行 | 多级回退：!dbg → DILocation → 函数级匹配；标注 "approximate" |
 | LLM 输出格式不稳定 | 无法自动解析为结构化 patch | 强制 JSON schema 约束 + 重试机制 + 格式验证层 |
 | LLM 幻觉导致语义错误 | 引入 bug | 多层验证（编译+测试），回滚机制 |
-| VPlan 代价模型信息不易导出 | 诊断信息不完整 | 注入辅助 IR annotation 到 LoopVectorize pass 提取内部状态 |
+| VPlan 逐指令代价不易导出 | 诊断信息不完整 | MVP 使用 expectedCost() 总代价，足够判断向量化是否划算；逐指令代价延后到 Phase 2 |
 | MCP 服务延迟大 | 编译迭代变慢 | 异步请求 + 模式缓存 + 本地预处理过滤 |
 | LLM token 消耗大 | 成本高 | 诊断信息压缩（只发失败循环的 IR，裁剪非必要上下文） |
 

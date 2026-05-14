@@ -122,6 +122,7 @@ aimv/mcp-server/
       "memory_info": {
         "num_stores": 1,
         "num_loads": 2,
+        "num_pred_stores": 0,
         "max_alignment": 4,
         "stride": "stride=1",
         "memory_check_count": 2,
@@ -277,7 +278,8 @@ class CostModelDetail(BaseModel):
 
 
 class DependencyInfo(BaseModel):
-    dep_type: str = Field(..., pattern="^(RAW|WAR|WAW|MayAlias|PartialAlias|Unknown)$")
+    """内存依赖分析结果 — dep_type 与 LLVM 21 Dependence::DepType 对应"""
+    dep_type: str = Field(..., pattern=r"^(RAW|WAR|IndirectUnsafe|BackwardVectorizable|BackwardVectorizableButPreventsForwarding|ForwardButPreventsForwarding|Unknown)$")
     source_ptr: str
     sink_ptr: str
     alias_result: str
@@ -819,6 +821,9 @@ class DiagnosticCache:
         self._redis = redis_client
         self._local: dict = {}          # fingerprint → (expiry, AnalyzeResponse)
         self._lock = threading.Lock()
+        self._total_requests = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     def get(self, fingerprint: str) -> Optional[AnalyzeResponse]:
         # L1: 本地内存
@@ -862,6 +867,11 @@ class DiagnosticCache:
     def get_stats(self) -> dict:
         return {
             "local_entries": len(self._local),
+            "total_requests": self._total_requests,
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate": (self._cache_hits / max(self._total_requests, 1)),
+            "estimated_cost_saved_usd": self._cache_hits * 0.01,  # 粗估，实际按 LLM API 单价算
         }
 ```
 

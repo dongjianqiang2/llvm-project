@@ -147,7 +147,7 @@ Content-Type: application/json
 | 必须字段              | 说明                                                                                         |
 | ----------------- | ------------------------------------------------------------------------------------------ |
 | **opt-info 失败文本** | LLVM optimization remark 完整文本（如 `loop not vectorized: unsafe dependent memory operations`） |
-| **VPlan 代价模型拆解**  | 每条指令代价、VF 候选评分明细                                                                           |
+| **VPlan 代价模型拆解**  | 总标量代价 vs 向量代价、VF、interleave count（MVP 不含逐指令明细，延后到 Phase 2）                      |
 | **失败循环源码 + 行号**   | 原始 C/C++ 源码片段及精确行号映射                                                                       |
 | **对应的 LLVM IR**   | 优化前后的 IR 片段（含 `!dbg` 调试行号）                                                                 |
 

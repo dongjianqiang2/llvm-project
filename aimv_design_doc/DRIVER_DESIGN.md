@@ -8,7 +8,14 @@
 
 ## 0. 设计目标
 
-`aimv-driver` 是 AIMV 闭环的编排中枢。它不实现任何编译优化逻辑，只负责将 LLVM Pass（诊断产出）、MCP Server（AI 分析）、源码 patch + 重编译验证串联为可控的迭代循环。
+`aimv-driver` 是 AIMV 闭环的编排中枢。它不实现任何编译优化逻辑，只负责将诊断信息（来自 LLVM Pass 或 YAML opt-records）、MCP Server（AI 分析）、源码 patch + 重编译验证串联为可控的迭代循环。
+
+**双模式运行**（对应 SPEC §3 的系统形态）:
+
+| 模式 | 诊断来源 | LLVM 改动 | 诊断丰富度 | 启动方式 |
+|------|---------|----------|-----------|---------|
+| **Pass 模式** | AIMVFeedbackPass JSON | 需要 | 完整（代价模型 + 依赖分析） | 默认，自动检测 `-aimv-output` |
+| **YAML 模式** | `-fsave-optimization-record` YAML | 零侵入 | 基础（remark 文本 + 源码位置） | `--mode=yaml` 或当 aimv.json 不存在时自动回退 |
 
 核心职责：
 1. **编译编排** — 管理 clang 子进程，注入 AIMV flags，解析 opt-records
@@ -194,6 +201,7 @@ class SessionRecord:
     source_files: List[str] = field(default_factory=list)
     aimv_level: str = "moderate"
     max_rounds: int = 5
+    target_loop_line: Optional[str] = None  # 目标循环源码位置（首轮自动选定）
 
     # 原始源码备份（会话开始时一次性创建）
     pristine_backup_dir: str = ""
@@ -242,6 +250,14 @@ class BuildOrchestrator:
         self.aimv_flags = config.get("aimv_flags", [])
         self.timeout_seconds = config.get("timeout", 120)
         self.work_dir = Path(config.get("work_dir", tempfile.mkdtemp(prefix="aimv-")))
+
+# extract_function_source 实现策略:
+#   - 首选: clang -Xclang -ast-dump 获取函数定义的行号范围
+#   - 次选: ctags/exuberant-ctags 查找函数定义位置
+#   - 回退: 基于 loop_location 行号截取前后 N 行
+# extract_function_signature: 用正则匹配函数声明模式（返回类型 + 函数名 + 参数列表）
+# extract_loop_line: 从 diagnostics[0].loop_location 解析 "<file>:<line>:<col>" 中的行号
+# extract_lines_around: 读取文件指定行前后 context 行的源码
 
     def compile_with_aimv(
         self,
@@ -322,7 +338,7 @@ class BuildOrchestrator:
             elapsed_ms=elapsed,
         )
 
-    def check_vectorization(self, aimv_json_path: str, function_name: str) -> VectorizationStatus:
+    def check_vectorization_from_json(self, aimv_json_path: str, function_name: str) -> VectorizationStatus:
         """解析 AIMV JSON，检查目标函数是否仍有点量化 missed remark。
 
         返回 VectorizationStatus。
@@ -370,6 +386,62 @@ class BuildOrchestrator:
             missed_loops=missed,
             missed_details=details,
         )
+
+    def check_vectorization_from_yaml(self, opt_record_path: str, function_name: str) -> VectorizationStatus:
+        """YAML 模式: 从 -fsave-optimization-record YAML 检查向量化状态。
+        YAML 包含 passed/missed/analysis 三种 remark。
+        目标函数无 missed remark → 判定为向量化成功。
+        """
+        import yaml
+
+        with open(opt_record_path) as f:
+            records = yaml.safe_load(f)
+
+        total = 0
+        missed = 0
+        details = []
+        for record in records:
+            # YAML remark 结构: { Function, Pass, Name, type, ... }
+            if (record.get("Function") == function_name and
+                "loop-vectorize" in str(record.get("Pass", ""))):
+                total += 1
+                if record.get("type") == "missed":
+                    missed += 1
+                    details.append({
+                        "remark_text": record.get("Name", ""),
+                        "loop_location": record.get("DebugLoc", ""),
+                    })
+
+        if total == 0:
+            return VectorizationStatus(
+                function_name=function_name,
+                total_loops=0,
+                vectorized_loops=0,
+                missed_loops=0,
+                missed_details=[{"remark_text": "No loop-vectorize remarks in YAML"}],
+            )
+
+        return VectorizationStatus(
+            function_name=function_name,
+            total_loops=total,
+            vectorized_loops=total - missed,
+            missed_loops=missed,
+            missed_details=details,
+        )
+
+
+def _check_target_loop_passed(vstatus: VectorizationStatus, target_loop: Optional[str]) -> bool:
+    """检查目标循环是否已成功向量化。
+
+    如果 target_loop 为 None（未指定目标），返回 False（由调用者处理全 passed 场景）。
+    """
+    if target_loop is None:
+        return False
+    # 在 passed 诊断中查找目标循环的 loop_location
+    # （需要在 VectorizationStatus 中增加 passed_details 或直接遍历原始 JSON）
+    # 实施期简化: 检查 missed_details 中是否不再包含 target_loop
+    return not any(target_loop in d.get("loop_location", "")
+                   for d in vstatus.missed_details)
 
     @staticmethod
     def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
@@ -977,25 +1049,79 @@ def main_loop(driver_config: dict) -> int:
                 sources.rollback_all()
                 continue
 
-            # 检查向量化状态
-            vstatus = builder.check_vectorization(build.aimv_json_path, session.function_name)
+            # 检查向量化状态（双模式）
+            # 策略: 按目标循环判断，非函数级全量判断。
+            # 函数可能有多个循环，部分 passed 部分仍然 missed。
+            # Driver 每轮只关注 session.target_loop_line 指定的循环
+            # （首次自动选取第一个 missed 循环）。
+            if Path(build.aimv_json_path).exists():
+                vstatus = builder.check_vectorization_from_json(
+                    build.aimv_json_path, session.function_name)
+            else:
+                # YAML 模式: 从 opt-record YAML 检查是否有 missed remark
+                # 注意: YAML 模式只有 passed/missed/analysis 的 type 字段，
+                # 无代价模型和依赖分析数据，LLM 可用的信息较少（此为已知限制）。
+                vstatus = builder.check_vectorization_from_yaml(
+                    build.opt_record_path, session.function_name)
             round_rec.vectorization_status = vstatus
 
-            if vstatus.total_loops > 0 and vstatus.missed_loops == 0:
-                # 有诊断记录且全部 passed → 向量化成功
-                session.termination_reason = TerminationReason.VECTORIZED
-                log_success(session)
-                break
+            # 首轮自动选定目标循环（如果有多个 missed 循环）
+            if session.target_loop_line is None and vstatus.missed_details:
+                session.target_loop_line = vstatus.missed_details[0].get("loop_location")
+
+            # 终止判定: 检查目标循环是否已从 missed 变为 passed
+            if vstatus.total_loops > 0:
+                target_passed = _check_target_loop_passed(vstatus, session.target_loop_line)
+                if target_passed:
+                    session.termination_reason = TerminationReason.VECTORIZED
+                    log_success(session)
+                    break
+                elif vstatus.missed_loops == 0:
+                    # 所有循环都 passed（即使没指定目标循环）
+                    session.termination_reason = TerminationReason.VECTORIZED
+                    log_success(session)
+                    break
             elif vstatus.total_loops == 0:
-                # 无诊断记录 → 可能 AIMV Pass 未运行，记录并继续
-                log_warning("No AIMV diagnostics found; pass may not have run")
-                # 仍可作为终止条件（实现期酌情调整）
+                log_warning("No diagnostics found; pass may not have run or function has no loops")
                 session.termination_reason = TerminationReason.NO_SUGGESTION
                 break
 
-            # 加载 AIMV JSON 作为 MCP 请求体
-            with open(build.aimv_json_path) as f:
-                aimv_json = json.load(f)
+            # 加载诊断数据（双模式）
+            if Path(build.aimv_json_path).exists():
+                # Pass 模式: 读取 AIMVFeedbackPass JSON（丰富诊断）
+                with open(build.aimv_json_path) as f:
+                    aimv_json = json.load(f)
+            else:
+                # YAML 模式: 从 opt-record YAML 解析基础诊断（零侵入）
+                # 注意: YAML 模式无代价模型和依赖分析数据，LLM 可用的信息较少
+                aimv_json = opt_info_parser.parse_to_analyze_request(
+                    build.opt_record_path,
+                    session.function_name,
+                    session.source_files[0],
+                )
+
+            # 补充 function 字段（Pass JSON 只有 diagnostics + target，
+            # AnalyzeRequest 要求完整的 FunctionInfo）
+            # 注意: source_code 只提取目标函数的源码片段，不发整个文件
+            # （避免 token 浪费、LLM 混淆、大文件超上下文窗口）。
+            func_source = extract_function_source(
+                session.source_files[0], session.function_name)
+            if func_source is None:
+                # 回退: 函数提取失败时截取 loop_location 前后 40 行
+                loop_line = extract_loop_line(
+                    aimv_json.get("diagnostics", []), session.function_name)
+                func_source = extract_lines_around(
+                    session.source_files[0], loop_line, context=40)
+
+            aimv_json["function"] = {
+                "name": session.function_name,
+                "signature": extract_function_signature(
+                    session.source_files[0], session.function_name),
+                "source_code": func_source,
+                "source_file": session.source_files[0],
+                "loop_line": extract_loop_line(
+                    aimv_json.get("diagnostics", []), session.function_name),
+            }
 
             # 注入 history
             aimv_json["history"] = build_history(session)
@@ -1026,9 +1152,18 @@ def main_loop(driver_config: dict) -> int:
             # Step 3: 应用 patch
             round_rec.status = DriverStatus.PATCHING
             suggestion = mcp_resp["suggestions"][0]
-            patch = sources.apply_patch(suggestion["source_file"], suggestion["diff"])
+
+            # 循环检测: 比较 diff 与历史 patch，防止 LLM 重复建议同一修改
+            new_diff = suggestion["diff"]
+            if any(p.diff_text.strip() == new_diff.strip()
+                   for p in sources._patch_history):
+                log_warning("Duplicate patch detected; LLM suggested same change as previous round")
+                session.termination_reason = TerminationReason.NO_IMPROVEMENT
+                store.save(session)
+                break
+
+            patch = sources.apply_patch(suggestion["source_file"], new_diff)
             round_rec.patch = patch
-            # 关键持久化点：patch 已应用，即使后续崩溃也能恢复
             store.save(session)
 
             # Step 4: 重编译验证

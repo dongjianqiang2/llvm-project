@@ -41,7 +41,7 @@ LoopVectorize::processLoop()
 
 ### 1.2 Named Metadata 节点格式
 
-每个被拒绝的循环在 `!aimv.diag` 中追加一个 MDNode：
+每个被拒绝或成功向量化的循环在 `!aimv.diag` 中追加一个 MDNode：
 
 ```llvm
 ; 格式:
@@ -145,7 +145,7 @@ LoopVectorize::processLoop()
 ### 2.1 修改范围
 
 **文件**: `llvm/lib/Transforms/Vectorize/LoopVectorize.cpp`
-**改动量**: ~80 行（新增 1 个辅助函数 + 在 4 个关键拒绝点插入调用）
+**改动量**: ~120 行（新增 1 个辅助函数 + 在 4 个拒绝点 + 1 个成功点插入调用）
 
 ### 2.2 新增辅助函数
 
@@ -154,6 +154,11 @@ LoopVectorize::processLoop()
 //
 // 声明在该头文件中（非 static），供 LoopVectorize.cpp 和 LoopAccessAnalysis.cpp 共同引用。
 // 实现在 LoopVectorize.cpp 中（单一定义）。
+//
+// 零跨组件符号依赖:
+//   - 函数仅依赖 LLVM Core/Analysis 的公共 API（Module, Function, Loop, LoopAccessInfo 等）
+//   - 不引用 LLVMAIMV 组件中的任何符号
+//   - AIMVFeedbackPass 通过 #include 此头文件调用 parseDiagnostics()，不调用 emitAIMVDiagnostic()
 
 /// [BiSheng] 当 LoopVectorize 拒绝向量化或成功向量化时，将结构化诊断写入 !aimv.diag
 ///
@@ -162,6 +167,10 @@ LoopVectorize::processLoop()
 ///
 /// 注释: -fsave-optimization-record 创建的 LLVMRemarkStreamer 会同时设置
 ///       getLLVMRemarkStreamer() 和 getMainRemarkStreamer()，因此检查前者即可。
+///
+/// 激活条件: 仅检查 getLLVMRemarkStreamer()。
+///   -aimv-enable / -aimv-output 由 AIMVFeedbackPass 自身消费（不影响此函数）。
+///   不使用跨组件的 cl::opt 共享变量，避免动态库构建模式下的链接和初始化顺序问题。
 ///
 /// @param M        Module
 /// @param F        被编译的函数
@@ -175,6 +184,8 @@ LoopVectorize::processLoop()
 /// @param SE       ScalarEvolution (可为 nullptr，此时无法获取 trip_count)
 /// @param RtCheckCost runtime check 总代价，从 GeneratedRTChecks::getCost() 获取
 ///                    （不可用时为 -1）
+/// @param RtCheckCount runtime pointer check 数量，从 RuntimePointerChecking 获取
+///                    （不可用时为 -1）
 void emitAIMVDiagnostic(
     Module &M, Function &F, Loop &L,
     LoopAccessInfo *LAI,
@@ -182,13 +193,15 @@ void emitAIMVDiagnostic(
     ElementCount VF, unsigned IC,
     StringRef RemarkID, StringRef RemarkMsg,
     ScalarEvolution *SE = nullptr,
-    int RtCheckCost = -1) {
+    int RtCheckCost = -1,
+    int RtCheckCount = -1) {
 
   LLVMContext &Ctx = M.getContext();
 
-  // 只在 ORE streamer 激活或显式 enable 时写入
-  // 注意: LLVMContext 同时有 getMainRemarkStreamer() 和 getLLVMRemarkStreamer()，
-  // 两者皆可工作。使用 getLLVMRemarkStreamer() 与 LLVM 的 ORE 机制一致。
+  // 激活条件: LLVMRemarkStreamer 非空即可。
+  // -fsave-optimization-record 和 -Rpass-missed=loop-vectorize 都会设置此 streamer。
+  // -aimv-enable / -aimv-output 的处理在 AIMVFeedbackPass::run() 中，
+  // 那里额外检查 AIMVFeedbackPass 自己的 OutputPath/EnabledFlag。
   if (!Ctx.getLLVMRemarkStreamer())
     return;
 
@@ -297,8 +310,12 @@ void emitAIMVDiagnostic(
         ConstantInt::get(Type::getInt32Ty(Ctx), LAI->getNumStores())));
     MemOps.push_back(ConstantAsMetadata::get(
         ConstantInt::get(Type::getInt32Ty(Ctx), LAI->getNumLoads())));
+    // num_pred_stores: LAI 不直接提供此字段。
+    // 精确值需要 LoopVectorizationLegality::blockNeedsPredication()（仅在 LV 上下文可用）。
+    // 此处统一填 0，实施期可在 LoopVectorize 的插入点从 Legal 获取真实值传入。
+    unsigned NumPredStores = 0;
     MemOps.push_back(ConstantAsMetadata::get(
-        ConstantInt::get(Type::getInt32Ty(Ctx), LAI->getNumPredStores())));
+        ConstantInt::get(Type::getInt32Ty(Ctx), NumPredStores)));
 
     // 计算最大对齐: 遍历循环体中所有 Load/Store 指令，从其 getAlign() 获取
     unsigned MaxAlign = 0;
@@ -314,17 +331,16 @@ void emitAIMVDiagnostic(
         ConstantInt::get(Type::getInt32Ty(Ctx), MaxAlign)));
 
     // stride_info: 从内存访问模式推断 stride
-    // check 为 0 且有内存操作 → 所有访问被判定为独立，大概率连续访问 (stride=1)
+    // RtCheckCount == 0 且有内存操作 → 所有访问被判定为独立，大概率连续访问 (stride=1)
     // 否则标记为 "non-constant" 或 "unknown"
     // 精确 stride 需在实施期通过 SCEV 分析每个指针的步长（MVP 可简化为上述二分类）
-    bool LikelyStride1 = (RtCheck.getNumberOfChecks() == 0) &&
+    bool LikelyStride1 = (RtCheckCount == 0) &&
                          (LAI->getNumStores() + LAI->getNumLoads() > 0);
     MemOps.push_back(MDString::get(Ctx,
         LikelyStride1 ? "stride=1" : "non-constant"));
-    // check 数量和代价通过 RuntimePointerChecking 的方法获取
+    // memory_check_count: 从调用者传入（不可用时为 -1）
     MemOps.push_back(ConstantAsMetadata::get(
-        ConstantInt::get(Type::getInt32Ty(Ctx),
-            (int)RtCheck.getNumberOfChecks())));
+        ConstantInt::get(Type::getInt32Ty(Ctx), RtCheckCount)));
     // 代价在 LoopVectorize 的 GeneratedRTChecks::getCost() 中计算;
     // 此处从调用者传入或在 insertion point 直接获取 Checks.getCost().getValue()
     // 若不可用（如 legality 阶段拒绝），存 -1
@@ -379,7 +395,7 @@ void emitAIMVDiagnostic(
 }
 ```
 
-### 2.3 四个插入点
+### 2.3 插入点一览
 
 #### 插入点 1: `CantReorderMemOps` — runtime check 代价过高拒绝（最重要）
 
@@ -406,11 +422,14 @@ if (!isOutsideLoopWorkProfitable(L, *LVL, VF, Checks)) {
   // Checks.getCost() 返回 InstructionCost，可能 Invalid → 需判空
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
+  // RtCheckCount: 从 LAI 的 RuntimePointerChecking 获取
+  int RtChkCount = LVL.getLAI().hasRuntimePointerChecks() ?
+      (int)LVL.getLAI().getRuntimePointerChecking().getNumberOfChecks() : 0;
   emitAIMVDiagnostic(M, F, L, &(*LVL).getLAI(), CM, VF, IC,
                      "CantReorderMemOps",
                      "unsafe dependent memory operations in loop",
                      &PSE.getSE(),
-                     RtCost);
+                     RtCost, RtChkCount);
 ```
 
 #### 插入点 2: `VectorizationNotBeneficial` — 代价模型拒绝
@@ -427,11 +446,13 @@ reportVectorizationFailure("Vectorization not beneficial",
 ```cpp
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
+  int RtChkCount = LVL.getLAI().hasRuntimePointerChecks() ?
+      (int)LVL.getLAI().getRuntimePointerChecking().getNumberOfChecks() : 0;
   emitAIMVDiagnostic(M, F, L, &(*LVL).getLAI(), CM, VF, IC,
                      "VectorizationNotBeneficial",
                      "the cost-model indicates that vectorization is not beneficial",
                      &PSE.getSE(),
-                     RtCost);
+                     RtCost, RtChkCount);
 ```
 
 #### 插入点 3: LAA 转发的 unsafe dep — 依赖分析失败
@@ -448,11 +469,15 @@ reportVectorizationFailure("Vectorization not beneficial",
 
 **插入**（CM/PSE/Checks 均不可用 → 使用默认值）:
 ```cpp
+  // LoopAccessAnalysis 上下文中无 CM/PSE/Checks，所有诊断相关参数使用默认值
+  // RtCheckCount: LAI 自身有 RuntimePointerChecking 信息
+  int RtChkCount = LAI->hasRuntimePointerChecks() ?
+      (int)LAI->getRuntimePointerChecking().getNumberOfChecks() : 0;
   emitAIMVDiagnostic(M, F, L, LAI, /*CM=*/nullptr, VF, IC,
                      "UnsafeDep",
                      LAI->getReport()->getRemarkMsg(),
                      /*SE=*/nullptr,
-                     /*RtCheckCost=*/-1);
+                     /*RtCheckCost=*/-1, RtChkCount);
 ```
 
 #### 插入点 4: `InterleavingNotBeneficial` — 交错不利
@@ -464,9 +489,28 @@ reportVectorizationFailure("Vectorization not beneficial",
 
 **说明**: Driver 依靠 `!aimv.diag` 中的 passed 记录来**正向确认**向量化成功。
 仅靠"无 missed 记录"无法区分"向量化成功"与"Pass 未运行"。
-因此需要在 LoopVectorize 成功时也写入诊断。
 
-**位置**: `LoopVectorize.cpp`，LoopVectorize 返回成功结果处（如 `LoopVectorizeResult(true)` 调用前）。
+**精确位置**（LLVM 21）: 在 `LoopVectorize.cpp` 的 `processLoop()` 函数中，
+`LoopVectorizeResult` 构造处（约 line 10260-10280），VPlan 已执行完毕、
+向量化决策已确定为 true 的单一路径。实施前需锁定该版本的确切行号。
+
+**注意**: 不要在 `reportVectorizationFailure` 路径或 early-exit 路径插入。
+
+### 2.5 部分向量化策略
+
+一个函数可能包含多个循环，部分循环可能已成功向量化、部分仍然失败。
+
+**`!aimv.diag` 的语义**: 每个循环独立记录——被拒绝的循环写 missed，成功的循环写 passed。
+`AIMVFeedbackPass` 输出的 JSON 中可能同时包含同一函数的 missed 和 passed 诊断。
+
+**Driver 的迭代策略**:
+- **函数级迭代** — Driver 每轮关注**一个**目标循环（由 `loop_location` 指定）
+- MCP 只收到该循环的 missed 诊断 + history
+- 终止条件: 目标循环从 missed 变为 passed（而非函数内所有循环都 passed）
+- Driver 可通过 `--loop-line` 参数或自动选择第一个 missed 循环来指定目标
+
+**多循环场景**: 用户需为不同循环分别运行 `aimv-driver`（或 CI 批量工具逐循环调用）。
+同一文件多循环并行分析由文件锁保证互斥（见 DRIVER_DESIGN §9）。
 
 **插入**:
 ```cpp
@@ -477,11 +521,13 @@ reportVectorizationFailure("Vectorization not beneficial",
   // MVP 建议: RemarkID = "LoopVectorized" + 原有标识，RemarkMsg 描述 VF/IC 信息
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
+  int RtChkCount = LVL.getLAI().hasRuntimePointerChecks() ?
+      (int)LVL.getLAI().getRuntimePointerChecking().getNumberOfChecks() : 0;
   emitAIMVDiagnostic(M, F, L, &(*LVL).getLAI(), CM, VF, IC,
                      "LoopVectorized",
                      "loop vectorized: VF=" + Twine(VF.getKnownMinValue()).str(),
                      &PSE.getSE(),
-                     RtCost);
+                     RtCost, RtChkCount);
 ```
 
 ### 2.4 SLPVectorize 改动点（可选，Phase 2）
@@ -549,6 +595,9 @@ public:
     TargetFunction = FuncName;
   }
 
+  /// [BiSheng] 显式启用（即使无 remark streamer 也运行）
+  void setEnabled(bool V = true) { EnabledFlag = V; }
+
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   static StringRef name() { return "aimv-feedback"; }
 
@@ -577,6 +626,7 @@ public:
     // 内存
     int NumStores = 0, NumLoads = 0, NumPredStores = 0;
     int MaxAlignment = 0;
+    std::string Stride = "unknown";
     int MemCheckCount = 0, MemCheckCost = 0;
     // 循环
     int NumBlocks = 0, NumInsts = 0, TripCount = -1;
@@ -589,6 +639,7 @@ public:
 private:
   std::string OutputPath;
   std::string TargetFunction;
+  bool EnabledFlag = false;  // -aimv-enable 设置
 };
 
 } // namespace llvm
@@ -631,6 +682,11 @@ RemarkID 匹配:
 `AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM)` 核心流程：
 
 ```
+0. 缓存优化: Function Pass 对每个函数独立运行，同一 Module 的 !aimv.diag 会被
+   重复解析 N 次（N=函数数）。实施时在 pass 实例内缓存首次 parseDiagnostics() 结果:
+     if (CachedModule != M) { CachedDiags = parseDiagnostics(*M); CachedModule = M; }
+   后续函数直接复用 CachedDiags 做 FunctionName 过滤，消除 O(N*M) 开销。
+
 1. 通过 F.getParent() 获取 Module &M
    - 若 Module 无 !aimv.diag Named Metadata → 返回 PreservedAnalyses::all()
 
@@ -642,7 +698,10 @@ RemarkID 匹配:
    - AM.getResult<AAResults>(F)
    - AM.getResult<ScalarEvolution>(F)（若有）
    - AM.getResult<LoopInfo>(F)
-   - Module 级：通过 MAMProxy 获取 TargetLibraryInfo, TargetTransformInfo
+   - AM.getResult<TargetIRAnalysis>(F) → TargetTransformInfo
+   - Module 级信息: M->getTargetTriple(), TTI->getRegisterBitWidth(true) 推算 vector_width
+     CPU/Features 从 Module 的 target-cpu/target-features attributes 获取
+     （-mcpu=-aimv-target-cpu= 作为 fallback，通过 setTargetCpu() 注入）
 
 4. 对每条匹配的诊断:
    a. 如果设置了 TargetFunction，仅处理目标函数（跳过不匹配的）
@@ -666,7 +725,10 @@ RemarkID 匹配:
 
 ### 3.4 JSON 输出格式
 
-输出文件与 PLAN.md 中定义的 `AnalyzeRequest` 协议完全对应。关键点：
+输出文件与 PLAN.md 中定义的 `AnalyzeRequest` 的 **diagnostics 部分**对应。
+完整 AnalyzeRequest 需要的 `function`（source_code/signature/loop_line）和 `target` 信息
+由 Driver 在发送 MCP 请求前从源文件和编译参数中补充。
+AIMVFeedbackPass 仅产出 IR 侧可获取的诊断数据。关键点：
 
 ```json
 {
@@ -703,6 +765,7 @@ RemarkID 匹配:
       ],
       "memory_info": {
         "num_stores": 1, "num_loads": 2,
+        "num_pred_stores": 0,
         "max_alignment": 4,
         "stride": "stride=1",
         "memory_check_count": 2,
@@ -768,8 +831,13 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
   if (!M)
     return PreservedAnalyses::all();
 
-  // 仅在有 remark consumer 或显式指定输出路径时运行
-  if (!M->getContext().getLLVMRemarkStreamer() && OutputPath.empty())
+  // 激活条件（三选一）:
+  //   1. getLLVMRemarkStreamer() 非空（-fsave-optimization-record / -Rpass-missed 触发）
+  //   2. !OutputPath.empty()（-aimv-output 显式指定）
+  //   3. AIMVFeedbackPass 自身的 EnabledFlag（-aimv-enable 触发）
+  // 注意: EnabledFlag 和 OutputPath 是 AIMVFeedbackPass 的私有成员，
+  //       由 BackendUtil.cpp 在构造 pass 时设置，不依赖跨组件符号。
+  if (!M->getContext().getLLVMRemarkStreamer() && OutputPath.empty() && !EnabledFlag)
     return PreservedAnalyses::all();
 
   // ... 正常执行 ...
@@ -777,9 +845,14 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
 ```
 
 触发条件（任一满足即运行）：
-- `-fsave-optimization-record=<file>` — 写入 YAML remarks
-- `-Rpass-missed=loop-vectorize` — 输出 remarks
-- `-aimv-output=<path>` — 显式要求 AIMV JSON 输出
+- `-fsave-optimization-record=<file>` — 写入 YAML remarks（同时激活 remark streamer）
+- `-Rpass-missed=loop-vectorize` — 输出 remarks（激活 remark streamer）
+- `-aimv-output=<path>` — 设置 OutputPath（AIMVFeedbackPass 私有成员，由 BackendUtil.cpp 注入）
+- `-aimv-enable` — 设置 EnabledFlag（AIMVFeedbackPass 私有成员）
+
+**关键**: 这四个触发条件全部在 AIMVFeedbackPass 内部处理，不依赖任何跨组件的 `cl::opt` 变量。
+`-aimv-output` 和 `-aimv-enable` 在 `clang/lib/CodeGen/BackendUtil.cpp` 中解析后，
+通过 `AIMVFeedbackPass::setOutputPath()` / `AIMVFeedbackPass::setEnabled()` 注入 pass 实例。
 
 ### 4.3 与现有 Remark 基础设施的关系
 
@@ -843,7 +916,7 @@ add_subdirectory(AIMV)
 
 **文件**: `llvm/lib/Passes/CMakeLists.txt`
 
-将 `LLVMAIMV` 添加到 `LINK_COMPONENTS`，确保 PassRegistry.def 中的 `MODULE_PASS("aimv-feedback", ...)` 可解析。
+将 `LLVMAIMV` 添加到 `LINK_COMPONENTS`，确保 PassRegistry.def 中的 `FUNCTION_PASS("aimv-feedback", ...)` 可解析。
 
 ---
 
@@ -882,8 +955,9 @@ curl -X POST http://mcp-server:8080/api/v1/analyze-vectorization \
 
 | 文件 | 变更类型 | 改动量 | 说明 |
 |------|---------|--------|------|
-| `llvm/lib/Transforms/Vectorize/LoopVectorize.cpp` | 修改 | +80 行 | 新增 `emitAIMVDiagnostic()` + 4 处调用 |
+| `llvm/lib/Transforms/Vectorize/LoopVectorize.cpp` | 修改 | +120 行 | 新增 `emitAIMVDiagnostic()` + 4 拒绝点 + 1 成功点调用 |
 | `llvm/lib/Transforms/Vectorize/LoopAccessAnalysis.cpp` | 修改 | +5 行 | UnsafeDep 拒绝点增加 AIMV 写入 |
+| `llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h` | **新建** | ~20 行 | 共享内部头文件，emitAIMVDiagnostic() 声明 |
 | `llvm/lib/Transforms/AIMV/AIMVFeedbackPass.cpp` | **新建** | ~350 行 | Pass 主实现 |
 | `llvm/lib/Transforms/AIMV/AIMVDiagnosticParser.cpp` | **新建** | ~150 行 | Metadata → RawDiagnostic 解析 |
 | `llvm/include/llvm/Transforms/AIMV/AIMVFeedback.h` | **新建** | ~80 行 | 公共头文件 |
@@ -894,8 +968,8 @@ curl -X POST http://mcp-server:8080/api/v1/analyze-vectorization \
 | `llvm/lib/Passes/CMakeLists.txt` | 修改 | +1 行 | 链接 LLVMAIMV |
 | `clang/lib/CodeGen/BackendUtil.cpp` | 修改 | +15 行 | `-aimv-output` 选项处理 |
 
-**总新增文件**: 4 个（~595 行）
-**总修改文件**: 7 个（~106 行）
+**总新增文件**: 5 个（~615 行，含 `AIMVDiagnostic.h`）
+**总修改文件**: 7 个（~145 行）
 
 ---
 
