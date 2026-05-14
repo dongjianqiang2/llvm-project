@@ -22,7 +22,7 @@ def _aimv_root() -> Path:
 # ---------------------------------------------------------------------------
 REQUIRED_DIRS = [
     "aimv/driver",
-    "aimv/mcp-server",
+    "aimv/mcp_server",
     "aimv/test",
     "aimv/benchmarks",
     "aimv/config",
@@ -34,7 +34,7 @@ REQUIRED_DIRS = [
 # ---------------------------------------------------------------------------
 REQUIRED_INIT_FILES = [
     "aimv/driver/__init__.py",
-    "aimv/mcp-server/__init__.py",
+    "aimv/mcp_server/__init__.py",
     "aimv/test/__init__.py",
 ]
 
@@ -45,7 +45,7 @@ REQUIRED_INIT_FILES = [
 REQUIRED_FILES = [
     "aimv/config/aimv_config.yaml",
     "aimv/driver/requirements.txt",
-    "aimv/mcp-server/requirements.txt",
+    "aimv/mcp_server/requirements.txt",
 ]
 
 

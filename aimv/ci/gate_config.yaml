@@ -1,0 +1,25 @@
+# aimv-gate-config.yaml — Gate decision configuration (T6.4)
+
+gate:
+  # Level 0: report-only (default)
+  #   - Never blocks merge
+  #   - Only generates MR comment + artifact
+  mode: "report"
+
+  # Level 1: regression gate
+  #   - Blocks merge if new code degrades previously vectorized functions
+  # mode: "regression"
+  regression:
+    baseline_artifact: "aimv-baseline/latest"
+    perf_degradation_threshold_pct: 5.0
+    coverage_degradation_threshold_pct: 2.0
+
+  # Level 2: enforce gate
+  #   - Requires minimum vectorization coverage for specific directories
+  # mode: "enforce"
+  enforce:
+    rules:
+      - path_pattern: "src/dsp/**/*.c"
+        min_vectorization_rate: 0.6       # 60% of loops must vectorize
+      - path_pattern: "src/control/**/*.c"
+        min_vectorization_rate: 0.0       # control code exempt

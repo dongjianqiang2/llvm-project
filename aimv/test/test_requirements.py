@@ -21,7 +21,7 @@ import pytest
 
 def _aimv_root() -> Path:
     """Return the absolute path to the ``aimv/`` top-level directory."""
-    return Path(__file__).resolve().parent.parent
+    return Path(__file__).resolve().parent.parent.parent
 
 
 _PIP_AVAILABLE: bool | None = None
@@ -64,7 +64,7 @@ def _skip_if_no_pip() -> None:
 # ---------------------------------------------------------------------------
 REQUIREMENTS_FILES = [
     "aimv/driver/requirements.txt",
-    "aimv/mcp-server/requirements.txt",
+    "aimv/mcp_server/requirements.txt",
 ]
 
 
