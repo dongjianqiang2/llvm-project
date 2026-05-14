@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [BiSheng] AIMV CI — aimv-run-batch (T6.2)
+# [AIMV] AIMV CI — aimv-run-batch (T6.2)
 """Batch AIMV analysis with per-file serialization, cross-file parallelism."""
 import argparse
 import asyncio

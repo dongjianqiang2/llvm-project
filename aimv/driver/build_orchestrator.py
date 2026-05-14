@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver — Build orchestrator (compilation + test subprocess management)
+# [AIMV] AIMV Driver — Build orchestrator (compilation + test subprocess management)
 import subprocess
 import tempfile
 import time

@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver — MCP REST client with retry
+# [AIMV] AIMV Driver — MCP REST client with retry
 import httpx
 import time
 from typing import Optional

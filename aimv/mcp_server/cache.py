@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — Diagnostic fingerprint cache
+# [AIMV] MCP Server — Diagnostic fingerprint cache
 import hashlib
 import json
 import threading

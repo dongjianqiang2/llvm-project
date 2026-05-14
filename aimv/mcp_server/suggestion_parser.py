@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — LLM response → structured Suggestion parser
+# [AIMV] MCP Server — LLM response → structured Suggestion parser
 import json
 import re
 from .models import AnalyzeResponse

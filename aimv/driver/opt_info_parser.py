@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver — opt-record YAML/JSON parser (YAML mode support)
+# [AIMV] AIMV Driver — opt-record YAML/JSON parser (YAML mode support)
 import yaml
 import json
 from pathlib import Path

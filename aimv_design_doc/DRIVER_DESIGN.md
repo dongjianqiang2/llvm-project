@@ -82,7 +82,7 @@ aimv/driver/
 ## 2. 内部数据模型
 
 ```python
-# [BiSheng] driver/models.py
+# [AIMV] driver/models.py
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -232,7 +232,7 @@ class SessionRecord:
 ### 3.1 编译执行
 
 ```python
-# [BiSheng] driver/build_orchestrator.py
+# [AIMV] driver/build_orchestrator.py
 
 import subprocess
 import tempfile
@@ -471,7 +471,7 @@ def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
 ### 3.2 超时与信号处理
 
 ```python
-# [BiSheng] 子进程超时 → 抛出 subprocess.TimeoutExpired
+# [AIMV] 子进程超时 → 抛出 subprocess.TimeoutExpired
 # driver 捕获后：
 #   编译超时 → 记录日志，标记该 patch 为 COMPILE_ERROR，回滚
 #   测试超时 → 记录日志，标记 TEST_FAILURE，回滚
@@ -487,7 +487,7 @@ def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
 ### 4.1 原子 patch + 回滚
 
 ```python
-# [BiSheng] driver/source_manager.py
+# [AIMV] driver/source_manager.py
 
 import os
 import hashlib
@@ -615,7 +615,7 @@ class SourceManager:
 ### 4.2 崩溃恢复
 
 ```python
-# [BiSheng] 崩溃恢复策略:
+# [AIMV] 崩溃恢复策略:
 #
 # 启动时检查 backup_dir 中是否有残留的 .bak 文件
 #   → 存在 → 询问用户是否恢复到 pre-aimv 原始状态
@@ -631,7 +631,7 @@ class SourceManager:
 ## 5. MCP 客户端（mcp_client.py）
 
 ```python
-# [BiSheng] driver/mcp_client.py
+# [AIMV] driver/mcp_client.py
 
 import httpx
 import time
@@ -708,7 +708,7 @@ class MCPClient:
 ### 6.1 决策逻辑
 
 ```python
-# [BiSheng] driver/iteration_engine.py
+# [AIMV] driver/iteration_engine.py
 
 from enum import Enum
 from typing import Optional
@@ -881,7 +881,7 @@ Round N 开始
 ### 7.1 格式
 
 ```python
-# [BiSheng] driver/session_store.py
+# [AIMV] driver/session_store.py
 
 import json
 import os
@@ -994,7 +994,7 @@ aimv-driver 启动
 ## 8. 主循环实现
 
 ```python
-# [BiSheng] driver/aimv_driver.py (核心循环，伪代码)
+# [AIMV] driver/aimv_driver.py (核心循环，伪代码)
 
 def main_loop(driver_config: dict) -> int:
     """主迭代循环。返回 0 表示成功，非 0 表示失败。"""
@@ -1268,7 +1268,7 @@ AIMV 操作的对象是**源码文件**。多函数并行分析存在文件冲�
 ```
 
 ```python
-# [BiSheng] driver/source_manager.py (补充)
+# [AIMV] driver/source_manager.py (补充)
 
 import fcntl  # Linux / macOS
 # Windows: import msvcrt

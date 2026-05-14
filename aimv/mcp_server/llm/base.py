@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — Abstract LLM Backend interface
+# [AIMV] MCP Server — Abstract LLM Backend interface
 from abc import ABC, abstractmethod
 from ..models import AnalyzeRequest, AnalyzeResponse
 

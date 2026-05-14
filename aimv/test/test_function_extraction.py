@@ -67,11 +67,12 @@ class TestExtractLoopLine:
         assert extract_loop_line(diags, "foo") == 42
 
     def test_empty_diagnostics(self):
-        assert extract_loop_line([], "foo") == 0
+        # [AIMV] Fallback is 1 (file start) since FunctionInfo.loop_line requires gt=0
+        assert extract_loop_line([], "foo") == 1
 
     def test_no_match(self):
         diags = [{"function_name": "bar", "loop_location": "test.c:1:1"}]
-        assert extract_loop_line(diags, "foo") == 0
+        assert extract_loop_line(diags, "foo") == 1
 
 
 class TestExtractLinesAround:

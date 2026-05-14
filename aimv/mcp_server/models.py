@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — Pydantic request/response models
+# [AIMV] MCP Server — Pydantic request/response models
 # Matches aimv_design_doc/MCP_DESIGN.md §3 (authoritative API contract)
 
 from pydantic import BaseModel, Field, field_validator

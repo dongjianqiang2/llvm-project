@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [BiSheng] AIMV Driver — CLI + main iteration loop
+# [AIMV] AIMV Driver — CLI + main iteration loop
 """aimv-driver — AI-driven loop vectorization optimization orchestration."""
 
 import argparse
@@ -72,14 +72,18 @@ def extract_function_signature(source_file: str, func_name: str) -> str:
 
 
 def extract_loop_line(diagnostics: list, func_name: str) -> int:
-    """Extract loop source line from diagnostics."""
+    """Extract loop source line from diagnostics.
+
+    Returns a positive line number. Falls back to 1 (file start)
+    if no exact match is found, since FunctionInfo.loop_line requires gt=0.
+    """
     for d in diagnostics:
         if d.get("function_name") == func_name:
             loc = d.get("loop_location", "")
             m = re.search(r':(\d+)', loc)
             if m:
                 return int(m.group(1))
-    return 0
+    return 1
 
 
 def extract_lines_around(source_file: str, line: int, context: int = 40) -> str:
@@ -236,6 +240,13 @@ def main_loop(driver_config: dict) -> int:
             aimv_json["history"] = build_history(session)
             aimv_json["aimv_level"] = engine.current_level
 
+            # [AIMV] --dry-run: stop after diagnostics, before MCP call
+            if driver_config.get("dry_run"):
+                print(f"[aimv-driver] Dry run: diagnostics collected for "
+                      f"{func_name}, skipping MCP query", file=sys.stderr)
+                session.termination_reason = TerminationReason.NO_SUGGESTION
+                break
+
             # Step 2: MCP query
             round_rec.status = DriverStatus.QUERYING_MCP
             mcp_resp = mcp.analyze(aimv_json)
@@ -261,8 +272,7 @@ def main_loop(driver_config: dict) -> int:
             suggestion = mcp_resp["suggestions"][0]
 
             new_diff = suggestion["diff"]
-            if any(p.diff_text.strip() == new_diff.strip()
-                   for p in sources._patch_history):
+            if sources.has_diff(new_diff):
                 session.termination_reason = TerminationReason.NO_IMPROVEMENT
                 store.save(session)
                 break
@@ -390,6 +400,32 @@ def main(argv=None):
         cfg["measure_perf"] = True
     if args.dry_run:
         cfg["dry_run"] = True
+
+    # [AIMV] --list-sessions: print session list and exit
+    if args.list_sessions:
+        store = SessionStore(cfg.get("output_dir", "./aimv-output"))
+        sessions = store.list_sessions()
+        if not sessions:
+            print("No sessions found.")
+        for s in sessions:
+            print(f"  {s['session_id']}  {s['function_name']}  "
+                  f"{s.get('status', 'in_progress')}  rounds={s.get('rounds', 0)}")
+        return 0
+
+    # [AIMV] --resume: load existing session and continue
+    if args.resume:
+        store = SessionStore(cfg.get("output_dir", "./aimv-output"))
+        existing = store.load(args.resume)
+        if existing is None:
+            print(f"Error: session '{args.resume}' not found", file=sys.stderr)
+            return 2
+        print(f"[aimv-driver] Resuming session {args.resume} "
+              f"(round {existing.current_round}, "
+              f"reason was: {existing.termination_reason})")
+        # [AIMV] TODO: full resume logic — re-apply patches from session
+        # and continue from existing.current_round + 1. For now, warn.
+        print("[aimv-driver] Warning: full resume not yet implemented. "
+              "Starting fresh iteration.", file=sys.stderr)
 
     return main_loop(cfg)
 

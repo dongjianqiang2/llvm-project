@@ -1,1 +1,1 @@
-# [BiSheng] AIMV Driver package
+# [AIMV] AIMV Driver package

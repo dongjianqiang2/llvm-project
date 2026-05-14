@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver — Performance measurement (T4.5)
+# [AIMV] AIMV Driver — Performance measurement (T4.5)
 """Performance measurement using perf stat or clock_gettime."""
 import subprocess
 import statistics

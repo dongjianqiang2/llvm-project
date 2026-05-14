@@ -1,4 +1,4 @@
-// [BiSheng] AIMVFeedbackPass — Function Pass implementation
+// [AIMV] AIMVFeedbackPass — Function Pass implementation
 #include "llvm/Transforms/AIMV/AIMVFeedback.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Constants.h"
@@ -16,7 +16,7 @@ using namespace llvm;
 
 static std::mutex JSONWriteMutex;
 
-// [BiSheng] Command-line flags (opt: -aimv-output=diag.json -aimv-enable)
+// [AIMV] Command-line flags (opt: -aimv-output=diag.json -aimv-enable)
 static cl::opt<std::string> AIMVOutputPath(
     "aimv-output", cl::desc("AIMV JSON diagnostic output path"), cl::Hidden);
 static cl::opt<bool> AIMVEnable(

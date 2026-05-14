@@ -1,1 +1,1 @@
-# [BiSheng] AIMV MCP Server package
+# [AIMV] AIMV MCP Server package

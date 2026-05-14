@@ -1,4 +1,4 @@
-# [BiSheng] AIMV CI — Incremental change detection (T6.1)
+# [AIMV] AIMV CI — Incremental change detection (T6.1)
 """Detect changed functions in a git diff for incremental AIMV analysis."""
 import subprocess
 import re
@@ -48,29 +48,73 @@ def _get_function_definitions(file: str) -> List[Tuple[str, int, int]]:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return _get_function_definitions_regex(file)
 
+    # [AIMV] AST dump format:
+    #   |-FunctionDecl 0x7f8b4c401600 <line:10:1, line:20:1> line:10:5 foo 'int (int)'
+    #   `-FunctionDecl 0x... prev 0x... <col:...> used bar 'void ()'
+    # The function name is the last bare identifier before the quoted type string.
+    # Pattern: capture the identifier immediately before 'type' (single-quoted).
+    # Fallback: capture identifier after source location "line:N:C ".
     functions = []
     for line in proc.stderr.split("\n"):
-        if "FunctionDecl" in line and " definition " in line:
-            name_match = re.search(r"FunctionDecl.*?\b(\w+)\b.*?'", line)
-            loc_match = re.search(r"<line:(\d+):\d+, line:(\d+):\d+>", line)
-            if name_match and loc_match:
-                functions.append(
-                    (name_match.group(1), int(loc_match.group(1)),
-                     int(loc_match.group(2))))
+        if "FunctionDecl" not in line or " definition " not in line:
+            continue
+        loc_match = re.search(r"<line:(\d+):\d+, line:(\d+):\d+>", line)
+        if not loc_match:
+            continue
+        # Prefer: word right before 'type' quote, e.g. "... foo 'int ()'"
+        name_match = re.search(r"\b(\w+)\s+'[^']*'", line)
+        if not name_match:
+            # Fallback: word after "line:N:C" source location
+            name_match = re.search(r"line:\d+:\d+\s+(\w+)", line)
+        if name_match:
+            functions.append(
+                (name_match.group(1), int(loc_match.group(1)),
+                 int(loc_match.group(2))))
     return functions
 
 
 def _get_function_definitions_regex(file: str) -> List[Tuple[str, int, int]]:
-    """Regex-based fallback for function detection."""
+    """Regex-based fallback for function detection.
+
+    Matches C function definitions by looking for the pattern:
+      [qualifiers] return_type func_name(params) {
+    Key: capture the identifier immediately before '(' that is NOT
+    a C keyword. The '(' is the reliable anchor — everything after
+    the last '(' on a definition line is the parameter list.
+    """
     text = Path(file).read_text()
     functions = []
+    # [AIMV] Strategy: find lines ending with '{' where an identifier
+    # precedes a parenthesized parameter list. Exclude C keywords.
+    keywords = frozenset({
+        "if", "else", "for", "while", "do", "switch", "return",
+        "struct", "union", "enum", "typedef", "sizeof", "case",
+    })
     pattern = re.compile(
-        r'^(?:static\s+|inline\s+|extern\s+)*[\w\s*]+'
-        r'(\w+)\s*\([^)]*\)\s*\{', re.MULTILINE)
+        r'^[ \t]*(?:(?:static|inline|extern|const|unsigned|signed|void'
+        r'|int|long|short|char|float|double|struct\s+\w+'
+        r'|enum\s+\w+|union\s+\w+)\s+)*'
+        r'(\*?\s*\w+)\s*\(([^)]*)\)\s*\{',
+        re.MULTILINE,
+    )
     for m in pattern.finditer(text):
-        name = m.group(1)
+        name = m.group(1).strip().lstrip("*").strip()
+        if not name or name in keywords:
+            continue
         line_start = text[:m.start()].count('\n') + 1
-        functions.append((name, line_start, line_start + 50))
+        # [AIMV] Find matching closing brace for end_line
+        depth = 1
+        pos = m.end()
+        end_line = line_start
+        while pos < len(text) and depth > 0:
+            if text[pos] == '{':
+                depth += 1
+            elif text[pos] == '}':
+                depth -= 1
+            elif text[pos] == '\n':
+                end_line += 1
+            pos += 1
+        functions.append((name, line_start, end_line))
     return functions
 
 
@@ -103,26 +147,29 @@ def filter_loopy_functions(
     """Pre-filter: only keep functions that contain loops."""
     import tempfile, os
     loopy = []
-    files_processed = set()
+    files_processed = {}  # file -> set of function names found in opt output
     for file, func_name, start, end in functions:
-        if file in files_processed:
-            continue
-        files_processed.add(file)
-        with tempfile.NamedTemporaryFile(suffix=".ll", delete=False) as tmp:
-            ir_path = tmp.name
-        try:
-            subprocess.run(
-                [cc, "-S", "-emit-llvm", "-O0", file, "-o", ir_path],
-                capture_output=True, text=True, timeout=30,
-            )
-            proc = subprocess.run(
-                ["opt", "-passes=print<loops>", "-disable-output", ir_path],
-                capture_output=True, text=True, timeout=30,
-            )
-            loopy_funcs = {f[0] for f in loopy}
-            for fn, fname, fs, fe in functions:
-                if fn not in loopy_funcs and fname in proc.stderr:
-                    loopy.append((fn, fname, fs, fe))
-        finally:
-            os.unlink(ir_path)
+        if file not in files_processed:
+            with tempfile.NamedTemporaryFile(suffix=".ll", delete=False) as tmp:
+                ir_path = tmp.name
+            try:
+                subprocess.run(
+                    [cc, "-S", "-emit-llvm", "-O0", file, "-o", ir_path],
+                    capture_output=True, text=True, timeout=30,
+                )
+                proc = subprocess.run(
+                    ["opt", "-passes=print<loops>", "-disable-output", ir_path],
+                    capture_output=True, text=True, timeout=30,
+                )
+                # [AIMV] Extract function names from loop printer output.
+                # Format: "Loop at depth N containing: ...\n  in function: func_name"
+                found = set()
+                for fm in re.finditer(r"in function:\s*(\w+)", proc.stderr):
+                    found.add(fm.group(1))
+                files_processed[file] = found
+            finally:
+                os.unlink(ir_path)
+        # [AIMV] Check only functions from the SAME file
+        if func_name in files_processed.get(file, set()):
+            loopy.append((file, func_name, start, end))
     return loopy

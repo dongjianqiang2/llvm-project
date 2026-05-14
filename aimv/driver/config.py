@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver configuration loader
+# [AIMV] AIMV Driver configuration loader
 import yaml
 import os
 from pathlib import Path

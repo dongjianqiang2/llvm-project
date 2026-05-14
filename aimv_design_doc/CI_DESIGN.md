@@ -67,7 +67,7 @@
 ### 2.1 识别变更函数
 
 ```python
-# [BiSheng] ci/change_detector.py
+# [AIMV] ci/change_detector.py
 
 """
 变更检测策略：
@@ -414,7 +414,7 @@ aimv:vectorization-analysis:
 ## 4. 批量分析工具（aimv-run-batch）
 
 ```python
-# [BiSheng] ci/aimv_run_batch.py
+# [AIMV] ci/aimv_run_batch.py
 
 """
 aimv-run-batch — 批量 AIMV 分析
@@ -701,7 +701,7 @@ gate:
 ### 6.2 门禁决策逻辑
 
 ```python
-# [BiSheng] ci/gate.py
+# [AIMV] ci/gate.py
 
 def evaluate_gate(summary: dict, config: dict, baseline: Optional[dict] = None) -> dict:
     """根据门禁配置评估是否放行。
@@ -815,7 +815,7 @@ jobs:
 ## 8. 通知集成
 
 ```python
-# [BiSheng] ci/notifications.py
+# [AIMV] ci/notifications.py
 
 """
 通知渠道:

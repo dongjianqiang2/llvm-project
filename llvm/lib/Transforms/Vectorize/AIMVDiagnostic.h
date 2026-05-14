@@ -1,4 +1,4 @@
-// [BiSheng] AIMVDiagnostic.h — shared internal header for emitAIMVDiagnostic()
+// [AIMV] AIMVDiagnostic.h — shared internal header for emitAIMVDiagnostic()
 //
 // Declared here (non-static), for inclusion by LoopVectorize.cpp and
 // LoopAccessAnalysis.cpp. Implementation lives in LoopVectorize.cpp.
@@ -23,7 +23,7 @@ class LoopVectorizationCostModel;
 
 namespace llvm {
 
-/// [BiSheng] Emit structured diagnostics into !aimv.diag Named Metadata.
+/// [AIMV] Emit structured diagnostics into !aimv.diag Named Metadata.
 ///
 /// Called from LoopVectorize (rejection/success points) and LoopAccessAnalysis
 /// (UnsafeDep). Writes parallel to ORE remarks for downstream AIMVFeedbackPass.

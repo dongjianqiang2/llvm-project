@@ -2560,7 +2560,7 @@ struct CSEDenseMapInfo {
 } // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
-// [BiSheng] AIMV: emit structured vectorization diagnostics into !aimv.diag
+// [AIMV] AIMV: emit structured vectorization diagnostics into !aimv.diag
 // See aimv_design_doc/LLVM_DESIGN.md §2.2 for full design.
 //===----------------------------------------------------------------------===//
 
@@ -10309,7 +10309,7 @@ bool LoopVectorizePass::processLoop(Loop *L) {
       });
       LLVM_DEBUG(dbgs() << "LV: Too many memory checks needed.\n");
       Hints.emitRemarkWithHints();
-      // [BiSheng] AIMV: emit structured diagnostic for CantReorderMemOps
+      // [AIMV] AIMV: emit structured diagnostic for CantReorderMemOps
       {
         auto RtCostIC = Checks.getCost();
         int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
@@ -10392,7 +10392,7 @@ bool LoopVectorizePass::processLoop(Loop *L) {
                                       L->getStartLoc(), L->getHeader())
              << VecDiagMsg.second;
     });
-    // [BiSheng] AIMV T1.4: VectorizationNotBeneficial
+    // [AIMV] AIMV T1.4: VectorizationNotBeneficial
     {
       auto RtCostIC = Checks.getCost();
       int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
@@ -10409,7 +10409,7 @@ bool LoopVectorizePass::processLoop(Loop *L) {
                                       L->getStartLoc(), L->getHeader())
              << IntDiagMsg.second;
     });
-    // [BiSheng] AIMV T1.6: InterleavingNotBeneficial
+    // [AIMV] AIMV T1.6: InterleavingNotBeneficial
     {
       auto RtCostIC = Checks.getCost();
       int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
@@ -10528,7 +10528,7 @@ bool LoopVectorizePass::processLoop(Loop *L) {
         LVP.executePlan(VF.Width, IC, BestPlan, LB, DT, false);
         ++LoopsVectorized;
 
-        // [BiSheng] AIMV T1.7: record successful vectorization
+        // [AIMV] AIMV T1.7: record successful vectorization
         {
           auto RtCostIC = Checks.getCost();
           int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;

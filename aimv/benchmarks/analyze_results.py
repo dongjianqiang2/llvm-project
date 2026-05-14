@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [BiSheng] AIMV — Benchmark results analyzer (T4.6)
+# [AIMV] AIMV — Benchmark results analyzer (T4.6)
 """Analyze benchmark timing results and compute speedup vs baseline."""
 import json
 import sys

@@ -22,7 +22,7 @@ jobs:
       - name: Setup AIMV
         run: |
           pip install -e aimv/driver
-          pip install -e aimv/mcp-server
+          pip install -e aimv/mcp_server
 
       - name: Build LLVM+Clang (with AIMV Pass)
         run: |
@@ -68,7 +68,7 @@ jobs:
       - name: Generate report
         if: always()
         run: |
-          aimv-report generate \
+          aimv-report \
             --input ./aimv-results \
             --format markdown \
             --output aimv-report.md

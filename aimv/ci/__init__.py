@@ -1,1 +1,1 @@
-# [BiSheng] AIMV CI tools package
+# [AIMV] AIMV CI tools package

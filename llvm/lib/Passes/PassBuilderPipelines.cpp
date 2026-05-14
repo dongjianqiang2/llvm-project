@@ -1391,7 +1391,7 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
       FPM.addPass(EarlyCSEPass());
     }
   }
-  // [BiSheng] AIMV: collect vectorization diagnostics after LoopVectorize+SLPVectorize
+  // [AIMV] AIMV: collect vectorization diagnostics after LoopVectorize+SLPVectorize
   // The pass internally checks for remark streamer or -aimv-output flag before running.
   FPM.addPass(AIMVFeedbackPass());
 

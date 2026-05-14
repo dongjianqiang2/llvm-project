@@ -2828,7 +2828,7 @@ void LoopAccessInfo::emitUnsafeDependenceRemark() {
         << ore::NV("Location", SourceLoc);
   }
 
-  // [BiSheng] AIMV T1.5: emit structured diagnostic for UnsafeDep
+  // [AIMV] AIMV T1.5: emit structured diagnostic for UnsafeDep
   // This function runs during legality analysis; no CM/VF/IC available.
   {
     Function *Fn = TheLoop->getHeader()->getParent();

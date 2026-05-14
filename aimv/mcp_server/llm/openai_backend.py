@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — OpenAI backend implementation
+# [AIMV] MCP Server — OpenAI backend implementation
 from openai import OpenAI
 from .base import AbstractLLMBackend
 from ..models import AnalyzeRequest, AnalyzeResponse

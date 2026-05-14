@@ -1,1 +1,1 @@
-# [BiSheng] AIMV test package
+# [AIMV] AIMV test package

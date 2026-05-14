@@ -115,7 +115,7 @@ Python dependencies (driver + mcp-server):
 
 ## Coding Conventions
 
-- **Comment prefix**: `// [BiSheng]` on all AIMV-added C++ code, `# [BiSheng]` for Python
+- **Comment prefix**: `// [AIMV` on all AIMV-added C++ code, `# [AIMV` for Python
 - **C++ style**: LLVM conventions (`.clang-format` at repo root)
 - **Naming**: `AIMV*` prefix for C++ classes, `aimv_*` for Python modules, `aimv-*` for CLI tools
 - **Tests**: `llvm-lit` for C++ pass tests, `pytest` for Python, C files in `benchmarks/`

@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver — Atomic source patching + rollback
+# [AIMV] AIMV Driver — Atomic source patching + rollback
 import hashlib
 import shutil
 import subprocess
@@ -80,6 +80,11 @@ class SourceManager:
         if self._patch_history:
             return self._patch_history[-1].diff_text
         return None
+
+    def has_diff(self, diff_text: str) -> bool:
+        """Check if an identical diff has already been applied."""
+        stripped = diff_text.strip()
+        return any(p.diff_text.strip() == stripped for p in self._patch_history)
 
 
 class FileLock:

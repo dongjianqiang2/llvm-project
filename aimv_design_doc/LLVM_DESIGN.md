@@ -159,7 +159,7 @@ LoopVectorize::processLoop()
 ### 2.2 新增辅助函数
 
 ```cpp
-// [BiSheng] 位置: llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h（新建共享内部头文件）
+// [AIMV] 位置: llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h（新建共享内部头文件）
 //
 // 声明在该头文件中（非 static），供 LoopVectorize.cpp 和 LoopAccessAnalysis.cpp 共同引用。
 // 实现在 LoopVectorize.cpp 中（单一定义）。
@@ -169,7 +169,7 @@ LoopVectorize::processLoop()
 //   - 不引用 LLVMAIMV 组件中的任何符号
 //   - AIMVFeedbackPass 通过 #include 此头文件调用 parseDiagnostics()，不调用 emitAIMVDiagnostic()
 
-/// [BiSheng] 当 LoopVectorize 拒绝向量化或成功向量化时，将结构化诊断写入 !aimv.diag
+/// [AIMV] 当 LoopVectorize 拒绝向量化或成功向量化时，将结构化诊断写入 !aimv.diag
 ///
 /// 与 ORE remark 平行输出，供下游 AIMVFeedbackPass 消费。
 /// 仅在 LLVMRemarkStreamer 激活或 aimv 诊断被使能时执行
@@ -592,7 +592,7 @@ llvm/include/llvm/Transforms/AIMV/
 ### 3.2 头文件
 
 ```cpp
-// [BiSheng] llvm/include/llvm/Transforms/AIMV/AIMVFeedback.h
+// [AIMV] llvm/include/llvm/Transforms/AIMV/AIMVFeedback.h
 
 #ifndef LLVM_TRANSFORMS_AIMV_AIMVFEEDBACK_H
 #define LLVM_TRANSFORMS_AIMV_AIMVFEEDBACK_H
@@ -602,7 +602,7 @@ llvm/include/llvm/Transforms/AIMV/
 
 namespace llvm {
 
-/// [BiSheng] AIMVFeedbackPass — 收集向量化诊断信息并导出 JSON
+/// [AIMV] AIMVFeedbackPass — 收集向量化诊断信息并导出 JSON
 ///
 /// 类型: Function Pass（对每个函数独立处理该函数关联的 !aimv.diag 诊断）
 /// 运行时机: LoopVectorize + SLPVectorize 之后
@@ -620,21 +620,21 @@ namespace llvm {
 ///   opt -passes="loop-vectorize,aimv-feedback" -aimv-output=/tmp/diag.json < input.ll
 class AIMVFeedbackPass : public PassInfoMixin<AIMVFeedbackPass> {
 public:
-  /// [BiSheng] 设置 JSON 输出文件路径
+  /// [AIMV] 设置 JSON 输出文件路径
   void setOutputPath(const std::string &Path) { OutputPath = Path; }
 
-  /// [BiSheng] 设置只导出指定函数的诊断（空=全部）
+  /// [AIMV] 设置只导出指定函数的诊断（空=全部）
   void setTargetFunction(const std::string &FuncName) {
     TargetFunction = FuncName;
   }
 
-  /// [BiSheng] 显式启用（即使无 remark streamer 也运行）
+  /// [AIMV] 显式启用（即使无 remark streamer 也运行）
   void setEnabled(bool V = true) { EnabledFlag = V; }
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   static StringRef name() { return "aimv-feedback"; }
 
-  /// [BiSheng] 从 !aimv.diag 解析出原始诊断向量
+  /// [AIMV] 从 !aimv.diag 解析出原始诊断向量
   /// @return 空 vector 表示无诊断数据
   /// @{
   struct RawDiagnostic {
@@ -818,7 +818,7 @@ AIMVFeedbackPass 仅产出 IR 侧可获取的诊断数据。关键点：
 **文件**: `llvm/lib/Passes/PassRegistry.def`
 
 ```cpp
-// [BiSheng] AIMV vectorization feedback analysis
+// [AIMV] AIMV vectorization feedback analysis
 FUNCTION_PASS("aimv-feedback", AIMVFeedbackPass())
 ```
 
@@ -844,7 +844,7 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
     FPM.addPass(SLPVectorizerPass());
   }
 
-  // [BiSheng] AIMV: 在 LoopVectorize + SLPVectorize 之后收集诊断
+  // [AIMV] AIMV: 在 LoopVectorize + SLPVectorize 之后收集诊断
   // 作为 Function Pass 插入 FPM，pass 内部通过 F.getParent() 访问 Module
   // 仅在有 remark streamer 或 -aimv-output 指定时实际执行
   FPM.addPass(AIMVFeedbackPass());
@@ -858,7 +858,7 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
 AIMVFeedbackPass 不是无条件运行。通过检查 remark streamer 是否存在来决定是否激活：
 
 ```cpp
-// [BiSheng] AIMVFeedback Pass 内部
+// [AIMV] AIMVFeedback Pass 内部
 PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();
   if (!M)
@@ -947,7 +947,7 @@ add_llvm_component_library(LLVMAIMV
 **文件**: `llvm/lib/Transforms/CMakeLists.txt`
 
 ```cmake
-# [BiSheng] AIMV feedback pass
+# [AIMV] AIMV feedback pass
 add_subdirectory(AIMV)
 ```
 

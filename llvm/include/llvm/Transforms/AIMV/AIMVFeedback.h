@@ -1,4 +1,4 @@
-// [BiSheng] AIMVFeedbackPass — Function Pass for collecting vectorization diagnostics
+// [AIMV] AIMVFeedbackPass — Function Pass for collecting vectorization diagnostics
 // See aimv_design_doc/LLVM_DESIGN.md §3 for full design.
 #ifndef LLVM_TRANSFORMS_AIMV_AIMVFEEDBACK_H
 #define LLVM_TRANSFORMS_AIMV_AIMVFEEDBACK_H
@@ -9,7 +9,7 @@
 
 namespace llvm {
 
-/// [BiSheng] AIMVFeedbackPass — collect vectorization diagnostics and export JSON
+/// [AIMV] AIMVFeedbackPass — collect vectorization diagnostics and export JSON
 ///
 /// Type: Function Pass (processes !aimv.diag diagnostics for each function)
 /// Timing: runs after LoopVectorize + SLPVectorize
@@ -17,21 +17,21 @@ namespace llvm {
 /// Output: appends JSON to --aimv-output=<path>
 class AIMVFeedbackPass : public PassInfoMixin<AIMVFeedbackPass> {
 public:
-  /// [BiSheng] Set JSON output file path
+  /// [AIMV] Set JSON output file path
   void setOutputPath(const std::string &Path) { OutputPath = Path; }
 
-  /// [BiSheng] Set target function filter (empty = all functions)
+  /// [AIMV] Set target function filter (empty = all functions)
   void setTargetFunction(const std::string &FuncName) {
     TargetFunction = FuncName;
   }
 
-  /// [BiSheng] Explicit enable (run even without remark streamer)
+  /// [AIMV] Explicit enable (run even without remark streamer)
   void setEnabled(bool V = true) { EnabledFlag = V; }
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   static StringRef name() { return "aimv-feedback"; }
 
-  /// [BiSheng] Parsed diagnostic record from !aimv.diag Named Metadata
+  /// [AIMV] Parsed diagnostic record from !aimv.diag Named Metadata
   struct RawDiagnostic {
     std::string PassName;        // "LoopVectorize" | "SLPVectorize"
     std::string RemarkID;        // "CantReorderMemOps" | ...
@@ -61,7 +61,7 @@ public:
     int NumBranches = 0, NumCalls = 0;
   };
 
-  /// [BiSheng] Parse !aimv.diag Named Metadata into RawDiagnostic vector
+  /// [AIMV] Parse !aimv.diag Named Metadata into RawDiagnostic vector
   /// @return empty vector if no diagnostics found
   static std::vector<RawDiagnostic> parseDiagnostics(Module &M);
 

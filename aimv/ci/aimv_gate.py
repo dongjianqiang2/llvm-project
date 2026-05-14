@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [BiSheng] AIMV CI — aimv-gate (T6.4)
+# [AIMV] AIMV CI — aimv-gate (T6.4)
 """Gate decision logic: report, regression, or enforce modes."""
 import argparse
 import json

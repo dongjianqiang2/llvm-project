@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [BiSheng] AIMV CI — aimv-detect-changes CLI (T6.1)
+# [AIMV] AIMV CI — aimv-detect-changes CLI (T6.1)
 """Detect changed functions via git diff + AST analysis."""
 import argparse
 import json

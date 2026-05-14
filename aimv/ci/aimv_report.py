@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [BiSheng] AIMV CI — aimv-report (T6.3)
+# [AIMV] AIMV CI — aimv-report (T6.3)
 """Generate AIMV analysis report from session JSON files."""
 import argparse
 import json

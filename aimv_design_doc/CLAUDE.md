@@ -43,7 +43,7 @@ SPEC.md → defines requirements
 ## Conventions
 
 - All documents use version 1.0, dated 2026-04-29
-- Code examples in docs are prefixed with `// [BiSheng]` comments
+- Code examples in docs are prefixed with `// [AIMV]` comments
 - Data models use Python dataclasses/Pydantic (driver/server) and C++ (LLVM)
 - The project is **independent from EmbeddedJIT** — no shared components
 - Target platforms are ARM embedded (e.g., armv7, cortex-a9 with NEON)

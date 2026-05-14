@@ -173,7 +173,7 @@ aimv/                                    # 项目根目录
 ### 3.1 诊断信息模型
 
 ```python
-# [BiSheng] mcp-server/models.py
+# [AIMV] mcp-server/models.py
 #
 # 注意: 此模型为 API 层的权威数据源（API Contract）。
 # MCP_DESIGN.md 中的模型定义是最终参考，其他文档应与之保持一致。
@@ -288,7 +288,7 @@ class AnalyzeResponse(BaseModel):
 ### 3.2 迭代状态模型
 
 ```python
-# [BiSheng] driver/iteration_tracker.py
+# [AIMV] driver/iteration_tracker.py
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -349,7 +349,7 @@ class SessionRecord:
 ### 3.3 源码 Patch 模型
 
 ```python
-# [BiSheng] driver/source_manager.py
+# [AIMV] driver/source_manager.py
 
 @dataclass
 class PatchRecord:
@@ -408,11 +408,11 @@ Base URL: http://<mcp-host>:<port>/api/v1
 ### 4.2 LLVM Pass 接口
 
 ```cpp
-// [BiSheng] llvm/include/llvm/Transforms/AIMV/AIMVFeedback.h
+// [AIMV] llvm/include/llvm/Transforms/AIMV/AIMVFeedback.h
 
 namespace llvm {
 
-/// [BiSheng] AIMVFeedbackPass — 收集向量化诊断信息并导出 JSON
+/// [AIMV] AIMVFeedbackPass — 收集向量化诊断信息并导出 JSON
 ///
 /// 类型: Function Pass。在 LoopVectorize / SLPVectorize 之后运行，
 /// 从 Module 的 !aimv.diag Named Metadata 中读取诊断（通过 F.getParent()），
@@ -421,10 +421,10 @@ namespace llvm {
 /// 输出：追加写入 -aimv-output=<path> 指定的 JSON 文件
 class AIMVFeedbackPass : public PassInfoMixin<AIMVFeedbackPass> {
 public:
-    /// [BiSheng] 配置 JSON 输出路径
+    /// [AIMV] 配置 JSON 输出路径
     void setOutputPath(const std::string& path);
 
-    /// [BiSheng] 配置只收集指定函数的诊断
+    /// [AIMV] 配置只收集指定函数的诊断
     void setTargetFunction(const std::string& funcName);
 
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);

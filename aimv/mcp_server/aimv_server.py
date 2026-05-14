@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — FastAPI entry point
+# [AIMV] MCP Server — FastAPI entry point
 """aimv-server — MCP REST API for AI-driven vectorization analysis."""
 
 import os

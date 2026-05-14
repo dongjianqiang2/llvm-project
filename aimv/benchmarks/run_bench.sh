@@ -1,5 +1,5 @@
 #!/bin/bash
-# [BiSheng] AIMV benchmark runner (T4.6)
+# [AIMV] AIMV benchmark runner (T4.6)
 # Usage: ./run_bench.sh [benchmark_name]
 # Runs all benchmarks if no name given. Outputs timing data to results.json.
 set -e

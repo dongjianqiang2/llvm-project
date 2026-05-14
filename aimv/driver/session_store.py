@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver — Session persistence and crash recovery
+# [AIMV] AIMV Driver — Session persistence and crash recovery
 import json
 import os
 from pathlib import Path

@@ -204,7 +204,7 @@ Authorization: Bearer <AIMV_API_KEY>
 FastAPI 中间件在请求进入时校验，不合法请求返回 401。
 
 ```python
-# [BiSheng] mcp-server/middleware.py
+# [AIMV] mcp-server/middleware.py
 
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -249,7 +249,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 ## 3. Pydantic 模型
 
 ```python
-# [BiSheng] mcp-server/models.py
+# [AIMV] mcp-server/models.py
 
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
@@ -525,7 +525,7 @@ No loop structure information available.
 ### 4.3 诊断指纹（用于缓存 key）
 
 ```python
-# [BiSheng] mcp-server/cache.py
+# [AIMV] mcp-server/cache.py
 
 import hashlib
 import json
@@ -585,7 +585,7 @@ def compute_diagnostic_fingerprint(request: AnalyzeRequest) -> str:
 ### 5.1 抽象接口
 
 ```python
-# [BiSheng] mcp-server/llm/base.py
+# [AIMV] mcp-server/llm/base.py
 
 from abc import ABC, abstractmethod
 from models import AnalyzeRequest, AnalyzeResponse
@@ -608,7 +608,7 @@ class AbstractLLMBackend(ABC):
 ### 5.2 OpenAI Backend
 
 ```python
-# [BiSheng] mcp-server/llm/openai_backend.py
+# [AIMV] mcp-server/llm/openai_backend.py
 
 from openai import OpenAI
 
@@ -641,7 +641,7 @@ class OpenAIBackend(AbstractLLMBackend):
 ### 5.3 Anthropic Backend
 
 ```python
-# [BiSheng] mcp-server/llm/anthropic_backend.py
+# [AIMV] mcp-server/llm/anthropic_backend.py
 
 from anthropic import Anthropic
 
@@ -674,7 +674,7 @@ class AnthropicBackend(AbstractLLMBackend):
 ### 5.4 DeepSeek Backend
 
 ```python
-# [BiSheng] mcp-server/llm/deepseek_backend.py
+# [AIMV] mcp-server/llm/deepseek_backend.py
 
 from openai import OpenAI  # DeepSeek API 兼容 OpenAI SDK
 
@@ -698,7 +698,7 @@ class DeepSeekBackend(OpenAIBackend):
 ### 6.1 核心逻辑
 
 ```python
-# [BiSheng] mcp-server/suggestion_parser.py
+# [AIMV] mcp-server/suggestion_parser.py
 
 import json
 import re
@@ -706,7 +706,7 @@ from typing import Optional
 from models import AnalyzeResponse, Suggestion
 
 
-# [BiSheng] JSON 响应 schema（注入 system prompt 用于约束 LLM 输出）
+# [AIMV] JSON 响应 schema（注入 system prompt 用于约束 LLM 输出）
 RESPONSE_SCHEMA_JSON = """
 {
   "suggestions": [
@@ -802,7 +802,7 @@ def _extract_json(text: str) -> str:
 ### 7.1 内存 + Redis 双层缓存
 
 ```python
-# [BiSheng] mcp-server/cache.py
+# [AIMV] mcp-server/cache.py
 
 import time
 import threading
@@ -882,7 +882,7 @@ class DiagnosticCache:
 ### 8.1 中间件
 
 ```python
-# [BiSheng] mcp-server/middleware.py
+# [AIMV] mcp-server/middleware.py
 
 import time
 import logging

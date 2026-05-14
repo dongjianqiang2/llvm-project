@@ -1,4 +1,4 @@
-# [BiSheng] AIMV Driver — Iteration strategy decision engine
+# [AIMV] AIMV Driver — Iteration strategy decision engine
 from enum import Enum
 from typing import Optional
 
@@ -36,7 +36,9 @@ class IterationEngine:
                 return NextAction.STOP, "consecutive compile failures"
             return NextAction.ROLLBACK, "compile failure, will retry"
         self._consecutive_compile_failures = 0
-        # Test failure: always terminal (patch broke semantics)
+        # [AIMV] Test failure: always terminal (patch broke semantics).
+        # Note: the current driver handles test failure directly (rollback + break)
+        # without calling decide(). This path is kept for API completeness.
         if not test_result_ok:
             return NextAction.ROLLBACK, "test failure, stopping"
         if not mcp_responded:

@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — API key auth middleware
+# [AIMV] MCP Server — API key auth middleware
 import os
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware

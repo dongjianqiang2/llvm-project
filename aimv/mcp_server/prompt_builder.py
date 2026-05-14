@@ -1,4 +1,4 @@
-# [BiSheng] MCP Server — Prompt builder: AnalyzeRequest → LLM prompt
+# [AIMV] MCP Server — Prompt builder: AnalyzeRequest → LLM prompt
 from .models import AnalyzeRequest
 
 SYSTEM_PROMPT_TEMPLATE = """\

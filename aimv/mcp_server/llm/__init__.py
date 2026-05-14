@@ -1,1 +1,1 @@
-# [BiSheng] AIMV MCP Server — LLM Backend package
+# [AIMV] AIMV MCP Server — LLM Backend package

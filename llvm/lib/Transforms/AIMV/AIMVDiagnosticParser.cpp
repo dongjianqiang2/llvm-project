@@ -1,4 +1,4 @@
-// [BiSheng] AIMVDiagnosticParser — parse !aimv.diag Named Metadata into
+// [AIMV] AIMVDiagnosticParser — parse !aimv.diag Named Metadata into
 // RawDiagnostic records. See aimv_design_doc/LLVM_DESIGN.md §1.2-§3.2.
 #include "llvm/Transforms/AIMV/AIMVFeedback.h"
 #include "llvm/IR/Constants.h"
