@@ -2566,8 +2566,8 @@ struct CSEDenseMapInfo {
 
 void llvm::emitAIMVDiagnostic(
     Module &M, Function &F, Loop &L,
-    LoopAccessInfo *LAI,
-    const LoopVectorizationCostModel *CM,
+    const LoopAccessInfo *LAI,
+    LoopVectorizationCostModel *CM,
     ElementCount VF, unsigned IC,
     StringRef RemarkID, StringRef RemarkMsg,
     ScalarEvolution *SE,
@@ -2681,9 +2681,9 @@ void llvm::emitAIMVDiagnostic(
     for (BasicBlock *BB : L.blocks()) {
       for (Instruction &I : *BB) {
         if (auto *LI = dyn_cast<LoadInst>(&I))
-          MaxAlign = std::max(MaxAlign, LI->getAlign().value());
+          MaxAlign = std::max(MaxAlign, (unsigned)LI->getAlign().value());
         else if (auto *SI = dyn_cast<StoreInst>(&I))
-          MaxAlign = std::max(MaxAlign, SI->getAlign().value());
+          MaxAlign = std::max(MaxAlign, (unsigned)SI->getAlign().value());
       }
     }
     MemOps.push_back(ConstantAsMetadata::get(
@@ -10313,14 +10313,14 @@ bool LoopVectorizePass::processLoop(Loop *L) {
       {
         auto RtCostIC = Checks.getCost();
         int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
-        int RtChkCount = (int)LVL.getLAI().getNumRuntimePointerChecks();
+        int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
         emitAIMVDiagnostic(
             *L->getHeader()->getParent()->getParent(),
             *L->getHeader()->getParent(), *L,
-            &LVL.getLAI(), &CM, VF.Width, IC,
+            LVL.getLAI(), &CM, VF.Width, IC,
             "CantReorderMemOps",
             "unsafe dependent memory operations in loop",
-            &PSE.getSE(), RtCost, RtChkCount);
+            PSE.getSE(), RtCost, RtChkCount);
       }
       return false;
     }
@@ -10396,13 +10396,13 @@ bool LoopVectorizePass::processLoop(Loop *L) {
     {
       auto RtCostIC = Checks.getCost();
       int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
-      int RtChkCount = (int)LVL.getLAI().getNumRuntimePointerChecks();
+      int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
       emitAIMVDiagnostic(
           *L->getHeader()->getParent()->getParent(),
           *L->getHeader()->getParent(), *L,
-          &LVL.getLAI(), &CM, VF.Width, IC,
+          LVL.getLAI(), &CM, VF.Width, IC,
           VecDiagMsg.first, VecDiagMsg.second,
-          &PSE.getSE(), RtCost, RtChkCount);
+          PSE.getSE(), RtCost, RtChkCount);
     }
     ORE->emit([&]() {
       return OptimizationRemarkMissed(LV_NAME, IntDiagMsg.first,
@@ -10413,13 +10413,13 @@ bool LoopVectorizePass::processLoop(Loop *L) {
     {
       auto RtCostIC = Checks.getCost();
       int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
-      int RtChkCount = (int)LVL.getLAI().getNumRuntimePointerChecks();
+      int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
       emitAIMVDiagnostic(
           *L->getHeader()->getParent()->getParent(),
           *L->getHeader()->getParent(), *L,
-          &LVL.getLAI(), &CM, VF.Width, IC,
+          LVL.getLAI(), &CM, VF.Width, IC,
           IntDiagMsg.first, IntDiagMsg.second,
-          &PSE.getSE(), RtCost, RtChkCount);
+          PSE.getSE(), RtCost, RtChkCount);
     }
     return false;
   }
@@ -10532,15 +10532,15 @@ bool LoopVectorizePass::processLoop(Loop *L) {
         {
           auto RtCostIC = Checks.getCost();
           int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
-          int RtChkCount = (int)LVL.getLAI().getNumRuntimePointerChecks();
+          int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
           std::string VFMsg =
               "loop vectorized: VF=" + std::to_string(VF.Width.getKnownMinValue());
           emitAIMVDiagnostic(
               *L->getHeader()->getParent()->getParent(),
               *L->getHeader()->getParent(), *L,
-              &LVL.getLAI(), &CM, VF.Width, IC,
+              LVL.getLAI(), &CM, VF.Width, IC,
               "LoopVectorized", VFMsg,
-              &PSE.getSE(), RtCost, RtChkCount);
+              PSE.getSE(), RtCost, RtChkCount);
         }
 
         // Add metadata to disable runtime unrolling a scalar loop when there

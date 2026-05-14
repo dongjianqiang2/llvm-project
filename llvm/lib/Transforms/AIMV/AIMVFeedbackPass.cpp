@@ -1,24 +1,12 @@
 // [BiSheng] AIMVFeedbackPass — Function Pass implementation
-// See aimv_design_doc/LLVM_DESIGN.md §3 for full design.
 #include "llvm/Transforms/AIMV/AIMVFeedback.h"
-#include "llvm/Support/CommandLine.h"
-
-// [BiSheng] Command-line flags for AIMV
-// For use with opt: opt -passes=aimv-feedback -aimv-output=diag.json
-static cl::opt<std::string> AIMVOutputPath(
-    "aimv-output", cl::desc("AIMV JSON diagnostic output path"), cl::Hidden);
-static cl::opt<bool> AIMVEnable(
-    "aimv-enable", cl::desc("Enable AIMV diagnostic collection"), cl::Hidden);
-static cl::opt<std::string> AIMVTargetFunction(
-    "aimv-target-function", cl::desc("Only analyze the specified function"),
-    cl::Hidden);
-#include "llvm/Analysis/LoopInfo.h"
-#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
-#include "llvm/IR/DebugInfoMetadata.h"
-#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include <fstream>
@@ -28,9 +16,17 @@ using namespace llvm;
 
 static std::mutex JSONWriteMutex;
 
+// [BiSheng] Command-line flags (opt: -aimv-output=diag.json -aimv-enable)
+static cl::opt<std::string> AIMVOutputPath(
+    "aimv-output", cl::desc("AIMV JSON diagnostic output path"), cl::Hidden);
+static cl::opt<bool> AIMVEnable(
+    "aimv-enable", cl::desc("Enable AIMV diagnostic collection"), cl::Hidden);
+static cl::opt<std::string> AIMVTargetFunction(
+    "aimv-target-function", cl::desc("Only analyze the specified function"),
+    cl::Hidden);
+
 namespace {
 
-/// Infer severity from RemarkID
 static std::string inferSeverity(const std::string &RemarkID) {
   if (RemarkID == "CantReorderMemOps" ||
       RemarkID == "VectorizationNotBeneficial" ||
@@ -43,9 +39,8 @@ static std::string inferSeverity(const std::string &RemarkID) {
   return "analysis";
 }
 
-/// Build a JSON object from a RawDiagnostic
 static json::Object buildDiagnosticJSON(
-    const AIMVFeedbackPass::RawDiagnostic &R, Function &F) {
+    const AIMVFeedbackPass::RawDiagnostic &R) {
   json::Object Diag;
   Diag["pass_name"] = R.PassName;
   Diag["remark_id"] = R.RemarkID;
@@ -53,12 +48,9 @@ static json::Object buildDiagnosticJSON(
   Diag["severity"] = inferSeverity(R.RemarkID);
   Diag["function_name"] = R.FunctionName;
   Diag["loop_location"] = R.SourceLocation;
-
-  // source_context: extract from IR debug info if available
   Diag["source_context"] = "";
   Diag["ir_snippet"] = "";
 
-  // cost_model
   json::Object Cost;
   Cost["scalar_cost"] = R.ScalarCost;
   Cost["vector_cost"] = R.VectorCost;
@@ -66,7 +58,6 @@ static json::Object buildDiagnosticJSON(
   Cost["interleave_count"] = R.IC;
   Diag["cost_model"] = std::move(Cost);
 
-  // dependencies
   json::Array Deps;
   for (auto &D : R.Dependencies) {
     json::Object Dep;
@@ -78,7 +69,6 @@ static json::Object buildDiagnosticJSON(
   }
   Diag["dependencies"] = std::move(Deps);
 
-  // memory_info
   json::Object Mem;
   Mem["num_stores"] = R.NumStores;
   Mem["num_loads"] = R.NumLoads;
@@ -89,7 +79,6 @@ static json::Object buildDiagnosticJSON(
   Mem["memory_check_cost"] = R.MemCheckCost;
   Diag["memory_info"] = std::move(Mem);
 
-  // loop_info
   json::Object Loop;
   Loop["num_blocks"] = R.NumBlocks;
   Loop["num_instructions"] = R.NumInsts;
@@ -109,8 +98,6 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F,
   if (!M)
     return PreservedAnalyses::all();
 
-  // Populate pass parameters from cl::opt (for opt-based testing)
-  // In clang-based usage, BackendUtil.cpp calls setOutputPath/setEnabled directly.
   if (OutputPath.empty() && !AIMVOutputPath.empty())
     OutputPath = AIMVOutputPath;
   if (!EnabledFlag && AIMVEnable)
@@ -118,13 +105,10 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F,
   if (TargetFunction.empty() && !AIMVTargetFunction.empty())
     TargetFunction = AIMVTargetFunction;
 
-  // Activation check: remark streamer, OutputPath, or explicit enable
   if (!M->getContext().getLLVMRemarkStreamer() &&
       OutputPath.empty() && !EnabledFlag)
     return PreservedAnalyses::all();
 
-  // Parse !aimv.diag (with caching for multi-function modules)
-  // Static cache: reuse parsed diagnostics across functions in same pipeline run
   static Module *CachedModule = nullptr;
   static std::unique_ptr<std::vector<RawDiagnostic>> CachedDiags;
   if (M != CachedModule) {
@@ -136,7 +120,6 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F,
   if (!CachedDiags || CachedDiags->empty())
     return PreservedAnalyses::all();
 
-  // Filter diagnostics for the current function
   std::vector<RawDiagnostic> FuncDiags;
   for (auto &R : *CachedDiags) {
     if (!TargetFunction.empty() && R.FunctionName != TargetFunction)
@@ -146,50 +129,40 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F,
     FuncDiags.push_back(R);
   }
 
-  if (FuncDiags.empty() && !OutputPath.empty()) {
-    // Explicit output requested but no diagnostics for this function — skip
+  if (FuncDiags.empty())
     return PreservedAnalyses::all();
-  }
 
-  // Get TTI
   auto &TTI = AM.getResult<TargetIRAnalysis>(F);
 
-  // Build target info
   json::Object Target;
-  Target["triple"] = M->getTargetTriple();
-  Target["cpu"] = M->getTargetCPU();
+  Target["triple"] = M->getTargetTriple().str();
+  Target["cpu"] = "";
   Target["features"] = json::Array();
   Target["vector_width"] =
-      (int)TTI.getRegisterBitWidth(TargetTransformInfo::RGK_FixedWidthVector)
-          .value_or(128);
+      (int)TTI.getRegisterBitWidth(
+               TargetTransformInfo::RGK_FixedWidthVector).getFixedValue();
 
-  // Build diagnostics array
   json::Array DiagArray;
   for (auto &R : FuncDiags)
-    DiagArray.push_back(buildDiagnosticJSON(R, F));
+    DiagArray.push_back(buildDiagnosticJSON(R));
 
-  // Build JSON document
   json::Object Doc;
   Doc["request_id"] = "aimv-" + M->getModuleIdentifier() + "-" +
-                       std::to_string(std::hash<std::string>{}(F.getName().str()));
+      std::to_string(std::hash<std::string>{}(F.getName().str()));
   Doc["target"] = std::move(Target);
   Doc["diagnostics"] = std::move(DiagArray);
 
-  // Serialize and write to OutputPath
   std::string JsonStr;
-  raw_string_ostream OS(JsonStr);
-  json::OStream JOS(OS, 2);
-  JOS.value(json::Value(std::move(Doc)));
-  OS.flush();
-
   {
+    raw_string_ostream OS(JsonStr);
+    OS << json::Value(std::move(Doc));
+  } // OS flushes on destruction
+
+  if (!OutputPath.empty()) {
     std::lock_guard<std::mutex> lock(JSONWriteMutex);
     std::ofstream Out(OutputPath, std::ios::app);
-    if (Out.is_open()) {
-      Out << JsonStr;
-      // Multiple functions: separate with newline for JSON Lines
-      Out << "\n";
-    }
+    if (Out.is_open())
+      Out << JsonStr << "\n";
   }
 
   return PreservedAnalyses::all();

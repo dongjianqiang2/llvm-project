@@ -16,7 +16,10 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/Module.h"
-#include "llvm/Transforms/Vectorize/LoopVectorizationCostModel.h"
+
+namespace llvm {
+class LoopVectorizationCostModel;
+}
 
 namespace llvm {
 
@@ -48,8 +51,8 @@ namespace llvm {
 ///                     (-1 = not available)
 void emitAIMVDiagnostic(
     Module &M, Function &F, Loop &L,
-    LoopAccessInfo *LAI,
-    const LoopVectorizationCostModel *CM,
+    const LoopAccessInfo *LAI,
+    LoopVectorizationCostModel *CM,
     ElementCount VF, unsigned IC,
     StringRef RemarkID, StringRef RemarkMsg,
     ScalarEvolution *SE = nullptr,

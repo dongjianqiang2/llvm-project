@@ -12,7 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/LoopAccessAnalysis.h"
-#include "llvm/Transforms/Vectorize/AIMVDiagnostic.h"
+#include "../Transforms/Vectorize/AIMVDiagnostic.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -2840,7 +2840,7 @@ void LoopAccessInfo::emitUnsafeDependenceRemark() {
                        this, /*CM=*/nullptr,
                        ElementCount::getFixed(0), /*IC=*/0,
                        "UnsafeDep", Info,
-                       &PSE.getSE(),
+                       PSE->getSE(),
                        /*RtCheckCost=*/-1, RtChkCount);
   }
 }
