@@ -200,8 +200,8 @@ class CostModelDetail(BaseModel):
     interleave_count: int = Field(..., ge=0)
 
 class DependencyInfo(BaseModel):
-    """内存依赖分析结果 — dep_type 与 LLVM 21 Dependence::DepType 对应"""
-    dep_type: str = Field(..., pattern=r"^(RAW|WAR|IndirectUnsafe|BackwardVectorizable|BackwardVectorizableButPreventsForwarding|ForwardButPreventsForwarding|Unknown)$")
+    """内存依赖分析结果 — dep_type 直接使用 LLVM Dependence::DepName[Dep.Type]"""
+    dep_type: str = Field(..., pattern=r"^(NoDep|Unknown|IndirectUnsafe|Forward|ForwardButPreventsForwarding|Backward|BackwardVectorizable|BackwardVectorizableButPreventsForwarding)$")
     source_ptr: str
     sink_ptr: str
     alias_result: str

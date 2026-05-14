@@ -71,8 +71,12 @@ int cost = IC.isValid() ? (int)IC.getValue() : -1;  // getValue() asserts if Inv
 // MemoryDepChecker::getDependences() returns const SmallVectorImpl<Dependence>*
 // — must null-check before iterating.
 
-// Dependence has 8 DepType values, not just RAW/WAR. Use isBackward(),
-// isForward(), isIndirectUnsafe(), isNoDep() etc. — don't filter too aggressively.
+// Dependence has 8 DepType values. Only 3 bool accessors exist:
+//   isForward(), isBackward(), isPossiblyBackward().
+// The following methods do NOT exist: isBackwardVectorizable(),
+//   isForwardButPreventsForwarding(), isIndirectUnsafe(), isNoDep().
+// To get the exact type, access Dep.Type directly or use Dependence::DepName[Dep.Type].
+// Use Dependence::isSafeForVectorization(Dep.Type) for safety classification.
 
 // RuntimePointerChecking: use getNumberOfChecks() (method), getPointerInfo(idx)
 // (returns const PointerInfo&). PointerInfo is a struct, not a pair.

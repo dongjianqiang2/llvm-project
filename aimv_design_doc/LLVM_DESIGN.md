@@ -96,19 +96,28 @@ LoopVectorize::processLoop()
 ; [0]: i32 dep_count
 ; [1...]: MDNode 每条依赖
 ;   每个依赖子节点:
-;     [0]: MDString dep_type    (LLVM 21 DepType 映射):
-;         "RAW"    ← Backward / BackwardVectorizable
-;         "WAR"    ← Forward / ForwardButPreventsForwarding
-;         "WAW"    ← (无直接对应，由 AA 推断)
-;         "IndirectUnsafe" ← IndirectUnsafe
-;         "BackwardVectorizableButPreventsForwarding"
-;         "Unknown" ← Unknown / NoDep（保留供 AI 分析）
+;     [0]: MDString dep_type    (直接使用 LLVM Dependence::DepName[Dep.Type]):
+;         "NoDep"                              ← 无依赖（通常跳过不记录）
+;         "Unknown"                            ← 无法确定方向/距离
+;         "IndirectUnsafe"                     ← 间接访问（如 A[B[i]]）
+;         "Forward"                            ← 词法前向依赖
+;         "ForwardButPreventsForwarding"       ← 前向但阻止 store-to-load 转发
+;         "Backward"                           ← 词法后向依赖（RAW，阻止向量化）
+;         "BackwardVectorizable"               ← 后向但距离允许向量化
+;         "BackwardVectorizableButPreventsForwarding" ← 同上但阻止转发
+;     注: 使用 Dependence::DepName[Dep.Type] 直接获取，不做二次映射。
+;         LLVM 21 的 Dependence struct 只有 3 个 bool 访问器（isForward/isBackward/
+;         isPossiblyBackward），无法区分全部 8 种类型。必须直接访问 Dep.Type 字段。
 ;     [1]: MDString source_ptr  (源指针描述)
 ;     [2]: MDString sink_ptr    (目标指针描述)
-;     [3]: MDString alias_result (AA 查询结果描述)
+;     [3]: MDString alias_result (安全/不安全分类描述)
 ; 注: 源/目标 Description 通过 Inst->getName() 或 Inst->getOpcodeName() 获取。
-;     不再只过滤 isPossiblyBackward()/isForward()，保留所有非 NoDep 类型。
-!3 = !{i32 2, !{!"RAW", !"ptr %a + i", !"ptr %b + i", !"MayAlias: both pointers derived from function args"}, !{!"IndirectUnsafe", ...}}
+;     过滤掉 NoDep（无实际意义），保留其余 7 种。
+; alias_result 使用 Dependence::isSafeForVectorization() 分类:
+;   Safe → "safe for vectorization"
+;   PossiblySafeWithRtChecks → "possibly safe with runtime checks"
+;   Unsafe → "unsafe: prevents vectorization"
+!3 = !{i32 2, !{!"Backward", !"ptr %a + i", !"ptr %b + i", !"unsafe: prevents vectorization"}, !{!"IndirectUnsafe", ...}}
 ```
 
 #### memory_data (operand [7])
@@ -268,19 +277,16 @@ void emitAIMVDiagnostic(
     SmallVector<Metadata *> DepEntries;
     if (Deps) {
       for (auto &Dep : *Deps) {
-        // 保留所有有意义的依赖类型（排除 NoDep）
-        if (Dep.isNoDep())
+        // 过滤掉 NoDep（无实际意义），保留其余 7 种
+        if (Dep.Type == MemoryDepChecker::Dependence::NoDep)
           continue;
-        // 映射 DepType 到 MDString; LLVM 21 有 8 种 DepType
-        const char *DepTypeStr = "Unknown";
-        if (Dep.isBackward() || Dep.isPossiblyBackward())
-          DepTypeStr = Dep.isBackwardVectorizable() ?
-              "BackwardVectorizable" : "RAW";
-        else if (Dep.isForward())
-          DepTypeStr = Dep.isForwardButPreventsForwarding() ?
-              "ForwardButPreventsForwarding" : "WAR";
-        else if (Dep.isIndirectUnsafe())
-          DepTypeStr = "IndirectUnsafe";
+        // 直接使用 DepName[Dep.Type] 获取 LLVM 原生类型名。
+        // 注: LLVM 21 的 Dependence struct 只有 3 个 bool 访问器
+        //     (isForward/isBackward/isPossiblyBackward)，
+        //     无法区分全部 8 种 DepType。不存在 isBackwardVectorizable()、
+        //     isForwardButPreventsForwarding()、isIndirectUnsafe()、isNoDep() 方法。
+        //     直接访问 Dep.Type 字段是唯一正确的方式。
+        const char *DepTypeStr = MemoryDepChecker::Dependence::DepName[Dep.Type];
         SmallVector<Metadata *> DepEntry;
         DepEntry.push_back(MDString::get(Ctx, DepTypeStr));
         // getSource/getDestination 接受 const MemoryDepChecker&，返回 Instruction*
@@ -294,9 +300,19 @@ void emitAIMVDiagnostic(
             getInstDesc(Dep.getSource(DepChecker))));
         DepEntry.push_back(MDString::get(Ctx,
             getInstDesc(Dep.getDestination(DepChecker))));
-        DepEntry.push_back(MDString::get(Ctx,
-            Dep.isPossiblyBackward() ? "backward dependency prevents vectorization"
-                                     : "unknown dependency"));
+        // alias_result: 使用 isSafeForVectorization() 分类
+        const char *SafetyStr;
+        using SafetyStatus = MemoryDepChecker::VectorizationSafetyStatus;
+        using MCDependence = MemoryDepChecker::Dependence;
+        switch (MCDependence::isSafeForVectorization(Dep.Type)) {
+        case SafetyStatus::Safe:
+          SafetyStr = "safe for vectorization"; break;
+        case SafetyStatus::PossiblySafeWithRtChecks:
+          SafetyStr = "possibly safe with runtime checks"; break;
+        case SafetyStatus::Unsafe:
+          SafetyStr = "unsafe: prevents vectorization"; break;
+        }
+        DepEntry.push_back(MDString::get(Ctx, SafetyStr));
         DepEntries.push_back(MDNode::get(Ctx, DepEntry));
         DepCount++;
       }
@@ -624,7 +640,7 @@ public:
     int IC = 0;
     // 依赖
     struct DepEntry {
-      std::string Type;        // "RAW"|"WAR"|"IndirectUnsafe"|"BackwardVectorizable"|"ForwardButPreventsForwarding"|"Unknown"
+      std::string Type;        // LLVM Dependence::DepName[]: "Backward"|"Forward"|"Unknown"|"IndirectUnsafe"|...
       std::string Source;
       std::string Sink;
       std::string AliasResult;
@@ -764,10 +780,10 @@ AIMVFeedbackPass 仅产出 IR 侧可获取的诊断数据。关键点：
       },
       "dependencies": [
         {
-          "dep_type": "RAW",
+          "dep_type": "Backward",
           "source_ptr": "ptr %b + i + 1",
           "sink_ptr": "ptr %a + i",
-          "alias_result": "MayAlias: function arguments may overlap"
+          "alias_result": "unsafe: prevents vectorization"
         }
       ],
       "memory_info": {
