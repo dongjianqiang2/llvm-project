@@ -80,6 +80,14 @@ int cost = IC.isValid() ? (int)IC.getValue() : -1;  // getValue() asserts if Inv
 
 // RuntimePointerChecking: use getNumberOfChecks() (method), getPointerInfo(idx)
 // (returns const PointerInfo&). PointerInfo is a struct, not a pair.
+// LoopAccessInfo has NO hasRuntimePointerChecks() method.
+// Use getNumRuntimePointerChecks() instead. PtrRtChecking is always initialized.
+
+// LoopAccessInfo::emitUnsafeDependenceRemark() has NO access to VF, IC, CM, or Checks.
+// VF/IC are only determined in LoopVectorize's cost model phase.
+// Inside emitUnsafeDependenceRemark, use: TheLoop, PSE.getSE(), Info (local string),
+// getNumRuntimePointerChecks(). Get Function/Module via pointer chain:
+//   TheLoop->getHeader()->getParent()->getParent()
 
 // Loop::getTripCount() does NOT exist. Use SE.getSmallConstantTripCount(&L).
 

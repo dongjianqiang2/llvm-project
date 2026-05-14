@@ -445,9 +445,8 @@ if (!isOutsideLoopWorkProfitable(L, *LVL, VF, Checks)) {
   // Checks.getCost() 返回 InstructionCost，可能 Invalid → 需判空
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
-  // RtCheckCount: 从 LAI 的 RuntimePointerChecking 获取
-  int RtChkCount = LVL.getLAI().hasRuntimePointerChecks() ?
-      (int)LVL.getLAI().getRuntimePointerChecking().getNumberOfChecks() : 0;
+  // RtCheckCount: 使用 getNumRuntimePointerChecks()（PtrRtChecking 始终已初始化）
+  int RtChkCount = (int)LVL.getLAI().getNumRuntimePointerChecks();
   emitAIMVDiagnostic(M, F, L, &(*LVL).getLAI(), CM, VF, IC,
                      "CantReorderMemOps",
                      "unsafe dependent memory operations in loop",
@@ -469,8 +468,7 @@ reportVectorizationFailure("Vectorization not beneficial",
 ```cpp
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
-  int RtChkCount = LVL.getLAI().hasRuntimePointerChecks() ?
-      (int)LVL.getLAI().getRuntimePointerChecking().getNumberOfChecks() : 0;
+  int RtChkCount = (int)LVL.getLAI().getNumRuntimePointerChecks();
   emitAIMVDiagnostic(M, F, L, &(*LVL).getLAI(), CM, VF, IC,
                      "VectorizationNotBeneficial",
                      "the cost-model indicates that vectorization is not beneficial",
@@ -483,23 +481,36 @@ reportVectorizationFailure("Vectorization not beneficial",
 **位置**: `LoopAccessAnalysis.cpp`，`LoopAccessInfo::emitUnsafeDependenceRemark()` 内
 **说明**: 真正的 UnsafeDep 发射点在此，不在 LoopVectorizationLegality.cpp。
 `LoopVectorizationLegality.cpp:1200-1208` 仅转发 LAI->getReport() 中的已有 remark。
-此处的上下文：无 CM（legality 阶段，代价模型未构建），无 PSE，无 Checks。
-但 LAI 可用。
+
+**关键上下文限制**: `emitUnsafeDependenceRemark()` 是 `LoopAccessInfo` 的私有成员函数，
+无参数。在此作用域中：
+- **可用**: `TheLoop` (Loop*), `PSE` (PredicatedScalarEvolution，含 `PSE.getSE()`),
+  `PtrRtChecking` (RuntimePointerChecking), `getDepChecker()` (MemoryDepChecker)
+- **可通过指针链获取**: `TheLoop->getHeader()->getParent()` → Function*,
+  `Function->getParent()` → Module*
+- **不可用**: VF (ElementCount), IC (unsigned), CM (CostModel), Checks (GeneratedRTChecks)
+  — 这些只在 LoopVectorize 的代价模型阶段才确定，LoopAccessInfo 运行在更早的分析阶段
 
 **方案**: 将 `emitAIMVDiagnostic()` 声明放在新建的头文件
 `llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h` 中（非 static）。
 该头文件由 LoopVectorize.cpp 和 LoopAccessAnalysis.cpp 共同包含。
 
-**插入**（CM/PSE/Checks 均不可用 → 使用默认值）:
+**插入**（VF/IC/CM 不可用 → 使用默认值，SE 从 PSE 获取）:
 ```cpp
-  // LoopAccessAnalysis 上下文中无 CM/PSE/Checks，所有诊断相关参数使用默认值
-  // RtCheckCount: LAI 自身有 RuntimePointerChecking 信息
-  int RtChkCount = LAI->hasRuntimePointerChecks() ?
-      (int)LAI->getRuntimePointerChecking().getNumberOfChecks() : 0;
-  emitAIMVDiagnostic(M, F, L, LAI, /*CM=*/nullptr, VF, IC,
+  // LoopAccessAnalysis 上下文: 无 VF/IC/CM/Checks
+  // 通过指针链获取 Function 和 Module
+  Function *Fn = TheLoop->getHeader()->getParent();
+  Module *Mod = Fn->getParent();
+  int RtChkCount = (int)getNumRuntimePointerChecks();
+  // RemarkMsg 使用 Info 变量（emitUnsafeDependenceRemark 中已构建的本地变量，
+  // 包含完整的安全依赖描述文本）。注意: Report 是 unique_ptr<OptimizationRemarkAnalysis>，
+  // 其消息内容通过 operator<< 流式写入，无 getRemarkMsg() 方法。
+  emitAIMVDiagnostic(*Mod, *Fn, *TheLoop,
+                     this, /*CM=*/nullptr,
+                     ElementCount::getFixed(0), /*IC=*/0,
                      "UnsafeDep",
-                     LAI->getReport()->getRemarkMsg(),
-                     /*SE=*/nullptr,
+                     Info,
+                     &PSE.getSE(),
                      /*RtCheckCost=*/-1, RtChkCount);
 ```
 
@@ -544,8 +555,7 @@ reportVectorizationFailure("Vectorization not beneficial",
   // MVP 建议: RemarkID = "LoopVectorized" + 原有标识，RemarkMsg 描述 VF/IC 信息
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
-  int RtChkCount = LVL.getLAI().hasRuntimePointerChecks() ?
-      (int)LVL.getLAI().getRuntimePointerChecking().getNumberOfChecks() : 0;
+  int RtChkCount = (int)LVL.getLAI().getNumRuntimePointerChecks();
   emitAIMVDiagnostic(M, F, L, &(*LVL).getLAI(), CM, VF, IC,
                      "LoopVectorized",
                      "loop vectorized: VF=" + Twine(VF.getKnownMinValue()).str(),
