@@ -61,30 +61,38 @@ pip install -e aimv/mcp_server
 Choose your LLM backend:
 
 ```bash
-# DeepSeek (已验证通过)
+# ── DeepSeek (OpenAI-compatible, 已验证) ──
 AIMV_LLM_BACKEND=openai \
   AIMV_LLM_BASE_URL=https://api.deepseek.com/v1 \
   OPENAI_API_KEY=sk-your-deepseek-key \
   AIMV_LLM_MODEL=deepseek-v4-pro \
   uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
 
-# OpenAI
+# ── DeepSeek (Anthropic-compatible) ──
+# DeepSeek 同时提供 Anthropic Messages API 兼容端点
+AIMV_LLM_BACKEND=anthropic \
+  AIMV_LLM_BASE_URL=https://api.deepseek.com/anthropic \
+  ANTHROPIC_API_KEY=sk-your-deepseek-key \
+  AIMV_LLM_MODEL=deepseek-v4-pro \
+  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+
+# ── OpenAI ──
 AIMV_LLM_BACKEND=openai \
   OPENAI_API_KEY=sk-... \
   uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
 
-# Anthropic
+# ── Anthropic ──
 AIMV_LLM_BACKEND=anthropic \
   ANTHROPIC_API_KEY=sk-ant-... \
   uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
 
-# Local OpenAI-compatible server (vLLM / Ollama / etc.)
+# ── 本地/代理 (vLLM / Ollama / LiteLLM 等) ──
 AIMV_LLM_BACKEND=openai \
   AIMV_LLM_BASE_URL=http://localhost:8000/v1 \
   OPENAI_API_KEY=not-needed \
   uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
 
-# Mock mode (no API key needed, returns empty suggestions)
+# ── Mock 模式 (无需 API Key，返回空建议) ──
 AIMV_LLM_BACKEND=mock \
   uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
 ```
@@ -102,6 +110,10 @@ aimv-driver --function=process_task --mode=yaml --mcp-url=http://localhost:8080 
 
 # Dry run (diagnostics only, no MCP call)
 aimv-driver --function=process_task --dry-run \
+  aimv/benchmarks/dep_fail_alias.c
+
+# Interactive mode (pause for human approval before applying each patch)
+aimv-driver --function=process_task --require-review --mcp-url=http://localhost:8080 \
   aimv/benchmarks/dep_fail_alias.c
 ```
 
@@ -125,6 +137,7 @@ aimv-driver --function=process_task --dry-run \
 | Provider | Backend | Protocol | Verified |
 |----------|---------|----------|----------|
 | **DeepSeek** | `openai` | OpenAI-compatible | ✅ Live tested |
+| **DeepSeek** | `anthropic` | Anthropic-compatible | ✅ Live tested |
 | **OpenAI** | `openai` | Native | SDK verified |
 | **Anthropic** | `anthropic` | Anthropic Messages | SDK verified |
 | **vLLM** | `openai` | OpenAI-compatible | Compatible |
@@ -132,11 +145,26 @@ aimv-driver --function=process_task --dry-run \
 | **阿里百炼** | `openai` | OpenAI-compatible | Compatible |
 | Any OpenAI-compatible | `openai` | OpenAI-compatible | Compatible |
 
+### DeepSeek 双端点
+
+DeepSeek 同时提供两种 API 端点：
+
+| 端点 | 协议 | 配置 |
+|------|------|------|
+| `https://api.deepseek.com/v1` | OpenAI Chat Completions | `AIMV_LLM_BACKEND=openai` |
+| `https://api.deepseek.com/anthropic` | Anthropic Messages | `AIMV_LLM_BACKEND=anthropic` |
+
+两个端点共用同一个 API Key，模型名相同（如 `deepseek-v4-pro`）。
+Anthropic 端点适合已集成 Anthropic SDK 的项目；OpenAI 端点更通用。
+
 ### Protocol
 
-The MCP Server uses the standard **OpenAI Chat Completions API** (`POST /v1/chat/completions`)
-for `openai` backend, and the **Anthropic Messages API** (`POST /v1/messages`) for `anthropic`.
-Any service compatible with either protocol can be used by setting `AIMV_LLM_BASE_URL`.
+MCP Server 支持两种底层 LLM 协议：
+
+- **OpenAI 协议** (`AIMV_LLM_BACKEND=openai`): `POST /v1/chat/completions`，system prompt 在 `messages[0]`，强制 JSON 输出通过 `response_format: json_object`
+- **Anthropic 协议** (`AIMV_LLM_BACKEND=anthropic`): `POST /v1/messages`，system prompt 在顶层 `system` 字段，JSON 约束通过 prompt 注入
+
+`AIMV_LLM_BASE_URL` 可指向任意兼容端点。
 
 ## Usage
 
