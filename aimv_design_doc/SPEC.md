@@ -88,6 +88,25 @@ clang Driver (C++)                     aimv-driver (Python)
 | LLVM Pass Pipeline | 注册 AIMVFeedbackPass，无修改 | 已完成 |
 | aimv-driver (Python) | 编排逻辑，无修改；新增 `--from-json` 入口 | ~10 行 |
 
+**迭代重编译与防无限 fork**：
+
+```
+Round 1 (用户触发):
+  clang -O2 -faimv -c task.c           ← 用户命令，含 -faimv
+    ├─ Driver 编译                           启动 AIMVFeedbackPass
+    └─ Driver fork aimv-driver --from-json=aimv.json
+
+Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
+  clang -O2 -faimv-output=<path> -c task.c    ← 不含 -faimv！
+    ├─ 不会触发 clang Driver 再 fork aimv-driver
+    ├─ 只运行 LLVM 层的 AIMVFeedbackPass 收集诊断
+    └─ aimv-driver 读新 aimv.json 判断下一轮
+
+关键: -faimv 只存在于 clang Driver 层（C++）。
+       aimv-driver 调用的是 LLVM 后端 flag（-mllvm -aimv-enable），
+       永远不会传递 -faimv，因此不会产生 fork 链。
+```
+
 | 产物 | 说明 |
 |------|------|
 | 源文件（原地修改） | 编译通过后写入 restrict/alignas 等 hint |

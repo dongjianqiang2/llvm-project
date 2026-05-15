@@ -501,6 +501,15 @@ aimv-driver 新增 --from-json 入口（Python，约 10 行改动）:
   --from-json=<path>   直接从 AIMV JSON 启动分析（跳过首次编译）
   --source=<file>      指定源文件路径
 
+**迭代重编译机制（防无限 fork）**:
+
+```
+-faimv 只在 clang Driver 层（C++）生效。
+aimv-driver 内部通过 BuildOrchestrator 重编译时，只传递 LLVM 后端 flag:
+  clang -O2 -mllvm -aimv-enable -mllvm -aimv-output=<path> -c task.c
+不传 -faimv → 不会触发 Driver 再次 fork → 不会产生 fork 链。
+```
+
 禁用 AIMV:
   -fno-aimv           # 本次编译跳过
 
