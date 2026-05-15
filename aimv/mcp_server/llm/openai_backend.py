@@ -8,7 +8,10 @@ from ..suggestion_parser import parse_structured_response
 
 class OpenAIBackend(AbstractLLMBackend):
     def __init__(self, config: dict):
-        self.client = OpenAI(api_key=config.get("api_key", "mock"))
+        client_kwargs = {"api_key": config.get("api_key", "mock")}
+        if config.get("base_url"):
+            client_kwargs["base_url"] = config["base_url"]
+        self.client = OpenAI(**client_kwargs)
         self.model = config.get("model", "gpt-4o")
         self.temperature = config.get("temperature", 0.1)
         self.max_tokens = config.get("max_tokens", 4096)

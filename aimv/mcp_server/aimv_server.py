@@ -94,12 +94,15 @@ async def analyze_vectorization(request: Request):
                 backend = OpenAIBackend({
                     "api_key": os.environ.get("OPENAI_API_KEY", ""),
                     "model": os.environ.get("AIMV_LLM_MODEL", "gpt-4o"),
+                    "base_url": os.environ.get("AIMV_LLM_BASE_URL"),
                 })
             elif LLM_BACKEND == "deepseek":
-                from .llm.deepseek_backend import DeepSeekBackend
-                backend = DeepSeekBackend({
+                from .llm.openai_backend import OpenAIBackend
+                backend = OpenAIBackend({
                     "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
                     "model": os.environ.get("AIMV_LLM_MODEL", "deepseek-v4-pro"),
+                    "base_url": os.environ.get("AIMV_LLM_BASE_URL",
+                                               "https://api.deepseek.com/v1"),
                 })
             else:
                 return JSONResponse(
