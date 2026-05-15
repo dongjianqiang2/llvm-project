@@ -14,27 +14,31 @@
 ## 2. 核心工作流
 
 ```
-用户视角 (透明模式):
+用户视角:
   clang -O2 -faimv -c task.c -o task.o
        │
        ▼
   ┌──────────────────────────────────────────────────────────┐
-  │               aimv-clang (clang 包装器)                   │
+  │                   clang Driver (C++)                     │
   │                                                          │
-  │  ┌──────────┐   ┌──────────────┐   ┌──────────────┐      │
-  │  │1.真clang │──▶│2.AIMV Pass   │──▶│3.MCP Server  │      │
-  │  │  编译    │   │  !aimv.diag  │   │  AI 分析      │      │
-  │  └──────────┘   │  → JSON      │   └──────────────┘      │
-  │                 └──────────────┘         │               │
-  │       ▲                                  │               │
-  │       │      ┌──────────────┐           │               │
-  │       └──────│5.重编译+测试  │◀──4.源码  │               │
-  │   (最多N轮)  │  验证         │   patch   │               │
-  │              └──────────────┘           │               │
+  │  ┌──────────┐   ┌──────────────┐                        │
+  │  │1.编译    │──▶│2.AIMV Pass   │                        │
+  │  │ +AIMV    │   │  !aimv.diag  │   aimv.json 产出       │
+  │  │ flags    │   │  → JSON      │                        │
+  │  └──────────┘   └──────┬───────┘                        │
+  │                        │                                │
+  │                        ▼ fork+exec                      │
+  │               ┌──────────────────┐                      │
+  │               │ 3. aimv-driver   │                      │
+  │               │   (Python 编排)   │                      │
+  │               │                  │                      │
+  │               │ MCP → AI → patch │                      │
+  │               │ → 重编译 → 测试   │                      │
+  │               └──────────────────┘                      │
   └──────────────────────────────────────────────────────────┘
   
   最终返回:  成功 → clang exit 0 + 源码已修改 + task.c.aimv.patch
-             放弃 → clang 原始 exit code + 回滚 + 诊断报告
+             放弃 → 回滚源码 + 报告路径输出到 stderr
 ```
 
 **迭代终止条件（组合策略）**:
@@ -47,22 +51,48 @@
 
 ## 3. 系统形态
 
-### 3.1 主入口：透明 clang 包装器（推荐）
+### 3.1 主入口：clang Driver 原生集成
 
-用户无需改变构建习惯。将 `aimv-clang` 置于 PATH 中的 `clang` 位置：
+用户零感知。`-faimv` 由 clang Driver 原生解析，编译后自动调用 `aimv-driver` 完成闭环：
 
 ```bash
 clang -O2 -faimv -c task.c -o task.o
 #                    ^^^^^^ 唯一新增的 flag
 ```
 
+```
+clang Driver (C++)                     aimv-driver (Python)
+     │                                       │
+     ├─ 解析 -faimv                           │
+     ├─ 转发 -mllvm -aimv-enable              │
+     ├─ 常规编译 + AIMVFeedbackPass           │
+     │  └─ 产出 aimv.json                     │
+     │                                       │
+     ├─ fork + exec aimv-driver ─────────────▶│
+     │   --from-json=aimv.json                ├─ 读 aimv.json → 调 MCP
+     │   --source=task.c                      ├─ AI 建议 → patch 源码
+     │                                       ├─ 重编译 + 测试验证
+     │                                       └─ 返回 exit code
+     │◀────────────────────────────────────── │
+     │                                       │
+     └─ driver exit 0 → 源码已修改，exit 0   │
+        driver exit ≠0 → 回滚，报告路径到 stderr
+```
+
+**改动范围**：
+
+| 层 | 改动 | 量 |
+|----|------|-----|
+| clang Driver (`Clang.cpp`) | 解析 `-faimv`，编译后 `fork+exec aimv-driver` | ~20 行 |
+| clang Options (`Options.td`) | 注册 `-faimv` / `-fno-aimv` flag | 3 行 |
+| LLVM Pass Pipeline | 注册 AIMVFeedbackPass，无修改 | 已完成 |
+| aimv-driver (Python) | 编排逻辑，无修改；新增 `--from-json` 入口 | ~10 行 |
+
 | 产物 | 说明 |
 |------|------|
 | 源文件（原地修改） | 编译通过后写入 restrict/alignas 等 hint |
 | `task.c.aimv.patch` | 每轮迭代的 unified diff 日志 |
 | `aimv-output/session.json` | 完整迭代记录（诊断→AI→验证） |
-
-`-faimv` 被 clang driver 识别，转发给 LLVM 后端激活 `!aimv.diag` 写入和 `AIMVFeedbackPass`。
 
 ### 3.2 开发者入口（需要精细控制时）
 
