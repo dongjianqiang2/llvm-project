@@ -855,22 +855,22 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
 
 ### 4.2 条件激活
 
-AIMVFeedbackPass 不是无条件运行。通过检查 remark streamer 是否存在来决定是否激活：
+AIMVFeedbackPass 通过 `-faimv` flag 激活。
 
 ```cpp
+// clang driver: -faimv → 转发为 -mllvm -aimv-enable + -mllvm -aimv-output=<path>
+// 
+// emitAIMVDiagnostic() 无条件写入（不检查 streamer），由 AIMVFeedbackPass 控制产出。
+// 这样避免 getLLVMRemarkStreamer() 在不同 LLVM 管道路径中的空值差异。
+
 // [AIMV] AIMVFeedback Pass 内部
 PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();
   if (!M)
     return PreservedAnalyses::all();
 
-  // 激活条件（三选一）:
-  //   1. getLLVMRemarkStreamer() 非空（-fsave-optimization-record / -Rpass-missed 触发）
-  //   2. !OutputPath.empty()（-aimv-output 显式指定）
-  //   3. AIMVFeedbackPass 自身的 EnabledFlag（-aimv-enable 触发）
-  // 注意: EnabledFlag 和 OutputPath 是 AIMVFeedbackPass 的私有成员，
-  //       由 BackendUtil.cpp 在构造 pass 时设置，不依赖跨组件符号。
-  if (!M->getContext().getLLVMRemarkStreamer() && OutputPath.empty() && !EnabledFlag)
+  // 激活条件: -faimv 设置了 EnabledFlag + OutputPath
+  if (OutputPath.empty() && !EnabledFlag)
     return PreservedAnalyses::all();
 
   // ... 正常执行 ...
@@ -878,20 +878,30 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
 ```
 
 触发条件（任一满足即运行）：
-- `-fsave-optimization-record=<file>` — 写入 YAML remarks（同时激活 remark streamer）
-- `-Rpass-missed=loop-vectorize` — 输出 remarks（激活 remark streamer）
-- `-aimv-output=<path>` — 设置 OutputPath（AIMVFeedbackPass 私有成员，由 BackendUtil.cpp 注入）
-- `-aimv-enable` — 设置 EnabledFlag（AIMVFeedbackPass 私有成员）
+- `-faimv` — clang driver flag，自动设置 EnabledFlag + OutputPath
+- `-mllvm -aimv-enable` + `-mllvm -aimv-output=<path>` — 直接传 LLVM 后端（opt 调试用）
 
-**关键**: 这四个触发条件全部在 AIMVFeedbackPass 内部处理，不依赖任何跨组件的 `cl::opt` 变量。
-`-aimv-output` 和 `-aimv-enable` 在 `clang/lib/CodeGen/BackendUtil.cpp` 中解析后，
-通过 `AIMVFeedbackPass::setOutputPath()` / `AIMVFeedbackPass::setEnabled()` 注入 pass 实例。
+### 4.4 clang Driver 集成（`-faimv`）
 
-**注意（激活条件不一致问题）**: `emitAIMVDiagnostic()` 仅检查 `getLLVMRemarkStreamer()` 来
-决定是否写入 `!aimv.diag`。因此，仅使用 `-aimv-enable` + `-aimv-output` 而不激活 remark streamer 时，
-`AIMVFeedbackPass` 会运行但读不到诊断数据——因为 `emitAIMVDiagnostic()` 根本没写入。
-正确用法必须同时指定 `-fsave-optimization-record` 或 `-Rpass-missed=loop-vectorize` 之一。
-这是有意的取舍：避免在 `emitAIMVDiagnostic()` 中引入跨组件依赖。
+**文件**: `clang/lib/Driver/ToolChains/Clang.cpp`
+
+```cpp
+// -faimv: enable AIMV feedback pass
+if (Args.hasFlag(options::OPT_faimv, options::OPT_fno_aimv, false)) {
+  CmdArgs.push_back("-mllvm");
+  CmdArgs.push_back("-aimv-enable");
+  CmdArgs.push_back("-mllvm");
+  CmdArgs.push_back("-aimv-output=" + Output.getFilename() + ".aimv.json");
+}
+```
+
+**文件**: `clang/include/clang/Driver/Options.td`
+
+```td
+def faimv : Flag<["-"], "faimv">, Group<f_Group>,
+  HelpText<"Enable AIMV AI-driven vectorization analysis">;
+def fno_aimv : Flag<["-"], "fno-aimv">, Group<f_Group>;
+```
 
 ### 4.3 与现有 Remark 基础设施的关系
 
@@ -961,31 +971,31 @@ add_subdirectory(AIMV)
 
 ## 6. 命令行参数
 
-### 6.1 新增选项
-
-**文件**: `clang/lib/Driver/ToolChains/Clang.cpp` 或 `clang/lib/CodeGen/BackendUtil.cpp`
+### 6.1 用户可见选项
 
 | 选项 | 说明 |
 |------|------|
-| `-aimv-output=<path>` | 指定 AIMV JSON 诊断输出路径 |
-| `-aimv-target-function=<name>` | 只分析指定函数 |
-| `-aimv-enable` | 显式启用 AIMV 诊断收集（**必须与 `-fsave-optimization-record` 或 `-Rpass-missed` 配合使用**，单独使用无效——见 §4.2 注意事项） |
+| `-faimv` | 启用 AIMV AI 驱动向量化分析 |
+| `-fno-aimv` | 禁用（默认） |
 
-### 6.2 使用示例
+### 6.2 LLVM 后端选项（`-mllvm` 传递，通常不直接使用）
+
+| 选项 | 说明 |
+|------|------|
+| `-aimv-output=<path>` | AIMV JSON 输出路径 |
+| `-aimv-enable` | 激活 AIMVFeedbackPass |
+| `-aimv-target-function=<name>` | 只分析指定函数 |
+
+### 6.3 使用示例
 
 ```bash
-# 完整流程：编译 + 收集 opt-info YAML + AIMV JSON
-clang -O2 \
-      -fsave-optimization-record=opt.yaml \
-      -aimv-output=aimv.json \
-      -Rpass-missed=loop-vectorize \
-      -g \
-      src/task.c -o task
+# 用户视角：只需 -faimv
+clang -O2 -faimv -c src/task.c -o task.o
 
-# aimv.json 可直接 POST 到 MCP Server
-curl -X POST http://mcp-server:8080/api/v1/analyze-vectorization \
-     -H "Content-Type: application/json" \
-     -d @aimv.json
+# opts 调试：手动传 LLVM 后端
+opt -passes="loop-vectorize,aimv-feedback" \
+    -aimv-output=aimv.json -aimv-enable \
+    -S src.ll -o /dev/null
 ```
 
 ---

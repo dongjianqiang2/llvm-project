@@ -18,6 +18,8 @@ AIMV (AI Multi-Level Vectorization) 通过编译器 opt-info 诊断信息 + 远�
 
 ```
 aimv/                                    # 项目根目录
+├── aimv-clang                           # ★ 透明 clang 包装器（主入口）
+├── aimv-clang++                         #    符号链接 → aimv-clang
 ├── driver/                              # Python Driver 脚本
 │   ├── aimv_driver.py                   # 主入口：编排编译-诊断-MCP-patch 流程
 │   ├── opt_info_parser.py               # 解析 YAML/JSON opt-records
@@ -82,50 +84,57 @@ aimv/                                    # 项目根目录
 
 ## 2. 整体架构
 
-### 2.1 端到端流程
+### 2.1 端到端流程（透明模式 — 主入口）
 
 ```
+用户:  clang -O2 -faimv -c task.c -o task.o
+              │
+              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  aimv-driver (迭代控制器)                                            │
+│  aimv-clang (透明 clang 包装器)                                      │
 │                                                                     │
 │  ┌──────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────┐ │
-│  │  clang   │──▶│ AIMVFeedback │──▶│  MCP Server  │──▶│ 源码     │ │
-│  │ -fsave-  │   │ Pass (JSON)  │   │  POST /api   │   │ patch    │ │
-│  │ opt-recrd│   │ 收集诊断信息   │   │  /v1/analyze │   │ 生成     │ │
+│  │ 真 clang │──▶│ AIMVFeedback │──▶│  MCP Server  │──▶│ 源码     │ │
+│  │ + AIMV   │   │ Pass → JSON  │   │  AI 分析      │   │ patch    │ │
+│  │ flags    │   │ 诊断产出      │   │              │   │ 原地覆盖  │ │
 │  └──────────┘   └──────────────┘   └──────────────┘   └──────────┘ │
 │       ▲                                                      │     │
 │       │         ┌──────────────┐                             │     │
 │       └─────────│  重编译+测试  │◀────────────────────────────┘     │
-│       (N轮迭代) │  验证        │                                    │
+│       (N轮)    │  验证        │                                    │
 │                 └──────────────┘                                    │
 │                                                                     │
-│  终止: 向量化成功 / 达到N轮上限 / 收益不增回滚                        │
+│  产出: 修改后的源文件 + task.c.aimv.patch + session.json             │
+│  终止: 向量化成功 / N轮上限 / 收益不增回滚                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+`-faimv` 是唯一新增的 flag。由 clang driver 解析，经 `-mllvm -aimv-enable` 转发到 LLVM 后端。
 
 ### 2.2 核心组件交互
 
 ```
-┌────────────────┐     ┌─────────────────┐     ┌──────────────────┐
-│ AIMVFeedback   │────▶│  aimv-driver    │────▶│  MCP Server      │
-│ (LLVM Pass)    │     │  (Python 编排)   │     │  (REST API)      │
-│                │     │                 │     │                  │
-│ · 收集 missed  │     │ · 迭代循环控制   │     │ · prompt 构造    │
-│   + passed     │     │ · 源码 patch     │     │ · LLM 调用       │
-│   remarks      │     │ · 编译/测试编排  │     │ · 响应解析       │
-│ · VPlan 代价   │     │ · 回滚管理       │     │ · 模式缓存       │
-│   模型导出     │     │ · 日志/追溯      │     │                  │
-│ · IR 上下文    │     │                 │     │                  │
-└────────────────┘     └─────────────────┘     └──────────────────┘
-        ↑                       │                       │
-        │ Pass 模式              │ HTTP POST             │ HTTP
-   ┌────┴─────┐          ┌──────┴──────┐         ┌──────┴──────┐
-   │aimv.json │          │  source.c   │         │ GPT/Claude  │
-   └──────────┘          └─────────────┘         │ API         │
-        ↑                                        └─────────────┘
-   ┌────┴─────┐
-   │ opt.yaml │  ← YAML 模式（零侵入，诊断信息较少）
-   └──────────┘    直接解析 -fsave-optimization-record 输出
+用户: clang -O2 -faimv -c src.c
+         │
+    ┌────┴──────┐     ┌──────────────────┐     ┌──────────────────┐
+    │aimv-clang │────▶│  AIMVFeedbackPass │────▶│   MCP Server     │
+    │(包装器)   │     │  (LLVM Pass)      │     │   (REST API)     │
+    │           │     │                   │     │                   │
+    │· 解析     │     │· !aimv.diag 写入  │     │· prompt 构造     │
+    │  -faimv   │     │· 代价模型 + 依赖  │     │· LLM 调用        │
+    │· 调用真   │     │· JSON 序列化      │     │· 结构化建议      │
+    │  clang    │     │                   │     │· 诊断缓存         │
+    │· 编排迭代 │     │                   │     │                   │
+    └────┬──────┘     └────────┬─────────┘     └────────┬─────────┘
+         │                     │                        │
+         ▼                     ▼                        ▼
+   ┌──────────┐        ┌──────────────┐         ┌──────────────┐
+   │ 真实clang│        │ !aimv.diag   │         │ DeepSeek     │
+   │ (编译)   │        │ + aimv.json  │         │ / GPT        │
+   └──────────┘        └──────────────┘         │ / Claude     │
+                                                 └──────────────┘
+
+配置: ~/.aimv/config  — mcp_url, api_key, max_rounds, aimv_level
 ```
 
 ### 2.3 Driver 迭代状态机
@@ -459,7 +468,48 @@ public:
 输出: JSON 文件（diagnostics 部分），供 aimv-driver 补充 function/target 后发送 MCP
 ```
 
-### 4.3 Driver CLI 接口
+### 4.3 aimv-clang 透明包装器（主入口）
+
+```
+用法与 clang 完全一致，仅新增 -faimv flag:
+
+  clang -O2 -faimv -c task.c -o task.o
+
+行为:
+  1. 解析 -faimv → 读 ~/.aimv/config 获取 MCP 地址/认证/参数
+  2. 调真实 clang，注入 -mllvm -aimv-enable -mllvm -aimv-output=...
+     → AIMVFeedbackPass 产出 aimv.json
+  3. 检查向量化状态:
+     全部 passed → 返回 clang exit 0，结束
+     有 missed   → 进入 driver 迭代循环
+  4. 迭代循环: MCP → AI → patch → 重编译 → 测试
+  5. 成功: 源文件已修改 + task.c.aimv.patch 日志
+     失败: 回滚源文件 + 警告输出
+
+禁用 AIMV:
+  -fno-aimv           # 本次编译跳过
+  AIMV_MODE=off       # 环境变量全局关闭
+
+仅收集诊断:
+  AIMV_MODE=dry-run   # 产 aimv.json 但不调用 MCP
+
+安全模式:
+  AIMV_MODE=review    # 每轮 patch 前暂停等待人工确认
+```
+
+**配置文件 `~/.aimv/config`**:
+
+```yaml
+mcp:
+  url: http://aimv-server:8080
+  api_key: sk-xxx
+driver:
+  max_rounds: 3
+  aimv_level: moderate
+  test_cmd: make test
+```
+
+### 4.4 Driver CLI 接口（手动/CI 使用）
 
 ```
 aimv-driver [OPTIONS] <source_file> -- <compiler_flags>
