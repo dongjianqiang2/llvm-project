@@ -36,10 +36,10 @@ Three subsystems:
 
 ### Prerequisites
 
-- LLVM 21+ (build from source with `-DLLVM_ENABLE_PROJECTS="clang"`)
 - Python 3.10+
+- LLVM 21+ (for Pass mode; optional for YAML mode)
 
-### 1. Build LLVM with AIMV Pass
+### 1. Build LLVM with AIMV Pass (optional for YAML mode)
 
 ```bash
 cmake -S llvm -B build -G Ninja \
@@ -49,16 +49,38 @@ cmake -S llvm -B build -G Ninja \
 ninja -C build clang opt
 ```
 
-### 2. Install Python dependencies
+### 2. One-click setup (recommended)
 
 ```bash
-pip install -e aimv/driver
-pip install -e aimv/mcp_server
+bash aimv/setup.sh
 ```
 
-### 3. Start MCP Server
+This auto-detects Python, installs all dependencies, generates `.env` and `start_server.sh`.
 
-Choose your LLM backend:
+### 3. Configure API keys
+
+Edit the generated `.env` file:
+
+```bash
+vim aimv/.env
+```
+
+Minimal config for DeepSeek:
+
+```ini
+AIMV_LLM_BACKEND=openai
+AIMV_LLM_BASE_URL=https://api.deepseek.com/v1
+OPENAI_API_KEY=sk-your-deepseek-key
+AIMV_LLM_MODEL=deepseek-v4-pro
+```
+
+### 4. Start MCP Server
+
+```bash
+bash aimv/start_server.sh
+```
+
+Or manually choose your LLM backend:
 
 ```bash
 # ── DeepSeek (OpenAI-compatible, 已验证) ──
@@ -97,7 +119,7 @@ AIMV_LLM_BACKEND=mock \
   uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
 ```
 
-### 4. Run analysis
+### 5. Run analysis
 
 ```bash
 # Pass mode (full diagnostics: cost model + dependency analysis)
