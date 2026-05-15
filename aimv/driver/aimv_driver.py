@@ -270,12 +270,40 @@ def main_loop(driver_config: dict) -> int:
             # Step 3: Apply patch
             round_rec.status = DriverStatus.PATCHING
             suggestion = mcp_resp["suggestions"][0]
-
             new_diff = suggestion["diff"]
+
+            # Duplicate detection
             if sources.has_diff(new_diff):
                 session.termination_reason = TerminationReason.NO_IMPROVEMENT
                 store.save(session)
                 break
+
+            # Review mode: pause for human confirmation before applying patch
+            if driver_config.get("require_review"):
+                print(f"\n{'='*60}")
+                print(f"Round {round_rec.round_number} — AI Suggestion")
+                print(f"{'='*60}")
+                print(f"Description: {suggestion.get('description', 'N/A')}")
+                print(f"Reasoning:  {suggestion.get('reasoning', 'N/A')[:200]}")
+                print(f"Impact:     {suggestion.get('estimated_impact', 'N/A')}")
+                if suggestion.get('safety_concern'):
+                    print(f"SAFETY:     {suggestion['safety_concern']}")
+                print(f"{'='*60}")
+                print(f"Diff:")
+                print(new_diff)
+                print(f"{'='*60}")
+                try:
+                    answer = input("Apply this patch? [y/N/r(etry)/q(uit)]: ").strip().lower()
+                except EOFError:
+                    answer = 'n'
+                if answer == 'q':
+                    session.termination_reason = TerminationReason.INTERRUPTED
+                    break
+                elif answer == 'r':
+                    continue  # retry MCP query with same diagnostics
+                elif answer != 'y':
+                    print("Skipped. Trying next suggestion or level...")
+                    continue
 
             patch = sources.apply_patch(suggestion["source_file"], new_diff)
             round_rec.patch = patch
@@ -373,6 +401,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", dest="resume")
     parser.add_argument("--list-sessions", action="store_true")
     parser.add_argument("--mode", choices=["pass", "yaml"], default="pass")
+    parser.add_argument("--require-review", action="store_true",
+                        help="Pause before applying each patch for human approval")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--json-log", action="store_true")
@@ -398,6 +428,8 @@ def main(argv=None):
         cfg["test_cmd"] = args.test_cmd
     if args.measure_perf:
         cfg["measure_perf"] = True
+    if args.require_review:
+        cfg["require_review"] = True
     if args.dry_run:
         cfg["dry_run"] = True
 
