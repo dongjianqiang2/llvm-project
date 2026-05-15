@@ -16,6 +16,12 @@ compile → diagnose failures → AI analysis → source patch → recompile + t
 │  !aimv.diag  │               │  (Python)    │              │  (FastAPI)   │
 │  → JSON      │               │  orchestrate │              │  → LLM       │
 └──────────────┘               └─────────────┘              └──────────────┘
+                                                              │
+                                              ┌───────────────┼───────────────┐
+                                              │               │               │
+                                              ▼               ▼               ▼
+                                          OpenAI          DeepSeek        Anthropic
+                                         (GPT-4o)        (V4-Pro)        (Claude)
 ```
 
 Three subsystems:
@@ -32,7 +38,6 @@ Three subsystems:
 
 - LLVM 21+ (build from source with `-DLLVM_ENABLE_PROJECTS="clang"`)
 - Python 3.10+
-- clang (for benchmark compilation)
 
 ### 1. Build LLVM with AIMV Pass
 
@@ -53,16 +58,35 @@ pip install -e aimv/mcp_server
 
 ### 3. Start MCP Server
 
-```bash
-cd aimv/mcp_server
-AIMV_LLM_BACKEND=openai OPENAI_API_KEY=sk-... \
-  uvicorn aimv_server:app --host 0.0.0.0 --port 8080
-```
-
-For testing without an LLM API key, use mock mode (default):
+Choose your LLM backend:
 
 ```bash
-AIMV_LLM_BACKEND=mock uvicorn aimv_server:app --host 0.0.0.0 --port 8080
+# DeepSeek (已验证通过)
+AIMV_LLM_BACKEND=openai \
+  AIMV_LLM_BASE_URL=https://api.deepseek.com/v1 \
+  OPENAI_API_KEY=sk-your-deepseek-key \
+  AIMV_LLM_MODEL=deepseek-v4-pro \
+  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+
+# OpenAI
+AIMV_LLM_BACKEND=openai \
+  OPENAI_API_KEY=sk-... \
+  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+
+# Anthropic
+AIMV_LLM_BACKEND=anthropic \
+  ANTHROPIC_API_KEY=sk-ant-... \
+  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+
+# Local OpenAI-compatible server (vLLM / Ollama / etc.)
+AIMV_LLM_BACKEND=openai \
+  AIMV_LLM_BASE_URL=http://localhost:8000/v1 \
+  OPENAI_API_KEY=not-needed \
+  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+
+# Mock mode (no API key needed, returns empty suggestions)
+AIMV_LLM_BACKEND=mock \
+  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
 ```
 
 ### 4. Run analysis
@@ -80,6 +104,39 @@ aimv-driver --function=process_task --mode=yaml --mcp-url=http://localhost:8080 
 aimv-driver --function=process_task --dry-run \
   aimv/benchmarks/dep_fail_alias.c
 ```
+
+## LLM Backend Configuration
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AIMV_LLM_BACKEND` | Yes | `mock` | `openai` / `anthropic` / `mock` |
+| `AIMV_LLM_MODEL` | No | `gpt-4o` | Model name |
+| `AIMV_LLM_BASE_URL` | No | SDK default | Custom API endpoint (proxy / local / compatible service) |
+| `OPENAI_API_KEY` | OpenAI only | — | OpenAI/DeepSeek API key |
+| `ANTHROPIC_API_KEY` | Anthropic only | — | Anthropic API key |
+| `DEEPSEEK_API_KEY` | DeepSeek only | — | DeepSeek API key (convenience alias) |
+| `AIMV_API_KEY` | No | — | MCP Server auth key (set to enable Bearer auth on all endpoints) |
+| `AIMV_CACHE_TTL` | No | `86400` | Diagnostic cache TTL in seconds |
+
+### Supported LLM Providers
+
+| Provider | Backend | Protocol | Verified |
+|----------|---------|----------|----------|
+| **DeepSeek** | `openai` | OpenAI-compatible | ✅ Live tested |
+| **OpenAI** | `openai` | Native | SDK verified |
+| **Anthropic** | `anthropic` | Anthropic Messages | SDK verified |
+| **vLLM** | `openai` | OpenAI-compatible | Compatible |
+| **Ollama** | `openai` | OpenAI-compatible | Compatible |
+| **阿里百炼** | `openai` | OpenAI-compatible | Compatible |
+| Any OpenAI-compatible | `openai` | OpenAI-compatible | Compatible |
+
+### Protocol
+
+The MCP Server uses the standard **OpenAI Chat Completions API** (`POST /v1/chat/completions`)
+for `openai` backend, and the **Anthropic Messages API** (`POST /v1/messages`) for `anthropic`.
+Any service compatible with either protocol can be used by setting `AIMV_LLM_BASE_URL`.
 
 ## Usage
 
@@ -135,7 +192,7 @@ GET  /api/v1/cache/stats             — Cache statistics
 POST /api/v1/feedback                — Record suggestion result for prompt optimization
 ```
 
-Authentication: `Authorization: Bearer <AIMV_API_KEY>` (set via `AIMV_API_KEY` env var).
+Authentication (optional): `Authorization: Bearer <AIMV_API_KEY>`.
 
 ## Configuration
 
@@ -144,7 +201,7 @@ Default config at `aimv/config/aimv_config.yaml`:
 ```yaml
 aimv:
   max_rounds: 5
-  aimv_level: moderate          # conservative | moderate | aggressive
+  aimv_level: moderate
   mcp:
     url: http://localhost:8080
     timeout_seconds: 60
@@ -153,7 +210,6 @@ aimv:
     cflags: -O2 -fsave-optimization-record -g
   verify:
     test_cmd: make test
-    check_vectorization: true
     measure_perf: false
   output:
     dir: ./aimv-output
@@ -202,7 +258,6 @@ pytest aimv/test/test_benchmarks.py -v
 ## Project Structure
 
 ```
-aimv/
 ├── README.md
 ├── CLAUDE.md                         # Workspace guidance
 ├── TASK.md                           # Atomic task list (49 tasks)
@@ -216,12 +271,15 @@ aimv/
 ├── aimv/                             # Implementation
 │   ├── driver/                       #   Python driver
 │   ├── mcp_server/                   #   MCP REST API server
+│   │   └── llm/                      #     LLM backends (OpenAI, Anthropic)
 │   ├── ci/                           #   CI integration tools
 │   ├── test/                         #   Test suite
 │   ├── benchmarks/                   #   C benchmark files
 │   └── config/                       #   YAML config templates
 ├── llvm/                             # LLVM source (monorepo)
-│   └── lib/Transforms/AIMV/          #   AIMVFeedbackPass implementation
+│   ├── lib/Transforms/AIMV/          #   AIMVFeedbackPass
+│   ├── lib/Transforms/Vectorize/     #   AIMVDiagnostic.h + LoopVectorize patches
+│   └── include/llvm/Transforms/AIMV/ #   Public headers
 └── .github/workflows/                # GitHub Actions CI
 ```
 
@@ -247,7 +305,8 @@ CI tools:
 
 - **Source-level modification**: AI suggests C/C++ source changes (not IR patches) — developer reviewable
 - **One change per iteration**: minimizes risk, easy to verify
-- **JSON REST API**: universal protocol, works with any LLM provider
+- **OpenAI-compatible protocol**: universal, works with any LLM provider or local model
+- **Multi-provider support**: OpenAI, DeepSeek, Anthropic, any compatible service
 - **Remote LLM**: strongest model quality, team-shared analysis history
 - **Multi-layer safety**: developer review → compile check → test suite → optional Alive2 verification
 - **Independent from EmbeddedJIT**: completely separate system, no shared components
