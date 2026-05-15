@@ -96,6 +96,13 @@ async def analyze_vectorization(request: Request):
                     "model": os.environ.get("AIMV_LLM_MODEL", "gpt-4o"),
                     "base_url": os.environ.get("AIMV_LLM_BASE_URL"),
                 })
+            elif LLM_BACKEND == "anthropic":
+                from .llm.anthropic_backend import AnthropicBackend
+                backend = AnthropicBackend({
+                    "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                    "model": os.environ.get("AIMV_LLM_MODEL", "claude-sonnet-4-6"),
+                    "base_url": os.environ.get("AIMV_LLM_BASE_URL"),
+                })
             elif LLM_BACKEND == "deepseek":
                 from .llm.openai_backend import OpenAIBackend
                 backend = OpenAIBackend({
