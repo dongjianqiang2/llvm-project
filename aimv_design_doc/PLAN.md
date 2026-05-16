@@ -338,8 +338,9 @@ class IterationStatus(Enum):
     PENDING = "pending"         # 等待开始
     COMPILING = "compiling"     # 正在编译
     ANALYZING = "analyzing"     # 正在分析 opt-info
-    QUERYING = "querying"       # 正在请求 MCP
-    PATCHING = "patching"       # 正在应用 patch + 验证（同一锁区间）
+    QUERYING = "querying"       # 正在请求 MCP（不持锁）
+    PATCHING = "patching"       # 正在应用 patch（影子文件，持锁区间内）
+    VERIFYING = "verifying"     # 正在重编译+测试（同一持锁区间内）
     SUCCESS = "success"         # 向量化成功
     FAILED = "failed"           # 本轮失败
     ROLLED_BACK = "rolled_back" # 已回滚
@@ -743,8 +744,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 |------|------|--------|
 | 3 | `AIMVFeedbackPass` 骨架：remark 遍历框架，`--aimv-output` 参数 | Pass 可加载运行 |
 | 4 | `OptInfoCollector`：源码反向映射（`!dbg`），IR 片段提取，remark 结构化 | 完整诊断 JSON 输出 |
-| 5 | `CostModelExporter`：VPlan 代价数据提取，依赖分析信息收集 | 含代价模型的完整诊断 |
-| 5 | clang Driver 集成：`Options.td` 注册 `-faimv`/`-fno-aimv`，`Clang.cpp` 中编译后 `fork+exec aimv-driver --from-json` | ~23 行 C++ |
+| 5 | `CostModelExporter`：VPlan 代价数据提取，依赖分析信息收集；clang Driver 集成：`Options.td` 注册 `-faimv`/`-fno-aimv`，`Clang.cpp` 编译后 `fork+exec aimv-driver --from-json` | 含代价模型的完整诊断 + `-faimv` 入口可工作（~23 行 C++） |
 
 **里程碑**: `clang -O2 -faimv -c benchmark.c` 编译后自动调用 aimv-driver，产出诊断 JSON 和 AI 建议
 
@@ -774,7 +774,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 | 10 | `source_manager`：影子文件协议、原子替换、备份、回滚、残留影子检测 | 安全的 patch 管理 |
 | 11 | `iteration_tracker`：SessionRecord 完整日志（多函数 PerFunctionResult），JSON 格式 session 文件 | 完整可追溯日志 |
 
-**里程碑**: `aimv-driver --function=proc dep_fail.c` 完成多轮迭代并输出 session.json
+**里程碑**: `aimv-driver --function=proc dep_fail.c` 完成多轮迭代并输出 session.json（手动模式）；`clang -O2 -faimv -c dep_fail.c` 完成端到端闭环（Driver 模式）
 
 ---
 
@@ -911,6 +911,6 @@ aimv:
 
 ---
 
-*文档版本: 1.1*
+*文档版本: 1.2*
 *创建日期: 2026-04-29*
-*最后更新: 2026-05-16*
+*最后更新: 2026-05-17*
