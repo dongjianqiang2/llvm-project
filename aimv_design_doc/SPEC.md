@@ -85,7 +85,7 @@ clang Driver (C++)                     aimv-driver (Python)
 |----|------|-----|
 | clang Driver (`Clang.cpp`) | 解析 `-faimv`，编译后 `fork+exec aimv-driver` | ~20 行 |
 | clang Options (`Options.td`) | 注册 `-faimv` / `-fno-aimv` flag | 3 行 |
-| LLVM Pass Pipeline | 注册 AIMVFeedbackPass，无修改 | 已完成 |
+| LLVM Pass Pipeline | 注册 AIMVFeedbackPass，无修改 | 设计已完成，待集成到 clang 构建 |
 | aimv-driver (Python) | 编排逻辑，无修改；新增 `--from-json` 入口 | ~10 行 |
 
 **空诊断时的行为**：`aimv.json` 中所有 diagnostics 的 `severity == "passed"`（即无向量化失败）时，`aimv-driver` 直接 exit 0，输出：`[AIMV] all loops already vectorized, nothing to do` 到 stderr。clang Driver 将该 exit 0 视为成功。
@@ -319,10 +319,10 @@ Content-Type: application/json
       "outcome": "compile_passed, vectorization_still_failed"
     }
   ]
-  // history 传递策略：发送最近 3 轮的历史（含 outcome），让 AI 避免重复建议。
-  // 不足 3 轮时发送全部。每条 history 约 100-200 字节，不会显著增加请求体积。
 }
 ```
+
+history 传递策略：发送最近 3 轮的历史（含 outcome），让 AI 避免重复建议。不足 3 轮时发送全部。每条 history 约 100-200 字节，不会显著增加请求体积。
 
 ### 5.3 诊断信息包（每轮发送给大模型）
 
@@ -380,7 +380,7 @@ Content-Type: application/json
 
 **合格阈值**: 中位数执行时间缩短 ≥ **5%** 且所有测试无回归。不只看向量化 "覆盖率"，要验证实际加速比。
 
-### 8.2 验证 Benchmark 集（首期）
+### 8.2 验证 Benchmark 集
 
 从 `aimv/benchmarks/` 中选取至少 5 个已知有向量化失败场景的 C 文件：
 
@@ -427,6 +427,7 @@ Content-Type: application/json
 | 决策点              | 选择                          | 理由                         |
 | ---------------- | --------------------------- | -------------------------- |
 | 入口方式             | clang Driver 原生集成（非外部 wrapper） | 零安装成本，`-faimv`/`-mllvm` 分层天然防 fork 链 |
+| 迭代粒度             | 按函数顺序处理，每函数独立轮次              | 多函数文件中已成功的函数不受其他函数失败影响 |
 | 修改层级             | C/C++ 源码层                   | 开发者可 review，可维护，不引入 IR 层魔数 |
 | MCP 协议           | JSON REST API               | 最通用，调试友好，易与多种大模型平台对接       |
 | MCP 部署           | 远程云端服务                      | 使用最强模型能力，支持团队共享分析历史        |
@@ -453,6 +454,6 @@ Content-Type: application/json
 
 ---
 
-*文档版本: 1.3*
+*文档版本: 1.4*
 *创建日期: 2026-04-29*
 *最后更新: 2026-05-16*

@@ -1,8 +1,8 @@
-# AIMV 技术方案 v1.0
+# AIMV 技术方案 v1.1
 
-**版本**: 1.0
-**日期**: 2026-04-29
-**关联文档**: SPEC.md
+**版本**: 1.1
+**日期**: 2026-05-16
+**关联文档**: SPEC.md v1.4
 
 ---
 
@@ -23,25 +23,28 @@ aimv/                                    # 项目根目录
 │   │                                    #   --from-json=<path> 由 clang Driver 调用
 │   ├── opt_info_parser.py               # 解析 YAML/JSON opt-records
 │   ├── mcp_client.py                    # MCP REST API 客户端
-│   ├── source_manager.py               # 源码 patch + 回滚 + 工作目录管理
+│   ├── source_manager.py               # 源码 patch + 回滚 + 影子文件协议
 │   ├── build_orchestrator.py            # 编译/测试 编排（迭代控制）
 │   ├── iteration_tracker.py             # 迭代状态追踪与日志
 │   └── requirements.txt
 │
-├── mcp-server/                          # MCP REST API 服务端
-│   ├── aimv_server.py                   # FastAPI/Flask 入口
+├── mcp_server/                          # MCP REST API 服务端
+│   ├── aimv_server.py                   # FastAPI 入口
 │   ├── models.py                        # Pydantic 请求/响应模型
 │   ├── prompt_builder.py                # 诊断信息 → LLM prompt 构造
 │   ├── suggestion_parser.py             # LLM 响应 → 结构化 patch 解析
 │   ├── cache.py                         # 诊断模式缓存（避免重复请求）
 │   └── requirements.txt
 │
-├── llvm/                                # LLVM 侧组件（直接在 llvm/ 目录下）
+├── llvm/                                # LLVM monorepo 根目录（与 aimv/ 平级，不在 aimv/ 内）
 │   ├── lib/Transforms/AIMV/
 │   │   ├── AIMVFeedbackPass.cpp         # Function Pass 主实现
 │   │   ├── AIMVDiagnosticParser.cpp     # !aimv.diag Metadata → RawDiagnostic 解析
 │   │   └── CMakeLists.txt
-│   │
+│   ├── lib/Transforms/Vectorize/
+│   │   └── AIMVDiagnostic.h             # emitAIMVDiagnostic() 共享头文件
+│   ├── lib/Passes/                      # PassBuilder + PassRegistry 注册点
+│   ├── lib/Driver/ToolChains/           # clang Driver: -faimv flag 解析（Clang.cpp）
 │   └── include/llvm/Transforms/AIMV/
 │       └── AIMVFeedback.h               # Pass 公共头文件
 │
@@ -66,10 +69,11 @@ aimv/                                    # 项目根目录
 │       └── test_dep_fail.c              # 已知向量化失败的 benchmark
 │
 ├── benchmarks/                          # 验证用的循环 benchmark
-│   ├── dep_fail_alias.c                 # 别名分析失败场景
-│   ├── dep_fail_stride.c                # 跨迭代依赖场景
-│   ├── cost_reject.c                    # 代价模型拒绝场景
-│   └── align_unknown.c                  # 对齐未知场景
+│   ├── dep_fail_alias.c                 # 别名分析失败场景 (MVP)
+│   ├── dep_fail_stride.c                # 跨迭代依赖场景 (MVP)
+│   ├── cost_reject.c                    # 代价模型拒绝场景 (Phase 2)
+│   ├── align_unknown.c                  # 对齐未知场景 (Phase 2)
+│   └── multi_fail.c                     # 混合失败场景 (Phase 2)
 │
 ├── config/
 │   └── aimv_config.yaml                 # 默认配置模板
@@ -103,17 +107,20 @@ aimv/                                    # 项目根目录
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │                 aimv-driver (Python 编排)                     │  │
 │  │                                                              │  │
+│  │  对文件中每个失败函数顺序处理（每函数独立轮次）:                    │  │
+│  │                                                              │  │
 │  │  ┌──────────────┐   ┌──────────────┐   ┌──────────┐         │  │
-│  │  │  MCP Server  │──▶│  源码 patch   │──▶│ 重编译   │         │  │
-│  │  │  AI 分析      │   │  原地覆盖     │   │ +测试    │         │  │
+│  │  │  MCP Server  │──▶│  影子文件     │──▶│ 重编译   │         │  │
+│  │  │  AI 分析      │   │  patch+替换  │   │ +测试    │         │  │
 │  │  └──────────────┘   └──────────────┘   └──────────┘         │  │
 │  │       ▲                                              │       │  │
 │  │       └──────────────────────────────────────────────┘       │  │
-│  │                      (N轮迭代)                                │  │
+│  │                      (每函数 N轮迭代)                          │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │                                                                     │
-│  终止: 成功 / N轮上限 / 收益不增回滚                                  │
+│  终止: 成功 / N轮上限 / 收益不增回滚（passed remark减少）             │
 │  产出: 修改后的源文件 + task.c.aimv.patch + session.json             │
+│  追溯: 累积patch + session记录 + 源码备份（详见 SPEC §3.1）          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -143,11 +150,15 @@ clang -O2 -faimv -c src.c
 │ (Python)     │     │ (磁盘)        │         │ / GPT        │
 │              │     │              │         │ / Claude     │
 │· 读 JSON     │     └──────────────┘         └──────────────┘
+│· 按函数迭代   │
+│· 影子文件协议 │
 │· MCP→patch   │
 │· 重编译验证   │
 └──────────────┘
 
-配置: ~/.aimv/config  — mcp_url, api_key, max_rounds, aimv_level
+配置优先级: ~/.aimv/config > 环境变量 > 默认值
+  环境变量: AIMV_MCP_URL, AIMV_LEVEL, AIMV_MAX_ROUNDS, AIMV_TEST_CMD
+  默认值:   mcp_url=localhost:8080, aimv_level=conservative, max_rounds=5, test_cmd=""
 ```
 
 ### 2.3 Driver 迭代状态机
@@ -156,35 +167,32 @@ clang -O2 -faimv -c src.c
           ┌──────────────┐
           │  IDLE        │
           └──────┬───────┘
-                 │ 开始分析函数 F
+                 │ 遍历文件中的失败函数（顺序处理）
+                 │ 对每个函数 F:
                  ▼
           ┌──────────────┐
-    ┌────▶│  COMPILING   │  clang -fsave-optimization-record
+    ┌────▶│  COMPILING   │  clang -mllvm -aimv-enable（不含 -faimv）
     │     └──────┬───────┘
     │            │
     │            ▼
     │     ┌──────────────┐
-    │     │  ANALYZING   │  解析 opt-records, 构造 JSON 诊断包
+    │     │  ANALYZING   │  解析 aimv.json 诊断包
     │     └──────┬───────┘
     │            │
     │            ▼
     │     ┌──────────────┐
     │     │  QUERYING    │  POST → MCP Server → 解析 suggestion
-    │     └──────┬───────┘
+    │     └──────┬───────┘    （不持锁，MCP 网络调用在锁外）
     │            │
     │            ▼
     │     ┌──────────────┐
-    │     │  PATCHING    │  应用 diff, 记录回滚点
-    │     └──────┬───────┘
+    │     │ PATCH+VERIFY │  [获取锁] 影子文件协议: cp→patch→重编译→测试
+    │     │  (同一锁区间) │  通过 → mv shadow→原文件 [释放锁]
+    │     └──────┬───────┘  失败 → rm shadow [释放锁]
     │            │
-    │            ▼
-    │     ┌──────────────┐
-    │     │  VERIFYING   │  重编译 + 运行测试
-    │     └──────┬───────┘
-    │            │
-    │            ├── 向量化成功 ──▶ SUCCESS
-    │            ├── 轮次上限   ──▶ GIVE_UP
-    │            ├── 收益退化   ──▶ ROLLBACK
+    │            ├── 向量化成功 ──▶ SUCCESS → 处理下一个函数
+    │            ├── 轮次上限   ──▶ GIVE_UP（该函数放弃，不影响其他函数）
+    │            ├── 收益退化   ──▶ ROLLBACK（passed remark 减少则回滚）
     │            └── 继续       ──▶ (round++) ──┘
 ```
 
@@ -195,7 +203,7 @@ clang -O2 -faimv -c src.c
 ### 3.1 诊断信息模型
 
 ```python
-# [AIMV] mcp-server/models.py
+# [AIMV] mcp_server/models.py
 #
 # 注意: 此模型为 API 层的权威数据源（API Contract）。
 # MCP_DESIGN.md 中的模型定义是最终参考，其他文档应与之保持一致。
@@ -269,12 +277,21 @@ class TargetInfo(BaseModel):
     vector_width: int = Field(..., gt=0)
 
 class FunctionInfo(BaseModel):
-    """被分析函数信息"""
+    """被分析函数信息
+    注意: source_code 为当前文件的完整内容（已包含前面函数所有已通过变更的版本），
+    非~=原始源码。AI 生成的 diff 基于该版本，行号与当前文件一致。"""
     name: str
     signature: str
     source_code: str
     source_file: str
     loop_line: int = Field(..., gt=0)
+
+class HistoryRecord(BaseModel):
+    """历史轮次记录 — 发送最近 3 轮，不足 3 轮时发送全部"""
+    round: int
+    diagnosis_summary: str
+    suggestion_applied: str
+    outcome: str      # e.g. "compile_passed, vectorization_still_failed"
 
 class AnalyzeRequest(BaseModel):
     """POST /api/v1/analyze-vectorization 请求体"""
@@ -282,8 +299,8 @@ class AnalyzeRequest(BaseModel):
     target: TargetInfo
     function: FunctionInfo
     diagnostics: List[SingleDiagnostic] = Field(..., min_length=1)
-    history: List[dict] = []
-    aimv_level: AimvLevel = AimvLevel.MODERATE
+    history: List[HistoryRecord] = []     # 最近 3 轮历史，让 AI 避免重复建议
+    aimv_level: AimvLevel = AimvLevel.CONSERVATIVE
 
 class Suggestion(BaseModel):
     """AI 返回的单条修改建议"""
@@ -331,7 +348,7 @@ class IterationStatus(Enum):
 class TerminationReason(Enum):
     VECTORIZED = "vectorized"           # 函数成功向量化
     ROUND_LIMIT = "round_limit"         # 达到最大轮次
-    NO_IMPROVEMENT = "no_improvement"   # 收益不增
+    NO_IMPROVEMENT = "no_improvement"   # 收益不增（passed remark 数量减少）
     NO_SUGGESTION = "no_suggestion"     # AI 无可用建议
     COMPILE_ERROR = "compile_error"     # patch 导致编译失败
     TEST_FAILURE = "test_failure"       # patch 导致测试失败
@@ -354,14 +371,20 @@ class RoundRecord:
     end_time: Optional[float] = None
 
 @dataclass
+class PerFunctionResult:
+    """单函数迭代结果（多函数文件中每个函数独立记录）"""
+    function_name: str
+    rounds: list = field(default_factory=list)
+    termination_reason: Optional[TerminationReason] = None
+    vectorized: bool = False
+
+@dataclass
 class SessionRecord:
     """完整分析会话记录（简化版；详细字段见 DRIVER_DESIGN.md）"""
-    function_name: str
     source_file: str
     aimv_level: str
     max_rounds: int
-    target_loop_line: Optional[str] = None  # 目标循环源码位置（首轮自动选定）
-    rounds: list = field(default_factory=list)
+    functions: list = field(default_factory=list)  # List[PerFunctionResult]
     termination_reason: Optional[TerminationReason] = None
     final_patch_path: Optional[str] = None
     overall_perf_improvement_pct: Optional[float] = None
@@ -372,6 +395,21 @@ class SessionRecord:
 
 ```python
 # [AIMV] driver/source_manager.py
+#
+# 影子文件 + 原子替换协议（详见 SPEC §3.1）:
+#   1. [无锁] MCP 查询获得 AI 建议
+#   2. [获取锁]
+#      a. cp source → source.aimv-tmp（基于当前版本快照）
+#      b. diff 基于快照生成
+#      c. patch source.aimv-tmp（在影子上修改）
+#      d. clang -c source.aimv-tmp（编译验证，原文件不受影响）
+#      e. 通过 → mv source.aimv-tmp source（rename(2) 原子替换）
+#         失败 → rm source.aimv-tmp
+#   3. [释放锁]
+#
+# 锁作用域: 仅步骤 2a-2e（文件 I/O，秒级）。MCP 查询不占锁。
+# 多函数: 每函数独立应用原子替换，函数 A 成功后立即 mv，不等待 B。
+# 中止保护: kill -9 残留 .aimv-tmp 文件，下次启动时警告用户手动检查。
 
 @dataclass
 class PatchRecord:
@@ -395,6 +433,10 @@ class SourceManager:
 
     def rollback_all(self):
         """按反序回滚所有 patch，单条失败不中断后续回滚"""
+        ...
+
+    def check_stale_shadow(self, source_file: str) -> Optional[str]:
+        """检测残留影子文件（kill -9 后）。返回路径或 None。"""
         ...
 ```
 
@@ -481,7 +523,7 @@ public:
 输出: JSON 文件（diagnostics 部分），供 aimv-driver 补充 function/target 后发送 MCP
 ```
 
-### 4.3 clang Driver 集成（主入口 — 方案 B）
+### 4.3 clang Driver 集成（主入口）
 
 ```
 用法与 clang 完全一致，仅新增 -faimv flag:
@@ -493,25 +535,38 @@ clang Driver 行为（C++，约 20 行改动）:
   2. 编译阶段: -faimv 存在 → 转发 -mllvm -aimv-enable -mllvm -aimv-output=<path>
      → AIMVFeedbackPass 产出 aimv.json
   3. 编译完成后: fork + exec aimv-driver --from-json=<aimv.json> --source=<file>
-     → driver 内部: 检查向量化 → MCP → AI → patch → 重编译 → 测试
+     → driver 内部: 按函数迭代 → MCP → AI → 影子文件 patch → 重编译 → 测试
   4. driver exit 0 → clang exit 0 (源码已修改)
      driver exit ≠0 → 回滚源码，输出报告路径到 stderr
 
-aimv-driver 新增 --from-json 入口（Python，约 10 行改动）:
+空诊断: aimv.json 中所有 severity=="passed" 时，driver 直接 exit 0:
+  [AIMV] all loops already vectorized, nothing to do
+
+aimv-driver --from-json 入口（Python，约 10 行改动）:
   --from-json=<path>   直接从 AIMV JSON 启动分析（跳过首次编译）
   --source=<file>      指定源文件路径
 
-**迭代重编译机制（防无限 fork）**:
+  执行路径:
+    1. 读 aimv.json，提取所有 severity=="missed" 的函数名列表
+    2. 若列表为空 → stderr: "nothing to do" → exit 0
+    3. 读 ~/.aimv/config + 环境变量获取 MCP URL / level / max_rounds
+    4. 对每个失败函数顺序处理:
+       a. 读当前源文件（可能已被前一个函数的 patch 修改）
+       b. 进入迭代循环: 编译 → MCP → AI → 影子文件 patch → 验证
+       c. 目标函数 passed → 处理下一个函数
+       d. 到达 max_rounds → 该函数放弃，处理下一个函数
+    5. 全部函数处理完毕 → 输出汇总到 stderr → exit 0
 
-```
--faimv 只在 clang Driver 层（C++）生效。
-aimv-driver 内部通过 BuildOrchestrator 重编译时，只传递 LLVM 后端 flag:
+防无限 fork: -faimv 只在 clang Driver 层（C++）生效。
+aimv-driver 内部重编译时只传 LLVM 后端 flag:
   clang -O2 -mllvm -aimv-enable -mllvm -aimv-output=<path> -c task.c
 不传 -faimv → 不会触发 Driver 再次 fork → 不会产生 fork 链。
 
-**并发安全**: 影子文件 + 原子替换（见 SPEC §3.1），FileLock 锁文件 I/O 阶段。
-MCP 查询不占锁，多个源文件完全并行。
-```
+作用范围: 仅修改 .c/.cpp 源文件，不修改头文件（.h/.hpp）。
+MVP 不处理头文件中的 static inline 函数或宏展开导致的向量化失败。
+
+自动化与人工审查: 默认全自动。AIMV_MODE=review 时每轮 patch 前暂停等待
+用户 [y/N/r/q] 确认。默认跳过 review 是因为编译验证+测试套件已可拦截语义错误。
 
 禁用 AIMV:
   -fno-aimv           # 本次编译跳过
@@ -520,16 +575,54 @@ MCP 查询不占锁，多个源文件完全并行。
   -faimv -mllvm -aimv-dry-run   # 产 aimv.json 但不调 driver
 ```
 
-**配置文件 `~/.aimv/config`**:
+**fork+exec 异常处理**：
+
+| 场景 | clang Driver 行为 |
+|------|------------------|
+| `aimv-driver` 未安装 / 找不到 | 打印警告到 stderr，退化到普通编译（exit code 不变） |
+| `aimv-driver` 崩溃（非零退出 / signal） | 回滚源码，打印错误到 stderr，exit code = driver 退出码 |
+| `aimv-driver` 超时（默认 120s） | SIGKILL 终止，回滚源码，打印超时错误 |
+| SIGINT / SIGTERM | 传递给 driver，由其回滚后退出 |
+
+**编译结束后的用户可见输出**（aimv-driver 输出到 stderr）：
+
+```
+# 单函数成功：
+[AIMV] process_task: vectorized (2 rounds, conservative)
+[AIMV]   Round 1: added restrict to parameter 'a' (line 1)
+[AIMV]   Patch: /home/user/task.c.aimv.patch
+[AIMV]   Report: /home/user/aimv-output/session_xxx.json
+
+# 多函数混合结果：
+[AIMV] task.c: 3 functions analyzed, 2 optimized, 1 skipped
+[AIMV]   process_task: vectorized (2 rounds, conservative)
+[AIMV]   filter_data:  vectorized (1 round, moderate)
+[AIMV]   init_buf:     already vectorized (skipped)
+
+# 放弃场景：
+[AIMV] process_task: unable to vectorize (3 rounds exhausted)
+[AIMV]   Source rolled back to original
+[AIMV]   Report: /home/user/aimv-output/session_xxx.json
+```
+
+**配置来源**（优先级从高到低）：
+
+1. `~/.aimv/config`（YAML，用户全局配置）
+2. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`
+3. 默认值：`mcp_url=http://localhost:8080`、`aimv_level=conservative`、`max_rounds=5`、`test_cmd=""`
+
+aimv.json 仅包含诊断数据，不含配置字段。
+
+**配置文件 `~/.aimv/config` 示例**:
 
 ```yaml
 mcp:
   url: http://aimv-server:8080
   api_key: sk-xxx
 driver:
-  max_rounds: 3
+  max_rounds: 5
   aimv_level: conservative
-  test_cmd: make test
+  test_cmd: ""                # 空 = 仅编译验证，跳过测试
 ```
 
 ### 4.4 Driver CLI 接口（手动/CI 使用）
@@ -544,12 +637,13 @@ OPTIONS:
   --mcp-url URL         MCP 服务地址（默认 http://localhost:8080）
   --output-dir DIR      输出目录（日志、patch、诊断 JSON）
   --build-cmd CMD       编译命令模板（默认 "clang -fsave-optimization-record {src}"）
-  --test-cmd CMD        测试命令模板
+  --test-cmd CMD        测试命令模板（默认空，仅编译验证）
   --dry-run             仅收集诊断，不执行修改
+  --require-review      每轮 patch 前等待用户确认
   --verbose             详细日志
 ```
 
-### 4.4 Offline Tool CLI 接口
+### 4.5 Offline Tool CLI 接口
 
 ```
 aimv-analyze [OPTIONS] <opt_record_file.yaml>
@@ -587,6 +681,7 @@ IMPORTANT RULES:
 - Each suggestion must be a single, local change
 - Provide a unified diff in the response
 - Be aware this is embedded code: avoid heap allocations, respect stack limits
+- Only suggest modifications to .c/.cpp source files, never to headers
 ```
 
 ### 5.2 诊断上下文注入格式
@@ -595,7 +690,7 @@ IMPORTANT RULES:
 ## Function: {function.name}
 Source file: {function.source_file}, line: {function.loop_line}
 
-### Source Code
+### Source Code (current version with prior changes applied)
 ```c
 {function.source_code}
 ```
@@ -618,7 +713,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 #### Dependencies
 {dep info table}
 
-#### Previous Attempts (this session)
+#### Previous Attempts (last 3 rounds)
 {history summary}
 
 {endfor}
@@ -635,7 +730,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 | 周次 | 任务 | 交付物 |
 |------|------|--------|
 | 1 | 目录结构搭建，CMakeLists.txt，Python venv/requirements | 可构建的空骨架 |
-| 2 | 配置系统（YAML schema），日志基础设施，单元测试框架 | 可运行的测试框架 |
+| 2 | 配置系统（YAML schema + 环境变量优先级），日志基础设施，单元测试框架 | 可运行的测试框架 |
 
 **里程碑**: `aimv-driver --help` 可执行，无实际逻辑
 
@@ -650,8 +745,9 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 | 3 | `AIMVFeedbackPass` 骨架：remark 遍历框架，`--aimv-output` 参数 | Pass 可加载运行 |
 | 4 | `OptInfoCollector`：源码反向映射（`!dbg`），IR 片段提取，remark 结构化 | 完整诊断 JSON 输出 |
 | 5 | `CostModelExporter`：VPlan 代价数据提取，依赖分析信息收集 | 含代价模型的完整诊断 |
+| 5 | clang Driver 集成：`Options.td` 注册 `-faimv`/`-fno-aimv`，`Clang.cpp` 中编译后 `fork+exec aimv-driver --from-json` | ~23 行 C++ |
 
-**里程碑**: 对已知 benchmark 运行 `clang -fpass-plugin=AIMVFeedback -aimv-output=diag.json`，输出完整诊断 JSON
+**里程碑**: `clang -O2 -faimv -c benchmark.c` 编译后自动调用 aimv-driver，产出诊断 JSON 和 AI 建议
 
 ---
 
@@ -676,8 +772,8 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 | 周次 | 任务 | 交付物 |
 |------|------|--------|
 | 9 | `build_orchestrator`：编译→解析→请求→重编译 迭代控制，终止条件判断 | 单轮闭环可运行 |
-| 10 | `source_patcher`：diff 应用、备份、回滚机制 | 安全的 patch 管理 |
-| 11 | `iteration_tracker`：SessionRecord 完整日志，JSON 格式 session 文件 | 完整可追溯日志 |
+| 10 | `source_manager`：影子文件协议、原子替换、备份、回滚、残留影子检测 | 安全的 patch 管理 |
+| 11 | `iteration_tracker`：SessionRecord 完整日志（多函数 PerFunctionResult），JSON 格式 session 文件 | 完整可追溯日志 |
 
 **里程碑**: `aimv-driver --function=proc dep_fail.c` 完成多轮迭代并输出 session.json
 
@@ -689,10 +785,17 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 
 | 周次 | 任务 | 交付物 |
 |------|------|--------|
-| 12 | 端到端联调：Pass + Driver + MCP Server，修正 prompt 精度 | 完整链路工作 |
-| 13 | 依赖分析 benchmark 集（3-5 个已知失败 case），验证端到端成功率 | benchmark 集 + 测试报告 |
+| 12 | 端到端联调：Pass + Driver + MCP Server + clang Driver `-faimv` 集成，修正 prompt 精度 | 完整链路工作（含 `-faimv` 入口） |
+| 13 | 依赖分析 benchmark 集（dep_fail_alias, dep_fail_stride），验证端到端成功率 | benchmark 集 + 测试报告 |
 
-**里程碑**: 至少 3 个 benchmark 通过 AIMV 成功向量化，性能有可测量提升
+**MVP 交付物**（对应 SPEC §7）:
+1. `aimv-driver` Python 脚本（编排编译-诊断-MCP-patch 流程）
+2. `AIVectorizeFeedback` LLVM Pass（收集 opt-info 诊断信息）
+3. MCP REST API mock/实现（接收诊断、返回建议）
+4. clang Driver `-faimv` 解析 + `fork+exec aimv-driver` 集成
+5. 1 个已知失败 benchmark 的端到端 demo（含 clang `-faimv` 入口）
+
+**里程碑**: 至少 2 个 MVP benchmark 通过 AIMV 成功向量化，性能有可测量提升
 
 ---
 
@@ -749,7 +852,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 - 阶段 0 是所有阶段的前置依赖
 - 阶段 1 应先行产出真实 JSON 诊断样本（至少 1 个 benchmark 的完整诊断 JSON）
 - 阶段 2/3 可用 mock JSON 并行开发骨架，但完整 prompt 工程和 driver 集成需真实 JSON 样本验证
-- 阶段 4 依赖 1+2+3 全部完成
+- 阶段 4 依赖 1+2+3 全部完成，并包含 clang Driver `-faimv` 集成
 - 阶段 5/6 依赖 MVP 验证通过
 
 ---
@@ -760,10 +863,11 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 |------|------|----------|
 | `!dbg` 反向映射不精确（优化后 IR 行号漂移） | AI 建议无法精确定位源码行 | 多级回退：!dbg → DILocation → 函数级匹配；标注 "approximate" |
 | LLM 输出格式不稳定 | 无法自动解析为结构化 patch | 强制 JSON schema 约束 + 重试机制 + 格式验证层 |
-| LLM 幻觉导致语义错误 | 引入 bug | 多层验证（编译+测试），回滚机制 |
+| LLM 幻觉导致语义错误 | 引入 bug | 多层验证（编译+测试），影子文件回滚机制 |
 | VPlan 逐指令代价不易导出 | 诊断信息不完整 | MVP 使用 expectedCost() 总代价，足够判断向量化是否划算；逐指令代价延后到 Phase 2 |
-| MCP 服务延迟大 | 编译迭代变慢 | 异步请求 + 模式缓存 + 本地预处理过滤 |
+| MCP 服务延迟大 | 编译迭代变慢 | MCP 查询不持锁，异步请求 + 模式缓存 + 本地预处理过滤 |
 | LLM token 消耗大 | 成本高 | 诊断信息压缩（只发失败循环的 IR，裁剪非必要上下文） |
+| 多函数文件中前序函数变更影响后续 | diff 行号偏移 | 发送当前文件完整内容（含已通过变更），AI diff 基于当前版本 |
 
 ---
 
@@ -771,6 +875,8 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 
 ```yaml
 # aimv_config.yaml — 默认配置
+# 配置优先级: 此文件 > 环境变量 > 代码默认值
+# 环境变量: AIMV_MCP_URL, AIMV_LEVEL, AIMV_MAX_ROUNDS, AIMV_TEST_CMD
 
 aimv:
   # 迭代控制
@@ -793,9 +899,9 @@ aimv:
 
   # 验证
   verify:
-    test_cmd: "make test"
-    check_vectorization: true      # 检查重编译后 remark 是否变为 passed
-    measure_perf: false            # 需要硬件 PMU 或计时框架
+    test_cmd: ""                  # 空 = 仅编译验证，跳过测试；设为 "make test" 等启用测试
+    check_vectorization: true     # 检查重编译后 remark 是否变为 passed
+    measure_perf: false           # Phase 2 预留（需硬件 PMU 或计时框架）
 
   # 输出
   output:
@@ -806,5 +912,6 @@ aimv:
 
 ---
 
-*文档版本: 1.0*
+*文档版本: 1.1*
 *创建日期: 2026-04-29*
+*最后更新: 2026-05-16*
