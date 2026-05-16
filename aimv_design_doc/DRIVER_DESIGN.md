@@ -1,8 +1,9 @@
 # AIMV — aimv-driver 详细设计方案
 
-**版本**: 1.0
-**日期**: 2026-04-29
-**关联文档**: SPEC.md, PLAN.md, LLVM_DESIGN.md, MCP_DESIGN.md
+**版本**: 2.0
+**日期**: 2026-05-17
+**关联文档**: SPEC.md v1.4, PLAN.md v1.1, LLVM_DESIGN.md, MCP_DESIGN.md
+**数据模型权威源**: MCP_DESIGN.md > PLAN.md > SPEC.md
 
 ---
 
@@ -10,20 +11,20 @@
 
 `aimv-driver` 是 AIMV 闭环的编排中枢。它不实现任何编译优化逻辑，只负责将诊断信息（来自 LLVM Pass 或 YAML opt-records）、MCP Server（AI 分析）、源码 patch + 重编译验证串联为可控的迭代循环。
 
-**双模式运行**（对应 SPEC §3 的系统形态）:
+**双模式运行**（对应 SPEC §3.1 + §3.2）:
 
-| 模式 | 诊断来源 | LLVM 改动 | 诊断丰富度 | 启动方式 |
-|------|---------|----------|-----------|---------|
-| **Pass 模式** | AIMVFeedbackPass JSON | 需要 | 完整（代价模型 + 依赖分析） | 默认，自动检测 `-aimv-output` |
-| **YAML 模式** | `-fsave-optimization-record` YAML | 零侵入 | 基础（remark 文本 + 源码位置） | `--mode=yaml` 或当 aimv.json 不存在时自动回退 |
+| 模式 | 诊断来源 | 启动方式 | 典型场景 |
+|------|---------|---------|---------|
+| **`--from-json` 模式** | AIMVFeedbackPass JSON（首次），后续轮次自产 | `aimv-driver --from-json=aimv.json --source=task.c`（由 clang Driver fork+exec） | clang `-faimv` 原生集成，主入口 |
+| **独立模式** | 自行编译获取 YAML/JSON | `aimv-driver --function=foo task.c` | 开发者手动控制、CI 集成 |
 
 核心职责：
-1. **编译编排** — 管理 clang 子进程，注入 AIMV flags，解析 opt-records
+1. **编译编排** — 管理 clang 子进程，注入 AIMV flags（`-mllvm -aimv-enable`，永不传 `-faimv`），解析 opt-records
 2. **MCP 通信** — 发送诊断 JSON，接收结构化建议，处理超时/重试
-3. **源码管理** — 影子文件 + 原子替换协议（见 SPEC §3.1），FileLock 并发控制
+3. **源码管理** — 影子文件 + 原子替换协议（SPEC §3.1），FileLock 并发控制
 4. **验证编排** — 运行测试套件，检查向量化 remark，可选性能测量
-5. **迭代决策** — 根据终止条件决定继续/换策略/回滚/放弃
-6. **持久化** — 完整 Session JSON，支持崩溃恢复后继续
+5. **迭代决策** — 根据终止条件（向量化成功 / 轮次上限 / 收益退化）决定继续/回滚/放弃
+6. **持久化** — 完整 Session JSON，traceability artifacts（累积 patch、session 记录、备份）
 
 ---
 
@@ -35,51 +36,184 @@ aimv/driver/
 ├── build_orchestrator.py       # 子进程管理（clang、test）
 ├── opt_info_parser.py          # opt-record YAML/JSON 解析
 ├── mcp_client.py               # MCP REST 客户端（含重试）
-├── source_manager.py           # 源码 patch + 回滚 + 工作目录管理
+├── source_manager.py           # 源码 patch + 回滚 + 影子文件协议 + FileLock
 ├── iteration_engine.py         # 迭代策略决策引擎
 ├── session_store.py            # Session 持久化与恢复
-├── perf_measurer.py            # 性能测量（可选）
-├── models.py                   # 内部数据模型（与 MCP 模型不同）
-└── config.py                   # 配置加载与校验
+├── perf_measurer.py            # 性能测量（可选，Phase 2）
+├── models.py                   # 内部数据模型（PerFunctionResult, RoundRecord 等）
+├── config.py                   # 配置加载（~/.aimv/config + env vars + defaults）
+└── requirements.txt
 ```
 
 ### 1.1 模块交互
 
 ```
-                    ┌──────────────────────┐
-                    │    aimv_driver.py     │
-                    │   (CLI + 主循环)       │
-                    └──────┬───────────────┘
+                    ┌──────────────────────────────────┐
+                    │        aimv_driver.py             │
+                    │   CLI + --from-json 入口          │
+                    │   多函数顺序编排主循环             │
+                    └──────┬───────────────────────────┘
                            │
           ┌────────────────┼────────────────┐
           │                │                │
           ▼                ▼                ▼
 ┌─────────────────┐ ┌─────────────┐ ┌──────────────────┐
 │build_orchestrator│ │mcp_client   │ │source_manager    │
-│· compile()      │ │· analyze()  │ │· apply_patch()   │
+│· compile()      │ │· analyze()  │ │· apply_shadow()  │
 │· test()         │ │· health()   │ │· rollback()      │
-│· get_remarks()  │ │             │ │· get_backups()   │
-└────────┬────────┘ └──────┬──────┘ └────────┬─────────┘
-         │                 │                  │
-         ▼                 ▼                  ▼
-┌─────────────────┐ ┌─────────────┐ ┌──────────────────┐
-│opt_info_parser  │ │config       │ │session_store     │
-│· parse_yaml()   │ │· load()     │ │· save()          │
-│· extract_loops()│ │· validate() │ │· resume()        │
+│· get_remarks()  │ │             │ │· check_stale()   │
+└────────┬────────┘ └──────┬──────┘ │· FileLock        │
+         │                 │        └────────┬─────────┘
+         ▼                 ▼                 │
+┌─────────────────┐ ┌─────────────┐          │
+│opt_info_parser  │ │config       │ ┌────────┴─────────┐
+│· parse_yaml()   │ │· load()     │ │session_store     │
+│· parse_json()   │ │· validate() │ │· save()          │
+│· extract_loops()│ │             │ │· resume()        │
 └─────────────────┘ └─────────────┘ └──────────────────┘
                            │
           ┌────────────────┤
           ▼                ▼
 ┌─────────────────┐ ┌──────────────────┐
 │iteration_engine │ │perf_measurer     │
-│· decide_next()  │ │· measure()       │
+│· decide_next()  │ │· measure()       │  (Phase 2)
 │· should_stop()  │ │· compare()       │
 └─────────────────┘ └──────────────────┘
 ```
 
 ---
 
-## 2. 内部数据模型
+## 2. `--from-json` 入口（主模式）
+
+这是 clang Driver fork+exec 调用时的主入口，对应 PLAN §4.3 描述的完整执行路径。
+
+### 2.1 执行流程
+
+```python
+# [AIMV] driver/aimv_driver.py
+
+def main_from_json(aimv_json_path: str, source_file: str) -> int:
+    """--from-json 入口：由 clang Driver fork+exec 调用。
+
+    执行路径（PLAN §4.3）:
+      1. 读 aimv.json → 提取 severity=="missed" 的函数名列表
+      2. 若列表为空 → stderr "nothing to do" → exit 0
+      3. 加载配置: ~/.aimv/config + 环境变量 → defaults
+      4. 对每个失败函数顺序处理:
+         a. 读当前源文件（已包含前面函数已通过的变更）
+         b. 迭代循环: 编译 → MCP → 影子文件 patch → 验证
+         c. 向量化成功 → 处理下一个函数
+         d. 到达 max_rounds → 该函数放弃，处理下一个函数
+      5. 全部函数处理完毕 → 输出汇总到 stderr → exit 0
+    """
+    import json
+    import sys
+
+    # Step 1: 读取 aimv.json
+    with open(aimv_json_path) as f:
+        aimv_data = json.load(f)
+
+    diagnostics = aimv_data.get("diagnostics", [])
+
+    # 提取所有 severity=="missed" 的函数名（去重，保持顺序）
+    failed_functions = list(dict.fromkeys(
+        d["function_name"]
+        for d in diagnostics
+        if d.get("severity") == "missed"
+    ))
+
+    # Step 2: 空诊断 → 直接退出
+    if not failed_functions:
+        print("[AIMV] all loops already vectorized, nothing to do",
+              file=sys.stderr)
+        return 0
+
+    # Step 3: 加载配置
+    config = load_config()  # ~/.aimv/config > env vars > defaults
+
+    # 初始化模块
+    builder = BuildOrchestrator(config)
+    mcp = MCPClient(config.mcp_url, config.mcp_timeout)
+    engine = IterationEngine(config.aimv_level, config.max_rounds)
+    store = SessionStore(config.output_dir)
+    sources = SourceManager(config.output_dir)
+
+    # 创建 pristine backup（会话级，仅一次）
+    pristine_dir = Path(config.output_dir) / "backups" / "pristine"
+    pristine_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_file, pristine_dir / Path(source_file).name)
+
+    # 创建 session
+    session = SessionRecord(
+        source_file=source_file,
+        aimv_level=config.aimv_level,
+        max_rounds=config.max_rounds,
+        session_id=f"aimv-{uuid.uuid4().hex[:12]}",
+    )
+
+    # Step 4: 对每个失败函数顺序处理
+    results: list[PerFunctionResult] = []
+
+    for func_name in failed_functions:
+        func_result = process_single_function(
+            function_name=func_name,
+            source_file=source_file,
+            initial_diagnostics=[
+                d for d in diagnostics
+                if d["function_name"] == func_name and d.get("severity") == "missed"
+            ],
+            config=config,
+            builder=builder,
+            mcp=mcp,
+            engine=IterationEngine(config.aimv_level, config.max_rounds),
+            sources=sources,
+            store=store,
+            session=session,
+        )
+        results.append(func_result)
+        # 函数 A 验证通过后变更已通过 atomic mv 写入原文件
+        # 函数 B 编译时看到的源码已包含 A 的变更
+
+    # Step 5: 输出汇总到 stderr
+    emit_summary(results, source_file, session, store, config)
+
+    return 0
+```
+
+### 2.2 防无限 fork 设计
+
+```
+Round 1 (用户触发):
+  clang -O2 -faimv -c task.c           ← 用户命令，含 -faimv
+    ├─ Driver 编译 + AIMVFeedbackPass
+    └─ Driver fork aimv-driver --from-json=aimv.json
+
+Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
+  clang -O2 -mllvm -aimv-enable -mllvm -aimv-output=<path> -c task.c
+    ├─ 不含 -faimv → 不会触发 Driver 再 fork
+    ├─ 只运行 LLVM 层的 AIMVFeedbackPass 收集诊断
+    └─ aimv-driver 读新 aimv.json 判断下一轮
+
+关键: -faimv 只存在于 clang Driver 层（C++）。
+      aimv-driver 内部只传 LLVM 后端 flag (-mllvm -aimv-enable)，
+      永远不传 -faimv → 不会产生 fork 链。
+```
+
+### 2.3 空诊断行为
+
+`aimv.json` 中所有 diagnostics 的 `severity == "passed"` 时，driver 直接 exit 0：
+
+```
+[AIMV] all loops already vectorized, nothing to do
+```
+
+clang Driver 将该 exit 0 视为成功。
+
+---
+
+## 3. 内部数据模型
+
+### 3.1 状态枚举
 
 ```python
 # [AIMV] driver/models.py
@@ -91,28 +225,32 @@ import uuid
 import time
 
 
-class DriverStatus(Enum):
-    IDLE = "idle"
+class IterationStatus(Enum):
+    PENDING = "pending"
     COMPILING = "compiling"
-    ANALYZING_OPT_INFO = "analyzing_opt_info"
-    QUERYING_MCP = "querying_mcp"
-    PATCHING = "patching"
-    VERIFYING = "verifying"
-    MEASURING = "measuring"
+    ANALYZING = "analyzing"
+    QUERYING = "querying"           # MCP 查询（不持锁）
+    PATCHING = "patching"           # 影子文件 patch（持锁区间内）
+    VERIFYING = "verifying"         # 重编译 + 测试（同一持锁区间内）
     SUCCESS = "success"
-    GAVE_UP = "gave_up"
-    ERROR = "error"
+    FAILED = "failed"
+    ROLLED_BACK = "rolled_back"
 
 
 class TerminationReason(Enum):
-    VECTORIZED = "vectorized"              # remark 变为 passed
-    ROUND_LIMIT = "round_limit"            # 达到 --max-rounds
-    NO_IMPROVEMENT = "no_improvement"      # 性能退化或不变
+    VECTORIZED = "vectorized"              # 函数成功向量化
+    ROUND_LIMIT = "round_limit"            # 达到 max_rounds
+    NO_IMPROVEMENT = "no_improvement"      # passed remark 数量减少 → 回滚
     NO_SUGGESTION = "no_suggestion"        # MCP 返回 no_action_possible
     COMPILE_ERROR = "compile_error"        # patch 导致编译失败
     TEST_FAILURE = "test_failure"          # patch 导致测试失败
     INTERRUPTED = "interrupted"            # 用户中断 (Ctrl+C)
+```
 
+### 3.2 编译与测试结果
+
+```python
+# [AIMV] driver/models.py
 
 @dataclass
 class BuildResult:
@@ -120,8 +258,8 @@ class BuildResult:
     returncode: int
     stdout: str
     stderr: str
-    opt_record_path: str                   # YAML/JSON opt-record 文件路径
-    aimv_json_path: str                    # AIMVFeedback Pass 输出的 JSON
+    opt_record_path: str                   # YAML opt-record 文件路径
+    aimv_json_path: str                    # AIMVFeedbackPass 输出的 JSON
     elapsed_ms: float
 
 
@@ -144,7 +282,13 @@ class VectorizationStatus:
     vectorized_loops: int                  # 成功向量化的循环数
     missed_loops: int                      # 仍然失败的循环数
     missed_details: List[dict]             # 失败循环的简要信息
+    passed_remark_count: int               # passed remark 总数（用于退化检测）
+```
 
+### 3.3 Patch 记录
+
+```python
+# [AIMV] driver/models.py
 
 @dataclass
 class PatchRecord:
@@ -154,13 +298,18 @@ class PatchRecord:
     diff_text: str
     original_hash: str                     # sha256 of original file
     applied_at: float = field(default_factory=time.time)
+```
 
+### 3.4 轮次记录
+
+```python
+# [AIMV] driver/models.py
 
 @dataclass
 class RoundRecord:
     """单轮迭代的完整记录"""
     round_number: int
-    status: DriverStatus = DriverStatus.IDLE
+    status: IterationStatus = IterationStatus.PENDING
 
     # 编译阶段
     build_result: Optional[BuildResult] = None
@@ -179,57 +328,73 @@ class RoundRecord:
     test_result: Optional[TestResult] = None
     vectorization_status: Optional[VectorizationStatus] = None
 
-    # 性能 (可选)
-    baseline_perf_ms: Optional[float] = None
-    after_perf_ms: Optional[float] = None
-    perf_delta_pct: Optional[float] = None
+    # AI 建议摘要（用于 history 注入下轮 prompt）
+    suggestion_description: Optional[str] = None
+    applied_diff_summary: Optional[str] = None
 
     # 时间戳
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
+```
 
-    # AI 建议原文（用于 history 注入下轮 prompt）
-    suggestion_description: Optional[str] = None
-    applied_diff_summary: Optional[str] = None
+### 3.5 PerFunctionResult（多函数顺序处理）
 
+```python
+# [AIMV] driver/models.py
+
+@dataclass
+class PerFunctionResult:
+    """单函数迭代结果（多函数文件中每个函数独立记录）
+
+    对应 PLAN §3.2 PerFunctionResult 数据模型。
+    每个函数独立轮次计数，独立终止原因。
+    函数 A 成功后立即 atomic mv 到原文件，
+    后续函数 B 编译时看到已包含 A 变更的源码。
+    """
+    function_name: str
+    rounds: List[RoundRecord] = field(default_factory=list)
+    termination_reason: Optional[TerminationReason] = None
+    vectorized: bool = False
+    rounds_used: int = 0
+    # 历史记录（用于 MCP 请求的 history 字段，最多保留最近 3 轮）
+    history: List[Dict] = field(default_factory=list)
+```
+
+### 3.6 Session 记录
+
+```python
+# [AIMV] driver/models.py
 
 @dataclass
 class SessionRecord:
     """完整 AIMV 会话记录"""
     session_id: str = field(default_factory=lambda: f"aimv-{uuid.uuid4().hex[:12]}")
-    function_name: str
-    source_files: List[str] = field(default_factory=list)
-    aimv_level: str = "moderate"
+    source_file: str = ""
+    aimv_level: str = "conservative"         # 默认 conservative（SPEC §3.1）
     max_rounds: int = 5
-    target_loop_line: Optional[str] = None  # 目标循环源码位置（首轮自动选定）
+    functions: List[PerFunctionResult] = field(default_factory=list)
 
     # 原始源码备份（会话开始时一次性创建）
-    pristine_backup_dir: str = ""
+    pristine_backup_path: str = ""
 
-    # 迭代记录
-    rounds: List[RoundRecord] = field(default_factory=list)
-    current_round: int = 0
-
-    # 终止原因
+    # 终止原因（最后一个函数的原因）
     termination_reason: Optional[TerminationReason] = None
 
     # 最终结果
-    final_patch_path: Optional[str] = None
+    final_patch_path: Optional[str] = None   # <source>.aimv.patch
     total_elapsed_ms: Optional[float] = None
-    overall_perf_improvement_pct: Optional[float] = None
 
     # 元信息
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     cli_command: str = ""
-    git_commit: str = ""
 ```
 
 ---
 
-## 3. 子进程管理（build_orchestrator.py）
+## 4. 子进程管理（build_orchestrator.py）
 
-### 3.1 编译执行
+### 4.1 编译执行
 
 ```python
 # [AIMV] driver/build_orchestrator.py
@@ -242,7 +407,11 @@ from pathlib import Path
 from typing import Optional
 
 class BuildOrchestrator:
-    """管理 clang 编译和测试子进程。"""
+    """管理 clang 编译和测试子进程。
+
+    关键约束：编译时使用 -mllvm -aimv-enable（不传 -faimv），
+    防止递归 fork。详见 SPEC §3.1 防无限 fork 设计。
+    """
 
     def __init__(self, config: dict):
         self.cc = config.get("cc", "clang")
@@ -251,45 +420,30 @@ class BuildOrchestrator:
         self.timeout_seconds = config.get("timeout", 120)
         self.work_dir = Path(config.get("work_dir", tempfile.mkdtemp(prefix="aimv-")))
 
-# extract_function_source 实现策略:
-#   - 首选: clang -Xclang -ast-dump 获取函数定义的行号范围
-#   - 次选: ctags/exuberant-ctags 查找函数定义位置
-#   - 回退: 基于 loop_location 行号截取前后 N 行
-# extract_function_signature: 用正则匹配函数声明模式（返回类型 + 函数名 + 参数列表）
-# extract_loop_line: 从 diagnostics[0].loop_location 解析 "<file>:<line>:<col>" 中的行号
-# extract_lines_around: 读取文件指定行前后 context 行的源码
-
     def compile_with_aimv(
         self,
         source_file: str,
         output_file: str,
-        target_function: Optional[str] = None,
         aimv_json_output: Optional[str] = None,
     ) -> BuildResult:
-        """编译源码，启用 -fsave-optimization-record 和 AIMVFeedback Pass。
+        """编译源码，启用 AIMVFeedbackPass。
 
-        关键 flags:
+        Flags（防 fork 设计）:
           -O2
-          -g                                    (debug info → 源码映射)
-          -fsave-optimization-record=<yaml>     (LLVM remark 序列化)
-          -Rpass-missed=loop-vectorize          (只收集 missed remarks)
-          -aimv-output=<json>                   (AIMVFeedback Pass 输出)
-          -aimv-target-function=<name>          (可选，聚焦单个函数)
+          -g                                          (debug info → 源码映射)
+          -mllvm -aimv-enable                         (LLVM 后端 flag，不含 -faimv!)
+          -mllvm -aimv-output=<json>                  (AIMVFeedback Pass 输出)
         """
 
-        opt_record_path = str(self.work_dir / "opt-records.yaml")
         aimv_path = aimv_json_output or str(self.work_dir / "aimv-diag.json")
 
         cmd = [self.cc]
         cmd.extend(self.cflags)
         cmd.extend([
             "-g",
-            f"-fsave-optimization-record={opt_record_path}",
-            "-Rpass-missed=loop-vectorize",
-            f"-aimv-output={aimv_path}",
+            "-mllvm", "-aimv-enable",
+            "-mllvm", f"-aimv-output={aimv_path}",
         ])
-        if target_function:
-            cmd.append(f"-aimv-target-function={target_function}")
         cmd.extend([source_file, "-o", output_file])
 
         start = time.monotonic()
@@ -305,18 +459,18 @@ class BuildOrchestrator:
             returncode=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
-            opt_record_path=opt_record_path,
+            opt_record_path="",              # Pass 模式不产生 YAML
             aimv_json_path=aimv_path,
             elapsed_ms=elapsed,
         )
 
     def run_tests(self, test_cmd: str) -> TestResult:
-        """运行测试套件，解析通过/失败数。
-
-        test_cmd 可以是任意 shell 命令。解析逻辑：
-        - 优先匹配 CTest/JUnit 输出格式
-        - 回退到检查 returncode
-        """
+        """运行测试套件。test_cmd 为空则跳过（返回 pass）。"""
+        if not test_cmd:
+            return TestResult(
+                returncode=0, stdout="", stderr="",
+                passed=0, failed=0, elapsed_ms=0,
+            )
 
         start = time.monotonic()
         proc = subprocess.run(
@@ -324,7 +478,7 @@ class BuildOrchestrator:
             shell=True,
             capture_output=True,
             text=True,
-            timeout=self.timeout_seconds * 2,  # 测试超时更长
+            timeout=self.timeout_seconds * 2,
         )
         elapsed = (time.monotonic() - start) * 1000
 
@@ -338,13 +492,11 @@ class BuildOrchestrator:
             elapsed_ms=elapsed,
         )
 
-    def check_vectorization_from_json(self, aimv_json_path: str, function_name: str) -> VectorizationStatus:
-        """解析 AIMV JSON，检查目标函数是否仍有点量化 missed remark。
+    def check_vectorization(self, aimv_json_path: str, function_name: str) -> VectorizationStatus:
+        """解析 AIMV JSON，检查目标函数的向量化状态。
 
-        返回 VectorizationStatus。
-        - 需要 !aimv.diag 同时包含 missed 和 passed 的循环信息;
-        - 空 diagnostics 不能直接判定为"向量化成功"（可能是 pass 未运行或函数名不匹配）。
-        - 实现期应增加"正向标记"：成功的循环也写入 !aimv.diag (severity="passed")。
+        需要 !aimv.diag 同时包含 missed 和 passed 诊断。
+        passed_remark_count 用于收益退化检测（新 patch 后 count 减少则回滚）。
         """
         import json
 
@@ -368,123 +520,57 @@ class BuildOrchestrator:
                 elif diag.get("severity") == "passed":
                     passed += 1
 
-        # 空 diagnostics: 无法判定 → 保守报告为未向量化
-        # (实现期需在 !aimv.diag 中同时写入 passed 和 missed 诊断)
-        if total == 0:
-            return VectorizationStatus(
-                function_name=function_name,
-                total_loops=0,
-                vectorized_loops=0,
-                missed_loops=0,
-                missed_details=[{"remark_text": "No AIMV diagnostics found — pass may not have run or function name mismatch"}],
-            )
-
         return VectorizationStatus(
             function_name=function_name,
             total_loops=total,
             vectorized_loops=passed,
             missed_loops=missed,
             missed_details=details,
+            passed_remark_count=passed,
         )
 
-    def check_vectorization_from_yaml(self, opt_record_path: str, function_name: str) -> VectorizationStatus:
-        """YAML 模式: 从 -fsave-optimization-record YAML 检查向量化状态。
-        YAML 包含 passed/missed/analysis 三种 remark。
-        目标函数无 missed remark → 判定为向量化成功。
-        """
-        import yaml
+    @staticmethod
+    def _parse_test_output(stdout: str, stderr: str) -> tuple:
+        """解析测试输出中的 pass/fail 计数。"""
+        import re
+        combined = stdout + stderr
 
-        with open(opt_record_path) as f:
-            records = yaml.safe_load(f)
+        # CTest
+        m = re.search(r"(\d+)% tests passed.*?(\d+) tests? failed.*?out of (\d+)", combined)
+        if m:
+            total = int(m.group(3))
+            failed = int(m.group(2))
+            return (total - failed, failed)
 
-        total = 0
-        missed = 0
-        details = []
-        for record in records:
-            # YAML remark 结构: { Function, Pass, Name, type, ... }
-            if (record.get("Function") == function_name and
-                "loop-vectorize" in str(record.get("Pass", ""))):
-                total += 1
-                if record.get("type") == "missed":
-                    missed += 1
-                    details.append({
-                        "remark_text": record.get("Name", ""),
-                        "loop_location": record.get("DebugLoc", ""),
-                    })
+        # GoogleTest
+        passed = len(re.findall(r"\[\s*PASSED\s*\]", combined))
+        failed = len(re.findall(r"\[\s*FAILED\s*\]", combined))
+        if passed + failed > 0:
+            return (passed, failed)
 
-        if total == 0:
-            return VectorizationStatus(
-                function_name=function_name,
-                total_loops=0,
-                vectorized_loops=0,
-                missed_loops=0,
-                missed_details=[{"remark_text": "No loop-vectorize remarks in YAML"}],
-            )
-
-        return VectorizationStatus(
-            function_name=function_name,
-            total_loops=total,
-            vectorized_loops=total - missed,
-            missed_loops=missed,
-            missed_details=details,
-        )
-
-
-def _check_target_loop_passed(vstatus: VectorizationStatus, target_loop: Optional[str]) -> bool:
-    """检查目标循环是否已成功向量化。
-
-    如果 target_loop 为 None（未指定目标），返回 False（由调用者处理全 passed 场景）。
-    """
-    if target_loop is None:
-        return False
-    # 在 passed 诊断中查找目标循环的 loop_location
-    # （需要在 VectorizationStatus 中增加 passed_details 或直接遍历原始 JSON）
-    # 实施期简化: 检查 missed_details 中是否不再包含 target_loop
-    return not any(target_loop in d.get("loop_location", "")
-                   for d in vstatus.missed_details)
-
-
-def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
-    """解析测试输出中的 pass/fail 计数。"""
-    import re
-
-    combined = stdout + stderr
-
-    # CTest: "100% tests passed, 0 tests failed out of 5"
-    m = re.search(r"(\d+)% tests passed.*?(\d+) tests? failed.*?out of (\d+)", combined)
-    if m:
-        total = int(m.group(3))
-        failed = int(m.group(2))
-        return (total - failed, failed)
-
-    # GoogleTest: "[  PASSED  ] 5 tests."
-    # GoogleTest: "[  FAILED  ] 1 test."
-    passed = len(re.findall(r"\[\s*PASSED\s*\]", combined))
-    failed = len(re.findall(r"\[\s*FAILED\s*\]", combined))
-    if passed + failed > 0:
-        return (passed, failed)
-
-    # 无法解析，根据 returncode 粗略判断
-    return (1, 1)  # 未知格式，保守假设有测试
+        # 回退到 returncode
+        return (1, 1) if "error" in combined.lower() else (1, 0)
 ```
 
-### 3.2 超时与信号处理
+### 4.2 超时与信号处理
 
 ```python
 # [AIMV] 子进程超时 → 抛出 subprocess.TimeoutExpired
-# driver 捕获后：
-#   编译超时 → 记录日志，标记该 patch 为 COMPILE_ERROR，回滚
-#   测试超时 → 记录日志，标记 TEST_FAILURE，回滚
+# driver 捕获后:
+#   编译超时 → 标记 COMPILE_ERROR，回滚
+#   测试超时 → 标记 TEST_FAILURE，回滚
 #
-# 额外保护：如果连续 2 轮超时，将 max_rounds 截断到当前轮次
-#           (说明 AI 生成的代码有死循环或死锁)
+# 连续 2 轮超时 → 截断 max_rounds 到当前轮次
+# （说明 AI 生成的代码有死循环或死锁）
 ```
 
 ---
 
-## 4. 源码管理（source_manager.py）
+## 5. 源码管理（source_manager.py）
 
-### 4.1 原子 patch + 回滚
+### 5.1 影子文件 + 原子替换协议
+
+完整时序遵循 SPEC §3.1。锁仅覆盖文件 I/O（秒级），MCP 查询（数十秒）不占锁。
 
 ```python
 # [AIMV] driver/source_manager.py
@@ -492,66 +578,126 @@ def _parse_test_output(stdout: str, stderr: str) -> tuple[int, int]:
 import os
 import hashlib
 import shutil
+import fcntl
+import time
 from pathlib import Path
 from typing import Optional, List
 
 
 class SourceManager:
-    """管理源码的原子性修改和回滚。
+    """源码的影子文件 patch、原子替换、回滚和 FileLock 管理。
 
-    策略：每次应用 patch 之前，先 copy 原文件到 backup_dir。
-    回滚时从 backup 恢复。使用 sha256 校验防止位翻转。
+    影子文件协议（SPEC §3.1 完整时序）:
+      1. [无锁] MCP 查询 → 获得 AI 建议
+      2. [获取锁]
+         a. cp source → source.aimv-tmp（基于当前版本快照）
+         b. diff 基于快照生成
+         c. patch source.aimv-tmp（在影子上修改）
+         d. clang -c source.aimv-tmp（编译验证，原文件不受影响）
+         e. 通过 → mv source.aimv-tmp source（rename(2) 原子替换）
+            失败 → rm source.aimv-tmp
+      3. [释放锁]
+
+    锁作用域: 仅步骤 2a-2e（文件 I/O，秒级）。
+    MCP 查询不占锁，不阻塞其他 clang 进程。
+
+    多函数: 每函数独立应用原子替换。函数 A 成功后立即 mv，
+    不等待 B。函数 B 编译时看到已包含 A 变更的源码。
+
+    中止保护: kill -9 残留 .aimv-tmp 文件，下次启动时警告用户。
     """
 
-    def __init__(self, backup_dir: str):
-        self.backup_dir = Path(backup_dir)
+    def __init__(self, output_dir: str):
+        self.backup_dir = Path(output_dir) / "backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-        self._patch_history: list[PatchRecord] = []
+        self.lock_dir = Path(output_dir) / "locks"
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        self._patch_history: List[PatchRecord] = []
+        self._locks: dict = {}            # path → fd
 
-    def apply_patch(self, source_file: str, diff_text: str) -> PatchRecord:
-        """应用 unified diff。失败时抛异常，不修改任何文件。
+    # ── FileLock ──────────────────────────────────────────
+
+    def acquire_lock(self, source_file: str, timeout_seconds: int = 30) -> bool:
+        """获取 per-source-file 文件锁。
+
+        锁粒度为单个源文件。不同文件可并行处理，同一文件串行化。
+        """
+        path = Path(source_file).resolve()
+        lock_name = hashlib.sha256(str(path).encode()).hexdigest()[:16]
+        lock_path = self.lock_dir / f"{lock_name}.lock"
+
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        deadline = time.time() + timeout_seconds
+
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._locks[str(path)] = fd
+                return True
+            except BlockingIOError:
+                if time.time() > deadline:
+                    os.close(fd)
+                    return False
+                time.sleep(0.5)
+
+    def release_lock(self, source_file: str):
+        """释放文件锁。"""
+        path = str(Path(source_file).resolve())
+        fd = self._locks.pop(path, None)
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    # ── 影子文件协议 ─────────────────────────────────────
+
+    def apply_shadow_patch(
+        self,
+        source_file: str,
+        diff_text: str,
+    ) -> PatchRecord:
+        """影子文件 patch 协议（SPEC §3.1）。
+
+        调用方必须在调用前 acquire_lock()。
+        调用方负责在完成后 release_lock()。
 
         步骤:
-          1. 校验 source_file 存在且可读
-          2. 计算原始文件 sha256
-          3. 创建 backup copy
-          4. 用 patch 命令应用 diff
-          5. 验证修改后文件可编译（语法层）—— 可选
-          6. 记录 PatchRecord
-
-        兼容性: GNU patch 在 Linux/macOS 上标配。Windows 开发机需安装 Git for Windows
-        （自带 patch.exe）或使用 WSL。也可增加纯 Python difflib 回退方案消除外部依赖。
+          a. cp source → source.aimv-tmp
+          b. 写 diff 临时文件
+          c. patch source.aimv-tmp
+          d. 返回 PatchRecord（调用方负责后续的编译验证和 atomic mv/rm）
         """
-
         src_path = Path(source_file).resolve()
         if not src_path.exists():
             raise FileNotFoundError(f"source file not found: {source_file}")
 
-        # 计算原始 hash
         original_hash = self._sha256(src_path)
 
-        # 创建备份
+        # Step a: cp source → source.aimv-tmp
+        shadow_path = src_path.parent / f"{src_path.name}.aimv-tmp"
+        shutil.copy2(src_path, shadow_path)
+
+        # 创建备份（用于 rollback）
         backup_path = self.backup_dir / f"{src_path.stem}.r{len(self._patch_history)}.bak"
         shutil.copy2(src_path, backup_path)
 
-        # 写入 diff 临时文件
+        # Step b: 写 diff 临时文件
         diff_path = self.backup_dir / f"{src_path.stem}.r{len(self._patch_history)}.diff"
         diff_path.write_text(diff_text, encoding="utf-8")
 
-        # 应用 patch
+        # Step c: patch source.aimv-tmp
         import subprocess
         proc = subprocess.run(
-            ["patch", "-u", "--fuzz=2", str(src_path), str(diff_path)],
+            ["patch", "-u", "--fuzz=2", str(shadow_path), str(diff_path)],
             capture_output=True, text=True,
         )
+        diff_path.unlink(missing_ok=True)
+
         if proc.returncode != 0:
-            # patch 失败时可能已部分修改源文件 → 无条件从备份恢复
-            shutil.copy2(backup_path, src_path)
+            # patch 失败 → rm shadow
+            shadow_path.unlink(missing_ok=True)
             backup_path.unlink(missing_ok=True)
-            diff_path.unlink(missing_ok=True)
             raise RuntimeError(f"patch apply failed: {proc.stderr}")
 
-        # 记录
         record = PatchRecord(
             source_file=str(src_path),
             backup_path=str(backup_path),
@@ -559,35 +705,48 @@ class SourceManager:
             original_hash=original_hash,
         )
         self._patch_history.append(record)
-
-        # 清理 diff 临时文件
-        diff_path.unlink(missing_ok=True)
-
         return record
 
-    def rollback(self, patch: PatchRecord) -> bool:
-        """从 backup 恢复原始文件。成功返回 True。"""
+    def commit_shadow(self, source_file: str) -> bool:
+        """影子文件验证通过 → atomic mv 替换原文件。
 
+        rename(2) 在同一文件系统上是原子的。
+        其他进程在读原文件不受影响。
+        """
+        src_path = Path(source_file).resolve()
+        shadow_path = src_path.parent / f"{src_path.name}.aimv-tmp"
+
+        if not shadow_path.exists():
+            return False
+
+        os.replace(str(shadow_path), str(src_path))  # atomic rename(2)
+        return True
+
+    def discard_shadow(self, source_file: str):
+        """影子文件验证失败 → rm shadow。"""
+        src_path = Path(source_file).resolve()
+        shadow_path = src_path.parent / f"{src_path.name}.aimv-tmp"
+        shadow_path.unlink(missing_ok=True)
+
+    def rollback(self, patch: PatchRecord) -> bool:
+        """从 backup 恢复原始文件。"""
         src_path = Path(patch.source_file)
         backup_path = Path(patch.backup_path)
 
         if not backup_path.exists():
             raise FileNotFoundError(f"backup not found: {backup_path}")
 
-        # 校验 backup 完整性
         backup_hash = self._sha256(backup_path)
         if backup_hash != patch.original_hash:
             raise RuntimeError(
                 f"backup hash mismatch: expected {patch.original_hash}, got {backup_hash}"
             )
 
-        # 恢复
         shutil.copy2(backup_path, src_path)
         return True
 
     def rollback_all(self):
-        """按反序回滚所有 patch（从最新到最早）。
-        单条回滚失败不中断后续回滚，收集所有错误后统一 raise。"""
+        """按反序回滚所有 patch。单条失败不中断后续。"""
         errors = []
         for patch in reversed(self._patch_history):
             try:
@@ -597,38 +756,93 @@ class SourceManager:
         if errors:
             raise RuntimeError(f"rollback_all: {len(errors)} failures: {errors}")
 
-    def get_current_diff(self) -> Optional[str]:
-        """返回最近一轮的 diff（用于 history 注入）"""
-        if self._patch_history:
-            return self._patch_history[-1].diff_text
+    # ── 残留影子检测 ─────────────────────────────────────
+
+    def check_stale_shadow(self, source_file: str) -> Optional[str]:
+        """检测残留影子文件（kill -9 后）。
+
+        返回残留影子路径，或 None。
+        下次启动时检测到残留 → 输出警告让用户手动检查，不自动覆盖。
+        """
+        src_path = Path(source_file).resolve()
+        shadow_path = src_path.parent / f"{src_path.name}.aimv-tmp"
+        if shadow_path.exists():
+            return str(shadow_path)
         return None
 
-    def get_all_modified_files(self) -> List[str]:
-        """返回所有被修改过的源文件列表"""
-        return list(set(p.source_file for p in self._patch_history))
+    def warn_stale_shadow(self, source_file: str):
+        """启动时检测残留影子文件并输出警告。"""
+        stale = self.check_stale_shadow(source_file)
+        if stale:
+            import sys
+            print(
+                f"[AIMV] WARNING: stale shadow file detected: {stale}\n"
+                f"  This may be from a previous aimv-driver process killed by signal.\n"
+                f"  Please inspect the file manually before proceeding.\n"
+                f"  To discard: rm {stale}",
+                file=sys.stderr,
+            )
+
+    # ── 累积 Patch 生成 ──────────────────────────────────
+
+    def generate_cumulative_patch(self, source_file: str) -> Optional[str]:
+        """生成累积 unified diff（相对于原始源码）。
+
+        输出路径: <source>.aimv.patch
+        仅包含最终成功的变更；失败/回滚的中间尝试不记录。
+        """
+        src_path = Path(source_file).resolve()
+        pristine = self.backup_dir / "pristine" / src_path.name
+        if not pristine.exists():
+            return None
+
+        import subprocess
+        proc = subprocess.run(
+            ["diff", "-u", str(pristine), str(src_path)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 1:  # differences found
+            patch_path = src_path.parent / f"{src_path.name}.aimv.patch"
+            patch_path.write_text(proc.stdout, encoding="utf-8")
+            return str(patch_path)
+        return None
 
     @staticmethod
     def _sha256(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 ```
 
-### 4.2 崩溃恢复
+### 5.2 影子文件时序图
 
-```python
-# [AIMV] 崩溃恢复策略:
-#
-# 启动时检查 backup_dir 中是否有残留的 .bak 文件
-#   → 存在 → 询问用户是否恢复到 pre-aimv 原始状态
-#          → 是 → 从 pristine_backup 恢复所有文件
-#          → 否 → 报告路径，让用户手工处理
-#
-# Pristine backup: 会话开始时创建完整源码 tree 的快照
-#   aimv-driver --resume <session_id> → 从 session JSON 恢复状态
+```
+Round N 完整时序（锁仅覆盖文件 I/O 阶段）:
+
+  1. [无锁] MCP 查询 → 获得 AI 建议（网络 I/O，数十秒）
+     │
+     │  ← 其他进程可正常读/写同一文件（排队等锁）或不同文件（并行）
+     │
+  2. [获取锁]
+     a. cp task.c → task.c.aimv-tmp        ← 基于当前版本创建快照
+     b. diff 基于快照生成                   ← 确保 diff 上下文正确
+     c. patch task.c.aimv-tmp              ← 在影子上修改
+     d. clang -c task.c.aimv-tmp           ← 编译验证
+        （其他进程读 task.c 不受影响）
+     e. 通过 → mv task.c.aimv-tmp task.c   ← rename(2) 是原子的
+        失败 → rm task.c.aimv-tmp          ← 丢弃影子
+  3. [释放锁]
+
+锁作用域: 仅步骤 2a-2e（文件 I/O，秒级）。
+步骤 1 MCP 查询不占锁，不阻塞其他 clang 进程。
+
+多函数原子替换时序:
+  函数 A 验证通过 → mv 完成 → 释放锁
+  → 处理函数 B（B 的 MCP 查询和编译基于已包含 A 变更的源码）
+  → 函数 B 失败不回滚函数 A 的变更
 ```
 
 ---
 
-## 5. MCP 客户端（mcp_client.py）
+## 6. MCP 客户端（mcp_client.py）
 
 ```python
 # [AIMV] driver/mcp_client.py
@@ -674,7 +888,6 @@ class MCPClient:
                     # 参数错误，不可重试
                     raise ValueError(f"MCP validation error: {resp.text}")
                 elif resp.status_code in (429, 500, 502, 503):
-                    # 可重试
                     if attempt < 2:
                         wait = 2.0 * (2 ** attempt)
                         time.sleep(wait)
@@ -683,7 +896,7 @@ class MCPClient:
                 else:
                     return None
 
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
+            except (httpx.TimeoutException, httpx.ConnectError):
                 if attempt < 2:
                     wait = 2.0 * (2 ** attempt)
                     time.sleep(wait)
@@ -703,9 +916,17 @@ class MCPClient:
 
 ---
 
-## 6. 迭代决策引擎（iteration_engine.py）
+## 7. 迭代决策引擎（iteration_engine.py）
 
-### 6.1 决策逻辑
+### 7.1 终止条件（SPEC §2）
+
+三个终止条件的组合策略：
+
+1. **向量化成功** — 检测到 LoopVectorize pass 成功生成向量指令（passed remark 出现）
+2. **轮次上限** — 达到 max_rounds（默认 5 轮，可配置）
+3. **收益退化** — 新 patch 后 passed remark 数量减少 → 回滚
+
+### 7.2 决策逻辑
 
 ```python
 # [AIMV] driver/iteration_engine.py
@@ -713,16 +934,19 @@ class MCPClient:
 from enum import Enum
 from typing import Optional
 
+
 class NextAction(Enum):
-    CONTINUE = "continue"              # 继续当前方向，增加激进
-    RETRY_SAME = "retry_same"          # 建议失败但可重试（编译错/超时），同一轮重试一次
-    ESCALATE_LEVEL = "escalate_level"  # 当前激进下无建议，提升 level
+    CONTINUE = "continue"              # 继续下一轮
+    RETRY_SAME = "retry_same"          # 编译错/超时，同轮重试一次
+    ESCALATE_LEVEL = "escalate_level"  # 无建议，提升 aimv_level
     ROLLBACK = "rollback"              # 回滚最近的 patch
-    STOP = "stop"                      # 终止（成功 or 无法继续）
+    STOP = "stop"                      # 终止
 
 
 class IterationEngine:
     """根据当前状态决定下一步行动。
+
+    每个函数独立引擎实例（独立轮次计数，独立 level 追踪）。
 
     决策矩阵:
     ┌──────────────────────┬───────────────────────────────────┐
@@ -730,27 +954,24 @@ class IterationEngine:
     ├──────────────────────┼───────────────────────────────────┤
     │ 向量化成功           │ STOP (VECTORIZED)                  │
     │ 达到 max_rounds      │ STOP (ROUND_LIMIT)                 │
-    │ 编译失败             │ ROLLBACK → 当前 round 重试一次     │
+    │ 编译失败             │ ROLLBACK → 同 round 重试一次       │
     │                      │ 再次失败 → STOP (COMPILE_ERROR)    │
     │ 测试失败             │ ROLLBACK → STOP (TEST_FAILURE)     │
-    │ MCP 超时/无响应      │ mcp_client 内部重试 3 次            │
+    │ MCP 无响应           │ mcp_client 内部重试 3 次            │
     │                      │ 全部失败 → STOP                    │
-    │ MCP 返回空建议       │ 升激进 (conservative→moderate→     │
-    │                      │         aggressive)               │
+    │ MCP 无建议           │ 升 level (conservative→moderate→   │
+    │                      │         aggressive)                │
     │                      │ 已是 aggressive → STOP             │
-    │ 性能退化             │ ROLLBACK → STOP (NO_IMPROVEMENT)   │
-    │ 性能不变             │ 继续下一轮 (不同策略)              │
+    │ 收益退化             │ ROLLBACK → STOP (NO_IMPROVEMENT)   │
+    │  (passed remark 减少) │                                    │
     └──────────────────────┴───────────────────────────────────┘
     """
 
-    def __init__(self, initial_level: str = "moderate", max_rounds: int = 5,
-                 perf_degradation_threshold_pct: float = 5.0):
+    def __init__(self, initial_level: str = "conservative", max_rounds: int = 5):
         self.initial_level = initial_level
         self.current_level = initial_level
         self.max_rounds = max_rounds
-        self.degradation_threshold = perf_degradation_threshold_pct
 
-        # 追踪状态
         self._consecutive_compile_failures = 0
         self._consecutive_mcp_failures = 0
         self._level_escalations = 0
@@ -763,32 +984,36 @@ class IterationEngine:
         vectorized: bool,
         mcp_had_suggestions: bool,
         mcp_responded: bool,
-        perf_delta_pct: Optional[float] = None,
-    ) -> tuple[NextAction, str]:
-        """返回 (action, reason) 元组。"""
+        passed_remark_delta: Optional[int] = None,
+    ) -> tuple:
+        """返回 (NextAction, reason_string) 元组。
 
-        # 成功
+        passed_remark_delta: 新 patch 后 passed remark 数量变化。
+          正值=增加, 负值=减少（退化）, None=无法比较。
+        """
+
+        # 1. 向量化成功
         if vectorized:
             return NextAction.STOP, "vectorization succeeded"
 
-        # 轮次上限
+        # 2. 轮次上限
         if current_round >= self.max_rounds:
             return NextAction.STOP, f"reached max rounds ({self.max_rounds})"
 
-        # 编译失败
+        # 3. 编译失败
         if not build_result_ok:
             self._consecutive_compile_failures += 1
             if self._consecutive_compile_failures >= 2:
                 return NextAction.STOP, "consecutive compile failures"
-            return NextAction.ROLLBACK, "compile failure, will retry with different approach"
+            return NextAction.ROLLBACK, "compile failure, will retry"
 
         self._consecutive_compile_failures = 0
 
-        # 测试失败 → 直接回滚并终止（语义错误，重试无意义）
+        # 4. 测试失败 → 回滚并终止（语义错误，重试无意义）
         if not test_result_ok:
             return NextAction.ROLLBACK, "test failure, stopping"
 
-        # MCP 无响应（网络重试由 mcp_client 层处理，引擎层直接判定失败）
+        # 5. MCP 无响应
         if not mcp_responded:
             self._consecutive_mcp_failures += 1
             if self._consecutive_mcp_failures >= 1:
@@ -797,22 +1022,24 @@ class IterationEngine:
 
         self._consecutive_mcp_failures = 0
 
-        # MCP 无建议
+        # 6. MCP 无建议
         if not mcp_had_suggestions:
             escalated = self._try_escalate()
             if escalated:
                 return NextAction.ESCALATE_LEVEL, f"escalated to {self.current_level}"
-            return NextAction.STOP, "no suggestions available at highest level"
+            return NextAction.STOP, "no suggestions at highest level"
 
-        # 性能退化
-        if perf_delta_pct is not None and perf_delta_pct < -self.degradation_threshold:
-            return NextAction.ROLLBACK, f"performance degraded by {-perf_delta_pct:.1f}%"
+        # 7. 收益退化（passed remark 数量减少）
+        if passed_remark_delta is not None and passed_remark_delta < 0:
+            return NextAction.ROLLBACK, (
+                f"regression: passed remark count decreased by {-passed_remark_delta}"
+            )
 
-        # 继续
+        # 8. 继续
         return NextAction.CONTINUE, "continuing to next round"
 
     def _try_escalate(self) -> bool:
-        """尝试提升激进度。成功返回 True。"""
+        """提升 aimv_level: conservative → moderate → aggressive"""
         levels = ["conservative", "moderate", "aggressive"]
         idx = levels.index(self.current_level)
         if idx < len(levels) - 1:
@@ -828,7 +1055,7 @@ class IterationEngine:
         self._level_escalations = 0
 ```
 
-### 6.2 迭代策略图示
+### 7.3 迭代策略流程图
 
 ```
 Round N 开始
@@ -839,46 +1066,467 @@ Round N 开始
     │                                  │
     ├── POST MCP Server ──→ 超时/无响应? ──→ mcp_client 内部重试 (最多 3 次)
     │              │                                │
-    │              │                         全部失败 → GIVE_UP
+    │              │                         全部失败 → STOP
     │              │
     │              └── 200 OK ──→ no_action_possible?
     │                                      │
-    │                                     是 → 升激进度 (C→M→A)
+    │                                     是 → 升 aimv_level (C→M→A)
     │                                      │        │
-    │                                      │   已是 A → GIVE_UP
+    │                                      │   已是 A → STOP
     │                                      │
     │                                     否
     │                                      │
-    ├── 应用 diff patch ──→ patch 失败? ──→ 编译失败? → ROLLBACK → retry
-    │              │                  (同轮 1 次重试，再次失败 → GIVE_UP)
+    ├── [获取锁] 影子文件 patch ──→ patch 失败? ──→ [rm shadow, 释放锁]
+    │              │                  (同轮 1 次重试，再次失败 → STOP)
     │              │
     │              └── patch 成功
     │                      │
-    ├── 重编译验证 ──→ 编译失败? ──→ ROLLBACK → retry → 仍失败 → GIVE_UP
+    ├── [锁内] 重编译验证 ──→ 编译失败? ──→ ROLLBACK → 重试 → 仍失败 → STOP
     │                      │
-    │                      └── 编译成功 → 检查向量化 remark
+    │                      └── 编译成功 → 检查 passed remark
     │                              │
-    │                             向量化成功 → SUCCESS
+    │                             向量化成功 → [mv shadow→source, 释放锁] → SUCCESS
+    │                             passed remark 减少 → [rm shadow, 释放锁] → ROLLBACK → STOP
     │                             仍失败:
     │                                │
-    ├── 运行测试套件 ──→ 失败? ──→ ROLLBACK → GIVE_UP
+    ├── [锁内] 运行测试 ──→ 失败? ──→ [rm shadow, 释放锁] → ROLLBACK → STOP
     │                      │
     │                      └── 通过
     │                              │
-    ├── [可选] 性能测量 ──→ 退化 > 5%? ──→ ROLLBACK → GIVE_UP
+    ├── [mv shadow→source, 释放锁]
     │                              │
-    │                              └── 不变或改善
-    │                                      │
     └── Round N+1 ──→ (N < max_rounds) ──→ 回到顶部
-                              │
-                        N == max_rounds → GIVE_UP
+                        │
+                  N == max_rounds → STOP (round_limit)
 ```
 
 ---
 
-## 7. Session 持久化（session_store.py）
+## 8. 配置系统（config.py）
 
-### 7.1 格式
+### 8.1 配置优先级链
+
+```
+~/.aimv/config (YAML)  >  环境变量  >  默认值
+
+环境变量:
+  AIMV_MCP_URL       MCP 服务地址
+  AIMV_LEVEL         修改激进度 (conservative|moderate|aggressive)
+  AIMV_MAX_ROUNDS    最大迭代轮次
+  AIMV_TEST_CMD      测试命令
+
+默认值（保守安全基线）:
+  mcp_url     = http://localhost:8080
+  aimv_level  = conservative           ← 不是 moderate
+  max_rounds  = 5
+  test_cmd    = ""                      ← 空 = 仅编译验证，跳过测试
+```
+
+### 8.2 配置加载实现
+
+```python
+# [AIMV] driver/config.py
+
+import os
+from pathlib import Path
+from dataclasses import dataclass
+
+
+@dataclass
+class DriverConfig:
+    mcp_url: str = "http://localhost:8080"
+    mcp_timeout: int = 60
+    aimv_level: str = "conservative"         # 默认 conservative
+    max_rounds: int = 5
+    test_cmd: str = ""                       # 空 = 跳过测试
+    cc: str = "clang"
+    cflags: list = None
+    output_dir: str = "./aimv-output"
+    aimv_mode: str = "auto"                  # auto | review
+
+    def __post_init__(self):
+        if self.cflags is None:
+            self.cflags = ["-O2"]
+
+
+def load_config() -> DriverConfig:
+    """加载配置，按优先级: ~/.aimv/config > 环境变量 > 默认值。"""
+
+    config = DriverConfig()
+
+    # Layer 1: ~/.aimv/config (YAML)
+    config_path = Path.home() / ".aimv" / "config"
+    if config_path.exists():
+        import yaml
+        with open(config_path) as f:
+            file_config = yaml.safe_load(f) or {}
+
+        mcp_cfg = file_config.get("mcp", {})
+        driver_cfg = file_config.get("driver", {})
+
+        if "url" in mcp_cfg:
+            config.mcp_url = mcp_cfg["url"]
+        if "timeout_seconds" in mcp_cfg:
+            config.mcp_timeout = mcp_cfg["timeout_seconds"]
+        if "max_rounds" in driver_cfg:
+            config.max_rounds = driver_cfg["max_rounds"]
+        if "aimv_level" in driver_cfg:
+            config.aimv_level = driver_cfg["aimv_level"]
+        if "test_cmd" in driver_cfg:
+            config.test_cmd = driver_cfg["test_cmd"]
+
+    # Layer 2: 环境变量覆盖
+    if env_url := os.environ.get("AIMV_MCP_URL"):
+        config.mcp_url = env_url
+    if env_level := os.environ.get("AIMV_LEVEL"):
+        config.aimv_level = env_level
+    if env_rounds := os.environ.get("AIMV_MAX_ROUNDS"):
+        config.max_rounds = int(env_rounds)
+    if env_test := os.environ.get("AIMV_TEST_CMD"):
+        config.test_cmd = env_test
+    if env_mode := os.environ.get("AIMV_MODE"):
+        config.aimv_mode = env_mode
+
+    # 校验
+    assert config.aimv_level in ("conservative", "moderate", "aggressive")
+    assert config.max_rounds > 0
+
+    return config
+```
+
+### 8.3 配置文件示例
+
+```yaml
+# ~/.aimv/config
+mcp:
+  url: http://aimv-server:8080
+  timeout_seconds: 60
+driver:
+  max_rounds: 5
+  aimv_level: conservative       # conservative | moderate | aggressive
+  test_cmd: ""                   # 空 = 仅编译验证
+```
+
+---
+
+## 9. History 策略
+
+### 9.1 历史记录注入
+
+每轮 MCP 请求携带最近 3 轮的历史，让 AI 避免重复建议。不足 3 轮时发送全部。
+
+```python
+# [AIMV] driver/aimv_driver.py
+
+def build_history(func_result: PerFunctionResult, max_entries: int = 3) -> list:
+    """从 PerFunctionResult 构建历史记录（最近 3 轮）。
+
+    对应 PLAN §3.1 HistoryRecord 字段:
+      round:              轮次号
+      diagnosis_summary:  该轮诊断摘要
+      suggestion_applied: 应用的 AI 建议摘要
+      outcome:            结果（compile_passed, vectorization_still_failed 等）
+    """
+    rounds = func_result.rounds[-max_entries:]
+    history = []
+    for r in rounds:
+        if r.finished_at is None:
+            continue
+        history.append({
+            "round": r.round_number,
+            "diagnosis_summary": _summarize_diagnostics(r.diagnostics_json),
+            "suggestion_applied": r.applied_diff_summary or "N/A",
+            "outcome": _classify_outcome(r),
+        })
+    return history
+
+
+def _summarize_diagnostics(diagnostics_json: Optional[dict]) -> str:
+    """提取诊断摘要（1-2 句话）。"""
+    if not diagnostics_json:
+        return "N/A"
+    diags = diagnostics_json.get("diagnostics", [])
+    if not diags:
+        return "N/A"
+    first = diags[0]
+    return f"{first.get('remark_id', 'unknown')}: {first.get('remark_text', '')[:100]}"
+
+
+def _classify_outcome(round_rec: RoundRecord) -> str:
+    """分类单轮结果。"""
+    if round_rec.vectorization_status and round_rec.vectorization_status.missed_loops == 0:
+        return "vectorized"
+    if round_rec.verify_build and round_rec.verify_build.returncode != 0:
+        return "compile_failed"
+    if round_rec.test_result and round_rec.test_result.failed > 0:
+        return "test_failed"
+    return "compile_passed, vectorization_still_failed"
+```
+
+---
+
+## 10. Review 模式
+
+### 10.1 AIMV_MODE=review
+
+默认全自动。设置 `AIMV_MODE=review` 环境变量后，每轮 patch 前暂停等待用户确认。
+
+```python
+# [AIMV] driver/aimv_driver.py
+
+def prompt_review(diff_text: str, description: str) -> str:
+    """AIMV_MODE=review 时，每轮 patch 前等待用户确认。
+
+    返回: 'y' (apply), 'n' (skip), 'r' (rollback all), 'q' (quit)
+    """
+    import sys
+    print(f"\n[AIMV] Suggested change: {description}", file=sys.stderr)
+    print(f"[AIMV] Diff:\n{diff_text}", file=sys.stderr)
+    print("[AIMV] Apply this change? [y/N/r/q]: ", end="", file=sys.stderr, flush=True)
+
+    response = input().strip().lower()
+    return response if response in ("y", "r", "q") else "n"
+```
+
+默认跳过 review 是因为编译验证 + 测试套件两层自动保险已可拦截语义错误（SPEC §3.1）。
+
+---
+
+## 11. 单函数迭代主循环
+
+```python
+# [AIMV] driver/aimv_driver.py
+
+def process_single_function(
+    function_name: str,
+    source_file: str,
+    initial_diagnostics: list,
+    config: DriverConfig,
+    builder: BuildOrchestrator,
+    mcp: MCPClient,
+    engine: IterationEngine,
+    sources: SourceManager,
+    store: SessionStore,
+    session: SessionRecord,
+) -> PerFunctionResult:
+    """单函数迭代主循环。
+
+    独立轮次计数，独立终止原因。
+    成功后变更立即通过 atomic mv 写入原文件。
+    """
+
+    func_result = PerFunctionResult(function_name=function_name)
+
+    # 残留影子检测
+    sources.warn_stale_shadow(source_file)
+
+    # 首轮诊断用于构造 MCP 请求
+    prev_passed_count = 0
+
+    try:
+        while True:
+            round_num = len(func_result.rounds) + 1
+            round_rec = RoundRecord(round_number=round_num)
+            func_result.rounds.append(round_rec)
+
+            # ── Step 1: 编译 + AIMV Pass ──
+            round_rec.status = IterationStatus.COMPILING
+            build = builder.compile_with_aimv(
+                source_file=source_file,
+                output_file=str(Path(config.output_dir) / f"{function_name}.o"),
+                aimv_json_output=str(
+                    Path(config.output_dir) / f"aimv-{function_name}-r{round_num}.json"
+                ),
+            )
+            round_rec.build_result = build
+
+            if build.returncode != 0:
+                action, reason = engine.decide(
+                    current_round=round_num,
+                    build_result_ok=False, test_result_ok=True,
+                    vectorized=False, mcp_had_suggestions=False,
+                    mcp_responded=True,
+                )
+                if action == NextAction.STOP:
+                    func_result.termination_reason = TerminationReason.COMPILE_ERROR
+                    break
+                continue
+
+            # 检查向量化状态
+            vstatus = builder.check_vectorization(
+                build.aimv_json_path, function_name)
+            round_rec.vectorization_status = vstatus
+
+            # 终止判定: 向量化成功
+            if vstatus.missed_loops == 0 and vstatus.total_loops > 0:
+                func_result.termination_reason = TerminationReason.VECTORIZED
+                func_result.vectorized = True
+                func_result.rounds_used = round_num
+                round_rec.status = IterationStatus.SUCCESS
+                break
+
+            # 加载诊断数据
+            with open(build.aimv_json_path) as f:
+                aimv_json = json.load(f)
+            round_rec.diagnostics_json = aimv_json
+
+            # 构造 MCP 请求
+            # source_code 为当前文件的完整内容（已包含前面函数的变更）
+            request_body = build_mcp_request(
+                function_name=function_name,
+                source_file=source_file,
+                diagnostics=aimv_json.get("diagnostics", []),
+                history=build_history(func_result),
+                aimv_level=engine.current_level,
+                config=config,
+            )
+            round_rec.mcp_request = request_body
+
+            # ── Step 2: MCP 查询 [无锁] ──
+            round_rec.status = IterationStatus.QUERYING
+            mcp_resp = mcp.analyze(request_body)
+            round_rec.mcp_response = mcp_resp
+            round_rec.suggestion_description = (
+                mcp_resp.get("suggestions", [{}])[0].get("description")
+                if mcp_resp else None
+            )
+
+            mcp_responded = mcp_resp is not None
+            mcp_had_suggestions = bool(
+                mcp_resp and mcp_resp.get("suggestions")
+                and not mcp_resp.get("no_action_possible")
+            )
+
+            if not mcp_responded or not mcp_had_suggestions:
+                action, reason = engine.decide(
+                    current_round=round_num,
+                    build_result_ok=True, test_result_ok=True,
+                    vectorized=False, mcp_had_suggestions=mcp_had_suggestions,
+                    mcp_responded=mcp_responded,
+                )
+                if action == NextAction.ESCALATE_LEVEL:
+                    continue
+                if action == NextAction.STOP:
+                    func_result.termination_reason = TerminationReason.NO_SUGGESTION
+                    break
+                continue
+
+            # Review 模式检查
+            suggestion = mcp_resp["suggestions"][0]
+            diff_text = suggestion["diff"]
+            round_rec.applied_diff_summary = suggestion.get("description", "")
+
+            if config.aimv_mode == "review":
+                response = prompt_review(diff_text, suggestion.get("description", ""))
+                if response == "n":
+                    continue
+                elif response == "r":
+                    sources.rollback_all()
+                    func_result.termination_reason = TerminationReason.INTERRUPTED
+                    break
+                elif response == "q":
+                    func_result.termination_reason = TerminationReason.INTERRUPTED
+                    break
+
+            # 循环检测: 防止 LLM 重复建议同一修改
+            if any(p.diff_text.strip() == diff_text.strip()
+                   for p in sources._patch_history):
+                func_result.termination_reason = TerminationReason.NO_IMPROVEMENT
+                break
+
+            # ── Step 3: 影子文件 patch [获取锁] ──
+            round_rec.status = IterationStatus.PATCHING
+            if not sources.acquire_lock(source_file):
+                func_result.termination_reason = TerminationReason.COMPILE_ERROR
+                break
+
+            try:
+                patch = sources.apply_shadow_patch(source_file, diff_text)
+                round_rec.patch = patch
+
+                # ── Step 4: 重编译验证 [同一锁区间] ──
+                round_rec.status = IterationStatus.VERIFYING
+                shadow_file = source_file + ".aimv-tmp"
+                verify_build = builder.compile_with_aimv(
+                    source_file=shadow_file,
+                    output_file=str(
+                        Path(config.output_dir) / f"{function_name}-verify.o"
+                    ),
+                )
+                round_rec.verify_build = verify_build
+
+                if verify_build.returncode != 0:
+                    # 编译失败 → 丢弃影子
+                    sources.discard_shadow(source_file)
+                    action, reason = engine.decide(
+                        current_round=round_num,
+                        build_result_ok=False, test_result_ok=True,
+                        vectorized=False, mcp_had_suggestions=True,
+                        mcp_responded=True,
+                    )
+                    if action == NextAction.STOP:
+                        func_result.termination_reason = TerminationReason.COMPILE_ERROR
+                        break
+                    continue
+
+                # 检查验证编译后的向量化状态
+                verify_vstatus = builder.check_vectorization(
+                    verify_build.aimv_json_path, function_name)
+
+                # 收益退化检测: passed remark 数量减少 → 回滚
+                if (prev_passed_count > 0 and
+                        verify_vstatus.passed_remark_count < prev_passed_count):
+                    sources.discard_shadow(source_file)
+                    func_result.termination_reason = TerminationReason.NO_IMPROVEMENT
+                    break
+
+                # 测试
+                test = builder.run_tests(config.test_cmd)
+                round_rec.test_result = test
+
+                if test.returncode != 0 or test.failed > 0:
+                    sources.discard_shadow(source_file)
+                    func_result.termination_reason = TerminationReason.TEST_FAILURE
+                    break
+
+                # 全部通过 → atomic mv 替换原文件
+                sources.commit_shadow(source_file)
+                prev_passed_count = verify_vstatus.passed_remark_count
+
+            finally:
+                sources.release_lock(source_file)
+
+            # 持久化
+            store.save(session)
+
+            # 轮次判定
+            action, reason = engine.decide(
+                current_round=round_num,
+                build_result_ok=True, test_result_ok=True,
+                vectorized=False, mcp_had_suggestions=True,
+                mcp_responded=True,
+            )
+            if action == NextAction.STOP:
+                func_result.termination_reason = TerminationReason.ROUND_LIMIT
+                func_result.rounds_used = round_num
+                break
+
+    except KeyboardInterrupt:
+        func_result.termination_reason = TerminationReason.INTERRUPTED
+        sources.rollback_all()
+
+    finally:
+        func_result.rounds_used = len(func_result.rounds)
+        round_rec.finished_at = time.time()
+
+    return func_result
+```
+
+---
+
+## 12. Session 持久化（session_store.py）
+
+### 12.1 格式
 
 ```python
 # [AIMV] driver/session_store.py
@@ -889,22 +1537,29 @@ from pathlib import Path
 from dataclasses import asdict
 from typing import Optional
 
+
 class SessionStore:
     """Session JSON 持久化。
 
-    JSON schema: 与 SessionRecord 的 dataclass 字段一一对应。
     文件路径: <output_dir>/sessions/<session_id>.json
 
     写入策略:
       - 每轮迭代结束后自动写入 (原子写: 写 tmp + rename)
       - 不依赖外部数据库
+
+    追溯产物（SPEC §3.1）:
+    | 产物         | 路径                               | 生成时机         |
+    |-------------|-------------------------------------|-----------------|
+    | 累积 patch  | <source>.aimv.patch                 | 每轮成功后更新   |
+    | Session 记录 | sessions/<session_id>.json          | 每轮更新         |
+    | 备份        | backups/<name>.r<N>.bak             | 每次 patch 前    |
     """
 
     def __init__(self, output_dir: str):
         self.sessions_dir = Path(output_dir) / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    def save(self, session: SessionRecord):
+    def save(self, session):
         """原子写入 session JSON。"""
         data = self._serialize(session)
         path = self.sessions_dir / f"{session.session_id}.json"
@@ -915,426 +1570,214 @@ class SessionStore:
 
         os.replace(tmp_path, path)  # 原子 rename
 
-    def load(self, session_id: str) -> Optional[SessionRecord]:
+    def load(self, session_id: str) -> Optional[dict]:
         """从磁盘恢复 session。"""
         path = self.sessions_dir / f"{session_id}.json"
         if not path.exists():
             return None
-
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            return json.load(f)
 
-        return self._deserialize(data)
-
-    def list_sessions(self) -> list[dict]:
+    def list_sessions(self) -> list:
         """列出所有 session 摘要。"""
         sessions = []
         for path in self.sessions_dir.glob("*.json"):
             with open(path) as f:
                 data = json.load(f)
             sessions.append({
-                "session_id": data["session_id"],
-                "function_name": data["function_name"],
+                "session_id": data.get("session_id", ""),
+                "source_file": data.get("source_file", ""),
                 "status": data.get("termination_reason", "in_progress"),
-                "rounds": len(data.get("rounds", [])),
+                "functions_count": len(data.get("functions", [])),
                 "started_at": data.get("started_at"),
-                "finished_at": data.get("finished_at"),
             })
-        return sorted(sessions, key=lambda s: s["started_at"] or "", reverse=True)
+        return sorted(sessions, key=lambda s: s.get("started_at") or "", reverse=True)
 
-    def _serialize(self, session: SessionRecord) -> dict:
-        """将 dataclass 递归序列化为 JSON 兼容 dict。"""
-        # 注意: PatchRecord.diff_text 可能包含特殊字符，但 JSON 正确处理
-        return _dataclass_to_dict(session)
+    @staticmethod
+    def _serialize(obj) -> dict:
+        """递归 dataclass → JSON 兼容 dict。"""
+        if hasattr(obj, "__dataclass_fields__"):
+            result = {}
+            for field_name in obj.__dataclass_fields__:
+                value = getattr(obj, field_name)
+                result[field_name] = SessionStore._serialize(value)
+            return result
+        elif isinstance(obj, list):
+            return [SessionStore._serialize(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {k: SessionStore._serialize(v) for k, v in obj.items()}
+        elif hasattr(obj, "value"):  # Enum
+            return obj.value
+        else:
+            return obj
+```
 
-    def _deserialize(self, data: dict) -> SessionRecord:
-        return _dict_to_session(data)
+---
+
+## 13. stderr 输出格式
+
+输出到 stderr，不干扰编译 stdout。格式严格遵循 SPEC §3.1。
+
+```python
+# [AIMV] driver/aimv_driver.py
+
+import sys
 
 
-def _dataclass_to_dict(obj) -> dict:
-    """递归 dataclass → dict"""
-    if hasattr(obj, "__dataclass_fields__"):
-        result = {}
-        for field_name in obj.__dataclass_fields__:
-            value = getattr(obj, field_name)
-            result[field_name] = _dataclass_to_dict(value)
-        return result
-    elif isinstance(obj, list):
-        return [_dataclass_to_dict(item) for item in obj]
-    elif isinstance(obj, dict):
-        return {k: _dataclass_to_dict(v) for k, v in obj.items()}
-    elif isinstance(obj, Enum):
-        return obj.value
+def emit_summary(
+    results: list,              # List[PerFunctionResult]
+    source_file: str,
+    session: SessionRecord,
+    store: SessionStore,
+    config: DriverConfig,
+):
+    """输出最终汇总到 stderr（SPEC §3.1 格式）。"""
+
+    total = len(results)
+    optimized = sum(1 for r in results if r.vectorized)
+    skipped = total - optimized  # includes gave_up + round_limit
+
+    if len(results) == 1:
+        r = results[0]
+        if r.vectorized:
+            # 单函数成功
+            print(
+                f"[AIMV] {r.function_name}: vectorized "
+                f"({r.rounds_used} rounds, {session.aimv_level})",
+                file=sys.stderr,
+            )
+            for rr in r.rounds:
+                if rr.applied_diff_summary:
+                    print(
+                        f"[AIMV]   Round {rr.round_number}: {rr.applied_diff_summary}",
+                        file=sys.stderr,
+                    )
+        else:
+            # 单函数放弃
+            reason_str = _format_termination(r.termination_reason, r.rounds_used)
+            print(
+                f"[AIMV] {r.function_name}: {reason_str}",
+                file=sys.stderr,
+            )
+            if r.termination_reason in (
+                TerminationReason.ROUND_LIMIT,
+                TerminationReason.NO_SUGGESTION,
+                TerminationReason.NO_IMPROVEMENT,
+            ):
+                print(
+                    "[AIMV]   Source rolled back to original",
+                    file=sys.stderr,
+                )
     else:
-        return obj
+        # 多函数混合结果
+        print(
+            f"[AIMV] {Path(source_file).name}: "
+            f"{total} functions analyzed, "
+            f"{optimized} optimized, "
+            f"{total - optimized} gave up",
+            file=sys.stderr,
+        )
+        for r in results:
+            if r.vectorized:
+                print(
+                    f"[AIMV]   {r.function_name}: vectorized "
+                    f"({r.rounds_used} rounds, {session.aimv_level})",
+                    file=sys.stderr,
+                )
+            elif r.termination_reason == TerminationReason.VECTORIZED:
+                print(
+                    f"[AIMV]   {r.function_name}: already vectorized (skipped)",
+                    file=sys.stderr,
+                )
+            else:
+                reason_str = _format_termination(r.termination_reason, r.rounds_used)
+                print(
+                    f"[AIMV]   {r.function_name}: {reason_str}",
+                    file=sys.stderr,
+                )
+
+    # 追溯产物路径
+    patch_path = Path(source_file).resolve()
+    patch_file = patch_path.parent / f"{patch_path.name}.aimv.patch"
+    if patch_file.exists():
+        print(f"[AIMV]   Patch: {patch_file}", file=sys.stderr)
+
+    session_path = store.sessions_dir / f"{session.session_id}.json"
+    if session_path.exists():
+        print(f"[AIMV]   Report: {session_path}", file=sys.stderr)
+
+
+def _format_termination(reason: TerminationReason, rounds_used: int) -> str:
+    """格式化终止原因。"""
+    if reason == TerminationReason.ROUND_LIMIT:
+        return f"unable to vectorize ({rounds_used} rounds exhausted)"
+    elif reason == TerminationReason.NO_SUGGESTION:
+        return "unable to vectorize (no suggestions from AI)"
+    elif reason == TerminationReason.NO_IMPROVEMENT:
+        return "unable to vectorize (regression detected)"
+    elif reason == TerminationReason.COMPILE_ERROR:
+        return "unable to vectorize (compile error)"
+    elif reason == TerminationReason.TEST_FAILURE:
+        return "unable to vectorize (test failure)"
+    elif reason == TerminationReason.INTERRUPTED:
+        return "interrupted by user"
+    else:
+        return f"unable to vectorize ({reason.value})"
 ```
 
-### 7.2 崩溃恢复流程
+**输出示例**（SPEC §3.1 精确格式）:
 
 ```
-aimv-driver 启动
-    │
-    ├── 检查 --resume <session_id>
-    │     │
-    │     └── session_id 存在 → load session JSON → 恢复到 last_round 状态
-    │           │
-    │           ├── 检查 backup_dir 是否有残留 .bak
-    │           │     └── 有 → 警告用户 "上次可能未正确清理"，从 pristine 恢复
-    │           │
-    │           ├── 从 session.current_round + 1 继续迭代
-    │           └── 注入 history (前几轮的 AI 建议和结果)
-    │
-    └── 正常启动
-          │
-          └── 创建 pristine backup → 开始 Round 1
+# 单函数成功：
+[AIMV] process_task: vectorized (2 rounds, conservative)
+[AIMV]   Round 1: added restrict to parameter 'a' (line 1)
+[AIMV]   Patch: /home/user/task.c.aimv.patch
+[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+
+# 多函数混合结果：
+[AIMV] task.c: 3 functions analyzed, 2 optimized, 1 skipped
+[AIMV]   process_task: vectorized (2 rounds, conservative)
+[AIMV]   filter_data:  vectorized (1 round, moderate)
+[AIMV]   init_buf:     already vectorized (skipped)
+[AIMV]   Patch: /home/user/task.c.aimv.patch
+[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+
+# 放弃场景：
+[AIMV] process_task: unable to vectorize (3 rounds exhausted)
+[AIMV]   Source rolled back to original
+[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
 ```
 
 ---
 
-## 8. 主循环实现
+## 14. CLI 接口
 
-```python
-# [AIMV] driver/aimv_driver.py (核心循环，伪代码)
+### 14.1 主入口：`--from-json`（clang Driver 调用）
 
-def main_loop(driver_config: dict) -> int:
-    """主迭代循环。返回 0 表示成功，非 0 表示失败。"""
+```
+aimv-driver --from-json=<aimv.json> --source=<source_file>
 
-    # 初始化模块
-    session = SessionRecord(
-        function_name=driver_config["function"],
-        source_files=driver_config["source_files"],
-        aimv_level=driver_config["aimv_level"],
-        max_rounds=driver_config["max_rounds"],
-        cli_command=" ".join(sys.argv),
-    )
-
-    builder = BuildOrchestrator(driver_config)
-    sources = SourceManager(driver_config["backup_dir"])
-    mcp = MCPClient(driver_config["mcp_url"])
-    engine = IterationEngine(driver_config["aimv_level"], driver_config["max_rounds"])
-    store = SessionStore(driver_config["output_dir"])
-
-    # 创建 pristine backup
-    for src in session.source_files:
-        pristine_dir = Path(driver_config["backup_dir"]) / "pristine"
-        pristine_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, pristine_dir / Path(src).name)
-
-    # 主循环
-    try:
-        while True:
-            round_rec = RoundRecord(round_number=len(session.rounds) + 1)
-            session.rounds.append(round_rec)
-            session.current_round = round_rec.round_number
-
-            # Step 1: 编译 + AIMV Pass
-            round_rec.status = DriverStatus.COMPILING
-            build = builder.compile_with_aimv(
-                source_file=session.source_files[0],
-                output_file=driver_config["output_binary"],
-                target_function=session.function_name,
-            )
-            round_rec.build_result = build
-
-            if build.returncode != 0:
-                action, reason = engine.decide(
-                    current_round=round_rec.round_number,
-                    build_result_ok=False, test_result_ok=True,
-                    vectorized=False, mcp_had_suggestions=False, mcp_responded=True,
-                )
-                if action == NextAction.STOP:
-                    session.termination_reason = TerminationReason.COMPILE_ERROR
-                    break
-                # action == RETRY_SAME → 重试同轮
-                sources.rollback_all()
-                continue
-
-            # 检查向量化状态（双模式）
-            # 策略: 按目标循环判断，非函数级全量判断。
-            # 函数可能有多个循环，部分 passed 部分仍然 missed。
-            # Driver 每轮只关注 session.target_loop_line 指定的循环
-            # （首次自动选取第一个 missed 循环）。
-            if Path(build.aimv_json_path).exists():
-                vstatus = builder.check_vectorization_from_json(
-                    build.aimv_json_path, session.function_name)
-            else:
-                # YAML 模式: 从 opt-record YAML 检查是否有 missed remark
-                # 注意: YAML 模式只有 passed/missed/analysis 的 type 字段，
-                # 无代价模型和依赖分析数据，LLM 可用的信息较少（此为已知限制）。
-                vstatus = builder.check_vectorization_from_yaml(
-                    build.opt_record_path, session.function_name)
-            round_rec.vectorization_status = vstatus
-
-            # 首轮自动选定目标循环（如果有多个 missed 循环）
-            if session.target_loop_line is None and vstatus.missed_details:
-                session.target_loop_line = vstatus.missed_details[0].get("loop_location")
-
-            # 终止判定: 检查目标循环是否已从 missed 变为 passed
-            if vstatus.total_loops > 0:
-                target_passed = _check_target_loop_passed(vstatus, session.target_loop_line)
-                if target_passed:
-                    session.termination_reason = TerminationReason.VECTORIZED
-                    log_success(session)
-                    break
-                elif vstatus.missed_loops == 0:
-                    # 所有循环都 passed（即使没指定目标循环）
-                    session.termination_reason = TerminationReason.VECTORIZED
-                    log_success(session)
-                    break
-            elif vstatus.total_loops == 0:
-                log_warning("No diagnostics found; pass may not have run or function has no loops")
-                session.termination_reason = TerminationReason.NO_SUGGESTION
-                break
-
-            # 加载诊断数据（双模式）
-            if Path(build.aimv_json_path).exists():
-                # Pass 模式: 读取 AIMVFeedbackPass JSON（丰富诊断）
-                with open(build.aimv_json_path) as f:
-                    aimv_json = json.load(f)
-            else:
-                # YAML 模式: 从 opt-record YAML 解析基础诊断（零侵入）
-                # 注意: YAML 模式无代价模型和依赖分析数据，LLM 可用的信息较少
-                aimv_json = opt_info_parser.parse_to_analyze_request(
-                    build.opt_record_path,
-                    session.function_name,
-                    session.source_files[0],
-                )
-
-            # 补充 function 字段（Pass JSON 只有 diagnostics + target，
-            # AnalyzeRequest 要求完整的 FunctionInfo）
-            # 注意: source_code 只提取目标函数的源码片段，不发整个文件
-            # （避免 token 浪费、LLM 混淆、大文件超上下文窗口）。
-            func_source = extract_function_source(
-                session.source_files[0], session.function_name)
-            if func_source is None:
-                # 回退: 函数提取失败时截取 loop_location 前后 40 行
-                loop_line = extract_loop_line(
-                    aimv_json.get("diagnostics", []), session.function_name)
-                func_source = extract_lines_around(
-                    session.source_files[0], loop_line, context=40)
-
-            aimv_json["function"] = {
-                "name": session.function_name,
-                "signature": extract_function_signature(
-                    session.source_files[0], session.function_name),
-                "source_code": func_source,
-                "source_file": session.source_files[0],
-                "loop_line": extract_loop_line(
-                    aimv_json.get("diagnostics", []), session.function_name),
-            }
-
-            # 注入 history
-            aimv_json["history"] = build_history(session)
-            aimv_json["aimv_level"] = engine.current_level
-
-            # Step 2: MCP 查询
-            round_rec.status = DriverStatus.QUERYING_MCP
-            mcp_resp = mcp.analyze(aimv_json)
-            round_rec.mcp_response = mcp_resp
-
-            mcp_responded = mcp_resp is not None
-            mcp_had_suggestions = bool(mcp_resp and mcp_resp.get("suggestions"))
-
-            if not mcp_responded or not mcp_had_suggestions:
-                action, reason = engine.decide(
-                    current_round=round_rec.round_number,
-                    build_result_ok=True, test_result_ok=True,
-                    vectorized=False, mcp_had_suggestions=mcp_had_suggestions,
-                    mcp_responded=mcp_responded,
-                )
-                if action == NextAction.ESCALATE_LEVEL:
-                    continue  # 用新 level 重复本轮
-                if action == NextAction.STOP:
-                    session.termination_reason = TerminationReason.NO_SUGGESTION
-                    break
-                continue  # RETRY_SAME
-
-            # Step 3: 应用 patch
-            round_rec.status = DriverStatus.PATCHING
-            suggestion = mcp_resp["suggestions"][0]
-
-            # 循环检测: 比较 diff 与历史 patch，防止 LLM 重复建议同一修改
-            new_diff = suggestion["diff"]
-            if any(p.diff_text.strip() == new_diff.strip()
-                   for p in sources._patch_history):
-                log_warning("Duplicate patch detected; LLM suggested same change as previous round")
-                session.termination_reason = TerminationReason.NO_IMPROVEMENT
-                store.save(session)
-                break
-
-            patch = sources.apply_patch(suggestion["source_file"], new_diff)
-            round_rec.patch = patch
-            store.save(session)
-
-            # Step 4: 重编译验证
-            round_rec.status = DriverStatus.VERIFYING
-            verify_build = builder.compile_with_aimv(
-                source_file=session.source_files[0],
-                output_file=driver_config["output_binary"],
-                target_function=session.function_name,
-            )
-            round_rec.verify_build = verify_build
-
-            # 验证后持久化
-            store.save(session)
-
-            if verify_build.returncode != 0:
-                sources.rollback(patch)
-                store.save(session)
-                action, reason = engine.decide(
-                    current_round=round_rec.round_number,
-                    build_result_ok=False, test_result_ok=True,
-                    vectorized=False, mcp_had_suggestions=True, mcp_responded=True,
-                )
-                if action == NextAction.STOP:
-                    session.termination_reason = TerminationReason.COMPILE_ERROR
-                    break
-                continue
-
-            # Step 5: 测试
-            test = builder.run_tests(driver_config["test_cmd"])
-            round_rec.test_result = test
-
-            if test.returncode != 0 or test.failed > 0:
-                # 测试失败 = patch 引入语义错误，回滚并立即终止（不重试）
-                sources.rollback(patch)
-                round_rec.status = DriverStatus.FAILED
-                session.termination_reason = TerminationReason.TEST_FAILURE
-                store.save(session)
-                break
-
-            # Step 6: (可选) 性能测量
-            if driver_config.get("measure_perf"):
-                round_rec.status = DriverStatus.MEASURING
-                baseline = session.rounds[0].baseline_perf_ms  # 首轮基线
-                current = measure_performance(driver_config["perf_cmd"])
-                perf_delta = ((baseline - current) / baseline) * 100 if baseline else None
-
-                action, reason = engine.decide(
-                    current_round=round_rec.round_number,
-                    build_result_ok=True, test_result_ok=True,
-                    vectorized=False, mcp_had_suggestions=True, mcp_responded=True,
-                    perf_delta_pct=perf_delta,
-                )
-                if action == NextAction.ROLLBACK:
-                    sources.rollback(patch)
-                    session.termination_reason = TerminationReason.NO_IMPROVEMENT
-                    break
-            else:
-                action, reason = engine.decide(
-                    current_round=round_rec.round_number,
-                    build_result_ok=True, test_result_ok=True,
-                    vectorized=False, mcp_had_suggestions=True, mcp_responded=True,
-                )
-
-            if action == NextAction.STOP:
-                session.termination_reason = TerminationReason.ROUND_LIMIT
-                break
-
-            # 持久化
-            store.save(session)
-
-    except KeyboardInterrupt:
-        session.termination_reason = TerminationReason.INTERRUPTED
-        sources.rollback_all()
-        log_interrupted(session)
-
-    finally:
-        session.finished_at = time.time()
-        session.total_elapsed_ms = (session.finished_at - session.started_at) * 1000
-        store.save(session)
-
-    return 0 if session.termination_reason == TerminationReason.VECTORIZED else 1
+  --from-json=PATH     从 AIMV JSON 启动分析（clang Driver fork+exec 入口）
+  --source=FILE        源文件路径
 ```
 
----
-
-## 9. 并发模型
-
-### 9.1 设计
-
-AIMV 操作的对象是**源码文件**。多函数并行分析存在文件冲突风险（两个函数在同一文件中，同时被修改）。
-
-```python
-# 并发策略: 以 source_file 为锁粒度
-#
-#   aimv-driver --function=func_a src.c  ─┐
-#   aimv-driver --function=func_b src.c  ─┤─→ 检测到 src.c 被占用
-#                                         │   → 排队等待 / 报错退出
-#   aimv-driver --function=func_c util.c ─┘   → 并行执行 (不同文件)
-#
-# 实现: 文件锁 (flock / LockFile)
-#   <output_dir>/locks/<sha256_of_abspath>.lock
-```
-
-```python
-# [AIMV] driver/source_manager.py (补充)
-
-import fcntl  # Linux / macOS
-# Windows: import msvcrt
-
-class FileLock:
-    """跨进程文件锁"""
-
-    def __init__(self, lock_dir: str):
-        self.lock_dir = Path(lock_dir)
-        self.lock_dir.mkdir(parents=True, exist_ok=True)
-        self._locks: dict[str, int] = {}
-
-    def acquire(self, source_file: str, timeout_seconds: int = 30) -> bool:
-        """获取文件锁。timeout 秒内未获取返回 False。"""
-        import hashlib
-
-        path = Path(source_file).resolve()
-        lock_name = hashlib.sha256(str(path).encode()).hexdigest()[:16]
-        lock_path = self.lock_dir / f"{lock_name}.lock"
-
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
-        deadline = time.time() + timeout_seconds
-
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._locks[str(path)] = fd
-                return True
-            except BlockingIOError:
-                if time.time() > deadline:
-                    os.close(fd)
-                    return False
-                time.sleep(0.5)
-
-    def release(self, source_file: str):
-        path = str(Path(source_file).resolve())
-        fd = self._locks.pop(path, None)
-        if fd is not None:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-```
-
----
-
-## 10. 配置与 CLI
-
-### 10.1 完整 CLI
+### 14.2 独立模式（手动/CI）
 
 ```
 aimv-driver [OPTIONS] <source_file>
 
 OPTIONS:
-  --function FUNC          目标函数名（必填）
-  --aimv-level LEVEL       修改激进度 (conservative|moderate|aggressive, 默认 moderate)
+  --function FUNC          目标函数名（默认: 所有失败函数）
+  --aimv-level LEVEL       修改激进度 (conservative|moderate|aggressive, 默认 conservative)
   --max-rounds N           最大迭代轮次（默认 5）
   --mcp-url URL            MCP 服务地址（默认 http://localhost:8080）
   --output-dir DIR         输出目录（默认 ./aimv-output）
-  --build-cmd CMD          编译命令模板（默认 "clang -O2 {src} -o {out}"）
-  --test-cmd CMD           测试命令（默认 "make test"）
-  --perf-cmd CMD           性能测量命令（可选）
-  --measure-perf           启用性能测量
+  --test-cmd CMD           测试命令（默认 ""，仅编译验证）
+  --dry-run                仅编译+诊断，不调用 MCP 不修改源码
+  --require-review         每轮 patch 前等待用户确认
   --resume SESSION_ID      从 session 恢复
   --list-sessions          列出所有 session
-  --dry-run                仅编译+诊断，不调用 MCP 不修改源码
   --verbose                详细日志
-  --json-log               日志以 JSON 格式输出到文件
 
 EXAMPLES:
   # 基本使用
@@ -1350,26 +1793,27 @@ EXAMPLES:
 
 ---
 
-## 11. 错误处理矩阵
+## 15. 错误处理矩阵
 
 | 场景 | 检测方式 | 处理 |
 |------|---------|------|
 | 源文件不存在 | 启动时检查 | 立即退出，exit code 2 |
-| clang 未安装 | 编译失败，stderr 含 "command not found" | 立即退出，exit code 3 |
+| clang 未安装 | 编译失败 stderr 含 "command not found" | 立即退出，exit code 3 |
 | MCP 服务不可达 | 健康检查 + POST 超时 | 3 次重试，仍失败则退出，exit code 4 |
 | MCP 返回非 JSON | JSONDecodeError | 记录原始响应到日志，重试 1 次 |
-| MCP 返回空建议 | no_action_possible=true | 升激进度或放弃 |
-| MCP 建议 diff 格式错误 | patch 命令失败 | 回滚，记录，重试（同 round 1 次） |
-| 编译失败（patch 引入语法错） | returncode != 0 | 回滚，重试（同 round 1 次），再次失败则停止 |
-| 测试失败 | returncode != 0 或解析到 failed > 0 | 回滚，停止 |
-| 性能退化 >5% | 可选 perf 测量 | 回滚，停止 |
+| MCP 返回空建议 | no_action_possible=true | 升 aimv_level 或放弃 |
+| MCP 建议 diff 格式错误 | patch 命令失败 | 回滚影子文件，重试（同 round 1 次） |
+| 编译失败（patch 引入语法错） | returncode != 0 | 丢弃影子文件，重试（同 round 1 次），再次失败则停止 |
+| 测试失败 | returncode != 0 或 failed > 0 | 丢弃影子文件，停止 |
+| 收益退化（passed remark 减少） | 比较前后 passed_remark_count | 丢弃影子文件，回滚，停止 |
 | 磁盘满 | OSError (ENOSPC) | 停止，保留已完成 session，exit code 5 |
 | 用户中断 (Ctrl+C) | KeyboardInterrupt | 回滚所有 patch，写入 session，exit code 130 |
 | 进程被 kill (SIGTERM) | signal handler | 回滚所有 patch，写入 session，exit code 143 |
+| 残留影子文件 | 启动时 check_stale_shadow() | 输出警告到 stderr，不自动覆盖 |
 
 ---
 
-## 12. 依赖
+## 16. 依赖
 
 ```
 aimv/driver/requirements.txt
@@ -1379,9 +1823,10 @@ pyyaml>=6.0
 jinja2>=3.1                   # 仅用于可选的自定义 prompt 模板
 ```
 
-零额外依赖 —— 核心逻辑只用 stdlib（subprocess, json, hashlib, fcntl, pathlib, dataclasses, time）。httpx 是唯一的第三方依赖（HTTP 客户端），可选替换为 urllib。
+零额外依赖 -- 核心逻辑只用 stdlib（subprocess, json, hashlib, fcntl, pathlib, dataclasses, time）。httpx 是唯一的第三方依赖（HTTP 客户端），可选替换为 urllib。
 
 ---
 
-*文档版本: 1.0*
+*文档版本: 2.0*
 *创建日期: 2026-04-29*
+*最后更新: 2026-05-17*
