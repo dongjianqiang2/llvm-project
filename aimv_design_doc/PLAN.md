@@ -528,7 +528,7 @@ mcp:
   api_key: sk-xxx
 driver:
   max_rounds: 3
-  aimv_level: moderate
+  aimv_level: conservative
   test_cmd: make test
 ```
 
@@ -775,7 +775,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 aimv:
   # 迭代控制
   max_rounds: 5
-  aimv_level: "moderate"           # conservative | moderate | aggressive
+  aimv_level: "conservative"       # conservative | moderate | aggressive
 
   # MCP 服务
   mcp:

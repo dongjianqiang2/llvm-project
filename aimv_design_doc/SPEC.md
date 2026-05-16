@@ -45,7 +45,7 @@
 
 1. 函数成功向量化即停止（检测到 LoopVectorize pass 成功生成向量指令）
 2. 到达最大迭代轮次上限（默认 5 轮，可配置）
-3. 收益不增时回滚（编译期判定：新 patch 后 `LoopVectorize` passed remark 数量减少则回滚。运行期性能验证留给用户通过 `aimv-bench` 在编译后执行，不在闭环内）
+3. 收益不增时回滚（编译期判定：新 patch 后 `LoopVectorize` passed remark 数量减少则回滚。运行期性能验证（`aimv-bench`）为 Phase 2 预留功能，不在 MVP 闭环内）
 
 ---
 
@@ -88,6 +88,8 @@ clang Driver (C++)                     aimv-driver (Python)
 | LLVM Pass Pipeline | 注册 AIMVFeedbackPass，无修改 | 已完成 |
 | aimv-driver (Python) | 编排逻辑，无修改；新增 `--from-json` 入口 | ~10 行 |
 
+**空诊断时的行为**：`aimv.json` 中所有 diagnostics 的 `severity == "passed"`（即无向量化失败）时，`aimv-driver` 直接 exit 0，输出：`[AIMV] all loops already vectorized, nothing to do` 到 stderr。clang Driver 将该 exit 0 视为成功。
+
 **迭代重编译与防无限 fork**：
 
 ```
@@ -117,6 +119,10 @@ Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
 - 轮次计数**每函数独立**：函数 A 成功向量化不影响函数 B 继续迭代
 - 编译结束时，stderr 输出按函数分别汇总
 
+**MCP 请求的源码版本**：每轮发送给 MCP 的 `source_code` 为**当前文件的完整内容**（即已包含前面函数所有已通过变更的版本）。AI 生成的 diff 基于该版本，行号与当前文件一致，不会出现偏移。
+
+**作用范围**：AIMV 仅修改 `.c` / `.cpp` 源文件，不修改头文件（`.h` / `.hpp`）。头文件中的 `static inline` 函数或宏展开导致的向量化失败不在 MVP 处理范围内。
+
 **配置来源**：
 
 `aimv-driver --from-json` 模式下，运行参数按以下优先级加载：
@@ -125,7 +131,7 @@ Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
 2. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`
 3. aimv.json 内无配置字段，仅包含诊断数据
 
-默认值：`aimv_level=conservative`、`max_rounds=5`、`mcp_url=http://localhost:8080`、`test_cmd=""`（空则跳过测试，仅做编译验证）。
+默认值：`aimv_level=conservative`（Driver 自动模式和 `aimv-driver` 独立模式统一。全自动场景下保守修改是安全基线，用户可通过配置提升）、`max_rounds=5`、`mcp_url=http://localhost:8080`、`test_cmd=""`（空则跳过测试，仅做编译验证）。
 
 **并发安全与数据竞争防护**：
 
@@ -157,13 +163,15 @@ Round N 完整时序（锁仅覆盖文件 I/O 阶段）:
 
 **中止保护**：`aimv-driver` 被 kill -9 或断电时，`task.c.aimv-tmp` 残留在磁盘。下次启动时检测到残留影子文件，输出警告让用户手动检查，不自动覆盖 `task.c`。
 
+**自动化与人工审查**：Driver 模式默认**全自动**（编译→AI→patch→验证，无需人工介入）。对安全性要求高的场景，设置 `AIMV_MODE=review` 环境变量后，每轮 patch 前暂停等待用户输入 `[y/N/r/q]` 确认（与 `aimv-driver --require-review` 行为一致）。默认跳过 review 是因为 §4.3 的"编译验证 + 测试套件"两层自动保险已可拦截语义错误。
+
 **fork+exec 异常处理**：
 
 | 场景 | clang Driver 行为 |
 |------|------------------|
 | `aimv-driver` 未安装 / 找不到 | 打印警告到 stderr，退化到普通编译（exit code 不变） |
-| `aimv-driver` 崩溃（非零退出 / signal） | 回滚源码到编译前状态，打印错误到 stderr，exit code = aimv-driver 退出码 |
-| `aimv-driver` 超时（默认 120s，可配置） | SIGKILL 终止，回滚源码，打印超时错误 |
+| `aimv-driver` 崩溃（非零退出 / signal） | 回滚源码（aimv-driver 内部 source_manager 维护备份），打印错误到 stderr，exit code = aimv-driver 退出码 |
+| `aimv-driver` 超时（默认 120s，可配置） | SIGKILL 终止，回滚源码（同上），打印超时错误 |
 | 用户 Ctrl+C（SIGINT） | 传递给 aimv-driver，由其回滚源码后退出；clang Driver waitpid 后退出 |
 | 用户 kill（SIGTERM） | 同 SIGINT |
 
@@ -194,7 +202,7 @@ Round N 完整时序（锁仅覆盖文件 I/O 阶段）:
 
 | 产物 | 路径 | 格式 | 生成时机 |
 |------|------|------|---------|
-| 累积 patch | `<source>.aimv.patch` | unified diff（所有成功轮次叠加） | 每轮成功后更新 |
+| 累积 patch | `<source>.aimv.patch` | unified diff（仅包含最终成功的变更，相对于原始源码；失败/回滚的中间尝试不记录） | 每轮成功后更新 |
 | Session 记录 | `aimv-output/sessions/<id>.json` | JSON（完整诊断→AI→patch→验证链） | 每轮更新 |
 | 备份 | `aimv-output/backups/<name>.r<N>.bak` | 原始源码副本 | 每次 patch 前 |
 
@@ -311,6 +319,8 @@ Content-Type: application/json
       "outcome": "compile_passed, vectorization_still_failed"
     }
   ]
+  // history 传递策略：发送最近 3 轮的历史（含 outcome），让 AI 避免重复建议。
+  // 不足 3 轮时发送全部。每条 history 约 100-200 字节，不会显著增加请求体积。
 }
 ```
 
@@ -443,6 +453,6 @@ Content-Type: application/json
 
 ---
 
-*文档版本: 1.2*
+*文档版本: 1.3*
 *创建日期: 2026-04-29*
 *最后更新: 2026-05-16*
