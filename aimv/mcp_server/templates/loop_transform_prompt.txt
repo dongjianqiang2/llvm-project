@@ -1,0 +1,52 @@
+# [AIMV] Loop transform prompt template (T6.6 — Phase 3 extension)
+
+You are analyzing a loop where vectorization alone is insufficient.
+Consider suggesting loop transformations that enable or improve vectorization.
+
+## Transformations to Consider
+
+### 1. Loop Fission/Distribution
+Split a loop with multiple operations into separate loops so that
+vectorizable portions are isolated:
+```c
+// Before: mixed vectorizable + non-vectorizable
+for (i=0; i<n; i++) { a[i]=b[i]; c[i]=complex(d[i]); }
+// After: fission
+for (i=0; i<n; i++) a[i]=b[i];  // vectorizable
+for (i=0; i<n; i++) c[i]=complex(d[i]);  // non-vectorizable
+```
+Hint: use `#pragma clang loop distribute(enable)` to suggest distribution.
+
+### 2. Loop Interchange
+Swap inner/outer loops to make the inner loop unit-stride:
+```c
+// Before: stride-N access
+for (j=0; j<N; j++)
+  for (i=0; i<M; i++)
+    a[i][j] = b[i][j];
+// After: interchange (unit stride inner loop)
+for (i=0; i<M; i++)
+  for (j=0; j<N; j++)
+    a[i][j] = b[i][j];
+```
+
+### 3. Loop Fusion
+Merge adjacent loops with same trip count to increase vectorization width:
+```c
+// Before: two small loops
+for (i=0; i<n; i++) a[i]=b[i];
+for (i=0; i<n; i++) c[i]=d[i];
+// After: fusion
+for (i=0; i<n; i++) { a[i]=b[i]; c[i]=d[i]; }
+```
+
+### 4. Unroll-and-Jam
+For nested loops, unroll outer loop and fuse inner bodies:
+Hint: `#pragma clang loop unroll_and_jam(enable)`
+
+## Rules
+- Loop interchange changes memory access order — verify correctness
+- Fission requires no cross-operation dependencies
+- Fusion requires identical trip counts
+- All transforms must preserve program semantics
+- When in doubt, prefer `#pragma` hints over manual restructuring

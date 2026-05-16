@@ -16,6 +16,7 @@ add_llvm_component_library(LLVMPasses
 
   LINK_COMPONENTS
   AggressiveInstCombine
+  AIMV
   Analysis
   CFGuard
   CodeGen

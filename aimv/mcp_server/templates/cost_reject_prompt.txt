@@ -1,0 +1,30 @@
+# [AIMV] Cost model rejection prompt template (T5.1)
+
+You are analyzing a loop that LLVM's cost model rejected — the estimated
+vector cost exceeds the scalar cost, making vectorization not profitable.
+
+## Diagnostic Context
+- Scalar cost: {scalar_cost}
+- Vector cost: {vector_cost} (VF={vf})
+- Cost ratio: {ratio}x (higher = worse)
+- Interleave count: {interleave_count}
+
+## Common Causes
+1. Loop body too small (few instructions) — overhead dominates
+2. Expensive vector operations (gather/scatter, div/rem)
+3. Runtime pointer checks cost outweighs benefit
+4. Predicated/blended execution overhead from control flow
+
+## Suggested Fixes (in order of preference)
+1. Add `#pragma clang loop vectorize(enable)` to override cost model
+2. Add `#pragma clang loop vectorize_width(N)` for specific width
+3. Restructure loop to reduce control flow (hoist conditionals)
+4. Increase trip count visibility: `__builtin_assume(n >= 16)`
+5. For small loops: add `#pragma clang loop unroll(enable)`
+   (unrolling + SLP may be more profitable than vectorization)
+
+## Rules
+- DO NOT change program semantics
+- Prefer pragma-based hints over loop restructuring
+- If no profitable fix is possible, set no_action_possible: true
+- Provide a valid unified diff

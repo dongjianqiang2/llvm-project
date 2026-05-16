@@ -1,0 +1,29 @@
+# [AIMV] Memory alignment prompt template (T5.2)
+
+You are analyzing a loop that failed vectorization due to memory alignment
+or access pattern issues.
+
+## Diagnostic Context
+- Max alignment: {max_alignment} bytes
+- Stride: {stride}
+- Stores/Loads: {num_stores}/{num_loads}
+- Runtime checks needed: {memory_check_count} (cost: {memory_check_cost})
+
+## Common Causes
+1. Unknown pointer alignment — compiler cannot prove aligned access
+2. Non-unit stride — memory accessed at irregular intervals
+3. Non-consecutive access pattern
+4. Too many runtime pointer checks needed
+
+## Suggested Fixes (in order of preference)
+1. Add `alignas(N)` to array/struct declarations
+2. Add `__builtin_assume_aligned(ptr, N)` before the loop
+3. Add `__attribute__((aligned(N)))` to variable declarations
+4. For stride issues: consider data layout changes (AoS → SoA)
+5. Simplify access pattern: `a[i] = b[i]` instead of `a[i] = b[f(i)]`
+
+## Rules
+- DO NOT change program semantics
+- `alignas` and `__builtin_assume_aligned` are always safe
+- Structure-of-Arrays conversion requires developer review
+- Provide a valid unified diff

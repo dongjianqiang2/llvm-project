@@ -54,6 +54,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
+#include "AIMVDiagnostic.h"
 #include "LoopVectorizationPlanner.h"
 #include "VPRecipeBuilder.h"
 #include "VPlan.h"
@@ -2557,6 +2558,173 @@ struct CSEDenseMapInfo {
 };
 
 } // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// [AIMV] emit structured vectorization diagnostics into !aimv.diag
+//===----------------------------------------------------------------------===//
+
+void llvm::emitAIMVDiagnostic(
+    Module &M, Function &F, Loop &L,
+    const LoopAccessInfo *LAI,
+    LoopVectorizationCostModel *CM,
+    ElementCount VF, unsigned IC,
+    StringRef RemarkID, StringRef RemarkMsg,
+    ScalarEvolution *SE,
+    int RtCheckCost,
+    int RtCheckCount) {
+
+  LLVMContext &Ctx = M.getContext();
+
+  // Build source_location
+  DebugLoc StartLoc = L.getStartLoc();
+  std::string SrcLoc;
+  if (StartLoc) {
+    DILocation *DIL = StartLoc.get();
+    raw_string_ostream(SrcLoc) << DIL->getFilename() << ":"
+                               << DIL->getLine() << ":" << DIL->getColumn();
+  } else if (DISubprogram *SP = F.getSubprogram()) {
+    raw_string_ostream(SrcLoc) << SP->getFilename() << ":" << SP->getLine();
+  } else {
+    SrcLoc = "unknown";
+  }
+
+  // --- cost_data ---
+  SmallVector<Metadata *> CostOps;
+  if (CM) {
+    auto ScC = CM->expectedCost(ElementCount::getFixed(1));
+    auto VecC = CM->expectedCost(VF);
+    CostOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx),
+            ScC.isValid() ? (int)ScC.getValue() : -1)));
+    CostOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx),
+            VecC.isValid() ? (int)VecC.getValue() : -1)));
+    CostOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), VF.getKnownMinValue())));
+    CostOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), IC)));
+  } else {
+    for (int i = 0; i < 4; i++)
+      CostOps.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Ctx), i < 2 ? -1 : 0)));
+  }
+
+  // --- dep_data ---
+  SmallVector<Metadata *> DepOps;
+  if (LAI) {
+    const MemoryDepChecker &DepChecker = LAI->getDepChecker();
+    const auto *Deps = DepChecker.getDependences();
+    unsigned DepCount = 0;
+    SmallVector<Metadata *> DepEntries;
+    if (Deps) {
+      for (auto &Dep : *Deps) {
+        if (Dep.Type == MemoryDepChecker::Dependence::NoDep) continue;
+        const char *DepTypeStr =
+            MemoryDepChecker::Dependence::DepName[Dep.Type];
+        SmallVector<Metadata *> DepEntry;
+        DepEntry.push_back(MDString::get(Ctx, DepTypeStr));
+        auto getInstDesc = [](Instruction *I) -> std::string {
+          if (!I) return "null";
+          if (I->hasName()) return I->getName().str();
+          return I->getOpcodeName();
+        };
+        DepEntry.push_back(MDString::get(Ctx,
+            getInstDesc(Dep.getSource(DepChecker))));
+        DepEntry.push_back(MDString::get(Ctx,
+            getInstDesc(Dep.getDestination(DepChecker))));
+        using SafetyStatus = MemoryDepChecker::VectorizationSafetyStatus;
+        const char *SafetyStr;
+        switch (MemoryDepChecker::Dependence::isSafeForVectorization(Dep.Type)) {
+        case SafetyStatus::Safe:
+          SafetyStr = "safe for vectorization"; break;
+        case SafetyStatus::PossiblySafeWithRtChecks:
+          SafetyStr = "possibly safe with runtime checks"; break;
+        case SafetyStatus::Unsafe:
+          SafetyStr = "unsafe: prevents vectorization"; break;
+        }
+        DepEntry.push_back(MDString::get(Ctx, SafetyStr));
+        DepEntries.push_back(MDNode::get(Ctx, DepEntry));
+        DepCount++;
+      }
+    }
+    DepOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), DepCount)));
+    for (auto *E : DepEntries) DepOps.push_back(E);
+  } else {
+    DepOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), 0)));
+  }
+
+  // --- memory_data ---
+  SmallVector<Metadata *> MemOps;
+  if (LAI) {
+    MemOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), LAI->getNumStores())));
+    MemOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), LAI->getNumLoads())));
+    MemOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), 0))); // num_pred_stores
+    unsigned MaxAlign = 0;
+    for (BasicBlock *BB : L.blocks())
+      for (Instruction &I : *BB)
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+          MaxAlign = std::max(MaxAlign, (unsigned)LI->getAlign().value());
+        else if (auto *SI = dyn_cast<StoreInst>(&I))
+          MaxAlign = std::max(MaxAlign, (unsigned)SI->getAlign().value());
+    MemOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), MaxAlign)));
+    bool Stride1 = (RtCheckCount == 0) &&
+                   (LAI->getNumStores() + LAI->getNumLoads() > 0);
+    MemOps.push_back(MDString::get(Ctx, Stride1 ? "stride=1" : "non-constant"));
+    MemOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), RtCheckCount)));
+    MemOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), RtCheckCost)));
+  } else {
+    for (int i = 0; i < 7; i++)
+      MemOps.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Ctx), -1)));
+  }
+
+  // --- loop_info ---
+  SmallVector<Metadata *> LoopOps;
+  LoopOps.push_back(MDString::get(Ctx, L.getName()));
+  LoopOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt32Ty(Ctx), L.getNumBlocks())));
+  unsigned NumInsts = 0, NumBranches = 0, NumCalls = 0;
+  for (BasicBlock *BB : L.blocks()) {
+    NumInsts += BB->size();
+    for (Instruction &I : *BB) {
+      if (isa<BranchInst>(&I) || isa<SwitchInst>(&I)) NumBranches++;
+      if (isa<CallBase>(&I)) NumCalls++;
+    }
+  }
+  LoopOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt32Ty(Ctx), NumInsts)));
+  int TripCount = SE ? (int)SE->getSmallConstantTripCount(&L) : -1;
+  LoopOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt32Ty(Ctx), TripCount)));
+  LoopOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt32Ty(Ctx), NumBranches)));
+  LoopOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt32Ty(Ctx), NumCalls)));
+
+  // Assemble MDNode
+  MDNode *DiagNode = MDNode::get(Ctx, {
+      MDString::get(Ctx, "LoopVectorize"),
+      MDString::get(Ctx, RemarkID),
+      MDString::get(Ctx, F.getName()),
+      MDString::get(Ctx, SrcLoc),
+      MDString::get(Ctx, RemarkMsg),
+      MDNode::get(Ctx, CostOps),
+      MDNode::get(Ctx, DepOps),
+      MDNode::get(Ctx, MemOps),
+      MDNode::get(Ctx, LoopOps)
+  });
+
+  NamedMDNode *NMD = M.getOrInsertNamedMetadata("aimv.diag");
+  NMD->addOperand(DiagNode);
+}
 
 ///Perform cse of induction variable instructions.
 static void cse(BasicBlock *BB) {
@@ -10123,6 +10291,21 @@ bool LoopVectorizePass::processLoop(Loop *L) {
       });
       LLVM_DEBUG(dbgs() << "LV: Too many memory checks needed.\n");
       Hints.emitRemarkWithHints();
+      // [AIMV] CantReorderMemOps
+      {
+        auto RtCostIC = Checks.getCost();
+        int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
+        const LoopAccessInfo *LAIPtr = LVL.getLAI();
+        int RtChkCount = LAIPtr ? (int)LAIPtr->getNumRuntimePointerChecks() : -1;
+        ScalarEvolution *SEPtr = PSE.getSE();
+        emitAIMVDiagnostic(
+            *L->getHeader()->getParent()->getParent(),
+            *L->getHeader()->getParent(), *L,
+            LAIPtr, &CM, VF.Width, IC,
+            "CantReorderMemOps",
+            "unsafe dependent memory operations in loop",
+            SEPtr, RtCost, RtChkCount);
+      }
       return false;
     }
   }
@@ -10193,11 +10376,39 @@ bool LoopVectorizePass::processLoop(Loop *L) {
                                       L->getStartLoc(), L->getHeader())
              << VecDiagMsg.second;
     });
+    // [AIMV] VectorizationNotBeneficial
+    {
+      auto RtCostIC = Checks.getCost();
+      int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
+      const LoopAccessInfo *LAIPtr = LVL.getLAI();
+      int RtChkCount = LAIPtr ? (int)LAIPtr->getNumRuntimePointerChecks() : -1;
+      ScalarEvolution *SEPtr = PSE.getSE();
+      emitAIMVDiagnostic(
+          *L->getHeader()->getParent()->getParent(),
+          *L->getHeader()->getParent(), *L,
+          LAIPtr, &CM, VF.Width, IC,
+          VecDiagMsg.first, VecDiagMsg.second,
+          SEPtr, RtCost, RtChkCount);
+    }
     ORE->emit([&]() {
       return OptimizationRemarkMissed(LV_NAME, IntDiagMsg.first,
                                       L->getStartLoc(), L->getHeader())
              << IntDiagMsg.second;
     });
+    // [AIMV] InterleavingNotBeneficial
+    {
+      auto RtCostIC = Checks.getCost();
+      int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
+      const LoopAccessInfo *LAIPtr = LVL.getLAI();
+      int RtChkCount = LAIPtr ? (int)LAIPtr->getNumRuntimePointerChecks() : -1;
+      ScalarEvolution *SEPtr = PSE.getSE();
+      emitAIMVDiagnostic(
+          *L->getHeader()->getParent()->getParent(),
+          *L->getHeader()->getParent(), *L,
+          LAIPtr, &CM, VF.Width, IC,
+          IntDiagMsg.first, IntDiagMsg.second,
+          SEPtr, RtCost, RtChkCount);
+    }
     return false;
   }
 
@@ -10304,6 +10515,23 @@ bool LoopVectorizePass::processLoop(Loop *L) {
                                Checks, BestPlan);
         LVP.executePlan(VF.Width, IC, BestPlan, LB, DT, false);
         ++LoopsVectorized;
+
+        // [AIMV] LoopVectorized (success)
+        {
+          auto RtCostIC = Checks.getCost();
+          int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
+          const LoopAccessInfo *LAIPtr = LVL.getLAI();
+          int RtChkCount = LAIPtr ? (int)LAIPtr->getNumRuntimePointerChecks() : -1;
+          ScalarEvolution *SEPtr = PSE.getSE();
+          std::string VFMsg = "loop vectorized: VF=" +
+              std::to_string(VF.Width.getKnownMinValue());
+          emitAIMVDiagnostic(
+              *L->getHeader()->getParent()->getParent(),
+              *L->getHeader()->getParent(), *L,
+              LAIPtr, &CM, VF.Width, IC,
+              "LoopVectorized", VFMsg,
+              SEPtr, RtCost, RtChkCount);
+        }
 
         // Add metadata to disable runtime unrolling a scalar loop when there
         // are no runtime checks about strides and memory. A scalar loop that is

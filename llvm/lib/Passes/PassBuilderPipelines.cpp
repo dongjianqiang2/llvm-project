@@ -143,6 +143,7 @@
 #include "llvm/Transforms/Utils/RelLookupTableConverter.h"
 #include "llvm/Transforms/Utils/SimplifyCFGOptions.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
+#include "llvm/Transforms/AIMV/AIMVFeedback.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include "llvm/Transforms/Vectorize/VectorCombine.h"
 
@@ -1390,6 +1391,9 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
       FPM.addPass(EarlyCSEPass());
     }
   }
+  // [AIMV] Collect vectorization diagnostics after LoopVectorize+SLPVectorize.
+  FPM.addPass(AIMVFeedbackPass());
+
   // Enhance/cleanup vector code.
   FPM.addPass(VectorCombinePass());
 

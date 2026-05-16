@@ -1,0 +1,81 @@
+# [BiSheng] AIMV — GitHub Actions CI workflow (T6.5)
+name: AIMV Vectorization Analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.h'
+
+jobs:
+  aimv-analyze:
+    runs-on: [self-hosted, arm64]
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup AIMV
+        run: |
+          pip install -e aimv/driver
+          pip install -e aimv/mcp_server
+
+      - name: Build LLVM+Clang (with AIMV Pass)
+        run: |
+          mkdir -p build && cd build
+          cmake .. -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="ARM;AArch64"
+          ninja clang opt
+
+      - name: Build baseline (AOT)
+        run: |
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
+          make -j$(nproc)
+
+      - name: Detect changed functions
+        id: changes
+        run: |
+          aimv-detect-changes \
+            --base origin/${{ github.base_ref }} \
+            --target HEAD \
+            --output changes.json
+          cat changes.json
+
+      - name: Run AIMV analysis
+        id: aimv
+        env:
+          AIMV_MCP_URL: ${{ secrets.AIMV_MCP_URL }}
+          AIMV_MCP_API_KEY: ${{ secrets.AIMV_MCP_API_KEY }}
+        run: |
+          aimv-run-batch \
+            --input changes.json \
+            --mcp-url "$AIMV_MCP_URL" \
+            --aimv-level moderate \
+            --max-rounds 3 \
+            --test-cmd "make -C build test" \
+            --parallel 4 \
+            --output-dir ./aimv-results
+
+      - name: Generate report
+        if: always()
+        run: |
+          aimv-report \
+            --input ./aimv-results \
+            --format markdown \
+            --output aimv-report.md
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aimv-results
+          path: ./aimv-results/

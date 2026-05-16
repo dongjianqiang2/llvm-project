@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/LoopAccessAnalysis.h"
+#include "../Transforms/Vectorize/AIMVDiagnostic.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -2825,6 +2826,19 @@ void LoopAccessInfo::emitUnsafeDependenceRemark() {
     if (SourceLoc)
       R << " Memory location is the same as accessed at "
         << ore::NV("Location", SourceLoc);
+  }
+
+  // [AIMV] UnsafeDep
+  {
+    Function *Fn = TheLoop->getHeader()->getParent();
+    Module *Mod = Fn->getParent();
+    int RtChkCount = (int)getNumRuntimePointerChecks();
+    emitAIMVDiagnostic(*Mod, *Fn, *TheLoop,
+                       this, /*CM=*/nullptr,
+                       ElementCount::getFixed(0), /*IC=*/0,
+                       "UnsafeDep", Info,
+                       PSE->getSE(),
+                       /*RtCheckCost=*/-1, RtChkCount);
   }
 }
 
