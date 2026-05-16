@@ -36,7 +36,7 @@
   │               │ → 重编译 → 测试   │                      │
   │               └──────────────────┘                      │
   └──────────────────────────────────────────────────────────┘
-  
+
   最终返回:  成功 → clang exit 0 + 源码已修改 + task.c.aimv.patch
              放弃 → 回滚源码 + 报告路径输出到 stderr
 ```
@@ -45,7 +45,7 @@
 
 1. 函数成功向量化即停止（检测到 LoopVectorize pass 成功生成向量指令）
 2. 到达最大迭代轮次上限（默认 5 轮，可配置）
-3. 收益不增时回滚（新策略导致已向量化循环退化则回退该变更）
+3. 收益不增时回滚（编译期判定：新 patch 后 `LoopVectorize` passed remark 数量减少则回滚。运行期性能验证留给用户通过 `aimv-bench` 在编译后执行，不在闭环内）
 
 ---
 
@@ -107,11 +107,66 @@ Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
        永远不会传递 -faimv，因此不会产生 fork 链。
 ```
 
-| 产物 | 说明 |
-|------|------|
-| 源文件（原地修改） | 编译通过后写入 restrict/alignas 等 hint |
-| `task.c.aimv.patch` | 每轮迭代的 unified diff 日志 |
-| `aimv-output/session.json` | 完整迭代记录（诊断→AI→验证） |
+**并发安全与数据竞争防护**：
+
+三种竞争场景及处理：
+
+| 场景 | 冲突？ | 处理 |
+|------|--------|------|
+| `make -j4` 编译不同 `.c` 文件 | 无 | 各自独立，不同锁 |
+| 同一 `.c` 被并行编译两次（`foo.o` + `foo.pic.o`）| 排队 | FileLock（`source_manager.py`）串行化 |
+| driver 改文件时另一个 make 进程在读 | **有** | 影子文件 + 原子替换 |
+| MCP 返回后源文件已被其他进程修改 | **有** | 影子基于获取锁时的快照 |
+
+**影子文件 + 原子替换协议**：
+
+```
+Round N (aimv-driver 持有锁期间):
+  1. cp task.c → task.c.aimv-tmp          ← 基于当前版本创建快照
+  2. diff 基于快照生成                     ← 确保 diff 上下文正确
+  3. patch task.c.aimv-tmp                ← 在影子上修改
+  4. clang -c task.c.aimv-tmp             ← 编译验证（其他进程读 task.c 不受影响）
+  5. 测试通过 → mv task.c.aimv-tmp task.c ← 原子替换（rename(2) 是原子的）
+     失败    → rm task.c.aimv-tmp         ← 丢弃影子
+  6. 释放锁
+```
+
+**锁的作用域**：仅覆盖步骤 1-6（文件 I/O，秒级）。MCP 查询（网络 I/O，数十秒）不占锁，不会阻塞其他 clang 进程。
+
+**中止保护**：`aimv-driver` 被 kill -9 或断电时，`task.c.aimv-tmp` 残留在磁盘。下次启动时检测到残留影子文件，输出警告让用户手动检查，不自动覆盖 `task.c`。
+
+**fork+exec 异常处理**：
+
+| 场景 | clang Driver 行为 |
+|------|------------------|
+| `aimv-driver` 未安装 / 找不到 | 打印警告到 stderr，退化到普通编译（exit code 不变） |
+| `aimv-driver` 崩溃（非零退出 / signal） | 回滚源码到编译前状态，打印错误到 stderr，exit code = aimv-driver 退出码 |
+| `aimv-driver` 超时（默认 120s，可配置） | SIGKILL 终止，回滚源码，打印超时错误 |
+| 用户 Ctrl+C（SIGINT） | 传递给 aimv-driver，由其回滚源码后退出；clang Driver waitpid 后退出 |
+| 用户 kill（SIGTERM） | 同 SIGINT |
+
+**编译结束后的用户可见输出**（aimv-driver 输出到 stderr，不干扰编译 stdout）：
+
+```
+# 成功场景：
+[AIMV] process_task: vectorized (2 rounds, conservative)
+[AIMV]   Round 1: added restrict to parameter 'a' (line 1)
+[AIMV]   Patch: /home/user/task.c.aimv.patch
+[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+
+# 放弃场景：
+[AIMV] process_task: unable to vectorize (3 rounds exhausted)
+[AIMV]   Source rolled back to original
+[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+```
+
+**追溯产物**（均由 aimv-driver 生成）：
+
+| 产物 | 路径 | 格式 | 生成时机 |
+|------|------|------|---------|
+| 累积 patch | `<source>.aimv.patch` | unified diff（所有成功轮次叠加） | 每轮成功后更新 |
+| Session 记录 | `aimv-output/sessions/<id>.json` | JSON（完整诊断→AI→patch→验证链） | 每轮更新 |
+| 备份 | `aimv-output/backups/<name>.r<N>.bak` | 原始源码副本 | 每次 patch 前 |
 
 ### 3.2 开发者入口（需要精细控制时）
 
@@ -261,7 +316,8 @@ Content-Type: application/json
 1. `aimv-driver` Python 脚本（编排编译-诊断-MCP-patch 流程）
 2. `AIVectorizeFeedback` LLVM Pass（收集 opt-info 诊断信息）
 3. MCP REST API mock/实现（接收诊断、返回建议）
-4. 1 个已知失败 benchmark 的端到端 demo
+4. clang Driver `-faimv` 解析 + `fork+exec aimv-driver` 集成
+5. 1 个已知失败 benchmark 的端到端 demo（含 clang `-faimv` 入口）
 
 ---
 
@@ -349,5 +405,6 @@ Content-Type: application/json
 
 ---
 
-*文档版本: 1.0*
+*文档版本: 1.1*
 *创建日期: 2026-04-29*
+*最后更新: 2026-05-15*

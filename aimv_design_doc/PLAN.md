@@ -508,6 +508,9 @@ aimv-driver 新增 --from-json 入口（Python，约 10 行改动）:
 aimv-driver 内部通过 BuildOrchestrator 重编译时，只传递 LLVM 后端 flag:
   clang -O2 -mllvm -aimv-enable -mllvm -aimv-output=<path> -c task.c
 不传 -faimv → 不会触发 Driver 再次 fork → 不会产生 fork 链。
+
+**并发安全**: 影子文件 + 原子替换（见 SPEC §3.1），FileLock 锁文件 I/O 阶段。
+MCP 查询不占锁，多个源文件完全并行。
 ```
 
 禁用 AIMV:
