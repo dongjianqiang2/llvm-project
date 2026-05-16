@@ -25,7 +25,7 @@ aimv/                                    # 项目根目录
 │   ├── mcp_client.py                    # MCP REST API 客户端
 │   ├── source_manager.py               # 源码 patch + 回滚 + 影子文件协议
 │   ├── build_orchestrator.py            # 编译/测试 编排（迭代控制）
-│   ├── iteration_tracker.py             # 迭代状态追踪与日志
+│   ├── iteration_engine.py              # 迭代状态追踪与日志
 │   └── requirements.txt
 │
 ├── mcp_server/                          # MCP REST API 服务端
@@ -327,7 +327,7 @@ class AnalyzeResponse(BaseModel):
 ### 3.2 迭代状态模型
 
 ```python
-# [AIMV] driver/iteration_tracker.py
+# [AIMV] driver/iteration_engine.py
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -339,8 +339,7 @@ class IterationStatus(Enum):
     COMPILING = "compiling"     # 正在编译
     ANALYZING = "analyzing"     # 正在分析 opt-info
     QUERYING = "querying"       # 正在请求 MCP
-    PATCHING = "patching"       # 正在应用 patch
-    VERIFYING = "verifying"     # 正在验证
+    PATCHING = "patching"       # 正在应用 patch + 验证（同一锁区间）
     SUCCESS = "success"         # 向量化成功
     FAILED = "failed"           # 本轮失败
     ROLLED_BACK = "rolled_back" # 已回滚
