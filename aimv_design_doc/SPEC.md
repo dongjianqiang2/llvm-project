@@ -97,7 +97,7 @@ Round 1 (用户触发):
     └─ Driver fork aimv-driver --from-json=aimv.json
 
 Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
-  clang -O2 -faimv-output=<path> -c task.c    ← 不含 -faimv！
+  clang -O2 -mllvm -aimv-output=<path> -c task.c    ← 不含 -faimv！
     ├─ 不会触发 clang Driver 再 fork aimv-driver
     ├─ 只运行 LLVM 层的 AIMVFeedbackPass 收集诊断
     └─ aimv-driver 读新 aimv.json 判断下一轮
@@ -107,31 +107,53 @@ Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
        永远不会传递 -faimv，因此不会产生 fork 链。
 ```
 
-**并发安全与数据竞争防护**：
+**多函数文件处理策略**：
 
-三种竞争场景及处理：
+一个 `.c` 文件可能包含多个函数，其中只有部分存在向量化失败。
+
+- `aimv.json` 按**函数**粒度组织诊断，每个函数独立记录
+- `aimv-driver` 按**函数**粒度迭代：对文件内所有失败函数**顺序处理**，每次只修改一个函数
+- 影子文件协议**每函数独立应用**：函数 A 验证通过后立即 `mv` 到原文件，不等待 B 完成。这样 B 编译时看到的源码已包含 A 的变更，且 B 失败时不需要回滚 A
+- 轮次计数**每函数独立**：函数 A 成功向量化不影响函数 B 继续迭代
+- 编译结束时，stderr 输出按函数分别汇总
+
+**配置来源**：
+
+`aimv-driver --from-json` 模式下，运行参数按以下优先级加载：
+
+1. `~/.aimv/config`（YAML，用户全局配置）
+2. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`
+3. aimv.json 内无配置字段，仅包含诊断数据
+
+默认值：`aimv_level=conservative`、`max_rounds=5`、`mcp_url=http://localhost:8080`、`test_cmd=""`（空则跳过测试，仅做编译验证）。
+
+**并发安全与数据竞争防护**：
 
 | 场景 | 冲突？ | 处理 |
 |------|--------|------|
 | `make -j4` 编译不同 `.c` 文件 | 无 | 各自独立，不同锁 |
-| 同一 `.c` 被并行编译两次（`foo.o` + `foo.pic.o`）| 排队 | FileLock（`source_manager.py`）串行化 |
+| 同一 `.c` 被并行编译两次（如 `foo.o` + `foo.pic.o`）| 排队 | FileLock（`source_manager.py`）串行化 |
+| 排队等锁的进程获得锁后，文件已被前一个进程修改 | **有** | 影子基于获取锁时的快照，而非旧版本 |
 | driver 改文件时另一个 make 进程在读 | **有** | 影子文件 + 原子替换 |
-| MCP 返回后源文件已被其他进程修改 | **有** | 影子基于获取锁时的快照 |
 
 **影子文件 + 原子替换协议**：
 
 ```
-Round N (aimv-driver 持有锁期间):
-  1. cp task.c → task.c.aimv-tmp          ← 基于当前版本创建快照
-  2. diff 基于快照生成                     ← 确保 diff 上下文正确
-  3. patch task.c.aimv-tmp                ← 在影子上修改
-  4. clang -c task.c.aimv-tmp             ← 编译验证（其他进程读 task.c 不受影响）
-  5. 测试通过 → mv task.c.aimv-tmp task.c ← 原子替换（rename(2) 是原子的）
-     失败    → rm task.c.aimv-tmp         ← 丢弃影子
-  6. 释放锁
+Round N 完整时序（锁仅覆盖文件 I/O 阶段）:
+  1. [无锁] MCP 查询 → 获得 AI 建议
+  2. [获取锁]
+     a. cp task.c → task.c.aimv-tmp        ← 基于当前版本创建快照
+     b. diff 基于快照生成                   ← 确保 diff 上下文正确
+     c. patch task.c.aimv-tmp              ← 在影子上修改
+     d. clang -c task.c.aimv-tmp           ← 编译验证（其他进程读 task.c 不受影响）
+     e. 测试通过 → mv task.c.aimv-tmp task.c ← 原子替换（rename(2) 是原子的）
+        失败    → rm task.c.aimv-tmp       ← 丢弃影子
+  3. [释放锁]
 ```
 
-**锁的作用域**：仅覆盖步骤 1-6（文件 I/O，秒级）。MCP 查询（网络 I/O，数十秒）不占锁，不会阻塞其他 clang 进程。
+**锁的作用域**：仅覆盖步骤 2a-2e（文件 I/O，秒级）。步骤 1 MCP 查询（网络 I/O，数十秒）不占锁，不阻塞其他 clang 进程。
+
+**多函数文件的原子替换时序**：每个函数的 round 独立应用。函数 A 验证通过 → `mv` 完成 → 释放锁 → 处理函数 B。函数 B 的 MCP 查询和编译基于**已包含 A 变更**的源码，函数 B 失败不回滚函数 A 的变更。
 
 **中止保护**：`aimv-driver` 被 kill -9 或断电时，`task.c.aimv-tmp` 残留在磁盘。下次启动时检测到残留影子文件，输出警告让用户手动检查，不自动覆盖 `task.c`。
 
@@ -148,9 +170,17 @@ Round N (aimv-driver 持有锁期间):
 **编译结束后的用户可见输出**（aimv-driver 输出到 stderr，不干扰编译 stdout）：
 
 ```
-# 成功场景：
+# 单函数成功：
 [AIMV] process_task: vectorized (2 rounds, conservative)
 [AIMV]   Round 1: added restrict to parameter 'a' (line 1)
+[AIMV]   Patch: /home/user/task.c.aimv.patch
+[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+
+# 多函数混合结果：
+[AIMV] task.c: 3 functions analyzed, 2 optimized, 1 skipped
+[AIMV]   process_task: vectorized (2 rounds, conservative)
+[AIMV]   filter_data:  vectorized (1 round, moderate)
+[AIMV]   init_buf:     already vectorized (skipped)
 [AIMV]   Patch: /home/user/task.c.aimv.patch
 [AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
 
@@ -221,7 +251,7 @@ AI 建议 ──▶ 开发者 review ──▶ 编译验证 ──▶ 测试套�
 ```
 
 - 每轮只建议**一个局部变更**，生成带解释的 diff
-- 编译通过 + 原测试套件全绿
+- 编译通过 + 原测试套件全绿（测试命令通过 `AIMV_TEST_CMD` 环境变量或 `~/.aimv/config` 指定；未配置时仅做编译验证，跳过测试步骤）
 - **Alive2 语义验证**（推荐启用，MVP 阶段至少对 restrict/alias 类变更验证）:
   - 编译优化前后 IR → `alive-tv <old.ll> <new.ll>`
   - 仅验证变更函数，不跑全量 IR
@@ -273,7 +303,14 @@ Content-Type: application/json
       "ir_snippet": "..."
     }
   ],
-  "history": [...]
+  "history": [
+    {
+      "round": 1,
+      "diagnosis_summary": "CantReorderMemOps: unsafe dependent memory operations",
+      "suggestion_applied": "added restrict to parameter 'a'",
+      "outcome": "compile_passed, vectorization_still_failed"
+    }
+  ]
 }
 ```
 
@@ -337,13 +374,13 @@ Content-Type: application/json
 
 从 `aimv/benchmarks/` 中选取至少 5 个已知有向量化失败场景的 C 文件：
 
-| Benchmark | 失败类型 | 目标 |
-|-----------|---------|------|
-| `dep_fail_alias.c` | 别名分析失败 (CantReorderMemOps) | restrict 修复后向量化 |
-| `dep_fail_stride.c` | 跨迭代 RAW 依赖 | loop fission 或 restrict |
-| `cost_reject.c` | 代价模型拒绝 | pragma 或结构调整 |
-| `align_unknown.c` | 对齐未知 | alignas 修复 |
-| `multi_fail.c` | 混合失败（依赖+代价） | 多轮迭代 |
+| Benchmark | 失败类型 | 目标 | 阶段 |
+|-----------|---------|------|------|
+| `dep_fail_alias.c` | 别名分析失败 (CantReorderMemOps) | restrict 修复后向量化 | MVP |
+| `dep_fail_stride.c` | 跨迭代 RAW 依赖 | loop fission 或 restrict | MVP |
+| `cost_reject.c` | 代价模型拒绝 | pragma 或结构调整 | Phase 2 |
+| `align_unknown.c` | 对齐未知 | alignas 修复 | Phase 2 |
+| `multi_fail.c` | 混合失败（依赖+代价） | 多轮迭代 | Phase 2 |
 
 ### 8.3 可操作性要求
 
@@ -379,6 +416,7 @@ Content-Type: application/json
 
 | 决策点              | 选择                          | 理由                         |
 | ---------------- | --------------------------- | -------------------------- |
+| 入口方式             | clang Driver 原生集成（非外部 wrapper） | 零安装成本，`-faimv`/`-mllvm` 分层天然防 fork 链 |
 | 修改层级             | C/C++ 源码层                   | 开发者可 review，可维护，不引入 IR 层魔数 |
 | MCP 协议           | JSON REST API               | 最通用，调试友好，易与多种大模型平台对接       |
 | MCP 部署           | 远程云端服务                      | 使用最强模型能力，支持团队共享分析历史        |
@@ -405,6 +443,6 @@ Content-Type: application/json
 
 ---
 
-*文档版本: 1.1*
+*文档版本: 1.2*
 *创建日期: 2026-04-29*
-*最后更新: 2026-05-15*
+*最后更新: 2026-05-16*
