@@ -137,7 +137,7 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
 
     # 初始化模块
     builder = BuildOrchestrator(config)
-    mcp = MCPClient(config.mcp_url, config.mcp_timeout)
+    mcp = MCPClient(config.mcp_url, config.mcp_timeout, api_key=config.mcp_api_key)
     engine = IterationEngine(config.aimv_level, config.max_rounds)
     store = SessionStore(config.output_dir)
     sources = SourceManager(config.output_dir)
@@ -874,10 +874,15 @@ class MCPClient:
       - 响应格式验证
     """
 
-    def __init__(self, base_url: str, timeout_seconds: int = 60):
+    def __init__(self, base_url: str, timeout_seconds: int = 60,
+                 api_key: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout_seconds
-        self._client = httpx.Client(timeout=timeout_seconds + 10)
+        # 构建 headers（含 API Key，对应 MCP_DESIGN §2.2 认证要求）
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._client = httpx.Client(timeout=timeout_seconds + 10, headers=headers)
 
     def analyze(self, request_json: dict) -> Optional[dict]:
         """POST /api/v1/analyze-vectorization，返回解析后的响应 dict。
@@ -1150,6 +1155,7 @@ from dataclasses import dataclass
 class DriverConfig:
     mcp_url: str = "http://localhost:8080"
     mcp_timeout: int = 60
+    mcp_api_key: str = ""            # MCP 服务 API 密钥（优先从 ~/.aimv/config 读取）
     aimv_level: str = "conservative"         # 默认 conservative
     max_rounds: int = 5
     test_cmd: str = ""                       # 空 = 跳过测试
@@ -1180,6 +1186,8 @@ def load_config() -> DriverConfig:
 
         if "url" in mcp_cfg:
             config.mcp_url = mcp_cfg["url"]
+        if "api_key" in mcp_cfg:
+            config.mcp_api_key = mcp_cfg["api_key"]
         if "timeout_seconds" in mcp_cfg:
             config.mcp_timeout = mcp_cfg["timeout_seconds"]
         if "max_rounds" in driver_cfg:
@@ -1192,6 +1200,8 @@ def load_config() -> DriverConfig:
     # Layer 2: 环境变量覆盖
     if env_url := os.environ.get("AIMV_MCP_URL"):
         config.mcp_url = env_url
+    if env_api_key := os.environ.get("AIMV_MCP_API_KEY"):
+        config.mcp_api_key = env_api_key
     if env_level := os.environ.get("AIMV_LEVEL"):
         config.aimv_level = env_level
     if env_rounds := os.environ.get("AIMV_MAX_ROUNDS"):
@@ -1214,6 +1224,7 @@ def load_config() -> DriverConfig:
 # ~/.aimv/config
 mcp:
   url: http://aimv-server:8080
+  api_key: ""                       # MCP API 密钥（生产环境应使用环境变量 AIMV_MCP_API_KEY）
   timeout_seconds: 60
 driver:
   max_rounds: 5
@@ -1275,6 +1286,75 @@ def _classify_outcome(round_rec: RoundRecord) -> str:
     if round_rec.test_result and round_rec.test_result.failed > 0:
         return "test_failed"
     return "compile_passed, vectorization_still_failed"
+```
+
+---
+
+## 9.5 MCP 请求构建
+
+```python
+# [AIMV] driver/aimv_driver.py
+
+def build_mcp_request(
+    function_name: str,
+    source_file: str,
+    diagnostics: list,
+    target: dict,
+    history: list,
+    aimv_level: str,
+    config: DriverConfig,
+) -> dict:
+    """构造 MCP AnalyzeRequest (对应 MCP_DESIGN.md §2.1)。
+
+    组装:
+      - request_id: "aimv-<session_id>-<func_name_hash>"
+      - target: 优先从 AIMVFeedbackPass JSON 获取，回退到 config
+      - function: 从当前源文件提取 name/signature/source_code/loop_line
+      - diagnostics: 从 AIMVFeedbackPass JSON 筛选当前函数的 missed 诊断
+      - history: 最近 3 轮历史记录
+      - aimv_level: 当前级别（可能已被 IterationEngine 升级）
+    """
+    import hashlib
+
+    with open(source_file, "r", encoding="utf-8") as f:
+        source_code = f.read()
+
+    # 从诊断中提取 loop_line（取第一个 missed 诊断的 loop_location）
+    loop_line = 1
+    for d in diagnostics:
+        if d.get("function_name") == function_name and d.get("severity") == "missed":
+            loc = d.get("loop_location", "")
+            # 解析 "file.c:42:5" 格式
+            parts = loc.rsplit(":", 2)
+            if len(parts) >= 2:
+                try:
+                    loop_line = int(parts[-2])
+                except ValueError:
+                    pass
+            break
+
+    return {
+        "request_id": f"aimv-{hashlib.sha256(function_name.encode()).hexdigest()[:12]}",
+        "target": target or {
+            "triple": "",
+            "cpu": "",
+            "features": [],
+            "vector_width": 128,
+        },
+        "function": {
+            "name": function_name,
+            "signature": "",  # 简化: MVP 不提取完整签名
+            "source_code": source_code,
+            "source_file": source_file,
+            "loop_line": loop_line,
+        },
+        "diagnostics": [
+            d for d in diagnostics
+            if d.get("function_name") == function_name and d.get("severity") == "missed"
+        ],
+        "history": history,
+        "aimv_level": aimv_level,
+    }
 ```
 
 ---
@@ -1384,12 +1464,16 @@ def process_single_function(
                 aimv_json = json.load(f)
             round_rec.diagnostics_json = aimv_json
 
-            # 构造 MCP 请求
+            # 构造 MCP 请求（格式对应 MCP_DESIGN.md §2.1 AnalyzeRequest）
             # source_code 为当前文件的完整内容（已包含前面函数的变更）
+            # build_mcp_request 组装: target (来自 aimv_json 或 config),
+            #   function (从源文件提取 name/signature/source_code/loop_line),
+            #   diagnostics (从 aimv_json), history (最近 3 轮), aimv_level
             request_body = build_mcp_request(
                 function_name=function_name,
                 source_file=source_file,
                 diagnostics=aimv_json.get("diagnostics", []),
+                target=aimv_json.get("target", {}),
                 history=build_history(func_result),
                 aimv_level=engine.current_level,
                 config=config,
@@ -1461,11 +1545,15 @@ def process_single_function(
                 # ── Step 4: 重编译验证 [同一锁区间] ──
                 round_rec.status = IterationStatus.VERIFYING
                 shadow_file = source_file + ".aimv-tmp"
+                verify_json = str(
+                    Path(config.output_dir) / f"aimv-{function_name}-verify-r{round_num}.json"
+                )
                 verify_build = builder.compile_with_aimv(
                     source_file=shadow_file,
                     output_file=str(
                         Path(config.output_dir) / f"{function_name}-verify.o"
                     ),
+                    aimv_json_output=verify_json,  # 独立 JSON 路径，避免覆盖首轮 aimv.json
                 )
                 round_rec.verify_build = verify_build
 
@@ -1488,9 +1576,21 @@ def process_single_function(
                     verify_build.aimv_json_path, function_name)
 
                 # 收益退化检测: passed remark 数量减少 → 回滚
+                # 注意: 此检测在 engine.decide() 之外直接处理，
+                # 因为需要传入 prev_passed_count 做精确比较。
+                # engine.decide() 的 regression 分支 (passed_remark_delta < 0)
+                # 在此处不可达——regression 在编译验证阶段就地检测并处理。
                 if (prev_passed_count > 0 and
                         verify_vstatus.passed_remark_count < prev_passed_count):
                     sources.discard_shadow(source_file)
+                    action, reason = engine.decide(
+                        current_round=round_num,
+                        build_result_ok=True, test_result_ok=True,
+                        vectorized=False, mcp_had_suggestions=True,
+                        mcp_responded=True,
+                        passed_remark_delta=(
+                            verify_vstatus.passed_remark_count - prev_passed_count),
+                    )
                     func_result.termination_reason = TerminationReason.NO_IMPROVEMENT
                     break
 
@@ -1534,7 +1634,9 @@ def process_single_function(
 
     finally:
         func_result.rounds_used = len(func_result.rounds)
-        round_rec.finished_at = time.time()
+        # 标记最后一轮完成时间（若存在）
+        if func_result.rounds:
+            func_result.rounds[-1].finished_at = time.time()
 
     return func_result
 ```

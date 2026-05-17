@@ -198,34 +198,39 @@ def filter_loopy_functions(functions: List[Tuple], cc: str = "clang") -> List[Tu
     import tempfile, os
 
     loopy = []
-    files_processed = set()
+    files_processed = {}  # file → set of (func_name, start, end) tuples that have loops
 
     for file, func_name, start, end in functions:
-        if file in files_processed:
-            continue
-        files_processed.add(file)
+        if file not in files_processed:
+            # 首次遇到此文件: 编译 + 分析循环
+            files_processed[file] = set()
 
-        with tempfile.NamedTemporaryFile(suffix=".ll", delete=False) as tmp:
-            ir_path = tmp.name
+            with tempfile.NamedTemporaryFile(suffix=".ll", delete=False) as tmp:
+                ir_path = tmp.name
 
-        try:
-            # 编译为 LLVM IR
-            subprocess.run(
-                [cc, "-S", "-emit-llvm", "-O0", file, "-o", ir_path],
-                capture_output=True, text=True, timeout=30,
-            )
+            try:
+                # 编译为 LLVM IR
+                subprocess.run(
+                    [cc, "-S", "-emit-llvm", "-O0", file, "-o", ir_path],
+                    capture_output=True, text=True, timeout=30,
+                )
 
-            # 获取该文件中的所有循环
-            proc = subprocess.run(
-                ["opt", "-passes=print<loops>", "-disable-output", ir_path],
-                capture_output=True, text=True, timeout=30,
-            )
-            # 输出中包含 "Loop at depth N containing: ..." 和函数名
-            for func, fn, fs, fe in functions:
-                if func not in [f[0] for f in loopy] and fn in proc.stderr:
-                    loopy.append((func, fn, fs, fe))
-        finally:
-            os.unlink(ir_path)
+                # 获取该文件中的所有循环
+                proc = subprocess.run(
+                    ["opt", "-passes=print<loops>", "-disable-output", ir_path],
+                    capture_output=True, text=True, timeout=30,
+                )
+                # 输出中包含 "Loop at depth N containing: ..." 和函数名
+                # 收集此文件中所有含有循环的函数名
+                for f, fn, fs, fe in functions:
+                    if f == file and fn in proc.stderr:
+                        files_processed[file].add(fn)
+            finally:
+                os.unlink(ir_path)
+
+        # 检查此函数是否含有循环
+        if func_name in files_processed.get(file, set()):
+            loopy.append((file, func_name, start, end))
 
     return loopy
 ```
@@ -405,7 +410,7 @@ aimv:vectorization-analysis:
     # 生成报告
     - aimv-report
         --input ./aimv-results
-        --format gitlab
+        --format gitlab-api
         --output aimv-report.md
 
   after_script:

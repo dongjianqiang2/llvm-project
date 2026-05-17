@@ -223,7 +223,10 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith("/api/v1/"):
             auth = request.headers.get("Authorization", "")
             if not auth.startswith("Bearer ") or auth.split(" ", 1)[1] != API_KEY:
-                raise HTTPException(status_code=401, detail="Invalid API key")
+                # 注意: 在 BaseHTTPMiddleware 中 raise HTTPException 会被 Starlette 吞掉。
+                # 必须返回 JSONResponse 而非抛异常。
+                from fastapi.responses import JSONResponse
+                return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
         return await call_next(request)
 ```
 
@@ -439,9 +442,9 @@ Given:
 You must determine a source-level modification to fix the failure.
 
 ## Target Platform
-- Triple: {target.triple}
-- CPU: {target.cpu}
-- SIMD: {target.features} ({target.vector_width}-bit vectors)
+- Triple: {{ target.triple }}
+- CPU: {{ target.cpu }}
+- SIMD: {{ target.features }} ({{ target.vector_width }}-bit vectors)
 
 ## Rules
 1. DO NOT change program semantics. The fix must be behavior-preserving.
@@ -455,17 +458,19 @@ You must determine a source-level modification to fix the failure.
 6. Only suggest modifications to .c/.cpp source files, never to headers
    (.h/.hpp). Header file changes (static inline functions, macros) are out
    of scope.
-7. For {aimv_level} level, you may:
+7. For {{ aimv_level }} level, you may:
    - conservative: only add qualifiers and attributes
    - moderate: also suggest loop fission, interchange, scalar promotion
    - aggressive: also suggest data structure changes (AoS->SoA)
 
 ## Output Format
 Respond with a single JSON object matching this exact schema:
-{response_schema}
+{{ response_schema }}
 
 Do not include any text outside the JSON.
 ```
+
+> **实现说明**: 以上模板使用 Jinja2 语法（`{{ variable }}`），由 `prompt_builder.py` 中的 `build_system_prompt()` 函数渲染。变量通过 Jinja2 Environment 传入 namespace 对象（如 `target=TargetInfo(...)`），模板中 `{{ target.triple }}` 会自动调用属性访问。
 
 ### 4.2 诊断信息注入模板（Jinja2）
 
@@ -592,6 +597,7 @@ def compute_diagnostic_fingerprint(request: AnalyzeRequest) -> str:
     canonical = {
         "target_triple": request.target.triple,
         "target_cpu": request.target.cpu,
+        "target_features": sorted(request.target.features),  # 排序确保稳定
         "vector_width": request.target.vector_width,
         "level": request.aimv_level.value,
         "function_name": request.function.name,
@@ -842,21 +848,45 @@ def parse_structured_response(raw_text: str, request_id: str) -> AnalyzeResponse
 
 
 def _extract_json(text: str) -> str:
-    """从 LLM 输出中提取 JSON，处理 ```json 包裹和噪音。"""
+    """从 LLM 输出中提取 JSON，处理 ```json 包裹和噪音。
+
+    注意: 不使用正则提取 ```json ... ```，因为 diff 字段中可能包含
+    triple backticks（unified diff 格式），导致正则提前截断。
+    改用大括号匹配策略，更可靠。
+    """
     text = text.strip()
 
-    # 移除 markdown 代码块
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if m:
-        return m.group(1)
-
-    # 找到第一个 { 和最后一个 }
+    # 策略: 找到最外层的 { ... } 对，用括号深度计数确保完整匹配。
+    # 这比正则更可靠——不会因为 diff 字段中的 ``` 而截断。
     start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1:
-        return text[start:end + 1]
+    if start == -1:
+        return text
 
-    return text
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == '\\' and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+
+    # 回退: 找不到匹配的 }，返回从 { 到末尾
+    return text[start:]
 ```
 
 ---
@@ -869,6 +899,7 @@ def _extract_json(text: str) -> str:
 # [AIMV] mcp_server/cache.py
 
 import time
+import json
 import threading
 from typing import Optional
 from models import AnalyzeResponse
@@ -894,10 +925,13 @@ class DiagnosticCache:
         self._cache_misses = 0
 
     def get(self, fingerprint: str) -> Optional[AnalyzeResponse]:
+        self._total_requests += 1
+
         # L1: 本地内存
         with self._lock:
             entry = self._local.get(fingerprint)
             if entry and entry[0] > time.time():
+                self._cache_hits += 1
                 return entry[1]
 
         # L2: Redis
@@ -909,8 +943,10 @@ class DiagnosticCache:
                 # 回填 L1
                 with self._lock:
                     self._local[fingerprint] = (time.time() + self._ttl, resp)
+                self._cache_hits += 1
                 return resp
 
+        self._cache_misses += 1
         return None
 
     def set(self, fingerprint: str, response: AnalyzeResponse):

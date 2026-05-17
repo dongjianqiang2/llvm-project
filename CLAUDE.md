@@ -21,7 +21,7 @@ aimv_design_doc/          # Design docs (authoritative for AIMV architecture)
   CI_DESIGN.md            #   CI/CD integration design
 aimv/                     # AIMV implementation root (to be created)
   driver/                 #   Python driver scripts
-  mcp-server/             #   MCP REST API server (FastAPI)
+  mcp_server/             #   MCP REST API server (FastAPI, Python module naming)
   ci/                     #   CI integration tools
   test/                   #   Tests (lit/, unit/, integration/)
   benchmarks/             #   C benchmark files

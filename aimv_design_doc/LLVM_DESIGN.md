@@ -392,6 +392,10 @@ llvm/lib/Transforms/Vectorize/
 
 class AIMVFeedbackPass : public PassInfoMixin<AIMVFeedbackPass> {
 public:
+  // 注意: 此 Pass 通过 FUNCTION_PASS("aimv-feedback", AIMVFeedbackPass())
+  // 默认构造注册。成员变量不会被自动设置。
+  // run() 内部直接从 cl::opt 全局变量读取配置，而非依赖这些 setter。
+  // setter 保留用于单元测试场景（手动构造 + 配置 Pass）。
   void setOutputPath(const std::string &Path);
   void setTargetFunction(const std::string &FuncName);
   void setEnabled(bool V = true);
@@ -456,6 +460,21 @@ static cl::opt<std::string> AIMVTargetFunction(
 
 所有参数标记为 `cl::Hidden`（不在 `-help` 中显示），通过 `-mllvm` 传递。
 
+**重要**: `FUNCTION_PASS("aimv-feedback", AIMVFeedbackPass())` 注册的是默认构造的 Pass 实例，成员变量 `EnabledFlag`/`OutputPath`/`TargetFunction` 不会被自动设置。Pass 的 `run()` 方法必须从 `cl::opt` 全局变量直接读取，而非依赖成员变量：
+
+```cpp
+PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM) {
+  // 从 cl::opt 读取配置（非成员变量——默认构造不会设置它们）
+  const bool Enabled = AIMVEnable;
+  const std::string Output = AIMVOutputPath;
+  const std::string Target = AIMVTargetFunction;
+
+  if (!Enabled || Output.empty())
+    return PreservedAnalyses::all();
+  // ... 后续逻辑使用 Output 和 Target
+}
+```
+
 #### 缓存优化（避免 O(N*M) 开销）
 
 Function Pass 对每个函数独立运行。同一 Module 的 `!aimv.diag` 会被 N 个函数各解析一次。Pass 实例内缓存首次 `parseDiagnostics()` 结果：
@@ -473,8 +492,14 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
   if (!M)
     return PreservedAnalyses::all();
 
-  // 激活条件: EnabledFlag + OutputPath（由 -faimv 转发的 -mllvm -aimv-enable 设置）
-  if (OutputPath.empty() && !EnabledFlag)
+  // 从 cl::opt 全局变量读取配置（默认构造的 Pass 实例不携带这些值）
+  const std::string Output = AIMVOutputPath;
+  const std::string Target = AIMVTargetFunction;
+  const bool Enabled = AIMVEnable;
+
+  // 激活条件: Enabled == true 且 Output 非空
+  // 由 -mllvm -aimv-enable + -mllvm -aimv-output=<path> 设置
+  if (!Enabled || Output.empty())
     return PreservedAnalyses::all();
 
   // 缓存: 仅在 Module 变更时重新解析
@@ -580,7 +605,9 @@ static std::string inferSeverity(const std::string &RemarkID) {
 
 ### 3.4 JSON 输出格式
 
-输出文件与 PLAN.md 中定义的 `AnalyzeRequest` 的 **diagnostics 部分**对应。完整 AnalyzeRequest 需要的 `function`（source_code/signature/loop_line）和 `target` 信息由 Driver 在发送 MCP 请求前从源文件和编译参数中补充。AIMVFeedbackPass 仅产出 IR 侧可获取的诊断数据。
+输出文件与 PLAN.md 中定义的 `AnalyzeRequest` 的 **diagnostics 部分**对应。完整 AnalyzeRequest 需要的 `function`（source_code/signature/loop_line）由 Driver 在发送 MCP 请求前从源文件和编译参数中补充。
+
+**`target` 字段**: AIMVFeedbackPass **尽力填充** `target` 中的 `triple`/`cpu`/`features`/`vector_width`（从 Module attributes + TTI 获取，见 §3.3 步骤 4）。Driver 发送 MCP 请求前**不覆盖** target 字段——但 Driver 会用编译参数中的 `-mcpu=` / `-mfpu=` 补充空值（若 Pass 无法获取）。
 
 **多函数输出**: 所有函数的诊断写入同一个 JSON 文件，由 `function_name` 字段区分。Driver 按 `function_name` 索引各函数的诊断，按函数顺序迭代处理。
 
@@ -715,17 +742,23 @@ if (AIMVEnabled) {
 
   // 检查 aimv.json 是否存在（编译可能无失败循环，不产出文件）
   if (llvm::sys::fs::exists(AimvJsonPath)) {
-    std::string DriverPath = "aimv-driver";
-    // 尝试查找 aimv-driver（不在 PATH 中则警告并退化）
-    if (llvm::sys::findProgramByName(DriverPath)) {
+    // findProgramByName 返回 ErrorOr<std::string>，需 .get() 获取完整路径
+    auto Found = llvm::sys::findProgramByName("aimv-driver");
+    if (Found) {
+      // 注意: 所有字符串参数必须存为 std::string，不能让 StringRef
+      // 指向临时对象（字符串拼接结果是临时量，StringRef 会悬空）
+      std::string FullPath = Found.get();
+      std::string FromJsonArg = "--from-json=" + AimvJsonPath;
+      std::string SourceArg = "--source=" + Input.getFilename().str();
+
       std::vector<StringRef> Args = {
-        DriverPath,
-        "--from-json=" + AimvJsonPath,
-        "--source=" + Input.getFilename()
+        FullPath,
+        FromJsonArg,
+        SourceArg,
       };
 
       // fork + exec + waitpid
-      int ExitCode = llvm::sys::ExecuteAndWait(DriverPath, Args);
+      int ExitCode = llvm::sys::ExecuteAndWait(FullPath, Args);
 
       if (ExitCode != 0) {
         // aimv-driver 失败: 回滚由 driver 内部 source_manager 处理
