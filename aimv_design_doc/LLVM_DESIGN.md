@@ -109,10 +109,11 @@ opt -passes="loop-vectorize,aimv-feedback" \
 ; [1]: i32 vector_cost  (-1=不可用)
 ; [2]: i32 vf           (0=未决定)
 ; [3]: i32 interleave_count
-; 注: 代价数据来自 LoopVectorizationCostModel::expectedCost()，
-;     其中 scalar_cost = expectedCost(ElementCount::getFixed(1))，
-;     vector_cost = expectedCost(VF)。
-;     在 legality 阶段拒绝时（CM 不可用），scalar_cost 和 vector_cost 均为 -1。
+; 注: 代价数据来自 AIMVCostSnapshot 参数（由调用方从 CostModel 预计算），
+;     其中 scalar_cost = CM->expectedCost(ElementCount::getFixed(1))，
+;     vector_cost = CM->expectedCost(VF)。
+;     在 legality 阶段拒绝时（CM 不可用），传 AIMVCostSnapshot::unknown()，
+;     scalar_cost 和 vector_cost 均为 -1。
 !2 = !{i32 24, i32 38, i32 4, i32 1}
 ```
 
@@ -190,24 +191,56 @@ opt -passes="loop-vectorize,aimv-feedback" \
 
 ### 2.1 位置与声明
 
-**声明文件**: `llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h`（共享内部头文件）
+**声明文件**: `llvm/include/llvm/Analysis/AIMVDiagnostic.h`（公共头文件，位于 Analysis 层）
 
-**实现文件**: `llvm/lib/Transforms/Vectorize/LoopVectorize.cpp`
+**实现文件**: `llvm/lib/Analysis/AIMVDiagnostic.cpp`
 
-该函数声明为非 static，供 LoopVectorize.cpp 和 LoopAccessAnalysis.cpp 共同引用。零跨组件符号依赖：函数仅依赖 LLVM Core/Analysis 的公共 API，不引用 LLVMAIMV 组件中的任何符号。
+**设计理由**: `emitAIMVDiagnostic()` 被 `LoopAccessAnalysis.cpp`（Analysis 组件）和 `LoopVectorize.cpp`（Vectorize 组件）共同调用。按 LLVM 构建层级，`Analysis` 不能依赖 `Vectorize`。若头文件放在 `Vectorize/` 下，`LoopAccessAnalysis.cpp` 无法 `#include` 它（CMake 依赖链断裂）。因此将声明和实现均放在 `Analysis` 层，使两个组件都能引用。
+
+**关键: `CM` 参数改为 `AIMVCostSnapshot`**: 原始设计直接传递 `LoopVectorizationCostModel*`，但该类定义在 `Vectorize` 组件中，`Analysis` 层不能依赖它。解决方案是定义一个扁平的 `AIMVCostSnapshot` 结构体，在 `Vectorize` 侧（调用点）预计算代价数据后传入，`Analysis` 层仅消费快照值。
 
 ```cpp
-// [AIMV] llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h
+// [AIMV] llvm/include/llvm/Analysis/AIMVDiagnostic.h
+
+// 预计算的代价快照——避免 Analysis 层依赖 Vectorize 的 CostModel 类。
+// 在 LoopVectorize.cpp 的各插入点中，从 CostModel 预计算后填入此结构体。
+// legality 阶段失败（如 UnsafeDep）时，传 AIMVCostSnapshot::unknown()。
+struct AIMVCostSnapshot {
+  int ScalarCost = -1;   // CM->expectedCost(VF).first, -1=不可用
+  int VectorCost = -1;   // CM->expectedCost(VF).second, -1=不可用
+  unsigned VF = 0;       // ElementCount.getKnownMinValue(), 0=未确定
+  unsigned IC = 0;       // interleave count
+
+  static AIMVCostSnapshot unknown() { return {}; }
+};
 
 void emitAIMVDiagnostic(
     Module &M, Function &F, Loop &L,
     const LoopAccessInfo *LAI,
-    LoopVectorizationCostModel *CM,
-    ElementCount VF, unsigned IC,
+    const AIMVCostSnapshot &Cost,
     StringRef RemarkID, StringRef RemarkMsg,
     ScalarEvolution *SE = nullptr,
     int RtCheckCost = -1,
     int RtCheckCount = -1);
+```
+
+所有插入点中原先传递 `CM, VF.Width, IC` 的位置，改为构造 `AIMVCostSnapshot` 并传入：
+
+```cpp
+// 示例: T1.1 插入点的改造
+AIMVCostSnapshot CostSnap;
+auto ICpair = CM.expectedCost(VF.Width);
+CostSnap.ScalarCost = ICpair.first.isValid() ? (int)ICpair.first.getValue() : -1;
+CostSnap.VectorCost = ICpair.second.isValid() ? (int)ICpair.second.getValue() : -1;
+CostSnap.VF = VF.Width.getKnownMinValue();
+CostSnap.IC = IC;
+emitAIMVDiagnostic(*Mod, *Fn, *L, LVL.getLAI(), CostSnap,
+                   "CantReorderMemOps", "...", PSE.getSE(), RtCost, RtChkCount);
+
+// 示例: T1.5 (UnsafeDep, 无 CM 可用)
+emitAIMVDiagnostic(*Mod, *Fn, *TheLoop, this,
+                   AIMVCostSnapshot::unknown(),
+                   "UnsafeDep", Info, PSE->getSE(), -1, RtChkCount);
 ```
 
 ### 2.2 激活条件
@@ -220,7 +253,7 @@ void emitAIMVDiagnostic(
 
 1. **source_location 构建**: `DebugLoc` -> `DILocation::getLine():getColumn()`，回退到 `DISubprogram`，最终回退到 "unknown"。使用 `raw_string_ostream` 避免 Twine 临时对象悬空引用。
 
-2. **cost_data**: 来自 `CM->expectedCost()`。`InstructionCost::getValue()` 返回 `int64_t`，调用前需检查 `isValid()`。CM 为 nullptr 时所有字段填 -1/0。
+2. **cost_data**: 来自 `AIMVCostSnapshot` 参数。调用方（LoopVectorize.cpp 各插入点）已从 `CM->expectedCost()` 预计算 scalar_cost/vector_cost 并检查 `isValid()`。`AIMVCostSnapshot::unknown()` 时所有字段为 -1/0。
 
 3. **dep_data**: 来自 `LAI->getDepChecker().getDependences()`，返回 `const SmallVectorImpl<Dependence>*`，需判空。过滤掉 NoDep，直接使用 `DepName[Dep.Type]` 获取 LLVM 原生类型名（LLVM 21 的 Dependence struct 只有 3 个 bool 访问器 `isForward`/`isBackward`/`isPossiblyBackward`，无法区分全部 8 种 DepType）。安全分类使用 `isSafeForVectorization(Dep.Type)`。
 
@@ -244,10 +277,17 @@ void emitAIMVDiagnostic(
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
   int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
+  // 预计算代价快照（避免 Analysis 层依赖 Vectorize 的 CostModel 类）
+  AIMVCostSnapshot CostSnap;
+  auto ICpair = CM.expectedCost(VF.Width);
+  CostSnap.ScalarCost = ICpair.first.isValid() ? (int)ICpair.first.getValue() : -1;
+  CostSnap.VectorCost = ICpair.second.isValid() ? (int)ICpair.second.getValue() : -1;
+  CostSnap.VF = VF.Width.getKnownMinValue();
+  CostSnap.IC = IC;
   emitAIMVDiagnostic(
       *L->getHeader()->getParent()->getParent(),
       *L->getHeader()->getParent(), *L,
-      LVL.getLAI(), &CM, VF.Width, IC,
+      LVL.getLAI(), CostSnap,
       "CantReorderMemOps",
       "unsafe dependent memory operations in loop",
       PSE.getSE(), RtCost, RtChkCount);
@@ -268,10 +308,16 @@ void emitAIMVDiagnostic(
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
   int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
+  AIMVCostSnapshot CostSnap;
+  auto ICpair = CM.expectedCost(VF.Width);
+  CostSnap.ScalarCost = ICpair.first.isValid() ? (int)ICpair.first.getValue() : -1;
+  CostSnap.VectorCost = ICpair.second.isValid() ? (int)ICpair.second.getValue() : -1;
+  CostSnap.VF = VF.Width.getKnownMinValue();
+  CostSnap.IC = IC;
   emitAIMVDiagnostic(
       *L->getHeader()->getParent()->getParent(),
       *L->getHeader()->getParent(), *L,
-      LVL.getLAI(), &CM, VF.Width, IC,
+      LVL.getLAI(), CostSnap,
       VecDiagMsg.first, VecDiagMsg.second,
       PSE.getSE(), RtCost, RtChkCount);
 }
@@ -297,9 +343,9 @@ void emitAIMVDiagnostic(
   Function *Fn = TheLoop->getHeader()->getParent();
   Module *Mod = Fn->getParent();
   int RtChkCount = (int)getNumRuntimePointerChecks();
+  // UnsafeDep 在 legality 阶段触发，无 CostModel 可用
   emitAIMVDiagnostic(*Mod, *Fn, *TheLoop,
-                     this, /*CM=*/nullptr,
-                     ElementCount::getFixed(0), /*IC=*/0,
+                     this, AIMVCostSnapshot::unknown(),
                      "UnsafeDep", Info,
                      PSE->getSE(),
                      /*RtCheckCost=*/-1, RtChkCount);
@@ -318,10 +364,16 @@ void emitAIMVDiagnostic(
   auto RtCostIC = Checks.getCost();
   int RtCost = RtCostIC.isValid() ? (int)RtCostIC.getValue() : -1;
   int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
+  AIMVCostSnapshot CostSnap;
+  auto ICpair = CM.expectedCost(VF.Width);
+  CostSnap.ScalarCost = ICpair.first.isValid() ? (int)ICpair.first.getValue() : -1;
+  CostSnap.VectorCost = ICpair.second.isValid() ? (int)ICpair.second.getValue() : -1;
+  CostSnap.VF = VF.Width.getKnownMinValue();
+  CostSnap.IC = IC;
   emitAIMVDiagnostic(
       *L->getHeader()->getParent()->getParent(),
       *L->getHeader()->getParent(), *L,
-      LVL.getLAI(), &CM, VF.Width, IC,
+      LVL.getLAI(), CostSnap,
       IntDiagMsg.first, IntDiagMsg.second,
       PSE.getSE(), RtCost, RtChkCount);
 }
@@ -341,10 +393,16 @@ void emitAIMVDiagnostic(
   int RtChkCount = (int)LVL.getLAI()->getNumRuntimePointerChecks();
   std::string VFMsg =
       "loop vectorized: VF=" + std::to_string(VF.Width.getKnownMinValue());
+  AIMVCostSnapshot CostSnap;
+  auto ICpair = CM.expectedCost(VF.Width);
+  CostSnap.ScalarCost = ICpair.first.isValid() ? (int)ICpair.first.getValue() : -1;
+  CostSnap.VectorCost = ICpair.second.isValid() ? (int)ICpair.second.getValue() : -1;
+  CostSnap.VF = VF.Width.getKnownMinValue();
+  CostSnap.IC = IC;
   emitAIMVDiagnostic(
       *L->getHeader()->getParent()->getParent(),
       *L->getHeader()->getParent(), *L,
-      LVL.getLAI(), &CM, VF.Width, IC,
+      LVL.getLAI(), CostSnap,
       "LoopVectorized", VFMsg,
       PSE.getSE(), RtCost, RtChkCount);
 }
@@ -379,8 +437,13 @@ llvm/include/llvm/Transforms/AIMV/
 ```
 
 ```
-llvm/lib/Transforms/Vectorize/
-+-- AIMVDiagnostic.h              # emitAIMVDiagnostic() 共享内部头文件 (~64 行)
+llvm/include/llvm/Analysis/
++-- AIMVDiagnostic.h              # emitAIMVDiagnostic() 声明 + AIMVCostSnapshot (~80 行)
+```
+
+```
+llvm/lib/Analysis/
++-- AIMVDiagnostic.cpp            # emitAIMVDiagnostic() 实现 (~120 行)
 ```
 
 ### 3.2 公共头文件
@@ -435,6 +498,9 @@ public:
     int NumBranches = 0, NumCalls = 0;
   };
 
+  // parseDiagnostics() 已移至 AIMVDiagnosticAnalysis::run()，
+  // 由 ModuleAnalysisManager 管理缓存生命周期。
+  // 此处保留 static 声明仅供 AIMVDiagnosticAnalysis 内部调用。
   static std::vector<RawDiagnostic> parseDiagnostics(Module &M);
 
 private:
@@ -449,11 +515,14 @@ private:
 #### 命令行参数
 
 ```cpp
-static cl::opt<std::string> AIMVOutputPath(
+// [AIMV] cl::opt 定义——必须是全局（非 static），供 BackendUtil.cpp 引用。
+// 注意: cl::opt 构造函数会将选项名注册到全局命令行解析器，
+// 同名选项不可在另一个翻译单元中重复定义（否则运行时断言失败）。
+cl::opt<std::string> AIMVOutputPath(
     "aimv-output", cl::desc("AIMV JSON diagnostic output path"), cl::Hidden);
-static cl::opt<bool> AIMVEnable(
+cl::opt<bool> AIMVEnable(
     "aimv-enable", cl::desc("Enable AIMV diagnostic collection"), cl::Hidden);
-static cl::opt<std::string> AIMVTargetFunction(
+cl::opt<std::string> AIMVTargetFunction(
     "aimv-target-function", cl::desc("Only analyze the specified function"),
     cl::Hidden);
 ```
@@ -477,16 +546,30 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
 
 #### 缓存优化（避免 O(N*M) 开销）
 
-Function Pass 对每个函数独立运行。同一 Module 的 `!aimv.diag` 会被 N 个函数各解析一次。Pass 实例内缓存首次 `parseDiagnostics()` 结果：
+Function Pass 对每个函数独立运行。同一 Module 的 `!aimv.diag` 会被 N 个函数各解析一次。使用 `ModuleAnalysisManager` 注册的 Analysis 缓存诊断解析结果，避免 `static` 变量的悬空指针风险：
 
 ```cpp
-// [AIMV] 缓存 parseDiagnostics() 结果，避免多函数重复解析
-// static 缓存对当前单线程 pass manager 安全。
-// 注意: 若未来 LLVM 的 new PM 启用多线程 pass 执行，
-//       需改用 ModuleAnalysisManager 的 AnalysisResult 缓存机制。
-static Module *CachedModule = nullptr;
-static std::unique_ptr<std::vector<RawDiagnostic>> CachedDiags;
+// [AIMV] Module Analysis: 缓存 !aimv.diag 解析结果
+// 使用 ModuleAnalysisManager 而非 static 变量。原因:
+//   1. static 变量在 clang 作为库被多次调用时（IDE/clangd/多文件编译），
+//      Module 指针释放后变成悬空指针，导致 UAF 或错误缓存命中。
+//   2. New PM 的 AnalysisResult 自动管理生命周期，Module 变更时自动失效。
+//   3. 线程安全：New PM 保证同一 Analysis 在同一 Module 上只计算一次。
 
+class AIMVDiagnosticAnalysis
+    : public AnalysisInfoMixin<AIMVDiagnosticAnalysis> {
+  friend AnalysisInfoMixin<AIMVDiagnosticAnalysis>;
+  static AnalysisKey Key;
+public:
+  struct Result {
+    std::vector<RawDiagnostic> Diagnostics;
+  };
+  Result run(Module &M, ModuleAnalysisManager &) {
+    return Result{AIMVFeedbackPass::parseDiagnostics(M)};
+  }
+};
+
+// AIMVFeedbackPass::run() 中获取缓存:
 PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();
   if (!M)
@@ -502,17 +585,16 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
   if (!Enabled || Output.empty())
     return PreservedAnalyses::all();
 
-  // 缓存: 仅在 Module 变更时重新解析
-  if (CachedModule != M) {
-    CachedDiags = std::make_unique<std::vector<RawDiagnostic>>(parseDiagnostics(*M));
-    CachedModule = M;
-  }
+  // 通过 ModuleAnalysisManager 获取缓存的诊断解析结果
+  auto &Diags = AM.getResult<AIMVDiagnosticAnalysis>(*M).Diagnostics;
 
   // 筛选当前函数的诊断...
 }
 ```
 
-后续函数直接复用 `CachedDiags` 做 `FunctionName` 过滤，消除 O(N*M) 开销。
+**注册**: 在 `PassRegistry.def` 中添加 `MODULE_ANALYSIS("aimv-diagnostic", AIMVDiagnosticAnalysis())`，并在 `PassBuilderPipelines.cpp` 的 `addVectorPasses()` 中 AIMVFeedbackPass 之前注册为依赖。
+
+后续函数直接复用 `Diags` 做 `FunctionName` 过滤，消除 O(N*M) 开销。
 
 **多函数处理**: 同一 Module 的 `!aimv.diag` 包含所有函数的诊断。Pass 对每个函数运行时筛选 `FunctionName` 匹配的记录。所有函数的诊断写入同一个 JSON 文件（由 `function_name` 字段区分）。Driver 读取后按 `function_name` 索引各函数的诊断，按函数顺序迭代处理。
 
@@ -809,16 +891,18 @@ Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
 
 **文件**: `clang/lib/CodeGen/BackendUtil.cpp`
 
-处理 `-aimv-output` 和 `-aimv-enable` 的 cl::opt 定义和传递：
+从 clang Driver 侧将 `-faimv` 解析结果传递给 LLVM 后端。**不在此处定义 `cl::opt`**——`cl::opt` 的选项名会全局注册，与 `AIMVFeedbackPass.cpp` 中的同名定义重复会导致 LLVM 命令行库运行时断言失败。此处仅引用 `AIMVFeedbackPass.cpp` 中已定义的 `extern cl::opt` 变量：
 
 ```cpp
-// [AIMV] LLVM 后端 cl::opt 定义
-static cl::opt<std::string> AIMVOutputPath("aimv-output",
-    cl::desc("AIMV JSON output path"),
-    cl::Hidden);
-static cl::opt<bool> AIMVEnable("aimv-enable",
-    cl::desc("Enable AIMV feedback pass"),
-    cl::Hidden);
+// [AIMV] 引用 AIMVFeedbackPass.cpp 中已定义的 cl::opt（不重复定义）
+// cl::opt 构造函数会将选项名注册到全局命令行解析器，
+// 同名选项在两个翻译单元中分别注册会导致重复注册断言失败。
+extern cl::opt<std::string> AIMVOutputPath;
+extern cl::opt<bool> AIMVEnable;
+
+// 在 EmitBackendOutput() 或相关函数中:
+//   AIMVEnable = true;    // 由 -faimv 触发
+//   AIMVOutputPath = ...; // 由 clang Driver 设置的临时路径
 ```
 
 ---
@@ -830,7 +914,9 @@ static cl::opt<bool> AIMVEnable("aimv-enable",
 **文件**: `llvm/lib/Passes/PassRegistry.def`
 
 ```cpp
-// [AIMV] AIMV vectorization feedback analysis
+// [AIMV] AIMV: Module Analysis 缓存 !aimv.diag 解析结果
+MODULE_ANALYSIS("aimv-diagnostic", AIMVDiagnosticAnalysis())
+// [AIMV] AIMV vectorization feedback pass
 FUNCTION_PASS("aimv-feedback", AIMVFeedbackPass())
 ```
 
@@ -843,6 +929,9 @@ FUNCTION_PASS("aimv-feedback", AIMVFeedbackPass())
 ```cpp
 // [AIMV] AIMV: collect vectorization diagnostics after LoopVectorize+SLPVectorize
 // The pass internally checks for AIMV enabled + output path before running.
+// RequiresAIMVDiagnosticAnalysis: 通过 require<AIMVDiagnosticAnalysis>() 确保
+// Module Analysis 在 Function Pass 运行前被计算并缓存，避免 static 变量悬空指针。
+FPM.addPass(RequireAnalysisPass<AIMVDiagnosticAnalysis, Function>());
 FPM.addPass(AIMVFeedbackPass());
 ```
 
@@ -963,23 +1052,25 @@ clang -O2 -faimv -mllvm -aimv-dry-run -c src/task.c -o task.o
 
 | 文件 | 变更类型 | 改动量 | 说明 |
 |------|---------|--------|------|
-| `llvm/lib/Transforms/Vectorize/LoopVectorize.cpp` | 修改 | +190 行 | emitAIMVDiagnostic() 实现 + 5 个插入点调用 |
-| `llvm/lib/Analysis/LoopAccessAnalysis.cpp` | 修改 | +15 行 | UnsafeDep 拒绝点增加 AIMV 写入 |
-| `llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h` | **新建** | ~64 行 | 共享内部头文件，emitAIMVDiagnostic() 声明 |
+| `llvm/lib/Transforms/Vectorize/LoopVectorize.cpp` | 修改 | +210 行 | 5 个插入点调用（含 AIMVCostSnapshot 预计算） |
+| `llvm/lib/Analysis/LoopAccessAnalysis.cpp` | 修改 | +10 行 | UnsafeDep 拒绝点增加 AIMV 写入 |
+| `llvm/include/llvm/Analysis/AIMVDiagnostic.h` | **新建** | ~80 行 | emitAIMVDiagnostic() 声明 + AIMVCostSnapshot 结构体 |
+| `llvm/lib/Analysis/AIMVDiagnostic.cpp` | **新建** | ~120 行 | emitAIMVDiagnostic() 实现 |
 | `llvm/lib/Transforms/AIMV/AIMVFeedbackPass.cpp` | **新建** | ~170 行 | Pass 主实现 |
 | `llvm/lib/Transforms/AIMV/AIMVDiagnosticParser.cpp` | **新建** | ~100 行 | Metadata -> RawDiagnostic 解析 |
 | `llvm/include/llvm/Transforms/AIMV/AIMVFeedback.h` | **新建** | ~77 行 | 公共头文件 |
 | `llvm/lib/Transforms/AIMV/CMakeLists.txt` | **新建** | ~13 行 | 构建配置 |
+| `llvm/lib/Analysis/CMakeLists.txt` | 修改 | +1 行 | 添加 AIMVDiagnostic.cpp |
 | `llvm/lib/Transforms/CMakeLists.txt` | 修改 | +1 行 | 添加子目录 |
-| `llvm/lib/Passes/PassBuilderPipelines.cpp` | 修改 | +5 行 | 头文件包含 + 在 addVectorPasses 中注册 |
-| `llvm/lib/Passes/PassRegistry.def` | 修改 | +2 行 | FUNCTION_PASS 注册 |
+| `llvm/lib/Passes/PassBuilderPipelines.cpp` | 修改 | +7 行 | 头文件包含 + RequireAnalysisPass + AIMVFeedbackPass 注册 |
+| `llvm/lib/Passes/PassRegistry.def` | 修改 | +3 行 | MODULE_ANALYSIS + FUNCTION_PASS 注册 |
 | `llvm/lib/Passes/CMakeLists.txt` | 修改 | +1 行 | 链接 LLVMAIMV |
-| `clang/lib/CodeGen/BackendUtil.cpp` | 修改 | +15 行 | `-aimv-output` / `-aimv-enable` cl::opt 处理 |
+| `clang/lib/CodeGen/BackendUtil.cpp` | 修改 | +10 行 | 引用 AIMV cl::opt extern 变量，传递 -faimv 配置 |
 | `clang/lib/Driver/ToolChains/Clang.cpp` | 修改 | +20 行 | `-faimv` 解析 + LLVM flags 转发 + fork+exec |
 | `clang/include/clang/Driver/Options.td` | 修改 | +3 行 | 注册 `-faimv` / `-fno-aimv` |
 
-**总新增文件**: 5 个（~424 行）
-**总修改文件**: 9 个（~252 行）
+**总新增文件**: 6 个（~544 行）
+**总修改文件**: 10 个（~258 行）
 
 ---
 

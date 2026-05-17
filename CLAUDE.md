@@ -31,14 +31,16 @@ aimv/                     # AIMV implementation root (to be created)
 AIMV LLVM-side code goes into:
 - `llvm/lib/Transforms/AIMV/` — new pass implementation
 - `llvm/include/llvm/Transforms/AIMV/` — public headers
-- `llvm/lib/Transforms/Vectorize/AIMVDiagnostic.h` — shared internal header for `emitAIMVDiagnostic()`
+- `llvm/include/llvm/Analysis/AIMVDiagnostic.h` — `emitAIMVDiagnostic()` declaration + `AIMVCostSnapshot`
+- `llvm/lib/Analysis/AIMVDiagnostic.cpp` — `emitAIMVDiagnostic()` implementation
 
 Key existing files AIMV touches:
 - `llvm/lib/Transforms/Vectorize/LoopVectorize.cpp` — add `emitAIMVDiagnostic()` calls
-- `llvm/lib/Transforms/Vectorize/LoopAccessAnalysis.cpp` — UnsafeDep insertion point
-- `llvm/lib/Passes/PassRegistry.def` — `FUNCTION_PASS("aimv-feedback", ...)`
+- `llvm/lib/Analysis/LoopAccessAnalysis.cpp` — UnsafeDep insertion point
+- `llvm/lib/Passes/PassRegistry.def` — `MODULE_ANALYSIS` + `FUNCTION_PASS` registration
 - `llvm/lib/Passes/PassBuilderPipelines.cpp` — wire into `addVectorPasses()`
 - `llvm/lib/Transforms/CMakeLists.txt` — `add_subdirectory(AIMV)`
+- `llvm/lib/Analysis/CMakeLists.txt` — add `AIMVDiagnostic.cpp`
 - `llvm/lib/Passes/CMakeLists.txt` — link `AIMV` component
 
 ## Architecture Summary
@@ -62,6 +64,8 @@ Things that bit us during design review — don't repeat these mistakes:
 
 ```cpp
 // InstructionCost: NO implicit conversion. Must check isValid() first.
+// Cost data is pre-computed into AIMVCostSnapshot at each insertion point,
+// then passed to emitAIMVDiagnostic(). Analysis layer never touches CostModel directly.
 InstructionCost IC = CM->expectedCost(VF);
 int cost = IC.isValid() ? (int)IC.getValue() : -1;  // getValue() asserts if Invalid
 

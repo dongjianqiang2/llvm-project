@@ -443,6 +443,11 @@ class BuildOrchestrator:
           -g                                          (debug info → 源码映射)
           -mllvm -aimv-enable                         (LLVM 后端 flag，不含 -faimv!)
           -mllvm -aimv-output=<json>                  (AIMVFeedback Pass 输出)
+
+        影子文件处理:
+          .aimv-tmp 扩展名不被编译器识别为 C/C++ 源文件，
+          必须使用 -x c（或 -x c++）显式指定语言。本方法
+          在检测到源文件扩展名非 .c/.cpp/.cc/.cxx 时自动注入。
         """
 
         aimv_path = aimv_json_output or str(self.work_dir / "aimv-diag.json")
@@ -454,6 +459,17 @@ class BuildOrchestrator:
             "-mllvm", "-aimv-enable",
             "-mllvm", f"-aimv-output={aimv_path}",
         ])
+        # [AIMV] 影子文件 .aimv-tmp 扩展名不被编译器识别，
+        # 必须用 -x c/c++ 显式指定语言，否则报 "unrecognized file type"。
+        # 根据原始源文件扩展名决定语言类型。
+        known_c_exts = {".c"}
+        known_cxx_exts = {".cpp", ".cc", ".cxx", ".C"}
+        src_ext = Path(source_file).suffix
+        if src_ext not in known_c_exts and src_ext not in known_cxx_exts:
+            # 推断语言: 从原始源文件名获取（影子文件由 .c → .c.aimv-tmp）
+            orig_ext = Path(source_file.replace(".aimv-tmp", "")).suffix
+            lang = "c++" if orig_ext in known_cxx_exts else "c"
+            cmd.extend(["-x", lang])
         cmd.extend([source_file, "-o", output_file])
 
         start = time.monotonic()
