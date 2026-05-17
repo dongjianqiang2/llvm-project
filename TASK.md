@@ -184,7 +184,7 @@
 
 ### T1.5 [MVP] AIMVFeedbackPass + AIMVDiagnosticAnalysis
 
-**前置**: T1.4
+**前置**: T1.4, T1.6
 
 **目标**: 创建 Function Pass + Module Analysis 缓存
 
@@ -202,13 +202,13 @@
 - `test_aimv_feedback_pass_target_function.ll`: `-aimv-target-function=foo` → 仅含 foo 的诊断
 - `test_aimv_feedback_pass_disabled.ll`: 无 `-aimv-enable` → 无 aimv.json 输出
 - `test_aimv_feedback_pass_cache.ll`: 多函数 Module → parseDiagnostics 仅执行一次（ModuleAnalysis 缓存）
-- `test_aimv_feedback_pass_json_schema.ll`: 输出 JSON 结构与 MCP_DESIGN AnalyzeRequest 的 diagnostics 部分兼容
+- `test_aimv_feedback_pass_json_schema.ll`: 输出 JSON 结构与 MCP_DESIGN AnalyzeRequest 的 diagnostics 部分兼容（依赖 T1.6 extractSourceContext 完整功能）
 
 ---
 
 ### T1.6 [MVP] 源码反向映射
 
-**前置**: T1.5 (extractSourceContext)
+**前置**: T1.4
 
 **目标**: IR → 源码位置 + 上下文提取
 
@@ -258,7 +258,7 @@
 - `RemarkSeverity`, `AimvLevel` 枚举
 - `CostModelDetail`: scalar_cost/vector_cost/vf/interleave_count (ge=-1 或 ge=0)
 - `DependencyInfo`: dep_type (pattern 约束 LLVM 8 种 DepType), source_ptr, sink_ptr, alias_result
-- `MemoryInfo`: num_stores/num_loads (ge=0), num_pred_stores (ge=0, default 0), max_alignment (ge=0), stride, memory_check_count (ge=0), memory_check_cost (ge=-1) — 与 PLAN.md / MCP_DESIGN.md 定义一致。legality 阶段无此数据时传 -1 sentinel（memory_check_count=0, memory_check_cost=-1, stride="unknown"）
+- `MemoryInfo`: num_stores/num_loads (ge=0), num_pred_stores (Optional[int]=None, MVP 阶段 LAI 不提供此数据，None 表示不可用), max_alignment (ge=0), stride, memory_check_count (Optional[int]=None, None=legality 阶段不可用), memory_check_cost (Optional[int]=None, None=不可用, -1=Invalid InstructionCost) — 与 MCP_DESIGN.md §3 修改后的定义一致
 - `LoopInfo`: trip_count (description: -1=不可用, 0=空循环, >0=具体值)
 - `SingleDiagnostic`: 含 source_accuracy (Optional[str]=None)
 - `TargetInfo`, `FunctionInfo` (signature 为 str，非 Optional), `HistoryRecord`
