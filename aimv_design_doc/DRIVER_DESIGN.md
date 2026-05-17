@@ -133,7 +133,7 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
         return 0
 
     # Step 3: 加载配置
-    config = load_config()  # ~/.aimv/config > env vars > defaults
+    config = load_config()  # env vars > ~/.aimv/config > defaults
 
     # 初始化模块
     builder = BuildOrchestrator(config)
@@ -175,6 +175,7 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
             session=session,
         )
         results.append(func_result)
+        session.functions.append(func_result)  # 持久化到 session
         # 函数 A 验证通过后变更已通过 atomic mv 写入原文件
         # 函数 B 编译时看到的源码已包含 A 的变更
 
@@ -602,11 +603,10 @@ class SourceManager:
          a. cp source → source.aimv-tmp（基于当前版本快照）
          b. diff 基于快照生成
          c. patch source.aimv-tmp（在影子上修改）
-         d. clang -c source.aimv-tmp -mllvm -aimv-enable ...（编译验证）
-            注意: 影子文件名 source.c.aimv-tmp 需在编译时正确处理:
+         d. clang -x c -c source.c.aimv-tmp -mllvm -aimv-enable ...（编译验证）
+            注意: 影子文件名 source.c.aimv-tmp 的扩展名不被编译器识别为 C。
+              - 必须使用 -x c 显式指定语言（.aimv-tmp 不是已知 C 扩展名）
               - -mllvm -aimv-output 指向独立的 JSON 路径（非原 aimv.json）
-              - 编译器基于文件扩展名（.c）识别语言，aimv-tmp 后缀不影响
-              - 若编译器对文件名敏感，可使用 -x c 显式指定语言
          e. 通过 → mv source.aimv-tmp source（rename(2) 原子替换）
             失败 → rm source.aimv-tmp
       3. [释放锁]
@@ -1126,10 +1126,13 @@ Round N 开始
 ### 8.1 配置优先级链
 
 ```
-~/.aimv/config (YAML)  >  环境变量  >  默认值
+环境变量  >  ~/.aimv/config (YAML)  >  默认值
+
+（环境变量覆盖配置文件，与 config.py 实现一致）
 
 环境变量:
   AIMV_MCP_URL       MCP 服务地址
+  AIMV_MCP_API_KEY   MCP API 密钥
   AIMV_LEVEL         修改激进度 (conservative|moderate|aggressive)
   AIMV_MAX_ROUNDS    最大迭代轮次
   AIMV_TEST_CMD      测试命令
@@ -1548,6 +1551,8 @@ def process_single_function(
                 verify_json = str(
                     Path(config.output_dir) / f"aimv-{function_name}-verify-r{round_num}.json"
                 )
+                # 影子文件编译需要 -x c: .aimv-tmp 不是已知 C 扩展名
+                # compile_with_aimv() 在检测到 source_file 不以 .c 结尾时自动加 -x c
                 verify_build = builder.compile_with_aimv(
                     source_file=shadow_file,
                     output_file=str(

@@ -1,7 +1,7 @@
-# AIMV 技术方案 v1.1
+# AIMV 技术方案 v1.2
 
-**版本**: 1.1
-**日期**: 2026-05-16
+**版本**: 1.2
+**日期**: 2026-05-17
 **关联文档**: SPEC.md v1.4
 
 ---
@@ -156,7 +156,7 @@ clang -O2 -faimv -c src.c
 │· 重编译验证   │
 └──────────────┘
 
-配置优先级: ~/.aimv/config > 环境变量 > 默认值
+配置优先级: 环境变量 > ~/.aimv/config > 默认值（环境变量覆盖配置文件，与 config.py 实现一致）
   环境变量: AIMV_MCP_URL, AIMV_LEVEL, AIMV_MAX_ROUNDS, AIMV_TEST_CMD
   默认值:   mcp_url=localhost:8080, aimv_level=conservative, max_rounds=5, test_cmd=""
 ```
@@ -772,7 +772,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 |------|------|--------|
 | 9 | `build_orchestrator`：编译→解析→请求→重编译 迭代控制，终止条件判断 | 单轮闭环可运行 |
 | 10 | `source_manager`：影子文件协议、原子替换、备份、回滚、残留影子检测 | 安全的 patch 管理 |
-| 11 | `iteration_tracker`：SessionRecord 完整日志（多函数 PerFunctionResult），JSON 格式 session 文件 | 完整可追溯日志 |
+| 11 | `iteration_engine`：SessionRecord 完整日志（多函数 PerFunctionResult），JSON 格式 session 文件 | 完整可追溯日志 |
 
 **里程碑**: `aimv-driver --function=proc dep_fail.c` 完成多轮迭代并输出 session.json（手动模式）；`clang -O2 -faimv -c dep_fail.c` 完成端到端闭环（Driver 模式）
 
@@ -789,7 +789,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 
 **MVP 交付物**（对应 SPEC §7）:
 1. `aimv-driver` Python 脚本（编排编译-诊断-MCP-patch 流程）
-2. `AIVectorizeFeedback` LLVM Pass（收集 opt-info 诊断信息）
+2. `AIMVFeedbackPass` LLVM Pass（收集 opt-info 诊断信息）
 3. MCP REST API mock/实现（接收诊断、返回建议）
 4. clang Driver `-faimv` 解析 + `fork+exec aimv-driver` 集成
 5. 1 个已知失败 benchmark 的端到端 demo（含 clang `-faimv` 入口）
@@ -874,7 +874,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 
 ```yaml
 # aimv_config.yaml — 默认配置
-# 配置优先级: 此文件 > 环境变量 > 代码默认值
+# 配置优先级: 环境变量 > ~/.aimv/config（部署后） > 代码默认值
 # 环境变量: AIMV_MCP_URL, AIMV_LEVEL, AIMV_MAX_ROUNDS, AIMV_TEST_CMD
 
 aimv:

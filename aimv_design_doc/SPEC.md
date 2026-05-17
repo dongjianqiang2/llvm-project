@@ -170,7 +170,7 @@ Round N 完整时序（锁仅覆盖文件 I/O 阶段）:
 | 场景 | clang Driver 行为 |
 |------|------------------|
 | `aimv-driver` 未安装 / 找不到 | 打印警告到 stderr，退化到普通编译（exit code 不变） |
-| `aimv-driver` 崩溃（非零退出 / signal） | 回滚源码（aimv-driver 内部 source_manager 维护备份），打印错误到 stderr，exit code = aimv-driver 退出码 |
+| `aimv-driver` 崩溃（非零退出 / signal） | 影子文件协议保证原文件未被修改（patch 在影子上）。clang Driver 检测到非零退出后，打印错误到 stderr，exit code = aimv-driver 退出码。若崩溃时残留 `*.aimv-tmp` 影子文件，下次 aimv-driver 或 CI 脚本应检测并清理。 |
 | `aimv-driver` 超时（默认 120s，可配置） | SIGKILL 终止，回滚源码（同上），打印超时错误 |
 | 用户 Ctrl+C（SIGINT） | 传递给 aimv-driver，由其回滚源码后退出；clang Driver waitpid 后退出 |
 | 用户 kill（SIGTERM） | 同 SIGINT |
@@ -361,7 +361,7 @@ history 传递策略：发送最近 3 轮的历史（含 outcome），让 AI 避
 **MVP 交付物**:
 
 1. `aimv-driver` Python 脚本（编排编译-诊断-MCP-patch 流程）
-2. `AIVectorizeFeedback` LLVM Pass（收集 opt-info 诊断信息）
+2. `AIMVFeedbackPass` LLVM Pass（收集 opt-info 诊断信息）
 3. MCP REST API mock/实现（接收诊断、返回建议）
 4. clang Driver `-faimv` 解析 + `fork+exec aimv-driver` 集成
 5. 1 个已知失败 benchmark 的端到端 demo（含 clang `-faimv` 入口）

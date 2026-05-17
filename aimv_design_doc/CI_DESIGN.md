@@ -15,7 +15,7 @@
 - **增量分析** — 只分析 git diff 中变更的函数，不跑全量
 - **可缓存** — MCP 结果 + 编译产物缓存，避免重复计算
 - **可配置** — 不同仓库/目录可配置不同的 AIMV 等级和门禁策略
-- **配置优先级** — 遵循 SPEC §3.1 定义的优先级链：配置文件 > 环境变量 > 默认值
+- **配置优先级** — 环境变量 > 配置文件 > 默认值（环境变量覆盖配置文件）
 
 ---
 
@@ -382,8 +382,8 @@ aimv:vectorization-analysis:
         - "**/*.cpp"
   timeout: 2h
   variables:
-    # [AIMV] 配置优先级: ~/.aimv/config > 环境变量 > 默认值
-    # CI 中通过环境变量注入 secrets（被配置文件覆盖，若存在）
+    # [AIMV] 配置优先级: 环境变量 > ~/.aimv/config > 默认值
+    # CI 中通过环境变量注入 secrets，环境变量优先于配置文件
     AIMV_MCP_URL: "${AIMV_MCP_URL}"
     AIMV_MCP_API_KEY: "${AIMV_MCP_API_KEY}"
     AIMV_LEVEL: "conservative"

@@ -295,6 +295,7 @@ class CostModelDetail(BaseModel):
 
 class DependencyInfo(BaseModel):
     """内存依赖分析结果 -- dep_type 直接使用 LLVM Dependence::DepName[Dep.Type]"""
+    # 注: 实施期应将 Field(pattern=...) 改为 Pydantic v2 正确的 Annotated[str, StringConstraints(pattern=...)]
     dep_type: str = Field(..., pattern=r"^(NoDep|Unknown|IndirectUnsafe|Forward|ForwardButPreventsForwarding|Backward|BackwardVectorizable|BackwardVectorizableButPreventsForwarding)$")
     source_ptr: str
     sink_ptr: str
@@ -406,7 +407,7 @@ class Suggestion(BaseModel):
     original: str
     modified: str
     diff: str
-    estimated_impact: str = Field(pattern="^(high|medium|low)$")
+    estimated_impact: str = Field(pattern="^(high|medium|low)$")  # 实施期改为 Annotated[str, StringConstraints(...)]
     safety_concern: Optional[str] = None
 
 
@@ -512,7 +513,7 @@ Do not include any text outside the JSON.
 | Scalar cost | {{ diag.cost_model.scalar_cost }} |
 | Vector cost (VF={{ diag.cost_model.vf }}) | {{ diag.cost_model.vector_cost }} |
 | Interleave count | {{ diag.cost_model.interleave_count }} |
-| Cost ratio | {{ "%.1f"|format(diag.cost_model.vector_cost / [diag.cost_model.scalar_cost, 1] | max) }}x |
+| Cost ratio | {{ "%.1f"|format(diag.cost_model.vector_cost / ([diag.cost_model.scalar_cost, 1] | max)) }}x |
 
 {% if diag.cost_model.scalar_cost < diag.cost_model.vector_cost %}
 **Key insight:** Vector cost ({{ diag.cost_model.vector_cost }}) > scalar cost ({{ diag.cost_model.scalar_cost }}). The cost model estimates vectorization is NOT profitable.
