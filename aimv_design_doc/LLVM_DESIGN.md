@@ -173,7 +173,7 @@ opt -passes="loop-vectorize,aimv-feedback" \
 #### loop_info (operand [8])
 
 ```llvm
-; [0]: MDString loop_id_str   (来自 L.getName()，可能为空则用 "loop_<header_bb_name>")
+; [0]: MDString loop_id_str   (来自 L.getName()，可能为空则用 "loop_<header_bb_name>"；注: MVP parser 跳过此字段，保留用于未来扩展)
 ; [1]: i32 num_blocks
 ; [2]: i32 num_instructions
 ; [3]: i32 trip_count          (-1=SE 不可用; 0=unknown/zero trips; >0=具体值; 通过 SE.getSmallConstantTripCount(&L) 获取，返回 unsigned，0 表示不可知)

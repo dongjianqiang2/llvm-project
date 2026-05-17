@@ -43,7 +43,7 @@
 
 **迭代终止条件（组合策略）**:
 
-1. 函数成功向量化即停止（检测到 LoopVectorize pass 成功生成向量指令）
+1. 目标函数内**所有循环**成功向量化即停止（`aimv-driver` 检测到该函数在最新 aimv.json 中无 `severity=="missed"` 的诊断记录）
 2. 到达最大迭代轮次上限（默认 5 轮，可配置）
 3. 收益不增时回滚（编译期判定：新 patch 后 `LoopVectorize` passed remark 数量减少则回滚。运行期性能验证（`aimv-bench`）为 Phase 2 预留功能，不在 MVP 闭环内）
 
@@ -85,7 +85,7 @@ clang Driver (C++)                     aimv-driver (Python)
 |----|------|-----|
 | clang Driver (`Clang.cpp`) | 解析 `-faimv`，编译后 `fork+exec aimv-driver` | ~20 行 |
 | clang Options (`Options.td`) | 注册 `-faimv` / `-fno-aimv` flag | 3 行 |
-| LLVM Pass Pipeline | 注册 AIMVFeedbackPass，无修改 | 设计已完成，待集成到 clang 构建 |
+| LLVM Pass Pipeline | `PassRegistry.def` + `PassBuilderPipelines.cpp` 新增注册 | ~5 行，设计已完成 |
 | aimv-driver (Python) | 编排逻辑，无修改；新增 `--from-json` 入口 | ~10 行 |
 
 **空诊断时的行为**：`aimv.json` 中所有 diagnostics 的 `severity == "passed"`（即无向量化失败）时，`aimv-driver` 直接 exit 0，输出：`[AIMV] all loops already vectorized, nothing to do` 到 stderr。clang Driver 将该 exit 0 视为成功。
@@ -128,7 +128,7 @@ Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
 `aimv-driver --from-json` 模式下，运行参数按以下优先级加载：
 
 1. `~/.aimv/config`（YAML，用户全局配置）
-2. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`
+2. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_MCP_API_KEY`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`、`AIMV_MODE`（`review`/`dry-run`/`off`）
 3. aimv.json 内无配置字段，仅包含诊断数据
 
 默认值：`aimv_level=conservative`（Driver 自动模式和 `aimv-driver` 独立模式统一。全自动场景下保守修改是安全基线，用户可通过配置提升）、`max_rounds=5`、`mcp_url=http://localhost:8080`、`test_cmd=""`（空则跳过测试，仅做编译验证）。
@@ -456,4 +456,4 @@ history 传递策略：发送最近 3 轮的历史（含 outcome），让 AI 避
 
 *文档版本: 1.4*
 *创建日期: 2026-04-29*
-*最后更新: 2026-05-16*
+*最后更新: 2026-05-17*

@@ -1214,9 +1214,11 @@ def load_config() -> DriverConfig:
     if env_mode := os.environ.get("AIMV_MODE"):
         config.aimv_mode = env_mode
 
-    # 校验
-    assert config.aimv_level in ("conservative", "moderate", "aggressive")
-    assert config.max_rounds > 0
+    # 校验（不使用 assert——python -O 会跳过 assert 语句）
+    if config.aimv_level not in ("conservative", "moderate", "aggressive"):
+        raise ValueError(f"invalid aimv_level: {config.aimv_level}")
+    if config.max_rounds <= 0:
+        raise ValueError(f"max_rounds must be > 0: {config.max_rounds}")
 
     return config
 ```

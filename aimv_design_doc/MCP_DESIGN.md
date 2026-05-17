@@ -1013,6 +1013,10 @@ class AIMVErrorHandler:
         self.retry_delay = retry_delay
 
     async def handle_llm_call(self, backend, request):
+        # 注: backend.analyze() 是同步调用（阻塞 I/O），在 async handler 中
+        # 会阻塞 asyncio event loop。生产环境应改用:
+        #   await asyncio.get_event_loop().run_in_executor(None, backend.analyze, request)
+        # MVP 阶段阻塞可接受（单客户端、低并发）。
         import asyncio
         last_error = None
 

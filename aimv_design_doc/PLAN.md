@@ -455,6 +455,7 @@ Base URL: http://<mcp-host>:<port>/api/v1
 | POST | `/analyze-vectorization` | 分析向量化失败，返回源码修改建议 |
 | GET | `/health` | 健康检查 |
 | GET | `/cache/stats` | 诊断模式缓存统计 |
+| POST | `/feedback` | 记录迭代结果供 prompt 优化（Phase 2） |
 
 #### POST /analyze-vectorization
 
