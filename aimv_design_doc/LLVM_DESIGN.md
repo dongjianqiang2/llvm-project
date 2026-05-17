@@ -177,7 +177,8 @@ opt -passes="loop-vectorize,aimv-feedback" \
 ; [0]: MDString loop_id_str   (来自 L.getName()，可能为空则用 "loop_<header_bb_name>"；注: MVP parser 跳过此字段，保留用于未来扩展)
 ; [1]: i32 num_blocks
 ; [2]: i32 num_instructions
-; [3]: i32 trip_count          (-1=SE 不可用; 0=unknown/zero trips; >0=具体值; 通过 SE.getSmallConstantTripCount(&L) 获取，返回 unsigned，0 表示不可知)
+; [3]: i32 trip_count          (-1=SE 不可用或返回 0(不可知); 0=零次迭代(空循环); >0=具体值;
+;     通过 SE.getSmallConstantTripCount(&L) 获取，返回 unsigned，0 表示不可知，AIMV 映射: SE 0 → -1)
 ; [4]: i32 num_branches
 ; [5]: i32 num_calls
 ; 注: SE.getSmallConstantTripCount() 属于 ScalarEvolution，emit 点需要 SE 参数。
@@ -525,7 +526,12 @@ cl::opt<bool> AIMVEnable(
 cl::opt<std::string> AIMVTargetFunction(
     "aimv-target-function", cl::desc("Only analyze the specified function"),
     cl::Hidden);
+cl::opt<bool> AIMVDryRun(
+    "aimv-dry-run", cl::desc("Produce aimv.json but skip fork+exec aimv-driver"),
+    cl::Hidden);
 ```
+
+`-aimv-dry-run` 行为: AIMVFeedbackPass 正常写入 aimv.json，但 `BackendUtil.cpp` 中检测到此标志时跳过 `fork+exec aimv-driver`。用于离线诊断收集和调试。
 
 所有参数标记为 `cl::Hidden`（不在 `-help` 中显示），通过 `-mllvm` 传递。
 

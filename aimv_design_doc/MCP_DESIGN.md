@@ -306,18 +306,18 @@ class MemoryInfo(BaseModel):
     """内存/对齐信息"""
     num_stores: int = Field(..., ge=0)
     num_loads: int = Field(..., ge=0)
-    num_pred_stores: int = Field(0, ge=0)
+    num_pred_stores: Optional[int] = Field(None, description="MVP: 信息不可用，LAI 不直接提供。Phase 2 从 LoopVectorizationLegality 获取")
     max_alignment: int = Field(..., ge=0)       # bytes
     stride: str
-    memory_check_count: int = Field(..., ge=0)
-    memory_check_cost: int = Field(..., ge=-1)
+    memory_check_count: Optional[int] = Field(None, description="None=信息不可用(legality阶段); >=0=具体值")
+    memory_check_cost: Optional[int] = Field(None, description="None=信息不可用; >=0=具体值; -1=Invalid InstructionCost")
 
 
 class LoopInfo(BaseModel):
     """循环结构信息"""
     num_blocks: int
     num_instructions: int
-    trip_count: int
+    trip_count: int = Field(..., description="-1=SE不可用; 0=零次迭代(空循环); >0=具体值。注意: SE.getSmallConstantTripCount()返回unsigned,0=不可知,AIMV映射: 0→-1")
     num_branches: int
     num_calls: int
 
@@ -332,6 +332,7 @@ class SingleDiagnostic(BaseModel):
     loop_location: str
     source_context: str
     ir_snippet: str
+    source_accuracy: Optional[str] = Field(None, description="None=精确; 'approximate'=行号可能偏差,需AI注意")
     cost_model: Optional[CostModelDetail] = None
     dependencies: List[DependencyInfo] = []
     memory_info: Optional[MemoryInfo] = None
@@ -498,6 +499,9 @@ Do not include any text outside the JSON.
 **Remark ID:** {{ diag.remark_id }}
 **Message:** {{ diag.remark_text }}
 **Severity:** {{ diag.severity }}
+{% if diag.source_accuracy == "approximate" %}
+**WARNING:** Source location is approximate — line numbers may be off by +/-5 lines due to IR optimization passes reordering instructions. Pay extra attention when generating diffs.
+{% endif %}
 
 #### LLVM IR (optimized, surrounding the loop)
 
@@ -511,7 +515,7 @@ Do not include any text outside the JSON.
 | Metric | Value |
 |--------|-------|
 | Scalar cost | {{ diag.cost_model.scalar_cost }} |
-| Vector cost (VF={{ diag.cost_model.vf }}) | {{ diag.cost_model.vector_cost }} |
+| Vector cost (VF={% if diag.cost_model.vf == 0 %}not determined, legality rejection{% else %}{{ diag.cost_model.vf }}{% endif %}) | {{ diag.cost_model.vector_cost }} |
 | Interleave count | {{ diag.cost_model.interleave_count }} |
 | Cost ratio | {{ "%.1f"|format(diag.cost_model.vector_cost / ([diag.cost_model.scalar_cost, 1] | max)) }}x |
 
@@ -525,6 +529,7 @@ Cost model data not available (legality stage rejection).
 #### Memory Dependencies
 
 {% if diag.dependencies %}
+**DepType semantics:** "Forward"=safe read-after-write; "Backward"=unsafe write-after-read; "BackwardVectorizable"=safe with element-wise overlap; "BackwardVectorizableButPreventsForwarding"=safe but blocks store forwarding; "ForwardButPreventsForwarding"=safe but blocks store forwarding; "Unknown"=SCEV cannot determine direction, treat as PossiblyBackward (potentially unsafe); "IndirectUnsafe"=unsafe through pointer aliasing.
 | # | Type | Source | Sink | Alias Result |
 |---|------|--------|------|-------------|
 {% for dep in diag.dependencies %}

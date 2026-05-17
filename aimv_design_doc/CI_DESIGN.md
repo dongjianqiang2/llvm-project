@@ -288,9 +288,10 @@ jobs:
 
       - name: Build baseline (AOT)
         run: |
+          # 使用与 Step 2 相同的构建配置，不重新 cmake（避免覆盖 Ninja 配置）
+          # 直接使用 ninja 重新构建 baseline 目标
           cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
-          make -j$(nproc)
+          ninja clang opt
 
       - name: Detect changed functions
         id: changes
@@ -1172,20 +1173,23 @@ def notify_slack(webhook_url: str, summary: dict):
 
 ## 10. 配置优先级
 
-### 10.1 配置链（与 SPEC §3.1 对齐）
+### 10.1 配置链（与 DRIVER_DESIGN §8.1 对齐）
 
 ```
-~/.aimv/config (YAML)
-    │
-    │  被以下环境变量覆盖:
+环境变量（最高优先级）
     │
     ├── AIMV_MCP_URL         MCP 服务地址
     ├── AIMV_MCP_API_KEY     MCP API 密钥（CI secrets 注入）
     ├── AIMV_LEVEL           修改激进度
     ├── AIMV_MAX_ROUNDS      最大迭代轮次
-    └── AIMV_TEST_CMD        测试命令
+    ├── AIMV_TEST_CMD        测试命令
+    └── AIMV_MODE            运行模式 (auto|review|dry-run|off)
             │
-            │  环境变量未设置时使用默认值:
+            │  环境变量未设置时回退到 ~/.aimv/config:
+            │
+    ~/.aimv/config (YAML)
+            │
+            │  配置文件未设置时使用默认值:
             │
             ├── mcp_url       = http://localhost:8080
             ├── aimv_level    = conservative
@@ -1207,9 +1211,9 @@ variables:
   AIMV_MCP_API_KEY: "${AIMV_MCP_API_KEY}"
 ```
 
-`aimv-driver --from-json` 内部按优先级链加载：若 `~/.aimv/config` 存在且包含 `mcp.api_key`，优先使用配置文件值；否则使用环境变量 `AIMV_MCP_API_KEY`；两者均无则报错。
+`aimv-driver --from-json` 内部按优先级链加载：环境变量 **始终覆盖** `~/.aimv/config` 中的同名字段（与 DRIVER_DESIGN §8.1 config.py 实现一致）。CI 中通过 secrets 注入的环境变量优先级最高，即使 `~/.aimv/config` 中存在同名字段也会被覆盖。两者均无则报错。
 
-CI 中 `aimv_level` 默认为 `conservative`（非 moderate），因为 CI 是全自动场景，保守修改是安全基线。若项目需更激进优化，可在 `~/.aimv/config` 中覆盖。
+CI 中 `aimv_level` 默认为 `conservative`（非 moderate），因为 CI 是全自动场景，保守修改是安全基线。若项目需更激进优化，可通过环境变量 `AIMV_LEVEL=moderate` 覆盖。
 
 ---
 

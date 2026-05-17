@@ -179,6 +179,19 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
         # 函数 A 验证通过后变更已通过 atomic mv 写入原文件
         # 函数 B 编译时看到的源码已包含 A 的变更
 
+        # [AIMV] 跨函数回归检测: 函数 B 的 patch 可能破坏已成功向量化的函数 A。
+        # 在每函数完成后，重新编译并检查前面所有已向量化函数的状态。
+        if func_result.termination_reason == TerminationReason.VECTORIZED:
+            regression = _check_cross_function_regression(
+                source_file, [r for r in results
+                              if r.termination_reason == TerminationReason.VECTORIZED],
+                builder, config)
+            if regression:
+                # 回滚最后一个函数的变更，保留前面已成功的函数
+                sources.rollback_last(source_file)
+                func_result.termination_reason = TerminationReason.NO_IMPROVEMENT
+                func_result.cross_function_regression = True
+
     # Step 5: 输出汇总到 stderr
     emit_summary(results, source_file, session, store, config)
 
@@ -249,6 +262,8 @@ class TerminationReason(Enum):
     NO_SUGGESTION = "no_suggestion"        # MCP 返回 no_action_possible
     COMPILE_ERROR = "compile_error"        # patch 导致编译失败
     TEST_FAILURE = "test_failure"          # patch 导致测试失败
+    LOCK_TIMEOUT = "lock_timeout"          # 文件锁获取超时（并发竞争）
+    MCP_ERROR = "mcp_error"                # MCP 认证/通信不可恢复错误
     INTERRUPTED = "interrupted"            # 用户中断 (Ctrl+C)
 ```
 
@@ -614,21 +629,29 @@ class SourceManager:
     """源码的影子文件 patch、原子替换、回滚和 FileLock 管理。
 
     影子文件协议（SPEC §3.1 完整时序）:
-      1. [无锁] MCP 查询 → 获得 AI 建议
-      2. [获取锁]
-         a. cp source → source.aimv-tmp（基于当前版本快照）
-         b. diff 基于快照生成
-         c. patch source.aimv-tmp（在影子上修改）
-         d. clang -x c -c source.c.aimv-tmp -mllvm -aimv-enable ...（编译验证）
-            注意: 影子文件名 source.c.aimv-tmp 的扩展名不被编译器识别为 C。
-              - 必须使用 -x c 显式指定语言（.aimv-tmp 不是已知 C 扩展名）
-              - -mllvm -aimv-output 指向独立的 JSON 路径（非原 aimv.json）
-         e. 通过 → mv source.aimv-tmp source（rename(2) 原子替换）
-            失败 → rm source.aimv-tmp
-      3. [释放锁]
+      1. [无锁] 记录当前文件内容 hash (pre_query_hash)
+         2. [无锁] MCP 查询 → 获得 AI 建议
+         3. [获取锁]
+            a. 校验文件 hash 与 pre_query_hash 是否一致
+               - 不一致: 文件在无锁期间被其他进程修改，AI diff 行号
+                 可能已不匹配。记录警告，丢弃当前建议，重新查询 MCP。
+            b. cp source → source.aimv-tmp（基于当前版本快照）
+            c. diff 基于快照生成
+            d. patch source.aimv-tmp（在影子上修改）
+            e. clang -x c -c source.c.aimv-tmp -mllvm -aimv-enable ...（编译验证）
+               注意: 影子文件名 source.c.aimv-tmp 的扩展名不被编译器识别为 C。
+                 - 必须使用 -x c 显式指定语言（.aimv-tmp 不是已知 C 扩展名）
+                 - -mllvm -aimv-output 指向独立的 JSON 路径（非原 aimv.json）
+            f. 通过 → mv source.aimv-tmp source（rename(2) 原子替换）
+               失败 → rm source.aimv-tmp
+         4. [释放锁]
 
-    锁作用域: 仅步骤 2a-2e（文件 I/O，秒级）。
+    锁作用域: 仅步骤 3a-3f（文件 I/O，秒级）。
     MCP 查询不占锁，不阻塞其他 clang 进程。
+
+    竞态保护: 步骤 1 的 pre_query_hash + 步骤 3a 的 hash 校验
+    确保即使其他进程在无锁期间修改了文件，也不会将基于旧版本
+    的 AI diff 应用到新版本上。
 
     多函数: 每函数独立应用原子替换。函数 A 成功后立即 mv，
     不等待 B。函数 B 编译时看到已包含 A 变更的源码。
@@ -643,6 +666,30 @@ class SourceManager:
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         self._patch_history: List[PatchRecord] = []
         self._locks: dict = {}            # path → fd
+
+    # ── 竞态保护 ──────────────────────────────────────────
+
+    @staticmethod
+    def file_hash(path: str) -> str:
+        """计算文件 SHA256，用于竞态检测"""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def snapshot_hash(self, source_file: str) -> str:
+        """在 MCP 查询前调用，记录当前文件内容 hash。
+        用于在获取锁后校验文件是否被其他进程修改。
+        """
+        return self.file_hash(source_file)
+
+    def check_stale(self, source_file: str, pre_query_hash: str) -> bool:
+        """获取锁后调用，检查文件是否在无锁期间被修改。
+        返回 True 表示文件已变更（stale），diff 可能不匹配。
+        """
+        current_hash = self.file_hash(source_file)
+        return current_hash != pre_query_hash
 
     # ── FileLock ──────────────────────────────────────────
 
@@ -906,11 +953,18 @@ class MCPClient:
         retry 策略:
           尝试 1 (立即) → 失败? → 等待 2s → 尝试 2 → 失败? → 等待 4s → 尝试 3
           3 次都失败 → 返回 None (driver 记录 ERROR 并放弃本轮)
+
+        总超时预算: 单次 analyze() 调用上限 180s（含重试等待），
+        防止 Driver+MCP 级联重试导致单次调用超过 10 分钟。
         """
 
         url = f"{self.base_url}/api/v1/analyze-vectorization"
+        deadline = time.monotonic() + 180  # 总超时 180s
 
         for attempt in range(3):
+            if time.monotonic() > deadline:
+                return None  # 总超时
+
             try:
                 start = time.monotonic()
                 resp = self._client.post(url, json=request_json)
@@ -918,6 +972,11 @@ class MCPClient:
 
                 if resp.status_code == 200:
                     return resp.json()
+                elif resp.status_code in (401, 403):
+                    # 认证错误，不可重试——立即报错，给出明确提示
+                    raise PermissionError(
+                        f"MCP authentication failed (HTTP {resp.status_code}): "
+                        f"check AIMV_MCP_API_KEY configuration")
                 elif resp.status_code == 422:
                     # 参数错误，不可重试
                     raise ValueError(f"MCP validation error: {resp.text}")
@@ -928,7 +987,9 @@ class MCPClient:
                         continue
                     return None
                 else:
-                    return None
+                    # 其他状态码（如 404），不可重试
+                    raise RuntimeError(
+                        f"MCP unexpected HTTP {resp.status_code}: {resp.text[:200]}")
 
             except (httpx.TimeoutException, httpx.ConnectError):
                 if attempt < 2:
@@ -1007,7 +1068,8 @@ class IterationEngine:
         self.current_level = initial_level
         self.max_rounds = max_rounds
 
-        self._consecutive_compile_failures = 0
+        self._consecutive_compile_failures = 0  # 仅统计 Step 4 (patch 编译) 失败
+        self._consecutive_source_compile_failures = 0  # Step 1 (原始源码编译) 失败
         self._consecutive_mcp_failures = 0
         self._level_escalations = 0
 
@@ -1020,11 +1082,16 @@ class IterationEngine:
         mcp_had_suggestions: bool,
         mcp_responded: bool,
         passed_remark_delta: Optional[int] = None,
+        compile_phase: str = "patch",  # "source" (Step1) or "patch" (Step4)
     ) -> tuple:
         """返回 (NextAction, reason_string) 元组。
 
         passed_remark_delta: 新 patch 后 passed remark 数量变化。
           正值=增加, 负值=减少（退化）, None=无法比较。
+        compile_phase: 区分编译失败来源——"source"为原始源码编译失败
+          （环境问题），"patch"为 AI patch 后编译失败（建议语法错误）。
+          两者使用独立计数器，避免 Step4 的 AI 建议错误触发
+          Step1 的环境问题终止逻辑。
         """
 
         # 1. 向量化成功
@@ -1035,14 +1102,20 @@ class IterationEngine:
         if current_round >= self.max_rounds:
             return NextAction.STOP, f"reached max rounds ({self.max_rounds})"
 
-        # 3. 编译失败
+        # 3. 编译失败（区分 Step1 源码编译 和 Step4 patch 编译）
         if not build_result_ok:
-            self._consecutive_compile_failures += 1
-            if self._consecutive_compile_failures >= 2:
-                return NextAction.STOP, "consecutive compile failures"
-            return NextAction.ROLLBACK, "compile failure, will retry"
+            if compile_phase == "source":
+                self._consecutive_source_compile_failures += 1
+                # 原始源码编译失败 → 可能是环境问题，直接终止
+                return NextAction.STOP, "source compile failure (environment issue)"
+            else:  # patch
+                self._consecutive_compile_failures += 1
+                if self._consecutive_compile_failures >= 2:
+                    return NextAction.STOP, "consecutive patch compile failures"
+                return NextAction.ROLLBACK, "patch compile failure, will retry"
 
         self._consecutive_compile_failures = 0
+        self._consecutive_source_compile_failures = 0
 
         # 4. 测试失败 → 回滚并终止（语义错误，重试无意义）
         if not test_result_ok:
@@ -1074,11 +1147,21 @@ class IterationEngine:
         return NextAction.CONTINUE, "continuing to next round"
 
     def _try_escalate(self) -> bool:
-        """提升 aimv_level: conservative → moderate → aggressive"""
+        """提升 aimv_level: conservative → moderate → aggressive
+
+        安全约束: 当 level 升至 aggressive 时，若当前为全自动模式
+        （非 review 模式），自动切换到 review 模式。理由:
+        aggressive 级别可建议数据结构变更（AoS→SoA）等高风险修改，
+        在无人工审查下自动应用可能导致语义错误。详见 SPEC §4.2。
+        """
         levels = ["conservative", "moderate", "aggressive"]
         idx = levels.index(self.current_level)
         if idx < len(levels) - 1:
-            self.current_level = levels[idx + 1]
+            next_level = levels[idx + 1]
+            if next_level == "aggressive" and not self._review_mode:
+                self._review_mode = True  # 自动切换到 review 模式
+                # 通知调用方: 下一轮 patch 前需等待用户确认
+            self.current_level = next_level
             self._level_escalations += 1
             return True
         return False
@@ -1086,6 +1169,7 @@ class IterationEngine:
     def reset(self):
         self.current_level = self.initial_level
         self._consecutive_compile_failures = 0
+        self._consecutive_source_compile_failures = 0
         self._consecutive_mcp_failures = 0
         self._level_escalations = 0
 ```
@@ -1328,7 +1412,7 @@ def build_mcp_request(
     """构造 MCP AnalyzeRequest (对应 MCP_DESIGN.md §2.1)。
 
     组装:
-      - request_id: "aimv-<session_id>-<func_name_hash>"
+      - request_id: "aimv-<session_id>-<func_hash[:8]>-r<round>" (唯一标识每轮请求，含 session+函数+轮次)
       - target: 优先从 AIMVFeedbackPass JSON 获取，回退到 config
       - function: 从当前源文件提取 name/signature/source_code/loop_line
       - diagnostics: 从 AIMVFeedbackPass JSON 筛选当前函数的 missed 诊断
@@ -1345,21 +1429,23 @@ def build_mcp_request(
     for d in diagnostics:
         if d.get("function_name") == function_name and d.get("severity") == "missed":
             loc = d.get("loop_location", "")
-            # 解析 "file.c:42:5" 格式
-            parts = loc.rsplit(":", 2)
-            if len(parts) >= 2:
+            # 从末尾解析 "file.c:42:5" 或 "C:\src\file.c:42:5" 格式
+            # 使用正则从末尾匹配，避免 Windows 路径冒号干扰
+            import re
+            m = re.search(r":(\d+):\d+$", loc)
+            if m:
                 try:
-                    loop_line = int(parts[-2])
+                    loop_line = int(m.group(1))
                 except ValueError:
                     pass
             break
 
     return {
-        "request_id": f"aimv-{hashlib.sha256(function_name.encode()).hexdigest()[:12]}",
+        "request_id": f"aimv-{session_id}-{func_hash[:8]}-r{round_num}",
         "target": target or {
             "triple": "",
-            "cpu": "",
-            "features": [],
+            "cpu": "",    # TODO: 从编译参数 -mcpu= 回退填充
+            "features": [],  # TODO: 从编译参数 -mfpu= 回退填充
             "vector_width": 128,
         },
         "function": {
@@ -1556,7 +1642,7 @@ def process_single_function(
             # ── Step 3: 影子文件 patch [获取锁] ──
             round_rec.status = IterationStatus.PATCHING
             if not sources.acquire_lock(source_file):
-                func_result.termination_reason = TerminationReason.COMPILE_ERROR
+                func_result.termination_reason = TerminationReason.LOCK_TIMEOUT
                 break
 
             try:
@@ -1581,17 +1667,20 @@ def process_single_function(
                 round_rec.verify_build = verify_build
 
                 if verify_build.returncode != 0:
-                    # 编译失败 → 丢弃影子
+                    # patch 编译失败 → 丢弃影子（已由 discard_shadow 完成回滚）
                     sources.discard_shadow(source_file)
                     action, reason = engine.decide(
                         current_round=round_num,
                         build_result_ok=False, test_result_ok=True,
                         vectorized=False, mcp_had_suggestions=True,
                         mcp_responded=True,
+                        compile_phase="patch",  # 区分 patch 编译 vs 源码编译
                     )
                     if action == NextAction.STOP:
                         func_result.termination_reason = TerminationReason.COMPILE_ERROR
                         break
+                    # ROLLBACK: 影子已丢弃，同轮重试一次（下一轮 MCP 会
+                    # 看到本轮历史中的"compile_failed"，避免重复相同建议）
                     continue
 
                 # 检查验证编译后的向量化状态
@@ -1917,7 +2006,7 @@ OPTIONS:
   --test-cmd CMD           测试命令（默认 ""，仅编译验证）
   --dry-run                仅编译+诊断，不调用 MCP 不修改源码
   --require-review         每轮 patch 前等待用户确认
-  --resume SESSION_ID      从 session 恢复
+  --resume SESSION_ID      从 session 恢复 (Phase 2: 需补充 IterationEngine 状态持久化 + 恢复逻辑)
   --list-sessions          列出所有 session
   --verbose                详细日志
 

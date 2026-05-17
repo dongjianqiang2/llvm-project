@@ -356,19 +356,21 @@ class TerminationReason(Enum):
 
 @dataclass
 class RoundRecord:
-    """单轮迭代记录（简化版；详细字段见 DRIVER_DESIGN.md）"""
+    """单轮迭代记录（简化版；实现以 DRIVER_DESIGN.md §3.4 为准，
+    字段名和类型以 DRIVER 版本为准: mcp_request/mcp_response/patch/verify_build/test_result/started_at/finished_at）
+    """
     round_number: int
     status: IterationStatus = IterationStatus.PENDING
     diagnostics: list = field(default_factory=list)
-    request_json: dict = field(default_factory=dict)
-    response_json: dict = field(default_factory=dict)
-    applied_patch: Optional[str] = None
-    compile_success: Optional[bool] = None
-    test_success: Optional[bool] = None
+    request_json: dict = field(default_factory=dict)   # DRIVER: mcp_request
+    response_json: dict = field(default_factory=dict)  # DRIVER: mcp_response
+    applied_patch: Optional[str] = None                # DRIVER: patch (PatchRecord)
+    compile_success: Optional[bool] = None             # DRIVER: verify_build (BuildResult)
+    test_success: Optional[bool] = None                # DRIVER: test_result (TestResult)
     vectorized: Optional[bool] = None   # 向量化是否成功
     perf_delta: Optional[float] = None  # 性能变化（正=改善）
-    start_time: float = field(default_factory=time.time)
-    end_time: Optional[float] = None
+    start_time: float = field(default_factory=time.time)  # DRIVER: started_at
+    end_time: Optional[float] = None                      # DRIVER: finished_at
 
 @dataclass
 class PerFunctionResult:
@@ -606,24 +608,25 @@ MVP 不处理头文件中的 static inline 函数或宏展开导致的向量化�
 [AIMV]   Report: /home/user/aimv-output/session_xxx.json
 ```
 
-**配置来源**（优先级从高到低）：
+**配置来源**（优先级从高到低，与 DRIVER_DESIGN §8.1 一致）：
 
-1. `~/.aimv/config`（YAML，用户全局配置）
-2. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`
+1. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_MCP_API_KEY`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`、`AIMV_MODE`
+2. `~/.aimv/config`（YAML，用户全局配置）
 3. 默认值：`mcp_url=http://localhost:8080`、`aimv_level=conservative`、`max_rounds=5`、`test_cmd=""`
 
 aimv.json 仅包含诊断数据，不含配置字段。
 
-**配置文件 `~/.aimv/config` 示例**:
+**配置文件 `~/.aimv/config` 示例**（与 DRIVER_DESIGN §8.3 对齐，顶层 key 为 `mcp:` 和 `driver:`）:
 
 ```yaml
 mcp:
   url: http://aimv-server:8080
-  api_key: sk-xxx
+  api_key: ""                       # MCP API 密钥（生产环境应使用环境变量 AIMV_MCP_API_KEY）
+  timeout_seconds: 60
 driver:
   max_rounds: 5
-  aimv_level: conservative
-  test_cmd: ""                # 空 = 仅编译验证，跳过测试
+  aimv_level: conservative       # conservative | moderate | aggressive
+  test_cmd: ""                   # 空 = 仅编译验证
 ```
 
 ### 4.4 Driver CLI 接口（手动/CI 使用）
@@ -745,9 +748,9 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 |------|------|--------|
 | 3 | `AIMVFeedbackPass` 骨架：remark 遍历框架，`--aimv-output` 参数 | Pass 可加载运行 |
 | 4 | `OptInfoCollector`：源码反向映射（`!dbg`），IR 片段提取，remark 结构化 | 完整诊断 JSON 输出 |
-| 5 | `CostModelExporter`：VPlan 代价数据提取，依赖分析信息收集；clang Driver 集成：`Options.td` 注册 `-faimv`/`-fno-aimv`，`Clang.cpp` 编译后 `fork+exec aimv-driver --from-json` | 含代价模型的完整诊断 + `-faimv` 入口可工作（~23 行 C++） |
+| 5 | `CostModelExporter`：VPlan 代价数据提取，依赖分析信息收集；clang Driver 集成（仅 flag 注册和 LLVM flags 转发，不含 fork+exec）: `Options.td` 注册 `-faimv`/`-fno-aimv`，`Clang.cpp` 转发 `-mllvm -aimv-enable` | 含代价模型的完整诊断 + `-faimv` flag 可编译（flag 转发部分 ~10 行 C++） |
 
-**里程碑**: `clang -O2 -faimv -c benchmark.c` 编译后自动调用 aimv-driver，产出诊断 JSON 和 AI 建议
+**里程碑**: `opt -passes="loop-vectorize,aimv-feedback" -aimv-enable -aimv-output=aimv.json benchmark.bc` 产出完整诊断 JSON。`clang -O2 -faimv -c benchmark.c` 可编译（`-faimv` 仅激活 Pass，fork+exec 在阶段 4 集成）
 
 ---
 
@@ -785,7 +788,7 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 
 | 周次 | 任务 | 交付物 |
 |------|------|--------|
-| 12 | 端到端联调：Pass + Driver + MCP Server + clang Driver `-faimv` 集成，修正 prompt 精度 | 完整链路工作（含 `-faimv` 入口） |
+| 12 | 端到端联调：Pass + Driver + MCP Server + clang Driver `-faimv` fork+exec 集成（`Clang.cpp` 编译后 `fork+exec aimv-driver --from-json`，~13 行 C++），修正 prompt 精度 | 完整链路工作（含 `-faimv` 端到端入口） |
 | 13 | 依赖分析 benchmark 集（dep_fail_alias, dep_fail_stride），验证端到端成功率 | benchmark 集 + 测试报告 |
 
 **MVP 交付物**（对应 SPEC §7）:
@@ -876,38 +879,26 @@ Vector cost: {diag.cost_model.vector_cost} (VF={diag.cost_model.vf})
 ```yaml
 # aimv_config.yaml — 默认配置
 # 配置优先级: 环境变量 > ~/.aimv/config（部署后） > 代码默认值
-# 环境变量: AIMV_MCP_URL, AIMV_LEVEL, AIMV_MAX_ROUNDS, AIMV_TEST_CMD
+# 环境变量: AIMV_MCP_URL, AIMV_MCP_API_KEY, AIMV_LEVEL, AIMV_MAX_ROUNDS, AIMV_TEST_CMD, AIMV_MODE
+# 注意: 顶层 key 为 mcp: / driver:（与 DRIVER_DESIGN §8.3 和 config.py 实现一致）
 
-aimv:
-  # 迭代控制
+mcp:
+  url: "http://localhost:8080"
+  api_key: ""                       # MCP API 密钥（生产环境应使用环境变量 AIMV_MCP_API_KEY）
+  timeout_seconds: 60
+  retry_count: 2
+  cache_enabled: true
+  cache_ttl_hours: 24
+
+driver:
   max_rounds: 5
-  aimv_level: "conservative"       # conservative | moderate | aggressive
-
-  # MCP 服务
-  mcp:
-    url: "http://localhost:8080"
-    timeout_seconds: 60
-    retry_count: 2
-    cache_enabled: true
-    cache_ttl_hours: 24
-
-  # 编译
-  build:
-    cc: "clang"
-    cflags: "-O2 -fsave-optimization-record -g -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize"
-    opt_record_format: "yaml"
-
-  # 验证
-  verify:
-    test_cmd: ""                  # 空 = 仅编译验证，跳过测试；设为 "make test" 等启用测试
-    check_vectorization: true     # 检查重编译后 remark 是否变为 passed
-    measure_perf: false           # Phase 2 预留（需硬件 PMU 或计时框架）
-
-  # 输出
-  output:
-    dir: "./aimv-output"
-    keep_sessions: true
-    log_level: "info"
+  aimv_level: "conservative"        # conservative | moderate | aggressive
+  test_cmd: ""                      # 空 = 仅编译验证，跳过测试
+  cc: "clang"
+  cflags: "-O2 -g"
+  output_dir: "./aimv-output"
+  check_vectorization: true         # 检查重编译后 remark 是否变为 passed
+  measure_perf: false               # Phase 2 预留
 ```
 
 ---

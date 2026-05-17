@@ -45,7 +45,7 @@
 
 1. 目标函数内**所有循环**成功向量化即停止（`aimv-driver` 检测到该函数在最新 aimv.json 中无 `severity=="missed"` 的诊断记录）
 2. 到达最大迭代轮次上限（默认 5 轮，可配置）
-3. 收益不增时回滚（编译期判定：新 patch 后 `LoopVectorize` passed remark 数量减少则回滚。运行期性能验证（`aimv-bench`）为 Phase 2 预留功能，不在 MVP 闭环内）
+3. 收益退化时回滚（编译期判定：新 patch 后 `LoopVectorize` passed remark 数量**减少**则回滚。持平不触发回滚。运行期性能验证（`aimv-bench`）为 Phase 2 预留功能，不在 MVP 闭环内）
 
 ---
 
@@ -123,15 +123,17 @@ Round 1-N (aimv-driver 内部，BuildOrchestrator 调用 clang):
 
 **作用范围**：AIMV 仅修改 `.c` / `.cpp` 源文件，不修改头文件（`.h` / `.hpp`）。头文件中的 `static inline` 函数或宏展开导致的向量化失败不在 MVP 处理范围内。
 
-**配置来源**：
+**配置来源**（与 DRIVER_DESIGN §8.1 一致）：
 
 `aimv-driver --from-json` 模式下，运行参数按以下优先级加载：
 
-1. `~/.aimv/config`（YAML，用户全局配置）
-2. 环境变量覆盖：`AIMV_MCP_URL`、`AIMV_MCP_API_KEY`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`、`AIMV_MODE`（`review`/`dry-run`/`off`）
-3. aimv.json 内无配置字段，仅包含诊断数据
+1. 环境变量（最高优先级）：`AIMV_MCP_URL`、`AIMV_MCP_API_KEY`、`AIMV_LEVEL`、`AIMV_MAX_ROUNDS`、`AIMV_TEST_CMD`、`AIMV_MODE`（`review`/`dry-run`/`off`）
+2. `~/.aimv/config`（YAML，用户全局配置）
+3. 默认值
 
-默认值：`aimv_level=conservative`（Driver 自动模式和 `aimv-driver` 独立模式统一。全自动场景下保守修改是安全基线，用户可通过配置提升）、`max_rounds=5`、`mcp_url=http://localhost:8080`、`test_cmd=""`（空则跳过测试，仅做编译验证）。
+aimv.json 内无配置字段，仅包含诊断数据。
+
+默认值：`aimv_level=conservative`（Driver 自动模式和 `aimv-driver` 独立模式统一。全自动场景下保守修改是安全基线，用户可通过环境变量或配置提升）、`max_rounds=5`、`mcp_url=http://localhost:8080`、`test_cmd=""`（空则跳过测试，仅做编译验证）。
 
 **并发安全与数据竞争防护**：
 
@@ -182,7 +184,7 @@ Round N 完整时序（锁仅覆盖文件 I/O 阶段）:
 [AIMV] process_task: vectorized (2 rounds, conservative)
 [AIMV]   Round 1: added restrict to parameter 'a' (line 1)
 [AIMV]   Patch: /home/user/task.c.aimv.patch
-[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+[AIMV]   Report: /home/user/aimv-output/aimv-a1b2c3d4e5f6.json
 
 # 多函数混合结果：
 [AIMV] task.c: 3 functions analyzed, 2 optimized, 1 skipped
@@ -190,12 +192,12 @@ Round N 完整时序（锁仅覆盖文件 I/O 阶段）:
 [AIMV]   filter_data:  vectorized (1 round, moderate)
 [AIMV]   init_buf:     already vectorized (skipped)
 [AIMV]   Patch: /home/user/task.c.aimv.patch
-[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+[AIMV]   Report: /home/user/aimv-output/aimv-a1b2c3d4e5f6.json
 
 # 放弃场景：
 [AIMV] process_task: unable to vectorize (3 rounds exhausted)
 [AIMV]   Source rolled back to original
-[AIMV]   Report: /home/user/aimv-output/session_20260515_143022.json
+[AIMV]   Report: /home/user/aimv-output/aimv-a1b2c3d4e5f6.json
 ```
 
 **追溯产物**（均由 aimv-driver 生成）：
@@ -260,7 +262,7 @@ AI 建议 ──▶ 开发者 review ──▶ 编译验证 ──▶ 测试套�
 
 - 每轮只建议**一个局部变更**，生成带解释的 diff
 - 编译通过 + 原测试套件全绿（测试命令通过 `AIMV_TEST_CMD` 环境变量或 `~/.aimv/config` 指定；未配置时仅做编译验证，跳过测试步骤）
-- **Alive2 语义验证**（推荐启用，MVP 阶段至少对 restrict/alias 类变更验证）:
+- **Alive2 语义验证**（Phase 2 预留，MVP 阶段不集成。MVP 仅依赖编译验证+测试套件两层保障）:
   - 编译优化前后 IR → `alive-tv <old.ll> <new.ll>`
   - 仅验证变更函数，不跑全量 IR
   - Alive2 超时（>30s per function）则跳过 + 标记 "unverified"
@@ -286,10 +288,11 @@ POST /api/v1/analyze-vectorization
 Content-Type: application/json
 
 {
-  "request_id": "uuid",
+  "request_id": "aimv-a1b2c3d4e5f6",
   "target": {
     "triple": "armv7-unknown-linux-gnueabi",
     "cpu": "cortex-a9",
+    "features": ["neon", "vfp4"],
     "vector_width": 128
   },
   "function": {
@@ -305,10 +308,12 @@ Content-Type: application/json
       "remark_id": "CantReorderMemOps",
       "remark_text": "loop not vectorized: unsafe dependent memory operations in loop",
       "severity": "missed",
-      "cost_model": { "scalar_cost": 24, "vector_cost": 38, "vf": 4, "interleave_count": 1 },
-      "dependencies": [...],
+      "function_name": "process_task",
+      "loop_location": "task.c:42:5",
       "source_context": "...",
-      "ir_snippet": "..."
+      "ir_snippet": "...",
+      "cost_model": { "scalar_cost": 24, "vector_cost": 38, "vf": 4, "interleave_count": 1 },
+      "dependencies": [...]
     }
   ],
   "history": [
@@ -318,7 +323,9 @@ Content-Type: application/json
       "suggestion_applied": "added restrict to parameter 'a'",
       "outcome": "compile_passed, vectorization_still_failed"
     }
-  ]
+  ],
+  "aimv_level": "conservative"
+}
 }
 ```
 
