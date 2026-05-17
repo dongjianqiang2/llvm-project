@@ -264,6 +264,9 @@ jobs:
           pip install aimv-driver
           # 或从源码安装: pip install -e ./aimv/driver
 
+          # 验证 aimv-driver 可用（clang -faimv 会 fork+exec 此工具）
+          which aimv-driver || (echo "ERROR: aimv-driver not found in PATH" && exit 1)
+
       - name: Build LLVM+Clang (with AIMV Pass)
         run: |
           mkdir -p build && cd build
@@ -274,6 +277,9 @@ jobs:
             -DLLVM_ENABLE_PROJECTS="clang" \
             -DLLVM_TARGETS_TO_BUILD="ARM;AArch64"
           ninja clang opt
+        # 注: 完整 LLVM 构建耗时较长（30-60 分钟）。
+        # 生产 CI 应使用预构建的 Docker 镜像（含已编译的 clang+opt+aimv-driver），
+        # 或将此步骤移到独立的构建流水线中，通过 artifact/cache 传递编译产物。
 
       - name: Build baseline (AOT)
         run: |
@@ -908,9 +914,9 @@ for i in $(seq 1 $RUNS); do
     aimv_times+=("$t_aimv")
 done
 
-# 计算中位数
-median_base=$(printf '%s\n' "${baseline_times[@]}" | sort -n | awk 'NR==6{print}')
-median_aimv=$(printf '%s\n' "${aimv_times[@]}" | sort -n | awk 'NR==6{print}')
+# 计算中位数（动态计算中间位置，而非硬编码 NR==6）
+median_base=$(printf '%s\n' "${baseline_times[@]}" | sort -n | awk '{a[NR]=$0} END{print a[int(NR/2)+1]}')
+median_aimv=$(printf '%s\n' "${aimv_times[@]}" | sort -n | awk '{a[NR]=$0} END{print a[int(NR/2)+1]}')
 
 # 计算改善百分比
 improvement=$(echo "scale=2; ($median_base - $median_aimv) / $median_base * 100" | bc)

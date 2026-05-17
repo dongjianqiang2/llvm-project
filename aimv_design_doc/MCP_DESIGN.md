@@ -507,7 +507,7 @@ Do not include any text outside the JSON.
 | Scalar cost | {{ diag.cost_model.scalar_cost }} |
 | Vector cost (VF={{ diag.cost_model.vf }}) | {{ diag.cost_model.vector_cost }} |
 | Interleave count | {{ diag.cost_model.interleave_count }} |
-| Cost ratio | {{ "%.1f"|format(diag.cost_model.vector_cost / max(diag.cost_model.scalar_cost, 1)) }}x |
+| Cost ratio | {{ "%.1f"|format(diag.cost_model.vector_cost / [diag.cost_model.scalar_cost, 1] | max) }}x |
 
 {% if diag.cost_model.scalar_cost < diag.cost_model.vector_cost %}
 **Key insight:** Vector cost ({{ diag.cost_model.vector_cost }}) > scalar cost ({{ diag.cost_model.scalar_cost }}). The cost model estimates vectorization is NOT profitable.
@@ -627,7 +627,11 @@ def compute_diagnostic_fingerprint(request: AnalyzeRequest) -> str:
 # 严格模式 (strict): fingerprint 含 source_code_sha256 + history
 #   - 适用场景: 同一函数的多轮迭代去重
 #     （源码未变 + 相同诊断 + 相同历史 → 复用建议）
-#   - 缺点: 迭代中源码每轮变更，缓存命中率低
+#   - 缺点: 迭代中源码每轮变更、history 每轮增长，
+#     导致严格模式下几乎每轮都是 cache miss。
+#     这是可接受的——MCP 的缓存主要收益来自宽松模式的跨函数复用。
+#   - 建议: 对迭代场景（同一 session 内的多轮）禁用严格模式缓存，
+#     仅在首次查询（history 为空）时缓存。
 #
 # 宽松模式 (relaxed): fingerprint 不含 source_code/history (仅按 target+diagnostics)
 #   - 适用场景: 跨函数相似诊断模式复用（不同函数遇相同向量化失败模式）

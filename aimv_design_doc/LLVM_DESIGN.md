@@ -45,7 +45,7 @@ LoopVectorize::processLoop()
 
 **设计**: `emitAIMVDiagnostic()` **无条件写入** `!aimv.diag`，由 `AIMVFeedbackPass` 控制是否消费。
 
-**实测验证**: `getLLVMRemarkStreamer()` 在 opt/clang 不同管道路径中返回值不一致（某些配置下 remark 正常输出但 streamer 为空），因此在 `emitAIMVDiagnostic()` 中移除了 streamer 检查。metadata 写入的开销极小（几个 MDNode），即使 AIMV 未启用也不影响性能。
+**设计决策理由**: CLAUDE.md 中的 LLVM 21 API 笔记记录了早期方案中检查 `getLLVMRemarkStreamer()` 的设计，但经评估后改为无条件写入。原因：(1) `getLLVMRemarkStreamer()` 在 opt/clang 不同管道路径中返回值不一致（某些配置下 remark 正常输出但 streamer 为空），不可靠；(2) metadata 写入的开销极小（几个 MDNode），即使 AIMV 未启用也不影响编译性能；(3) 将控制点从"写入侧"移到"消费侧"（AIMVFeedbackPass 的 EnabledFlag + OutputPath）更简单可靠。
 
 | 组件 | 行为 |
 |------|------|
@@ -256,6 +256,8 @@ void emitAIMVDiagnostic(
 
 **上下文**: CM 可用，SE 从 PSE 获取，`Checks.getCost()` 返回 `InstructionCost` 可能 Invalid 需判空，`RtCheckCount` 使用 `getNumRuntimePointerChecks()`（PtrRtChecking 始终已初始化）。
 
+> **实施期注意**: `LVL.getLAI()` 的实际返回类型（指针 `const LoopAccessInfo*` vs 引用 vs optional）需在实施期确认 LLVM 21 的 `LoopVectorizationLegality` 定义。所有插入点中的 `LVL.getLAI()` 调用假设返回指针类型；若返回引用，需去掉指针取地址操作。
+
 #### 插入点 T1.4: `VectorizationNotBeneficial` -- 代价模型拒绝
 
 当 `VF.Width.isScalar()` 时，代价模型判定向量化不划算。此处同时发出 VectorizationNotBeneficial 和 InterleavingNotBeneficial 两个 remark。
@@ -460,7 +462,9 @@ Function Pass 对每个函数独立运行。同一 Module 的 `!aimv.diag` 会�
 
 ```cpp
 // [AIMV] 缓存 parseDiagnostics() 结果，避免多函数重复解析
-// static 缓存对当前单线程 pass manager 安全
+// static 缓存对当前单线程 pass manager 安全。
+// 注意: 若未来 LLVM 的 new PM 启用多线程 pass 执行，
+//       需改用 ModuleAnalysisManager 的 AnalysisResult 缓存机制。
 static Module *CachedModule = nullptr;
 static std::unique_ptr<std::vector<RawDiagnostic>> CachedDiags;
 
@@ -585,8 +589,8 @@ static std::string inferSeverity(const std::string &RemarkID) {
   "request_id": "aimv-<module_id>-<func_name_hash>",
   "target": {
     "triple": "armv7-unknown-linux-gnueabi",
-    "cpu": "",
-    "features": [],
+    "cpu": "cortex-a9",
+    "features": ["neon", "vfp3"],
     "vector_width": 128
   },
   "diagnostics": [
@@ -699,6 +703,8 @@ if (Args.hasFlag(options::OPT_faimv, options::OPT_fno_aimv, false)) {
 ### 4.4 fork+exec aimv-driver
 
 编译完成（`CC1Command` 执行完毕）后，若 `-faimv` 生效，执行 `aimv-driver`：
+
+> **实施期注意**: 以下代码为理想化逻辑。fork+exec 的精确插入点需在实施期根据 clang Driver 的实际架构确定——可能位于 `Driver::ExecuteCompilation()`、`CC1Command::Execute()` 的后置钩子、或通过自定义 `Command` 子类实现。此处展示的是功能语义，不是最终插入位置。
 
 ```cpp
 // [AIMV] 编译完成后 fork+exec aimv-driver
@@ -1039,9 +1045,11 @@ clang/test/Driver/
 
 以下设计点已在当前实现中留有占位或简化处理，需在后续迭代中完善：
 
-### 12.1 源码反向映射（source_context）
+> **优先级说明**: §12.1 和 §12.2 的 `source_context` / `ir_snippet` 直接影响 MCP Server 的 AI 分析质量——空字段意味着 LLM 缺少关键上下文信息。建议在 MVP 阶段就实现基础版本的源码映射和 IR 提取，即使行号精度不够（可标记 `"source_accuracy": "approximate"`）。§12.3-§12.5 可延后到 Phase 2。
 
-当前 `source_context` 字段输出为空字符串。完整实现需要：
+### 12.1 源码反向映射（source_context）**[高优先级]**
+
+当前 `source_context` 字段输出为空字符串。空字段意味着 MCP 的 AI 分析缺少最关键的源码上下文，直接影响建议质量。完整实现需要：
 - `!dbg` metadata -> `DILocation::getLine()` (最精确)
 - `DILocation::getScope()` -> `DISubprogram` (函数级匹配)
 - 循环 header 的 DebugLoc (循环级粗略匹配)
@@ -1049,9 +1057,9 @@ clang/test/Driver/
 
 回退到第 3/4 级时，诊断 JSON 中增加 `"source_accuracy": "approximate"` 标记。
 
-### 12.2 IR 片段提取（ir_snippet）
+### 12.2 IR 片段提取（ir_snippet）**[高优先级]**
 
-当前 `ir_snippet` 字段输出为空字符串。实现需要：
+当前 `ir_snippet` 字段输出为空字符串。与 source_context 相同，空 ir_snippet 严重削弱 AI 分析能力。实现需要：
 - 在 LoopInfo 中按位置匹配对应的 `Loop*`
 - 从 `Loop*` 的 blocks 提取 IR 指令文本
 - 截取适当长度（建议 500-1000 字符，避免 token 浪费）

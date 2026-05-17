@@ -110,6 +110,10 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
     import sys
 
     # Step 1: 读取 aimv.json
+    # 注: aimv.json 是首轮编译由 AIMVFeedbackPass 产出的完整诊断文件。
+    #     后续轮次中 BuildOrchestrator 会重新编译并产出新的 JSON 到独立路径
+    #     (aimv-<func>-r<N>.json)，首轮的 aimv.json 不变。
+    #     Driver 每轮从新的 JSON 文件读取最新诊断。
     with open(aimv_json_path) as f:
         aimv_data = json.load(f)
 
@@ -388,6 +392,11 @@ class SessionRecord:
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     cli_command: str = ""
+
+    # 注: SessionRecord 包含 PLAN §3.2 中未定义的扩展字段
+    #     (pristine_backup_path, final_patch_path, total_elapsed_ms, cli_command)。
+    #     这些字段为 Driver 内部使用，不参与 MCP 通信。
+    #     PLAN 的 SessionRecord 是最小核心模型，Driver 实现可扩展。
 ```
 
 ---
@@ -593,7 +602,11 @@ class SourceManager:
          a. cp source → source.aimv-tmp（基于当前版本快照）
          b. diff 基于快照生成
          c. patch source.aimv-tmp（在影子上修改）
-         d. clang -c source.aimv-tmp（编译验证，原文件不受影响）
+         d. clang -c source.aimv-tmp -mllvm -aimv-enable ...（编译验证）
+            注意: 影子文件名 source.c.aimv-tmp 需在编译时正确处理:
+              - -mllvm -aimv-output 指向独立的 JSON 路径（非原 aimv.json）
+              - 编译器基于文件扩展名（.c）识别语言，aimv-tmp 后缀不影响
+              - 若编译器对文件名敏感，可使用 -x c 显式指定语言
          e. 通过 → mv source.aimv-tmp source（rename(2) 原子替换）
             失败 → rm source.aimv-tmp
       3. [释放锁]
@@ -968,6 +981,7 @@ class IterationEngine:
     """
 
     def __init__(self, initial_level: str = "conservative", max_rounds: int = 5):
+        # 参数命名与 DriverConfig 一致: aimv_level → initial_level, max_rounds
         self.initial_level = initial_level
         self.current_level = initial_level
         self.max_rounds = max_rounds
@@ -1496,7 +1510,10 @@ def process_single_function(
             finally:
                 sources.release_lock(source_file)
 
-            # 持久化
+            # 持久化（锁外，不阻塞文件 I/O）
+            # 注意: session 对象在多函数间共享，此处保存的是整个 session 的当前状态。
+            # 对于多函数场景，每个函数完成后都会保存一次（N 函数最多 N 次 save）。
+            # 如果 session JSON 较大，可考虑每函数完成后再 save，而非每轮 save。
             store.save(session)
 
             # 轮次判定

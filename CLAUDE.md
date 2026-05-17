@@ -67,6 +67,10 @@ int cost = IC.isValid() ? (int)IC.getValue() : -1;  // getValue() asserts if Inv
 
 // Remark Streamer: -fsave-optimization-record sets BOTH getLLVMRemarkStreamer()
 // AND getMainRemarkStreamer(). Checking the former is sufficient.
+// NOTE: emitAIMVDiagnostic() does NOT check the streamer — it writes
+// unconditionally to !aimv.diag. The consumer (AIMVFeedbackPass) controls
+// activation via EnabledFlag + OutputPath. This avoids streamer inconsistency
+// across opt/clang pipelines. See LLVM_DESIGN.md §1.2.
 
 // MemoryDepChecker::getDependences() returns const SmallVectorImpl<Dependence>*
 // — must null-check before iterating.
