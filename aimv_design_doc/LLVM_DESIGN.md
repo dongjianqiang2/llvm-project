@@ -812,7 +812,7 @@ Pass 内部通过 `EnabledFlag`/`OutputPath` 检查决定是否实际执行，�
 ### 5.3 与现有 Remark 基础设施的关系
 
 ```
-clang -O2 -fsave-optimization-record=opt.yaml -aimv-output=aimv.json src.c
+clang -O2 -faimv -fsave-optimization-record=opt.yaml -aimv-output=aimv.json src.c
 
        +----------------------------------------+
        |         Pass Pipeline                  |
@@ -911,7 +911,6 @@ clang -O2 -faimv -c src/task.c -o task.o
 
 # opt 调试：手动传 LLVM 后端
 opt -passes="loop-vectorize,aimv-feedback" \
-    -fsave-optimization-record=json \
     -aimv-output=aimv.json -aimv-enable \
     -S src.ll -o /dev/null
 
@@ -997,7 +996,7 @@ llvm/test/Transforms/AIMV/
 ### 11.2 测试 Pattern
 
 ```llvm
-; RUN: opt -passes="loop-vectorize,aimv-feedback" -fsave-optimization-record=json -aimv-output=%t.json -aimv-enable -S < %s
+; RUN: opt -passes="loop-vectorize,aimv-feedback" -pass-remarks-output=%t.yaml -pass-remarks-missed=loop-vectorize -aimv-output=%t.json -aimv-enable -S < %s
 ; RUN: FileCheck %s -check-prefix=JSON < %t.json
 
 ; JSON: "pass_name": "LoopVectorize"
