@@ -1,7 +1,5 @@
 # [AIMV] MCP Server — Mock LLM Backend (offline testing, no real LLM needed)
-import os
 import re
-from typing import Optional
 
 from .base import AbstractLLMBackend
 from ..models import (
@@ -26,6 +24,33 @@ PATTERN_SUGGESTIONS = {
         "estimated_impact": "medium",
         "safety_concern": "Ensure the dependency is truly spurious before adding restrict.",
     },
+    "VectorizationNotBeneficial": {
+        "description": "Add #pragma clang loop vectorize(enable) to override cost model",
+        "reasoning": "The cost model estimates vectorization is not profitable. "
+                     "A pragma override forces the compiler to vectorize, which may "
+                     "be beneficial when trip counts are larger than the model assumes.",
+        "estimated_impact": "medium",
+        "safety_concern": "Forcing vectorization when the cost model rejects it "
+                          "may degrade performance for small trip counts.",
+    },
+    "InterleavingNotBeneficial": {
+        "description": "Add #pragma clang loop vectorize(enable) to override cost model",
+        "reasoning": "Interleaving was rejected by the cost model. "
+                     "A pragma override can enable vectorization.",
+        "estimated_impact": "low",
+        "safety_concern": "Same as VectorizationNotBeneficial — may hurt small trip counts.",
+    },
+}
+
+# Alignment-based pattern: triggered when max_alignment <= 1
+ALIGN_SUGGESTION = {
+    "description": "Add alignas(16) to pointer targets or use __builtin_assume_aligned",
+    "reasoning": "Unknown or zero alignment prevents the compiler from using "
+                 "aligned vector load/store instructions. Adding alignment hints "
+                 "enables more efficient vector code generation.",
+    "estimated_impact": "high",
+    "safety_concern": "alignas and __builtin_assume_aligned require the memory "
+                      "to actually be aligned at runtime. Misaligned access is undefined behavior.",
 }
 
 
@@ -52,6 +77,9 @@ class MockLLMBackend(AbstractLLMBackend):
             if remark_id in PATTERN_SUGGESTIONS:
                 pattern = PATTERN_SUGGESTIONS[remark_id]
                 suggestion = self._build_suggestion(request, diag, pattern)
+                suggestions.append(suggestion)
+            elif diag.memory_info and diag.memory_info.max_alignment <= 1:
+                suggestion = self._build_suggestion(request, diag, ALIGN_SUGGESTION)
                 suggestions.append(suggestion)
 
         if not suggestions:
@@ -85,31 +113,34 @@ class MockLLMBackend(AbstractLLMBackend):
         if loop_line < 1 or loop_line > len(lines):
             loop_line = 1
 
-        # Find the function signature line (first line with the function name)
-        func_line_idx = 0
+        # Find the for-loop line (contains 'for')
+        loop_line_idx = loop_line - 1
         for i, line in enumerate(lines):
-            if request.function.name in line:
-                func_line_idx = i
+            stripped = line.strip()
+            if stripped.startswith("for "):
+                loop_line_idx = i
                 break
 
-        func_line = lines[func_line_idx] if func_line_idx < len(lines) else ""
-        line_start = func_line_idx + 1
-        line_end = func_line_idx + 1
-
-        # Try to add restrict to pointer parameters
-        modified = self._add_restrict(func_line)
-        if modified == func_line:
-            # Fallback: add comment to target line
-            target_line = lines[loop_line - 1] if loop_line <= len(lines) else ""
-            modified = f"{target_line} /* AIMV: {pattern['description']} */"
-            line_start = loop_line
-            line_end = loop_line
-            func_line = target_line
+        # Determine modification strategy based on pattern
+        desc = pattern["description"]
+        if "pragma" in desc.lower():
+            modified, line_start, line_end, original = self._add_pragma(lines, loop_line_idx)
+        elif "alignas" in desc.lower() or "assume_aligned" in desc.lower():
+            modified, line_start, line_end, original = self._add_alignas(lines, loop_line_idx)
+        elif "restrict" in desc.lower():
+            modified, line_start, line_end, original = self._add_restrict_to_func(lines, request.function.name)
+        else:
+            # Generic fallback: add comment
+            target_line = lines[loop_line_idx]
+            modified = f"{target_line} /* AIMV: {desc} */"
+            line_start = loop_line_idx + 1
+            line_end = loop_line_idx + 1
+            original = target_line
 
         diff = (
             f"--- a/{source_file}\n+++ b/{source_file}\n"
             f"@@ -{line_start},{line_end - line_start + 1} +{line_start},{line_end - line_start + 1} @@\n"
-            f"-{func_line}\n+{modified}\n"
+            f"-{original}\n+{modified}\n"
         )
 
         return Suggestion(
@@ -118,7 +149,7 @@ class MockLLMBackend(AbstractLLMBackend):
             source_file=source_file,
             line_start=line_start,
             line_end=line_end,
-            original=func_line,
+            original=original,
             modified=modified,
             diff=diff,
             estimated_impact=pattern.get("estimated_impact", "medium"),
@@ -126,16 +157,57 @@ class MockLLMBackend(AbstractLLMBackend):
         )
 
     @staticmethod
-    def _add_restrict(line: str) -> str:
-        """Try to add restrict to first pointer parameter in a line."""
-        # Match patterns like "int *a" or "float *b"
+    def _add_pragma(lines, loop_line_idx):
+        """Add #pragma clang loop vectorize(enable) before the for-loop."""
+        indent = len(lines[loop_line_idx]) - len(lines[loop_line_idx].lstrip())
+        pragma_line = " " * indent + "#pragma clang loop vectorize(enable)"
+        modified = pragma_line + "\n" + lines[loop_line_idx]
+        line_start = loop_line_idx + 1
+        line_end = loop_line_idx + 1
+        original = lines[loop_line_idx]
+        return modified, line_start, line_end, original
+
+    @staticmethod
+    def _add_alignas(lines, loop_line_idx):
+        """Add __builtin_assume_aligned before the for-loop."""
+        # Find pointer declarations before the loop
+        for i in range(loop_line_idx - 1, -1, -1):
+            if "*" in lines[i] and ("char" in lines[i] or "void" in lines[i] or "int" in lines[i]):
+                # Add assume_aligned after the declaration line
+                modified = lines[i] + "\n  src = __builtin_assume_aligned(src, 16);"
+                line_start = i + 1
+                line_end = i + 1
+                return modified, line_start, line_end, lines[i]
+        # Fallback: add pragma before loop
+        indent = len(lines[loop_line_idx]) - len(lines[loop_line_idx].lstrip())
+        hint_line = " " * indent + "/* AIMV: add alignas(16) to buffer declarations */"
+        modified = hint_line + "\n" + lines[loop_line_idx]
+        line_start = loop_line_idx + 1
+        line_end = loop_line_idx + 1
+        return modified, line_start, line_end, lines[loop_line_idx]
+
+    @staticmethod
+    def _add_restrict_to_func(lines, func_name):
+        """Add restrict to first pointer parameter in function signature."""
+        func_line_idx = 0
+        for i, line in enumerate(lines):
+            if func_name in line:
+                func_line_idx = i
+                break
+
+        func_line = lines[func_line_idx] if func_line_idx < len(lines) else ""
         modified = re.sub(
             r'(\w+\s*\*\s*)(\w+)',
             r'\1restrict \2',
-            line,
+            func_line,
             count=1,
         )
-        return modified
+        line_start = func_line_idx + 1
+        line_end = func_line_idx + 1
+        if modified == func_line:
+            # No pointer parameter found; return unchanged
+            pass
+        return modified, line_start, line_end, func_line
 
 
 def create_mock_backend() -> MockLLMBackend:

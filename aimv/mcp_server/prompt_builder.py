@@ -1,5 +1,18 @@
 # [AIMV] MCP Server — Prompt builder: AnalyzeRequest → LLM prompt
+import os
 from .models import AnalyzeRequest, HistoryRecord
+
+_TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
+
+
+def _load_template(name: str) -> str:
+    path = os.path.join(_TEMPLATES_DIR, name)
+    with open(path) as f:
+        return f.read()
+
+
+_COST_REJECT_TEMPLATE = _load_template("cost_reject_prompt.txt")
+_ALIGN_TEMPLATE = _load_template("align_prompt.txt")
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert compiler engineer specializing in automatic vectorization
@@ -214,5 +227,61 @@ def build_user_prompt(request: AnalyzeRequest) -> str:
             "\n**Important:** Do NOT repeat any of the above suggestions. "
             "They have been tried and failed or did not fully resolve the issue.\n"
         )
+
+    # Scenario-specific prompt augmentation (T5.1, T5.2)
+    _append_scenario_hints(request, lines)
+
+    return "\n".join(lines)
+
+
+def _append_scenario_hints(request: AnalyzeRequest, lines: list):
+    """Append scenario-specific prompt sections based on diagnostic content."""
+    has_cost_reject = False
+    has_align_unknown = False
+
+    for diag in request.diagnostics:
+        # T5.1: cost model rejection
+        if diag.remark_id == "VectorizationNotBeneficial":
+            has_cost_reject = True
+        if diag.cost_model and diag.cost_model.scalar_cost > 0 and diag.cost_model.vector_cost > diag.cost_model.scalar_cost:
+            has_cost_reject = True
+
+        # T5.2: alignment unknown
+        if diag.remark_id in ("CantReorderMemOps", "UnsafeDep"):
+            if diag.memory_info and diag.memory_info.max_alignment <= 1:
+                has_align_unknown = True
+        if diag.memory_info and diag.memory_info.max_alignment == 0:
+            has_align_unknown = True
+
+    if has_cost_reject:
+        lines.append("## Cost Model Rejection Guidance\n")
+        for diag in request.diagnostics:
+            if diag.cost_model:
+                cm = diag.cost_model
+                lines.append(_COST_REJECT_TEMPLATE.format(
+                    scalar_cost=cm.scalar_cost,
+                    vector_cost=cm.vector_cost,
+                    vf=cm.vf or "N/A",
+                    ratio=f"{cm.vector_cost / max(cm.scalar_cost, 1):.1f}",
+                    interleave_count=cm.interleave_count,
+                ))
+                break
+        lines.append("")
+
+    if has_align_unknown:
+        lines.append("## Memory Alignment Guidance\n")
+        for diag in request.diagnostics:
+            if diag.memory_info:
+                mi = diag.memory_info
+                lines.append(_ALIGN_TEMPLATE.format(
+                    max_alignment=mi.max_alignment,
+                    stride=mi.stride,
+                    num_stores=mi.num_stores,
+                    num_loads=mi.num_loads,
+                    memory_check_count=mi.memory_check_count if mi.memory_check_count is not None else "N/A",
+                    memory_check_cost=mi.memory_check_cost if mi.memory_check_cost is not None else "N/A",
+                ))
+                break
+        lines.append("")
 
     return "\n".join(lines)
