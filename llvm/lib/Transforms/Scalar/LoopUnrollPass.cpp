@@ -1066,6 +1066,13 @@ bool llvm::computeUnrollCount(
   }
   assert(TripCount == 0 &&
          "All cases when TripCount is constant should be covered here.");
+  // [AIMV] Unroll-1: CantUnrollTripCount — trip count unknown at compile time
+  emitAIMVDiagnostic(
+      *L->getHeader()->getParent()->getParent(),
+      *L->getHeader()->getParent(), L,
+      /*LAI=*/nullptr, AIMVCostSnapshot::unknown(),
+      "LoopUnroll", "CantUnrollTripCount",
+      "loop has a runtime trip count, cannot determine unroll factor");
   if (PragmaFullUnroll) {
     ORE->emit([&]() {
       return OptimizationRemarkMissed(
@@ -1075,13 +1082,6 @@ bool llvm::computeUnrollCount(
                 "pragma "
                 "because loop has a runtime trip count.";
     });
-    // [AIMV] Unroll-1: CantUnrollTripCount
-    emitAIMVDiagnostic(
-        *L->getHeader()->getParent()->getParent(),
-        *L->getHeader()->getParent(), L,
-        /*LAI=*/nullptr, AIMVCostSnapshot::unknown(),
-        "LoopUnroll", "CantUnrollTripCount",
-        "loop has a runtime trip count, cannot determine unroll factor");
   }
 
   // 7th priority is runtime unrolling.
