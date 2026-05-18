@@ -411,13 +411,58 @@ emitAIMVDiagnostic(*Mod, *Fn, *TheLoop, this,
 
 **注意**: 不在 `reportVectorizationFailure` 路径或 early-exit 路径插入。Epilogue 向量化路径暂未添加 AIMV 诊断，可后续补充。
 
-### 2.5 SLPVectorize 改动点（可选，Phase 2）
+### 2.5 SLPVectorize 改动点（Phase 2b）
 
 **文件**: `llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp`
 
-SLP 主要处理 BB 内向量化，失败模式比 LoopVectorize 简单。暂定在 `tryToVectorize()` 返回 false 时写入，格式复用 `!aimv.diag`，pass_name = `"SLPVectorize"`。
+SLP 处理基本块内的标量指令链向量化（水平向量化）。失败模式比 LoopVectorize 简单，诊断信息粒度与 LoopVectorize 几乎完全相同——复用同一个 `!aimv.diag` 通道和 `AIMVFeedbackPass`。
 
-**初期可跳过**，MVP 聚焦 LoopVectorize。
+**SLP 4 个拒绝点**（RemarkID 从 LLVM 源码中的 `OptimizationRemarkMissed` 提取）:
+
+| 插入点 | RemarkID | 触发条件 | 上下文 |
+|--------|----------|---------|--------|
+| SLP-1 | `UnsupportedType` | 指令操作数类型不被 SIMD 支持 | `SLPVectorizer.cpp:21599`，有 `I0` (Instruction*) |
+| SLP-2 | `SmallVF` | 可向量化的指令太少 | `SLPVectorizer.cpp:21615`，有 `I0` |
+| SLP-3 | `NotBeneficial` | 打包/解包开销超过 SIMD 收益 | `SLPVectorizer.cpp:21702`，有 `I0` |
+| SLP-4 | `NotPossible` | reduction 模式不被识别 | `SLPVectorizer.cpp:21709`，有 `I0` |
+
+**与 LoopVectorize 插入点的关键差异**:
+- SLP 无 `Loop*` 对象（它操作的是 BB 内指令序列，不是循环）。`emitAIMVDiagnostic()` 的 `Loop &L` 参数需传 `nullptr` 或使用重载。
+- 无 `LVL` (LoopVectorizationLegality)，无 LAI，无 CM。代价数据和依赖分析不可用。
+- `AIMVCostSnapshot::unknown()` 适用于所有 SLP 插入点。
+
+**实现策略**:
+```cpp
+// SLP 插入点示例 (NotBeneficial):
+emitAIMVDiagnostic(
+    *I0->getFunction()->getParent(),  // Module
+    *I0->getFunction(),               // Function
+    /*Loop=*/nullptr,                 // SLP has no Loop
+    /*LAI=*/nullptr,                  // No LoopAccessInfo
+    AIMVCostSnapshot::unknown(),      // No cost model
+    "NotBeneficial",
+    "SLP vectorization is not beneficial",
+    /*SE=*/nullptr,
+    /*RtCheckCost=*/-1, /*RtCheckCount=*/-1);
+```
+
+> **注意**: 插入点行号为 LLVM 21 `release/21.x` 分支。需在实施前锁定精确行号。
+
+### 2.6 Loop Unrolling 改动点（Phase 2c）
+
+**文件**: `llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp`
+
+Loop Unrolling 既可以独立优化，也可以是向量化的前置条件（展开小循环使其达到 VF 宽度）。
+
+**Unroll 3 个关键诊断点**:
+
+| 插入点 | RemarkID | 触发条件 |
+|--------|----------|---------|
+| Unroll-1 | `CantUnrollTripCount` | trip count 不可知，无法计算展开因子 |
+| Unroll-2 | `UnrollNotBeneficial` | 展开后代码膨胀超过阈值 |
+| Unroll-3 | `UnrollTooExpensive` | 展开代价太高 |
+
+**实现策略**: 在 `LoopUnrollPass.cpp` 中已有 `OptimizationRemarkMissed` 发射点（共 28 处 ORE 引用），在这些点旁增加 `emitAIMVDiagnostic()` 调用。`pass_name="LoopUnroll"`。
 
 ---
 
