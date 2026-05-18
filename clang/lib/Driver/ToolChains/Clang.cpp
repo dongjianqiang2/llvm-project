@@ -7479,6 +7479,15 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   handleVectorizeLoopsArgs(Args, CmdArgs);
   handleVectorizeSLPArgs(Args, CmdArgs);
 
+  // [AIMV] -faimv: forward LLVM backend flags to activate AIMVFeedbackPass
+  if (Args.hasFlag(options::OPT_faimv, options::OPT_fno_aimv, false)) {
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back("-aimv-enable");
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back(Args.MakeArgString(
+        Twine("-aimv-output=") + Output.getFilename() + ".aimv.json"));
+  }
+
   StringRef VecWidth = parseMPreferVectorWidthOption(D.getDiags(), Args);
   if (!VecWidth.empty())
     CmdArgs.push_back(Args.MakeArgString("-mprefer-vector-width=" + VecWidth));

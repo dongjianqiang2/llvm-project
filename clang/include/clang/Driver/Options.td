@@ -4166,6 +4166,12 @@ def fslp_vectorize : Flag<["-"], "fslp-vectorize">, Group<f_Group>,
 def fno_slp_vectorize : Flag<["-"], "fno-slp-vectorize">, Group<f_Group>;
 def : Flag<["-"], "ftree-slp-vectorize">, Alias<fslp_vectorize>;
 def : Flag<["-"], "fno-tree-slp-vectorize">, Alias<fno_slp_vectorize>;
+
+// [AIMV] AI-driven vectorization feedback
+def faimv : Flag<["-"], "faimv">, Group<f_Group>,
+  HelpText<"Enable AIMV (AI Multi-Level Vectorization) feedback optimization">;
+def fno_aimv : Flag<["-"], "fno-aimv">, Group<f_Group>,
+  HelpText<"Disable AIMV feedback optimization">;
 }
 
 def Wlarge_by_value_copy_def : Flag<["-"], "Wlarge-by-value-copy">,
