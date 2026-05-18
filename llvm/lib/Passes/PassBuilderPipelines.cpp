@@ -1392,7 +1392,8 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
     }
   }
   // [AIMV] Collect vectorization diagnostics after LoopVectorize+SLPVectorize.
-  FPM.addPass(RequireAnalysisPass<AIMVDiagnosticAnalysis, Function>());
+  // AIMVDiagnosticAnalysis is registered as a MODULE_ANALYSIS; the pass
+  // uses a static cache fallback when no wrapping MPM proxy is available.
   FPM.addPass(AIMVFeedbackPass());
 
   // Enhance/cleanup vector code.
