@@ -8,7 +8,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from .middleware import APIKeyMiddleware, AIMVErrorHandler
-from .models import AnalyzeRequest, AnalyzeResponse
+from .models import AnalyzeRequest, AnalyzeResponse, LoopTransformRequest, LoopTransformResponse, RemarkSeverity
 from .prompt_builder import build_system_prompt, build_user_prompt
 from .suggestion_parser import parse_structured_response, SuggestionParseError
 from .cache import DiagnosticCache, compute_diagnostic_fingerprint
@@ -113,6 +113,127 @@ async def analyze_vectorization(request: Request):
 
     cache.set(fingerprint, response)
     return response.model_dump()
+
+
+@app.post("/api/v1/analyze-loop-transform")
+async def analyze_loop_transform(request: Request):
+    """T6.1: Analyze loop for transformation opportunities (interchange, fission, etc.)."""
+    try:
+        body = await request.json()
+        transform_req = LoopTransformRequest.model_validate(body)
+    except Exception as e:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": [{"msg": str(e)}]},
+        )
+
+    # Mock backend: pattern-based transform suggestions
+    if LLM_BACKEND == "mock":
+        from .llm.mock_backend import MockLLMBackend
+        mock = MockLLMBackend()
+        # Reuse analyze for the vectorization part, then add transform suggestions
+        analyze_req = AnalyzeRequest(
+            request_id=transform_req.request_id,
+            target=transform_req.target,
+            function=transform_req.function,
+            diagnostics=transform_req.diagnostics,
+            aimv_level=transform_req.aimv_level,
+        )
+        vec_resp = mock.analyze(analyze_req)
+
+        # Build loop transform suggestions
+        from .models import TransformSuggestion
+        transform_suggestions = []
+
+        # If nested loop info provided, suggest interchange
+        if transform_req.loop_nest:
+            ln = transform_req.loop_nest
+            if ln.is_row_major is False:
+                # Column-major access → interchange helps
+                source_file = transform_req.function.source_file or "source.c"
+                source_code = transform_req.function.source_code
+                lines = source_code.split("\n")
+                outer_idx = ln.outer_loop_line - 1
+                inner_idx = ln.inner_loop_line - 1
+                outer_line = lines[outer_idx] if outer_idx < len(lines) else ""
+                inner_line = lines[inner_idx] if inner_idx < len(lines) else ""
+                original = outer_line + "\n" + inner_line
+                modified = inner_line + "\n" + outer_line
+                diff = (
+                    f"--- a/{source_file}\n+++ b/{source_file}\n"
+                    f"@@ -{ln.outer_loop_line},2 +{ln.outer_loop_line},2 @@\n"
+                    f"-{original}\n+{modified}\n"
+                )
+                transform_suggestions.append(TransformSuggestion(
+                    transform_type="interchange",
+                    description="Swap outer and inner loops for unit-stride access",
+                    reasoning="Column-major memory access causes cache misses. "
+                              "Loop interchange makes the inner loop access consecutive memory.",
+                    source_file=source_file,
+                    line_start=ln.outer_loop_line,
+                    line_end=ln.inner_loop_line,
+                    original=original,
+                    modified=modified,
+                    diff=diff,
+                    estimated_impact="high",
+                    safety_concern="Loop interchange changes memory access order. "
+                                   "Verify that no dependencies are violated.",
+                ))
+
+        # If vectorization failed, check if fission could help
+        for diag in transform_req.diagnostics:
+            if diag.severity == RemarkSeverity.MISSED and diag.remark_id == "CantReorderMemOps":
+                if not transform_suggestions:
+                    source_file = transform_req.function.source_file or "source.c"
+                    transform_suggestions.append(TransformSuggestion(
+                        transform_type="distribution",
+                        description="Distribute loop to isolate vectorizable part",
+                        reasoning="Memory dependencies prevent vectorization of the whole loop. "
+                                  "Loop distribution (#pragma clang loop distribute(enable)) "
+                                  "can isolate the vectorizable portion.",
+                        source_file=source_file,
+                        line_start=transform_req.function.loop_line,
+                        line_end=transform_req.function.loop_line,
+                        original="",
+                        modified="#pragma clang loop distribute(enable)",
+                        diff=f"--- a/{source_file}\n+++ b/{source_file}\n"
+                             f"@@ -{transform_req.function.loop_line},1 +{transform_req.function.loop_line},1 @@\n"
+                             f"+#pragma clang loop distribute(enable)\n",
+                        estimated_impact="medium",
+                        safety_concern="Distribution requires no cross-iteration dependencies "
+                                       "between the distributed parts.",
+                    ))
+                break
+
+        if not transform_suggestions and vec_resp.no_action_possible:
+            return LoopTransformResponse(
+                request_id=transform_req.request_id,
+                suggestions=[],
+                overall_analysis="No loop transformation opportunities identified.",
+                confidence=1.0,
+                no_action_possible=True,
+            ).model_dump()
+
+        overall = "Mock analysis: " + "; ".join(
+            s.description for s in transform_suggestions
+        ) if transform_suggestions else vec_resp.overall_analysis
+
+        return LoopTransformResponse(
+            request_id=transform_req.request_id,
+            suggestions=transform_suggestions,
+            overall_analysis=overall,
+            confidence=0.8,
+            no_action_possible=len(transform_suggestions) == 0,
+        ).model_dump()
+
+    # Non-mock backend: delegate to LLM with loop transform template
+    return LoopTransformResponse(
+        request_id=transform_req.request_id,
+        suggestions=[],
+        overall_analysis="Loop transform analysis requires LLM backend (not yet connected).",
+        confidence=0.0,
+        no_action_possible=True,
+    ).model_dump()
 
 
 def _create_backend(backend_name: str):

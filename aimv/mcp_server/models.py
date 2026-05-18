@@ -151,3 +151,51 @@ class AnalyzeResponse(BaseModel):
     overall_analysis: str
     confidence: float = Field(..., ge=0.0, le=1.0)
     no_action_possible: bool = False
+
+
+# --- Loop Transform models (T6.1) ---
+
+
+class LoopNestInfo(BaseModel):
+    """Nested loop structure info"""
+    outer_loop_line: int = Field(..., gt=0)
+    inner_loop_line: int = Field(..., gt=0)
+    outer_trip_count: int = Field(-1, description="-1=unknown")
+    inner_trip_count: int = Field(-1, description="-1=unknown")
+    is_row_major: Optional[bool] = Field(None, description="None=undetermined")
+
+
+class LoopTransformRequest(BaseModel):
+    """POST /api/v1/analyze-loop-transform request body"""
+    request_id: str
+    target: TargetInfo
+    function: FunctionInfo
+    diagnostics: List[SingleDiagnostic] = Field(..., min_length=1)
+    loop_nest: Optional[LoopNestInfo] = None
+    aimv_level: AimvLevel = AimvLevel.CONSERVATIVE
+
+
+class TransformSuggestion(BaseModel):
+    """AI returned loop transform suggestion"""
+    transform_type: str = Field(
+        pattern=r"^(interchange|fission|fusion|unroll|unroll_and_jam|distribution)$"
+    )
+    description: str
+    reasoning: str
+    source_file: str
+    line_start: int
+    line_end: int
+    original: str
+    modified: str
+    diff: str
+    estimated_impact: str = Field(pattern=r"^(high|medium|low)$")
+    safety_concern: Optional[str] = None
+
+
+class LoopTransformResponse(BaseModel):
+    """POST /api/v1/analyze-loop-transform response body"""
+    request_id: str
+    suggestions: List[TransformSuggestion] = []
+    overall_analysis: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    no_action_possible: bool = False

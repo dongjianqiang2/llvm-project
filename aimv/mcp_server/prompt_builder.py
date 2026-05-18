@@ -13,6 +13,7 @@ def _load_template(name: str) -> str:
 
 _COST_REJECT_TEMPLATE = _load_template("cost_reject_prompt.txt")
 _ALIGN_TEMPLATE = _load_template("align_prompt.txt")
+_LOOP_TRANSFORM_TEMPLATE = _load_template("loop_transform_prompt.txt")
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert compiler engineer specializing in automatic vectorization
@@ -283,5 +284,39 @@ def _append_scenario_hints(request: AnalyzeRequest, lines: list):
                 ))
                 break
         lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_loop_transform_prompt(request) -> str:
+    """T6.2: Build prompt for loop transform analysis."""
+    lines = []
+
+    f = request.function
+    lines.append("## Loop Transform Analysis\n")
+    lines.append(f"**Function:** `{f.name}` (`{f.signature}`)")
+    lines.append(f"**File:** `{f.source_file}`, line {f.loop_line}\n")
+    lines.append("### Source Code\n")
+    lines.append("```c")
+    lines.append(f.source_code)
+    lines.append("```\n")
+
+    if request.loop_nest:
+        ln = request.loop_nest
+        lines.append("### Loop Nest Structure\n")
+        lines.append(f"- Outer loop: line {ln.outer_loop_line} (trip count: {ln.outer_trip_count if ln.outer_trip_count >= 0 else 'unknown'})")
+        lines.append(f"- Inner loop: line {ln.inner_loop_line} (trip count: {ln.inner_trip_count if ln.inner_trip_count >= 0 else 'unknown'})")
+        if ln.is_row_major is not None:
+            access = "row-major" if ln.is_row_major else "column-major"
+            lines.append(f"- Access pattern: {access}")
+        lines.append("")
+
+    for i, diag in enumerate(request.diagnostics):
+        lines.append(f"### Diagnostic #{i + 1}\n")
+        lines.append(f"**Remark ID:** {diag.remark_id}")
+        lines.append(f"**Message:** {diag.remark_text}")
+        lines.append("")
+
+    lines.append(_LOOP_TRANSFORM_TEMPLATE)
 
     return "\n".join(lines)
