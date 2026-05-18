@@ -250,13 +250,19 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
     DiagsPtr = Proxy->getCachedResult<AIMVDiagnosticAnalysis>(*M);
   }
   if (!DiagsPtr) {
-    // Standalone mode: parse directly (no wrapping FPM to pre-run the analysis)
+    // Standalone mode: parse directly (no wrapping FPM to pre-run the analysis).
+    // Track !aimv.diag operand count to invalidate cache when prior passes
+    // (SLP, LoopUnroll, etc.) add diagnostics between function invocations.
     static Module *CachedModule = nullptr;
     static std::unique_ptr<std::vector<AIMVDiagnostic>> CachedStandalone;
-    if (M != CachedModule) {
+    static unsigned CachedDiagCount = 0;
+    NamedMDNode *NMD = M->getNamedMetadata("aimv.diag");
+    unsigned CurrentCount = NMD ? NMD->getNumOperands() : 0;
+    if (M != CachedModule || CurrentCount != CachedDiagCount) {
       CachedStandalone = std::make_unique<std::vector<AIMVDiagnostic>>(
           parseDiagnostics(*M));
       CachedModule = M;
+      CachedDiagCount = CurrentCount;
     }
     DiagsPtr = CachedStandalone.get();
   }
