@@ -2,91 +2,13 @@
 import json
 import os
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
-from enum import Enum
-from typing import Optional, List
-import time
+from typing import Optional
 
-
-class DriverStatus(Enum):
-    IDLE = "idle"
-    COMPILING = "compiling"
-    ANALYZING_OPT_INFO = "analyzing_opt_info"
-    QUERYING_MCP = "querying_mcp"
-    PATCHING = "patching"
-    VERIFYING = "verifying"
-    MEASURING = "measuring"
-    SUCCESS = "success"
-    GAVE_UP = "gave_up"
-    FAILED = "failed"
-    ERROR = "error"
-
-
-class TerminationReason(Enum):
-    VECTORIZED = "vectorized"
-    ROUND_LIMIT = "round_limit"
-    NO_IMPROVEMENT = "no_improvement"
-    NO_SUGGESTION = "no_suggestion"
-    COMPILE_ERROR = "compile_error"
-    TEST_FAILURE = "test_failure"
-    INTERRUPTED = "interrupted"
-
-
-@dataclass
-class PatchRecord:
-    source_file: str
-    backup_path: str
-    diff_text: str
-    original_hash: str
-    applied_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class VectorizationStatus:
-    function_name: str
-    total_loops: int = 0
-    vectorized_loops: int = 0
-    missed_loops: int = 0
-    missed_details: List[dict] = field(default_factory=list)
-
-
-@dataclass
-class RoundRecord:
-    round_number: int
-    status: DriverStatus = DriverStatus.IDLE
-    diagnostics_json: Optional[dict] = None
-    mcp_request: Optional[dict] = None
-    mcp_response: Optional[dict] = None
-    mcp_elapsed_ms: Optional[float] = None
-    patch: Optional[PatchRecord] = None
-    vectorization_status: Optional[VectorizationStatus] = None
-    compile_success: Optional[bool] = None
-    test_success: Optional[bool] = None
-    baseline_perf_ms: Optional[float] = None
-    after_perf_ms: Optional[float] = None
-    perf_delta_pct: Optional[float] = None
-    started_at: float = field(default_factory=time.time)
-    finished_at: Optional[float] = None
-
-
-@dataclass
-class SessionRecord:
-    session_id: str = field(default_factory=lambda: f"aimv-{time.time_ns():x}")
-    function_name: str = ""
-    source_files: List[str] = field(default_factory=list)
-    aimv_level: str = "moderate"
-    max_rounds: int = 5
-    target_loop_line: Optional[str] = None
-    pristine_backup_dir: str = ""
-    rounds: List[RoundRecord] = field(default_factory=list)
-    current_round: int = 0
-    termination_reason: Optional[TerminationReason] = None
-    final_patch_path: Optional[str] = None
-    total_elapsed_ms: Optional[float] = None
-    overall_perf_improvement_pct: Optional[float] = None
-    started_at: float = field(default_factory=time.time)
-    finished_at: Optional[float] = None
-    cli_command: str = ""
+from .models import (
+    SessionRecord, RoundRecord, TerminationReason, IterationStatus,
+    BuildResult, TestResult, VectorizationStatus, PatchRecord,
+    PerFunctionResult,
+)
 
 
 class SessionStore:
@@ -116,12 +38,20 @@ class SessionStore:
                 data = json.load(f)
             sessions.append({
                 "session_id": data.get("session_id", ""),
-                "function_name": data.get("function_name", ""),
+                "function_name": _first_function_name(data),
                 "status": data.get("termination_reason", "in_progress"),
-                "rounds": len(data.get("rounds", [])),
+                "rounds": sum(
+                    len(fn.get("rounds", []))
+                    for fn in data.get("functions", [])
+                ),
                 "started_at": data.get("started_at"),
             })
         return sorted(sessions, key=lambda s: s.get("started_at", ""), reverse=True)
+
+
+def _first_function_name(data: dict) -> str:
+    fns = data.get("functions", [])
+    return fns[0].get("function_name", "") if fns else ""
 
 
 def _serialize(obj):
@@ -135,7 +65,8 @@ def _serialize(obj):
         return [_serialize(item) for item in obj]
     elif isinstance(obj, dict):
         return {k: _serialize(v) for k, v in obj.items()}
-    elif isinstance(obj, Enum):
+    elif hasattr(obj, "value"):
+        # Enum
         return obj.value
     else:
         return obj
@@ -144,12 +75,84 @@ def _serialize(obj):
 def _deserialize(data: dict) -> SessionRecord:
     session = SessionRecord()
     session.session_id = data.get("session_id", "")
-    session.function_name = data.get("function_name", "")
-    session.source_files = data.get("source_files", [])
-    session.aimv_level = data.get("aimv_level", "moderate")
+    session.source_file = data.get("source_file", "")
+    session.aimv_level = data.get("aimv_level", "conservative")
     session.max_rounds = data.get("max_rounds", 5)
-    session.target_loop_line = data.get("target_loop_line")
+    session.pristine_backup_path = data.get("pristine_backup_path", "")
+    session.cli_command = data.get("cli_command", "")
+    session.started_at = data.get("started_at", 0)
+    session.finished_at = data.get("finished_at")
+    session.total_elapsed_ms = data.get("total_elapsed_ms")
+    session.final_patch_path = data.get("final_patch_path")
+
     tr = data.get("termination_reason")
     if tr:
-        session.termination_reason = TerminationReason(tr)
+        try:
+            session.termination_reason = TerminationReason(tr)
+        except ValueError:
+            pass
+
+    # Deserialize functions list
+    for fn_data in data.get("functions", []):
+        pfr = PerFunctionResult(function_name=fn_data.get("function_name", ""))
+        pfr.vectorized = fn_data.get("vectorized", False)
+        pfr.rounds_used = fn_data.get("rounds_used", 0)
+        pfr.cross_function_regression = fn_data.get("cross_function_regression", False)
+        pfr.history = fn_data.get("history", [])
+
+        fn_tr = fn_data.get("termination_reason")
+        if fn_tr:
+            try:
+                pfr.termination_reason = TerminationReason(fn_tr)
+            except ValueError:
+                pass
+
+        for r_data in fn_data.get("rounds", []):
+            rr = _deserialize_round(r_data)
+            pfr.rounds.append(rr)
+
+        session.functions.append(pfr)
+
     return session
+
+
+def _deserialize_round(data: dict) -> RoundRecord:
+    rr = RoundRecord(round_number=data.get("round_number", 0))
+
+    status_val = data.get("status")
+    if status_val:
+        try:
+            rr.status = IterationStatus(status_val)
+        except ValueError:
+            pass
+
+    rr.diagnostics_json = data.get("diagnostics_json")
+    rr.mcp_request = data.get("mcp_request")
+    rr.mcp_response = data.get("mcp_response")
+    rr.mcp_elapsed_ms = data.get("mcp_elapsed_ms")
+    rr.suggestion_description = data.get("suggestion_description")
+    rr.applied_diff_summary = data.get("applied_diff_summary")
+    rr.started_at = data.get("started_at", 0)
+    rr.finished_at = data.get("finished_at")
+
+    br_data = data.get("build_result")
+    if br_data and isinstance(br_data, dict):
+        rr.build_result = BuildResult(**br_data)
+
+    vb_data = data.get("verify_build")
+    if vb_data and isinstance(vb_data, dict):
+        rr.verify_build = BuildResult(**vb_data)
+
+    tr_data = data.get("test_result")
+    if tr_data and isinstance(tr_data, dict):
+        rr.test_result = TestResult(**tr_data)
+
+    vs_data = data.get("vectorization_status")
+    if vs_data and isinstance(vs_data, dict):
+        rr.vectorization_status = VectorizationStatus(**vs_data)
+
+    p_data = data.get("patch")
+    if p_data and isinstance(p_data, dict):
+        rr.patch = PatchRecord(**p_data)
+
+    return rr

@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from aimv.driver.aimv_driver import (
     extract_function_source, extract_function_signature,
-    extract_loop_line, extract_lines_around,
+    extract_loop_line,
 )
 
 
@@ -76,11 +76,5 @@ class TestExtractLoopLine:
 
 
 class TestExtractLinesAround:
-    def test_extract_normal(self, c_file):
-        lines = extract_lines_around(c_file, 3, context=2)
-        assert "void foo" in lines
-
-    def test_zero_line_returns_whole_file(self, c_file):
-        lines = extract_lines_around(c_file, 0)
-        assert "void foo" in lines
-        assert "int bar" in lines
+    """extract_lines_around was removed in T3.8 rewrite. Skip these tests."""
+    pass
