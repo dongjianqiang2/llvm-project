@@ -1,32 +1,19 @@
-# aimv_config.yaml — default configuration
+# aimv_config.yaml — default configuration template
+# Priority: env vars > ~/.aimv/config > defaults
+# Env vars: AIMV_MCP_URL, AIMV_MCP_API_KEY, AIMV_LEVEL, AIMV_MAX_ROUNDS, AIMV_TEST_CMD, AIMV_MODE
 
-aimv:
-  # iteration control
+mcp:
+  url: "http://localhost:8080"
+  api_key: ""
+  timeout_seconds: 60
+  retry_count: 2
+  cache_enabled: true
+  cache_ttl_hours: 24
+
+driver:
   max_rounds: 5
-  aimv_level: "moderate"           # conservative | moderate | aggressive
-
-  # MCP service
-  mcp:
-    url: "http://localhost:8080"
-    timeout_seconds: 60
-    retry_count: 2
-    cache_enabled: true
-    cache_ttl_hours: 24
-
-  # build
-  build:
-    cc: "clang"
-    cflags: "-O2 -fsave-optimization-record -g -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize"
-    opt_record_format: "yaml"
-
-  # verification
-  verify:
-    test_cmd: "make test"
-    check_vectorization: true      # check if remark changes to passed after recompilation
-    measure_perf: false            # requires hardware PMU or timing framework
-
-  # output
-  output:
-    dir: "./aimv-output"
-    keep_sessions: true
-    log_level: "info"
+  aimv_level: "conservative"     # conservative | moderate | aggressive
+  test_cmd: ""                   # empty = compile-only verification
+  cc: "clang"
+  cflags: "-O2 -g"
+  output_dir: "./aimv-output"

@@ -1,81 +1,75 @@
 # [AIMV] AIMV Driver configuration loader
-import yaml
+# Priority: env vars > ~/.aimv/config > defaults (DRIVER_DESIGN §8.1)
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-_DEFAULT_CONFIG_PATHS = [
-    Path("aimv/config/aimv_config.yaml"),
-    Path(os.path.expanduser("~/.config/aimv/aimv_config.yaml")),
-]
+import yaml
 
 
-def _find_config(config_path: Optional[str] = None) -> Path:
-    if config_path:
-        p = Path(config_path)
-        if p.exists():
-            return p
-        raise FileNotFoundError(f"config not found: {config_path}")
-    for p in _DEFAULT_CONFIG_PATHS:
-        if p.exists():
-            return p
-    raise FileNotFoundError("no aimv_config.yaml found in default paths")
+@dataclass
+class DriverConfig:
+    mcp_url: str = "http://localhost:8080"
+    mcp_timeout: int = 60
+    mcp_api_key: str = ""
+    aimv_level: str = "conservative"
+    max_rounds: int = 5
+    test_cmd: str = ""
+    cc: str = "clang"
+    cflags: list = field(default_factory=lambda: ["-O2"])
+    output_dir: str = "./aimv-output"
+    aimv_mode: str = "auto"  # auto | review
 
 
-def load_config(config_path: Optional[str] = None) -> dict:
-    """Load and validate AIMV configuration from YAML file.
+def load_config() -> DriverConfig:
+    """Load configuration with priority: env vars > ~/.aimv/config > defaults."""
+    config = DriverConfig()
 
-    Returns a dict with defaults filled in for any missing keys.
-    """
-    path = _find_config(config_path)
-    with open(path) as f:
-        raw = yaml.safe_load(f) or {}
+    # Layer 1: ~/.aimv/config (YAML)
+    config_path = Path.home() / ".aimv" / "config"
+    if config_path.exists():
+        with open(config_path) as f:
+            file_config = yaml.safe_load(f) or {}
 
-    aimv = raw.get("aimv", {})
+        mcp_cfg = file_config.get("mcp", {})
+        driver_cfg = file_config.get("driver", {})
 
-    # Apply defaults
-    cfg = {
-        "max_rounds": aimv.get("max_rounds", 5),
-        "aimv_level": aimv.get("aimv_level", "moderate"),
-        "mcp_url": aimv.get("mcp", {}).get("url", "http://localhost:8080"),
-        "mcp_timeout_seconds": aimv.get("mcp", {}).get("timeout_seconds", 60),
-        "mcp_retry_count": aimv.get("mcp", {}).get("retry_count", 2),
-        "cache_enabled": aimv.get("mcp", {}).get("cache_enabled", True),
-        "cache_ttl_hours": aimv.get("mcp", {}).get("cache_ttl_hours", 24),
-        "cc": aimv.get("build", {}).get("cc", "clang"),
-        "cflags": aimv.get("build", {}).get(
-            "cflags",
-            "-O2 -fsave-optimization-record -g "
-            "-Rpass=loop-vectorize -Rpass-missed=loop-vectorize "
-            "-Rpass-analysis=loop-vectorize",
-        ),
-        "opt_record_format": aimv.get("build", {}).get("opt_record_format", "yaml"),
-        "test_cmd": aimv.get("verify", {}).get("test_cmd", "make test"),
-        "check_vectorization": aimv.get("verify", {}).get("check_vectorization", True),
-        "measure_perf": aimv.get("verify", {}).get("measure_perf", False),
-        "output_dir": aimv.get("output", {}).get("dir", "./aimv-output"),
-        "keep_sessions": aimv.get("output", {}).get("keep_sessions", True),
-        "log_level": aimv.get("output", {}).get("log_level", "info"),
-    }
+        if "url" in mcp_cfg:
+            config.mcp_url = mcp_cfg["url"]
+        if "api_key" in mcp_cfg:
+            config.mcp_api_key = mcp_cfg["api_key"]
+        if "timeout_seconds" in mcp_cfg:
+            config.mcp_timeout = mcp_cfg["timeout_seconds"]
+        if "max_rounds" in driver_cfg:
+            config.max_rounds = driver_cfg["max_rounds"]
+        if "aimv_level" in driver_cfg:
+            config.aimv_level = driver_cfg["aimv_level"]
+        if "test_cmd" in driver_cfg:
+            config.test_cmd = driver_cfg["test_cmd"]
+        if "cc" in driver_cfg:
+            config.cc = driver_cfg["cc"]
+        if "cflags" in driver_cfg:
+            config.cflags = driver_cfg["cflags"].split() if isinstance(driver_cfg["cflags"], str) else driver_cfg["cflags"]
 
-    _validate(cfg)
-    return cfg
+    # Layer 2: Environment variables override
+    if env_url := os.environ.get("AIMV_MCP_URL"):
+        config.mcp_url = env_url
+    if env_api_key := os.environ.get("AIMV_MCP_API_KEY"):
+        config.mcp_api_key = env_api_key
+    if env_level := os.environ.get("AIMV_LEVEL"):
+        config.aimv_level = env_level
+    if env_rounds := os.environ.get("AIMV_MAX_ROUNDS"):
+        config.max_rounds = int(env_rounds)
+    if env_test := os.environ.get("AIMV_TEST_CMD"):
+        config.test_cmd = env_test
+    if env_mode := os.environ.get("AIMV_MODE"):
+        config.aimv_mode = env_mode
 
+    # Validate (raise ValueError, not assert — python -O skips assert)
+    if config.aimv_level not in ("conservative", "moderate", "aggressive"):
+        raise ValueError(f"invalid aimv_level: {config.aimv_level}")
+    if config.max_rounds <= 0:
+        raise ValueError(f"max_rounds must be > 0: {config.max_rounds}")
 
-def _validate(cfg: dict):
-    """Validate configuration values."""
-    if not isinstance(cfg["max_rounds"], int) or cfg["max_rounds"] < 1:
-        raise ValueError(f"max_rounds must be >= 1, got {cfg['max_rounds']}")
-    if cfg["aimv_level"] not in ("conservative", "moderate", "aggressive"):
-        raise ValueError(
-            f"aimv_level must be conservative|moderate|aggressive, "
-            f"got {cfg['aimv_level']}"
-        )
-    if cfg["mcp_timeout_seconds"] < 1:
-        raise ValueError(
-            f"mcp_timeout_seconds must be >= 1, got {cfg['mcp_timeout_seconds']}"
-        )
-    if cfg["mcp_retry_count"] < 0:
-        raise ValueError(
-            f"mcp_retry_count must be >= 0, got {cfg['mcp_retry_count']}"
-        )
+    return config
