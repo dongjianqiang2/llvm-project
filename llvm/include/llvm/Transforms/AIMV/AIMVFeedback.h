@@ -29,6 +29,7 @@ public:
     std::string RemarkID;        // "CantReorderMemOps" | ...
     std::string FunctionName;
     std::string SourceLocation;  // "file.c:42:5"
+    std::string SourceAccuracy;  // "approximate" when !dbg degraded, else empty
     std::string RemarkMsg;
     int ScalarCost = -1, VectorCost = -1, VF = 0, IC = 0;
     struct DepEntry {

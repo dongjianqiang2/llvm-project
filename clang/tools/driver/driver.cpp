@@ -18,6 +18,7 @@
 #include "clang/Config/config.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/DriverDiagnostic.h"
+#include "clang/Driver/Job.h"
 #include "clang/Driver/Options.h"
 #include "clang/Driver/ToolChain.h"
 #include "clang/Frontend/ChainedDiagnosticConsumer.h"
@@ -465,5 +466,56 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
 
   // If we have multiple failing commands, we return the result of the first
   // failing command.
+
+  // [AIMV] After successful compilation, fork+exec aimv-driver for
+  // AI-driven vectorization feedback loop. Only triggers if -faimv was
+  // passed and aimv.json was produced by the LLVM backend.
+  if (Res == 0 && C && !C->containsError()) {
+    const auto &Args = C->getArgs();
+    if (Args.hasFlag(clang::driver::options::OPT_faimv,
+                     clang::driver::options::OPT_fno_aimv, false)) {
+      for (const auto &Job : C->getJobs()) {
+        const Command *Cmd = dyn_cast<Command>(&Job);
+        if (!Cmd) continue;
+        for (const std::string &OutputFile : Cmd->getOutputFilenames()) {
+          std::string AimvJsonPath = OutputFile + ".aimv.json";
+          if (!llvm::sys::fs::exists(AimvJsonPath)) continue;
+
+          auto Found = llvm::sys::findProgramByName("aimv-driver");
+          if (Found) {
+            // Get the source file from the command's input infos.
+            std::string SourceFile;
+            for (const auto &II : Cmd->getInputInfos()) {
+              if (const char *FN = II.getFilename()) {
+                SourceFile = FN;
+                break;
+              }
+            }
+            if (SourceFile.empty()) break;
+
+            std::string FullPath = Found.get();
+            SmallVector<StringRef, 4> DriverArgs;
+            DriverArgs.push_back(FullPath);
+            DriverArgs.push_back("--from-json");
+            DriverArgs.push_back(AimvJsonPath);
+            DriverArgs.push_back("--source");
+            DriverArgs.push_back(SourceFile);
+
+            int ExitCode = llvm::sys::ExecuteAndWait(FullPath, DriverArgs);
+            if (ExitCode != 0) {
+              llvm::errs() << "[AIMV] aimv-driver exited with code "
+                           << ExitCode << " (source rollback handled by driver)\n";
+              Res = ExitCode;
+            }
+          } else {
+            llvm::errs() << "[AIMV] warning: aimv-driver not found in PATH, "
+                         << "falling back to normal compilation\n";
+          }
+        }
+        break; // Only process the first compilation job
+      }
+    }
+  }
+
   return Res;
 }
