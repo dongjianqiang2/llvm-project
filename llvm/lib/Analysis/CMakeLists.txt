@@ -158,6 +158,7 @@ add_llvm_component_library(LLVMAnalysis
   ScopedNoAliasAA.cpp
   ValueLattice.cpp
   ValueLatticeUtils.cpp
+  AIMVDiagnostic.cpp
   ValueTracking.cpp
   VectorUtils.cpp
   ${GeneratedMLSources}

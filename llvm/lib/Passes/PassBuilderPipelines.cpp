@@ -1392,6 +1392,7 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
     }
   }
   // [AIMV] Collect vectorization diagnostics after LoopVectorize+SLPVectorize.
+  FPM.addPass(RequireAnalysisPass<AIMVDiagnosticAnalysis, Function>());
   FPM.addPass(AIMVFeedbackPass());
 
   // Enhance/cleanup vector code.

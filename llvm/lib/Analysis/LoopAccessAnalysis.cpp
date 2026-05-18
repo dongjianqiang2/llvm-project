@@ -12,7 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/LoopAccessAnalysis.h"
-#include "../Transforms/Vectorize/AIMVDiagnostic.h"
+#include "llvm/Analysis/AIMVDiagnostic.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -2834,8 +2834,7 @@ void LoopAccessInfo::emitUnsafeDependenceRemark() {
     Module *Mod = Fn->getParent();
     int RtChkCount = (int)getNumRuntimePointerChecks();
     emitAIMVDiagnostic(*Mod, *Fn, *TheLoop,
-                       this, /*CM=*/nullptr,
-                       ElementCount::getFixed(0), /*IC=*/0,
+                       this, AIMVCostSnapshot::unknown(),
                        "UnsafeDep", Info,
                        PSE->getSE(),
                        /*RtCheckCost=*/-1, RtChkCount);

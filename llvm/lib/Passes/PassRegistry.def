@@ -18,6 +18,7 @@
 #ifndef MODULE_ANALYSIS
 #define MODULE_ANALYSIS(NAME, CREATE_PASS)
 #endif
+MODULE_ANALYSIS("aimv-diagnostic", AIMVDiagnosticAnalysis())
 MODULE_ANALYSIS("callgraph", CallGraphAnalysis())
 MODULE_ANALYSIS("collector-metadata", CollectorMetadataAnalysis())
 MODULE_ANALYSIS("ctx-prof-analysis", CtxProfAnalysis())

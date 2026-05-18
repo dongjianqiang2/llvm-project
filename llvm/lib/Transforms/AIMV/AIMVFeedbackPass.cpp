@@ -103,7 +103,7 @@ static std::string extractSourceContext(const std::string &SourceLocation,
 // [AIMV] Find the Loop* in LoopInfo that best matches a diagnostic.
 // Matches by comparing source locations from loop header DebugLoc.
 static Loop *findMatchingLoop(LoopInfo &LI, Function &F,
-                              const AIMVFeedbackPass::RawDiagnostic &R) {
+                              const AIMVDiagnostic &R) {
   std::string DiagFile, DiagFunc;
   unsigned DiagLine = 0, DiagCol = 0;
   bool DiagHasCol = parseSourceLocation(R.SourceLocation, DiagFile, DiagLine, DiagCol);
@@ -167,7 +167,7 @@ static std::string inferSeverity(const std::string &RemarkID) {
   return "analysis";
 }
 
-static json::Object buildDiagnosticJSON(const AIMVFeedbackPass::RawDiagnostic &R,
+static json::Object buildDiagnosticJSON(const AIMVDiagnostic &R,
                                          Loop *L) {
   json::Object Diag;
   Diag["pass_name"] = R.PassName;
@@ -218,6 +218,15 @@ static json::Object buildDiagnosticJSON(const AIMVFeedbackPass::RawDiagnostic &R
 
 } // anonymous namespace
 
+// [AIMV] Module Analysis: parse !aimv.diag once per Module.
+// Result is cached by the pass manager for all function passes in the module.
+AnalysisKey AIMVDiagnosticAnalysis::Key;
+
+AIMVDiagnosticAnalysis::Result
+AIMVDiagnosticAnalysis::run(Module &M, ModuleAnalysisManager &) {
+  return AIMVFeedbackPass::parseDiagnostics(M);
+}
+
 PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();
   if (!M) return PreservedAnalyses::all();
@@ -231,21 +240,33 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
   if (!EnabledFlag || OutputPath.empty())
     return PreservedAnalyses::all();
 
-  // Parse !aimv.diag (cached per module)
-  static Module *CachedModule = nullptr;
-  static std::unique_ptr<std::vector<RawDiagnostic>> CachedDiags;
-  if (M != CachedModule) {
-    CachedDiags = std::make_unique<std::vector<RawDiagnostic>>(
-        parseDiagnostics(*M));
-    CachedModule = M;
+  // Get diagnostics via ModuleAnalysisManager proxy when available
+  // (proper pipeline), or parse directly when running standalone.
+  const std::vector<AIMVDiagnostic> *DiagsPtr = nullptr;
+  std::vector<AIMVDiagnostic> StandaloneDiags;
+  auto *Proxy =
+      AM.getCachedResult<ModuleAnalysisManagerFunctionProxy>(F);
+  if (Proxy) {
+    DiagsPtr = Proxy->getCachedResult<AIMVDiagnosticAnalysis>(*M);
+  }
+  if (!DiagsPtr) {
+    // Standalone mode: parse directly (no wrapping FPM to pre-run the analysis)
+    static Module *CachedModule = nullptr;
+    static std::unique_ptr<std::vector<AIMVDiagnostic>> CachedStandalone;
+    if (M != CachedModule) {
+      CachedStandalone = std::make_unique<std::vector<AIMVDiagnostic>>(
+          parseDiagnostics(*M));
+      CachedModule = M;
+    }
+    DiagsPtr = CachedStandalone.get();
   }
 
-  if (!CachedDiags || CachedDiags->empty())
+  if (!DiagsPtr || DiagsPtr->empty())
     return PreservedAnalyses::all();
 
   // Filter for current function
-  std::vector<RawDiagnostic> FuncDiags;
-  for (auto &R : *CachedDiags) {
+  std::vector<AIMVDiagnostic> FuncDiags;
+  for (auto &R : *DiagsPtr) {
     if (!TargetFunction.empty() && R.FunctionName != TargetFunction) continue;
     if (R.FunctionName != F.getName().str()) continue;
     FuncDiags.push_back(R);
@@ -255,10 +276,26 @@ PreservedAnalyses AIMVFeedbackPass::run(Function &F, FunctionAnalysisManager &AM
   // Build JSON
   auto &TTI = AM.getResult<TargetIRAnalysis>(F);
   auto &LI = AM.getResult<LoopAnalysis>(F);
+  // [AIMV] Extract target CPU and features from function attributes.
+  // These are set by clang -mcpu= / -mattr= / --target= flags.
+  std::string TargetCPU, TargetFeatures;
+  if (auto A = F.getFnAttribute("target-cpu"); A.isValid())
+    TargetCPU = A.getValueAsString().str();
+  if (auto A = F.getFnAttribute("target-features"); A.isValid())
+    TargetFeatures = A.getValueAsString().str();
+
   json::Object Target;
   Target["triple"] = M->getTargetTriple().str();
-  Target["cpu"] = "";
-  Target["features"] = json::Array();
+  Target["cpu"] = TargetCPU;
+  json::Array FeaturesArray;
+  // target-features is a comma-separated string like "+neon,-fp-armv8"
+  if (!TargetFeatures.empty()) {
+    SmallVector<StringRef, 8> FeatureList;
+    StringRef(TargetFeatures).split(FeatureList, ',');
+    for (auto &Ftr : FeatureList)
+      FeaturesArray.push_back(Ftr.trim().str());
+  }
+  Target["features"] = std::move(FeaturesArray);
   Target["vector_width"] = (int)TTI.getRegisterBitWidth(
       TargetTransformInfo::RGK_FixedWidthVector).getFixedValue();
 
