@@ -26,6 +26,7 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/AIMVDiagnostic.h"
 #include "llvm/Analysis/LoopUnrollAnalyzer.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
@@ -1043,6 +1044,13 @@ bool llvm::computeUnrollCount(
 
     if (UP.PartialThreshold != NoThreshold) {
       if (UP.Count == 0) {
+        // [AIMV] Unroll-2: UnrollNotBeneficial — body too large
+        emitAIMVDiagnostic(
+            *L->getHeader()->getParent()->getParent(),
+            *L->getHeader()->getParent(), L,
+            /*LAI=*/nullptr, AIMVCostSnapshot::unknown(),
+            "LoopUnroll", "UnrollNotBeneficial",
+            "unrolled loop body too large, unrolling not beneficial");
         if (PragmaEnableUnroll)
           ORE->emit([&]() {
             return OptimizationRemarkMissed(DEBUG_TYPE,
@@ -1058,7 +1066,7 @@ bool llvm::computeUnrollCount(
   }
   assert(TripCount == 0 &&
          "All cases when TripCount is constant should be covered here.");
-  if (PragmaFullUnroll)
+  if (PragmaFullUnroll) {
     ORE->emit([&]() {
       return OptimizationRemarkMissed(
                  DEBUG_TYPE, "CantFullUnrollAsDirectedRuntimeTripCount",
@@ -1067,6 +1075,14 @@ bool llvm::computeUnrollCount(
                 "pragma "
                 "because loop has a runtime trip count.";
     });
+    // [AIMV] Unroll-1: CantUnrollTripCount
+    emitAIMVDiagnostic(
+        *L->getHeader()->getParent()->getParent(),
+        *L->getHeader()->getParent(), L,
+        /*LAI=*/nullptr, AIMVCostSnapshot::unknown(),
+        "LoopUnroll", "CantUnrollTripCount",
+        "loop has a runtime trip count, cannot determine unroll factor");
+  }
 
   // 7th priority is runtime unrolling.
   // Don't unroll a runtime trip count loop when it is disabled.
@@ -1095,6 +1111,13 @@ bool llvm::computeUnrollCount(
     LLVM_DEBUG(
         dbgs() << "  will not try to unroll loop with runtime trip count "
                << "-unroll-runtime not given\n");
+    // [AIMV] Unroll-3: UnrollTooExpensive — runtime unrolling disabled
+    emitAIMVDiagnostic(
+        *L->getHeader()->getParent()->getParent(),
+        *L->getHeader()->getParent(), L,
+        /*LAI=*/nullptr, AIMVCostSnapshot::unknown(),
+        "LoopUnroll", "UnrollTooExpensive",
+        "runtime unrolling not enabled, unroll too expensive");
     UP.Count = 0;
     return false;
   }

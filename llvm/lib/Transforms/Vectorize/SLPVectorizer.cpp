@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
+#include "llvm/Analysis/AIMVDiagnostic.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PriorityQueue.h"
@@ -21600,6 +21601,13 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
                << "Cannot SLP vectorize list: type "
                << TypeStr + " is unsupported by vectorizer";
       });
+      // [AIMV] SLP-1: UnsupportedType
+      emitAIMVDiagnostic(
+          *I0->getFunction()->getParent(), *I0->getFunction(),
+          /*Loop=*/nullptr, /*LAI=*/nullptr,
+          AIMVCostSnapshot::unknown(),
+          "SLPVectorize", "UnsupportedType",
+          "type unsupported by SLP vectorizer");
       return false;
     }
   }
@@ -21617,6 +21625,13 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
              << "less than 2 is not supported";
     });
     return false;
+    // [AIMV] SLP-2: SmallVF
+    emitAIMVDiagnostic(
+        *I0->getFunction()->getParent(), *I0->getFunction(),
+        /*Loop=*/nullptr, /*LAI=*/nullptr,
+        AIMVCostSnapshot::unknown(),
+        "SLPVectorize", "SmallVF",
+        "SLP vectorization factor too small");
   }
 
   bool Changed = false;
@@ -21704,12 +21719,26 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
              << ore::NV("Cost", MinCost) << " >= "
              << ore::NV("Treshold", -SLPCostThreshold);
     });
+    // [AIMV] SLP-3: NotBeneficial
+    emitAIMVDiagnostic(
+        *I0->getFunction()->getParent(), *I0->getFunction(),
+        /*Loop=*/nullptr, /*LAI=*/nullptr,
+        AIMVCostSnapshot::unknown(),
+        "SLPVectorize", "NotBeneficial",
+        "SLP vectorization not beneficial");
   } else if (!Changed) {
     R.getORE()->emit([&]() {
       return OptimizationRemarkMissed(SV_NAME, "NotPossible", I0)
              << "Cannot SLP vectorize list: vectorization was impossible"
              << " with available vectorization factors";
     });
+    // [AIMV] SLP-4: NotPossible
+    emitAIMVDiagnostic(
+        *I0->getFunction()->getParent(), *I0->getFunction(),
+        /*Loop=*/nullptr, /*LAI=*/nullptr,
+        AIMVCostSnapshot::unknown(),
+        "SLPVectorize", "NotPossible",
+        "SLP vectorization not possible");
   }
   return Changed;
 }

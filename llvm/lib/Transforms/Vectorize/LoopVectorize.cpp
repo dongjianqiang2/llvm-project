@@ -10139,9 +10139,9 @@ bool LoopVectorizePass::processLoop(Loop *L) {
             (int)VF.Width.getKnownMinValue(), (int)IC};
         emitAIMVDiagnostic(
             *L->getHeader()->getParent()->getParent(),
-            *L->getHeader()->getParent(), *L,
+            *L->getHeader()->getParent(), L,
             LAIPtr, Cost,
-            "CantReorderMemOps",
+            "LoopVectorize", "CantReorderMemOps",
             "unsafe dependent memory operations in loop",
             SEPtr, RtCost, RtChkCount);
       }
@@ -10230,9 +10230,9 @@ bool LoopVectorizePass::processLoop(Loop *L) {
           (int)VF.Width.getKnownMinValue(), (int)IC};
       emitAIMVDiagnostic(
           *L->getHeader()->getParent()->getParent(),
-          *L->getHeader()->getParent(), *L,
+          *L->getHeader()->getParent(), L,
           LAIPtr, Cost2,
-          VecDiagMsg.first, VecDiagMsg.second,
+          "LoopVectorize", VecDiagMsg.first, VecDiagMsg.second,
           SEPtr, RtCost, RtChkCount);
     }
     ORE->emit([&]() {
@@ -10255,9 +10255,9 @@ bool LoopVectorizePass::processLoop(Loop *L) {
           (int)VF.Width.getKnownMinValue(), (int)IC};
       emitAIMVDiagnostic(
           *L->getHeader()->getParent()->getParent(),
-          *L->getHeader()->getParent(), *L,
+          *L->getHeader()->getParent(), L,
           LAIPtr, Cost3,
-          IntDiagMsg.first, IntDiagMsg.second,
+          "LoopVectorize", IntDiagMsg.first, IntDiagMsg.second,
           SEPtr, RtCost, RtChkCount);
     }
     return false;
@@ -10384,9 +10384,9 @@ bool LoopVectorizePass::processLoop(Loop *L) {
               (int)VF.Width.getKnownMinValue(), (int)IC};
           emitAIMVDiagnostic(
               *L->getHeader()->getParent()->getParent(),
-              *L->getHeader()->getParent(), *L,
+              *L->getHeader()->getParent(), L,
               LAIPtr, Cost4,
-              "LoopVectorized", VFMsg,
+              "LoopVectorize", "LoopVectorized", VFMsg,
               SEPtr, RtCost, RtChkCount);
         }
 

@@ -2833,9 +2833,9 @@ void LoopAccessInfo::emitUnsafeDependenceRemark() {
     Function *Fn = TheLoop->getHeader()->getParent();
     Module *Mod = Fn->getParent();
     int RtChkCount = (int)getNumRuntimePointerChecks();
-    emitAIMVDiagnostic(*Mod, *Fn, *TheLoop,
+    emitAIMVDiagnostic(*Mod, *Fn, TheLoop,
                        this, AIMVCostSnapshot::unknown(),
-                       "UnsafeDep", Info,
+                       "LoopVectorize", "UnsafeDep", Info,
                        PSE->getSE(),
                        /*RtCheckCost=*/-1, RtChkCount);
   }

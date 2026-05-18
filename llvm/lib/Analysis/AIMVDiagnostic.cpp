@@ -13,10 +13,10 @@
 using namespace llvm;
 
 void llvm::emitAIMVDiagnostic(
-    Module &M, Function &F, Loop &L,
+    Module &M, Function &F, Loop *L,
     const LoopAccessInfo *LAI,
     const AIMVCostSnapshot &Cost,
-    StringRef RemarkID, StringRef RemarkMsg,
+    StringRef PassName, StringRef RemarkID, StringRef RemarkMsg,
     ScalarEvolution *SE,
     int RtCheckCost,
     int RtCheckCount) {
@@ -24,20 +24,24 @@ void llvm::emitAIMVDiagnostic(
   LLVMContext &Ctx = M.getContext();
 
   // Build source_location with fallback chain:
-  //   1. DILocation (precise)
+  //   1. DILocation from Loop (precise)
   //   2. DISubprogram (function-level)
   //   3. "unknown"
-  DebugLoc StartLoc = L.getStartLoc();
   std::string SrcLoc;
-  if (StartLoc) {
-    DILocation *DIL = StartLoc.get();
-    raw_string_ostream(SrcLoc) << DIL->getFilename() << ":"
-                               << DIL->getLine() << ":" << DIL->getColumn();
-  } else if (DISubprogram *SP = F.getSubprogram()) {
-    raw_string_ostream(SrcLoc) << SP->getFilename() << ":" << SP->getLine();
-  } else {
-    SrcLoc = "unknown";
+  if (L) {
+    DebugLoc StartLoc = L->getStartLoc();
+    if (StartLoc) {
+      DILocation *DIL = StartLoc.get();
+      raw_string_ostream(SrcLoc) << DIL->getFilename() << ":"
+                                 << DIL->getLine() << ":" << DIL->getColumn();
+    }
   }
+  if (SrcLoc.empty() && F.getSubprogram()) {
+    raw_string_ostream(SrcLoc) << F.getSubprogram()->getFilename() << ":"
+                               << F.getSubprogram()->getLine();
+  }
+  if (SrcLoc.empty())
+    SrcLoc = "unknown";
 
   // --- cost_data (4 x i32) from pre-computed snapshot ---
   SmallVector<Metadata *> CostOps;
@@ -106,12 +110,14 @@ void llvm::emitAIMVDiagnostic(
     MemOps.push_back(ConstantAsMetadata::get(
         ConstantInt::get(Type::getInt32Ty(Ctx), 0))); // num_pred_stores
     unsigned MaxAlign = 0;
-    for (BasicBlock *BB : L.blocks())
-      for (Instruction &I : *BB)
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          MaxAlign = std::max(MaxAlign, (unsigned)LI->getAlign().value());
-        else if (auto *SI = dyn_cast<StoreInst>(&I))
-          MaxAlign = std::max(MaxAlign, (unsigned)SI->getAlign().value());
+    if (L) {
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (auto *LI = dyn_cast<LoadInst>(&I))
+            MaxAlign = std::max(MaxAlign, (unsigned)LI->getAlign().value());
+          else if (auto *SI = dyn_cast<StoreInst>(&I))
+            MaxAlign = std::max(MaxAlign, (unsigned)SI->getAlign().value());
+    }
     MemOps.push_back(ConstantAsMetadata::get(
         ConstantInt::get(Type::getInt32Ty(Ctx), MaxAlign)));
     bool Stride1 = (RtCheckCount == 0) &&
@@ -129,30 +135,38 @@ void llvm::emitAIMVDiagnostic(
 
   // --- loop_info (loop_name + 5 x i32) ---
   SmallVector<Metadata *> LoopOps;
-  LoopOps.push_back(MDString::get(Ctx, L.getName()));
-  LoopOps.push_back(ConstantAsMetadata::get(
-      ConstantInt::get(Type::getInt32Ty(Ctx), L.getNumBlocks())));
-  unsigned NumInsts = 0, NumBranches = 0, NumCalls = 0;
-  for (BasicBlock *BB : L.blocks()) {
-    NumInsts += BB->size();
-    for (Instruction &I : *BB) {
-      if (isa<BranchInst>(&I) || isa<SwitchInst>(&I)) NumBranches++;
-      if (isa<CallBase>(&I)) NumCalls++;
+  if (L) {
+    LoopOps.push_back(MDString::get(Ctx, L->getName()));
+    LoopOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), L->getNumBlocks())));
+    unsigned NumInsts = 0, NumBranches = 0, NumCalls = 0;
+    for (BasicBlock *BB : L->blocks()) {
+      NumInsts += BB->size();
+      for (Instruction &I : *BB) {
+        if (isa<BranchInst>(&I) || isa<SwitchInst>(&I)) NumBranches++;
+        if (isa<CallBase>(&I)) NumCalls++;
+      }
     }
+    LoopOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), NumInsts)));
+    int TripCount = SE ? (int)SE->getSmallConstantTripCount(L) : -1;
+    LoopOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), TripCount)));
+    LoopOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), NumBranches)));
+    LoopOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt32Ty(Ctx), NumCalls)));
+  } else {
+    // No Loop available (e.g. SLP Vectorizer) — fill sentinel values
+    LoopOps.push_back(MDString::get(Ctx, ""));
+    for (int i = 0; i < 5; i++)
+      LoopOps.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Ctx), -1)));
   }
-  LoopOps.push_back(ConstantAsMetadata::get(
-      ConstantInt::get(Type::getInt32Ty(Ctx), NumInsts)));
-  int TripCount = SE ? (int)SE->getSmallConstantTripCount(&L) : -1;
-  LoopOps.push_back(ConstantAsMetadata::get(
-      ConstantInt::get(Type::getInt32Ty(Ctx), TripCount)));
-  LoopOps.push_back(ConstantAsMetadata::get(
-      ConstantInt::get(Type::getInt32Ty(Ctx), NumBranches)));
-  LoopOps.push_back(ConstantAsMetadata::get(
-      ConstantInt::get(Type::getInt32Ty(Ctx), NumCalls)));
 
   // Assemble 9-operand MDNode
   MDNode *DiagNode = MDNode::get(Ctx, {
-      MDString::get(Ctx, "LoopVectorize"),   // [0] PassName
+      MDString::get(Ctx, PassName),           // [0] PassName
       MDString::get(Ctx, RemarkID),          // [1] RemarkID
       MDString::get(Ctx, F.getName()),       // [2] FunctionName
       MDString::get(Ctx, SrcLoc),            // [3] SourceLocation

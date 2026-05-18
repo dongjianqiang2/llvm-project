@@ -1,5 +1,5 @@
 // [AIMV] Public header for emitAIMVDiagnostic() and AIMVCostSnapshot.
-// Included by LoopVectorize.cpp and LoopAccessAnalysis.cpp.
+// Included by LoopVectorize, LoopAccessAnalysis, SLPVectorizer, LoopUnroll.
 #ifndef LLVM_ANALYSIS_AIMVDIAGNOSTIC_H
 #define LLVM_ANALYSIS_AIMVDIAGNOSTIC_H
 
@@ -23,13 +23,18 @@ struct AIMVCostSnapshot {
 };
 
 /// [AIMV] Emit structured diagnostics into !aimv.diag Named Metadata.
+///
 /// Always writes when called; AIMVFeedbackPass controls consumption via
 /// -mllvm -aimv-enable / -faimv. Overhead is negligible.
+///
+/// Loop* may be nullptr for non-loop passes (SLP Vectorizer).
+/// All other pointer parameters may be nullptr — the function fills
+/// default/sentinel values when information is unavailable.
 void emitAIMVDiagnostic(
-    Module &M, Function &F, Loop &L,
+    Module &M, Function &F, Loop *L,
     const LoopAccessInfo *LAI,
     const AIMVCostSnapshot &Cost,
-    StringRef RemarkID, StringRef RemarkMsg,
+    StringRef PassName, StringRef RemarkID, StringRef RemarkMsg,
     ScalarEvolution *SE = nullptr,
     int RtCheckCost = -1,
     int RtCheckCount = -1);

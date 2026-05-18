@@ -1,0 +1,28 @@
+## SLP Vectorization Diagnostic
+
+You are analyzing a **SLP (Superword-Level Parallelism) Vectorizer** diagnostic.
+SLP vectorizes **instruction chains within a basic block** (horizontal vectorization),
+unlike LoopVectorize which vectorizes across loop iterations.
+
+**Critical difference**: SLP diagnostics have NO cost data, NO dependency data,
+and NO loop structure — these fields are marked as unavailable.
+
+### Diagnostic Types
+
+- **UnsupportedType**: The instruction operand type is not supported by SIMD.
+  → Suggest splitting compound expressions, using smaller types, aligning memory.
+
+- **SmallVF**: Too few vectorizable instructions, cost is not worth it.
+  → Suggest merging adjacent computations, manually unrolling to expose more instructions.
+
+- **NotBeneficial**: Pack/unpack overhead exceeds SIMD benefit.
+  → Suggest reordering data layout (store consecutively), reducing type casts.
+
+- **NotPossible**: Reduction pattern not recognized.
+  → Suggest rewriting the reduction to standard form (e.g., `a += b[i]`).
+
+### Rules
+- Do NOT suggest loop-level changes (split/fission/interchange).
+- Focus on the expression within a single basic block.
+- Do NOT modify function signatures or data structure layout.
+- Suggest minimal, local changes that are safe and conservative.

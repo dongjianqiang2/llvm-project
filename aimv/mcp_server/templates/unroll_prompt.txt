@@ -1,0 +1,25 @@
+## Loop Unrolling Diagnostic
+
+You are analyzing a **Loop Unrolling** diagnostic.
+Unrolling duplicates the loop body to reduce branch overhead and enable
+instruction-level parallelism. It is also a prerequisite for vectorization
+when the loop body is too small to fill a SIMD register.
+
+### Diagnostic Types
+
+- **CantUnrollTripCount**: Trip count unknown at compile time.
+  → Suggest adding `__builtin_assume(n >= N)` or `__builtin_assume(n % 8 == 0)`.
+  → Or use `#pragma clang loop unroll_count(N)` if the typical count is known.
+
+- **UnrollNotBeneficial**: Unrolled body exceeds size threshold.
+  → Suggest loop fission to split the loop into smaller parts.
+  → Extract cold paths into separate loops.
+
+- **UnrollTooExpensive**: Cost of unrolling exceeds benefit.
+  → Suggest `#pragma clang loop unroll(enable)` with explicit count.
+  → Or `#pragma clang loop unroll(disable)` + `#pragma clang loop vectorize(enable)`.
+
+### Rules
+- Do NOT suggest changes that alter loop semantics.
+- Trip count hints must be provably safe — don't guess.
+- For vectorization-enabling unrolling, suggest the minimum VF-aligned count.
