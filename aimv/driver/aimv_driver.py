@@ -107,7 +107,7 @@ def build_mcp_request(
 
     loop_line = 1
     for d in diagnostics:
-        if d.get("function_name") == function_name and d.get("severity") == "missed":
+        if d.get("function_name") == function_name and d.get("severity") in ("missed", "analysis"):
             loc = d.get("loop_location", "")
             m = re.search(r":(\d+):\d+$", loc)
             if m:
@@ -134,7 +134,7 @@ def build_mcp_request(
         },
         "diagnostics": [
             d for d in diagnostics
-            if d.get("function_name") == function_name and d.get("severity") == "missed"
+            if d.get("function_name") == function_name and d.get("severity") in ("missed", "analysis")
         ],
         "history": history,
         "aimv_level": aimv_level,
@@ -287,9 +287,40 @@ def process_single_function(
                 round_rec.status = IterationStatus.SUCCESS
                 break
 
-            # Load diagnostics
+            # Load diagnostics (newline-delimited JSON: one object per function)
+            aimv_json = None
             with open(build.aimv_json_path) as f:
-                aimv_json = json.load(f)
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # Match object containing diagnostics for our function
+                    if any(d.get("function_name") == function_name
+                           for d in obj.get("diagnostics", [])):
+                        aimv_json = obj
+                        break
+                if aimv_json is None:
+                    # Fallback: use first valid JSON object
+                    f.seek(0)
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            aimv_json = json.loads(line)
+                            break
+                        except json.JSONDecodeError:
+                            continue
+            if aimv_json is None:
+                round_rec.status = IterationStatus.FAILED
+                round_rec.finished_at = time.time()
+                result.termination_reason = TerminationReason.COMPILE_ERROR
+                logger.error("No valid JSON diagnostics in %s", build.aimv_json_path)
+                break
             round_rec.diagnostics_json = aimv_json
 
             # Build MCP request
@@ -483,7 +514,7 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
     failed_functions = list(dict.fromkeys(
         d["function_name"]
         for d in diagnostics
-        if d.get("severity") == "missed"
+        if d.get("severity") in ("missed", "analysis")
     ))
 
     if not failed_functions:
@@ -516,7 +547,7 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
             source_file=source_file,
             initial_diagnostics=[
                 d for d in diagnostics
-                if d["function_name"] == func_name and d.get("severity") == "missed"
+                if d["function_name"] == func_name and d.get("severity") in ("missed", "analysis")
             ],
             config=config,
             builder=builder,
@@ -599,7 +630,7 @@ def main_independent(source_file: str, function_name: Optional[str],
         failed_functions = list(dict.fromkeys(
             d["function_name"]
             for d in diagnostics
-            if d.get("severity") == "missed"
+            if d.get("severity") in ("missed", "analysis")
         ))
 
     if not failed_functions:
@@ -626,7 +657,7 @@ def main_independent(source_file: str, function_name: Optional[str],
             source_file=source_file,
             initial_diagnostics=[
                 d for d in diagnostics
-                if d["function_name"] == func_name and d.get("severity") == "missed"
+                if d["function_name"] == func_name and d.get("severity") in ("missed", "analysis")
             ],
             config=config,
             builder=builder,

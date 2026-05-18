@@ -41,12 +41,12 @@ class DependencyInfo(BaseModel):
 
 class MemoryInfo(BaseModel):
     """Memory/alignment info"""
-    num_stores: int = Field(..., ge=0)
-    num_loads: int = Field(..., ge=0)
+    num_stores: int = Field(..., ge=-1, description="-1=unavailable (SLP/Unroll)")
+    num_loads: int = Field(..., ge=-1, description="-1=unavailable (SLP/Unroll)")
     num_pred_stores: Optional[int] = Field(
         None, description="MVP: unavailable, LAI doesn't provide. Phase 2 from LoopVectorizationLegality"
     )
-    max_alignment: int = Field(..., ge=0)
+    max_alignment: int = Field(..., ge=-1, description="-1=unavailable (SLP/Unroll)")
     stride: str
     memory_check_count: Optional[int] = Field(
         None, description="None=unavailable(legality stage); >=0=specific value"

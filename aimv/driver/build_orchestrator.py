@@ -48,7 +48,7 @@ class BuildOrchestrator:
         cmd = [self.cc]
         cmd.extend(self.cflags)
         cmd.extend([
-            "-g",
+            "-c", "-g",
             "-mllvm", "-aimv-enable",
             "-mllvm", f"-aimv-output={aimv_path}",
         ])
