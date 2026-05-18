@@ -87,14 +87,9 @@ async def analyze_vectorization(request: Request):
 
     # LLM call
     if LLM_BACKEND == "mock":
-        elapsed = (time.monotonic() - start) * 1000
-        response = AnalyzeResponse(
-            request_id=analyze_req.request_id,
-            suggestions=[],
-            overall_analysis=f"Mock backend — no LLM call performed. Response time: {elapsed:.0f}ms",
-            confidence=0.0,
-            no_action_possible=True,
-        )
+        from .llm.mock_backend import MockLLMBackend
+        mock_backend = MockLLMBackend()
+        response = mock_backend.analyze(analyze_req)
     else:
         try:
             backend = _create_backend(LLM_BACKEND)

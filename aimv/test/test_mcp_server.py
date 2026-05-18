@@ -74,7 +74,9 @@ class TestAnalyzeEndpoint:
             resp = client.post("/api/v1/analyze-vectorization", json=VALID_REQUEST_BODY)
         assert resp.status_code == 200
         data = resp.json()
-        assert data["no_action_possible"] is True
+        # MockLLMBackend recognizes CantReorderMemOps and returns a suggestion
+        assert data["no_action_possible"] is False
+        assert len(data["suggestions"]) >= 1
 
     def test_analyze_invalid_request(self):
         client = _make_client(api_key="")
