@@ -1,8 +1,9 @@
 # AIMV 实施任务分解
 
-> 基于 `aimv_design_doc/` 设计文档（v2.0 系列），按 PLAN.md 6 阶段拆分为原子任务。
+> 基于 `aimv_design_doc/` 设计文档（v2.0 系列），按 8 阶段拆分为原子任务。
 > 每个任务可独立实现、独立测试，任务间通过依赖关系串联。
 > 标注 [MVP] 的为阶段 0-4 必须完成的任务。
+> 阶段 7-8 为 Phase 2b/2c 扩展（SLP + Unrolling），复用 !aimv.diag 通道。
 
 ---
 
@@ -756,3 +757,120 @@
 
 **测试**:
 - `test_baseline_save_and_compare`: 保存 + 比较基线
+
+---
+
+## 阶段 7: SLP Vectorizer 诊断集成 (Phase 2b)
+
+### T7.1 SLP 4 个插入点
+
+**前置**: T1.2 (`emitAIMVDiagnostic` 可用，`AIMVCostSnapshot` 已定义)
+
+**目标**: 在 `SLPVectorizer.cpp` 的 4 个位置插入 `emitAIMVDiagnostic()` 调用
+
+**实现**:
+- 插入点 UnsupportedType: `tryToVectorize()` 中类型检查失败时，传 `nullptr` Loop/LAI + `AIMVCostSnapshot::unknown()`
+- 插入点 SmallVF: 可向量化指令数 < 2 时
+- 插入点 NotBeneficial: 代价分析确定打包/解包开销超过收益时
+- 插入点 NotPossible: reduction 模式不被识别时
+- `pass_name = "SLPVectorize"`
+- 所有插入点: `#include "llvm/Analysis/AIMVDiagnostic.h"`
+- SLP 无 Loop*/LAI/CM → 全部传 `nullptr` + `AIMVCostSnapshot::unknown()`
+
+**测试** (llvm-lit):
+- `test_slp_unsupported_type.ll`: 非 SIMD 类型 → `!aimv.diag` 含 UnsupportedType
+- `test_slp_small_vf.ll`: 可向量化指令太少 → SmallVF
+- `test_slp_not_beneficial.ll`: 代价不划算 → NotBeneficial
+- `test_slp_not_possible.ll`: reduction 失败 → NotPossible
+
+---
+
+### T7.2 SLP 诊断 prompt 模板
+
+**前置**: T7.1
+
+**目标**: 新增 SLP 专用 prompt 模板 `aimv/mcp_server/templates/slp_prompt.txt`
+
+**实现**:
+- SLP 4 种诊断的语义说明（与 LoopVectorize 的区别）
+- 建议策略: 拆分复合表达式、合并相邻计算、调整数据布局、重写归约
+- 空 cost_data / dep_data 的处理（注明 "SLP 不提供代价/依赖信息"）
+
+**测试**:
+- `test_slp_prompt_unsupported_type`: 渲染 UnsupportedType → 含类型建议
+- `test_slp_prompt_small_vf`: 渲染 SmallVF → 含合并计算建议
+- `test_slp_prompt_null_fields`: cost_data/dep_data 为空 → prompt 注明不可用
+
+---
+
+### T7.3 SLP benchmark 端到端验证
+
+**前置**: T7.1, T7.2
+
+**目标**: SLP benchmark 通过 AIMV 成功向量化
+
+**实现**:
+- `aimv/benchmarks/slp_unsupported.c`: 复合类型表达式 → 拆分后 SLP 成功
+- `aimv/benchmarks/slp_reduction.c`: 非标准归约模式 → 重写后 SLP 成功
+- 验证: 编译 + 测试通过 + SLP 向量化统计改善
+
+**测试**:
+- `test_benchmark_slp_unsupported`: AIMV 全流程 → SLP 向量化成功
+- `test_benchmark_slp_reduction`: AIMV 全流程 → reduction 识别成功
+
+---
+
+## 阶段 8: Loop Unrolling 诊断集成 (Phase 2c)
+
+### T8.1 Unroll 3 个插入点
+
+**前置**: T1.2
+
+**目标**: 在 `LoopUnrollPass.cpp` 的 3 个位置插入 `emitAIMVDiagnostic()` 调用
+
+**实现**:
+- 插入点 CantUnrollTripCount: trip count 不可知时（`OptimizationRemarkMissed` 旁）
+- 插入点 UnrollNotBeneficial: 展开后代码膨胀超过阈值时
+- 插入点 UnrollTooExpensive: 展开代价太高时
+- `pass_name = "LoopUnroll"`
+- `#include "llvm/Analysis/AIMVDiagnostic.h"`
+- Unroll 有 Loop* → 可传递完整 loop_info；无 LAI/CM → 传 `nullptr` + `AIMVCostSnapshot::unknown()`
+
+**测试** (llvm-lit):
+- `test_unroll_trip_count.ll`: 可变 trip count → `!aimv.diag` 含 CantUnrollTripCount
+- `test_unroll_not_beneficial.ll`: 大循环体 → UnrollNotBeneficial
+- `test_unroll_too_expensive.ll`: 高代价 → UnrollTooExpensive
+
+---
+
+### T8.2 Unroll 诊断 prompt 模板
+
+**前置**: T8.1
+
+**目标**: 新增 Unroll 专用 prompt 模板 `aimv/mcp_server/templates/unroll_prompt.txt`
+
+**实现**:
+- Unroll 3 种诊断的语义说明
+- 建议策略: `__builtin_assume(n >= N)`、循环 fission 拆分、`#pragma clang loop unroll`
+- trip_count 信息利用: 已有 trip count 时优先建议 pragma 调整因子
+
+**测试**:
+- `test_unroll_prompt_trip_count`: 渲染 CantUnrollTripCount → 含 assume 建议
+- `test_unroll_prompt_not_beneficial`: 渲染 UnrollNotBeneficial → 含 fission 建议
+
+---
+
+### T8.3 Unroll benchmark 端到端验证
+
+**前置**: T8.1, T8.2
+
+**目标**: Unroll benchmark 通过 AIMV 改善展开决策
+
+**实现**:
+- `aimv/benchmarks/unroll_trip_unknown.c`: trip count 不可知 → assume 后 unroll 成功
+- `aimv/benchmarks/unroll_too_large.c`: 循环体过大 → fission + unroll 成功
+- 验证: 编译 + 测试通过 + 执行时间改善
+
+**测试**:
+- `test_benchmark_unroll_trip_unknown`: AIMV 全流程 → unroll 成功
+- `test_benchmark_unroll_too_large`: AIMV 全流程 → fission + unroll 成功
