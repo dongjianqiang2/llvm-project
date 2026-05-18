@@ -1,5 +1,5 @@
 # [AIMV] MCP Server — Prompt builder: AnalyzeRequest → LLM prompt
-from .models import AnalyzeRequest
+from .models import AnalyzeRequest, HistoryRecord
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert compiler engineer specializing in automatic vectorization
@@ -8,7 +8,9 @@ and suggest source-level fixes to enable loop vectorization.
 
 ## Your Task
 Given:
-1. The original C source code of a function containing a loop
+1. The current version of the C source code of a function containing a loop
+   (note: this source may already contain changes from prior iterations for
+   other functions in the same file; line numbers match this version exactly)
 2. LLVM diagnostic data explaining WHY vectorization failed
 3. LLVM IR snippets showing how the compiler sees the loop
 4. Cost model details and memory dependency analysis
@@ -26,9 +28,13 @@ You must determine a source-level modification to fix the failure.
    rewriting loop structure.
 3. Suggest ONE change per iteration. The driver will re-run the compiler and
    send you updated diagnostics if the first fix isn't sufficient.
-4. If you cannot determine a safe fix, set no_action_possible: true.
-5. Provide a valid unified diff in the diff field.
-6. For {aimv_level} level, you may:
+4. If you cannot determine a safe fix, set `no_action_possible: true`.
+5. Provide a valid unified diff in the `diff` field. Line numbers in the diff
+   must match the current source_code version (not the original file).
+6. Only suggest modifications to .c/.cpp source files, never to headers
+   (.h/.hpp). Header file changes (static inline functions, macros) are out
+   of scope.
+7. For {aimv_level} level, you may:
    - conservative: only add qualifiers and attributes
    - moderate: also suggest loop fission, interchange, scalar promotion
    - aggressive: also suggest data structure changes (AoS->SoA)
@@ -62,12 +68,21 @@ RESPONSE_SCHEMA_JSON = """\
 }
 """
 
+DEPTYPE_SEMANTICS = (
+    '"Forward"=safe read-after-write; "Backward"=unsafe write-after-read; '
+    '"BackwardVectorizable"=safe with element-wise overlap; '
+    '"BackwardVectorizableButPreventsForwarding"=safe but blocks store forwarding; '
+    '"ForwardButPreventsForwarding"=safe but blocks store forwarding; '
+    '"Unknown"=SCEV cannot determine direction, treat as PossiblyBackward (potentially unsafe); '
+    '"IndirectUnsafe"=unsafe through pointer aliasing.'
+)
+
 
 def build_system_prompt(request: AnalyzeRequest) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         triple=request.target.triple,
         cpu=request.target.cpu,
-        features=", ".join(request.target.features),
+        features=", ".join(request.target.features) if request.target.features else "default",
         vector_width=request.target.vector_width,
         aimv_level=request.aimv_level.value,
         response_schema=RESPONSE_SCHEMA_JSON,
@@ -79,11 +94,11 @@ def build_user_prompt(request: AnalyzeRequest) -> str:
 
     # Function context
     f = request.function
-    lines.append(f"## Function Under Analysis\n")
+    lines.append("## Function Under Analysis\n")
     lines.append(f"**Name:** `{f.name}`")
     lines.append(f"**Signature:** `{f.signature}`")
     lines.append(f"**File:** `{f.source_file}`, line {f.loop_line}\n")
-    lines.append("### Source Code\n")
+    lines.append("### Source Code (current version with prior changes applied)\n")
     lines.append("```c")
     lines.append(f.source_code)
     lines.append("```\n")
@@ -95,66 +110,109 @@ def build_user_prompt(request: AnalyzeRequest) -> str:
         lines.append(f"**Pass:** {diag.pass_name}")
         lines.append(f"**Remark ID:** {diag.remark_id}")
         lines.append(f"**Message:** {diag.remark_text}")
-        lines.append(f"**Severity:** {diag.severity.value}\n")
+        lines.append(f"**Severity:** {diag.severity.value}")
+
+        # source_accuracy warning (MCP_DESIGN §4.2)
+        if diag.source_accuracy == "approximate":
+            lines.append(
+                "**WARNING:** Source location is approximate — line numbers may be off "
+                "by +/-5 lines due to IR optimization passes reordering instructions. "
+                "Pay extra attention when generating diffs."
+            )
+        lines.append("")
 
         if diag.ir_snippet:
-            lines.append("#### LLVM IR\n")
+            lines.append("#### LLVM IR (optimized, surrounding the loop)\n")
             lines.append("```llvm")
             lines.append(diag.ir_snippet)
             lines.append("```\n")
 
+        # Cost model (MCP_DESIGN §4.2: VF=0 conditional rendering)
         if diag.cost_model:
             cm = diag.cost_model
             lines.append("#### Cost Model Analysis\n")
-            lines.append(f"| Metric | Value |")
-            lines.append(f"|--------|-------|")
+            lines.append("| Metric | Value |")
+            lines.append("|--------|-------|")
             lines.append(f"| Scalar cost | {cm.scalar_cost} |")
-            lines.append(f"| Vector cost (VF={cm.vf}) | {cm.vector_cost} |")
+            if cm.vf == 0:
+                vf_label = "not determined, legality rejection"
+            else:
+                vf_label = str(cm.vf)
+            lines.append(f"| Vector cost (VF={vf_label}) | {cm.vector_cost} |")
             lines.append(f"| Interleave count | {cm.interleave_count} |")
+            denom = max(cm.scalar_cost, 1)
+            lines.append(f"| Cost ratio | {cm.vector_cost / denom:.1f}x |")
             if cm.scalar_cost < cm.vector_cost:
-                lines.append(f"\n**Key insight:** Vector cost ({cm.vector_cost}) > scalar cost ({cm.scalar_cost}). The cost model estimates vectorization is NOT profitable.\n")
+                lines.append(
+                    f"\n**Key insight:** Vector cost ({cm.vector_cost}) > scalar cost "
+                    f"({cm.scalar_cost}). The cost model estimates vectorization is NOT profitable.\n"
+                )
         else:
             lines.append("Cost model data not available (legality stage rejection).\n")
 
+        # Dependencies (MCP_DESIGN §4.2: dep_type semantics)
         if diag.dependencies:
             lines.append("#### Memory Dependencies\n")
+            lines.append(f"**DepType semantics:** {DEPTYPE_SEMANTICS}")
             lines.append("| # | Type | Source | Sink | Alias Result |")
             lines.append("|---|------|--------|------|-------------|")
             for j, dep in enumerate(diag.dependencies):
-                lines.append(f"| {j + 1} | `{dep.dep_type}` | `{dep.source_ptr}` | `{dep.sink_ptr}` | {dep.alias_result} |")
+                lines.append(
+                    f"| {j + 1} | `{dep.dep_type}` | `{dep.source_ptr}` | "
+                    f"`{dep.sink_ptr}` | {dep.alias_result} |"
+                )
             lines.append("")
         else:
             lines.append("No dependency information available.\n")
 
+        # Memory info
         if diag.memory_info:
             mi = diag.memory_info
             lines.append("#### Memory Access Pattern\n")
-            lines.append(f"| Attribute | Value |")
-            lines.append(f"|-----------|-------|")
+            lines.append("| Attribute | Value |")
+            lines.append("|-----------|-------|")
             lines.append(f"| Stores / Loads | {mi.num_stores} / {mi.num_loads} |")
             lines.append(f"| Max alignment | {mi.max_alignment} bytes |")
             lines.append(f"| Stride | {mi.stride} |")
-            lines.append(f"| Memory checks needed | {mi.memory_check_count} (cost: {mi.memory_check_cost}) |")
+            check_count = mi.memory_check_count if mi.memory_check_count is not None else "N/A"
+            check_cost = mi.memory_check_cost if mi.memory_check_cost is not None else "N/A"
+            lines.append(f"| Memory checks needed | {check_count} (cost: {check_cost}) |")
             lines.append("")
 
+        # Loop structure
         if diag.loop_info:
             li = diag.loop_info
             trip = li.trip_count if li.trip_count >= 0 else "unknown"
             lines.append("#### Loop Structure\n")
-            lines.append(f"| Blocks | Instructions | Trip count | Branches | Calls |")
-            lines.append(f"|--------|-------------|------------|----------|-------|")
+            lines.append("| Blocks | Instructions | Trip count | Branches | Calls |")
+            lines.append("|--------|-------------|------------|----------|-------|")
             lines.append(f"| {li.num_blocks} | {li.num_instructions} | {trip} | {li.num_branches} | {li.num_calls} |")
             lines.append("")
 
         lines.append("---\n")
 
-    # History
+    # History (MCP_DESIGN §4.2: structured HistoryRecord)
     if request.history:
-        lines.append("### Previous Attempts (This Session)\n")
+        lines.append(f"### Previous Attempts (last {len(request.history)} round(s))\n")
         for item in request.history:
-            lines.append(f"**Round {item.get('round', '?')}:**")
-            lines.append(f"- Suggestion: {item.get('suggestion_description', 'unknown')}")
-            lines.append(f"- Result: {item.get('result', 'unknown')}")
-        lines.append("\n**Important:** Do NOT repeat any of the above suggestions. They have been tried and failed.\n")
+            # Handle both HistoryRecord objects and plain dicts
+            if isinstance(item, HistoryRecord):
+                round_num = item.round
+                summary = item.diagnosis_summary
+                applied = item.suggestion_applied
+                outcome = item.outcome
+            else:
+                round_num = item.get("round", "?")
+                summary = item.get("diagnosis_summary", "N/A")
+                applied = item.get("suggestion_applied", "N/A")
+                outcome = item.get("outcome", "N/A")
+            lines.append(f"Round {round_num}:")
+            lines.append(f"- Diagnosis: {summary}")
+            lines.append(f"- Applied: {applied}")
+            lines.append(f"- Outcome: {outcome}")
+        lines.append(
+            "\n**Important:** Do NOT repeat any of the above suggestions. "
+            "They have been tried and failed or did not fully resolve the issue.\n"
+        )
 
     return "\n".join(lines)

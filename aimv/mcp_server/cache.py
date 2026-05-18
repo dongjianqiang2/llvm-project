@@ -7,32 +7,62 @@ from typing import Optional
 from .models import AnalyzeRequest, AnalyzeResponse
 
 
-def compute_diagnostic_fingerprint(request: AnalyzeRequest) -> str:
+def compute_diagnostic_fingerprint(request: AnalyzeRequest, mode: str = "strict") -> str:
     """Compute stable fingerprint for cache matching.
 
-    Includes source_code hash to avoid stale cache hits across iterations.
-    Uses relaxed mode: target + diagnostics pattern for cross-function reuse.
+    Strict mode: includes source_code hash + history (same function + same history → cache hit)
+    Relaxed mode: only target + diagnostics pattern (cross-function similar patterns → cache hit)
     """
-    canonical = {
-        "target_triple": request.target.triple,
-        "target_cpu": request.target.cpu,
-        "vector_width": request.target.vector_width,
-        "level": request.aimv_level.value,
-        "function_name": request.function.name,
-        "source_code_sha256": hashlib.sha256(
-            request.function.source_code.encode()
-        ).hexdigest(),
-        "diagnostics": [
-            {
-                "pass": diag.pass_name,
-                "remark_id": diag.remark_id,
-                "remark_prefix": diag.remark_text[:120],
-            }
-            for diag in request.diagnostics
-        ],
-    }
+    if mode == "relaxed":
+        canonical = {
+            "target_triple": request.target.triple,
+            "target_cpu": request.target.cpu,
+            "target_features": sorted(request.target.features),
+            "vector_width": request.target.vector_width,
+            "level": request.aimv_level.value,
+            "diagnostics": [
+                {
+                    "pass": diag.pass_name,
+                    "remark_id": diag.remark_id,
+                    "remark_prefix": diag.remark_text[:120],
+                }
+                for diag in request.diagnostics
+            ],
+        }
+    else:
+        # Strict: includes source_code hash + history
+        canonical = {
+            "target_triple": request.target.triple,
+            "target_cpu": request.target.cpu,
+            "target_features": sorted(request.target.features),
+            "vector_width": request.target.vector_width,
+            "level": request.aimv_level.value,
+            "function_name": request.function.name,
+            "source_code_sha256": hashlib.sha256(
+                request.function.source_code.encode()
+            ).hexdigest(),
+            "diagnostics": [
+                {
+                    "pass": diag.pass_name,
+                    "remark_id": diag.remark_id,
+                    "remark_prefix": diag.remark_text[:120],
+                }
+                for diag in request.diagnostics
+            ],
+            "history": [
+                {
+                    "round": h.round,
+                    "diagnosis_summary": h.diagnosis_summary,
+                    "suggestion_applied": h.suggestion_applied,
+                    "outcome": h.outcome,
+                }
+                for h in request.history
+            ] if request.history else [],
+        }
+
     payload = json.dumps(canonical, sort_keys=True).encode()
-    return hashlib.sha256(payload).hexdigest()[:16]
+    prefix = "relaxed" if mode == "relaxed" else "strict"
+    return f"{prefix}:{hashlib.sha256(payload).hexdigest()[:16]}"
 
 
 class DiagnosticCache:
@@ -91,7 +121,7 @@ class DiagnosticCache:
 
     def get_stats(self) -> dict:
         return {
-            "local_entries": len(self._local),
+            "total_entries": len(self._local),
             "total_requests": self._total_requests,
             "cache_hits": self._cache_hits,
             "cache_misses": self._cache_misses,

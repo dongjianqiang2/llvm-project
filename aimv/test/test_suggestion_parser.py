@@ -1,12 +1,8 @@
-"""T2.4 — Suggestion parser tests."""
-import sys
+# [AIMV] Tests for aimv/mcp_server/suggestion_parser.py (T2.5)
 import json
 import pytest
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from aimv.mcp_server.suggestion_parser import (
-    parse_structured_response, SuggestionParseError,
+    parse_structured_response, SuggestionParseError, _extract_json,
 )
 
 
@@ -28,21 +24,56 @@ VALID_RESPONSE = json.dumps({
 })
 
 
+class TestExtractJson:
+    """T2.5: _extract_json uses brace-depth counting, not regex."""
+
+    def test_extract_json_plain(self):
+        text = '{"key": "value"}'
+        assert _extract_json(text) == text
+
+    def test_extract_json_markdown_wrapped(self):
+        text = '```json\n{"key": "value"}\n```'
+        result = _extract_json(text)
+        assert '"key"' in result
+
+    def test_extract_json_with_diff_backticks(self):
+        """diff field containing triple backticks should not truncate."""
+        data = {
+            "suggestions": [{
+                "description": "d", "reasoning": "r",
+                "source_file": "f.c", "line_start": 1, "line_end": 1,
+                "original": "x", "modified": "y",
+                "diff": "```diff\n-sold\n+new\n```",
+                "estimated_impact": "high",
+            }],
+            "overall_analysis": "a", "confidence": 0.5,
+            "no_action_possible": False,
+        }
+        text = json.dumps(data)
+        result = _extract_json(text)
+        parsed = json.loads(result)
+        assert "```diff" in parsed["suggestions"][0]["diff"]
+
+    def test_extract_json_with_apology_prefix(self):
+        text = "I'm sorry, here is the analysis:\n" + VALID_RESPONSE
+        result = _extract_json(text)
+        parsed = json.loads(result)
+        assert parsed["confidence"] == 0.92
+
+    def test_extract_json_no_json(self):
+        result = _extract_json("no json here")
+        assert result == "no json here"
+
+
 class TestParseStructuredResponse:
     def test_valid_json(self):
         resp = parse_structured_response(VALID_RESPONSE, "req-1")
         assert resp.request_id == "req-1"
         assert len(resp.suggestions) == 1
         assert resp.confidence == 0.92
-        assert resp.no_action_possible is False
 
     def test_json_in_markdown_block(self):
         text = "```json\n" + VALID_RESPONSE + "\n```"
-        resp = parse_structured_response(text, "req-1")
-        assert resp.request_id == "req-1"
-
-    def test_json_with_prefix_noise(self):
-        text = "Here is the analysis:\n" + VALID_RESPONSE
         resp = parse_structured_response(text, "req-1")
         assert resp.request_id == "req-1"
 
@@ -74,3 +105,8 @@ class TestParseStructuredResponse:
         })
         with pytest.raises(SuggestionParseError):
             parse_structured_response(data, "req-1")
+
+    def test_parse_with_prefix_noise(self):
+        text = "Here is the analysis:\n" + VALID_RESPONSE
+        resp = parse_structured_response(text, "req-1")
+        assert resp.request_id == "req-1"

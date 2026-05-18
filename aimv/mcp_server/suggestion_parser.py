@@ -1,6 +1,5 @@
 # [AIMV] MCP Server — LLM response → structured Suggestion parser
 import json
-import re
 from .models import AnalyzeResponse
 
 
@@ -37,7 +36,8 @@ def parse_structured_response(raw_text: str, request_id: str) -> AnalyzeResponse
     Handles common LLM output format issues:
     - JSON wrapped in ```json ... ``` code blocks
     - Trailing commas
-    - Prefix noise ("Here is the response: ...")
+    - Prefix noise ("I'm sorry, here is...")
+    - diff field containing triple backticks
     """
 
     json_text = _extract_json(raw_text)
@@ -57,18 +57,40 @@ def parse_structured_response(raw_text: str, request_id: str) -> AnalyzeResponse
 
 
 def _extract_json(text: str) -> str:
-    """Extract JSON from LLM output, handling markdown wraps and noise."""
+    """Extract JSON from LLM output using brace-depth counting.
+
+    Does NOT use regex for ```json extraction because diff fields
+    may contain triple backticks (unified diff format), causing
+    premature truncation. Brace matching is more reliable.
+    """
     text = text.strip()
 
-    # Remove markdown code block
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if m:
-        return m.group(1)
-
-    # Find first { and last }
     start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1:
-        return text[start:end + 1]
+    if start == -1:
+        return text
 
-    return text
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == '\\' and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+
+    # Fallback: no matching } found
+    return text[start:]
