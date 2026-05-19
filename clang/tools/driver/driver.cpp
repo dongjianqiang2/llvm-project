@@ -481,8 +481,23 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
           std::string AimvJsonPath = OutputFile + ".aimv.json";
           if (!llvm::sys::fs::exists(AimvJsonPath)) continue;
 
-          auto Found = llvm::sys::findProgramByName("aimv-driver");
-          if (Found) {
+          // [AIMV] Find aimv-driver: same directory as clang first, then PATH
+          std::string FullPath;
+          // Search alongside the clang binary (handles absolute-path invocation)
+          std::string ClangExe =
+              llvm::sys::fs::getMainExecutable(Argv[0], (void *)(intptr_t)&FullPath);
+          std::string ClangDir = llvm::sys::path::parent_path(ClangExe).str();
+          std::string SiblingPath = ClangDir + "/aimv-driver";
+          if (llvm::sys::fs::exists(SiblingPath)) {
+            FullPath = SiblingPath;
+          } else {
+            auto Found = llvm::sys::findProgramByName("aimv-driver");
+            if (Found) {
+              FullPath = Found.get();
+            }
+          }
+
+          if (!FullPath.empty()) {
             // Get the source file from the command's input infos.
             std::string SourceFile;
             for (const auto &II : Cmd->getInputInfos()) {
@@ -492,8 +507,6 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
               }
             }
             if (SourceFile.empty()) break;
-
-            std::string FullPath = Found.get();
             SmallVector<StringRef, 4> DriverArgs;
             DriverArgs.push_back(FullPath);
             DriverArgs.push_back("--from-json");
