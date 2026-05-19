@@ -33,10 +33,9 @@ Three subsystems:
 ### Prerequisites
 
 - Python 3.10+
-- LLVM 21 with ARM/AArch64 target (for pass mode)
 - `patch` command (for applying diffs)
 
-### 1. Build LLVM with AIMV Pass
+### 1. Build & Install
 
 ```bash
 cmake -S llvm -B build -G Ninja \
@@ -44,6 +43,19 @@ cmake -S llvm -B build -G Ninja \
   -DLLVM_ENABLE_PROJECTS="clang" \
   -DLLVM_TARGETS_TO_BUILD="ARM;AArch64"
 ninja -C build clang opt
+
+# Install clang, opt, aimv-driver, aimv-server to prefix
+DESTDIR=/path/to/install ninja -C build install
+```
+
+After install:
+
+```
+<prefix>/bin/
+├── clang-21
+├── opt
+├── aimv-driver       # AI-driven vectorization CLI
+└── aimv-server       # MCP REST API server
 ```
 
 ### 2. Install Python dependencies
@@ -55,25 +67,22 @@ pip install fastapi uvicorn httpx pyyaml jinja2 openai anthropic
 ### 3. Start MCP Server
 
 ```bash
-cd aimv
-
 # Anthropic backend (e.g. glm-5.1 via BigModel)
 ANTHROPIC_API_KEY="your-key" \
 ANTHROPIC_BASE_URL="https://open.bigmodel.cn/api/anthropic" \
 ANTHROPIC_MODEL="glm-5.1" \
 AIMV_LLM_BACKEND="anthropic" \
-python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080
+aimv-server
 
 # OpenAI backend
 OPENAI_API_KEY="sk-..." \
 OPENAI_BASE_URL="https://api.openai.com/v1" \
 OPENAI_MODEL="gpt-4o" \
 AIMV_LLM_BACKEND="openai" \
-python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080
+aimv-server
 
-# Mock backend (offline testing, returns known suggestions for known patterns)
-AIMV_LLM_BACKEND="mock" \
-python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080
+# Mock backend (offline testing)
+AIMV_LLM_BACKEND="mock" aimv-server
 ```
 
 ### 4. Run analysis
@@ -84,14 +93,18 @@ clang -O2 -g --target=armv7-unknown-linux-gnueabi -S -emit-llvm src.c -o src.ll
 opt -passes="loop-vectorize,slp-vectorizer,loop-unroll,aimv-feedback" -S src.ll \
     -aimv-output=aimv.json -aimv-enable
 
-# Run driver with MCP server
-cd aimv
-python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
+# Run driver (installed)
+aimv-driver --from-json aimv.json --source src.c \
     --mcp-url http://localhost:8080 --max-rounds 3
 
 # Target a specific function
-python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
+aimv-driver --from-json aimv.json --source src.c \
     --function process_task --mcp-url http://localhost:8080
+
+# Quick start from source tree (without install)
+cd aimv
+python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
+    --mcp-url http://localhost:8080
 ```
 
 ## Environment Variables
@@ -140,7 +153,7 @@ The JSON output uses newline-delimited JSON (NDJSON) — one JSON object per fun
 ## Driver CLI
 
 ```
-python3 -m driver.aimv_driver [OPTIONS]
+aimv-driver [OPTIONS] [source_file]
 
 Options:
   --from-json PATH       Read diagnostics from aimv.json (produced by opt)
@@ -152,6 +165,22 @@ Options:
   --output-dir DIR       Output directory (default: ./aimv-output)
   --dry-run              Collect diagnostics only, skip MCP
   --verbose              Verbose output
+
+# From source tree (without install):
+#   cd aimv && python3 -m driver.aimv_driver [OPTIONS]
+```
+
+### Server
+
+```bash
+aimv-server                          # mock backend (default)
+AIMV_LLM_BACKEND=anthropic aimv-server  # with env vars
+
+# Custom host/port:
+AIMV_HOST=0.0.0.0 AIMV_PORT=9000 aimv-server
+
+# From source tree:
+#   cd aimv && AIMV_LLM_BACKEND=mock python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080
 ```
 
 ## MCP Server API
@@ -250,6 +279,10 @@ to its original state.
 ```
 aimv/
 ├── README.md
+├── CMakeLists.txt                   # Install rules (bundled with LLVM build)
+├── bin/                             # Entry-point scripts
+│   ├── aimv-driver                  #   Driver CLI wrapper
+│   └── aimv-server                  #   Server wrapper
 ├── setup.sh                         # One-click server setup
 ├── driver/                          # Python CLI driver
 │   ├── aimv_driver.py               #   Entry point + main loop
@@ -337,7 +370,12 @@ cd aimv && python3 -m pytest test/ -q
 # LLVM lit tests (19 cases, requires built opt)
 build/bin/llvm-lit -v llvm/test/Transforms/AIMV/
 
-# E2E with mock backend
+# E2E with installed tools + mock backend
+AIMV_LLM_BACKEND=mock aimv-server &
+aimv-driver --from-json aimv.json --source src.c \
+    --mcp-url http://localhost:8080 --max-rounds 2
+
+# E2E from source tree
 cd aimv
 AIMV_LLM_BACKEND=mock python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080 &
 python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
