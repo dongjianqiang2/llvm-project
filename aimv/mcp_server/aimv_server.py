@@ -239,30 +239,38 @@ async def analyze_loop_transform(request: Request):
 def _create_backend(backend_name: str):
     """Dynamically create LLM backend instance.
 
-    OpenAI backend env vars:
-      OPENAI_API_KEY   — API key (required)
-      OPENAI_BASE_URL  — custom base URL (optional, e.g. https://api.openai.com/v1)
-      OPENAI_MODEL     — model name (optional, falls back to AIMV_LLM_MODEL then gpt-4o)
+    Required env vars per backend:
 
-    Anthropic backend env vars:
-      ANTHROPIC_API_KEY  — API key (required)
-      ANTHROPIC_BASE_URL — custom base URL (optional, e.g. https://open.bigmodel.cn/api/anthropic)
-      ANTHROPIC_MODEL    — model name (optional, falls back to AIMV_LLM_MODEL then claude-sonnet-4-6)
+      openai:
+        OPENAI_API_KEY   — API key
+        OPENAI_BASE_URL  — base URL (e.g. https://api.openai.com/v1)
+        OPENAI_MODEL     — model name (e.g. gpt-4o)
+
+      anthropic:
+        ANTHROPIC_API_KEY  — API key
+        ANTHROPIC_BASE_URL — base URL (e.g. https://open.bigmodel.cn/api/anthropic)
+        ANTHROPIC_MODEL    — model name (e.g. glm-5.1)
+
+    Server will refuse to start if any required var is missing.
     """
     if backend_name == "openai":
         from .llm.openai_backend import OpenAIBackend
+        api_key = os.environ["OPENAI_API_KEY"]
+        base_url = os.environ["OPENAI_BASE_URL"]
+        model = os.environ["OPENAI_MODEL"]
         return OpenAIBackend({
-            "api_key": os.environ.get("OPENAI_API_KEY", ""),
-            "base_url": os.environ.get("OPENAI_BASE_URL", ""),
-            "model": os.environ.get("OPENAI_MODEL",
-                       os.environ.get("AIMV_LLM_MODEL", "gpt-4o")),
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
         })
     elif backend_name == "anthropic":
         from .llm.anthropic_backend import AnthropicBackend
+        api_key = os.environ["ANTHROPIC_API_KEY"]
+        base_url = os.environ["ANTHROPIC_BASE_URL"]
+        model = os.environ["ANTHROPIC_MODEL"]
         return AnthropicBackend({
-            "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
-            "base_url": os.environ.get("ANTHROPIC_BASE_URL", ""),
-            "model": os.environ.get("ANTHROPIC_MODEL",
-                       os.environ.get("AIMV_LLM_MODEL", "claude-sonnet-4-6")),
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
         })
     return None
