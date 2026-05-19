@@ -521,19 +521,33 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
             }
 
             // [AIMV] Forward compilation flags to aimv-driver --cflags
-            // Extract -O flag from the cc1 command arguments.
-            // Use --cflags=VALUE form because -O2 starts with '-' which
-            // argparse would otherwise interpret as a separate flag.
+            // Collect -O and vectorization-relevant -f flags from cc1 args.
+            std::string CFlags;
             for (const char *Arg : Cmd->getArguments()) {
               if (!Arg) continue;
-              StringRef ArgStr(Arg);
-              if (ArgStr.size() >= 2 && ArgStr[0] == '-' && ArgStr[1] == 'O' &&
-                  (ArgStr.size() == 3 ||
-                   ArgStr == "-Os" || ArgStr == "-Oz")) {
-                DriverArgs.push_back(
-                    Args.MakeArgString(Twine("--cflags=") + ArgStr));
-                break;
+              StringRef S(Arg);
+              // Optimization level: -O0, -O1, -O2, -O3, -Os, -Oz
+              if (S.size() >= 2 && S[0] == '-' && S[1] == 'O' &&
+                  (S.size() == 3 || S == "-Os" || S == "-Oz")) {
+                if (!CFlags.empty()) CFlags += " ";
+                CFlags += S.str();
               }
+              // Vectorization-relevant -f flags
+              if (S.starts_with("-f") && (S.find("vector") != StringRef::npos ||
+                                         S.find("unroll") != StringRef::npos ||
+                                         S.find("fast-math") != StringRef::npos ||
+                                         S.find("math-errno") != StringRef::npos ||
+                                         S.find("associative") != StringRef::npos ||
+                                         S.find("reciprocal") != StringRef::npos ||
+                                         S.find("signed-zeros") != StringRef::npos ||
+                                         S.find("trapping-math") != StringRef::npos)) {
+                if (!CFlags.empty()) CFlags += " ";
+                CFlags += S.str();
+              }
+            }
+            if (!CFlags.empty()) {
+              DriverArgs.push_back(
+                  Args.MakeArgString(Twine("--cflags=") + CFlags));
             }
 
             int ExitCode = llvm::sys::ExecuteAndWait(FullPath, DriverArgs);
