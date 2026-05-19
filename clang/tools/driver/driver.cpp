@@ -520,29 +520,30 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
               DriverArgs.push_back(A->getValue());
             }
 
-            // [AIMV] Forward compilation flags to aimv-driver --cflags
-            // Collect -O and vectorization-relevant -f flags from cc1 args.
+            // [AIMV] Forward original compilation flags to aimv-driver --cflags.
+            // Collect all -O and -f flags from the original user arguments.
+            // Exclude flags that the driver handles separately (-faimv, -g, -c, -o).
             std::string CFlags;
-            for (const char *Arg : Cmd->getArguments()) {
-              if (!Arg) continue;
-              StringRef S(Arg);
-              // Optimization level: -O0, -O1, -O2, -O3, -Os, -Oz
-              if (S.size() >= 2 && S[0] == '-' && S[1] == 'O' &&
-                  (S.size() == 3 || S == "-Os" || S == "-Oz")) {
+            const auto &InputArgs = C->getInputArgs();
+            for (auto &A : InputArgs) {
+              StringRef OptName = A->getOption().getName();
+              StringRef ArgStr = A->getAsString(InputArgs);
+              if (ArgStr.empty()) continue;
+              // Optimization level
+              if ((ArgStr.size() >= 2 && ArgStr[0] == '-' && ArgStr[1] == 'O')) {
                 if (!CFlags.empty()) CFlags += " ";
-                CFlags += S.str();
+                CFlags += ArgStr.str();
               }
-              // Vectorization-relevant -f flags
-              if (S.starts_with("-f") && (S.find("vector") != StringRef::npos ||
-                                         S.find("unroll") != StringRef::npos ||
-                                         S.find("fast-math") != StringRef::npos ||
-                                         S.find("math-errno") != StringRef::npos ||
-                                         S.find("associative") != StringRef::npos ||
-                                         S.find("reciprocal") != StringRef::npos ||
-                                         S.find("signed-zeros") != StringRef::npos ||
-                                         S.find("trapping-math") != StringRef::npos)) {
+              // All -f flags except those we handle
+              if (ArgStr.starts_with("-f") &&
+                  !ArgStr.starts_with("-faimv")) {
                 if (!CFlags.empty()) CFlags += " ";
-                CFlags += S.str();
+                CFlags += ArgStr.str();
+              }
+              // -m flags (like -mcpu=, -mattr= etc.)
+              if (ArgStr.starts_with("-m") && !ArgStr.starts_with("-mllvm")) {
+                if (!CFlags.empty()) CFlags += " ";
+                CFlags += ArgStr.str();
               }
             }
             if (!CFlags.empty()) {
