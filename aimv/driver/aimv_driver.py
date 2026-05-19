@@ -411,12 +411,19 @@ def process_single_function(
                 try:
                     patch = sources.apply_shadow_patch(source_file, diff_text)
                 except Exception as e:
-                    logger.warning("Patch apply failed, skipping: %s", e)
+                    logger.warning("Patch apply failed: %s", e)
+                    # Rollback only this function's successful patches
+                    for prev_round in reversed(func_result.rounds):
+                        if prev_round.patch:
+                            try:
+                                sources.rollback(prev_round.patch)
+                            except Exception:
+                                pass
                     sources.discard_shadow(source_file)
                     sources.release_lock(source_file)
                     round_rec.status = IterationStatus.FAILED
                     round_rec.finished_at = time.time()
-                    continue
+                    break
                 round_rec.patch = patch
 
                 # ── Step 4: Compile verify [same lock region] ──
@@ -436,6 +443,13 @@ def process_single_function(
 
                 if verify_build.returncode != 0:
                     sources.discard_shadow(source_file)
+                    # Rollback this function's previous patches on compile failure
+                    for prev_round in reversed(func_result.rounds):
+                        if prev_round.patch:
+                            try:
+                                sources.rollback(prev_round.patch)
+                            except Exception:
+                                pass
                     action, reason = engine.decide(
                         current_round=round_num,
                         build_result_ok=False, test_result_ok=True,
@@ -456,6 +470,13 @@ def process_single_function(
                 if (prev_passed_count > 0 and
                         verify_vstatus.passed_remark_count < prev_passed_count):
                     sources.discard_shadow(source_file)
+                    # Rollback on regression
+                    for prev_round in reversed(func_result.rounds):
+                        if prev_round.patch:
+                            try:
+                                sources.rollback(prev_round.patch)
+                            except Exception:
+                                pass
                     action, reason = engine.decide(
                         current_round=round_num,
                         build_result_ok=True, test_result_ok=True,
@@ -474,6 +495,13 @@ def process_single_function(
 
                     if test.returncode != 0 or test.failed > 0:
                         sources.discard_shadow(source_file)
+                        # Rollback on test failure
+                        for prev_round in reversed(func_result.rounds):
+                            if prev_round.patch:
+                                try:
+                                    sources.rollback(prev_round.patch)
+                                except Exception:
+                                    pass
                         func_result.termination_reason = TerminationReason.TEST_FAILURE
                         break
 
