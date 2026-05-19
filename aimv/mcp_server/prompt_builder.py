@@ -22,9 +22,11 @@ and suggest source-level fixes to enable loop vectorization.
 
 ## Your Task
 Given:
-1. The current version of the C source code of a function containing a loop
-   (note: this source may already contain changes from prior iterations for
-   other functions in the same file; line numbers match this version exactly)
+1. The C source code of a function containing a loop that failed to vectorize.
+   **CRITICAL: This is the EXACT current state of the source file.**
+   No prior suggestions or modifications have been applied. The code you see
+   is the original source. Generate diffs against THIS exact code, NOT an
+   imagined state that already has your suggested changes applied.
 2. LLVM diagnostic data explaining WHY vectorization failed
 3. LLVM IR snippets showing how the compiler sees the loop
 4. Cost model details and memory dependency analysis
@@ -43,8 +45,10 @@ You must determine a source-level modification to fix the failure.
 3. Suggest ONE change per iteration. The driver will re-run the compiler and
    send you updated diagnostics if the first fix isn't sufficient.
 4. If you cannot determine a safe fix, set `no_action_possible: true`.
-5. Provide a valid unified diff in the `diff` field. Line numbers in the diff
-   must match the current source_code version (not the original file).
+5. Provide a valid unified diff in the `diff` field. The diff MUST apply
+   cleanly to the exact source code shown above. Verify that the context lines
+   and line numbers in your diff match the ACTUAL source code — do NOT
+   hallucinate that previous suggestions have already been applied.
 6. Only suggest modifications to .c/.cpp source files, never to headers
    (.h/.hpp). Header file changes (static inline functions, macros) are out
    of scope.
@@ -112,7 +116,7 @@ def build_user_prompt(request: AnalyzeRequest) -> str:
     lines.append(f"**Name:** `{f.name}`")
     lines.append(f"**Signature:** `{f.signature}`")
     lines.append(f"**File:** `{f.source_file}`, line {f.loop_line}\n")
-    lines.append("### Source Code (current version with prior changes applied)\n")
+    lines.append("### Source Code (original, unmodified)\n")
     lines.append("```c")
     lines.append(f.source_code)
     lines.append("```\n")
