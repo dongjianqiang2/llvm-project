@@ -7487,6 +7487,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Args.MakeArgString(
         Twine("-aimv-output=") + Output.getFilename() + ".aimv.json"));
   }
+  // [AIMV] Consume -faimv-mcp-url= (used by driver fork+exec, not cc1)
+  Args.getLastArg(options::OPT_faimv_mcp_url_EQ);
 
   StringRef VecWidth = parseMPreferVectorWidthOption(D.getDiags(), Args);
   if (!VecWidth.empty())

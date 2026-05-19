@@ -4172,6 +4172,8 @@ def faimv : Flag<["-"], "faimv">, Group<f_Group>,
   HelpText<"Enable AIMV (AI Multi-Level Vectorization) feedback optimization">;
 def fno_aimv : Flag<["-"], "fno-aimv">, Group<f_Group>,
   HelpText<"Disable AIMV feedback optimization">;
+def faimv_mcp_url_EQ : Joined<["-"], "faimv-mcp-url=">, Group<f_Group>,
+  HelpText<"AIMV MCP server URL (forwarded to aimv-driver)">;
 }
 
 def Wlarge_by_value_copy_def : Flag<["-"], "Wlarge-by-value-copy">,

@@ -501,6 +501,12 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
             DriverArgs.push_back("--source");
             DriverArgs.push_back(SourceFile);
 
+            // [AIMV] Forward -faimv-mcp-url= to aimv-driver --mcp-url
+            if (Arg *A = Args.getLastArg(options::OPT_faimv_mcp_url_EQ)) {
+              DriverArgs.push_back("--mcp-url");
+              DriverArgs.push_back(A->getValue());
+            }
+
             int ExitCode = llvm::sys::ExecuteAndWait(FullPath, DriverArgs);
             if (ExitCode != 0) {
               llvm::errs() << "[AIMV] aimv-driver exited with code "
