@@ -107,6 +107,28 @@ python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
     --mcp-url http://localhost:8080
 ```
 
+### 5. One-command automation
+
+```bash
+# Full auto: compile + diagnose + MCP + patch + verify
+clang -O2 -faimv -faimv-mcp-url=http://mcp:8080 -c file.c
+```
+
+The `-faimv` flag triggers the full pipeline automatically via fork+exec of `aimv-driver` after compilation. No separate `opt` or `aimv-driver` invocation needed.
+
+## Configuration
+
+### MCP URL Priority
+
+The MCP server address is resolved in this order:
+
+| Priority | Source | Example |
+|----------|--------|---------|
+| **1 (highest)** | `-faimv-mcp-url=` flag | `clang -faimv -faimv-mcp-url=http://mcp:8080 -c file.c` |
+| **2** | `AIMV_MCP_URL` env var | `export AIMV_MCP_URL=http://mcp:8080` |
+| **3** | `~/.aimv/config` YAML | `mcp: { url: http://mcp:8080 }` |
+| **4 (lowest)** | built-in default | `http://localhost:8080` |
+
 ## Environment Variables
 
 ### MCP Server
@@ -122,6 +144,9 @@ python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
 | `ANTHROPIC_MODEL` | anthropic only | Model name (e.g. `glm-5.1`) |
 | `AIMV_API_KEY` | No | Enable Bearer token auth on all endpoints |
 | `AIMV_CACHE_TTL` | No | Diagnostic cache TTL in seconds (default: 86400) |
+| `AIMV_MCP_URL` | No | MCP server URL for driver (default: `http://localhost:8080`) |
+| `AIMV_MAX_ROUNDS` | No | Max iteration rounds per function (default: 5) |
+| `AIMV_LEVEL` | No | Modification level: `conservative` / `moderate` / `aggressive` |
 
 All three backend-specific variables (API_KEY, BASE_URL, MODEL) are **required**.
 The server refuses to start if any is missing.
