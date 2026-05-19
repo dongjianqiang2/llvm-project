@@ -27,6 +27,7 @@ class BuildOrchestrator:
             cflags = config.get("cflags", ["-O2"])
             self.cflags = cflags if isinstance(cflags, list) else cflags.split()
             self.timeout_seconds = config.get("timeout_seconds", 120)
+        self.target_triple = ""  # Set from aimv.json to preserve original target
         self.work_dir = Path(tempfile.mkdtemp(prefix="aimv-"))
 
     def compile_with_aimv(
@@ -34,11 +35,15 @@ class BuildOrchestrator:
         source_file: str,
         output_file: str,
         aimv_json_output: Optional[str] = None,
+        target_triple: Optional[str] = None,
     ) -> BuildResult:
         """Compile source with AIMVFeedbackPass enabled.
 
         Flags (anti-fork design):
-          -O2 -g -mllvm -aimv-enable -mllvm -aimv-output=<json>
+          -O2 -g --target=<triple> -mllvm -aimv-enable -mllvm -aimv-output=<json>
+
+        If target_triple is given and --target is not already in cflags,
+        injects --target=<triple> to preserve the original compilation target.
 
         Shadow file handling:
           .aimv-tmp extension not recognized by compiler, auto-inject -x c/c++.
@@ -47,6 +52,12 @@ class BuildOrchestrator:
 
         cmd = [self.cc]
         cmd.extend(self.cflags)
+        # [AIMV] Preserve target triple from original compilation
+        triple = target_triple or self.target_triple
+        if triple and triple not in ("", "unknown"):
+            has_target = any(a.startswith("--target=") for a in self.cflags)
+            if not has_target:
+                cmd.append(f"--target={triple}")
         cmd.extend([
             "-c", "-g",
             "-mllvm", "-aimv-enable",

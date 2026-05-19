@@ -582,6 +582,10 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
     config = load_config()
 
     builder = BuildOrchestrator(config)
+    # [AIMV] Preserve target triple from original compilation
+    target = aimv_data.get("target", {})
+    if target.get("triple") and target["triple"] not in ("", "unknown"):
+        builder.target_triple = target["triple"]
     mcp = MCPClient(config.mcp_url, config.mcp_timeout, api_key=config.mcp_api_key)
     sources = SourceManager(config.output_dir)
     store = SessionStore(config.output_dir)
@@ -680,6 +684,10 @@ def main_independent(source_file: str, function_name: Optional[str],
             build.opt_record_path, function_name or "", source_file)
 
     diagnostics = aimv_data.get("diagnostics", [])
+    # [AIMV] Preserve target triple from original compilation
+    target = aimv_data.get("target", {})
+    if target.get("triple") and target["triple"] not in ("", "unknown"):
+        builder.target_triple = target["triple"]
 
     if function_name:
         failed_functions = [function_name]
