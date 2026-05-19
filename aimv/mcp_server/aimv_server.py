@@ -28,10 +28,15 @@ cache = DiagnosticCache(
 
 @app.get("/api/v1/health")
 async def health():
+    model = "mock"
+    if LLM_BACKEND == "openai":
+        model = os.environ.get("OPENAI_MODEL", "mock")
+    elif LLM_BACKEND == "anthropic":
+        model = os.environ.get("ANTHROPIC_MODEL", "mock")
     return {
         "status": "ok",
         "backend": LLM_BACKEND,
-        "model": os.environ.get("AIMV_LLM_MODEL", "mock"),
+        "model": model,
         "cache_hits": cache._cache_hits,
         "cache_misses": cache._cache_misses,
         "uptime_seconds": 0,
