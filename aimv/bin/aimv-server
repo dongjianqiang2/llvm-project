@@ -1,0 +1,48 @@
+#!/bin/bash
+# [AIMV] aimv-server — MCP REST API for AI-driven vectorization analysis
+#
+# Start the server:
+#   aimv-server [uvicorn options]
+#
+# Environment variables (required):
+#   AIMV_LLM_BACKEND=openai|anthropic|mock
+#
+#   For openai:   OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+#   For anthropic: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ANTHROPIC_MODEL
+#
+# Finds the AIMV Python package relative to this script's location.
+# Works both in the build tree and installed prefix.
+
+set -e
+
+# Resolve the real script path (follow symlinks)
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+if [ -L "$SCRIPT_PATH" ]; then
+    SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+fi
+BIN_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# Search for the aimv Python package
+for candidate in \
+    "$BIN_DIR/../aimv" \
+    "$BIN_DIR/../share/aimv" \
+    "$BIN_DIR/../../aimv"; do
+    candidate="$(cd "$candidate" 2>/dev/null && pwd)" || continue
+    if [ -f "$candidate/mcp_server/aimv_server.py" ]; then
+        AIMV_HOME="$candidate"
+        break
+    fi
+done
+
+if [ -z "${AIMV_HOME:-}" ]; then
+    echo "aimv-server: cannot find AIMV Python package" >&2
+    echo "  searched relative to: $BIN_DIR" >&2
+    exit 1
+fi
+
+# Default host/port
+HOST="${AIMV_HOST:-127.0.0.1}"
+PORT="${AIMV_PORT:-8080}"
+
+PYTHONPATH="$AIMV_HOME${PYTHONPATH:+:$PYTHONPATH}" \
+    exec python3 -m uvicorn mcp_server.aimv_server:app --host "$HOST" --port "$PORT" "$@"

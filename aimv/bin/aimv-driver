@@ -1,0 +1,40 @@
+#!/bin/bash
+# [AIMV] aimv-driver — AI-driven loop vectorization optimization
+#
+# Usage: aimv-driver [OPTIONS] [source_file]
+#   aimv-driver --from-json aimv.json --source src.c --mcp-url http://...
+#
+# Finds the AIMV Python package relative to this script's location.
+# Works both in the build tree and installed prefix.
+
+set -e
+
+# Resolve the real script path (follow symlinks)
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+if [ -L "$SCRIPT_PATH" ]; then
+    SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+fi
+BIN_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# Search for the aimv Python package in order:
+#   1. build tree:   $BIN_DIR/../aimv/  (python package at repo root)
+#   2. installed:    $BIN_DIR/../share/aimv/
+#   3. source tree:  $BIN_DIR/../../aimv/
+for candidate in \
+    "$BIN_DIR/../aimv" \
+    "$BIN_DIR/../share/aimv" \
+    "$BIN_DIR/../../aimv"; do
+    candidate="$(cd "$candidate" 2>/dev/null && pwd)" || continue
+    if [ -f "$candidate/driver/aimv_driver.py" ]; then
+        AIMV_HOME="$candidate"
+        break
+    fi
+done
+
+if [ -z "${AIMV_HOME:-}" ]; then
+    echo "aimv-driver: cannot find AIMV Python package" >&2
+    echo "  searched relative to: $BIN_DIR" >&2
+    exit 1
+fi
+
+PYTHONPATH="$AIMV_HOME${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m driver.aimv_driver "$@"

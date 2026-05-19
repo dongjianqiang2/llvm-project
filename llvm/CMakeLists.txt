@@ -1366,6 +1366,9 @@ endforeach()
 
 add_subdirectory(projects)
 
+# [AIMV] Install driver + server alongside clang/opt in bin/
+add_subdirectory(../aimv ${CMAKE_CURRENT_BINARY_DIR}/aimv)
+
 if( LLVM_INCLUDE_TOOLS )
   add_subdirectory(tools)
 endif()
