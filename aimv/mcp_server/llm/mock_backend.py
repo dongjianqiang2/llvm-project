@@ -9,6 +9,7 @@ from ..models import (
 
 # Known diagnostic pattern → fixed suggestion mapping
 PATTERN_SUGGESTIONS = {
+    # LoopVectorize patterns
     "CantReorderMemOps": {
         "description": "Add restrict qualifier to pointer parameters",
         "reasoning": "Alias analysis failed because pointers may alias. "
@@ -40,6 +41,68 @@ PATTERN_SUGGESTIONS = {
         "estimated_impact": "low",
         "safety_concern": "Same as VectorizationNotBeneficial — may hurt small trip counts.",
     },
+    "InterleavingNotBeneficialAndDisabled": {
+        "description": "Add #pragma clang loop vectorize(enable) to override cost model",
+        "reasoning": "Interleaving was rejected and disabled. "
+                     "A pragma override can enable vectorization with interleaving.",
+        "estimated_impact": "low",
+        "safety_concern": "Forcing vectorization may degrade performance for small trip counts.",
+    },
+    # SLP Vectorizer patterns
+    "NotBeneficial": {
+        "description": "Reorder scalar operations to enable SLP vectorization",
+        "reasoning": "SLP vectorization was possible but not beneficial due to "
+                     "pack/unpack overhead. Reordering operations or using wider "
+                     "types can reduce overhead.",
+        "estimated_impact": "medium",
+        "safety_concern": "Operation reordering must preserve program semantics.",
+    },
+    "NotPossible": {
+        "description": "Restructure scalar code to enable SLP vectorization",
+        "reasoning": "SLP could not find a vectorizable pattern. Consider "
+                     "combining adjacent scalar operations or using explicit "
+                     "SIMD intrinsics.",
+        "estimated_impact": "low",
+        "safety_concern": "Manual restructuring may reduce code readability.",
+    },
+    "UnsupportedType": {
+        "description": "Use standard SIMD-friendly types for SLP vectorization",
+        "reasoning": "The operation uses a type not supported by SIMD. "
+                     "Convert to standard integer or float types.",
+        "estimated_impact": "medium",
+        "safety_concern": "Type changes may affect precision or overflow behavior.",
+    },
+    "SmallVF": {
+        "description": "Merge adjacent computations to increase SLP vector width",
+        "reasoning": "Too few instructions to form a profitable vector. "
+                     "Unroll the loop or merge adjacent computations.",
+        "estimated_impact": "low",
+        "safety_concern": "Merging computations may increase register pressure.",
+    },
+    # LoopUnroll patterns
+    "CantUnrollTripCount": {
+        "description": "Add __builtin_assume(n >= 16) to hint trip count range",
+        "reasoning": "Trip count is unknown at compile time, preventing unroll "
+                     "decisions. Adding assume hints enables the compiler to "
+                     "choose a profitable unroll factor.",
+        "estimated_impact": "high",
+        "safety_concern": "Assumed bounds must hold at runtime. Wrong hints "
+                          "cause undefined behavior.",
+    },
+    "UnrollNotBeneficial": {
+        "description": "Use loop fission to split large loop body for unrolling",
+        "reasoning": "The unrolled loop body exceeds size threshold. "
+                     "Splitting the loop into smaller parts allows selective unrolling.",
+        "estimated_impact": "medium",
+        "safety_concern": "Loop fission may change memory access patterns.",
+    },
+    "UnrollTooExpensive": {
+        "description": "Add #pragma clang loop unroll(enable) with explicit count",
+        "reasoning": "Runtime unrolling is disabled by default due to cost. "
+                     "A pragma with explicit count enables controlled unrolling.",
+        "estimated_impact": "medium",
+        "safety_concern": "Explicit unroll factors increase code size.",
+    },
 }
 
 # Alignment-based pattern: triggered when max_alignment <= 1
@@ -70,7 +133,8 @@ class MockLLMBackend(AbstractLLMBackend):
         suggestions = []
 
         for diag in request.diagnostics:
-            if diag.severity != RemarkSeverity.MISSED:
+            # Accept both missed (LV) and analysis (SLP/Unroll) severities
+            if diag.severity not in (RemarkSeverity.MISSED, RemarkSeverity.ANALYSIS):
                 continue
 
             remark_id = diag.remark_id

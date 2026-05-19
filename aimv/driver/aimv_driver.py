@@ -504,10 +504,29 @@ def process_single_function(
 # --from-json entry point (T3.8)
 # ---------------------------------------------------------------------------
 
+def _load_aimv_json(path: str) -> dict:
+    """Load newline-delimited JSON, merge all diagnostics into first object."""
+    result = {}
+    all_diags = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not result:
+                result = obj
+            all_diags.extend(obj.get("diagnostics", []))
+    if result:
+        result["diagnostics"] = all_diags
+    return result
+
 def main_from_json(aimv_json_path: str, source_file: str) -> int:
     """--from-json entry: called by clang Driver fork+exec."""
-    with open(aimv_json_path) as f:
-        aimv_data = json.load(f)
+    aimv_data = _load_aimv_json(aimv_json_path)
 
     diagnostics = aimv_data.get("diagnostics", [])
 
@@ -616,8 +635,7 @@ def main_independent(source_file: str, function_name: Optional[str],
 
     # Parse diagnostics
     if Path(initial_json).exists():
-        with open(initial_json) as f:
-            aimv_data = json.load(f)
+        aimv_data = _load_aimv_json(initial_json)
     else:
         aimv_data = opt_info_parser.parse_to_analyze_request(
             build.opt_record_path, function_name or "", source_file)
