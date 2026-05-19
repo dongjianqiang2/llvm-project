@@ -833,6 +833,8 @@ def _format_termination(reason: TerminationReason, rounds_used: int) -> str:
         return "unable to vectorize (test failure)"
     elif reason == TerminationReason.INTERRUPTED:
         return "interrupted by user"
+    elif reason is None:
+        return "unable to vectorize (interrupted)"
     else:
         return f"unable to vectorize ({reason.value})"
 
