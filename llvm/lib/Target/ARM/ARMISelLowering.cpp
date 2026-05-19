@@ -3876,13 +3876,20 @@ SDValue ARMTargetLowering::LowerGlobalAddressELF(SDValue Op,
   const TargetMachine &TM = getTargetMachine();
   bool IsRO = isReadOnly(GV);
 
-  // promoteToConstantPool only if not generating XO text section
-  if (TM.shouldAssumeDSOLocal(*GV->getParent(), GV) && !Subtarget->genExecuteOnly())
+  // promoteToConstantPool only if not generating XO text section.
+  // Weak symbols may be overridden at link time, so don't inline them.
+  if (TM.shouldAssumeDSOLocal(*GV->getParent(), GV) && !Subtarget->genExecuteOnly() &&
+      !GV->isWeakForLinker())
     if (SDValue V = promoteToConstantPool(this, GV, DAG, PtrVT, dl))
       return V;
 
   if (isPositionIndependent()) {
-    bool UseGOT_PREL = !TM.shouldAssumeDSOLocal(*GV->getParent(), GV);
+    // Weak symbols need GOT indirection even when hidden/DSO-local.
+    // The assembler eagerly resolves PC-relative expressions when the
+    // symbol and reference are in the same section, which prevents the
+    // linker from overriding a weak definition with a strong one.
+    bool UseGOT_PREL = !TM.shouldAssumeDSOLocal(*GV->getParent(), GV) ||
+                       GV->isWeakForLinker();
     SDValue G = DAG.getTargetGlobalAddress(GV, dl, PtrVT, 0,
                                            UseGOT_PREL ? ARMII::MO_GOT : 0);
     SDValue Result = DAG.getNode(ARMISD::WrapperPIC, dl, PtrVT, G);

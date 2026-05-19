@@ -2950,7 +2950,9 @@ bool ARMFastISel::tryToFoldLoadIntoMI(MachineInstr *MI, unsigned OpNo,
 }
 
 unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV, MVT VT) {
-  bool UseGOT_PREL = !TM.shouldAssumeDSOLocal(*GV->getParent(), GV);
+  // Weak symbols need GOT indirection even when hidden/DSO-local.
+  bool UseGOT_PREL = !TM.shouldAssumeDSOLocal(*GV->getParent(), GV) ||
+                     GV->isWeakForLinker();
 
   LLVMContext *Context = &MF->getFunction().getContext();
   unsigned ARMPCLabelIndex = AFI->createPICLabelUId();

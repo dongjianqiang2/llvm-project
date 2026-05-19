@@ -360,12 +360,22 @@ bool ARMSubtarget::isGVIndirectSymbol(const GlobalValue *GV) const {
       (GV->isDeclarationForLinker() || GV->hasCommonLinkage()))
     return true;
 
+  // In ELF PIC mode, weak symbols referenced via the constant pool use a
+  // PC-relative expression (e.g. .long xxx-(.LPC+8)) that the assembler
+  // eagerly resolves when both the symbol and label are in the same section.
+  // This prevents the linker from overriding a weak definition with a strong
+  // one. Use GOT indirection for weak symbols to avoid this.
+  if (isTargetELF() && TM.isPositionIndependent() &&
+      GV->isWeakForLinker())
+    return true;
+
   return false;
 }
 
 bool ARMSubtarget::isGVInGOT(const GlobalValue *GV) const {
   return isTargetELF() && TM.isPositionIndependent() &&
-         !TM.shouldAssumeDSOLocal(*GV->getParent(), GV);
+         (!TM.shouldAssumeDSOLocal(*GV->getParent(), GV) ||
+          GV->isWeakForLinker());
 }
 
 unsigned ARMSubtarget::getMispredictionPenalty() const {
