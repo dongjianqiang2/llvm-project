@@ -1,45 +1,42 @@
 # AIMV — AI Multi-Level Vectorization
 
-AI-driven compiler optimization feedback system. Automatically identifies vectorization
-failures in C/C++ loops, queries an LLM for source-level fixes, applies patches, and
+AI-driven compiler optimization feedback loop. Automatically identifies vectorization
+failures across **LoopVectorize**, **SLP Vectorizer**, and **Loop Unrolling** passes,
+queries an LLM for source-level fixes, applies patches with atomic rollback, and
 verifies correctness — all in a closed iteration loop.
 
 ```
-compile → diagnose failures → AI analysis → source patch → recompile + test → repeat
+compile → diagnose (LV+SLP+Unroll) → AI analysis → source patch → recompile + verify → repeat
 ```
 
 ## Architecture
 
 ```
-┌──────────────┐     JSON      ┌─────────────┐     HTTP      ┌──────────────┐
-│  LLVM Pass   │──────────────▶│  Driver      │─────────────▶│  MCP Server  │
-│  !aimv.diag  │               │  (Python)    │              │  (FastAPI)   │
-│  → JSON      │               │  orchestrate │              │  → LLM       │
-└──────────────┘               └─────────────┘              └──────────────┘
-                                                              │
-                                              ┌───────────────┼───────────────┐
-                                              │               │               │
-                                              ▼               ▼               ▼
-                                          OpenAI          DeepSeek        Anthropic
-                                         (GPT-4o)        (V4-Pro)        (Claude)
+┌──────────────────┐   NDJSON    ┌──────────────┐    HTTP     ┌────────────────┐
+│  LLVM Passes      │───────────▶│  Driver       │───────────▶│  MCP Server     │
+│  LV + SLP + Unroll│            │  (Python CLI) │            │  (FastAPI)      │
+│  → !aimv.diag     │            │  orchestrate  │            │  → LLM backend  │
+│  → aimv.json      │            │  patch+verify │            │  → AnalyzeResp  │
+└──────────────────┘            └──────────────┘            └────────────────┘
 ```
 
 Three subsystems:
 
 | Component | Language | Role |
 |-----------|----------|------|
-| **LLVM Pass** (`AIMVFeedbackPass`) | C++ | Collects structured diagnostics from LoopVectorize into `!aimv.diag` Named Metadata, serializes to JSON |
-| **Driver** (`aimv-driver`) | Python | Orchestrates compile→diagnose→MCP→patch→recompile iteration loop |
-| **MCP Server** (`aimv-server`) | Python/FastAPI | Receives diagnostic JSON, constructs LLM prompt, returns structured `AnalyzeResponse` with unified diffs |
+| **LLVM Passes** | C++ | LoopVectorize, SLPVectorize, LoopUnroll emit diagnostics via `emitAIMVDiagnostic()` into `!aimv.diag` Named Metadata. `AIMVFeedbackPass` parses and serializes to NDJSON. |
+| **Driver** (`aimv-driver`) | Python | Orchestrates compile → diagnose → MCP → patch → recompile → verify loop. Supports multi-function sequential processing with rollback. |
+| **MCP Server** (`aimv-server`) | Python/FastAPI | Receives `AnalyzeRequest`, builds prompt with source context + IR + cost model, calls LLM, returns `AnalyzeResponse` with unified diffs. |
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.10+
-- LLVM 21+ (for Pass mode; optional for YAML mode)
+- LLVM 21 with ARM/AArch64 target (for pass mode)
+- `patch` command (for applying diffs)
 
-### 1. Build LLVM with AIMV Pass (optional for YAML mode)
+### 1. Build LLVM with AIMV Pass
 
 ```bash
 cmake -S llvm -B build -G Ninja \
@@ -49,315 +46,310 @@ cmake -S llvm -B build -G Ninja \
 ninja -C build clang opt
 ```
 
-### 2. One-click setup (recommended)
+### 2. Install Python dependencies
 
 ```bash
-bash aimv/setup.sh
+pip install fastapi uvicorn httpx pyyaml jinja2 openai anthropic
 ```
 
-This auto-detects Python, installs all dependencies, generates `.env` and `start_server.sh`.
-
-### 3. Configure API keys
-
-Edit the generated `.env` file:
+### 3. Start MCP Server
 
 ```bash
-vim aimv/.env
+cd aimv
+
+# Anthropic backend (e.g. glm-5.1 via BigModel)
+ANTHROPIC_API_KEY="your-key" \
+ANTHROPIC_BASE_URL="https://open.bigmodel.cn/api/anthropic" \
+ANTHROPIC_MODEL="glm-5.1" \
+AIMV_LLM_BACKEND="anthropic" \
+python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080
+
+# OpenAI backend
+OPENAI_API_KEY="sk-..." \
+OPENAI_BASE_URL="https://api.openai.com/v1" \
+OPENAI_MODEL="gpt-4o" \
+AIMV_LLM_BACKEND="openai" \
+python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080
+
+# Mock backend (offline testing, returns known suggestions for known patterns)
+AIMV_LLM_BACKEND="mock" \
+python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080
 ```
 
-Minimal config for DeepSeek:
-
-```ini
-AIMV_LLM_BACKEND=openai
-AIMV_LLM_BASE_URL=https://api.deepseek.com/v1
-OPENAI_API_KEY=sk-your-deepseek-key
-AIMV_LLM_MODEL=deepseek-v4-pro
-```
-
-### 4. Start MCP Server
+### 4. Run analysis
 
 ```bash
-bash aimv/start_server.sh
+# Generate aimv.json with all diagnostic passes
+clang -O2 -g --target=armv7-unknown-linux-gnueabi -S -emit-llvm src.c -o src.ll
+opt -passes="loop-vectorize,slp-vectorizer,loop-unroll,aimv-feedback" -S src.ll \
+    -aimv-output=aimv.json -aimv-enable
+
+# Run driver with MCP server
+cd aimv
+python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
+    --mcp-url http://localhost:8080 --max-rounds 3
+
+# Target a specific function
+python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
+    --function process_task --mcp-url http://localhost:8080
 ```
 
-Or manually choose your LLM backend:
+## Environment Variables
 
-```bash
-# ── DeepSeek (OpenAI-compatible, 已验证) ──
-AIMV_LLM_BACKEND=openai \
-  AIMV_LLM_BASE_URL=https://api.deepseek.com/v1 \
-  OPENAI_API_KEY=sk-your-deepseek-key \
-  AIMV_LLM_MODEL=deepseek-v4-pro \
-  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+### MCP Server
 
-# ── DeepSeek (Anthropic-compatible) ──
-# DeepSeek 同时提供 Anthropic Messages API 兼容端点
-AIMV_LLM_BACKEND=anthropic \
-  AIMV_LLM_BASE_URL=https://api.deepseek.com/anthropic \
-  ANTHROPIC_API_KEY=sk-your-deepseek-key \
-  AIMV_LLM_MODEL=deepseek-v4-pro \
-  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AIMV_LLM_BACKEND` | Yes | `openai` / `anthropic` / `mock` |
+| `OPENAI_API_KEY` | openai only | API key |
+| `OPENAI_BASE_URL` | openai only | Base URL (e.g. `https://api.openai.com/v1`) |
+| `OPENAI_MODEL` | openai only | Model name (e.g. `gpt-4o`) |
+| `ANTHROPIC_API_KEY` | anthropic only | API key |
+| `ANTHROPIC_BASE_URL` | anthropic only | Base URL (e.g. `https://open.bigmodel.cn/api/anthropic`) |
+| `ANTHROPIC_MODEL` | anthropic only | Model name (e.g. `glm-5.1`) |
+| `AIMV_API_KEY` | No | Enable Bearer token auth on all endpoints |
+| `AIMV_CACHE_TTL` | No | Diagnostic cache TTL in seconds (default: 86400) |
 
-# ── OpenAI ──
-AIMV_LLM_BACKEND=openai \
-  OPENAI_API_KEY=sk-... \
-  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
+All three backend-specific variables (API_KEY, BASE_URL, MODEL) are **required**.
+The server refuses to start if any is missing.
 
-# ── Anthropic ──
-AIMV_LLM_BACKEND=anthropic \
-  ANTHROPIC_API_KEY=sk-ant-... \
-  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
-
-# ── 本地/代理 (vLLM / Ollama / LiteLLM 等) ──
-AIMV_LLM_BACKEND=openai \
-  AIMV_LLM_BASE_URL=http://localhost:8000/v1 \
-  OPENAI_API_KEY=not-needed \
-  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
-
-# ── Mock 模式 (无需 API Key，返回空建议) ──
-AIMV_LLM_BACKEND=mock \
-  uvicorn aimv.mcp_server.aimv_server:app --host 0.0.0.0 --port 8080
-```
-
-### 5. Run analysis
-
-```bash
-# Pass mode (full diagnostics: cost model + dependency analysis)
-aimv-driver --function=process_task --mcp-url=http://localhost:8080 \
-  aimv/benchmarks/dep_fail_alias.c
-
-# YAML mode (zero LLVM modification, fewer diagnostics)
-aimv-driver --function=process_task --mode=yaml --mcp-url=http://localhost:8080 \
-  aimv/benchmarks/dep_fail_alias.c
-
-# Dry run (diagnostics only, no MCP call)
-aimv-driver --function=process_task --dry-run \
-  aimv/benchmarks/dep_fail_alias.c
-
-# Interactive mode (pause for human approval before applying each patch)
-aimv-driver --function=process_task --require-review --mcp-url=http://localhost:8080 \
-  aimv/benchmarks/dep_fail_alias.c
-```
-
-## LLM Backend Configuration
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `AIMV_LLM_BACKEND` | Yes | `mock` | `openai` / `anthropic` / `mock` |
-| `AIMV_LLM_MODEL` | No | `gpt-4o` | Model name |
-| `AIMV_LLM_BASE_URL` | No | SDK default | Custom API endpoint (proxy / local / compatible service) |
-| `OPENAI_API_KEY` | OpenAI only | — | OpenAI/DeepSeek API key |
-| `ANTHROPIC_API_KEY` | Anthropic only | — | Anthropic API key |
-| `DEEPSEEK_API_KEY` | DeepSeek only | — | DeepSeek API key (convenience alias) |
-| `AIMV_API_KEY` | No | — | MCP Server auth key (set to enable Bearer auth on all endpoints) |
-| `AIMV_CACHE_TTL` | No | `86400` | Diagnostic cache TTL in seconds |
-
-### Supported LLM Providers
+### LLM Providers
 
 | Provider | Backend | Protocol | Verified |
 |----------|---------|----------|----------|
-| **DeepSeek** | `openai` | OpenAI-compatible | ✅ Live tested |
-| **DeepSeek** | `anthropic` | Anthropic-compatible | ✅ Live tested |
-| **OpenAI** | `openai` | Native | SDK verified |
-| **Anthropic** | `anthropic` | Anthropic Messages | SDK verified |
-| **vLLM** | `openai` | OpenAI-compatible | Compatible |
-| **Ollama** | `openai` | OpenAI-compatible | Compatible |
-| **阿里百炼** | `openai` | OpenAI-compatible | Compatible |
-| Any OpenAI-compatible | `openai` | OpenAI-compatible | Compatible |
+| **Zhipu GLM** | `anthropic` | Anthropic Messages | Live tested |
+| **OpenAI** | `openai` | Chat Completions | SDK verified |
+| **DeepSeek** | `openai` | OpenAI-compatible | Compatible |
+| **vLLM / Ollama** | `openai` | OpenAI-compatible | Compatible |
+| Any OpenAI-compatible | `openai` | Chat Completions | Compatible |
+| Any Anthropic-compatible | `anthropic` | Messages API | Compatible |
 
-### DeepSeek 双端点
+## Diagnostic Passes
 
-DeepSeek 同时提供两种 API 端点：
+AIMV collects diagnostics from **three LLVM passes**, all sharing the `!aimv.diag` channel:
 
-| 端点 | 协议 | 配置 |
-|------|------|------|
-| `https://api.deepseek.com/v1` | OpenAI Chat Completions | `AIMV_LLM_BACKEND=openai` |
-| `https://api.deepseek.com/anthropic` | Anthropic Messages | `AIMV_LLM_BACKEND=anthropic` |
+| Pass | Remark IDs | Has Loop | Has LAI | Has Cost |
+|------|-----------|----------|---------|----------|
+| **LoopVectorize** | `CantReorderMemOps`, `UnsafeDep`, `VectorizationNotBeneficial`, `InterleavingNotBeneficial`, `LoopVectorized` | Yes | Yes | Yes |
+| **SLP Vectorizer** | `UnsupportedType`, `SmallVF`, `NotBeneficial`, `NotPossible` | No | No | No |
+| **Loop Unrolling** | `CantUnrollTripCount`, `UnrollNotBeneficial`, `UnrollTooExpensive` | Yes | No | No |
 
-两个端点共用同一个 API Key，模型名相同（如 `deepseek-v4-pro`）。
-Anthropic 端点适合已集成 Anthropic SDK 的项目；OpenAI 端点更通用。
+When LAI or CostModel is unavailable (SLP/Unroll), sentinel values (`-1`) are used.
+The JSON output uses newline-delimited JSON (NDJSON) — one JSON object per function.
 
-### Protocol
-
-MCP Server 支持两种底层 LLM 协议：
-
-- **OpenAI 协议** (`AIMV_LLM_BACKEND=openai`): `POST /v1/chat/completions`，system prompt 在 `messages[0]`，强制 JSON 输出通过 `response_format: json_object`
-- **Anthropic 协议** (`AIMV_LLM_BACKEND=anthropic`): `POST /v1/messages`，system prompt 在顶层 `system` 字段，JSON 约束通过 prompt 注入
-
-`AIMV_LLM_BASE_URL` 可指向任意兼容端点。
-
-## Usage
-
-### Driver CLI
+## Driver CLI
 
 ```
-aimv-driver [OPTIONS] <source_file>
+python3 -m driver.aimv_driver [OPTIONS]
 
-OPTIONS:
-  --function FUNC         Target function name (required)
-  --aimv-level LEVEL      Modification aggressiveness:
-                            conservative | moderate | aggressive (default: moderate)
-  --max-rounds N          Max iteration rounds (default: 5)
-  --mcp-url URL           MCP server URL (default: http://localhost:8080)
-  --output-dir DIR        Output directory (default: ./aimv-output)
-  --mode MODE             Diagnostic source: pass (AIMVFeedbackPass) | yaml (opt-records)
-  --dry-run               Collect diagnostics only, skip MCP + source modification
-  --test-cmd CMD          Test command for verification
-  --measure-perf          Enable performance measurement
-  --resume SESSION_ID     Resume from saved session
-  --list-sessions         List all saved sessions
-  --verbose               Verbose output
+Options:
+  --from-json PATH       Read diagnostics from aimv.json (produced by opt)
+  --source PATH          Source file (required with --from-json)
+  --function NAME        Process only this function
+  --mcp-url URL          MCP server URL (default: http://localhost:8080)
+  --max-rounds N         Max iteration rounds per function (default: 5)
+  --aimv-level LEVEL     conservative | moderate | aggressive (default: conservative)
+  --output-dir DIR       Output directory (default: ./aimv-output)
+  --dry-run              Collect diagnostics only, skip MCP
+  --verbose              Verbose output
 ```
 
-### LLVM Pass (standalone with opt)
+## MCP Server API
 
-```bash
-# Compile C to IR, then run AIMV pass
-clang -O2 -S -emit-llvm -g src.c -o src.ll
-opt -passes="loop-vectorize,aimv-feedback" \
-  -pass-remarks-output=opt.yaml \
-  -pass-remarks-missed=loop-vectorize \
-  -aimv-output=aimv.json \
-  -S src.ll -o /dev/null
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/analyze-vectorization` | POST | Analyze vectorization failures, return suggestions |
+| `/api/v1/health` | GET | Server health + backend info |
+| `/api/v1/cache/stats` | GET | Diagnostic cache statistics |
+| `/api/v1/feedback` | POST | Record suggestion outcome for prompt optimization |
+
+Authentication (optional): `Authorization: Bearer <AIMV_API_KEY>`
+
+### Request Format
+
+```json
+{
+  "request_id": "aimv-...",
+  "target": {"triple": "armv7-...", "cpu": "cortex-a9", "features": ["+neon"], "vector_width": 128},
+  "function": {"name": "process_task", "source_code": "void f(...) {...}", "source_file": "src.c", "loop_line": 5},
+  "diagnostics": [
+    {
+      "pass_name": "LoopVectorize", "remark_id": "CantReorderMemOps",
+      "severity": "missed", "loop_location": "src.c:5:3",
+      "source_context": "2: void f(...) {\n3:   for ...\n...",
+      "ir_snippet": "define void @f(...) { ...",
+      "cost_model": {"scalar_cost": 5, "vector_cost": 8, "vf": 4},
+      "dependencies": [{"dep_type": "Backward", "source_ptr": "store", ...}],
+      "memory_info": {"num_stores": 1, "max_alignment": 4, "stride": "non-constant", ...},
+      "loop_info": {"num_blocks": 1, "trip_count": -1, ...}
+    }
+  ],
+  "history": [],
+  "aimv_level": "conservative"
+}
 ```
 
-### Clang Integrated
+### Response Format
 
-```bash
-clang -O2 \
-  -fsave-optimization-record=opt.yaml \
-  -aimv-output=aimv.json \
-  -Rpass-missed=loop-vectorize \
-  -g src.c -o task
+```json
+{
+  "request_id": "aimv-...",
+  "suggestions": [{
+    "description": "Add restrict qualifier to pointer parameters",
+    "reasoning": "Alias analysis failed because...",
+    "diff": "--- a/src.c\n+++ b/src.c\n@@ -1,5 +1,5 @@\n ...",
+    "estimated_impact": "high",
+    "safety_concern": "Restrict requires that pointers do not alias at runtime."
+  }],
+  "overall_analysis": "summary paragraph",
+  "confidence": 0.85,
+  "no_action_possible": false
+}
 ```
-
-### MCP Server API
-
-```
-POST /api/v1/analyze-vectorization   — Analyze vectorization failure
-GET  /api/v1/health                  — Health check
-GET  /api/v1/cache/stats             — Cache statistics
-POST /api/v1/feedback                — Record suggestion result for prompt optimization
-```
-
-Authentication (optional): `Authorization: Bearer <AIMV_API_KEY>`.
-
-## Configuration
-
-Default config at `aimv/config/aimv_config.yaml`:
-
-```yaml
-aimv:
-  max_rounds: 5
-  aimv_level: moderate
-  mcp:
-    url: http://localhost:8080
-    timeout_seconds: 60
-  build:
-    cc: clang
-    cflags: -O2 -fsave-optimization-record -g
-  verify:
-    test_cmd: make test
-    measure_perf: false
-  output:
-    dir: ./aimv-output
-```
-
-## Modification Levels
-
-| Level | Allowed Changes |
-|-------|----------------|
-| **conservative** | `restrict`, `const`, `alignas`, `#pragma clang loop vectorize(enable)`, `__builtin_assume` |
-| **moderate** | Above + loop fission/distribution, interchange, scalar promotion, reduction adjustment |
-| **aggressive** | Above + AoS→SoA conversion, algorithm substitution (requires developer confirmation) |
 
 ## Iteration Flow
 
 ```
-Round N:
-  1. COMPILE   → clang -O2 -fsave-optimization-record -aimv-output=aimv.json
-  2. CHECK     → parse JSON: any missed loops?
-  3. MCP       → POST /api/v1/analyze-vectorization
-  4. PATCH     → apply unified diff, save backup
-  5. VERIFY    → recompile, run tests
-  6. MEASURE   → (optional) perf stat comparison
-  ──▶ SUCCESS (all loops vectorized)
-  ──▶ CONTINUE (still missed, try next round)
-  ──▶ ROLLBACK (test failure / perf regression)
-  ──▶ GIVE_UP (max rounds / no suggestion available)
+Function: process_task
+  Round 1:
+    1. COMPILE   → clang -c -g -mllvm -aimv-enable -mllvm -aimv-output=aimv.json src.c
+    2. DIAGNOSE  → parse NDJSON, filter by function_name
+    3. MCP       → POST /api/v1/analyze-vectorization
+    4. PATCH     → apply_shadow_patch (diff → .aimv-tmp shadow file)
+    5. VERIFY    → compile shadow file, check vectorization status
+    6. COMMIT    → commit_shadow (atomic replace original with shadow)
+    → Continue if still missed loops
+
+  Round N (failure):
+    4. PATCH     → apply_shadow_patch FAILS (malformed diff)
+    → Rollback all previous rounds' patches for this function
+    → BREAK — terminate function processing
+
+  Termination:
+    → VECTORIZED  — all loops vectorized
+    → ROUND_LIMIT — max rounds reached
+    → ROLLBACK    — patch/compile/test failure, source restored
+```
+
+## Rollback Mechanism
+
+Every patch application creates a backup before modifying the source.
+When any round fails, all patches applied in previous rounds for the
+**same function** are rolled back in reverse order, restoring the file
+to its original state.
+
+| Failure | Action |
+|---------|--------|
+| Patch apply fails (malformed diff) | Rollback all → BREAK |
+| Shadow compile fails | Discard shadow → Rollback all → engine.decide |
+| Vectorization regression | Discard shadow → Rollback all → BREAK |
+| Test failure | Discard shadow → Rollback all → BREAK |
+
+## Project Structure
+
+```
+aimv/
+├── README.md
+├── setup.sh                         # One-click server setup
+├── driver/                          # Python CLI driver
+│   ├── aimv_driver.py               #   Entry point + main loop
+│   ├── build_orchestrator.py        #   clang subprocess management
+│   ├── source_manager.py            #   Shadow file + rollback + FileLock
+│   ├── iteration_engine.py          #   Decision matrix + level escalation
+│   ├── mcp_client.py                #   HTTP client for MCP server
+│   ├── config.py                    #   DriverConfig: env > YAML > defaults
+│   ├── models.py                    #   Data models + enums
+│   ├── session_store.py             #   Session persistence
+│   ├── logger.py                    #   [AIMV]-prefixed logging
+│   └── requirements.txt
+├── mcp_server/                      # FastAPI REST server
+│   ├── aimv_server.py               #   Entry point + endpoints
+│   ├── models.py                    #   Pydantic request/response models
+│   ├── prompt_builder.py            #   Prompt construction
+│   ├── suggestion_parser.py         #   LLM output → AnalyzeResponse
+│   ├── cache.py                     #   Diagnostic fingerprint cache
+│   ├── middleware.py                #   API key auth + error handler
+│   ├── llm/                         #   LLM backends
+│   │   ├── base.py                  #     AbstractLLMBackend
+│   │   ├── openai_backend.py        #     OpenAI Chat Completions
+│   │   ├── anthropic_backend.py     #     Anthropic Messages
+│   │   └── mock_backend.py          #     Pattern-based offline testing
+│   ├── templates/                   #   Prompt templates
+│   │   ├── cost_reject_prompt.txt
+│   │   ├── align_prompt.txt
+│   │   ├── loop_transform_prompt.txt
+│   │   ├── slp_prompt.txt
+│   │   └── unroll_prompt.txt
+│   └── requirements.txt
+├── ci/                              # CI integration
+│   ├── aimv_detect_changes.py
+│   ├── aimv_run_batch.py
+│   ├── aimv_report.py
+│   └── aimv_gate.py
+├── benchmarks/                      # C benchmark files
+│   ├── dep_fail_alias.c             #   Alias analysis failure
+│   ├── dep_fail_stride.c            #   Stride failure
+│   ├── cost_reject.c                #   Cost model rejection
+│   ├── align_unknown.c              #   Alignment unknown
+│   ├── multi_fail.c                 #   Multi-dimension failure
+│   └── tsvc_aimv_suite.c            #   25-function TSVC-style suite
+├── test/                            # Python test suite (330+ cases)
+│   ├── test_aimv_driver.py
+│   ├── test_source_manager.py
+│   ├── test_iteration_engine.py
+│   ├── test_mcp_server.py
+│   ├── test_prompt_builder.py
+│   ├── test_e2e_loop.py
+│   └── ... (28 test files)
+└── config/                          # YAML config templates
+    └── aimv_config.yaml
+```
+
+LLVM-side code (in the monorepo):
+
+```
+llvm/
+├── include/llvm/Analysis/
+│   └── AIMVDiagnostic.h             #   emitAIMVDiagnostic() + AIMVCostSnapshot
+├── lib/Analysis/
+│   ├── AIMVDiagnostic.cpp           #   emitAIMVDiagnostic() implementation
+│   └── LoopAccessAnalysis.cpp       #   UnsafeDep insertion point
+├── lib/Transforms/AIMV/
+│   ├── AIMVFeedbackPass.cpp         #   !aimv.diag → NDJSON
+│   ├── AIMVDiagnosticParser.cpp     #   Metadata parser
+│   └── CMakeLists.txt
+├── lib/Transforms/Vectorize/
+│   ├── LoopVectorize.cpp            #   4 insertion points (LV)
+│   └── SLPVectorizer.cpp            #   4 insertion points (SLP)
+├── lib/Transforms/Scalar/
+│   └── LoopUnrollPass.cpp           #   3 insertion points (Unroll)
+├── include/llvm/Transforms/AIMV/
+│   └── AIMVFeedback.h              #   AIMVFeedbackPass + AIMVDiagnostic
+└── test/Transforms/AIMV/            #   19 llvm-lit tests
 ```
 
 ## Running Tests
 
 ```bash
-# Python unit tests (158+ cases)
-pytest aimv/test/ -v
+# Python tests (330+ cases)
+cd aimv && python3 -m pytest test/ -q
 
-# LLVM Lit tests (requires built opt + FileCheck)
-build/bin/opt -passes="loop-vectorize,aimv-feedback" \
-  -pass-remarks-output=/tmp/t.yaml -pass-remarks-missed=loop-vectorize \
-  -aimv-output=/tmp/aimv.json -S \
-  llvm/test/Transforms/AIMV/aimv_diag_metadata.ll -o /dev/null
+# LLVM lit tests (19 cases, requires built opt)
+build/bin/llvm-lit -v llvm/test/Transforms/AIMV/
 
-# Benchmark compilation tests (requires clang)
-pytest aimv/test/test_benchmarks.py -v
+# E2E with mock backend
+cd aimv
+AIMV_LLM_BACKEND=mock python3 -m uvicorn mcp_server.aimv_server:app --host 127.0.0.1 --port 8080 &
+python3 -m driver.aimv_driver --from-json aimv.json --source src.c \
+    --mcp-url http://localhost:8080 --max-rounds 2
 ```
-
-## Project Structure
-
-```
-├── README.md
-├── CLAUDE.md                         # Workspace guidance
-├── TASK.md                           # Atomic task list (49 tasks)
-├── aimv_design_doc/                  # Design documents
-│   ├── SPEC.md                       #   Requirements specification
-│   ├── PLAN.md                       #   Technical plan + data models
-│   ├── LLVM_DESIGN.md                #   LLVM Pass design
-│   ├── DRIVER_DESIGN.md              #   Driver design
-│   ├── MCP_DESIGN.md                 #   MCP Server design
-│   └── CI_DESIGN.md                  #   CI/CD design
-├── aimv/                             # Implementation
-│   ├── driver/                       #   Python driver
-│   ├── mcp_server/                   #   MCP REST API server
-│   │   └── llm/                      #     LLM backends (OpenAI, Anthropic)
-│   ├── ci/                           #   CI integration tools
-│   ├── test/                         #   Test suite
-│   ├── benchmarks/                   #   C benchmark files
-│   └── config/                       #   YAML config templates
-├── llvm/                             # LLVM source (monorepo)
-│   ├── lib/Transforms/AIMV/          #   AIMVFeedbackPass
-│   ├── lib/Transforms/Vectorize/     #   AIMVDiagnostic.h + LoopVectorize patches
-│   └── include/llvm/Transforms/AIMV/ #   Public headers
-└── .github/workflows/                # GitHub Actions CI
-```
-
-## CI Integration
-
-GitHub Actions workflow at `.github/workflows/aimv-analysis.yml`:
-
-- Triggered on PRs touching `*.c`/`*.cpp`/`*.h`
-- Detects changed functions via `aimv-detect-changes`
-- Runs batch AIMV analysis with `aimv-run-batch`
-- Posts Markdown report as PR comment
-
-CI tools:
-
-| Tool | Purpose |
-|------|---------|
-| `aimv-detect-changes` | Git diff → changed function list |
-| `aimv-run-batch` | Parallel batch AIMV analysis |
-| `aimv-report` | Session JSON → Markdown report |
-| `aimv-gate` | Gate decision (report/regression/enforce) |
 
 ## Design Decisions
 
-- **Source-level modification**: AI suggests C/C++ source changes (not IR patches) — developer reviewable
+- **Source-level modification**: LLM suggests C source changes (not IR), developer-reviewable
+- **Three-pass diagnostics**: LV + SLP + Unroll share the same `!aimv.diag` / NDJSON channel
 - **One change per iteration**: minimizes risk, easy to verify
-- **OpenAI-compatible protocol**: universal, works with any LLM provider or local model
-- **Multi-provider support**: OpenAI, DeepSeek, Anthropic, any compatible service
-- **Remote LLM**: strongest model quality, team-shared analysis history
-- **Multi-layer safety**: developer review → compile check → test suite → optional Alive2 verification
-- **Independent from EmbeddedJIT**: completely separate system, no shared components
+- **Atomic shadow file protocol**: cp → patch shadow → atomic replace, with backup for rollback
+- **Per-function rollback**: on failure, only the current function's patches are reversed
+- **NDJSON output**: one JSON line per function, parsed by `_load_aimv_json()` merging all
 - **LLVM baseline: 21**: all API calls verified against this version
