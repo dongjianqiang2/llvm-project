@@ -852,7 +852,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--aimv-level", default="conservative",
                         choices=["conservative", "moderate", "aggressive"])
     parser.add_argument("--max-rounds", type=int, default=5)
-    parser.add_argument("--mcp-url", default="http://localhost:8080")
+    parser.add_argument("--mcp-url", default=None)
     parser.add_argument("--output-dir", default="./aimv-output")
     parser.add_argument("--test-cmd", dest="test_cmd", default="")
     parser.add_argument("--dry-run", action="store_true")
@@ -876,7 +876,7 @@ def main(argv=None):
         config.aimv_level = args.aimv_level
     if args.max_rounds:
         config.max_rounds = args.max_rounds
-    if args.mcp_url:
+    if args.mcp_url is not None:
         config.mcp_url = args.mcp_url
     if args.output_dir:
         config.output_dir = args.output_dir
