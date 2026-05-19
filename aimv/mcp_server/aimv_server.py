@@ -237,12 +237,25 @@ async def analyze_loop_transform(request: Request):
 
 
 def _create_backend(backend_name: str):
-    """Dynamically create LLM backend instance."""
+    """Dynamically create LLM backend instance.
+
+    OpenAI backend env vars:
+      OPENAI_API_KEY   — API key (required)
+      OPENAI_BASE_URL  — custom base URL (optional, e.g. https://api.openai.com/v1)
+      OPENAI_MODEL     — model name (optional, falls back to AIMV_LLM_MODEL then gpt-4o)
+
+    Anthropic backend env vars:
+      ANTHROPIC_API_KEY  — API key (required)
+      ANTHROPIC_BASE_URL — custom base URL (optional, e.g. https://open.bigmodel.cn/api/anthropic)
+      ANTHROPIC_MODEL    — model name (optional, falls back to AIMV_LLM_MODEL then claude-sonnet-4-6)
+    """
     if backend_name == "openai":
         from .llm.openai_backend import OpenAIBackend
         return OpenAIBackend({
             "api_key": os.environ.get("OPENAI_API_KEY", ""),
-            "model": os.environ.get("AIMV_LLM_MODEL", "gpt-4o"),
+            "base_url": os.environ.get("OPENAI_BASE_URL", ""),
+            "model": os.environ.get("OPENAI_MODEL",
+                       os.environ.get("AIMV_LLM_MODEL", "gpt-4o")),
         })
     elif backend_name == "anthropic":
         from .llm.anthropic_backend import AnthropicBackend
@@ -251,11 +264,5 @@ def _create_backend(backend_name: str):
             "base_url": os.environ.get("ANTHROPIC_BASE_URL", ""),
             "model": os.environ.get("ANTHROPIC_MODEL",
                        os.environ.get("AIMV_LLM_MODEL", "claude-sonnet-4-6")),
-        })
-    elif backend_name == "deepseek":
-        from .llm.deepseek_backend import DeepSeekBackend
-        return DeepSeekBackend({
-            "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
-            "model": os.environ.get("AIMV_LLM_MODEL", "deepseek-v4-pro"),
         })
     return None
