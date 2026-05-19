@@ -1,6 +1,6 @@
 #!/bin/bash
 # [AIMV] One-click server setup script
-# Usage: bash setup.sh [--dev] [--gpu]
+# Usage: bash setup.sh
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -42,13 +42,13 @@ $PYTHON -m pip install --break-system-packages -q \
 # ── Install MCP server dependencies ──
 echo "[3/4] Installing aimv-server dependencies..."
 $PYTHON -m pip install --break-system-packages -q \
-    fastapi uvicorn openai pydantic
+    fastapi uvicorn pydantic
 
-# Optional: Anthropic backend
-ANTHROPIC_SPECIFIED=false
-if $PYTHON -c "import anthropic" 2>/dev/null; then
-    ANTHROPIC_SPECIFIED=true
-fi
+# OpenAI backend (optional)
+$PYTHON -m pip install --break-system-packages -q openai 2>/dev/null || true
+
+# Anthropic backend (optional)
+$PYTHON -m pip install --break-system-packages -q anthropic 2>/dev/null || true
 
 # ── Generate .env template ──
 echo "[4/4] Generating configuration..."
@@ -57,27 +57,23 @@ ENV_FILE="$SCRIPT_DIR/.env"
 if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" << 'ENVEOF'
 # AIMV Server Configuration
-# Copy to .env and fill in your keys.
-# Source with: source .env
+# Choose ONE backend and fill in all three fields.
 
-# LLM Backend: openai | anthropic | mock
+# Backend: openai | anthropic | mock
 AIMV_LLM_BACKEND=mock
 
-# Model name
-AIMV_LLM_MODEL=gpt-4o
-
-# API Key (set ONE based on backend)
+# ─── OpenAI backend (required if AIMV_LLM_BACKEND=openai) ───
 OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o
+
+# ─── Anthropic backend (required if AIMV_LLM_BACKEND=anthropic) ───
 ANTHROPIC_API_KEY=
-DEEPSEEK_API_KEY=
+ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic
+ANTHROPIC_MODEL=glm-5.1
 
-# Custom base URL (leave empty for default)
-# DeepSeek OpenAI:  https://api.deepseek.com/v1
-# DeepSeek Anthropic: https://api.deepseek.com/anthropic
-# vLLM/Ollama:       http://localhost:8000/v1
-AIMV_LLM_BASE_URL=
-
-# MCP Server auth (optional, leave empty to disable)
+# ─── Server settings ───
+# Bearer token auth (optional, leave empty to disable)
 AIMV_API_KEY=
 
 # Cache TTL in seconds (default: 86400 = 24h)
@@ -100,10 +96,25 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 cd "$SCRIPT_DIR"
+
+BACKEND="${AIMV_LLM_BACKEND:-mock}"
 echo "Starting AIMV Server..."
-echo "  Backend: ${AIMV_LLM_BACKEND:-mock}"
-echo "  Model:   ${AIMV_LLM_MODEL:-gpt-4o}"
-echo "  URL:     http://localhost:${AIMV_PORT:-8080}"
+echo "  Backend: $BACKEND"
+
+case "$BACKEND" in
+    openai)
+        echo "  Model:   ${OPENAI_MODEL:-(not set)}"
+        echo "  URL:     ${OPENAI_BASE_URL:-(not set)}"
+        ;;
+    anthropic)
+        echo "  Model:   ${ANTHROPIC_MODEL:-(not set)}"
+        echo "  URL:     ${ANTHROPIC_BASE_URL:-(not set)}"
+        ;;
+    mock)
+        echo "  Model:   mock (offline)"
+        ;;
+esac
+echo "  Listen:  http://localhost:${AIMV_PORT:-8080}"
 echo ""
 
 python3 -m uvicorn mcp_server.aimv_server:app \
@@ -129,12 +140,20 @@ echo "     curl http://localhost:8080/api/v1/health"
 echo ""
 echo "Quick start examples:"
 echo ""
-echo "  # DeepSeek (OpenAI endpoint)"
-echo "  AIMV_LLM_BACKEND=openai \\"
-echo "    AIMV_LLM_BASE_URL=https://api.deepseek.com/v1 \\"
-echo "    OPENAI_API_KEY=sk-... \\"
+echo "  # Anthropic backend"
+echo "  ANTHROPIC_API_KEY=sk-... \\"
+echo "    ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic \\"
+echo "    ANTHROPIC_MODEL=glm-5.1 \\"
+echo "    AIMV_LLM_BACKEND=anthropic \\"
 echo "    bash aimv/start_server.sh"
 echo ""
-echo "  # Mock mode (no API key)"
+echo "  # OpenAI backend"
+echo "  OPENAI_API_KEY=sk-... \\"
+echo "    OPENAI_BASE_URL=https://api.openai.com/v1 \\"
+echo "    OPENAI_MODEL=gpt-4o \\"
+echo "    AIMV_LLM_BACKEND=openai \\"
+echo "    bash aimv/start_server.sh"
+echo ""
+echo "  # Mock mode (offline testing)"
 echo "  AIMV_LLM_BACKEND=mock bash aimv/start_server.sh"
 echo ""
