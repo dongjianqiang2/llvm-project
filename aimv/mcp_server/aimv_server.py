@@ -248,7 +248,9 @@ def _create_backend(backend_name: str):
         from .llm.anthropic_backend import AnthropicBackend
         return AnthropicBackend({
             "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
-            "model": os.environ.get("AIMV_LLM_MODEL", "claude-sonnet-4-6"),
+            "base_url": os.environ.get("ANTHROPIC_BASE_URL", ""),
+            "model": os.environ.get("ANTHROPIC_MODEL",
+                       os.environ.get("AIMV_LLM_MODEL", "claude-sonnet-4-6")),
         })
     elif backend_name == "deepseek":
         from .llm.deepseek_backend import DeepSeekBackend

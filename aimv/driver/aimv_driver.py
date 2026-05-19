@@ -14,10 +14,13 @@ from pathlib import Path
 from typing import Optional
 
 from .config import load_config, DriverConfig
+from .logger import get_logger
 from .build_orchestrator import BuildOrchestrator
 from .source_manager import SourceManager
 from .mcp_client import MCPClient
 from .iteration_engine import IterationEngine
+
+logger = get_logger(__name__)
 from .session_store import SessionStore
 from .models import (
     NextAction, TerminationReason, IterationStatus,
@@ -405,7 +408,15 @@ def process_single_function(
                     sources.release_lock(source_file)
                     continue
 
-                patch = sources.apply_shadow_patch(source_file, diff_text)
+                try:
+                    patch = sources.apply_shadow_patch(source_file, diff_text)
+                except Exception as e:
+                    logger.warning("Patch apply failed, skipping: %s", e)
+                    sources.discard_shadow(source_file)
+                    sources.release_lock(source_file)
+                    round_rec.status = IterationStatus.FAILED
+                    round_rec.finished_at = time.time()
+                    continue
                 round_rec.patch = patch
 
                 # ── Step 4: Compile verify [same lock region] ──
