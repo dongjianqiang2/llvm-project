@@ -563,8 +563,12 @@ def _load_aimv_json(path: str) -> dict:
         result["diagnostics"] = all_diags
     return result
 
-def main_from_json(aimv_json_path: str, source_file: str) -> int:
+def main_from_json(aimv_json_path: str, source_file: str,
+                   config: DriverConfig = None) -> int:
     """--from-json entry: called by clang Driver fork+exec."""
+    if config is None:
+        config = load_config()
+
     aimv_data = _load_aimv_json(aimv_json_path)
 
     diagnostics = aimv_data.get("diagnostics", [])
@@ -578,8 +582,6 @@ def main_from_json(aimv_json_path: str, source_file: str) -> int:
     if not failed_functions:
         print("[AIMV] all loops already vectorized, nothing to do", file=sys.stderr)
         return 0
-
-    config = load_config()
 
     builder = BuildOrchestrator(config)
     # [AIMV] Preserve target triple from original compilation
@@ -863,6 +865,8 @@ def build_argparser() -> argparse.ArgumentParser:
                         choices=["conservative", "moderate", "aggressive"])
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--mcp-url", default=None)
+    parser.add_argument("--cflags", default=None,
+                        help="Compilation flags forwarded from clang -faimv")
     parser.add_argument("--output-dir", default="./aimv-output")
     parser.add_argument("--test-cmd", dest="test_cmd", default="")
     parser.add_argument("--dry-run", action="store_true")
@@ -888,6 +892,8 @@ def main(argv=None):
         config.max_rounds = args.max_rounds
     if args.mcp_url is not None:
         config.mcp_url = args.mcp_url
+    if args.cflags is not None:
+        config.cflags = args.cflags.split() if args.cflags else []
     if args.output_dir:
         config.output_dir = args.output_dir
     if args.test_cmd:
@@ -913,7 +919,7 @@ def main(argv=None):
         if not Path(source_file).exists():
             print(f"[AIMV] Error: source file not found: {source_file}", file=sys.stderr)
             return 2
-        return main_from_json(args.from_json, source_file)
+        return main_from_json(args.from_json, source_file, config)
 
     # Independent mode
     source_file = args.source_file

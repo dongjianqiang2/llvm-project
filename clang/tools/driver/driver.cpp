@@ -520,6 +520,22 @@ int clang_main(int Argc, char **Argv, const llvm::ToolContext &ToolContext) {
               DriverArgs.push_back(A->getValue());
             }
 
+            // [AIMV] Forward compilation flags to aimv-driver --cflags
+            // Extract -O flag from the cc1 command arguments.
+            // Use --cflags=VALUE form because -O2 starts with '-' which
+            // argparse would otherwise interpret as a separate flag.
+            for (const char *Arg : Cmd->getArguments()) {
+              if (!Arg) continue;
+              StringRef ArgStr(Arg);
+              if (ArgStr.size() >= 2 && ArgStr[0] == '-' && ArgStr[1] == 'O' &&
+                  (ArgStr.size() == 3 ||
+                   ArgStr == "-Os" || ArgStr == "-Oz")) {
+                DriverArgs.push_back(
+                    Args.MakeArgString(Twine("--cflags=") + ArgStr));
+                break;
+              }
+            }
+
             int ExitCode = llvm::sys::ExecuteAndWait(FullPath, DriverArgs);
             if (ExitCode != 0) {
               llvm::errs() << "[AIMV] aimv-driver exited with code "
