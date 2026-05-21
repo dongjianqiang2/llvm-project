@@ -36,7 +36,7 @@ func.func @no_change(%arg0: vector<2x[4]x1xf32>, %arg1: vector<2x[4]x1xf32>) -> 
 
 // CHECK-LABEL:   func.func @cast_away_leading_one_dim(
 // CHECK:           %[[MUL:.*]] = arith.mulf %{{.*}}, %{{.*}} : vector<4x1xf32>
-// CHECK:           vector.broadcast %[[MUL]] : vector<4x1xf32> to vector<1x4x1xf32>
+// CHECK:           vector.shape_cast %[[MUL]] : vector<4x1xf32> to vector<1x4x1xf32>
 func.func @cast_away_leading_one_dim(%arg0: vector<1x4x1xf32>, %arg1: vector<1x4x1xf32>) -> vector<1x4x1xf32> {
   %1 = arith.mulf %arg0, %arg1 : vector<1x4x1xf32>
   return %1: vector<1x4x1xf32>
@@ -44,7 +44,7 @@ func.func @cast_away_leading_one_dim(%arg0: vector<1x4x1xf32>, %arg1: vector<1x4
 
 // CHECK-LABEL:   func.func @cast_away_leading_one_dim_scalable(
 // CHECK:           %[[MUL:.*]] = arith.mulf %{{.*}}, %{{.*}} : vector<[4]x1xf32>
-// CHECK:           vector.broadcast %[[MUL]] : vector<[4]x1xf32> to vector<1x[4]x1xf32>
+// CHECK:           vector.shape_cast %[[MUL]] : vector<[4]x1xf32> to vector<1x[4]x1xf32>
 func.func @cast_away_leading_one_dim_scalable(%arg0: vector<1x[4]x1xf32>, %arg1: vector<1x[4]x1xf32>) -> vector<1x[4]x1xf32> {
   %1 = arith.mulf %arg0, %arg1 : vector<1x[4]x1xf32>
   return %1: vector<1x[4]x1xf32>
@@ -184,15 +184,6 @@ func.func @vector_transfers(%arg0: index, %arg1: index) {
   return
 }
 
-// CHECK-LABEL: func @cancelling_shape_cast_ops
-//  CHECK-SAME: %[[A0:.*0]]: vector<2x4xf32>
-//       CHECK: return %[[A0]] : vector<2x4xf32>
-func.func @cancelling_shape_cast_ops(%arg0 : vector<2x4xf32>) -> vector<2x4xf32> {
-  %0 = vector.shape_cast %arg0 : vector<2x4xf32> to vector<8xf32>
-  %1 = vector.shape_cast %0 : vector<8xf32> to vector<2x4xf32>
-  return %1 : vector<2x4xf32>
-}
-
 // CHECK-LABEL: func @elementwise_unroll
 //  CHECK-SAME: (%[[ARG0:.*]]: memref<4x4xf32>, %[[ARG1:.*]]: memref<4x4xf32>)
 //       CHECK-DAG:   %[[C2:.*]] = arith.constant 2 : index
@@ -286,13 +277,15 @@ func.func @contraction4x4_ikj_xfer_read_tensor(%arg0 : tensor<4x2xf32>,
 func.func @bubble_down_bitcast_in_extract(%src: vector<4xf32>) -> (f16, f16) {
   %0 = vector.bitcast %src : vector<4xf32> to vector<8xf16>
   // CHECK: %[[EXTRACT1:.+]] = vector.extract %[[SRC]][1] : f32 from vector<4xf32>
-  // CHECK:  %[[INSERT1:.+]] = vector.insert %[[EXTRACT1]], %{{.+}} [0] : f32 into vector<1xf32>
-  // CHECK:    %[[CAST1:.+]] = vector.bitcast %[[INSERT1]] : vector<1xf32> to vector<2xf16>
+  // CHECK:  %[[INSERT1:.+]] = vector.insert %[[EXTRACT1]], %{{.+}} [] : f32 into vector<f32>
+  // CHECK:  %[[SHAPE_CAST1:.+]] = vector.shape_cast %[[INSERT1]] : vector<f32> to vector<1xf32>
+  // CHECK:    %[[CAST1:.+]] = vector.bitcast %[[SHAPE_CAST1]] : vector<1xf32> to vector<2xf16>
   // CHECK: %[[EXTRACT2:.+]] = vector.extract %[[CAST1]][1] : f16 from vector<2xf16>
   %1 = vector.extract %0[3] : f16 from vector<8xf16>
   // CHECK: %[[EXTRACT3:.+]] = vector.extract %[[SRC]][2] : f32 from vector<4xf32>
-  // CHECK:  %[[INSERT3:.+]] = vector.insert %[[EXTRACT3]], %{{.+}} [0] : f32 into vector<1xf32>
-  // CHECK:    %[[CAST2:.+]] = vector.bitcast %[[INSERT3]] : vector<1xf32> to vector<2xf16>
+  // CHECK:  %[[INSERT3:.+]] = vector.insert %[[EXTRACT3]], %{{.+}} [] : f32 into vector<f32>
+  // CHECK:  %[[SHAPE_CAST2:.+]] = vector.shape_cast %[[INSERT3]] : vector<f32> to vector<1xf32>
+  // CHECK:    %[[CAST2:.+]] = vector.bitcast %[[SHAPE_CAST2]] : vector<1xf32> to vector<2xf16>
   // CHECK: %[[EXTRACT4:.+]] = vector.extract %[[CAST2]][0] : f16 from vector<2xf16>
   %2 = vector.extract %0[4] : f16 from vector<8xf16>
   // CHECK: return %[[EXTRACT2]], %[[EXTRACT4]]
@@ -442,3 +435,16 @@ func.func @vec_0D(%arg0: vector<f32>) -> vector<i32> {
   %0 = vector.bitcast %arg0 : vector<f32> to vector<i32>
   return %0 : vector<i32>
 }
+
+// Make sure not crash on dynamic index `vector.extract`:
+func.func @vector_extract_dynamic_index(%arg0 : vector<4xi32>, %index : index) -> i16 {
+  %0 = vector.bitcast %arg0 : vector<4xi32> to vector<8xi16>
+  %1 = vector.extract %0[%index] : i16 from vector<8xi16>
+  return %1 : i16
+}
+
+// CHECK-LABEL: func.func @vector_extract_dynamic_index
+// CHECK-SAME: (%[[VEC:.+]]: vector<4xi32>, %[[IDX:.+]]: index) -> i16 {
+// CHECK: %[[BC:.+]] = vector.bitcast %[[VEC]] : vector<4xi32> to vector<8xi16>
+// CHECK: %[[EXTRACT:.+]] = vector.extract %[[BC]][%[[IDX]]] : i16 from vector<8xi16>
+// CHECK: return %[[EXTRACT]]

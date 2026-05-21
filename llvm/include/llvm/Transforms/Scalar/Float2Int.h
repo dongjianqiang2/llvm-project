@@ -28,7 +28,7 @@ class LLVMContext;
 class Type;
 class Value;
 
-class Float2IntPass : public PassInfoMixin<Float2IntPass> {
+class Float2IntPass : public OptionalPassInfoMixin<Float2IntPass> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
@@ -44,7 +44,7 @@ private:
   std::optional<ConstantRange> calcRange(Instruction *I);
   void walkBackwards();
   void walkForwards();
-  bool validateAndTransform();
+  bool validateAndTransform(const DataLayout &DL);
   Value *convert(Instruction *I, Type *ToTy);
   void cleanup();
 

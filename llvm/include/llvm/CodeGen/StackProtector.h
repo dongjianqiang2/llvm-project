@@ -82,11 +82,11 @@ public:
                                      SSPLayoutMap *Layout = nullptr);
 };
 
-class StackProtectorPass : public PassInfoMixin<StackProtectorPass> {
+class StackProtectorPass : public RequiredPassInfoMixin<StackProtectorPass> {
   const TargetMachine *TM;
 
 public:
-  explicit StackProtectorPass(const TargetMachine *TM) : TM(TM) {}
+  explicit StackProtectorPass(const TargetMachine &TM) : TM(&TM) {}
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 };
 
@@ -108,6 +108,8 @@ public:
   static char ID; // Pass identification, replacement for typeid.
 
   StackProtector();
+
+  SSPLayoutInfo &getLayoutInfo() { return LayoutInfo; }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 

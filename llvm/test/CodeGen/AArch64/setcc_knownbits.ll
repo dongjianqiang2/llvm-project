@@ -33,8 +33,7 @@ define noundef i1 @logger(i32 noundef %logLevel, ptr %ea, ptr %pll) {
 ; CHECK-GI-NEXT:    b.hi .LBB1_2
 ; CHECK-GI-NEXT:  // %bb.1: // %land.rhs
 ; CHECK-GI-NEXT:    ldr x8, [x1]
-; CHECK-GI-NEXT:    ldrb w8, [x8]
-; CHECK-GI-NEXT:    and w0, w8, #0x1
+; CHECK-GI-NEXT:    ldrb w0, [x8]
 ; CHECK-GI-NEXT:  .LBB1_2: // %land.end
 ; CHECK-GI-NEXT:    ret
 entry:
@@ -68,9 +67,7 @@ define i1 @lshr_ctlz_undef_cmpeq_one_i64(i64 %in) {
 ; CHECK-GI-LABEL: lshr_ctlz_undef_cmpeq_one_i64:
 ; CHECK-GI:       // %bb.0:
 ; CHECK-GI-NEXT:    clz x8, x0
-; CHECK-GI-NEXT:    lsr x8, x8, #6
-; CHECK-GI-NEXT:    cmp x8, #1
-; CHECK-GI-NEXT:    cset w0, eq
+; CHECK-GI-NEXT:    lsr w0, w8, #6
 ; CHECK-GI-NEXT:    ret
   %ctlz = call i64 @llvm.ctlz.i64(i64 %in, i1 -1)
   %lshr = lshr i64 %ctlz, 6

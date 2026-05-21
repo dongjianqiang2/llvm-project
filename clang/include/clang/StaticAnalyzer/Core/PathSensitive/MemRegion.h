@@ -26,6 +26,7 @@
 #include "clang/Analysis/AnalysisDeclContext.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState_Fwd.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SVals.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
 #include "llvm/ADT/DenseMap.h"
@@ -34,6 +35,7 @@
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -47,7 +49,7 @@ class AnalysisDeclContext;
 class CXXRecordDecl;
 class Decl;
 class LocationContext;
-class StackFrameContext;
+class StackFrame;
 
 namespace ento {
 
@@ -99,6 +101,8 @@ public:
 #define REGION(Id, Parent) Id ## Kind,
 #define REGION_RANGE(Id, First, Last) BEGIN_##Id = First, END_##Id = Last,
 #include "clang/StaticAnalyzer/Core/PathSensitive/Regions.def"
+#undef REGION
+#undef REGION_RANGE
   };
 
 private:
@@ -116,7 +120,40 @@ public:
 
   virtual MemRegionManager &getMemRegionManager() const = 0;
 
-  LLVM_ATTRIBUTE_RETURNS_NONNULL const MemSpaceRegion *getMemorySpace() const;
+  /// Deprecated. Gets the 'raw' memory space of a memory region's base region.
+  /// If the MemRegion is originally associated with Unknown memspace, then the
+  /// State may have a more accurate memspace for this region.
+  /// Use getMemorySpace(ProgramStateRef) instead.
+  [[nodiscard]] LLVM_ATTRIBUTE_RETURNS_NONNULL const MemSpaceRegion *
+  getRawMemorySpace() const;
+
+  /// Deprecated. Use getMemorySpace(ProgramStateRef) instead.
+  template <class MemSpace>
+  [[nodiscard]] const MemSpace *getRawMemorySpaceAs() const {
+    return dyn_cast<MemSpace>(getRawMemorySpace());
+  }
+
+  /// Returns the most specific memory space for this memory region in the given
+  /// ProgramStateRef. We may infer a more accurate memory space for unknown
+  /// space regions and associate this in the State.
+  [[nodiscard]] LLVM_ATTRIBUTE_RETURNS_NONNULL const MemSpaceRegion *
+  getMemorySpace(ProgramStateRef State) const;
+
+  template <class MemSpace>
+  [[nodiscard]] const MemSpace *getMemorySpaceAs(ProgramStateRef State) const {
+    return dyn_cast<MemSpace>(getMemorySpace(State));
+  }
+
+  template <typename... MemorySpaces>
+  [[nodiscard]] bool hasMemorySpace(ProgramStateRef State) const {
+    static_assert(sizeof...(MemorySpaces));
+    return isa<MemorySpaces...>(getMemorySpace(State));
+  }
+
+  /// Set the dynamically deduced memory space of a MemRegion that currently has
+  /// UnknownSpaceRegion. \p Space shouldn't be UnknownSpaceRegion.
+  [[nodiscard]] ProgramStateRef
+  setMemorySpace(ProgramStateRef State, const MemSpaceRegion *Space) const;
 
   LLVM_ATTRIBUTE_RETURNS_NONNULL const MemRegion *getBaseRegion() const;
 
@@ -136,12 +173,6 @@ public:
   /// goes up the base chain looking for the first symbolic base region.
   /// It might return null.
   const SymbolicRegion *getSymbolicBase() const;
-
-  bool hasStackStorage() const;
-
-  bool hasStackNonParametersStorage() const;
-
-  bool hasStackParametersStorage() const;
 
   /// Compute the offset within the top level memory object.
   RegionOffset getAsOffset() const;
@@ -170,6 +201,8 @@ public:
   virtual void printPrettyAsExpr(raw_ostream &os) const;
 
   Kind getKind() const { return kind; }
+
+  StringRef getKindStr() const;
 
   template<typename RegionTy> const RegionTy* getAs() const;
   template <typename RegionTy>
@@ -339,7 +372,7 @@ public:
 };
 
 /// The region containing globals which can be modified by calls to
-/// "internally" defined functions - (for now just) functions other then system
+/// "internally" defined functions - (for now just) functions other than system
 /// calls.
 class GlobalInternalSpaceRegion : public NonStaticGlobalSpaceRegion {
   friend class MemRegionManager;
@@ -386,18 +419,18 @@ public:
 class StackSpaceRegion : public MemSpaceRegion {
   virtual void anchor();
 
-  const StackFrameContext *SFC;
+  const StackFrame *SF;
 
 protected:
-  StackSpaceRegion(MemRegionManager &mgr, Kind k, const StackFrameContext *sfc)
-      : MemSpaceRegion(mgr, k), SFC(sfc) {
+  StackSpaceRegion(MemRegionManager &mgr, Kind k, const StackFrame *SF)
+      : MemSpaceRegion(mgr, k), SF(SF) {
     assert(classof(this));
-    assert(sfc);
+    assert(SF);
   }
 
 public:
   LLVM_ATTRIBUTE_RETURNS_NONNULL
-  const StackFrameContext *getStackFrame() const { return SFC; }
+  const StackFrame *getStackFrame() const { return SF; }
 
   void Profile(llvm::FoldingSetNodeID &ID) const override;
 
@@ -410,8 +443,8 @@ public:
 class StackLocalsSpaceRegion : public StackSpaceRegion {
   friend class MemRegionManager;
 
-  StackLocalsSpaceRegion(MemRegionManager &mgr, const StackFrameContext *sfc)
-      : StackSpaceRegion(mgr, StackLocalsSpaceRegionKind, sfc) {}
+  StackLocalsSpaceRegion(MemRegionManager &mgr, const StackFrame *SF)
+      : StackSpaceRegion(mgr, StackLocalsSpaceRegionKind, SF) {}
 
 public:
   void dumpToStream(raw_ostream &os) const override;
@@ -425,8 +458,8 @@ class StackArgumentsSpaceRegion : public StackSpaceRegion {
 private:
   friend class MemRegionManager;
 
-  StackArgumentsSpaceRegion(MemRegionManager &mgr, const StackFrameContext *sfc)
-      : StackSpaceRegion(mgr, StackArgumentsSpaceRegionKind, sfc) {}
+  StackArgumentsSpaceRegion(MemRegionManager &mgr, const StackFrame *SF)
+      : StackSpaceRegion(mgr, StackArgumentsSpaceRegionKind, SF) {}
 
 public:
   void dumpToStream(raw_ostream &os) const override;
@@ -781,7 +814,7 @@ class SymbolicRegion : public SubRegion {
       : SubRegion(sreg, SymbolicRegionKind), sym(s) {
     // Because pointer arithmetic is represented by ElementRegion layers,
     // the base symbol here should not contain any arithmetic.
-    assert(s && isa<SymbolData>(s));
+    assert(isa_and_nonnull<SymbolData>(s));
     assert(s->getType()->isAnyPointerType() ||
            s->getType()->isReferenceType() ||
            s->getType()->isBlockPointerType());
@@ -961,7 +994,7 @@ public:
   const VarDecl *getDecl() const override = 0;
 
   /// It might return null.
-  const StackFrameContext *getStackFrame() const;
+  const StackFrame *getStackFrame() const;
 
   QualType getValueType() const override {
     // FIXME: We can cache this if needed.
@@ -974,6 +1007,10 @@ public:
   }
 };
 
+// TODO: Currently MemRegionManager::getVarRegion returns NonParamVarRegion
+// instances to represent the parameters of the entrypoint stack frame and
+// parameters of outer stack frames that appear as captured within a lambda or
+// a block. This should be overhauled.
 class NonParamVarRegion : public VarRegion {
   friend class MemRegionManager;
 
@@ -1016,10 +1053,11 @@ public:
   }
 };
 
-/// ParamVarRegion - Represents a region for paremters. Only parameters of the
+/// ParamVarRegion - Represents a region for parameters. Only parameters of the
 /// function in the current stack frame are represented as `ParamVarRegion`s.
 /// Parameters of top-level analyzed functions as well as captured paremeters
-/// by lambdas and blocks are repesented as `VarRegion`s.
+/// by lambdas and blocks are repesented as `NonParamVarRegion`s.
+/// TODO: It would be nice to make this more consistent.
 
 // FIXME: `ParamVarRegion` only supports parameters of functions, C++
 // constructors, blocks and Objective-C methods with existing `Decl`. Upon
@@ -1201,7 +1239,7 @@ class ElementRegion : public TypedValueRegion {
       : TypedValueRegion(sReg, ElementRegionKind), ElementType(elementType),
         Index(Idx) {
     assert((!isa<nonloc::ConcreteInt>(Idx) ||
-            Idx.castAs<nonloc::ConcreteInt>().getValue().isSigned()) &&
+            Idx.castAs<nonloc::ConcreteInt>().getValue()->isSigned()) &&
            "The index must be signed");
     assert(!elementType.isNull() && !elementType->isVoidType() &&
            "Invalid region type!");
@@ -1249,7 +1287,7 @@ public:
   const Expr *getExpr() const { return Ex; }
 
   LLVM_ATTRIBUTE_RETURNS_NONNULL
-  const StackFrameContext *getStackFrame() const;
+  const StackFrame *getStackFrame() const;
 
   QualType getValueType() const override { return Ex->getType(); }
 
@@ -1288,7 +1326,7 @@ public:
   LLVM_ATTRIBUTE_RETURNS_NONNULL
   const ValueDecl *getExtendingDecl() const { return ExD; }
   /// It might return null.
-  const StackFrameContext *getStackFrame() const;
+  const StackFrame *getStackFrame() const;
 
   QualType getValueType() const override { return Ex->getType(); }
 
@@ -1406,10 +1444,10 @@ class MemRegionManager {
   GlobalSystemSpaceRegion *SystemGlobals = nullptr;
   GlobalImmutableSpaceRegion *ImmutableGlobals = nullptr;
 
-  llvm::DenseMap<const StackFrameContext *, StackLocalsSpaceRegion *>
-    StackLocalsSpaceRegions;
-  llvm::DenseMap<const StackFrameContext *, StackArgumentsSpaceRegion *>
-    StackArgumentsSpaceRegions;
+  llvm::DenseMap<const StackFrame *, StackLocalsSpaceRegion *>
+      StackLocalsSpaceRegions;
+  llvm::DenseMap<const StackFrame *, StackArgumentsSpaceRegion *>
+      StackArgumentsSpaceRegions;
   llvm::DenseMap<const CodeTextRegion *, StaticGlobalSpaceRegion *>
     StaticsGlobalSpaceRegions;
 
@@ -1433,13 +1471,12 @@ public:
 
   /// getStackLocalsRegion - Retrieve the memory region associated with the
   ///  specified stack frame.
-  const StackLocalsSpaceRegion *
-  getStackLocalsRegion(const StackFrameContext *STC);
+  const StackLocalsSpaceRegion *getStackLocalsRegion(const StackFrame *SF);
 
   /// getStackArgumentsRegion - Retrieve the memory region associated with
   ///  function/method arguments of the specified stack frame.
   const StackArgumentsSpaceRegion *
-  getStackArgumentsRegion(const StackFrameContext *STC);
+  getStackArgumentsRegion(const StackFrame *SF);
 
   /// getGlobalsRegion - Retrieve the memory region associated with
   ///  global variables.
@@ -1503,7 +1540,7 @@ public:
   ///  associated element type, index, and super region.
   const ElementRegion *getElementRegion(QualType elementType, NonLoc Idx,
                                         const SubRegion *superRegion,
-                                        ASTContext &Ctx);
+                                        const ASTContext &Ctx);
 
   const ElementRegion *getElementRegionWithSuper(const ElementRegion *ER,
                                                  const SubRegion *superRegion) {
@@ -1515,8 +1552,8 @@ public:
   ///  a specified FieldDecl.  'superRegion' corresponds to the containing
   ///  memory region (which typically represents the memory representing
   ///  a structure or class).
-  const FieldRegion *getFieldRegion(const FieldDecl *fd,
-                                    const SubRegion* superRegion);
+  const FieldRegion *getFieldRegion(const FieldDecl *FD,
+                                    const SubRegion *SuperRegion);
 
   const FieldRegion *getFieldRegionWithSuper(const FieldRegion *FR,
                                              const SubRegion *superRegion) {

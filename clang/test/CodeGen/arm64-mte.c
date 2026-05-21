@@ -1,6 +1,6 @@
 // Test memory tagging extension intrinsics
-// RUN: %clang_cc1 -triple aarch64 -target-feature +mte -O3 -S -emit-llvm -o - %s  | FileCheck %s
-// RUN: %clang_cc1 -triple aarch64 -DMTE -O3 -S -emit-llvm -o - %s  | FileCheck %s
+// RUN: %clang_cc1 -triple aarch64 -target-feature +mte -O3 -emit-llvm -o - %s  | FileCheck %s
+// RUN: %clang_cc1 -triple aarch64 -DMTE -O3 -emit-llvm -o - %s  | FileCheck %s
 #include <stddef.h>
 #include <arm_acle.h>
 
@@ -49,9 +49,18 @@ short *increment_tag2(short *a) {
         return __arm_mte_increment_tag(a,3);
 }
 
-// CHECK-LABEL: define{{.*}} i32 @exclude_tag
+// CHECK-LABEL: define{{.*}} i32 @exclude_tag1
 attribute
-unsigned exclude_tag(int *a, unsigned m) {
+unsigned exclude_tag1(int *a, unsigned m) {
+// CHECK: [[T0:%[0-9]+]] = zext i32 %m to i64
+// CHECK: [[T2:%[0-9]+]] = tail call i64 @llvm.aarch64.gmi(ptr %a, i64 [[T0]])
+// CHECK: trunc i64 [[T2]] to i32
+  return __arm_mte_exclude_tag(a, m);
+}
+
+// CHECK-LABEL: define{{.*}} i32 @exclude_tag2
+attribute
+int exclude_tag2(int *a, unsigned m) {
 // CHECK: [[T0:%[0-9]+]] = zext i32 %m to i64
 // CHECK: [[T2:%[0-9]+]] = tail call i64 @llvm.aarch64.gmi(ptr %a, i64 [[T0]])
 // CHECK: trunc i64 [[T2]] to i32

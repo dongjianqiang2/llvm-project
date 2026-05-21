@@ -12,6 +12,8 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Transforms/Scalar/LoopPassManager.h"
+#include "llvm/Transforms/Utils/ExtraPassManager.h"
 
 namespace llvm {
 
@@ -63,7 +65,8 @@ class raw_ostream;
 /// Because partial unswitching of switches is extremely unlikely to be possible
 /// in practice and significantly complicates the implementation, this pass does
 /// not currently implement that in any mode.
-class SimpleLoopUnswitchPass : public PassInfoMixin<SimpleLoopUnswitchPass> {
+class SimpleLoopUnswitchPass
+    : public OptionalPassInfoMixin<SimpleLoopUnswitchPass> {
   bool NonTrivial;
   bool Trivial;
 
@@ -76,6 +79,14 @@ public:
 
   void printPipeline(raw_ostream &OS,
                      function_ref<StringRef(StringRef)> MapClassName2PassName);
+};
+
+/// A marker analysis to determine if SimpleLoopUnswitch should run again on a
+/// given loop.
+struct ShouldRunExtraSimpleLoopUnswitch
+    : public ShouldRunExtraPasses<ShouldRunExtraSimpleLoopUnswitch>,
+      public AnalysisInfoMixin<ShouldRunExtraSimpleLoopUnswitch> {
+  static AnalysisKey Key;
 };
 
 } // end namespace llvm

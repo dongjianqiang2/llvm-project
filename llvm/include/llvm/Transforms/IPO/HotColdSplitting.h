@@ -19,6 +19,7 @@ namespace llvm {
 
 class Module;
 class ProfileSummaryInfo;
+class BasicBlock;
 class BlockFrequencyInfo;
 class TargetTransformInfo;
 class OptimizationRemarkEmitter;
@@ -63,7 +64,8 @@ private:
 };
 
 /// Pass to outline cold regions.
-class HotColdSplittingPass : public PassInfoMixin<HotColdSplittingPass> {
+class HotColdSplittingPass
+    : public OptionalPassInfoMixin<HotColdSplittingPass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
