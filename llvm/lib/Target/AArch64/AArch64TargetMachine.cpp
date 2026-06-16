@@ -256,6 +256,8 @@ LLVMInitializeAArch64Target() {
 #ifndef EJIT_TRIM_LLVM_BACKEND
   initializeSMEABIPass(PR);
   initializeSMEPeepholeOptPass(PR);
+#endif
+#ifndef EJIT_DISABLE_SVE
   initializeSVEIntrinsicOptsPass(PR);
 #endif
   initializeAArch64SpeculationHardeningPass(PR);
@@ -642,7 +644,7 @@ void AArch64PassConfig::addIRPasses() {
   addPass(createAtomicExpandLegacyPass());
 
   // Expand any SVE vector library calls that we can't code generate directly.
-#ifndef EJIT_TRIM_LLVM_BACKEND
+#ifndef EJIT_DISABLE_SVE
   if (EnableSVEIntrinsicOpts &&
       TM->getOptLevel() != CodeGenOptLevel::None)
     addPass(createSVEIntrinsicOptsPass());

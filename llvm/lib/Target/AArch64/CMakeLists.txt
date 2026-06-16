@@ -78,11 +78,16 @@ set(AARCH64_CODEGEN_SOURCES
   AArch64TargetTransformInfo.cpp
   )
 
+if(NOT EJIT_DISABLE_SVE)
+  list(APPEND AARCH64_CODEGEN_SOURCES
+    SVEIntrinsicOpts.cpp
+  )
+endif()
+
 if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL AND NOT EJIT_TRIM_LLVM_BACKEND)
   list(APPEND AARCH64_CODEGEN_SOURCES
     SMEABIPass.cpp
     SMEPeepholeOpt.cpp
-    SVEIntrinsicOpts.cpp
     AArch64AdvSIMDScalarPass.cpp
     AArch64SIMDInstrOpt.cpp
     )

@@ -570,6 +570,11 @@ if(EJIT_FREESTANDING)
   add_definitions(-DEJIT_FREESTANDING)
 endif()
 
+option(EJIT_DISABLE_SVE "Disable AArch64 SVE code generation. Use to reduce binary size." OFF)
+if(EJIT_DISABLE_SVE)
+  add_definitions(-DEJIT_DISABLE_SVE)
+endif()
+
 set(LLVM_TARGETS_TO_BUILD "all"
     CACHE STRING "Semicolon-separated list of targets to build, or \"all\".")
 
