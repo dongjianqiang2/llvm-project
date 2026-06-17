@@ -1,0 +1,114 @@
+//===- XBBRGraph.h - Global XBBR basic-block graph -------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// XBBRGraph is the linker-side "stage 0" data structure that aggregates,
+// over all input ObjFiles, the BB-level metadata XBBR needs to drive
+// hot-cluster reordering (PLAN §4.3 Stage 0 / §8.1).
+//
+// Inputs (per ObjFile):
+//   * SHT_LLVM_BB_ADDR_MAP   — BB IDs/sizes + PGO analyses (FuncEntryCount,
+//                              BBFreq, BrProb), already produced for M1.
+//   * SHT_LLVM_XBBR_ATTR     — per-BB blacklist bitmask (M1-T05).
+//   * SHT_LLVM_CALL_GRAPH_PROFILE — cross-function call edges (lld already
+//                              parses this into ctx.arg.callGraphProfile;
+//                              we adopt it directly).
+//
+// Outputs:
+//   * std::vector<XBBRNode> nodes — global enumeration of XBBR-relevant BBs.
+//   * std::vector<XBBREdge> edges — CFG (intra-fn) + call (cross-fn) edges.
+//   * Two indices: function → first node index; (FuncId, BBId) → node index.
+//
+// Determinism: `nodes` is ordered by (input file index, section index, BB id)
+// and never visited via DenseMap iteration — see PLAN §6. The two indices
+// above are convenience lookups, never used as a sort key.
+//
+// Lifetime: one XBBRGraph per `ld.lld` invocation, owned by Ctx.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLD_ELF_XBBR_XBBRGRAPH_H
+#define LLD_ELF_XBBR_XBBRGRAPH_H
+
+#include "lld/ELF/XBBR/XBBRTypes.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace lld::elf {
+
+struct Ctx;
+
+namespace xbbr {
+
+/// Per-function summary, populated from SHT_LLVM_BB_ADDR_MAP +
+/// SHT_LLVM_XBBR_ATTR + (optionally) IRPGO entry count. One per
+/// FuncId in the global graph.
+struct FuncInfo {
+  FuncId Section = nullptr;
+  uint32_t FirstNode = 0;       ///< first index in XBBRGraph::nodes
+  uint32_t NumNodes = 0;        ///< node count for this function
+  uint64_t EntryCount = 0;      ///< from BBAddrMap PGO (FuncEntryCount)
+  bool HasProfile = false;      ///< true if FuncEntryCount was present
+
+  llvm::ArrayRef<XBBRNode> nodes(const std::vector<XBBRNode> &all) const {
+    return llvm::ArrayRef<XBBRNode>(&all[FirstNode], NumNodes);
+  }
+};
+
+class XBBRGraph {
+public:
+  XBBRGraph() = default;
+  XBBRGraph(const XBBRGraph &) = delete;
+  XBBRGraph &operator=(const XBBRGraph &) = delete;
+
+  /// Stage 0 entry point — populate the graph from ctx's input ObjFiles
+  /// and ctx.arg.callGraphProfile. After build() the graph is read-only
+  /// for downstream stages.
+  ///
+  /// Returns false if a fatal inconsistency was diagnosed (e.g. a
+  /// `.llvm_xbbr_attr` whose num_bbs disagrees with BB_ADDR_MAP — these
+  /// must round-trip; the M1 emitter writes both from the same MIR pass).
+  bool build(Ctx &ctx);
+
+  /// Read-only views — downstream stages never mutate the graph.
+  llvm::ArrayRef<XBBRNode> nodes() const { return Nodes; }
+  llvm::ArrayRef<XBBREdge> edges() const { return Edges; }
+  llvm::ArrayRef<FuncInfo> funcs() const { return Funcs; }
+
+  /// Look up the global node index for (Func, BB), or nullopt if the BB
+  /// was not in any input's BB_ADDR_MAP (e.g. a function compiled
+  /// without `-fbb-cross-reorder=`).
+  std::optional<uint32_t> findNode(FuncId Func, BBId BB) const;
+
+  /// Number of nodes flagged isAnchor() — useful for stats / cost-model
+  /// sanity checks (anchors set the lower bound on cluster fragmentation).
+  uint32_t numAnchors() const;
+
+private:
+  std::vector<XBBRNode> Nodes;
+  std::vector<XBBREdge> Edges;
+  std::vector<FuncInfo> Funcs;
+
+  // Indices (DenseMap is fine — never iterated for output).
+  llvm::DenseMap<FuncId, uint32_t> FuncIndex;             ///< FuncId → Funcs idx
+  llvm::DenseMap<BBKey, uint32_t> BBIndex;                ///< (Func,BB) → Nodes idx
+
+  // Stage 0 internals — declared here so unit tests in a follow-up
+  // patch can drive them piecewise without going through build().
+  bool collectFromObjFiles(Ctx &ctx);
+  bool collectCallGraphEdges(Ctx &ctx);
+  bool runConsistencyChecks(Ctx &ctx) const;
+};
+
+} // namespace xbbr
+} // namespace lld::elf
+
+#endif // LLD_ELF_XBBR_XBBRGRAPH_H
