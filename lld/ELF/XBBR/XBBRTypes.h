@@ -124,9 +124,15 @@ struct XBBREdge {
   uint32_t SrcNode = 0;      ///< index into XBBRGraph::nodes
   uint32_t DstNode = 0;
   uint64_t Weight = 0;       ///< absolute frequency estimate
-  bool IsFallthrough : 1 = false;  ///< fall-through in the input baseline
-  bool IsCrossFunc : 1 = false;    ///< cross-function call edge
-  bool IsIndirectCall : 1 = false; ///< from IRPGO IPVK_IndirectCallTarget VP
+  // Bitfields without default initializers — XBBREdge is value-initialized
+  // by collectFromObjFiles/collectCallGraphEdges, which set every bit
+  // explicitly. (C++17 doesn't support bitfield default initializers.)
+  bool IsFallthrough : 1;    ///< fall-through in the input baseline
+  bool IsCrossFunc : 1;      ///< cross-function call edge
+  bool IsIndirectCall : 1;   ///< from IRPGO IPVK_IndirectCallTarget VP
+
+  XBBREdge()
+      : IsFallthrough(false), IsCrossFunc(false), IsIndirectCall(false) {}
 };
 
 } // namespace xbbr

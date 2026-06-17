@@ -34,7 +34,7 @@
 #ifndef LLD_ELF_XBBR_XBBRGRAPH_H
 #define LLD_ELF_XBBR_XBBRGRAPH_H
 
-#include "lld/ELF/XBBR/XBBRTypes.h"
+#include "XBBR/XBBRTypes.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 

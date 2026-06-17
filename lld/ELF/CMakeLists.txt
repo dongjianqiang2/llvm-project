@@ -39,6 +39,7 @@ add_lld_library(lldELF
   ARMErrataFix.cpp
   BPSectionOrderer.cpp
   CallGraphSort.cpp
+  XBBR/XBBRGraph.cpp
   DWARF.cpp
   Driver.cpp
   DriverUtils.cpp
