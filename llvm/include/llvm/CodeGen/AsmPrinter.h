@@ -439,6 +439,10 @@ public:
 
   void emitBBAddrMapSection(const MachineFunction &MF);
 
+  /// Emit the SHT_LLVM_XBBR_ATTR section for this function (PLAN §9.3).
+  /// Reads per-BB bytes computed by XBBRMetadataEmitter via getXBBRAttrs().
+  void emitXBBRAttrSection(const MachineFunction &MF);
+
   void emitKCFITrapEntry(const MachineFunction &MF, const MCSymbol *Symbol);
   virtual void emitKCFITypeId(const MachineFunction &MF);
 

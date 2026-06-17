@@ -1577,6 +1577,42 @@ void AsmPrinter::emitBBAddrMapSection(const MachineFunction &MF) {
   OutStreamer->popSection();
 }
 
+void AsmPrinter::emitXBBRAttrSection(const MachineFunction &MF) {
+  // Only emit when XBBR is on (mirrors useBBAddrMap()), and only when the
+  // pass actually computed bytes for this function.
+  if (!EnableXBBR)
+    return;
+  ArrayRef<uint8_t> Attrs = getXBBRAttrs(MF);
+  if (Attrs.empty())
+    return;
+
+  MCSection *XBBRSection =
+      getObjFileLowering().getXBBRAttrSection(*MF.getSection());
+  if (!XBBRSection)
+    return;
+
+  OutStreamer->pushSection();
+  OutStreamer->switchSection(XBBRSection);
+
+  // Per-function section format (PLAN §9.3, simplified per-text-section
+  // layout — the original §9.3 module-wide table is one option, but
+  // BB_ADDR_MAP-style per-function sections compose cleanly with
+  // SHF_LINK_ORDER and are what we adopt here):
+  //   uint8  version   // 0x01 — format may grow; consumers must check.
+  //   uleb128 num_bbs
+  //   uint8  attrs[num_bbs]   // bit layout: see xbbr::AttrBit.
+  OutStreamer->AddComment("XBBR version");
+  OutStreamer->emitInt8(1);
+  OutStreamer->AddComment("number of basic blocks");
+  OutStreamer->emitULEB128IntValue(Attrs.size());
+  for (uint8_t B : Attrs) {
+    OutStreamer->AddComment("XBBR attrs");
+    OutStreamer->emitInt8(B);
+  }
+
+  OutStreamer->popSection();
+}
+
 void AsmPrinter::emitKCFITrapEntry(const MachineFunction &MF,
                                    const MCSymbol *Symbol) {
   MCSection *Section =
@@ -2146,6 +2182,9 @@ void AsmPrinter::emitFunctionBody() {
   if (HasAnyRealCode) {
     if (useBBAddrMap(*MF))
       emitBBAddrMapSection(*MF);
+    // XBBR per-BB attributes go alongside BB_ADDR_MAP.
+    if (EnableXBBR)
+      emitXBBRAttrSection(*MF);
     else if (PgoAnalysisMapFeatures.getBits() != 0)
       MF->getContext().reportWarning(
           SMLoc(), "pgo-analysis-map is enabled for function " + MF->getName() +

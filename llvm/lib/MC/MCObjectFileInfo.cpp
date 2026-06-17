@@ -1160,6 +1160,26 @@ MCObjectFileInfo::getBBAddrMapSection(const MCSection &TextSec) const {
 }
 
 MCSection *
+MCObjectFileInfo::getXBBRAttrSection(const MCSection &TextSec) const {
+  if (Ctx->getObjectFileType() != MCContext::IsELF)
+    return nullptr;
+
+  const MCSectionELF &ElfSec = static_cast<const MCSectionELF &>(TextSec);
+  // SHF_EXCLUDE drops the section at link time (PLAN §9.3 — XBBR attrs
+  // never enter the loadable image).
+  unsigned Flags = ELF::SHF_LINK_ORDER | ELF::SHF_EXCLUDE;
+  StringRef GroupName;
+  if (const MCSymbol *Group = ElfSec.getGroup()) {
+    GroupName = Group->getName();
+    Flags |= ELF::SHF_GROUP;
+  }
+
+  return Ctx->getELFSection(".llvm_xbbr_attr", ELF::SHT_LLVM_XBBR_ATTR,
+                            Flags, 0, GroupName, true, ElfSec.getUniqueID(),
+                            cast<MCSymbolELF>(TextSec.getBeginSymbol()));
+}
+
+MCSection *
 MCObjectFileInfo::getKCFITrapSection(const MCSection &TextSec) const {
   if (Ctx->getObjectFileType() != MCContext::IsELF)
     return nullptr;

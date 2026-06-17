@@ -363,6 +363,11 @@ public:
 
   MCSection *getBBAddrMapSection(const MCSection &TextSec) const;
 
+  /// XBBR per-BB attribute section, attached to each function's text section.
+  /// SHF_LINK_ORDER + SHF_EXCLUDE — same per-text-section pattern as
+  /// `.llvm_bb_addr_map`, but discarded at link time (PLAN §9.3).
+  MCSection *getXBBRAttrSection(const MCSection &TextSec) const;
+
   MCSection *getKCFITrapSection(const MCSection &TextSec) const;
 
   MCSection *getPseudoProbeSection(const MCSection &TextSec) const;
