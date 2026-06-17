@@ -14,5 +14,5 @@ entry:
   ret i32 %r
 }
 
-; ver=1, num=1, [Entry|HasSetjmp = 0x09]
-; CHECK: 010109
+; ver=2, num=1, [Entry|HasSetjmp = 0x0009]
+; CHECK: 02010900

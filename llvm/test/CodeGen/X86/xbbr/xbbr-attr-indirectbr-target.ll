@@ -19,5 +19,5 @@ L2:
   ret void
 }
 
-; ver=1, num=3, [Entry=0x01, L1=IsIndirectBrTarget=0x04, L2=IsIndirectBrTarget=0x04]
-; CHECK: 01030104 04
+; ver=2, num=3, [Entry=0x0001, L1=IsIndirectBrTarget=0x0004, L2=IsIndirectBrTarget=0x0004]
+; CHECK: 02030100 04000400

@@ -139,6 +139,11 @@ public:
   // semantics arrive in M3.
   std::string BBCrossReorder;
 
+  // -fbb-cross-reorder-blacklist=<file> — path to a newline-separated
+  // user blacklist (SPEC §6.1). Functions named in this file get the
+  // UserBlacklisted bit on every non-entry BB.
+  std::string BBCrossReorderBlacklist;
+
   // If set, override the default value of MCAsmInfo::BinutilsVersion. If
   // DisableIntegratedAS is specified, the assembly output will consider GNU as
   // support. "none" means that all ELF features can be used, regardless of

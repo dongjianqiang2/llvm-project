@@ -1582,7 +1582,7 @@ void AsmPrinter::emitXBBRAttrSection(const MachineFunction &MF) {
   // pass actually computed bytes for this function.
   if (!EnableXBBR)
     return;
-  ArrayRef<uint8_t> Attrs = getXBBRAttrs(MF);
+  ArrayRef<uint16_t> Attrs = getXBBRAttrs(MF);
   if (Attrs.empty())
     return;
 
@@ -1594,20 +1594,20 @@ void AsmPrinter::emitXBBRAttrSection(const MachineFunction &MF) {
   OutStreamer->pushSection();
   OutStreamer->switchSection(XBBRSection);
 
-  // Per-function section format (PLAN §9.3, simplified per-text-section
-  // layout — the original §9.3 module-wide table is one option, but
-  // BB_ADDR_MAP-style per-function sections compose cleanly with
-  // SHF_LINK_ORDER and are what we adopt here):
-  //   uint8  version   // 0x01 — format may grow; consumers must check.
+  // Per-function section format (see PLAN §9.3 — already documents this
+  // per-text-section layout). Bumping bit width from u8 to u16 here in
+  // M1 (review fix: SPEC §5.3 item 7 brings the count to 9 bits).
+  //   uint8  version    // 0x02 (was 0x01 with u8 attrs in the M1
+  //                     // initial landing — bump signals the wider bits).
   //   uleb128 num_bbs
-  //   uint8  attrs[num_bbs]   // bit layout: see xbbr::AttrBit.
+  //   uint16 attrs[num_bbs]   // little-endian; bit layout: xbbr::AttrBit.
   OutStreamer->AddComment("XBBR version");
-  OutStreamer->emitInt8(1);
+  OutStreamer->emitInt8(2);
   OutStreamer->AddComment("number of basic blocks");
   OutStreamer->emitULEB128IntValue(Attrs.size());
-  for (uint8_t B : Attrs) {
+  for (uint16_t W : Attrs) {
     OutStreamer->AddComment("XBBR attrs");
-    OutStreamer->emitInt8(B);
+    OutStreamer->emitInt16(W);
   }
 
   OutStreamer->popSection();

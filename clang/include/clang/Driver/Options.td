@@ -4443,6 +4443,18 @@ def fbb_cross_reorder_EQ : Joined<["-"], "fbb-cross-reorder=">, Group<f_Group>,
            "emission (ELF, x86_64 first; experimental).">,
   Values<"none,function,partial,full">,
   MarshallingInfoString<CodeGenOpts<"BBCrossReorder">, [{"none"}]>;
+def fbb_cross_reorder_blacklist_EQ
+    : Joined<["-"], "fbb-cross-reorder-blacklist=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Path to a newline-separated XBBR per-function blacklist "
+           "(SPEC §6.1). Functions listed here will have all their "
+           "non-entry BBs marked UserBlacklisted in .llvm_xbbr_attr.">,
+  MarshallingInfoString<CodeGenOpts<"BBCrossReorderBlacklist">>;
+def fbb_cross_reorder_stats : Flag<["-"], "fbb-cross-reorder-stats">,
+  Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Print XBBR per-function attribute statistics (SPEC §6.1).">,
+  MarshallingInfoFlag<CodeGenOpts<"BBCrossReorderStats">>;
 defm data_sections : BoolFOption<"data-sections",
   CodeGenOpts<"DataSections">, DefaultFalse,
   PosFlag<SetTrue, [], [ClangOption, CC1Option],

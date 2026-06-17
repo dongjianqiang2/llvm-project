@@ -15,5 +15,6 @@ define i32 @entry_only() {
 ; attrs are dropped at link time (PLAN §9.3).
 ; SECTION: .llvm_xbbr_attr{{.*}}LLVM_XBBR_ATTR{{.*}}LE
 
-; Format: u8 version=1, uleb128 num_bbs=1, u8 attrs[num_bbs] = {0x01}.
-; BYTES: 010101
+; Format: u8 version=2, uleb128 num_bbs=1, u16 attrs[num_bbs] = {0x0001}
+; (version 0x02 = u16 attrs widened to fit IsNoReturnTail = bit 8).
+; BYTES: 02010100

@@ -25,5 +25,5 @@ lpad:
   resume { ptr, i32 } %l
 }
 
-; ver=1, num=3, [Entry=0x01, cont=0x00, lpad=0x02]
-; CHECK: 01030100 02
+; ver=2, num=3, [Entry=0x0001, cont=0x0000, lpad=0x0002]
+; CHECK: 02030100 00000200

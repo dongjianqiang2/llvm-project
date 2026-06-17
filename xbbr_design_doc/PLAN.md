@@ -165,14 +165,19 @@ entry_count(F)  = F 的绝对入口执行次数
 |---|---|---|---|
 | `is_entry` | 函数入口 BB | `MBB.getNumber() == 0`（等价于 BB_ADDR_MAP 首个 range 的首 BB） | 派生 |
 | `is_landing_pad` | EH landing pad | `MBB.isEHPad()` | **复用 `BBEntry::Metadata::IsEHPad`** |
-| `is_indirectbr_target` | indirectbr/callbr 目标 / `blockaddress` 取址 | `MBB.hasAddressTaken()` 或 `MBB.isInlineAsmBrIndirectTarget()`；可由 `BBEntry::Metadata::HasIndirectBranch` 辅助 | 部分复用 |
-| `has_setjmp` | 含 setjmp/longjmp | 扫描指令的 intrinsic ID | 新位 |
-| `has_inline_asm_label` | inline asm + section/label | `MBB.isInlineAsmBrIndirectTarget()` + section attr 检查 | 新位 |
+| `is_indirectbr_target` | indirectbr/callbr 目标 / `blockaddress` 取址 / inline asm goto 间接目标 | `MBB.hasAddressTaken()` 或 `MBB.isInlineAsmBrIndirectTarget()`；可由 `BBEntry::Metadata::HasIndirectBranch` 辅助 | 部分复用 |
+| `has_setjmp` | 含 setjmp/longjmp | (a) `CallBase::hasFnAttr(ReturnsTwice)` 命中 setjmp 系列；(b) callee 名匹配 `longjmp` / `_longjmp` / `siglongjmp` 等命中 longjmp 系列（glibc longjmp 无 IR 级标记，只有 `noreturn`，但 `noreturn` 会误命中 `abort/exit/__cxa_throw` 等，故必须用名匹配） | 新位 |
+| `has_inline_asm_label` | inline asm 内含 `.section`/`.pushsection`/`.popsection` 指令 | 扫描 `InlineAsm::getAsmString()` | 新位 |
 | `is_musttail` | musttail call | **`MF.getFunction()` 上遍历 BB，调用 IR `BasicBlock::getTerminatingMustTailCall()` 或 `CallBase::isMustTailCall()`** | 新位 |
-| `user_blacklisted` | 用户黑名单 | 读 `-fbb-cross-reorder-blacklist` 文件 | 新位 |
-| `cold` | 冷 BB | 由 `MachineFunctionSplitter` 同步；冷判据见 SPEC §4/§6.1（`global_freq < threshold×entry_count`） | 新位 |
+| `user_blacklisted` | 用户黑名单（`-fbb-cross-reorder-blacklist=<file>` 列出的函数） | 读黑名单文件，命中函数的非入口 BB 全部置位（入口 BB 本来就锚定，不重复置位） | 新位 |
+| `is_no_return_tail` | `noreturn` callsite 后无后继尾块（SPEC §5.3 第 7 项） | MBB 满足 `succ_empty()` 且其父 IR BB 终止指令为 `unreachable`、其前驱指令为 `noreturn` callsite | 新位 |
+| `cold` | 冷 BB | 由 `MachineFunctionSplitter` 同步；冷判据见 SPEC §4/§6.1（`global_freq < threshold×entry_count`） | 新位（M3 落地，lld 消费 cold-threshold 时启用） |
 
 > **musttail 检测修正（回应评审 #7）**：musttail 是**调用**指令（`IS_CALL`），不是返回指令。`MachineInstr::isReturn()` 过宽——会误命中普通 `RET` 与所有 `tail call`（后者 lowering 为 `TCRETURN`，亦带 `isReturn`），无法专一识别 musttail。正确做法是回到 IR 级：musttail 调用必为其所在 BB 的终止指令，`BasicBlock::getTerminatingMustTailCall()`（见 `SjLjEHPrepare.cpp`、`GlobalMergeFunctions.cpp` 用法）可精确判定，经 `MF.getFunction()` 在 CodeGen 层可达。`BBEntry::Metadata::HasTailCall` 仅标识任意尾调用，不足以替代。
+
+> **`is_no_return_tail` 的窄检测（SPEC §5.3 第 7 项）**：仅当 BB **同时**满足"无后继(succ_empty)" 与 "终止指令前是 noreturn callsite" 两个条件时才置位。若仅靠 `noreturn` 属性,会把所有调用 `abort/exit/__cxa_throw` 的 BB 都标黑名单——这些 BB 恰恰是冷代码、应被允许迁出，与 SPEC §2 优化目标冲突。两条件 AND 后只命中真正的"函数尾巴",符合 SPEC 第 7 项"归属原函数有助于回溯"的本意。
+
+> **`has_setjmp` 中 longjmp 的命名匹配**：如表中所注，glibc longjmp 的 IR 表达没有 `returns_twice`，只有 `noreturn`。LLVM 也没有 TLI 库函数枚举或 builtin 对应它（只有 SjLj EH 内建 `eh_sjlj_longjmp`，仅在部分 ARM 平台触发）。唯一可靠的检测是按 callee 函数名匹配 `longjmp` / `_longjmp` / `siglongjmp` / `__longjmp` / `_siglongjmp`。同名但非标准库实现（如自定义模拟 longjmp）也会被命中——这是过保守的安全方向，符合 SPEC §5.3 的强约束。
 
 ### 3.5 函数内 baseline ordering
 
@@ -621,17 +626,20 @@ For each edge:
 
 ```
 Per-function section (one section per text section):
-    uint8   version;            // 0x01
+    uint8   version;            // 0x02 (v0x01 used u8 attrs and lacked
+                                //       IsNoReturnTail; v0x02 widens to u16)
     uleb128 num_bbs;            // MachineFunction 中 MBB 个数
-    uint8   attrs[num_bbs];     // 位掩码（按 MachineFunction 迭代序）：
+    uint16  attrs[num_bbs];     // little-endian 16-bit bitmask（按
+                                // MachineFunction 迭代序）：
                                 // bit0=is_entry,
                                 // bit1=is_landing_pad,
                                 // bit2=is_indirectbr_target,
-                                // bit3=has_setjmp,
+                                // bit3=has_setjmp,                (含 longjmp 名匹配)
                                 // bit4=has_inline_asm_label,
                                 // bit5=is_musttail,
                                 // bit6=user_blacklisted,
-                                // bit7=cold (synced with MFS)
+                                // bit7=is_cold (M3 落地),
+                                // bit8=is_no_return_tail (SPEC §5.3 #7)
 ```
 
 > **设计选择 1 vs 2（已落地为 1，本节是回写）**：早先草案给出"全模块单 section + `num_funcs` 头"格式（设计选择 2）。M1 实现采用**设计选择 1：per-function-section + SHF_LINK_ORDER**，理由：

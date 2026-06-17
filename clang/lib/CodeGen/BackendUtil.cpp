@@ -461,6 +461,23 @@ static bool initTargetOptions(const CompilerInstance &CI,
   if (BBCRMode == "partial" || BBCRMode == "full") {
     Options.BBAddrMap = true;
     llvm::EnableXBBR = true;
+
+    // Sub-options (SPEC §6.1) are bridged through the same cl::opt
+    // backbone the llc tests use: see XBBRMetadataEmitter.cpp.
+    if (!CodeGenOpts.BBCrossReorderBlacklist.empty()) {
+      static llvm::cl::opt<std::string> *XBBRBlacklistFile =
+          static_cast<llvm::cl::opt<std::string> *>(
+              llvm::cl::getRegisteredOptions().lookup("xbbr-blacklist"));
+      if (XBBRBlacklistFile)
+        XBBRBlacklistFile->setValue(CodeGenOpts.BBCrossReorderBlacklist);
+    }
+    if (CodeGenOpts.BBCrossReorderStats) {
+      static llvm::cl::opt<bool> *XBBRStats =
+          static_cast<llvm::cl::opt<bool> *>(
+              llvm::cl::getRegisteredOptions().lookup("xbbr-stats"));
+      if (XBBRStats)
+        XBBRStats->setValue(true);
+    }
   }
   Options.FunctionSections = CodeGenOpts.FunctionSections;
   Options.DataSections = CodeGenOpts.DataSections;

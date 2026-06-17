@@ -6222,6 +6222,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   // XBBR (M1-T06): -fbb-cross-reorder=none|function|partial|full.
   // ELF only; partial/full require x86_64 in M1 (M5 adds AArch64/ARM).
+  // ThinLTO is unsupported (SPEC §8.3) — its parallel per-module CodeGen
+  // breaks the per-partition metadata roundtrip. Full LTO is fine.
   if (Arg *A = Args.getLastArg(options::OPT_fbb_cross_reorder_EQ)) {
     StringRef Val = A->getValue();
     if (Val != "none" && Val != "function" && Val != "partial" &&
@@ -6238,10 +6240,19 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       // up front rather than silently producing nothing useful.
       D.Diag(diag::err_drv_unsupported_opt_for_target)
           << A->getAsString(Args) << TripleStr;
+    } else if ((Val == "partial" || Val == "full") &&
+               LTOMode == LTOK_Thin) {
+      D.Diag(diag::err_drv_unsupported_opt_for_target)
+          << A->getAsString(Args) << "ThinLTO (SPEC §8.3)";
     } else {
       A->render(Args, CmdArgs);
     }
   }
+  // XBBR sub-options (SPEC §6.1) — pass through to cc1 verbatim.
+  if (Arg *A = Args.getLastArg(options::OPT_fbb_cross_reorder_blacklist_EQ))
+    A->render(Args, CmdArgs);
+  if (Arg *A = Args.getLastArg(options::OPT_fbb_cross_reorder_stats))
+    A->render(Args, CmdArgs);
 
   bool HasDefaultDataSections = Triple.isOSBinFormatXCOFF();
   if (Args.hasFlag(options::OPT_fdata_sections, options::OPT_fno_data_sections,

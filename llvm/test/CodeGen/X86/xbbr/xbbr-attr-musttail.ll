@@ -23,6 +23,6 @@ entry:
   ret i32 %x
 }
 
-; @withmusttail (3 bytes) immediately followed by @plain_ret (3 bytes):
-;   01 01 21    01 01 01
-; CHECK: 01012101 0101
+; @withmusttail (5 bytes: ver+num+u16): 02 01 21 00
+; @plain_ret    (5 bytes: ver+num+u16): 02 01 01 00
+; CHECK: 02012100 02010100

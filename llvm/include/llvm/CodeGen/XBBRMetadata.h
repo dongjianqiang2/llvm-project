@@ -7,9 +7,15 @@
 //===----------------------------------------------------------------------===//
 //
 // This declares the XBBRMetadataEmitter pass interface and the per-BB
-// attribute byte format consumed by AsmPrinter to emit `.llvm_xbbr_attr`
+// attribute word format consumed by AsmPrinter to emit `.llvm_xbbr_attr`
 // (PLAN §9.3, SPEC §5.3 blacklist conditions). Enabled by
 // `-fbb-cross-reorder=partial|full` (clang) or `-enable-xbbr` (llc testing).
+//
+// Width: 16-bit per BB. The original M1 design used 8 bits (just enough
+// for the §5.3 list); a code review surfaced "noreturn-tail" as a
+// missing 9th bit (SPEC §5.3 item 7) and the cleanest way forward is
+// to widen the on-disk encoding to a u16 little-endian word. This
+// leaves headroom for future bits without another format break.
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,27 +39,51 @@ class MachineFunctionPass;
 extern cl::opt<bool> EnableXBBR;
 
 /// Per-basic-block XBBR attribute bits (PLAN §9.3 / SPEC §5.3).
-/// Stored one byte per MBB in the order MachineFunction iterates. Bits are
-/// independent (e.g., the entry block is also blacklisted from migration),
-/// so the value is a bitmask, not a tag.
+/// 16-bit bitmask, stored one little-endian word per MBB in the order
+/// MachineFunction iterates. Bits are independent (e.g., the entry
+/// block is also blacklisted from migration), so the value is a
+/// bitmask, not a tag.
 namespace xbbr {
-enum AttrBit : uint8_t {
+enum AttrBit : uint16_t {
   IsEntry           = 1u << 0, ///< Function entry block (anchored).
   IsLandingPad      = 1u << 1, ///< EH landing pad (mirrors BBEntry::IsEHPad).
   IsIndirectBrTarget= 1u << 2, ///< blockaddress / callbr / indirectbr target.
-  HasSetjmp         = 1u << 3, ///< Calls setjmp / canReturnTwice.
-  HasInlineAsmLabel = 1u << 4, ///< Inline asm with section/label (M1: 0).
-  IsMustTail        = 1u << 5, ///< Block ends with a musttail call.
-  UserBlacklisted   = 1u << 6, ///< Listed in -fbb-cross-reorder-blacklist (M1-T06).
-  IsCold            = 1u << 7, ///< Synced with MachineFunctionSplitter (M1-T06).
+                                ///< Also covers inline-asm-goto indirect
+                                ///< targets via MBB.isInlineAsmBrIndirectTarget()
+                                ///< — see HasInlineAsmLabel comment.
+  HasSetjmp         = 1u << 3, ///< Calls setjmp/longjmp — recognized by
+                                ///< the returns_twice attribute (setjmp side)
+                                ///< or by callee name match (longjmp side,
+                                ///< since glibc longjmp has no IR-level
+                                ///< marker — only `noreturn`, which would
+                                ///< over-match abort/exit).
+  HasInlineAsmLabel = 1u << 4, ///< Inline asm whose body emits .section
+                                ///< / .pushsection / .popsection. Distinct
+                                ///< from "inline asm goto with indirect
+                                ///< targets", which is already covered by
+                                ///< IsIndirectBrTarget.
+  IsMustTail        = 1u << 5, ///< Block ends with a musttail call (IR
+                                ///< BasicBlock::getTerminatingMustTailCall()
+                                ///< / CallBase::isMustTailCall — NOT
+                                ///< MachineInstr::isReturn(), see PLAN §3.4
+                                ///< review correction).
+  UserBlacklisted   = 1u << 6, ///< Listed in -fbb-cross-reorder-blacklist=.
+  IsCold            = 1u << 7, ///< Synced with MachineFunctionSplitter
+                                ///< (deferred; lld consumer in M3 — flag
+                                ///< is currently always 0).
+  IsNoReturnTail    = 1u << 8, ///< BB ends with a `noreturn` callsite and
+                                ///< has no successors (SPEC §5.3 item 7).
+                                ///< Anchoring this aids backtrace fidelity
+                                ///< in non-Unwind exception flows.
 };
 } // namespace xbbr
 
-/// Returns the per-MBB XBBR attribute bytes computed by XBBRMetadataEmitter
-/// for a given MachineFunction, in MachineFunction iteration order. Returns
-/// an empty ArrayRef if -enable-xbbr was not in effect for this MF or the
-/// pass did not run yet.
-ArrayRef<uint8_t> getXBBRAttrs(const MachineFunction &MF);
+/// Returns the per-MBB XBBR attribute words (u16, host-endian; the
+/// linker reads them as little-endian on disk) computed by
+/// XBBRMetadataEmitter for a given MachineFunction, in MachineFunction
+/// iteration order. Returns an empty ArrayRef if -enable-xbbr was not
+/// in effect for this MF or the pass did not run yet.
+ArrayRef<uint16_t> getXBBRAttrs(const MachineFunction &MF);
 
 /// createXBBRMetadataEmitterPass - Compute XBBR per-BB metadata after
 /// MachineBlockPlacement; the actual section bytes are written by
