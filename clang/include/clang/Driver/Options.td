@@ -4437,6 +4437,12 @@ def fbasic_block_sections_EQ : Joined<["-"], "fbasic-block-sections=">, Group<f_
   DocBrief<[{Place each basic block or a subset of basic blocks in its own section.}]>,
   Values<"all,none,list=">,
   MarshallingInfoString<CodeGenOpts<"BBSections">, [{"none"}]>;
+def fbb_cross_reorder_EQ : Joined<["-"], "fbb-cross-reorder=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Enable XBBR cross-function basic block reordering metadata "
+           "emission (ELF, x86_64 first; experimental).">,
+  Values<"none,function,partial,full">,
+  MarshallingInfoString<CodeGenOpts<"BBCrossReorder">, [{"none"}]>;
 defm data_sections : BoolFOption<"data-sections",
   CodeGenOpts<"DataSections">, DefaultFalse,
   PosFlag<SetTrue, [], [ClangOption, CC1Option],

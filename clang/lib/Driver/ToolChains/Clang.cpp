@@ -6220,6 +6220,29 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     }
   }
 
+  // XBBR (M1-T06): -fbb-cross-reorder=none|function|partial|full.
+  // ELF only; partial/full require x86_64 in M1 (M5 adds AArch64/ARM).
+  if (Arg *A = Args.getLastArg(options::OPT_fbb_cross_reorder_EQ)) {
+    StringRef Val = A->getValue();
+    if (Val != "none" && Val != "function" && Val != "partial" &&
+        Val != "full") {
+      D.Diag(diag::err_drv_invalid_value)
+          << A->getAsString(Args) << A->getValue();
+    } else if (Val == "none") {
+      A->render(Args, CmdArgs); // pass through but no-op
+    } else if (!Triple.isOSBinFormatELF()) {
+      D.Diag(diag::err_drv_unsupported_opt_for_target)
+          << A->getAsString(Args) << TripleStr;
+    } else if ((Val == "partial" || Val == "full") && !Triple.isX86()) {
+      // M1 only emits XBBR metadata for x86_64. Diagnose other arches
+      // up front rather than silently producing nothing useful.
+      D.Diag(diag::err_drv_unsupported_opt_for_target)
+          << A->getAsString(Args) << TripleStr;
+    } else {
+      A->render(Args, CmdArgs);
+    }
+  }
+
   bool HasDefaultDataSections = Triple.isOSBinFormatXCOFF();
   if (Args.hasFlag(options::OPT_fdata_sections, options::OPT_fno_data_sections,
                    UseSeparateSections || HasDefaultDataSections)) {

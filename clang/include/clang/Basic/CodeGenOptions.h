@@ -129,6 +129,16 @@ public:
   // "none":        Disable sections for basic blocks.
   std::string BBSections;
 
+  // -fbb-cross-reorder= mode (XBBR, PLAN/SPEC §4):
+  //   "none":     XBBR off (default).
+  //   "function": function-level reorder only (no per-BB metadata).
+  //   "partial":  hot BBs may migrate cross-function (embedded default).
+  //   "full":     all non-blacklisted BBs may migrate.
+  // Implementation in M1: "partial"/"full" both turn on BBAddrMap+PGO
+  // features and emit `.llvm_xbbr_attr`. Differentiated cold-threshold
+  // semantics arrive in M3.
+  std::string BBCrossReorder;
+
   // If set, override the default value of MCAsmInfo::BinutilsVersion. If
   // DisableIntegratedAS is specified, the assembly output will consider GNU as
   // support. "none" means that all ELF features can be used, regardless of

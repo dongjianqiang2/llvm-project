@@ -25,6 +25,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Bitcode/BitcodeWriterPass.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/CodeGen/XBBRMetadata.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Frontend/Driver/CodeGenOptions.h"
 #include "llvm/IR/DataLayout.h"
@@ -447,6 +448,20 @@ static bool initTargetOptions(const CompilerInstance &CI,
   }
 
   Options.EnableMachineFunctionSplitter = CodeGenOpts.SplitMachineFunctions;
+
+  // XBBR (M1-T06): partial/full implicitly enable BB_ADDR_MAP + PGO
+  // features (see useBBAddrMap() in AsmPrinter.cpp) so global_freq is
+  // available to lld at link time (PLAN §3.2). EnableXBBR is the same
+  // cl::opt gate the llc test path uses; setting it here lets clang and
+  // llc share one code path. M2 will replace this with a proper
+  // TargetOptions::XBBR enum so LTO partitions can roundtrip the mode.
+  // Driver (Clang.cpp) already validates the value set; values other
+  // than partial/full are silently treated as off here.
+  StringRef BBCRMode = CodeGenOpts.BBCrossReorder;
+  if (BBCRMode == "partial" || BBCRMode == "full") {
+    Options.BBAddrMap = true;
+    llvm::EnableXBBR = true;
+  }
   Options.FunctionSections = CodeGenOpts.FunctionSections;
   Options.DataSections = CodeGenOpts.DataSections;
   Options.IgnoreXCOFFVisibility = LangOpts.IgnoreXCOFFVisibility;
