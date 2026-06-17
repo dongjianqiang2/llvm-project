@@ -1276,9 +1276,9 @@ void TargetPassConfig::addMachinePasses() {
     addPass(createStaticDataAnnotatorPass());
   }
   // We run the BasicBlockSections pass if either we need BB sections or BB
-  // address map (or both).
+  // address map (or both). XBBR (M1-T03) needs BB_ADDR_MAP scaffolding too.
   if (TM->getBBSectionsType() != llvm::BasicBlockSection::None ||
-      TM->Options.BBAddrMap) {
+      TM->Options.BBAddrMap || EnableXBBR) {
     if (TM->getBBSectionsType() == llvm::BasicBlockSection::List) {
       addPass(llvm::createBasicBlockSectionsProfileReaderWrapperPass(
           TM->getBBSectionsFuncListBuf()));

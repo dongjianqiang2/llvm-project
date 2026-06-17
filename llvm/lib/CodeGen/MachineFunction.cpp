@@ -31,6 +31,7 @@
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/XBBRMetadata.h"
 #include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/PseudoSourceValueManager.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
@@ -502,9 +503,9 @@ MachineFunction::CreateMachineBasicBlock(const BasicBlock *BB,
   MachineBasicBlock *MBB =
       new (BasicBlockRecycler.Allocate<MachineBasicBlock>(Allocator))
           MachineBasicBlock(*this, BB);
-  // Set BBID for `-basic-block-sections=list` and `-basic-block-address-map` to
-  // allow robust mapping of profiles to basic blocks.
-  if (Target.Options.BBAddrMap ||
+  // Set BBID for `-basic-block-sections=list`, `-basic-block-address-map`, and
+  // XBBR (M1-T03) — all paths need stable BB IDs for downstream consumers.
+  if (Target.Options.BBAddrMap || EnableXBBR ||
       Target.getBBSectionsType() == BasicBlockSection::List)
     MBB->setBBID(BBID.has_value() ? *BBID : UniqueBBID{NextBBID++, 0});
   return MBB;

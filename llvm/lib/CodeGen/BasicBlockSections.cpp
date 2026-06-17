@@ -76,6 +76,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachinePostDominators.h"
+#include "llvm/CodeGen/XBBRMetadata.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/InitializePasses.h"
@@ -378,7 +379,9 @@ bool BasicBlockSections::handleBBSections(MachineFunction &MF) {
 // avoids the need to store basic block IDs in the BB address map section, since
 // they can be determined implicitly.
 bool BasicBlockSections::handleBBAddrMap(MachineFunction &MF) {
-  if (!MF.getTarget().Options.BBAddrMap)
+  // XBBR (M1-T03) implicitly enables BB_ADDR_MAP — see useBBAddrMap() in
+  // AsmPrinter.cpp; mirror the condition here so RenumberBlocks runs.
+  if (!MF.getTarget().Options.BBAddrMap && !EnableXBBR)
     return false;
   MF.RenumberBlocks();
   return true;

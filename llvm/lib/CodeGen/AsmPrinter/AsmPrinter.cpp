@@ -40,6 +40,7 @@
 #include "llvm/CodeGen/GCMetadataPrinter.h"
 #include "llvm/CodeGen/LazyMachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/XBBRMetadata.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -160,6 +161,17 @@ static cl::bits<PGOMapFeaturesEnum> PgoAnalysisMapFeatures(
     cl::desc(
         "Enable extended information within the SHT_LLVM_BB_ADDR_MAP that is "
         "extracted from PGO related analysis."));
+
+/// XBBR (M1-T03) requires SHT_LLVM_BB_ADDR_MAP with PGO features
+/// (FuncEntryCount/BBFreq/BrProb) to be emitted, since global_freq is
+/// derived from BBFreq × FuncEntryCount in lld at link time (PLAN §3.2).
+/// Treat -enable-xbbr as implicitly turning on -basic-block-address-map.
+/// Returns true if a function should emit BB_ADDR_MAP and the surrounding
+/// label/symbol scaffolding (mirrors the previous bare
+/// `MF.getTarget().Options.BBAddrMap` checks in this file).
+static bool useBBAddrMap(const MachineFunction &MF) {
+  return MF.getTarget().Options.BBAddrMap || EnableXBBR;
+}
 
 static cl::opt<bool> BBAddrMapSkipEmitBBEntries(
     "basic-block-address-map-skip-bb-entries",
@@ -1404,7 +1416,12 @@ getBBAddrMapFeature(const MachineFunction &MF, int NumMBBSectionRanges,
   }
 
   bool NoFeatures = PgoAnalysisMapFeatures.isSet(PGOMapFeaturesEnum::None);
-  bool AllFeatures = PgoAnalysisMapFeatures.isSet(PGOMapFeaturesEnum::All);
+  // XBBR (M1-T03): treat -enable-xbbr as implicitly enabling all PGO features
+  // unless the user explicitly passed -pgo-analysis-map=. This matches PLAN
+  // §3.2 where global_freq = BBFreq × FuncEntryCount and lld also wants
+  // per-edge BrProb for CFG weights.
+  bool AllFeatures = PgoAnalysisMapFeatures.isSet(PGOMapFeaturesEnum::All) ||
+                     (EnableXBBR && PgoAnalysisMapFeatures.getBits() == 0);
   bool FuncEntryCountEnabled =
       AllFeatures || (!NoFeatures && PgoAnalysisMapFeatures.isSet(
                                          PGOMapFeaturesEnum::FuncEntryCount));
@@ -1840,7 +1857,7 @@ void AsmPrinter::emitFunctionBody() {
           !MI.isDebugInstr()) {
         HasAnyRealCode = true;
       }
-      if (MI.isCall() && MF->getTarget().Options.BBAddrMap)
+      if (MI.isCall() && useBBAddrMap(*MF))
         OutStreamer->emitLabel(createCallsiteSymbol(MBB));
 
       // If there is a pre-instruction symbol, emit a label for it here.
@@ -1973,7 +1990,7 @@ void AsmPrinter::emitFunctionBody() {
     // We must emit temporary symbol for the end of this basic block, if either
     // we have BBLabels enabled or if this basic blocks marks the end of a
     // section.
-    if (MF->getTarget().Options.BBAddrMap ||
+    if (useBBAddrMap(*MF) ||
         (MAI->hasDotTypeDotSizeDirective() && MBB.isEndSection()))
       OutStreamer->emitLabel(MBB.getEndSymbol());
 
@@ -2127,7 +2144,7 @@ void AsmPrinter::emitFunctionBody() {
   // Emit section containing BB address offsets and their metadata, when
   // BB labels are requested for this function. Skip empty functions.
   if (HasAnyRealCode) {
-    if (MF->getTarget().Options.BBAddrMap)
+    if (useBBAddrMap(*MF))
       emitBBAddrMapSection(*MF);
     else if (PgoAnalysisMapFeatures.getBits() != 0)
       MF->getContext().reportWarning(
@@ -2840,7 +2857,7 @@ void AsmPrinter::SetupMachineFunction(MachineFunction &MF) {
       F.hasFnAttribute("xray-instruction-threshold") ||
       needFuncLabels(MF, *this) || NeedsLocalForSize ||
       MF.getTarget().Options.EmitStackSizeSection ||
-      MF.getTarget().Options.BBAddrMap) {
+      useBBAddrMap(MF)) {
     CurrentFnBegin = createTempSymbol("func_begin");
     if (NeedsLocalForSize)
       CurrentFnSymForSize = CurrentFnBegin;
@@ -4459,7 +4476,7 @@ bool AsmPrinter::shouldEmitLabelForBasicBlock(
   // With `-fbasic-block-sections=`, a label is needed for every non-entry block
   // in the labels mode (option `=labels`) and every section beginning in the
   // sections mode (`=all` and `=list=`).
-  if ((MF->getTarget().Options.BBAddrMap || MBB.isBeginSection()) &&
+  if ((useBBAddrMap(*MF) || MBB.isBeginSection()) &&
       !MBB.isEntryBlock())
     return true;
   // A label is needed for any block with at least one predecessor (when that
