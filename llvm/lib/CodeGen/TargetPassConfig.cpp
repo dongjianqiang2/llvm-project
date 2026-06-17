@@ -26,6 +26,7 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachinePassRegistry.h"
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/XBBRMetadata.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -1558,6 +1559,10 @@ void TargetPassConfig::addBlockPlacement() {
     // Run a separate pass to collect block placement statistics.
     if (EnableBlockPlacementStats)
       addPass(&MachineBlockPlacementStatsID);
+    // XBBR: compute per-BB metadata after final block placement, before
+    // AsmPrinter emits .llvm_xbbr_attr.
+    if (EnableXBBR)
+      addPass(createXBBRMetadataEmitterPass());
   }
 }
 

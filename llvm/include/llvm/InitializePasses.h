@@ -205,6 +205,7 @@ LLVM_ABI void initializeMachineDominanceFrontierPass(PassRegistry &);
 LLVM_ABI void initializeMachineDominatorTreeWrapperPassPass(PassRegistry &);
 LLVM_ABI void initializeMachineFunctionPrinterPassPass(PassRegistry &);
 LLVM_ABI void initializeMachineFunctionSplitterPass(PassRegistry &);
+LLVM_ABI void initializeXBBRMetadataEmitterPass(PassRegistry &);
 LLVM_ABI void initializeMachineLateInstrsCleanupLegacyPass(PassRegistry &);
 LLVM_ABI void initializeMachineLICMPass(PassRegistry &);
 LLVM_ABI void initializeMachineLoopInfoWrapperPassPass(PassRegistry &);
