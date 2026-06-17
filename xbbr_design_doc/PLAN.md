@@ -613,18 +613,19 @@ For each edge:
 
 链接后不保留。
 
-### 9.3 `.llvm_xbbr_attr`（类型 `SHT_LLVM_XBBR_ATTR`，新分配）
+### 9.3 `.llvm_xbbr_attr`（类型 `SHT_LLVM_XBBR_ATTR = 0x6fff4c0e`，新分配）
 
-承载 XBBR 专属黑名单/属性位。函数关联通过 section 依附（不存 `.symtab` 索引）。
+承载 XBBR 专属黑名单/属性位。**采用 per-function-section 模式**（与 `.llvm_bb_addr_map` 一致），每函数一个独立 section：`SHF_LINK_ORDER` 依附该函数的 text section（`sh_link → .text.<fn>`），加 `SHF_EXCLUDE` 在链接后丢弃。函数关联完全由 section dependency 表达，**不存 `.symtab` 索引、不存符号名**。
+
+每个 `.llvm_xbbr_attr` section 的字节格式：
 
 ```
-Header (8 bytes):
-    uint32  version;
-    uint32  num_funcs;
-For each function:
-    uint32  num_bbs;
-    uint8   attrs[num_bbs];     // 位掩码：
-                                // bit0=is_entry, bit1=is_landing_pad,
+Per-function section (one section per text section):
+    uint8   version;            // 0x01
+    uleb128 num_bbs;            // MachineFunction 中 MBB 个数
+    uint8   attrs[num_bbs];     // 位掩码（按 MachineFunction 迭代序）：
+                                // bit0=is_entry,
+                                // bit1=is_landing_pad,
                                 // bit2=is_indirectbr_target,
                                 // bit3=has_setjmp,
                                 // bit4=has_inline_asm_label,
@@ -633,7 +634,14 @@ For each function:
                                 // bit7=cold (synced with MFS)
 ```
 
-> **与 `BBEntry::Metadata` 的关系**：`is_landing_pad`/`is_indirectbr_target`/musttail 的尾调用属性与 BB_ADDR_MAP `BBEntry::Metadata` 的 `IsEHPad`/`HasIndirectBranch`/`HasTailCall` 重叠。实现优先读 `BBEntry::Metadata`，仅 `has_setjmp`/`has_inline_asm_label`/`is_musttail`(精确)/`user_blacklisted`/`cold` 等 XBBR 新位由本 section 提供；`is_musttail` 判定见 §3.4（IR 级，非 `isReturn()`）。Stage 0 须对二者做一致性断言。
+> **设计选择 1 vs 2（已落地为 1，本节是回写）**：早先草案给出"全模块单 section + `num_funcs` 头"格式（设计选择 2）。M1 实现采用**设计选择 1：per-function-section + SHF_LINK_ORDER**，理由：
+> - 与既有 `SHT_LLVM_BB_ADDR_MAP` 一致（同样 per-function、同样 SHF_LINK_ORDER），lld 端读出/索引代码可以完全复用 BB_ADDR_MAP 路径；
+> - 函数被 ICF/dead-strip 丢弃时，依赖它的 `.llvm_xbbr_attr` 自动随之消失（SHF_LINK_ORDER 语义），无需额外 GC 逻辑；
+> - 不需要 `func_symbol_index` 字段，从根上避免了"`.symtab` 索引跨文件不稳定"问题（评审 #6）。
+>
+> 代价：单 .o 内若有 N 个函数则有 N 个 `.llvm_xbbr_attr` section，比单一 section 多 N×40B 头开销。`SHF_EXCLUDE` 在链接后全部丢弃,运行时零开销。
+
+> **与 `BBEntry::Metadata` 的关系**：`is_landing_pad`/`is_indirectbr_target` 与 BB_ADDR_MAP `BBEntry::Metadata` 的 `IsEHPad`/`HasIndirectBranch` 重叠；`is_musttail` 比 `BBEntry::Metadata::HasTailCall` 更精确（musttail ⊂ tailcall，PLAN §3.4 评审 #7）。实现优先读 `BBEntry::Metadata`；XBBR 新位（`has_setjmp` / `has_inline_asm_label` / `is_musttail` 精确版 / `user_blacklisted` / `cold`）由本 section 提供。Stage 0 须对重叠位做一致性断言。
 
 链接后不保留（`SHF_EXCLUDE`）。
 
