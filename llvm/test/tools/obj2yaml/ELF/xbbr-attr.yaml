@@ -1,0 +1,26 @@
+## Test that obj2yaml dumps a SHT_LLVM_XBBR_ATTR section with the symbolic
+## type name (not a raw 0x6FFF4C0E) and that the YAML round-trips back
+## through yaml2obj into an identical section type.
+
+# RUN: yaml2obj %s -o %t
+# RUN: obj2yaml %t | FileCheck %s
+# RUN: obj2yaml %t | yaml2obj -o %t2
+# RUN: llvm-readobj -S %t2 | FileCheck %s --check-prefix=OBJ
+
+--- !ELF
+FileHeader:
+  Class:   ELFCLASS64
+  Data:    ELFDATA2LSB
+  Type:    ET_REL
+  Machine: EM_X86_64
+Sections:
+  - Name:            .llvm_xbbr_attr
+    Type:            SHT_LLVM_XBBR_ATTR
+    Flags:           [ SHF_EXCLUDE ]
+    Content:         B2
+
+# CHECK: Name: .llvm_xbbr_attr
+# CHECK: Type: SHT_LLVM_XBBR_ATTR
+
+# OBJ: Name: .llvm_xbbr_attr
+# OBJ: Type: SHT_LLVM_XBBR_ATTR (0x6FFF4C0E)

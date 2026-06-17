@@ -1,0 +1,23 @@
+## Test that yaml2obj emits a section of type SHT_LLVM_XBBR_ATTR and that
+## llvm-readobj/llvm-readelf report the symbolic type name (not "Unknown").
+
+# RUN: yaml2obj %s -o %t
+# RUN: llvm-readobj -S %t | FileCheck %s --check-prefix=OBJ
+# RUN: llvm-readelf -S %t | FileCheck %s --check-prefix=GNU
+
+--- !ELF
+FileHeader:
+  Class:   ELFCLASS64
+  Data:    ELFDATA2LSB
+  Type:    ET_REL
+  Machine: EM_X86_64
+Sections:
+  - Name:            .llvm_xbbr_attr
+    Type:            SHT_LLVM_XBBR_ATTR
+    Flags:           [ SHF_EXCLUDE ]
+    Content:         A1
+
+# OBJ:      Name: .llvm_xbbr_attr
+# OBJ:      Type: SHT_LLVM_XBBR_ATTR (0x6FFF4C0E)
+
+# GNU: .llvm_xbbr_attr{{.*}}LLVM_XBBR_ATTR
