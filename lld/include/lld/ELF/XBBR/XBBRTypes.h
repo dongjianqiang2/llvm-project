@@ -11,11 +11,18 @@
 // implementation files don't pull in each other's heavy dependencies.
 //
 // Stability invariants (PLAN §6, M2-T01):
-//   * `FuncId` is `InputSectionBase *` of the function's text section.
-//     Within one ld.lld invocation this pointer is stable and unique;
-//     across .o files it is collision-free because lld owns the
-//     allocation. This sidesteps the .symtab-index-instability concern
-//     raised in design-doc review #6.
+//   * `FuncId` is a small, dense integer assigned by XBBRGraph at Stage 0,
+//     in the deterministic order (input file index, section index). The
+//     mapping back to the lld InputSectionBase* lives in XBBRGraph.
+//     Rationale for an integer ID instead of using `InputSectionBase *`
+//     directly:
+//       - tests can spell concrete IDs ({0,1,2,...}); raw pointers vary
+//         per run and are useless in FileCheck output;
+//       - decision-map serialization (M4 / PLAN §9.4) is straightforward;
+//       - DenseMap<FuncId,...> is more compact than DenseMap<ptr,...>.
+//     The pointer is still the source of truth — the integer IS the
+//     pointer's stable position in the deterministic sort order, so
+//     across two ld.lld runs of the same inputs the IDs match.
 //   * `BBId` is the basic block ID emitted in the per-function
 //     `SHT_LLVM_BB_ADDR_MAP` section (BBEntry::ID; `UniqueBBID::BaseID`).
 //
@@ -37,9 +44,16 @@ class InputSectionBase;
 
 namespace xbbr {
 
-/// Stable identifier for a function within one ld.lld invocation.
-/// See header comment — this is the function's text InputSectionBase.
-using FuncId = InputSectionBase *;
+/// Stable integer identifier for a function within one ld.lld invocation.
+/// Assigned by XBBRGraph in (input file index, section index) order so
+/// the same inputs always produce the same IDs. Use
+/// `XBBRGraph::sectionToFunc(InputSectionBase *)` and
+/// `XBBRGraph::funcSection(FuncId)` to bridge to/from lld objects.
+using FuncId = uint32_t;
+
+/// Sentinel for "no such function" (e.g. the lookup target was not part
+/// of any input ObjFile's BB_ADDR_MAP).
+inline constexpr FuncId InvalidFuncId = ~uint32_t{0};
 
 /// Basic-block identifier within a function (matches BBAddrMap BBEntry::ID).
 using BBId = uint32_t;
@@ -70,11 +84,18 @@ inline bool any(Provenance a, Provenance b) {
 /// link. Heavy fields (successors) live in XBBRGraph::edges, indexed
 /// by node index, to keep XBBRNode trivially-copyable in a vector.
 struct XBBRNode {
-  FuncId Func = nullptr;     ///< owning text section
-  BBId BB = 0;               ///< MBB id within the function
-  uint32_t Size = 0;         ///< instruction-byte size of this BB
-  uint64_t GlobalFreq = 0;   ///< BBFreq × FuncEntryCount (PLAN §3.2)
-  uint8_t XBBRAttrs = 0;     ///< bitmask, see xbbr::AttrBit (LLVM side)
+  FuncId Func = InvalidFuncId; ///< owning function (XBBRGraph::funcSection)
+  BBId BB = 0;                 ///< MBB id within the function
+  uint32_t Size = 0;           ///< BB byte size. M2-T01: from BBAddrMap
+                               ///<   (the .o-time size). M5 / §4.5
+                               ///<   ConstraintSolver may patch this to
+                               ///<   post-relaxation size.
+  uint64_t GlobalFreq = 0;     ///< pre-multiplied BBFreq × FuncEntryCount
+                               ///<   (PLAN §3.2). Use this directly for
+                               ///<   cross-function comparison; the raw
+                               ///<   per-entry BBFreq is recoverable as
+                               ///<   GlobalFreq / FuncInfo.EntryCount.
+  uint8_t XBBRAttrs = 0;       ///< bitmask, see xbbr::AttrBit (LLVM side)
 
   /// Quick predicates derived from XBBRAttrs (mirroring xbbr::AttrBit
   /// in include/llvm/CodeGen/XBBRMetadata.h — Stage 0 will assert these

@@ -52,7 +52,7 @@ namespace xbbr {
 /// SHT_LLVM_XBBR_ATTR + (optionally) IRPGO entry count. One per
 /// FuncId in the global graph.
 struct FuncInfo {
-  FuncId Section = nullptr;
+  InputSectionBase *Section = nullptr;  ///< lld object for this function
   uint32_t FirstNode = 0;       ///< first index in XBBRGraph::nodes
   uint32_t NumNodes = 0;        ///< node count for this function
   uint64_t EntryCount = 0;      ///< from BBAddrMap PGO (FuncEntryCount)
@@ -83,9 +83,15 @@ public:
   llvm::ArrayRef<XBBREdge> edges() const { return Edges; }
   llvm::ArrayRef<FuncInfo> funcs() const { return Funcs; }
 
+  /// Bridge between FuncId and the underlying lld object. `funcSection`
+  /// is the inverse of `sectionToFunc`. Returns InvalidFuncId / nullptr
+  /// if no mapping exists (e.g. function compiled without
+  /// `-fbb-cross-reorder=`).
+  FuncId sectionToFunc(InputSectionBase *S) const;
+  InputSectionBase *funcSection(FuncId F) const;
+
   /// Look up the global node index for (Func, BB), or nullopt if the BB
-  /// was not in any input's BB_ADDR_MAP (e.g. a function compiled
-  /// without `-fbb-cross-reorder=`).
+  /// was not in any input's BB_ADDR_MAP.
   std::optional<uint32_t> findNode(FuncId Func, BBId BB) const;
 
   /// Number of nodes flagged isAnchor() — useful for stats / cost-model
@@ -95,11 +101,11 @@ public:
 private:
   std::vector<XBBRNode> Nodes;
   std::vector<XBBREdge> Edges;
-  std::vector<FuncInfo> Funcs;
+  std::vector<FuncInfo> Funcs;       ///< indexed by FuncId
 
   // Indices (DenseMap is fine — never iterated for output).
-  llvm::DenseMap<FuncId, uint32_t> FuncIndex;             ///< FuncId → Funcs idx
-  llvm::DenseMap<BBKey, uint32_t> BBIndex;                ///< (Func,BB) → Nodes idx
+  llvm::DenseMap<InputSectionBase *, FuncId> SectionToFuncId;
+  llvm::DenseMap<BBKey, uint32_t> BBIndex;            ///< (FuncId, BBId) → Nodes idx
 
   // Stage 0 internals — declared here so unit tests in a follow-up
   // patch can drive them piecewise without going through build().
