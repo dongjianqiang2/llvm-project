@@ -145,6 +145,38 @@ def call_graph_profile_sort: JJ<"call-graph-profile-sort=">,
 def : FF<"no-call-graph-profile-sort">, Alias<call_graph_profile_sort>, AliasArgs<["none"]>,
   Flags<[HelpHidden]>;
 
+// XBBR (SPEC §6.2 / TASK M2-T04). The main switch is a Joined option
+// taking an .profdata path or "none"; M2 consumes it as a boolean
+// (any non-"none" value enables Stage 0+1 reuse of hfsort+).
+def bb_cross_reorder_eq : JJ<"bb-cross-reorder=">,
+  HelpText<"XBBR cross-function basic-block reordering: profdata path or 'none' (experimental).">,
+  MetaVarName<"<profdata-or-none>">;
+def bb_cross_reorder_mode_eq : JJ<"bb-cross-reorder-mode=">,
+  HelpText<"XBBR mode: partial (default, embedded) or full (server)">,
+  MetaVarName<"<partial|full>">,
+  Values<"partial,full">;
+def bb_cross_reorder_cluster_algo_eq : JJ<"bb-cross-reorder-cluster-algo=">,
+  HelpText<"XBBR Stage 1 (function clustering) algorithm">,
+  Values<"hfsort+,c3,custom">;
+def bb_cross_reorder_layout_algo_eq : JJ<"bb-cross-reorder-layout-algo=">,
+  HelpText<"XBBR Stage 2 (BB layout) algorithm">,
+  Values<"ext-tsp,ph,custom">;
+def bb_cross_reorder_weights_eq : JJ<"bb-cross-reorder-weights=">,
+  HelpText<"XBBR multi-objective cost weights, e.g. icache=4,itlb=2,btb=1,size=2">;
+def bb_cross_reorder_max_thunk_bytes_eq : JJ<"bb-cross-reorder-max-thunk-bytes=">,
+  HelpText<"Maximum total thunk/veneer bytes XBBR may inject (0 = unlimited)">;
+def bb_cross_reorder_fallback_eq : JJ<"bb-cross-reorder-fallback=">,
+  HelpText<"XBBR fallback policy: auto, conservative, none">,
+  Values<"auto,conservative,none">;
+def bb_cross_reorder_emit_decision_map : FF<"bb-cross-reorder-emit-decision-map">,
+  HelpText<"Emit .llvm_cross_bb_map describing XBBR layout decisions">;
+def bb_cross_reorder_deterministic : FF<"bb-cross-reorder-deterministic">,
+  HelpText<"Force XBBR to bitwise-identical output for the same inputs">;
+def bb_cross_reorder_stats : FF<"bb-cross-reorder-stats">,
+  HelpText<"Print XBBR Stage 0/1 statistics to stderr (diagnostic; not in SPEC §6.2)">;
+def bb_cross_reorder_max_align_eq : JJ<"bb-cross-reorder-max-align=">,
+  HelpText<"Cap on per-BB alignment when XBBR migrates blocks (bytes; default 16)">;
+
 defm irpgo_profile: EEq<"irpgo-profile",
   "Read a temporary profile file for use with --bp-startup-sort=">;
 def bp_compression_sort: JJ<"bp-compression-sort=">, MetaVarName<"[none,function,data,both]">,

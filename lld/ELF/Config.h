@@ -93,6 +93,21 @@ enum class BuildIdKind { None, Fast, Md5, Sha1, Hexstring, Uuid };
 // For --call-graph-profile-sort={none,hfsort,cdsort}.
 enum class CGProfileSortKind { None, Hfsort, Cdsort };
 
+/// XBBR (PLAN/SPEC §4): cross-function basic-block reordering mode.
+/// `Function` is the M2 milestone scope — function-level hfsort+
+/// reordering, equivalent to `--call-graph-profile-sort=hfsort`.
+/// `Partial`/`Full` add per-BB migration in M3.
+enum class XBBRMode : uint8_t { None, Function, Partial, Full };
+
+/// XBBR Stage 1 algorithm choice (SPEC §6.2).
+enum class XBBRClusterAlgo : uint8_t { HFSortPlus, C3, Custom };
+
+/// XBBR Stage 2 algorithm choice (SPEC §6.2).
+enum class XBBRLayoutAlgo : uint8_t { ExtTSP, PH, Custom };
+
+/// XBBR fallback policy (SPEC §6.2 / §7).
+enum class XBBRFallback : uint8_t { Auto, Conservative, None };
+
 // For --discard-{all,locals,none}.
 enum class DiscardPolicy { Default, All, Locals, None };
 
@@ -300,6 +315,27 @@ struct Config {
   bool armBe8 = false;
   BsymbolicKind bsymbolic = BsymbolicKind::None;
   CGProfileSortKind callGraphProfileSort;
+
+  // XBBR (SPEC §6.2 / TASK M2-T04). Most fields are stored unmodified
+  // here in M2 — they're consumed by Stage 2/3/4 in M3. M2 only acts on
+  // `xbbrMode != None` (enabling the pipeline) and on the Propeller
+  // mutex check.
+  XBBRMode xbbrMode = XBBRMode::None;
+  bool xbbrEnabled = false;          ///< true when --bb-cross-reorder= was passed
+  llvm::StringRef xbbrProfdataPath;  ///< value of --bb-cross-reorder=<path>
+  XBBRClusterAlgo xbbrClusterAlgo = XBBRClusterAlgo::HFSortPlus;
+  XBBRLayoutAlgo xbbrLayoutAlgo = XBBRLayoutAlgo::ExtTSP;
+  // Cost-function weights (Stage 3, M3). Defaults follow SPEC §4.3.
+  unsigned xbbrWeightIcache = 4;
+  unsigned xbbrWeightItlb = 2;
+  unsigned xbbrWeightBtb = 1;
+  unsigned xbbrWeightSize = 1;
+  uint64_t xbbrMaxThunkBytes = 0;    ///< 0 = unlimited
+  XBBRFallback xbbrFallback = XBBRFallback::Auto;
+  bool xbbrEmitDecisionMap = false;  ///< --bb-cross-reorder-emit-decision-map
+  bool xbbrDeterministic = false;    ///< --bb-cross-reorder-deterministic
+  bool xbbrStats = false;            ///< --bb-cross-reorder-stats (diagnostic)
+  unsigned xbbrMaxAlign = 16;        ///< --bb-cross-reorder-max-align (bytes)
   llvm::StringRef irpgoProfilePath;
   bool bpStartupFunctionSort = false;
   bool bpCompressionSortStartupFunctions = false;

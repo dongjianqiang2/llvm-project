@@ -1378,6 +1378,115 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
       ctx.arg.bsymbolic = BsymbolicKind::All;
   }
   ctx.arg.callGraphProfileSort = getCGProfileSortKind(ctx, args);
+
+  // XBBR (SPEC §6.2 / TASK M2-T04) — read the option set unconditionally;
+  // M2 only acts on `xbbrEnabled` and the mode field, but storing the
+  // rest now keeps all the parsing in one place. M3 will consume the
+  // weights / fallback / max-* fields for Stage 2/3/4.
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_eq)) {
+    StringRef val = arg->getValue();
+    if (val == "none") {
+      ctx.arg.xbbrEnabled = false;
+    } else {
+      ctx.arg.xbbrEnabled = true;
+      ctx.arg.xbbrProfdataPath = val;
+      // SPEC §6.3: --bb-cross-reorder is mutually exclusive with the
+      // legacy Propeller flow (--symbol-ordering-file). Diagnose now
+      // before any IO happens.
+      if (args.hasArg(OPT_symbol_ordering_file)) {
+        ErrAlways(ctx) << "--bb-cross-reorder= and --symbol-ordering-file "
+                          "may not be used together (SPEC §6.3)";
+      }
+      // M2 default: function-level reordering equivalent to hfsort+.
+      // Mode comes from --bb-cross-reorder-mode= if present.
+      ctx.arg.xbbrMode = XBBRMode::Function;
+      if (auto *modeArg = args.getLastArg(OPT_bb_cross_reorder_mode_eq)) {
+        StringRef mode = modeArg->getValue();
+        if (mode == "partial")
+          ctx.arg.xbbrMode = XBBRMode::Partial;
+        else if (mode == "full")
+          ctx.arg.xbbrMode = XBBRMode::Full;
+        else
+          ErrAlways(ctx) << "unknown --bb-cross-reorder-mode= value '"
+                         << mode << "' (expected partial or full)";
+      }
+      // Force hfsort+ as Stage 1: XBBR-on means CGProfile-driven
+      // function-level clustering, even if the user didn't pass
+      // --call-graph-profile-sort=. M3 will introduce a Stage 2 BB-level
+      // pass on top; M2's "function" mode IS the function-level result.
+      if (ctx.arg.callGraphProfileSort == CGProfileSortKind::None)
+        ctx.arg.callGraphProfileSort = CGProfileSortKind::Hfsort;
+    }
+  }
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_cluster_algo_eq)) {
+    StringRef v = arg->getValue();
+    if (v == "hfsort+")
+      ctx.arg.xbbrClusterAlgo = XBBRClusterAlgo::HFSortPlus;
+    else if (v == "c3")
+      ctx.arg.xbbrClusterAlgo = XBBRClusterAlgo::C3;
+    else if (v == "custom")
+      ctx.arg.xbbrClusterAlgo = XBBRClusterAlgo::Custom;
+    else
+      ErrAlways(ctx) << "unknown --bb-cross-reorder-cluster-algo= value '"
+                     << v << "'";
+  }
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_layout_algo_eq)) {
+    StringRef v = arg->getValue();
+    if (v == "ext-tsp")
+      ctx.arg.xbbrLayoutAlgo = XBBRLayoutAlgo::ExtTSP;
+    else if (v == "ph")
+      ctx.arg.xbbrLayoutAlgo = XBBRLayoutAlgo::PH;
+    else if (v == "custom")
+      ctx.arg.xbbrLayoutAlgo = XBBRLayoutAlgo::Custom;
+    else
+      ErrAlways(ctx) << "unknown --bb-cross-reorder-layout-algo= value '"
+                     << v << "'";
+  }
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_weights_eq)) {
+    // Parse "icache=4,itlb=2,btb=1,size=2" — silently ignore unknown
+    // keys (they may be added in a later milestone).
+    for (StringRef kv : llvm::split(arg->getValue(), ',')) {
+      auto [k, v] = kv.split('=');
+      unsigned n = 0;
+      if (v.getAsInteger(10, n))
+        continue;
+      if (k == "icache") ctx.arg.xbbrWeightIcache = n;
+      else if (k == "itlb") ctx.arg.xbbrWeightItlb = n;
+      else if (k == "btb") ctx.arg.xbbrWeightBtb = n;
+      else if (k == "size") ctx.arg.xbbrWeightSize = n;
+    }
+  }
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_max_thunk_bytes_eq)) {
+    uint64_t n = 0;
+    if (StringRef(arg->getValue()).getAsInteger(10, n))
+      ErrAlways(ctx) << "invalid --bb-cross-reorder-max-thunk-bytes= value '"
+                     << arg->getValue() << "'";
+    else
+      ctx.arg.xbbrMaxThunkBytes = n;
+  }
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_fallback_eq)) {
+    StringRef v = arg->getValue();
+    if (v == "auto")
+      ctx.arg.xbbrFallback = XBBRFallback::Auto;
+    else if (v == "conservative")
+      ctx.arg.xbbrFallback = XBBRFallback::Conservative;
+    else if (v == "none")
+      ctx.arg.xbbrFallback = XBBRFallback::None;
+    else
+      ErrAlways(ctx) << "unknown --bb-cross-reorder-fallback= value '"
+                     << v << "'";
+  }
+  ctx.arg.xbbrEmitDecisionMap = args.hasArg(OPT_bb_cross_reorder_emit_decision_map);
+  ctx.arg.xbbrDeterministic = args.hasArg(OPT_bb_cross_reorder_deterministic);
+  ctx.arg.xbbrStats = args.hasArg(OPT_bb_cross_reorder_stats);
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_max_align_eq)) {
+    unsigned n = 0;
+    if (StringRef(arg->getValue()).getAsInteger(10, n))
+      ErrAlways(ctx) << "invalid --bb-cross-reorder-max-align= value '"
+                     << arg->getValue() << "'";
+    else
+      ctx.arg.xbbrMaxAlign = n;
+  }
   parseBPOrdererOptions(ctx, args);
   ctx.arg.checkSections =
       args.hasFlag(OPT_check_sections, OPT_no_check_sections, true);

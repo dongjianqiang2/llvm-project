@@ -16,6 +16,7 @@
 #include "LinkerScript.h"
 #include "MapFile.h"
 #include "OutputSections.h"
+#include "XBBR/XBBRGraph.h"
 #include "Relocations.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -1090,6 +1091,25 @@ static void maybeShuffle(Ctx &ctx,
 // that don't appear in the order file.
 static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
   DenseMap<const InputSectionBase *, int> sectionOrder;
+
+  // XBBR (TASK M2-T01 + M2-T04): when --bb-cross-reorder= is on, run
+  // Stage 0 to collect global per-BB metadata, regardless of whether
+  // CGProfile data is present in the inputs (Stage 0 still produces
+  // useful intra-function info — call edges may be empty but the per-BB
+  // attr/freq tables aren't). M2 doesn't yet alter the section order
+  // here; Stage 2/3/4 in M3 will be the consumer.
+  if (ctx.arg.xbbrEnabled) {
+    xbbr::XBBRGraph graph;
+    if (graph.build(ctx) && ctx.arg.xbbrStats) {
+      llvm::errs() << "xbbr-stats: nodes=" << graph.nodes().size()
+                   << " edges=" << graph.edges().size()
+                   << " funcs=" << graph.funcs().size()
+                   << " anchors=" << graph.numAnchors() << "\n";
+    }
+    // build() failures are diagnosed inline; we still fall through to
+    // the existing layout to produce *some* output.
+  }
+
   if (ctx.arg.bpStartupFunctionSort || ctx.arg.bpFunctionOrderForCompression ||
       ctx.arg.bpDataOrderForCompression) {
     TimeTraceScope timeScope("Balanced Partitioning Section Orderer");

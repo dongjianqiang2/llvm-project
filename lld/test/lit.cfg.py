@@ -55,6 +55,10 @@ tool_patterns = [
     "yaml2obj",
     "opt",
     "llvm-dis",
+    # XBBR M2 end-to-end tests need clang to build the .o input on the
+    # fly (so the test directory contains source the user can read,
+    # not pre-baked binaries).
+    "clang",
 ]
 
 llvm_config.add_tool_substitutions(tool_patterns)
