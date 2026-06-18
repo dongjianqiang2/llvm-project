@@ -1,0 +1,60 @@
+## XBBR (TASK M4-T04): llvm-bbreorder-dump basic functionality.
+## Verifies the tool can parse .debug_xbbr_decision and produce
+## human-readable, summary, and Graphviz output.
+
+# REQUIRES: x86-registered-target
+
+# RUN: rm -rf %t && split-file %s %t && cd %t
+
+# RUN: clang -target x86_64-unknown-linux-gnu -O2 -fbb-cross-reorder=partial \
+# RUN:     -ffunction-sections -c a.c -o a.o
+# RUN: clang -target x86_64-unknown-linux-gnu -O2 -fbb-cross-reorder=partial \
+# RUN:     -ffunction-sections -c b.c -o b.o
+
+# RUN: ld.lld -e foo a.o b.o \
+# RUN:     --bb-cross-reorder=foo --bb-cross-reorder-mode=partial \
+# RUN:     --bb-cross-reorder-emit-decision-map \
+# RUN:     --unresolved-symbols=ignore-all -o exe
+
+## Summary mode.
+# RUN: llvm-bbreorder-dump --summary exe | FileCheck %s --check-prefix=SUMMARY
+
+## Human-readable mode.
+# RUN: llvm-bbreorder-dump exe | FileCheck %s --check-prefix=HUMAN
+
+## Graphviz mode.
+# RUN: llvm-bbreorder-dump --graphviz exe | FileCheck %s --check-prefix=DOT
+
+## Missing file.
+# RUN: not llvm-bbreorder-dump nonexistent.elf 2>&1 | FileCheck %s --check-prefix=ERR
+
+# SUMMARY: xbbr-dump: entries=
+# SUMMARY-DAG: functions=
+
+# HUMAN: XBBR Decision Map
+# HUMAN: version   : 0x00010000
+# HUMAN: entries   :
+# HUMAN: Function
+# HUMAN: BB  OrigAddr      NewAddr       Cluster  Flag
+
+# DOT: digraph XBBR {
+# DOT: label="XBBR Layout
+# DOT: subgraph cluster_0
+
+# ERR: error: cannot open
+
+#--- a.c
+extern int helper(int);
+int foo(int n) {
+  if (__builtin_expect(n < 0, 0))
+    return -1;
+  return helper(n);
+}
+
+#--- b.c
+extern int foo(int);
+int bar(int x) {
+  if (x > 100)
+    return foo(x / 2);
+  return x;
+}

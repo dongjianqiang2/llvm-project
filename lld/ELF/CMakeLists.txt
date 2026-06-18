@@ -44,6 +44,7 @@ add_lld_library(lldELF
   XBBR/XBBRClustering.cpp
   XBBR/ConstraintSolver.cpp
   XBBR/CostFunction.cpp
+  XBBR/DWARFRewriter.cpp
   XBBR/SectionEmitter.cpp
   XBBR/XBBRPipeline.cpp
   DWARF.cpp
