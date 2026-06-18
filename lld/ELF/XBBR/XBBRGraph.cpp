@@ -11,8 +11,8 @@
 // then folds in the cross-function call edges that lld already parsed
 // out of SHT_LLVM_CALL_GRAPH_PROFILE into ctx.arg.callGraphProfile.
 //
-// M2 scope (SPEC §10): x86_64 only. The BBAddrMap parser is templated on
-// ELF64LE here; M5 will lift it to invokeELFT once AArch64/ARM land.
+// Supported architectures: x86_64 and AArch64 (both ELF64LE). ARM (ELF32LE)
+// support lands after M5 thunk integration.
 //
 //===----------------------------------------------------------------------===//
 

@@ -6235,9 +6235,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     } else if (!Triple.isOSBinFormatELF()) {
       D.Diag(diag::err_drv_unsupported_opt_for_target)
           << A->getAsString(Args) << TripleStr;
-    } else if ((Val == "partial" || Val == "full") && !Triple.isX86()) {
-      // M1 only emits XBBR metadata for x86_64. Diagnose other arches
-      // up front rather than silently producing nothing useful.
+    } else if ((Val == "partial" || Val == "full") &&
+               !Triple.isX86() && !Triple.isAArch64()) {
+      // M1 only emits XBBR metadata for x86_64 and AArch64.
+      // ARM support lands after M5 thunk integration.
       D.Diag(diag::err_drv_unsupported_opt_for_target)
           << A->getAsString(Args) << TripleStr;
     } else if ((Val == "partial" || Val == "full") &&
