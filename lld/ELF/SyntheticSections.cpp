@@ -403,25 +403,18 @@ XBBRDecisionMapSection::XBBRDecisionMapSection(Ctx &ctx)
                        /*flags=*/0, /*addralign=*/8) {}
 
 void XBBRDecisionMapSection::writeTo(uint8_t *buf) {
-  // Header: char magic[4] + uint32 version + uint32 num_entries + uint32 flags.
-  // PLAN §9.4 fixes the magic at "XBBR" and version 0x00010000.
   memcpy(buf + 0, "XBBR", 4);
-  write32le(buf + 4, 0x00010000);  // version
-  write32le(buf + 8, NumEntries);  // num_entries
-  write32le(buf + 12, 0);          // flags (reserved)
-  // Entries (PLAN §9.4 32-byte stride). M2 emits no entries — M3 fills.
-  // The skeleton below is left as the sole writer because M3's Stage 5
-  // needs to compose with the same buffer once it runs.
+  write32le(buf + 4, 0x00010000);                  // version
+  write32le(buf + 8, static_cast<uint32_t>(Entries.size())); // num_entries
+  write32le(buf + 12, 0);                          // flags
   uint8_t *p = buf + headerSize;
-  for (uint32_t I = 0; I < NumEntries; ++I) {
-    // M2 default values; M3 will override in a follow-up patch when
-    // it has live (orig_func_addr, bb_index, new_address) data.
-    write64le(p + 0, 0);    // orig_func_addr
-    write32le(p + 8, 0);    // bb_index
-    write64le(p + 12, 0);   // new_address
-    write32le(p + 20, 0);   // cluster_id
-    write32le(p + 24, 0);   // decision_flags
-    write32le(p + 28, 0);   // reserved
+  for (const XBBRDecisionEntry &E : Entries) {
+    write64le(p + 0, E.OrigFuncAddr);
+    write32le(p + 8, E.BBIndex);
+    write64le(p + 12, E.NewAddress);
+    write32le(p + 20, E.ClusterId);
+    write32le(p + 24, E.DecisionFlags);
+    write32le(p + 28, E.Reserved);
     p += entrySize;
   }
 }

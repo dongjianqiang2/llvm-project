@@ -186,23 +186,32 @@ private:
 // In M2 the section emits only the 16-byte header with `num_entries=0`
 // (XBBR Stage 0 is informational; no BB has actually moved yet).
 // M3's Stage 5 will populate the per-entry table from the XBBRGraph.
+/// Per-entry data for the XBBR decision map (PLAN §9.4, 32-byte stride).
+struct XBBRDecisionEntry {
+  uint64_t OrigFuncAddr = 0;   ///< entry block VA of the owning function
+  uint32_t BBIndex = 0;        ///< BB index within the function
+  uint64_t NewAddress = 0;     ///< post-XBBR VA (projected in M3)
+  uint32_t ClusterId = 0;      ///< owning hot cluster
+  uint32_t DecisionFlags = 0;  ///< moved|anchored|fallback|thunk
+  uint32_t Reserved = 0;       ///< padding to 32-byte entry
+};
+
 class XBBRDecisionMapSection final : public SyntheticSection {
 public:
-  static const unsigned headerSize = 16;       // magic+version+num+flags
-  static const unsigned entrySize = 32;        // PLAN §9.4
+  static const unsigned headerSize = 16;
+  static const unsigned entrySize = 32;
 
   XBBRDecisionMapSection(Ctx &);
   size_t getSize() const override {
-    return headerSize + entrySize * NumEntries;
+    return headerSize + entrySize * Entries.size();
   }
   void writeTo(uint8_t *buf) override;
 
-  // M3 will call setNumEntries() and a writer-callback after Stage 5
-  // computes the layout. Today both default to "empty map".
-  void setNumEntries(uint32_t N) { NumEntries = N; }
+  /// Set the full entry table. Called by M3 Stage 5 (SectionEmitter).
+  void setEntries(std::vector<XBBRDecisionEntry> &&e) { Entries = std::move(e); }
 
 private:
-  uint32_t NumEntries = 0;
+  std::vector<XBBRDecisionEntry> Entries;
 };
 
 // BssSection is used to reserve space for copy relocations and common symbols.

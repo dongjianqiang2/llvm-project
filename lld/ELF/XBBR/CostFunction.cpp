@@ -127,15 +127,20 @@ double computeBTBPressure(const XBBRGraph &graph,
   for (const auto &p : proj)
     nodeToProj[p.NodeIdx] = &p;
 
-  // Count unique (src_addr, dst_addr) pairs.
-  std::unordered_set<uint64_t> seen; // hash = (src << 32) | dst (approximate)
+  // Count unique (src_addr, dst_addr) pairs using a collision-free
+  // pair hash (not (hi<<32)|lo which truncates when Offset ≥ 4 GiB).
+  std::unordered_set<uint64_t> seen;
   for (const XBBREdge &E : graph.edges()) {
     auto sIt = nodeToProj.find(E.SrcNode);
     auto dIt = nodeToProj.find(E.DstNode);
     if (sIt == nodeToProj.end() || dIt == nodeToProj.end())
       continue;
-    uint64_t key = (sIt->second->Offset << 32) | dIt->second->Offset;
-    seen.insert(key);
+    // Hash a (u64,u64) pair into a u64 via splitmix64-ish mixing,
+    // avoiding the truncation of (hi<<32)|lo.
+    uint64_t s = sIt->second->Offset, d = dIt->second->Offset;
+    uint64_t h = s * 0x9E3779B97F4A7C15ULL;
+    h ^= d + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    seen.insert(h);
   }
   return static_cast<double>(seen.size()) * w.Btb;
 }
@@ -177,6 +182,13 @@ std::vector<uint32_t> localSearchRefine(const XBBRGraph &graph,
   if (order.size() < 3)
     return order;
 
+  // Large-cluster guard: cap iterations by size to avoid O(N²·E) blowup.
+  // For clusters over 512 BBs, reduce max attempted iterations sharply.
+  if (order.size() > 512)
+    maxIterations = std::min(maxIterations, unsigned(16));
+  else if (order.size() > 256)
+    maxIterations = std::min(maxIterations, unsigned(32));
+
   auto bestCost = computeLayoutCost(graph, order, weights, maxAlign);
   bool improved = true;
   unsigned iters = 0;
@@ -185,61 +197,74 @@ std::vector<uint32_t> localSearchRefine(const XBBRGraph &graph,
     improved = false;
     ++iters;
 
-    // Try adjacent swaps.
+    // Pass 1: adjacent swaps (one full scan).
     for (size_t I = 0; I + 1 < order.size(); ++I) {
-      // Don't move anchors (entry blocks, landing pads, etc.).
       if (graph.nodes()[order[I]].isAnchor() ||
           graph.nodes()[order[I + 1]].isAnchor())
         continue;
-
       std::swap(order[I], order[I + 1]);
       double newCost = computeLayoutCost(graph, order, weights, maxAlign);
       if (newCost < bestCost) {
         bestCost = newCost;
         improved = true;
       } else {
-        std::swap(order[I], order[I + 1]); // revert
+        std::swap(order[I], order[I + 1]);
       }
     }
 
-    // Try single-BB moves within ±8 window.
+    // Pass 2: single-BB moves within ±window.  Accept only the best
+    // move across the entire pass (not greedy-first-break), so the
+    // outcome is deterministic for a given order.
+    int bestI = -1, bestJ = -1;
+    double bestImprovement = 0.0;
+    const size_t window = std::min(size_t(6), order.size() - 1);
+
     for (size_t I = 0; I < order.size(); ++I) {
       if (graph.nodes()[order[I]].isAnchor())
         continue;
-      size_t window = std::min(size_t(8), order.size() - 1);
-      for (size_t J = std::max(size_t(0), I > window ? I - window : 0);
-           J <= std::min(order.size() - 1, I + window); ++J) {
+      size_t lo = I > window ? I - window : 0;
+      size_t hi = std::min(order.size() - 1, I + window);
+      for (size_t J = lo; J <= hi; ++J) {
         if (I == J || graph.nodes()[order[J]].isAnchor())
           continue;
-        // Move order[I] to position J.
         uint32_t moved = order[I];
         if (I < J) {
-          for (size_t K = I; K < J; ++K)
-            order[K] = order[K + 1];
+          for (size_t K = I; K < J; ++K) order[K] = order[K + 1];
           order[J] = moved;
         } else {
-          for (size_t K = I; K > J; --K)
-            order[K] = order[K - 1];
+          for (size_t K = I; K > J; --K) order[K] = order[K - 1];
           order[J] = moved;
         }
         double newCost = computeLayoutCost(graph, order, weights, maxAlign);
-        if (newCost < bestCost) {
-          bestCost = newCost;
-          improved = true;
-          break;
+        double improvement = bestCost - newCost;
+        if (improvement > bestImprovement) {
+          bestImprovement = improvement;
+          bestI = static_cast<int>(I);
+          bestJ = static_cast<int>(J);
         }
-        // Revert — move didn't improve.
+        // Revert.
         if (J < I) {
-          for (size_t K = J; K < I; ++K)
-            order[K] = order[K + 1];
+          for (size_t K = J; K < I; ++K) order[K] = order[K + 1];
+          order[I] = moved;
         } else {
-          for (size_t K = J; K > I; --K)
-            order[K] = order[K - 1];
+          for (size_t K = J; K > I; --K) order[K] = order[K - 1];
+          order[I] = moved;
         }
-        order[I] = moved;
       }
-      if (improved)
-        break;
+    }
+
+    // Apply the single best move (if any).
+    if (bestI >= 0) {
+      uint32_t moved = order[bestI];
+      if (bestI < bestJ) {
+        for (size_t K = bestI; K < size_t(bestJ); ++K) order[K] = order[K + 1];
+        order[bestJ] = moved;
+      } else {
+        for (size_t K = bestI; K > size_t(bestJ); --K) order[K] = order[K - 1];
+        order[bestJ] = moved;
+      }
+      bestCost = computeLayoutCost(graph, order, weights, maxAlign);
+      improved = true;
     }
   }
 

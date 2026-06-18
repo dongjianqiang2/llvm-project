@@ -94,25 +94,23 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
 
         const XBBRNode &node = allNodes[nodeIdx];
 
-        // Constraint checks:
+        // Constraint checks — only for migratable BBs.
+        // Anchors are placed by Stage 2 and never drift; skip them.
         bool violated = false;
-
-        // 1. Blacklist / anchor assertion (belt-and-suspenders).
         if (node.isAnchor()) {
-          violated = true;
+          order[writePos++] = nodeIdx; // keep anchor in place
+          continue;
         }
 
-        // 2. Branch range (x86_64: always passes).
-        if (!violated && violatesBranchRange(graph, order, node, /*va=*/0)) {
+        // 1. Branch range (x86_64: always passes).
+        if (violatesBranchRange(graph, order, node, /*va=*/0))
           violated = true;
-        }
 
-        // 3. EH constraint.
-        if (!violated && violatesEHConstraint(node)) {
+        // 2. EH constraint.
+        if (violatesEHConstraint(node))
           violated = true;
-        }
 
-        // 4. Thunk budget (M5).
+        // 3. Thunk budget (M5).
         // Not checked in M3 — x86_64 has no thunks.
 
         if (violated) {

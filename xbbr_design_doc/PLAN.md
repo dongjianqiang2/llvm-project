@@ -301,6 +301,8 @@ else:
 
 #### Stage 5 — Section Emission
 
+> **M3 范围**：M3 实现了 `XBBRLayoutResult`（各阶段布局输出）+ `SectionEmitter` 生成 BBFragment 与决策 map BB 级条目（`.debug_xbbr_decision` 含完整 `XBBRDecisionEntry`）。物理 BB 级重排 `.text.hot`/`.text.unlikely` 输出（含 thunk 生成、对齐放置、跨段跳转补丁）推迟到 M5。M3 的 `.text` 布局仍走既有 hfsort+ 函数级路径，但管线已产出完整的 per-BB 决策数据以供验证和后续消费。
+
 输出三段（`.text.warm` 可选）：
 - `.text.hot`：被识别为热路径簇的 BB（来自所有原函数）。
 - `.text.warm`：温度中等的 BB（避免 hot 段过大，嵌入式可关闭）。

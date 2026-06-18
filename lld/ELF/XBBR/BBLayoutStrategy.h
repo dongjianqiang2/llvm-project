@@ -48,7 +48,7 @@ public:
 
 /// Factory — picks the strategy based on Config.
 std::unique_ptr<BBLayoutStrategy>
-createBBLayoutStrategy(XBBRLayoutAlgo algo, unsigned maxAlign);
+createBBLayoutStrategy(XBBRLayoutAlgo algo, unsigned maxAlign = 0);
 
 } // namespace lld::elf::xbbr
 

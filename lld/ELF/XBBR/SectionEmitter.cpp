@@ -40,16 +40,13 @@ std::vector<BBFragment> buildFragments(const XBBRGraph &graph,
   for (const auto &order : result.ClusterBBOrders) {
     for (uint32_t nodeIdx : order) {
       const XBBRNode &node = allNodes[nodeIdx];
-      // Alignment: min(node alignment, maxAlign cap). Nodes don't carry
-      // explicit alignment yet (M5), so use 1.
-      unsigned align = 1;
-      if (align > 1 && (currentVA % align) != 0)
-        currentVA += align - (currentVA % align);
+      // Alignment: M5 will read per-BB alignment from BBAddrMap
+      // BBEntry::Alignment. For M3, alignment is always 1 (no padding).
 
       BBFragment frag;
       frag.NodeIdx = nodeIdx;
       frag.Size = node.Size;
-      frag.Alignment = align;
+      frag.Alignment = 1;
       frag.FinalVA = currentVA;
 
       // Map node back to its InputSection + offset.
@@ -92,48 +89,48 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
     return;
 
   XBBRDecisionMapSection &dm = *mainPart->xbbrDecisionMap;
-  dm.setNumEntries(static_cast<uint32_t>(fragments.size()));
 
-  // Store per-BB entries for writeTo(). The decision map format
-  // (PLAN §9.4) is 32 bytes per entry:
-  //   uint64 orig_func_addr — entry-block VA
-  //   uint32 bb_index       — BB index within function
-  //   uint64 new_address    — post-XBBR VA (projected for M3)
-  //   uint32 cluster_id     — owning cluster
-  //   uint32 decision_flags — moved/anchored/fallback/thunk
-  //   uint32 reserved
-
-  // We store the entry data in a vector owned by the decision map.
-  // For now, use the SectionEmitter's local data; M5 will make this
-  // persistent.
-  if (ctx.arg.xbbrStats) {
-    uint32_t nAnchored = 0, nMoved = 0, nFallback = 0;
-    for (const auto &frag : fragments) {
-      const XBBRNode &node = graph.nodes()[frag.NodeIdx];
-      if (node.isAnchor())
-        ++nAnchored;
-      else
-        ++nMoved;
+  // Build per-BB decision entries (PLAN §9.4, 32-byte stride).
+  std::vector<XBBRDecisionEntry> entries;
+  entries.reserve(fragments.size());
+  uint32_t a = 0, m = 0;
+  for (const auto &frag : fragments) {
+    const XBBRNode &node = graph.nodes()[frag.NodeIdx];
+    XBBRDecisionEntry e;
+    e.BBIndex = node.BB;
+    e.NewAddress = frag.FinalVA;
+    e.ClusterId = 0; // simplified for M3
+    if (node.isAnchor()) {
+      e.DecisionFlags = 2; // anchored
+      ++a;
+    } else {
+      e.DecisionFlags = 1; // moved
+      ++m;
     }
-    (void)nFallback;
-    errs() << "xbbr-emit: decisionEntries=" << fragments.size()
-           << " moved=" << nMoved << " anchored=" << nAnchored << "\n";
+    // orig_func_addr: use owning function's entry-block VA.
+    // M3: projected offset; M5 patches to real VA after assignOffsets.
+    auto fn = graph.funcs()[node.Func];
+    if (fn.FirstNode < graph.nodes().size())
+      e.OrigFuncAddr = fn.FirstNode; // placeholder; M5 → real symbol VA
+    entries.push_back(e);
   }
+  dm.setEntries(std::move(entries));
 
-  // Store fragments for M5 physical emission.
+  if (ctx.arg.xbbrStats)
+    errs() << "xbbr-emit: decisionEntries=" << fragments.size()
+           << " moved=" << m << " anchored=" << a << "\n";
+
+  // Build placements for M5 physical emission.
   result.Placements.clear();
   for (const auto &frag : fragments) {
     BBPlacement p;
     p.NodeIdx = frag.NodeIdx;
-    p.ClusterIdx = 0; // simplified for M3
     const XBBRNode &node = graph.nodes()[frag.NodeIdx];
     p.TargetSec = node.isAnchor() ? BBPlacement::Section::Original
                   : node.isCold()  ? BBPlacement::Section::Unlikely
                                    : BBPlacement::Section::Hot;
     result.Placements.push_back(p);
   }
-
-  result.ThunkBytes = 0; // M5 computes actual thunk bytes
 }
 
 } // namespace lld::elf::xbbr

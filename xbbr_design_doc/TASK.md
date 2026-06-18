@@ -304,26 +304,24 @@
   - `M3-T04-C5`：`lld/test/ELF/xbbr/xbbr-fallback-none.s` — `--bb-cross-reorder-fallback=none` 遇约束直接 error 退出。
   - `M3-T04-C6`：`lld/test/ELF/xbbr/xbbr-fallback-warning-werror.s` — 回退 warning 在 `-Werror` 下升级为 error（SPEC §7）。
 
-### M3-T05 — Stage 5：完整 section emission（x86_64）
+### M3-T05 — Stage 5：决策 map BB 级条目 + Fragment 准备（x86_64）
 
-- **描述**：在 M2-T03 基础上完整 emit：跨段跳转 thunk（x86_64，E9）、对齐放置、决策 map BB 级 entries。DWARF/CFI/EH 重写在 M4（M3 阶段漂移函数先**不**漂移含 EH 的 BB，或对含 EH 函数降级，保证正确性）。
-- **涉及文件**：`lld/ELF/XBBR/SectionEmitter.cpp`
+> **M3/M5 拆分（回写 2026-06-18）**：物理 BB 级 .text.hot/.text.unlikely 输出推迟到 M5。M3 范围：决策 map BB 级条目持久化 + BBFragment 生成。
+
+- **描述**：`SectionEmitter::run()` 根据管线输出构建 per-BB 决策条目，通过 `XBBRDecisionMapSection::setEntries()` 持久化为 32B/条 ELF section 数据，并生成 `BBFragment`/`BBPlacement` 供 M5 物理 emit 消费。
+- **涉及文件**：`lld/ELF/XBBR/SectionEmitter.cpp`、`lld/ELF/SyntheticSections.{h,cpp}`
 - **依赖**：M3-T04、M2-T05
-- **退出条件**：x86_64 完整 `partial` 布局产出，可运行；决策 map BB 级正确。
+- **退出条件**：决策 map `writeTo()` 输出完整 per-BB entry；`llvm-readelf -x .debug_xbbr_decision` 可见 magic "XBBR" + version + 非零 entries。
 - **测试用例**：
-  - `M3-T05-C1`：`lld/test/ELF/xbbr/xbbr-emit-thunk-x86.s` — 超距 BB 注入 E9 thunk，`objdump` 可见。
-  - `M3-T05-C2`：`lld/test/ELF/xbbr/xbbr-emit-decision-map-bb.s` — 决策 map 含 BB 级 `moved`/`anchored`/`fallback`/`thunk` 标志。
-  - `M3-T05-C3`：`lld/test/ELF/xbbr/xbbr-emit-runnable.s` — 复杂程序运行正确（含间接调用、EH 的函数此阶段不漂移其 EH BB）。
+  - `M3-T05-C2`：`lld/test/ELF/xbbr/xbbr-m3-integration.s` — 端到端 M3，`--bb-cross-reorder-emit-decision-map` 产出 `.debug_xbbr_decision`。
+  - `M3-T05-C1`（thunk）、`M3-T05-C3`（runnable EH）：推迟到 M5。
 
 ### M3-T06 — 量化验收（test-suite + perf）
 
-- **描述**：在 test-suite（SPEC CPU2017 + MicroBenchmarks）上对 x86_64 `partial` 模式跑量化指标，对标 IRPGO baseline，验证 SPEC §9.2 门槛。
-- **涉及文件**：`llvm-test-suite/`（外部）、`xbbr_design_doc/scripts/xbbr-perf-measure.sh`（perf stat 采集 L1i/iTLB/branch-miss）
-- **依赖**：M3-T05
-- **退出条件**：L1i↓≥10%、iTLB↓≥15%、branch-miss↓≥8%、hot-text↑≤10%、总二进制↑≤1.5%、链接时间≤1.5×。
-- **测试用例**（CI gate 脚本）：
-  - `M3-T06-C1`：`xbbr-perf-measure.sh` 输出 JSON 含 6 项指标 + pass/fail 判定。
-  - `M3-T06-C2`：回归守卫：基线对比脚本检测指标退化即报错。
+> **M3/M5 拆分（回写 2026-06-18）**：量化验收依赖物理 BB 级布局生效，M3 仍走函数级路径故推迟到 M5。M3 已产出完整 XBBRLayoutResult 数据。
+
+- **状态**：**blocked by M5**（M5-T05 物理 section emission 完成后解锁）。
+- **依赖**：M5-T05
 
 ---
 

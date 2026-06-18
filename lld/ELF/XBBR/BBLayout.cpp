@@ -30,16 +30,11 @@ namespace {
 
 class ExtTSPStrategy : public BBLayoutStrategy {
 public:
-  explicit ExtTSPStrategy(unsigned mAlign) : maxAlign(mAlign) { (void)this->maxAlign; } // M3-T03
-
   const char *name() const override { return "ExtTSP"; }
 
   std::vector<uint32_t> run(const XBBRGraph &graph,
                             const FunctionCluster &cluster,
                             const CostWeights &weights) override;
-
-private:
-  unsigned maxAlign;
 };
 
 } // namespace
@@ -126,20 +121,37 @@ std::vector<uint32_t> ExtTSPStrategy::run(const XBBRGraph &graph,
   std::vector<uint64_t> extTspOrder =
       computeExtTspLayout(nodeSizes, nodeCounts, edgeCounts);
 
-  // Phase 5: remap back to global indices.
+  // Phase 5: interleave anchors and migratable BBs. Anchors stay at
+  // their original positions within each function (preserving fall-through
+  // from preceding BBs); migratable BBs fill in around them in ExtTSP order.
+  //
+  // Strategy: walk cluster member functions in original order, emit each
+  // function's BB sequence with anchors in-place and migratable BBs pulled
+  // from the ExtTSP order for the gaps.
   std::vector<uint32_t> result;
-  // Anchors first (in original function order).
+  size_t extTspCursor = 0;
+
   for (FuncId F : cluster.Members) {
     auto fn = graph.funcs()[F];
     for (uint32_t I = fn.FirstNode; I < fn.FirstNode + fn.NumNodes; ++I) {
-      if (isAnchor[I])
+      if (isAnchor[I]) {
+        // Anchor stays at its original intra-function position.
         result.push_back(I);
+      } else {
+        // Fill with next migratable BB from ExtTSP order.
+        if (extTspCursor < extTspOrder.size()) {
+          uint64_t localIdx = extTspOrder[extTspCursor++];
+          if (localIdx < localToGlobal.size())
+            result.push_back(localToGlobal[localIdx]);
+        }
+      }
     }
   }
-  // Migratable BBs in ExtTSP order.
-  for (uint64_t Local : extTspOrder) {
-    if (Local < localToGlobal.size())
-      result.push_back(localToGlobal[Local]);
+  // Append any remaining ExtTSP BBs after all functions.
+  while (extTspCursor < extTspOrder.size()) {
+    uint64_t localIdx = extTspOrder[extTspCursor++];
+    if (localIdx < localToGlobal.size())
+      result.push_back(localToGlobal[localIdx]);
   }
 
   return result;
@@ -151,23 +163,18 @@ std::vector<uint32_t> ExtTSPStrategy::run(const XBBRGraph &graph,
 /// Entry blocks are never moved — chains must not cross anchor boundaries.
 class PHStrategy : public BBLayoutStrategy {
 public:
-  explicit PHStrategy(unsigned mAlign) : maxAlign(mAlign) { (void)this->maxAlign; } // M3-T03
-
   const char *name() const override { return "PH"; }
 
   std::vector<uint32_t> run(const XBBRGraph &graph,
                             const FunctionCluster &cluster,
                             const CostWeights &weights) override;
-
-private:
-  unsigned maxAlign;
 };
 
 std::vector<uint32_t> PHStrategy::run(const XBBRGraph &graph,
                                       const FunctionCluster &cluster,
                                       const CostWeights & /*weights*/) {
   // Run ExtTSP first to get the base layout.
-  ExtTSPStrategy extTsp(maxAlign);
+  ExtTSPStrategy extTsp;
   std::vector<uint32_t> order = extTsp.run(graph, cluster, CostWeights{});
 
   if (order.size() <= 4)
@@ -218,14 +225,14 @@ std::vector<uint32_t> PHStrategy::run(const XBBRGraph &graph,
 }
 
 std::unique_ptr<BBLayoutStrategy>
-createBBLayoutStrategy(XBBRLayoutAlgo algo, unsigned maxAlign) {
+createBBLayoutStrategy(XBBRLayoutAlgo algo, unsigned /*maxAlign*/) {
   switch (algo) {
   case XBBRLayoutAlgo::ExtTSP:
-    return std::make_unique<ExtTSPStrategy>(maxAlign);
+    return std::make_unique<ExtTSPStrategy>();
   case XBBRLayoutAlgo::PH:
-    return std::make_unique<PHStrategy>(maxAlign);
+    return std::make_unique<PHStrategy>();
   case XBBRLayoutAlgo::Custom:
-    return std::make_unique<ExtTSPStrategy>(maxAlign);
+    return std::make_unique<ExtTSPStrategy>();
   }
   llvm_unreachable("unknown XBBR layout algorithm");
 }
