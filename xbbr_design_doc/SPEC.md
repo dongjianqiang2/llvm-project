@@ -284,8 +284,8 @@ XBBR 必须提供分级回退能力，避免单点失败导致整体编译/链�
 | **M1** | 编译器侧元数据 sections + `XBBRMetadataEmitter` pass + clang 选项打通 | x86_64 上 `.o` 文件元数据正确，lld 暂不消费 |
 | **M2** | lld Stage 0+1：读元数据 + 函数级 hfsort+ 粗排 + section emission 框架 | x86_64 静态可执行体可生成；功能等价于 CGProfile-only |
 | **M3** | lld Stage 2+3+4：BB 级 ExtTSP + 多目标代价 + 单 BB 回退 + 决策 map BB 级条目 | x86_64 上 BB 级布局管线产出完整 `XBBRLayoutResult` + 决策 map（含 per-BB 32B entry）；物理 `.text.hot/.text.unlikely` BB 级 emit 推迟到 M5 |
-| **M4** | DWARF/CFI/EH 完整重写 + `llvm-bbreorder-dump` | gdb / perf annotate 可读；BOLT 可消费决策 map |
-| **M5** | `full` mode + AArch64 编译器/链接器端到端支持 + 物理 BB 级 section emission + ARM (thunk) + PIE / 动态库 + §9.2 量化门槛 | AArch64 端到端通过（clang→.o→ld.lld→决策 map）；嵌入式 demo（Zephyr）；服务端 (clang/MySQL)；L1i↓≥10–15% |
+| **M4** | `llvm-bbreorder-dump` 工具 + `DWARFRewriter` / `EHRewriter` 接口骨架 + IsCold 编译器侧填位 | dump 工具能解析决策 map（per-BB / cluster / Graphviz）；`-fbb-cross-reorder-cold-threshold=` 在编译器侧标 BB cold 位、lld 在 partial 模式按 cold 排除迁移；DWARF/EH 完整重写实物随物理 emit 在 M5 落地 |
+| **M5** | 物理 BB 级 section emission + DWARF/CFI/EH 完整重写 + `full` mode 真行为差异 + AArch64 / ARM 完整支持（含 thunk）+ PIE / 动态库 + BOLT 消费决策 map + §9.2 量化门槛 | AArch64 端到端通过（clang→.o→ld.lld→决策 map）；gdb/`addr2line` 对漂移 BB 正确归因；BOLT 读决策 map 成功；嵌入式 demo（Zephyr）；服务端 (clang/MySQL)；L1i↓≥10–15% |
 
 **Upstream 策略**：5 阶段以"实验性 feature"形式逐步进入 upstream LLVM (前缀 `experimental-`)，M5 完成后申请去前缀。
 

@@ -327,8 +327,10 @@
 
 ## 5. M4 — 调试设施 + 决策 map + 工具（SPEC §10 M4）
 
-**里程碑目标**：gdb/perf annotate 可读；BOLT 可消费决策 map。
-**退出条件**：M4-T01…M4-T06 通过；漂移函数在 gdb `bt`、`perf annotate`、`addr2line` 下正确归因；BOLT 读决策 map 成功。
+> **M4/M5 拆分（回写 2026-06-18）**：M4 实际范围限定为：T04（dump 工具）落地 + T01（DWARFRewriter 接口骨架）+ IsCold 编译器侧填位 + lld 侧 cold-threshold 消费链路。**T01 完整 DWARF/CFI 重写、T02 EH 重写（含 `.eh_frame_hdr` 重建）、T03 ARM exidx、T05 BOLT 消费、T06 端到端集成均依赖物理 BB 级 .text 布局，与 M5 物理 emit 一并交付。** 顶部 "里程碑目标" 与 "退出条件" 应理解为 M4+M5 合并退出条件。
+
+**里程碑目标**：M4 阶段产出可被 dump 工具消费的决策 map + IsCold 闭环；调试可观测性（gdb/addr2line/BOLT）随 M5 物理 emit 一并达成。
+**退出条件**：M4-T04 + IsCold 闭环（编译器侧标位 + lld 侧消费）通过；M4-T01..T03/T05/T06 推迟至 M5。
 
 ### M4-T01 — DWARF/CFI 重写
 
@@ -396,8 +398,10 @@
 
 ## 6. M5 — AArch64 + ARM + PIE/动态库 + full mode（SPEC §10 M5）
 
-**里程碑目标**：三架构完整支持；嵌入式/服务端 demo 通过。
-**退出条件**：M5-T01…M5-T09 通过；AArch64/ARM 含 thunk 的 ±128MB/±32MB/±16MB 跳转正确；PIE/动态库（内部链接函数漂移）正确；`full` mode 全跨函数正确；Zephyr/clang/MySQL demo 通过；SPEC §9.2 `full` 门槛达标。
+> **M5 范围扩充（回写 2026-06-18）**：吸收 M3 推迟的物理 BB 级 emit 与 M4 推迟的 DWARF/CFI/EH 重写、ARM exidx、BOLT 消费、M4 集成测试。M5 因此是"全部物理布局相关 + 多架构 + 验收"的单点收口。
+
+**里程碑目标**：三架构完整支持；嵌入式/服务端 demo 通过；调试观测全链路。
+**退出条件**：M5-T01…M5-T09 + (M3 推迟物理 emit) + (M4 推迟 T01/T02/T03/T05/T06) 全部通过；AArch64/ARM 含 thunk 的 ±128MB/±32MB/±16MB 跳转正确；PIE/动态库（内部链接函数漂移）正确；`full` mode 全跨函数正确；gdb/addr2line/BOLT 读决策 map 成功；Zephyr/clang/MySQL demo 通过；SPEC §9.2 `partial`/`full` 门槛达标。
 
 ### M5-T01 — AArch64 thunk 集成
 
