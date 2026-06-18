@@ -414,7 +414,7 @@ void XBBRDecisionMapSection::writeTo(uint8_t *buf) {
     write64le(p + 12, E.NewAddress);
     write32le(p + 20, E.ClusterId);
     write32le(p + 24, E.DecisionFlags);
-    write32le(p + 28, E.Reserved);
+    write32le(p + 28, E.FuncId);
     p += entrySize;
   }
 }

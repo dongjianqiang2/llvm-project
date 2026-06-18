@@ -112,6 +112,7 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
     // block's real linked VA after assignOffsets. (PLAN §9.4: this is
     // the linker-time absolute address, not a node index.)
     e.OrigFuncAddr = 0; // M5 → funcSection(Func)->getVA()
+    e.FuncId = node.Func; // internal FuncId for reverse lookup
     entries.push_back(e);
   }
   dm.setEntries(std::move(entries));

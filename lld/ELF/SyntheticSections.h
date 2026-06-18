@@ -188,12 +188,12 @@ private:
 // M3's Stage 5 will populate the per-entry table from the XBBRGraph.
 /// Per-entry data for the XBBR decision map (PLAN §9.4, 32-byte stride).
 struct XBBRDecisionEntry {
-  uint64_t OrigFuncAddr = 0;   ///< entry block VA of the owning function
+  uint64_t OrigFuncAddr = 0;   ///< entry block VA (placeholder 0 in M3; M5 fills)
   uint32_t BBIndex = 0;        ///< BB index within the function
   uint64_t NewAddress = 0;     ///< post-XBBR VA (projected in M3)
   uint32_t ClusterId = 0;      ///< owning hot cluster
   uint32_t DecisionFlags = 0;  ///< moved|anchored|fallback|thunk
-  uint32_t Reserved = 0;       ///< padding to 32-byte entry
+  uint32_t FuncId = 0;         ///< internal XBBR FuncId (M3 fills; M5 keeps)
 };
 
 class XBBRDecisionMapSection final : public SyntheticSection {
@@ -211,7 +211,7 @@ public:
   void setEntries(std::vector<XBBRDecisionEntry> &&e) { Entries = std::move(e); }
   /// Set the degraded flag (SPEC §7). When true, bit 0 of the header flags
   /// field is set to indicate the pipeline fell back to function-level mode.
-  void setDegraded(bool d) { Degraded = d; }
+  void setDegraded(bool d) { Degraded |= d; } // monotonic: once degraded, never unset
 
 private:
   std::vector<XBBRDecisionEntry> Entries;

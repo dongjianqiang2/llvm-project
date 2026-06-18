@@ -666,14 +666,15 @@ Header (16 bytes):
     char    magic[4];           // "XBBR"
     uint32  version;            // 0x00010000
     uint32  num_entries;
-    uint32  flags;              // 保留
+    uint32  flags;              // bit 0: degraded (Stage 4 回退到 function 模式)
+                                // bits 1-31 reserved
 For each entry (32 bytes):
-    uint64  orig_func_addr;     // 原函数入口块（符号）的链接时绝对地址
+    uint64  orig_func_addr;     // 原函数入口块的链接时绝对地址 (M3: placeholder 0; M5 填真 VA)
     uint32  bb_index;           // 函数内 BB 索引
-    uint64  new_address;        // 重排后地址
+    uint64  new_address;        // 重排后地址 (M3: 投影偏移; M5 填真 VA)
     uint32  cluster_id;         // 所属热簇编号
     uint32  decision_flags;     // moved | anchored | fallback | thunk
-    uint32  reserved;           // 填充至 32 字节对齐
+    uint32  func_id;            // 内部 FuncId，标识所属函数 (M3 填写；M5 保持)
 ```
 
 默认进入二进制但不可加载（`SHF_ALLOC` 不置位，故不进 loadable 段、不计入 §2.2 体积预算），由 `strip --strip-debug` 自动剥离（依赖 `.debug_` 前缀的标准识别行为）。无需新 `SHT_LLVM_*` 类型常量——使用保留段名 `.debug_xbbr_decision` + `SHT_PROGBITS` 即可（与 `.debug_*` 既有"按名识别"段一致）。
