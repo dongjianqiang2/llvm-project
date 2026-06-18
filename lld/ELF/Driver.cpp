@@ -37,6 +37,7 @@
 #include "SyntheticSections.h"
 #include "Target.h"
 #include "Writer.h"
+#include "XBBR/XBBRGraph.h"
 #include "lld/Common/Args.h"
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/ErrorHandler.h"
@@ -97,6 +98,7 @@ ELFSyncStream elf::InternalErr(Ctx &ctx, const uint8_t *buf) {
 }
 
 Ctx::Ctx() : driver(*this) {}
+Ctx::~Ctx() = default;
 
 llvm::raw_fd_ostream Ctx::openAuxiliaryFile(llvm::StringRef filename,
                                             std::error_code &ec) {

@@ -86,8 +86,11 @@ public:
   /// Bridge between FuncId and the underlying lld object. `funcSection`
   /// is the inverse of `sectionToFunc`. Returns InvalidFuncId / nullptr
   /// if no mapping exists (e.g. function compiled without
-  /// `-fbb-cross-reorder=`).
-  FuncId sectionToFunc(InputSectionBase *S) const;
+  /// `-fbb-cross-reorder=`). `sectionToFunc` accepts a const pointer
+  /// because it is purely a lookup — it never mutates the section,
+  /// and accepting const lets callers pass the const-qualified
+  /// pointers ctx.arg.callGraphProfile keys carry without const_cast.
+  FuncId sectionToFunc(const InputSectionBase *S) const;
   InputSectionBase *funcSection(FuncId F) const;
 
   /// Look up the global node index for (Func, BB), or nullopt if the BB
@@ -104,7 +107,10 @@ private:
   std::vector<FuncInfo> Funcs;       ///< indexed by FuncId
 
   // Indices (DenseMap is fine — never iterated for output).
-  llvm::DenseMap<InputSectionBase *, FuncId> SectionToFuncId;
+  // Key is `const InputSectionBase *` because lookups (and
+  // ctx.arg.callGraphProfile keys) are const; XBBRGraph never mutates
+  // the section through this map.
+  llvm::DenseMap<const InputSectionBase *, FuncId> SectionToFuncId;
   llvm::DenseMap<BBKey, uint32_t> BBIndex;            ///< (FuncId, BBId) → Nodes idx
 
   // Stage 0 internals — declared here so unit tests in a follow-up

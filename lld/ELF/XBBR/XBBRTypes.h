@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace lld::elf {
 
@@ -95,7 +96,12 @@ struct XBBRNode {
                                ///<   cross-function comparison; the raw
                                ///<   per-entry BBFreq is recoverable as
                                ///<   GlobalFreq / FuncInfo.EntryCount.
-  uint8_t XBBRAttrs = 0;       ///< bitmask, see xbbr::AttrBit (LLVM side)
+  uint16_t XBBRAttrs = 0;      ///< 16-bit bitmask, see xbbr::AttrBit on the
+                               ///< LLVM side. The on-disk layout (PLAN
+                               ///< §9.3 v0x02) is u16 little-endian; this
+                               ///< field has to match (M2 review-bug fix
+                               ///< — was uint8_t, silently dropped bit 8
+                               ///< IsNoReturnTail and any future bit).
 
   /// Quick predicates derived from XBBRAttrs (mirroring xbbr::AttrBit
   /// in include/llvm/CodeGen/XBBRMetadata.h — Stage 0 will assert these
@@ -108,11 +114,18 @@ struct XBBRNode {
   bool isMustTail() const { return XBBRAttrs & 0x20; }
   bool userBlacklisted() const { return XBBRAttrs & 0x40; }
   bool isCold() const { return XBBRAttrs & 0x80; }
+  bool isNoReturnTail() const { return XBBRAttrs & 0x100; }
 
   /// PLAN §5.3: an "anchor" BB cannot drift. Entry blocks anchor by
-  /// definition; the rest is the §5.3 blacklist.
+  /// definition; the rest is the §5.3 blacklist (items 1-7). IsCold
+  /// is *not* anchor — cold BBs are precisely the ones we WANT to
+  /// migrate to .text.unlikely.
   bool isAnchor() const {
-    return XBBRAttrs & (0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40);
+    // bit 0 IsEntry, 1 LandingPad, 2 IndirectBrTarget, 3 Setjmp,
+    // 4 InlineAsmLabel, 5 MustTail, 6 UserBlacklisted, 8 NoReturnTail.
+    // (bit 7 IsCold deliberately excluded — cold ≠ anchored.)
+    return XBBRAttrs &
+           (0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100);
   }
 };
 
@@ -124,15 +137,69 @@ struct XBBREdge {
   uint32_t SrcNode = 0;      ///< index into XBBRGraph::nodes
   uint32_t DstNode = 0;
   uint64_t Weight = 0;       ///< absolute frequency estimate
-  // Bitfields without default initializers — XBBREdge is value-initialized
-  // by collectFromObjFiles/collectCallGraphEdges, which set every bit
-  // explicitly. (C++17 doesn't support bitfield default initializers.)
   bool IsFallthrough : 1;    ///< fall-through in the input baseline
   bool IsCrossFunc : 1;      ///< cross-function call edge
   bool IsIndirectCall : 1;   ///< from IRPGO IPVK_IndirectCallTarget VP
 
   XBBREdge()
       : IsFallthrough(false), IsCrossFunc(false), IsIndirectCall(false) {}
+};
+
+/// Cost-function weight set (PLAN §4.3 Stage 3). Passed from Config
+/// through the pipeline into CostFunction.
+struct CostWeights {
+  unsigned Icache = 4;
+  unsigned Itlb = 2;
+  unsigned Btb = 1;
+  unsigned Size = 1;
+};
+
+/// A cluster of functions grouped by Stage 1. One cluster becomes the
+/// input domain for a single ExtTSP run in Stage 2.
+struct FunctionCluster {
+  uint32_t Id = 0;               ///< 0-based cluster index
+  std::vector<FuncId> Members;   ///< FuncIds in this cluster
+  uint64_t TotalSize = 0;        ///< sum of member function byte sizes
+  uint64_t TotalWeight = 0;      ///< sum of member FuncEntryCount values
+  double Density = 0.0;          ///< TotalWeight / TotalSize
+
+  bool empty() const { return Members.empty(); }
+  uint32_t size() const { return static_cast<uint32_t>(Members.size()); }
+};
+
+/// Per-BB placement decision produced by Stages 2-3, consumed by Stage 5.
+struct BBPlacement {
+  uint32_t NodeIdx = 0;          ///< index into XBBRGraph::nodes
+  uint32_t ClusterIdx = 0;       ///< which cluster this BB belongs to
+  enum class Section : uint8_t { Hot, Unlikely, Original };
+  Section TargetSec = Section::Original;
+};
+
+/// The complete result of M3 processing (Stages 1-4), consumed by Stage 5.
+struct XBBRLayoutResult {
+  std::vector<FunctionCluster> Clusters;
+  /// Per-cluster BB ordering: outer vector indexed by cluster, inner
+  /// vector is the ordered sequence of global node indices.
+  std::vector<std::vector<uint32_t>> ClusterBBOrders;
+  /// Per-BB placement decisions (one per migratable BB).
+  std::vector<BBPlacement> Placements;
+  /// Estimated final cost from Stage 3 (projected-offset model).
+  double EstimatedCost = 0.0;
+  /// Actual cost after emission (filled by Stage 5 terminal verification).
+  double ActualCost = 0.0;
+  /// Total bytes of thunks emitted (Stage 5).
+  uint64_t ThunkBytes = 0;
+};
+
+/// BB-level emission fragment: a contiguous byte range from an
+/// InputSection that is emitted as an independent unit by Stage 5.
+struct BBFragment {
+  InputSectionBase *Section = nullptr; ///< owning InputSection
+  uint32_t NodeIdx = 0;            ///< index into XBBRGraph::nodes
+  uint32_t Offset = 0;             ///< byte offset within the section
+  uint32_t Size = 0;               ///< size in bytes
+  uint32_t Alignment = 1;          ///< alignment (1 = no alignment)
+  uint64_t FinalVA = 0;            ///< filled by SectionEmitter after layout
 };
 
 } // namespace xbbr

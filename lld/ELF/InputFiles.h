@@ -275,6 +275,13 @@ public:
   // SHT_LLVM_CALL_GRAPH_PROFILE section index.
   uint32_t cgProfileSectionIndex = 0;
 
+  // XBBR (M2-T01): indices of SHT_LLVM_XBBR_ATTR sections seen in this
+  // object. The sections themselves are discarded by the linker
+  // (SHF_EXCLUDE — they must not enter the loadable image), but Stage
+  // 0 reads them through the raw Elf_Shdr table before that drop.
+  // Empty when -fbb-cross-reorder= was not in effect at compile time.
+  llvm::SmallVector<uint32_t, 0> xbbrAttrSectionIndices;
+
   // MIPS GP0 value defined by this file. This value represents the gp value
   // used to create the relocatable object and required to support
   // R_MIPS_GPREL16 / R_MIPS_GPREL32 relocations.

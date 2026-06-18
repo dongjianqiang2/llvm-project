@@ -169,7 +169,7 @@ def bb_cross_reorder_fallback_eq : JJ<"bb-cross-reorder-fallback=">,
   HelpText<"XBBR fallback policy: auto, conservative, none">,
   Values<"auto,conservative,none">;
 def bb_cross_reorder_emit_decision_map : FF<"bb-cross-reorder-emit-decision-map">,
-  HelpText<"Emit .llvm_cross_bb_map describing XBBR layout decisions">;
+  HelpText<"Emit .debug_xbbr_decision describing XBBR layout decisions">;
 def bb_cross_reorder_deterministic : FF<"bb-cross-reorder-deterministic">,
   HelpText<"Force XBBR to bitwise-identical output for the same inputs">;
 def bb_cross_reorder_stats : FF<"bb-cross-reorder-stats">,

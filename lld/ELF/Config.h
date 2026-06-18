@@ -51,6 +51,9 @@ class BitcodeCompiler;
 class OutputSection;
 class LinkerScript;
 class TargetInfo;
+namespace xbbr {
+class XBBRGraph;
+} // namespace xbbr
 struct Ctx;
 struct Partition;
 struct PhdrEntry;
@@ -763,10 +766,18 @@ struct Ctx : CommonLinkerContext {
   llvm::DenseSet<std::pair<const Symbol *, uint64_t>> ppc64noTocRelax;
 
   Ctx();
+  // Out-of-line because XBBRGraph is forward-declared here and
+  // unique_ptr's deleter needs the complete type (defined in Driver.cpp).
+  ~Ctx();
 
   llvm::raw_fd_ostream openAuxiliaryFile(llvm::StringRef, std::error_code &);
 
   std::optional<AArch64PauthAbiCoreInfo> aarch64PauthAbiCoreInfo;
+
+  // M3: Stage 0 graph persisted across the link. Populated by
+  // buildSectionOrder() when --bb-cross-reorder= is on; consumed by the
+  // XBBR pipeline (Stages 1-4). nullptr otherwise.
+  std::unique_ptr<xbbr::XBBRGraph> xbbrGraph;
 };
 
 // The first two elements of versionDefinitions represent VER_NDX_LOCAL and

@@ -40,6 +40,12 @@ add_lld_library(lldELF
   BPSectionOrderer.cpp
   CallGraphSort.cpp
   XBBR/XBBRGraph.cpp
+  XBBR/BBLayout.cpp
+  XBBR/XBBRClustering.cpp
+  XBBR/ConstraintSolver.cpp
+  XBBR/CostFunction.cpp
+  XBBR/SectionEmitter.cpp
+  XBBR/XBBRPipeline.cpp
   DWARF.cpp
   Driver.cpp
   DriverUtils.cpp

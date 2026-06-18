@@ -17,6 +17,7 @@
 #include "MapFile.h"
 #include "OutputSections.h"
 #include "XBBR/XBBRGraph.h"
+#include "XBBR/XBBRPipeline.h"
 #include "Relocations.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -1092,19 +1093,45 @@ static void maybeShuffle(Ctx &ctx,
 static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
   DenseMap<const InputSectionBase *, int> sectionOrder;
 
-  // XBBR (TASK M2-T01 + M2-T04): when --bb-cross-reorder= is on, run
-  // Stage 0 to collect global per-BB metadata, regardless of whether
-  // CGProfile data is present in the inputs (Stage 0 still produces
-  // useful intra-function info — call edges may be empty but the per-BB
-  // attr/freq tables aren't). M2 doesn't yet alter the section order
-  // here; Stage 2/3/4 in M3 will be the consumer.
+  // XBBR (M3): when --bb-cross-reorder= is on, run Stage 0 to collect
+  // global per-BB metadata. The graph is persisted in ctx.xbbrGraph for
+  // consumption by the M3 pipeline (Stages 1-4). M2 only prints stats;
+  // Stage 2/3/4 in M3 will consume the graph to drive BB-level layout.
   if (ctx.arg.xbbrEnabled) {
-    xbbr::XBBRGraph graph;
-    if (graph.build(ctx) && ctx.arg.xbbrStats) {
-      llvm::errs() << "xbbr-stats: nodes=" << graph.nodes().size()
-                   << " edges=" << graph.edges().size()
-                   << " funcs=" << graph.funcs().size()
-                   << " anchors=" << graph.numAnchors() << "\n";
+    auto graph = std::make_unique<xbbr::XBBRGraph>();
+    if (graph->build(ctx)) {
+      if (ctx.arg.xbbrStats) {
+        // Per-bit breakdown so regression tests can pin individual
+        // attribute kinds without depending on the total `anchors`
+        // count (which collapses every blacklist class together).
+        uint32_t nLpad = 0, nIndirBr = 0, nSetjmp = 0, nMustTail = 0,
+                 nUserBL = 0, nNoRetTail = 0, nCold = 0;
+        for (const auto &N : graph->nodes()) {
+          if (N.isLandingPad())     ++nLpad;
+          if (N.isIndirectBrTarget())++nIndirBr;
+          if (N.hasSetjmp())        ++nSetjmp;
+          if (N.isMustTail())       ++nMustTail;
+          if (N.userBlacklisted())  ++nUserBL;
+          if (N.isNoReturnTail())   ++nNoRetTail;
+          if (N.isCold())           ++nCold;
+        }
+        llvm::errs() << "xbbr-stats: nodes=" << graph->nodes().size()
+                     << " edges=" << graph->edges().size()
+                     << " funcs=" << graph->funcs().size()
+                     << " anchors=" << graph->numAnchors()
+                     << " landingpad=" << nLpad
+                     << " indirectbr=" << nIndirBr
+                     << " setjmp=" << nSetjmp
+                     << " musttail=" << nMustTail
+                     << " userbl=" << nUserBL
+                     << " noreturntail=" << nNoRetTail
+                     << " cold=" << nCold << "\n";
+      }
+      ctx.xbbrGraph = std::move(graph);
+      // M3: run Stages 1-4 when XBBR is on with partial/full mode.
+      // Stage 5 (SectionEmitter) runs inside the pipeline.
+      if (ctx.arg.xbbrMode >= XBBRMode::Partial)
+        xbbr::runXBBRPipeline(ctx, *ctx.xbbrGraph);
     }
     // build() failures are diagnosed inline; we still fall through to
     // the existing layout to produce *some* output.

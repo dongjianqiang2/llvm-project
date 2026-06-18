@@ -41,48 +41,54 @@ using llvm::support::endian::read16le;
 
 namespace {
 
-/// XBBR attr-section format (PLAN §9.3, version 0x02):
+/// XBBR attr-section format (PLAN §9.3, version 0x02).
+///
+/// One section may concatenate the attr blocks for multiple functions
+/// when they share the same text section (typical without
+/// -ffunction-sections). Each block is:
 ///   u8 version (0x02)
 ///   uleb128 num_bbs
 ///   u16 attrs[num_bbs]   (little-endian)
 struct XBBRAttrParseResult {
   bool Ok = false;
-  std::vector<uint16_t> Attrs;     ///< per-BB attr words
+  /// Each std::vector<uint16_t> is one function's per-BB attr words,
+  /// in the order the functions appear in the .o.
+  std::vector<std::vector<uint16_t>> PerFunc;
 };
 
-/// Parse a single .llvm_xbbr_attr section's bytes into per-BB attr words.
-/// Returns Ok=false (with no diagnostic — caller decides) on any malformed
-/// content; the caller's "num_bbs disagrees with BB_ADDR_MAP" check is the
-/// authoritative consistency gate.
+/// Parse a single .llvm_xbbr_attr section's bytes. Returns Ok=false
+/// (with no diagnostic — caller decides) on any malformed content.
 XBBRAttrParseResult parseXBBRAttr(ArrayRef<uint8_t> Bytes) {
   XBBRAttrParseResult R;
-  if (Bytes.size() < 2)
-    return R; // need at least version + a uleb byte
-  if (Bytes[0] != 0x02)
-    return R; // unknown version
-  size_t Pos = 1;
-
-  // Decode uleb128 num_bbs (max 5 bytes for u32).
-  uint32_t NumBBs = 0;
-  unsigned Shift = 0;
+  size_t Pos = 0;
   while (Pos < Bytes.size()) {
-    uint8_t B = Bytes[Pos++];
-    NumBBs |= uint32_t(B & 0x7f) << Shift;
-    if ((B & 0x80) == 0)
-      break;
-    Shift += 7;
-    if (Shift >= 32)
+    if (Bytes[Pos] != 0x02)
+      return R; // unknown version
+    ++Pos;
+    if (Pos >= Bytes.size())
       return R;
-  }
-
-  // Followed by NumBBs little-endian u16 words.
-  if (Pos + size_t(NumBBs) * 2 != Bytes.size())
-    return R; // length mismatch — corrupted or wrong version
-
-  R.Attrs.reserve(NumBBs);
-  for (uint32_t I = 0; I < NumBBs; ++I) {
-    R.Attrs.push_back(read16le(Bytes.data() + Pos));
-    Pos += 2;
+    // Decode uleb128 num_bbs (max 5 bytes for u32).
+    uint32_t NumBBs = 0;
+    unsigned Shift = 0;
+    while (Pos < Bytes.size()) {
+      uint8_t B = Bytes[Pos++];
+      NumBBs |= uint32_t(B & 0x7f) << Shift;
+      if ((B & 0x80) == 0)
+        break;
+      Shift += 7;
+      if (Shift >= 32)
+        return R;
+    }
+    // Followed by NumBBs little-endian u16 words.
+    if (Pos + size_t(NumBBs) * 2 > Bytes.size())
+      return R; // length truncated
+    std::vector<uint16_t> Func;
+    Func.reserve(NumBBs);
+    for (uint32_t I = 0; I < NumBBs; ++I) {
+      Func.push_back(read16le(Bytes.data() + Pos));
+      Pos += 2;
+    }
+    R.PerFunc.push_back(std::move(Func));
   }
   R.Ok = true;
   return R;
@@ -106,10 +112,11 @@ bool decodeBBAddrMapForX86_64(InputSectionBase *S, BBAddrMapDecoded &Out) {
   auto Shdrs = EF.sections();
   if (!Shdrs)
     return false;
-  // Locate this section's Elf_Shdr by matching offset/size — InputSection
-  // doesn't expose its sh_index directly, but we can compare contents.
-  // ObjFile stores sections in the same order as Elf_Shdrs; the section
-  // index is its position in the section list.
+  // M2: linear scan to find this section's index. With N functions
+  // per ObjFile this gives O(N²) total cost in collectFromObjFiles.
+  // M3 TODO: cache a DenseMap<InputSectionBase*, size_t> per ObjFile
+  // to amortize. M2 only does function-level reordering, so the cost
+  // stays well below noise on realistic inputs.
   ArrayRef<InputSectionBase *> AllSecs = OF->getSections();
   size_t Idx = 0;
   for (; Idx < AllSecs.size(); ++Idx)
@@ -119,9 +126,23 @@ bool decodeBBAddrMapForX86_64(InputSectionBase *S, BBAddrMapDecoded &Out) {
     return false;
 
   const auto &Shdr = (*Shdrs)[Idx];
+
+  // Relocatable .o files reference the function symbol through a
+  // companion SHT_RELA section whose `sh_info` points back at the
+  // BB_ADDR_MAP. decodeBBAddrMap needs that reloc data — without it
+  // it fails with "failed to get relocation data for offset N" on
+  // the function-address field.
+  const typename ELFT::Shdr *RelaShdr = nullptr;
+  for (const auto &Sh : *Shdrs) {
+    if (Sh.sh_type == ELF::SHT_RELA && Sh.sh_info == Idx) {
+      RelaShdr = &Sh;
+      break;
+    }
+  }
+
   std::vector<PGOAnalysisMap> PGO;
   Expected<std::vector<BBAddrMap>> Maps =
-      EF.decodeBBAddrMap(Shdr, /*RelaSec=*/nullptr, &PGO);
+      EF.decodeBBAddrMap(Shdr, RelaShdr, &PGO);
   if (!Maps) {
     consumeError(Maps.takeError());
     return false;
@@ -205,12 +226,31 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       DecodedMaps[S] = std::move(D);
     }
 
-    // Pre-decode every .llvm_xbbr_attr section in this ObjFile.
-    DenseMap<InputSectionBase *, XBBRAttrParseResult> DecodedAttrs;
-    for (InputSectionBase *S : Secs) {
-      if (!S || S->type != ELF::SHT_LLVM_XBBR_ATTR)
-        continue;
-      DecodedAttrs[S] = parseXBBRAttr(S->content());
+    // Pre-decode every .llvm_xbbr_attr section attached to this
+    // ObjFile via SHF_EXCLUDE. The sections are NOT in
+    // FB->getSections() (they were marked discarded in InputFiles —
+    // SHF_EXCLUDE means they don't enter the output), so we have to
+    // fetch them from the raw Elf_Shdr table using the indices that
+    // ObjFile recorded for us. Map: sh_link → parsed attrs.
+    DenseMap<uint32_t, XBBRAttrParseResult> AttrsByLink;
+    {
+      ObjFile<ELF64LE> *OF = cast<ObjFile<ELF64LE>>(FB);
+      auto Shdrs = OF->getObj().sections();
+      if (!Shdrs) {
+        consumeError(Shdrs.takeError());
+      } else {
+        for (uint32_t Idx : OF->xbbrAttrSectionIndices) {
+          if (Idx >= Shdrs->size())
+            continue;
+          const auto &Shdr = (*Shdrs)[Idx];
+          auto Bytes = OF->getObj().getSectionContents(Shdr);
+          if (!Bytes) {
+            consumeError(Bytes.takeError());
+            continue;
+          }
+          AttrsByLink[Shdr.sh_link] = parseXBBRAttr(*Bytes);
+        }
+      }
     }
 
     // For every text section in this file, look up its decoded
@@ -222,16 +262,16 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       if ((Text->flags & ELF::SHF_EXECINSTR) == 0)
         continue;
 
-      // Find sibling sections that link to this text section.
+      // Find sibling sections that link to this text section. The
+      // BB_ADDR_MAP is in `Secs` (it's not SHF_EXCLUDE); the
+      // `.llvm_xbbr_attr` was discarded from `Secs` and is fetched
+      // from AttrsByLink, keyed on sh_link.
       InputSectionBase *AddrMap = nullptr;
-      InputSectionBase *AttrSec = nullptr;
       for (InputSectionBase *S : Secs) {
         if (!S || S->link != SIdx)
           continue;
         if (S->type == ELF::SHT_LLVM_BB_ADDR_MAP)
           AddrMap = S;
-        else if (S->type == ELF::SHT_LLVM_XBBR_ATTR)
-          AttrSec = S;
       }
       if (!AddrMap)
         continue; // No BB_ADDR_MAP — function not compiled for XBBR.
@@ -245,11 +285,16 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
                                       ? nullptr
                                       : &MIt->second.PGO.front();
 
-      const XBBRAttrParseResult *Attrs = nullptr;
-      if (AttrSec) {
-        auto AIt = DecodedAttrs.find(AttrSec);
-        if (AIt != DecodedAttrs.end() && AIt->second.Ok)
-          Attrs = &AIt->second;
+      const std::vector<uint16_t> *FuncAttrs = nullptr;
+      auto AIt = AttrsByLink.find(SIdx);
+      if (AIt != AttrsByLink.end() && AIt->second.Ok &&
+          !AIt->second.PerFunc.empty()) {
+        // M2: assume one function per text section (works under
+        // -ffunction-sections, which XBBR effectively requires for
+        // BB-level reorder anyway). M3 generalizes to N functions
+        // per section by indexing into PerFunc with the BBAddrMap
+        // entry's position.
+        FuncAttrs = &AIt->second.PerFunc.front();
       }
 
       FuncId Fid = SectionToFuncId.lookup(Text);
@@ -276,10 +321,10 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       // Optional consistency check: .llvm_xbbr_attr's num_bbs must
       // match the BB_ADDR_MAP BB count. M1 produced both from the
       // same MIR pass; a mismatch means tampering or version skew.
-      if (Attrs && Attrs->Attrs.size() != Flat.size()) {
+      if (FuncAttrs && FuncAttrs->size() != Flat.size()) {
         Err(ctx) << "XBBR Stage 0: " << Text->name << " in "
                  << FB->getName()
-                 << ": .llvm_xbbr_attr num_bbs (" << Attrs->Attrs.size()
+                 << ": .llvm_xbbr_attr num_bbs (" << FuncAttrs->size()
                  << ") does not match BB_ADDR_MAP (" << Flat.size() << ")";
         return false;
       }
@@ -289,6 +334,13 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       if (PAM && !PAM->BBEntries.empty())
         EntryRaw = PAM->BBEntries.front().BlockFreq.getFrequency();
 
+      // Walk Flat (BBAddrMap entries flattened across BBRanges) and
+      // PAM->BBEntries in lock-step. Both are emitted by AsmPrinter in
+      // `for (MBB : MF)` order (see AsmPrinter::emitBBAddrMapSection),
+      // so a positional pairing is well-defined regardless of BB IDs —
+      // the index `I` is *position*, not numeric BBID. This is also
+      // why we don't index into PAM->BBEntries by Flat[I].Id: the
+      // pairing is by emission order, not by ID.
       for (size_t I = 0; I < Flat.size(); ++I) {
         XBBRNode N;
         N.Func = Fid;
@@ -300,20 +352,54 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
               FI.EntryCount);
         else
           N.GlobalFreq = 0;
-        N.XBBRAttrs = Attrs ? Attrs->Attrs[I] : 0;
+        N.XBBRAttrs = FuncAttrs ? (*FuncAttrs)[I] : 0;
 
         BBKey K{Fid, N.BB};
         BBIndex.try_emplace(K, static_cast<uint32_t>(Nodes.size()));
         Nodes.push_back(N);
       }
       FI.NumNodes = static_cast<uint32_t>(Nodes.size()) - FI.FirstNode;
+
+      // Collect intra-function CFG edges from BBAddrMap BrProb data.
+      // PGOBBEntry::Successors carries (target-BB-ID, BranchProbability)
+      // per source BB. These edges are the primary input to ExtTSP in
+      // Stage 2, alongside the cross-function call edges from CGProfile.
+      if (PAM) {
+        for (size_t I = 0; I < Flat.size(); ++I) {
+          if (I >= PAM->BBEntries.size())
+            continue;
+          const auto &PGOEntry = PAM->BBEntries[I];
+          uint32_t SrcIdx = FI.FirstNode + static_cast<uint32_t>(I);
+          for (const auto &Succ : PGOEntry.Successors) {
+            auto Dst = findNode(Fid, Succ.ID);
+            if (!Dst)
+              continue;
+            XBBREdge E;
+            E.SrcNode = SrcIdx;
+            E.DstNode = *Dst;
+            // Scale the branch probability to an absolute count using the
+            // source BB's global frequency. BranchProbability::scale() does
+            // Prob/denom * GlobalFreq, yielding an approximate execution
+            // count for this edge.
+            E.Weight = static_cast<uint64_t>(
+                Succ.Prob.scale(uint64_t(Nodes[SrcIdx].GlobalFreq)));
+            // Fallthrough iff the successor BB immediately follows the
+            // source BB in the original function order (BB IDs are dense
+            // and sequential after RenumberBlocks).
+            E.IsFallthrough = (Flat[I].Id + 1 == Succ.ID);
+            E.IsCrossFunc = false;
+            E.IsIndirectCall = false;
+            Edges.push_back(E);
+          }
+        }
+      }
     }
   }
 
-  // Trim out trailing empty FuncInfos (text sections with no
-  // BB_ADDR_MAP) so funcs() only exposes XBBR-instrumented functions.
-  // Doing this after the fact preserves stable FuncIds for the ones
-  // that did get nodes; the empty trailing FuncInfos are harmless.
+  // Funcs may contain entries with NumNodes==0: text sections that
+  // weren't compiled with -fbb-cross-reorder= and therefore have no
+  // BB_ADDR_MAP. Keeping them around preserves stable FuncIds and is
+  // harmless (downstream code defends with NumNodes==0 checks).
   return true;
 }
 
@@ -326,12 +412,10 @@ bool XBBRGraph::collectCallGraphEdges(Ctx &ctx) {
   // Both keys come from the same per-section pool we've already
   // enumerated in collectFromObjFiles, so the FuncId lookup is O(1).
   for (const auto &KV : ctx.arg.callGraphProfile) {
-    // ctx.arg.callGraphProfile keys are `const InputSectionBase *` (lld
-    // doesn't mutate them through this map). Casting away const is
-    // safe — sectionToFunc/SectionToFuncId only ever read the pointer
-    // identity for lookup, never mutate the pointee.
-    InputSectionBase *FromS = const_cast<InputSectionBase *>(KV.first.first);
-    InputSectionBase *ToS = const_cast<InputSectionBase *>(KV.first.second);
+    // ctx.arg.callGraphProfile keys are `const InputSectionBase *`.
+    // sectionToFunc accepts that directly — no const_cast required.
+    const InputSectionBase *FromS = KV.first.first;
+    const InputSectionBase *ToS = KV.first.second;
     FuncId From = sectionToFunc(FromS);
     FuncId To = sectionToFunc(ToS);
     if (From == InvalidFuncId || To == InvalidFuncId)
@@ -379,7 +463,7 @@ bool XBBRGraph::build(Ctx &ctx) {
   return true;
 }
 
-FuncId XBBRGraph::sectionToFunc(InputSectionBase *S) const {
+FuncId XBBRGraph::sectionToFunc(const InputSectionBase *S) const {
   auto It = SectionToFuncId.find(S);
   if (It == SectionToFuncId.end())
     return InvalidFuncId;
@@ -402,7 +486,11 @@ std::optional<uint32_t> XBBRGraph::findNode(FuncId Func, BBId BB) const {
 uint32_t XBBRGraph::numAnchors() const {
   uint32_t N = 0;
   for (const XBBRNode &Node : Nodes)
-    if (Node.XBBRAttrs != 0)
+    // Use isAnchor() so this stays consistent with downstream
+    // consumers (Stage 1/2 use isAnchor() for cluster fragmentation
+    // bounds). `XBBRAttrs != 0` would over-count IsCold blocks
+    // (cold ≠ anchored, see XBBRTypes.h).
+    if (Node.isAnchor())
       ++N;
   return N;
 }
