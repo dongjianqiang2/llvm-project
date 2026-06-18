@@ -11,11 +11,10 @@
 // (PLAN §9.3, SPEC §5.3 blacklist conditions). Enabled by
 // `-fbb-cross-reorder=partial|full` (clang) or `-enable-xbbr` (llc testing).
 //
-// Width: 16-bit per BB. The original M1 design used 8 bits (just enough
-// for the §5.3 list); a code review surfaced "noreturn-tail" as a
-// missing 9th bit (SPEC §5.3 item 7) and the cleanest way forward is
-// to widen the on-disk encoding to a u16 little-endian word. This
-// leaves headroom for future bits without another format break.
+// Width: 16-bit per BB. The bitmask covers SPEC §5.3 (blacklist
+// conditions §5.3 #1–#7) plus IsCold for partial/full mode
+// differentiation. The on-disk encoding is a u16 little-endian word,
+// leaving headroom for future bits without a format break.
 //
 //===----------------------------------------------------------------------===//
 
@@ -68,9 +67,11 @@ enum AttrBit : uint16_t {
                                 ///< MachineInstr::isReturn(), see PLAN §3.4
                                 ///< review correction).
   UserBlacklisted   = 1u << 6, ///< Listed in -fbb-cross-reorder-blacklist=.
-  IsCold            = 1u << 7, ///< Synced with MachineFunctionSplitter
-                                ///< (deferred; lld consumer in M3 — flag
-                                ///< is currently always 0).
+  IsCold            = 1u << 7, ///< Set when the BB's block frequency
+                                ///< drops below the configured cold
+                                ///< threshold. Consumed by the linker
+                                ///< in partial mode to keep cold BBs
+                                ///< with their original function.
   IsNoReturnTail    = 1u << 8, ///< BB ends with a `noreturn` callsite and
                                 ///< has no successors (SPEC §5.3 item 7).
                                 ///< Anchoring this aids backtrace fidelity

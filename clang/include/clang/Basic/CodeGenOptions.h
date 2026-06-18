@@ -134,15 +134,21 @@ public:
   //   "function": function-level reorder only (no per-BB metadata).
   //   "partial":  hot BBs may migrate cross-function (embedded default).
   //   "full":     all non-blacklisted BBs may migrate.
-  // Implementation in M1: "partial"/"full" both turn on BBAddrMap+PGO
-  // features and emit `.llvm_xbbr_attr`. Differentiated cold-threshold
-  // semantics arrive in M3.
+  // "partial"/"full" both turn on BBAddrMap+PGO features and emit
+  // `.llvm_xbbr_attr`; cold-threshold semantics differentiate them
+  // (cold BBs stay anchored under partial, migrate under full).
   std::string BBCrossReorder;
 
   // -fbb-cross-reorder-blacklist=<file> — path to a newline-separated
   // user blacklist (SPEC §6.1). Functions named in this file get the
   // UserBlacklisted bit on every non-entry BB.
   std::string BBCrossReorderBlacklist;
+
+  // -fbb-cross-reorder-cold-threshold=<frac> — fraction of entry-block
+  // frequency below which a BB is marked cold (SPEC §6.1). Default
+  // "0.01". Cold BBs are excluded from cross-function migration in
+  // partial mode (lld then keeps them with their original function).
+  std::string BBCrossReorderColdThreshold;
 
   // If set, override the default value of MCAsmInfo::BinutilsVersion. If
   // DisableIntegratedAS is specified, the assembly output will consider GNU as

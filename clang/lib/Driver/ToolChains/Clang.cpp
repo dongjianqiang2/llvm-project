@@ -6220,10 +6220,11 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     }
   }
 
-  // XBBR (M1-T06): -fbb-cross-reorder=none|function|partial|full.
-  // ELF only; partial/full require x86_64 in M1 (M5 adds AArch64/ARM).
-  // ThinLTO is unsupported (SPEC §8.3) — its parallel per-module CodeGen
-  // breaks the per-partition metadata roundtrip. Full LTO is fine.
+  // XBBR: -fbb-cross-reorder=none|function|partial|full.
+  // ELF only; partial/full currently require x86_64 or AArch64. ARM
+  // support lands once thunk integration is in place. ThinLTO is
+  // unsupported (SPEC §8.3) — its parallel per-module CodeGen breaks
+  // the per-partition metadata roundtrip. Full LTO is fine.
   if (Arg *A = Args.getLastArg(options::OPT_fbb_cross_reorder_EQ)) {
     StringRef Val = A->getValue();
     if (Val != "none" && Val != "function" && Val != "partial" &&
@@ -6237,8 +6238,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
           << A->getAsString(Args) << TripleStr;
     } else if ((Val == "partial" || Val == "full") &&
                !Triple.isX86() && !Triple.isAArch64()) {
-      // M1 only emits XBBR metadata for x86_64 and AArch64.
-      // ARM support lands after M5 thunk integration.
+      // XBBR metadata emission is only wired for x86_64 and AArch64.
+      // ARM support lands after thunk integration.
       D.Diag(diag::err_drv_unsupported_opt_for_target)
           << A->getAsString(Args) << TripleStr;
     } else if ((Val == "partial" || Val == "full") &&
@@ -6254,6 +6255,17 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     A->render(Args, CmdArgs);
   if (Arg *A = Args.getLastArg(options::OPT_fbb_cross_reorder_stats))
     A->render(Args, CmdArgs);
+  if (Arg *A =
+          Args.getLastArg(options::OPT_fbb_cross_reorder_cold_threshold_EQ)) {
+    // Validate numeric form here; cc1 also re-parses but driver-level
+    // diagnostics give better error positions.
+    StringRef V = A->getValue();
+    double Frac;
+    if (V.getAsDouble(Frac) || Frac < 0.0 || Frac >= 1.0)
+      D.Diag(diag::err_drv_invalid_value) << A->getAsString(Args) << V;
+    else
+      A->render(Args, CmdArgs);
+  }
 
   bool HasDefaultDataSections = Triple.isOSBinFormatXCOFF();
   if (Args.hasFlag(options::OPT_fdata_sections, options::OPT_fno_data_sections,

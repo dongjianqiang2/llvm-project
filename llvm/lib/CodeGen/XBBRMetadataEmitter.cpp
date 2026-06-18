@@ -29,7 +29,7 @@
 //
 //   * `is_musttail` uses IR-level `BasicBlock::getTerminatingMustTailCall()`
 //     and `CallBase::isMustTailCall()`, NOT `MachineInstr::isReturn()`
-//     (PLAN §3.4 review correction — review #7).
+//     (PLAN §3.4 covers why the latter is too broad).
 //
 //   * `is_no_return_tail` flags the SPEC §5.3 item 7 case — a BB that
 //     ends with a `noreturn` callsite and has no successors. Anchoring
@@ -48,6 +48,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/IR/BasicBlock.h"
@@ -58,6 +59,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/BlockFrequency.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -71,14 +73,14 @@ using namespace llvm;
 
 #define DEBUG_TYPE "xbbr-metadata-emitter"
 
-/// Testing flag enabling XBBR metadata emission from llc. clang instead sets
-/// TargetOptions::XBBR via -fbb-cross-reorder= (wired up in M1-T06).
+/// Testing flag enabling XBBR metadata emission from llc. clang instead
+/// sets TargetOptions::XBBR via -fbb-cross-reorder=.
 cl::opt<bool> llvm::EnableXBBR(
     "enable-xbbr", cl::Hidden, cl::init(false),
     cl::desc("Enable XBBR metadata emission (.llvm_xbbr_attr) for testing"));
 
-/// Path to a newline-separated function blacklist (M1-T06,
-/// SPEC §6.1 -fbb-cross-reorder-blacklist=). One symbol name per line;
+/// Path to a newline-separated function blacklist (SPEC §6.1
+/// -fbb-cross-reorder-blacklist=). One symbol name per line;
 /// `#` starts a comment; blank lines are ignored. Functions in the
 /// blacklist get UserBlacklisted on every BB except the entry.
 static cl::opt<std::string> XBBRBlacklistFile(
@@ -90,6 +92,18 @@ static cl::opt<std::string> XBBRBlacklistFile(
 static cl::opt<bool> XBBRStats(
     "xbbr-stats", cl::Hidden, cl::init(false),
     cl::desc("Print XBBR per-function attr statistics to stderr"));
+
+/// Cold-BB threshold (SPEC §6.1 -fbb-cross-reorder-cold-threshold=). A BB
+/// is marked IsCold iff its block-frequency relative weight (BFI scale,
+/// where the entry block normalizes to its raw entry frequency) drops
+/// below `threshold` of the entry block — i.e. the BB executes fewer than
+/// `threshold × entry_count` times in expectation. Default 0.01 matches
+/// SPEC §6.1; threshold=0 means "only zero-frequency BBs are cold" which
+/// makes partial mode degenerate toward full (debug aid).
+static cl::opt<double> XBBRColdThreshold(
+    "xbbr-cold-threshold", cl::Hidden, cl::init(0.01),
+    cl::desc("Mark BBs as cold (XBBR) when relative-freq < threshold "
+             "(default 0.01)"));
 
 namespace {
 
@@ -229,6 +243,12 @@ public:
 
   StringRef getPassName() const override { return "XBBR Metadata Emitter"; }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesAll();
+    AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
   bool runOnMachineFunction(MachineFunction &MF) override {
     if (!EnableXBBR)
       return false;
@@ -240,6 +260,28 @@ public:
 
     DenseMap<const BasicBlock *, uint16_t> IRAttrs = computeIRAttrs(MF);
     const bool UserBL = functionIsUserBlacklisted(MF.getFunction());
+
+    // BFI for cold-BB detection. The entry block's raw frequency normalizes
+    // the BFI scale (BFI emits BlockFrequency where the entry block's value
+    // is the implementation max), so we compare each BB's frequency against
+    // EntryFreq × XBBRColdThreshold to decide cold. Skip when entry is 0
+    // (no profile / dead function) — every BB stays "warm" rather than all
+    // being cold simultaneously.
+    //
+    // Cold detection only meaningful with real PGO data. Without IRPGO
+    // entry count, BFI provides only static heuristic estimates — using
+    // those to mark BBs cold would be misleading and would corrupt every
+    // existing test that runs `llc` without profile. SPEC §6.1 implicitly
+    // requires `-fprofile-instr-use` for the threshold to take effect.
+    auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
+    uint64_t EntryFreq = 0;
+    if (!MF.empty())
+      EntryFreq = MBFI.getBlockFreq(&MF.front()).getFrequency();
+    const double ColdThresholdFrac = XBBRColdThreshold;
+    const bool HasProfile = MF.getFunction().getEntryCount().has_value();
+    const bool ColdEnabled = HasProfile && EntryFreq > 0 &&
+                             ColdThresholdFrac >= 0.0 &&
+                             ColdThresholdFrac < 1.0;
 
     std::vector<uint16_t> Attrs;
     Attrs.reserve(MF.size());
@@ -295,16 +337,34 @@ public:
         // "this function's BBs may not migrate cross-function".
         Bits |= xbbr::UserBlacklisted;
       }
-      // bit7=cold sync with MachineFunctionSplitter is deferred to M3
-      // (lld is the only consumer of cold-threshold; SPEC §6.1's
-      // -fbb-cross-reorder-cold-threshold= is wired then).
+      // bit7=cold: synced from BFI when -xbbr-cold-threshold is set
+      // (clang surfaces this as -fbb-cross-reorder-cold-threshold=, SPEC
+      // §6.1). Entry block is never cold by definition. Computation is
+      // (EntryFreq × threshold) compared against MBB's BlockFrequency on
+      // BFI's raw scale — both are uint64_t in the same scale, so the
+      // multiplication is in 128-bit to avoid overflow on functions with
+      // very high entry counts.
+      if (ColdEnabled && !MBB.isEntryBlock()) {
+        uint64_t MBBRaw = MBFI.getBlockFreq(&MBB).getFrequency();
+        // ColdThresholdFrac in [0, 1). Compare MBBRaw < EntryFreq × frac.
+        // To stay in integer math: multiply EntryFreq by an integer scale
+        // and the threshold by the same scale, then compare.
+        constexpr uint64_t kScale = 1'000'000ULL;
+        uint64_t IntThr =
+            static_cast<uint64_t>(ColdThresholdFrac * double(kScale));
+        // `EntryFreq × IntThr / kScale` in 128-bit to avoid overflow.
+        __uint128_t Cutoff =
+            (__uint128_t(EntryFreq) * __uint128_t(IntThr)) / kScale;
+        if (__uint128_t(MBBRaw) < Cutoff)
+          Bits |= xbbr::IsCold;
+      }
       Attrs.push_back(Bits);
     }
 
     if (XBBRStats) {
       uint32_t NumAnchors = 0, NumMustTail = 0, NumLandingPad = 0,
                NumNoRetTail = 0, NumIndirectBr = 0, NumSetjmp = 0,
-               NumUserBL = 0;
+               NumUserBL = 0, NumCold = 0;
       for (uint16_t W : Attrs) {
         if (W & (xbbr::IsEntry | xbbr::IsLandingPad |
                  xbbr::IsIndirectBrTarget | xbbr::HasSetjmp |
@@ -317,6 +377,7 @@ public:
         if (W & xbbr::IsIndirectBrTarget) ++NumIndirectBr;
         if (W & xbbr::HasSetjmp) ++NumSetjmp;
         if (W & xbbr::UserBlacklisted) ++NumUserBL;
+        if (W & xbbr::IsCold) ++NumCold;
       }
       errs() << "xbbr-stats: " << MF.getName() << " bbs=" << Attrs.size()
              << " anchors=" << NumAnchors
@@ -325,7 +386,8 @@ public:
              << " noreturntail=" << NumNoRetTail
              << " indirectbr=" << NumIndirectBr
              << " setjmp=" << NumSetjmp
-             << " userbl=" << NumUserBL << "\n";
+             << " userbl=" << NumUserBL
+             << " cold=" << NumCold << "\n";
     }
 
     auto &T = getAttrTable();

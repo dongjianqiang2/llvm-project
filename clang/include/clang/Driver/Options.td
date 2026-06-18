@@ -4450,6 +4450,13 @@ def fbb_cross_reorder_blacklist_EQ
            "(SPEC §6.1). Functions listed here will have all their "
            "non-entry BBs marked UserBlacklisted in .llvm_xbbr_attr.">,
   MarshallingInfoString<CodeGenOpts<"BBCrossReorderBlacklist">>;
+def fbb_cross_reorder_cold_threshold_EQ
+    : Joined<["-"], "fbb-cross-reorder-cold-threshold=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Threshold (fraction of entry frequency) below which an XBBR "
+           "BB is marked cold (SPEC §6.1). Default 0.01. Cold BBs are "
+           "excluded from cross-function migration in partial mode.">,
+  MarshallingInfoString<CodeGenOpts<"BBCrossReorderColdThreshold">, [{"0.01"}]>;
 def fbb_cross_reorder_stats : Flag<["-"], "fbb-cross-reorder-stats">,
   Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,

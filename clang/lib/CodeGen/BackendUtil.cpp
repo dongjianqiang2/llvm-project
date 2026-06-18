@@ -449,14 +449,15 @@ static bool initTargetOptions(const CompilerInstance &CI,
 
   Options.EnableMachineFunctionSplitter = CodeGenOpts.SplitMachineFunctions;
 
-  // XBBR (M1-T06): partial/full implicitly enable BB_ADDR_MAP + PGO
-  // features (see useBBAddrMap() in AsmPrinter.cpp) so global_freq is
-  // available to lld at link time (PLAN §3.2). EnableXBBR is the same
-  // cl::opt gate the llc test path uses; setting it here lets clang and
-  // llc share one code path. M2 will replace this with a proper
-  // TargetOptions::XBBR enum so LTO partitions can roundtrip the mode.
-  // Driver (Clang.cpp) already validates the value set; values other
-  // than partial/full are silently treated as off here.
+  // XBBR: partial/full implicitly enable BB_ADDR_MAP + PGO features
+  // (see useBBAddrMap() in AsmPrinter.cpp) so global_freq is available
+  // to lld at link time (PLAN §3.2). EnableXBBR is the same cl::opt
+  // gate the llc test path uses; setting it here lets clang and llc
+  // share one code path. (A future revision may replace this with a
+  // TargetOptions::XBBR enum so LTO partitions can roundtrip the mode
+  // without going through cl::opt globals.) The driver already
+  // validates the value set; values other than partial/full are
+  // silently treated as off here.
   StringRef BBCRMode = CodeGenOpts.BBCrossReorder;
   if (BBCRMode == "partial" || BBCRMode == "full") {
     Options.BBAddrMap = true;
@@ -477,6 +478,16 @@ static bool initTargetOptions(const CompilerInstance &CI,
               llvm::cl::getRegisteredOptions().lookup("xbbr-stats"));
       if (XBBRStats)
         XBBRStats->setValue(true);
+    }
+    // Cold-BB threshold (SPEC §6.1 -fbb-cross-reorder-cold-threshold=).
+    // The driver validates the numeric format; we just forward.
+    if (!CodeGenOpts.BBCrossReorderColdThreshold.empty()) {
+      double Frac = 0.01;
+      if (!llvm::StringRef(CodeGenOpts.BBCrossReorderColdThreshold)
+               .getAsDouble(Frac))
+        if (auto *XBBRCold = static_cast<llvm::cl::opt<double> *>(
+                llvm::cl::getRegisteredOptions().lookup("xbbr-cold-threshold")))
+          XBBRCold->setValue(Frac);
     }
   }
   Options.FunctionSections = CodeGenOpts.FunctionSections;

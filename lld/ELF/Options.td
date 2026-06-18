@@ -145,9 +145,9 @@ def call_graph_profile_sort: JJ<"call-graph-profile-sort=">,
 def : FF<"no-call-graph-profile-sort">, Alias<call_graph_profile_sort>, AliasArgs<["none"]>,
   Flags<[HelpHidden]>;
 
-// XBBR (SPEC §6.2 / TASK M2-T04). The main switch is a Joined option
-// taking an .profdata path or "none"; M2 consumes it as a boolean
-// (any non-"none" value enables Stage 0+1 reuse of hfsort+).
+// XBBR (SPEC §6.2). The main switch is a Joined option taking an
+// .profdata path or "none"; the linker treats any non-"none" value as a
+// boolean enable for Stage 0/1 (function-level hfsort+ reuse).
 def bb_cross_reorder_eq : JJ<"bb-cross-reorder=">,
   HelpText<"XBBR cross-function basic-block reordering: profdata path or 'none' (experimental).">,
   MetaVarName<"<profdata-or-none>">;
@@ -177,9 +177,11 @@ def bb_cross_reorder_stats : FF<"bb-cross-reorder-stats">,
 def bb_cross_reorder_max_align_eq : JJ<"bb-cross-reorder-max-align=">,
   HelpText<"Cap on per-BB alignment when XBBR migrates blocks (bytes; default 16)">;
 def bb_cross_reorder_cold_threshold_eq : JJ<"bb-cross-reorder-cold-threshold=">,
-  HelpText<"Cold BB threshold fraction (default 0.01). BBs with global_freq "
-           "< threshold * entry_count are cold and excluded from migration in "
-           "partial mode">;
+  HelpText<"Informational: cold BB threshold (default 0.01). The actual "
+           "IsCold bit is computed by clang's -fbb-cross-reorder-cold-threshold "
+           "during compilation; this option records the value for diagnostics "
+           "only — pass the same value to clang for cold-classification to "
+           "match.">;
 
 defm irpgo_profile: EEq<"irpgo-profile",
   "Read a temporary profile file for use with --bp-startup-sort=">;
