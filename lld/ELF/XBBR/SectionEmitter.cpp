@@ -9,9 +9,11 @@
 // Stage 5 of the XBBR linker pipeline (PLAN §4.3): builds per-BB
 // decision-map entries and BBFragment objects from the pipeline result.
 //
-// M3 scope: decision map is fully populated with BB-level entries.
-// Physical BB-level section emission is deferred to M5; M3 uses the
-// existing function-level hfsort+ order for the actual .text layout.
+// Current scope: the decision map is fully populated with BB-level
+// entries. Physical BB-level section emission (actually moving BBs into
+// .text.hot / .text.unlikely) is out of scope here and runs in a
+// follow-up patch; until then the .text layout still uses the existing
+// function-level hfsort+ order.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,6 +23,7 @@
 #include "SyntheticSections.h"
 #include "XBBR/XBBRGraph.h"
 #include "XBBR/XBBRTypes.h"
+#include "llvm/BinaryFormat/XBBRDecisionMap.h"
 
 
 using namespace llvm;
@@ -40,8 +43,8 @@ std::vector<BBFragment> buildFragments(const XBBRGraph &graph,
   for (const auto &order : result.ClusterBBOrders) {
     for (uint32_t nodeIdx : order) {
       const XBBRNode &node = allNodes[nodeIdx];
-      // Alignment: M5 will read per-BB alignment from BBAddrMap
-      // BBEntry::Alignment. For M3, alignment is always 1 (no padding).
+      // Per-BB alignment will eventually come from BBAddrMap
+      // BBEntry::Alignment; for now we always use 1 (no padding).
 
       BBFragment frag;
       frag.NodeIdx = nodeIdx;
@@ -79,11 +82,6 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
   auto fragments = buildFragments(graph, result, ctx.arg.xbbrMaxAlign);
 
   // Populate the decision-map section with BB-level entries.
-  // In M2, this section was header-only (num_entries=0). M3 fills the
-  // per-BB entries from the pipeline result.
-  //
-  // The XBBRDecisionMapSection lives in ctx.mainPart->xbbrDecisionMap.
-  // We set the entry count and populate the entry data.
   Partition *mainPart = ctx.mainPart;
   if (!mainPart || !mainPart->xbbrDecisionMap)
     return;
@@ -95,23 +93,34 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
   std::vector<XBBRDecisionEntry> entries;
   entries.reserve(fragments.size());
   uint32_t a = 0, m = 0;
+  // In partial mode cold BBs are kept with their original function (per
+  // SPEC §4 / BBLayout::collectMigratableBBs); they should be reported
+  // as `anchored` in the decision map even though their XBBR attr bits
+  // don't make them anchors in the SPEC §5.3 sense. Otherwise downstream
+  // tools (BOLT, llvm-bbreorder-dump) cannot distinguish cold BBs that
+  // *will* migrate (full) from cold BBs that *won't* (partial) — which
+  // is the core partial-vs-full differentiation those tools surface.
+  const bool partialMode = ctx.arg.xbbrMode == XBBRMode::Partial;
   for (const auto &frag : fragments) {
     const XBBRNode &node = graph.nodes()[frag.NodeIdx];
     XBBRDecisionEntry e;
     e.BBIndex = node.BB;
     e.NewAddress = frag.FinalVA;
-    e.ClusterId = 0; // simplified for M3
-    if (node.isAnchor()) {
-      e.DecisionFlags = 2; // anchored
+    e.ClusterId = 0; // simplified for now; multi-cluster routing later
+    const bool effectiveAnchor =
+        node.isAnchor() || (partialMode && node.isCold());
+    if (effectiveAnchor) {
+      e.DecisionFlags = llvm::XBBRDecisionMap::EntryFlags::Anchored;
       ++a;
     } else {
-      e.DecisionFlags = 1; // moved
+      e.DecisionFlags = llvm::XBBRDecisionMap::EntryFlags::Moved;
       ++m;
     }
-    // orig_func_addr: placeholder 0. M5 patches to the function entry
-    // block's real linked VA after assignOffsets. (PLAN §9.4: this is
-    // the linker-time absolute address, not a node index.)
-    e.OrigFuncAddr = 0; // M5 → funcSection(Func)->getVA()
+    // orig_func_addr: placeholder 0. A follow-up patch patches this to
+    // the function entry block's real linked VA after assignOffsets has
+    // run. (PLAN §9.4: it is the linker-time absolute address, not a
+    // node index.)
+    e.OrigFuncAddr = 0;
     e.FuncId = node.Func; // internal FuncId for reverse lookup
     entries.push_back(e);
   }
@@ -121,7 +130,7 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
     errs() << "xbbr-emit: decisionEntries=" << fragments.size()
            << " moved=" << m << " anchored=" << a << "\n";
 
-  // Build placements for M5 physical emission.
+  // Build placements for the future physical-emission pass.
   result.Placements.clear();
   for (const auto &frag : fragments) {
     BBPlacement p;

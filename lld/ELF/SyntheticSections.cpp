@@ -32,6 +32,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/BinaryFormat/XBBRDecisionMap.h"
 #include "llvm/DebugInfo/DWARF/DWARFAcceleratorTable.h"
 #include "llvm/DebugInfo/DWARF/DWARFDebugPubTable.h"
 #include "llvm/Support/DJB.h"
@@ -389,33 +390,34 @@ void BuildIdSection::writeBuildId(ArrayRef<uint8_t> buf) {
   memcpy(hashBuf, buf.data(), hashSize);
 }
 
-// XBBR decision map (PLAN §9.4 / TASK M2-T05).
+// XBBR decision map (PLAN §9.4).
 //
 // Type SHT_PROGBITS, flags 0 — preserved in the output ELF but not
 // loadable. Section name uses the .debug_ prefix so that the standard
 // `strip --strip-debug` recognizes it as debug data and removes it,
 // matching the SPEC §9.4 expectation that the decision map is
-// stripable along with debug info. M2 emits header-only
-// (NumEntries == 0); M3's Stage 5 will populate per-BB entries from
-// the XBBRGraph.
+// stripable along with debug info. The per-BB entry table is populated
+// by Stage 5 (SectionEmitter) from the XBBRGraph; until any per-BB
+// entries arrive the section just carries the 16-byte header.
 XBBRDecisionMapSection::XBBRDecisionMapSection(Ctx &ctx)
     : SyntheticSection(ctx, ".debug_xbbr_decision", llvm::ELF::SHT_PROGBITS,
                        /*flags=*/0, /*addralign=*/8) {}
 
 void XBBRDecisionMapSection::writeTo(uint8_t *buf) {
-  memcpy(buf + 0, "XBBR", 4);
-  write32le(buf + 4, 0x00010000);                // version
+  using namespace llvm::XBBRDecisionMap;
+  memcpy(buf + 0, kMagic, 4);
+  write32le(buf + 4, kVersion);
   write32le(buf + 8, static_cast<uint32_t>(Entries.size()));
-  write32le(buf + 12, Degraded ? 1u : 0u);       // flags: bit 0 = degraded
-  uint8_t *p = buf + headerSize;
+  write32le(buf + 12, Degraded ? HeaderFlags::Degraded : 0u);
+  uint8_t *p = buf + kHeaderSize;
   for (const XBBRDecisionEntry &E : Entries) {
-    write64le(p + 0, E.OrigFuncAddr);
-    write32le(p + 8, E.BBIndex);
-    write64le(p + 12, E.NewAddress);
-    write32le(p + 20, E.ClusterId);
-    write32le(p + 24, E.DecisionFlags);
-    write32le(p + 28, E.FuncId);
-    p += entrySize;
+    write64le(p + kEntryOffOrigFuncAddr, E.OrigFuncAddr);
+    write32le(p + kEntryOffBBIndex, E.BBIndex);
+    write64le(p + kEntryOffNewAddress, E.NewAddress);
+    write32le(p + kEntryOffClusterId, E.ClusterId);
+    write32le(p + kEntryOffDecisionFlags, E.DecisionFlags);
+    write32le(p + kEntryOffFuncId, E.FuncId);
+    p += kEntrySize;
   }
 }
 
@@ -4828,8 +4830,8 @@ template <class ELFT> void elf::createSyntheticSections(Ctx &ctx) {
       add(*part.buildId);
     }
 
-    // XBBR decision map (TASK M2-T05). Header-only in M2 — M3 Stage 5
-    // populates entries. We only attach the section when the user asked
+    // XBBR decision map. Stage 5 (SectionEmitter) populates the entry
+    // table later; we only attach the section at all when the user asked
     // for it, so plain `--bb-cross-reorder=` with no
     // `--bb-cross-reorder-emit-decision-map` keeps the output clean.
     if (ctx.arg.xbbrEnabled && ctx.arg.xbbrEmitDecisionMap) {

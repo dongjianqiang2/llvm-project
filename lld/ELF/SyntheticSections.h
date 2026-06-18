@@ -173,33 +173,32 @@ private:
   uint8_t *hashBuf;
 };
 
-// XBBR decision map (PLAN §9.4 / TASK M2-T05).
+// XBBR decision map (PLAN §9.4).
 //
 // Records, per BB that XBBR moved/anchored, where it ended up. The
-// section is `.llvm_cross_bb_map`, type SHT_PROGBITS, flags 0 (not
+// section is `.debug_xbbr_decision`, type SHT_PROGBITS, flags 0 (not
 // SHF_ALLOC) — it is preserved in the output ELF (so post-link tools
 // like BOLT and llvm-bbreorder-dump can read it) but is not part of
 // any loadable segment, and `strip --strip-debug` removes it.
 //
 // Triggered by `--bb-cross-reorder-emit-decision-map`.
 //
-// In M2 the section emits only the 16-byte header with `num_entries=0`
-// (XBBR Stage 0 is informational; no BB has actually moved yet).
-// M3's Stage 5 will populate the per-entry table from the XBBRGraph.
 /// Per-entry data for the XBBR decision map (PLAN §9.4, 32-byte stride).
 struct XBBRDecisionEntry {
-  uint64_t OrigFuncAddr = 0;   ///< entry block VA (placeholder 0 in M3; M5 fills)
+  uint64_t OrigFuncAddr = 0;   ///< entry block VA (placeholder 0 until
+                               ///<   physical emission patches the real VA)
   uint32_t BBIndex = 0;        ///< BB index within the function
-  uint64_t NewAddress = 0;     ///< post-XBBR VA (projected in M3)
+  uint64_t NewAddress = 0;     ///< post-XBBR VA (projected; physical
+                               ///<   emission later swaps in real VAs)
   uint32_t ClusterId = 0;      ///< owning hot cluster
   uint32_t DecisionFlags = 0;  ///< moved|anchored|fallback|thunk
-  uint32_t FuncId = 0;         ///< internal XBBR FuncId (M3 fills; M5 keeps)
+  uint32_t FuncId = 0;         ///< internal XBBR FuncId (for reverse lookup)
 };
 
 class XBBRDecisionMapSection final : public SyntheticSection {
 public:
-  static const unsigned headerSize = 16;
-  static const unsigned entrySize = 32;
+  static const unsigned headerSize = 16; // matches XBBRDecisionMap::kHeaderSize
+  static const unsigned entrySize = 32;  // matches XBBRDecisionMap::kEntrySize
 
   XBBRDecisionMapSection(Ctx &);
   size_t getSize() const override {
@@ -207,7 +206,7 @@ public:
   }
   void writeTo(uint8_t *buf) override;
 
-  /// Set the full entry table. Called by M3 Stage 5 (SectionEmitter).
+  /// Set the full entry table. Called by Stage 5 (SectionEmitter).
   void setEntries(std::vector<XBBRDecisionEntry> &&e) { Entries = std::move(e); }
   /// Set the degraded flag (SPEC §7). When true, bit 0 of the header flags
   /// field is set to indicate the pipeline fell back to function-level mode.
