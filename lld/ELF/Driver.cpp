@@ -1489,6 +1489,11 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
     else
       ctx.arg.xbbrMaxAlign = n;
   }
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_cold_threshold_eq)) {
+    double t = 0.01;
+    if (!StringRef(arg->getValue()).getAsDouble(t))
+      ctx.arg.xbbrColdThreshold = t;
+  }
   parseBPOrdererOptions(ctx, args);
   ctx.arg.checkSections =
       args.hasFlag(OPT_check_sections, OPT_no_check_sections, true);

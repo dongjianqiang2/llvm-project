@@ -38,7 +38,7 @@ void runXBBRPipeline(Ctx &ctx, XBBRGraph &graph) {
 
   // Stage 2: per-cluster ExtTSP BB layout.
   auto strategy = createBBLayoutStrategy(ctx.arg.xbbrLayoutAlgo,
-                                         ctx.arg.xbbrMaxAlign);
+                                         ctx.arg.xbbrMode);
   CostWeights cw;
   cw.Icache = ctx.arg.xbbrWeightIcache;
   cw.Itlb = ctx.arg.xbbrWeightItlb;
@@ -71,9 +71,10 @@ void runXBBRPipeline(Ctx &ctx, XBBRGraph &graph) {
     uint32_t totalBBs = 0;
     for (const auto &o : result.ClusterBBOrders)
       totalBBs += o.size();
-    errs() << "xbbr-m3: clusters=" << result.Clusters.size()
+    errs() << "xbbr-m5: clusters=" << result.Clusters.size()
            << " layoutBBs=" << totalBBs
            << " strategy=" << strategy->name()
+           << " mode=" << (ctx.arg.xbbrMode == XBBRMode::Full ? "full" : "partial")
            << " costBefore=" << static_cast<uint64_t>(totalCostBefore)
            << " costAfter=" << static_cast<uint64_t>(totalCostAfter)
            << " placed=" << result.Placements.size() << "\n";

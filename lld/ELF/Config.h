@@ -338,6 +338,7 @@ struct Config {
   bool xbbrEmitDecisionMap = false;  ///< --bb-cross-reorder-emit-decision-map
   bool xbbrDeterministic = false;    ///< --bb-cross-reorder-deterministic
   bool xbbrStats = false;            ///< --bb-cross-reorder-stats (diagnostic)
+  double xbbrColdThreshold = 0.01;   ///< --bb-cross-reorder-cold-threshold=<frac>
   unsigned xbbrMaxAlign = 16;        ///< --bb-cross-reorder-max-align (bytes)
   llvm::StringRef irpgoProfilePath;
   bool bpStartupFunctionSort = false;

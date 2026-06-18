@@ -176,6 +176,10 @@ def bb_cross_reorder_stats : FF<"bb-cross-reorder-stats">,
   HelpText<"Print XBBR Stage 0/1 statistics to stderr (diagnostic; not in SPEC §6.2)">;
 def bb_cross_reorder_max_align_eq : JJ<"bb-cross-reorder-max-align=">,
   HelpText<"Cap on per-BB alignment when XBBR migrates blocks (bytes; default 16)">;
+def bb_cross_reorder_cold_threshold_eq : JJ<"bb-cross-reorder-cold-threshold=">,
+  HelpText<"Cold BB threshold fraction (default 0.01). BBs with global_freq "
+           "< threshold * entry_count are cold and excluded from migration in "
+           "partial mode">;
 
 defm irpgo_profile: EEq<"irpgo-profile",
   "Read a temporary profile file for use with --bp-startup-sort=">;
