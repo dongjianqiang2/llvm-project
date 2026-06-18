@@ -4,7 +4,7 @@
 ; RUN: llvm-readelf -SW %t.o | FileCheck %s --check-prefix=SECTION
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s --check-prefix=BYTES
 
-; M1-T05: a single-block function should produce exactly one xbbr_attr byte
+; : a single-block function should produce exactly one xbbr_attr byte
 ; with IsEntry (0x01) set and nothing else.
 
 define i32 @entry_only() {

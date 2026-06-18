@@ -3,11 +3,12 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T05 (review #1): glibc longjmp has only `noreturn`, not
-; `returns_twice`. The previous emitter recognized only the setjmp
-; side; this test pins down that the longjmp side is now caught by
-; callee-name match. PLAN §3.4 documents why name-match is the only
-; sound signal — `noreturn` would over-match abort/exit.
+; longjmp recognition: glibc longjmp has only `noreturn`, not
+; `returns_twice`. This test pins down that the longjmp side is caught
+; by callee-name match (separately from the setjmp side, which is
+; recognized via the returns_twice attribute). PLAN §3.4 documents why
+; name-match is the only sound signal — `noreturn` would over-match
+; abort/exit.
 ;
 ; The `tail` attribute is added explicitly so the IR has the canonical
 ; shape; XBBR detection is unaffected by it.

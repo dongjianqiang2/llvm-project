@@ -1381,10 +1381,10 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
   }
   ctx.arg.callGraphProfileSort = getCGProfileSortKind(ctx, args);
 
-  // XBBR (SPEC §6.2 / TASK M2-T04) — read the option set unconditionally;
-  // M2 only acts on `xbbrEnabled` and the mode field, but storing the
-  // rest now keeps all the parsing in one place. M3 will consume the
-  // weights / fallback / max-* fields for Stage 2/3/4.
+  // XBBR (SPEC §6.2) — read the option set unconditionally; the Driver
+  // only acts on `xbbrEnabled` and the mode field, while the rest is
+  // consumed by the pipeline stages (lld/ELF/XBBR/). Storing every
+  // option in one place keeps parsing tidy.
   if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_eq)) {
     StringRef val = arg->getValue();
     if (val == "none") {
@@ -1399,7 +1399,7 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
         ErrAlways(ctx) << "--bb-cross-reorder= and --symbol-ordering-file "
                           "may not be used together (SPEC §6.3)";
       }
-      // M2 default: function-level reordering equivalent to hfsort+.
+      // Default to function-level reordering (equivalent to hfsort+).
       // Mode comes from --bb-cross-reorder-mode= if present.
       ctx.arg.xbbrMode = XBBRMode::Function;
       if (auto *modeArg = args.getLastArg(OPT_bb_cross_reorder_mode_eq)) {
@@ -1414,8 +1414,8 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
       }
       // Force hfsort+ as Stage 1: XBBR-on means CGProfile-driven
       // function-level clustering, even if the user didn't pass
-      // --call-graph-profile-sort=. M3 will introduce a Stage 2 BB-level
-      // pass on top; M2's "function" mode IS the function-level result.
+      // --call-graph-profile-sort=. The function-level result feeds
+      // into Stage 2 BB-level reordering when partial/full is set.
       if (ctx.arg.callGraphProfileSort == CGProfileSortKind::None)
         ctx.arg.callGraphProfileSort = CGProfileSortKind::Hfsort;
     }

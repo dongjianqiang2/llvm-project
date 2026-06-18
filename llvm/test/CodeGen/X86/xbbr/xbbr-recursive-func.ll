@@ -4,7 +4,7 @@
 ; RUN: llvm-readobj --bb-addr-map --pretty-pgo-analysis-map %t.o \
 ; RUN:   | FileCheck %s
 
-; M1-T03: recursive functions must report entry_count as the measured total
+; : recursive functions must report entry_count as the measured total
 ; call count (NOT geometric amplification — the PLAN §3.2 fix to the
 ; "recursion blows up frequency" review concern). lld will use entry_count
 ; (not Σ global_freq over BBs) for cluster density (PLAN §4.3 Stage 1).

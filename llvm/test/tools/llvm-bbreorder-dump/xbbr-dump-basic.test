@@ -1,4 +1,4 @@
-## XBBR (TASK M4-T04): llvm-bbreorder-dump basic functionality.
+## XBBR : llvm-bbreorder-dump basic functionality.
 ## Verifies the tool can parse .debug_xbbr_decision and produce
 ## human-readable, summary, and Graphviz output.
 

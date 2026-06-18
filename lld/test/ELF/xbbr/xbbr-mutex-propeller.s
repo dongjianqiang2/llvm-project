@@ -1,4 +1,4 @@
-## XBBR (TASK M2-T04 / SPEC §6.3): --bb-cross-reorder= must be mutually
+## XBBR mutex (SPEC §6.3): --bb-cross-reorder= must be mutually
 ## exclusive with --symbol-ordering-file (Propeller). Combining them
 ## must produce a hard error before any layout work happens.
 

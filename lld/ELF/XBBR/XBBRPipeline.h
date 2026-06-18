@@ -32,8 +32,8 @@ namespace lld::elf::xbbr {
 /// Stages:
 ///   1. clusterFunctions() → vector<FunctionCluster>
 ///   2. per-cluster ExtTSP BB layout → ClusterBBOrders
-///   3. multi-objective cost local search (M3-T03, placeholder)
-///   4. constraint fallback loop (M3-T04, placeholder)
+///   3. multi-objective cost local search (, placeholder)
+///   4. constraint fallback loop (, placeholder)
 ///
 /// Places result in ctx.xbbrLayoutResult.
 void runXBBRPipeline(Ctx &ctx, XBBRGraph &graph);

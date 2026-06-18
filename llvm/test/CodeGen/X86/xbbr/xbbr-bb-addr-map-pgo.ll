@@ -4,7 +4,7 @@
 ; RUN: llvm-readobj --bb-addr-map --pretty-pgo-analysis-map %t.o \
 ; RUN:   | FileCheck %s
 
-; M1-T03: -enable-xbbr must implicitly turn on SHT_LLVM_BB_ADDR_MAP with
+; : -enable-xbbr must implicitly turn on SHT_LLVM_BB_ADDR_MAP with
 ; FuncEntryCount + BBFreq + BrProb features (PLAN §3.2). The frontend's
 ; profile metadata (entry_count + branch_weights) is propagated to lld
 ; via this section, where global_freq(BB) = BBFreq × FuncEntryCount.

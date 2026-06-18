@@ -3,7 +3,7 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T05 / SPEC §5.3 item 7 (review #2 fix): a BB whose terminator is a
+; SPEC §5.3 item 7: a BB whose terminator is a `noreturn` callsite and
 ; `noreturn` callsite and which has no successors must be flagged
 ; IsNoReturnTail (bit 8 = 0x100). The narrow detection — succ_empty()
 ; AND `noreturn` callsite immediately before `unreachable` — keeps us

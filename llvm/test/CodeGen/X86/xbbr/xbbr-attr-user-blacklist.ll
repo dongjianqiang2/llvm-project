@@ -4,7 +4,7 @@
 ; RUN:     -mtriple=x86_64-unknown-linux-gnu %s -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T06 / SPEC §6.1 -fbb-cross-reorder-blacklist=<file>: each function
+;  / SPEC §6.1 -fbb-cross-reorder-blacklist=<file>: each function
 ; named in the blacklist file gets the UserBlacklisted bit on every
 ; non-entry BB. The entry BB is anchored regardless (function symbol =
 ; entry address) so the redundant bit is suppressed there.

@@ -4,7 +4,7 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --cg-profile %t.o | FileCheck %s
 
-; M1-T04 integration: indirect-call edges (IRPGO VP) must survive the
+;  integration: indirect-call edges (IRPGO VP) must survive the
 ; full IR → CG Profile module flag → MC → SHT_LLVM_CALL_GRAPH_PROFILE
 ; pipeline when XBBR is enabled. Without this test, an MC-side change
 ; that filters ELF call-graph-profile entries would silently corrupt

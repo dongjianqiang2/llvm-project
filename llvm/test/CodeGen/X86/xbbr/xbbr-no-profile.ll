@@ -4,7 +4,7 @@
 ; RUN: llvm-readobj --bb-addr-map --pretty-pgo-analysis-map %t.o \
 ; RUN:   | FileCheck %s
 
-; M1-T03: a function with no profile metadata must not crash and must emit
+; : a function with no profile metadata must not crash and must emit
 ; FuncEntryCount=0 (treated as cold by lld per SPEC §3.1).
 
 define i32 @noprof(i32 %n) {

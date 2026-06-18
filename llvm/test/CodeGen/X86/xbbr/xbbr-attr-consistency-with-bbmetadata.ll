@@ -4,7 +4,7 @@
 ; RUN: llvm-readobj --bb-addr-map %t.o | FileCheck %s --check-prefix=BBADDR
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s --check-prefix=ATTR
 
-; M1-T05-C10: when both .llvm_xbbr_attr and BB_ADDR_MAP describe the
+; : when both .llvm_xbbr_attr and BB_ADDR_MAP describe the
 ; same BB, the overlapping bits must agree. This is the lld Stage 0
 ; consistency assertion's first line of defense — caught at compile
 ; time, before the linker ever sees the .o.

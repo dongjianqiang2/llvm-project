@@ -1,8 +1,8 @@
-## XBBR (TASK M2-T01-C1, M2-T04 end-to-end): clang produces .o files
-## with the M1 metadata, and ld.lld --bb-cross-reorder= reads them
-## through Stage 0 (XBBRGraph::build). The --bb-cross-reorder-stats
-## diagnostic confirms that the graph was built and contains the
-## expected number of XBBR-enabled functions.
+## XBBR Stage 0 end-to-end: clang produces .o files with the
+## compiler-side XBBR metadata, and ld.lld --bb-cross-reorder= reads
+## them through Stage 0 (XBBRGraph::build). The
+## --bb-cross-reorder-stats diagnostic confirms that the graph was
+## built and contains the expected number of XBBR-enabled functions.
 ##
 ## We don't statically link a libc here — the function symbols aren't
 ## defined; we use --unresolved-symbols=ignore-all to keep ld.lld from

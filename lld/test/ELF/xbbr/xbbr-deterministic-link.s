@@ -1,4 +1,4 @@
-## XBBR (TASK X-T01 / SPEC §9.3): two ld.lld invocations on the same
+## XBBR reproducibility (SPEC §9.3): two ld.lld invocations on the same
 ## inputs with --bb-cross-reorder= must produce bitwise-identical ELFs.
 ## This is a hard CI gate — Stage 0 currently uses sorted enumeration
 ## (no DenseMap iteration in node ordering) so this should hold; if a

@@ -3,7 +3,7 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T05 / PLAN §3.4 review fix: musttail must be detected via IR
+;  / PLAN §3.4 review fix: musttail must be detected via IR
 ; getTerminatingMustTailCall(), NOT MachineInstr::isReturn() (which would
 ; over-match plain RET / TCRETURN tail calls).
 ;

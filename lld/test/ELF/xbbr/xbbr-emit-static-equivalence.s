@@ -1,7 +1,7 @@
-## XBBR (TASK M2-T03 / SPEC §10 M2 exit condition): linking with
-## --bb-cross-reorder= must produce a runnable static x86_64 executable
-## whose section layout is functionally equivalent to CGProfile-only
-## (M2 doesn't yet do per-BB reordering).
+## XBBR linker emission (SPEC §10): linking with --bb-cross-reorder=
+## must produce a runnable static x86_64 executable whose section
+## layout is functionally equivalent to a plain CGProfile-only link
+## while no BBs have physically moved yet.
 ##
 ## Specifically:
 ##   * The output ELF must NOT contain .llvm_xbbr_attr (SHF_EXCLUDE
@@ -10,7 +10,7 @@
 ##   * SHT_LLVM_BB_ADDR_MAP IS retained (lld preserves it for perf
 ##     and downstream tools — that's existing behavior, not XBBR).
 ##   * The sections list with --bb-cross-reorder= must equal the
-##     sections list without it (functional equivalence in M2).
+##     sections list without it (functional equivalence).
 
 # REQUIRES: x86
 
@@ -33,8 +33,8 @@
 # RUN: llvm-readelf -SW out.xbbr  | FileCheck %s --check-prefix=BBMAP
 # RUN: llvm-readelf -SW out.plain | FileCheck %s --check-prefix=BBMAP
 
-## Functional equivalence in M2: same section list / sizes regardless
-## of whether --bb-cross-reorder= was passed.
+## Functional equivalence: same section list / sizes regardless of
+## whether --bb-cross-reorder= was passed.
 # RUN: llvm-readelf -SW out.xbbr  | sed -n '/Section Headers/,/^Key to Flags/p' > out.xbbr.sections
 # RUN: llvm-readelf -SW out.plain | sed -n '/Section Headers/,/^Key to Flags/p' > out.plain.sections
 # RUN: cmp out.xbbr.sections out.plain.sections

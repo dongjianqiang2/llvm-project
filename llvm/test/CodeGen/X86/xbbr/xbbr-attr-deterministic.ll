@@ -5,7 +5,7 @@
 ; RUN:     -filetype=obj -o %t2.o
 ; RUN: cmp %t1.o %t2.o
 
-; M1-T05 + SPEC §9.3: same source + flags ⇒ bitwise-identical .o, including
+;  + SPEC §9.3: same source + flags ⇒ bitwise-identical .o, including
 ; the new .llvm_xbbr_attr section. Catches DenseMap-iteration-order leaks
 ; in the per-MF attr table. Without `pinned` ordering, this would fail.
 

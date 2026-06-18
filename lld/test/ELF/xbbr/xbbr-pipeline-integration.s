@@ -1,8 +1,7 @@
-## XBBR (TASK M3-T06): M3 milestone integration test.
-##
-## End-to-end: clang -fbb-cross-reorder=partial → .o with metadata →
-## ld.lld --bb-cross-reorder= runs Stages 0-4 pipeline → runnable ELF.
-## Verifies: stats, section presence/absence, reproducibility.
+## XBBR pipeline integration end-to-end:
+## clang -fbb-cross-reorder=partial → .o with metadata →
+## ld.lld --bb-cross-reorder= runs the Stage 0..5 pipeline → runnable
+## ELF. Verifies stats, section presence/absence, reproducibility.
 
 # REQUIRES: x86
 
@@ -15,7 +14,7 @@
 # RUN: clang -target x86_64-unknown-linux-gnu -O2 -fbb-cross-reorder=partial \
 # RUN:     -ffunction-sections -c main.c -o main.o
 
-## Full M3 link.
+## Full link with every relevant XBBR option set.
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --bb-cross-reorder=foo.profdata \
 # RUN:     --bb-cross-reorder-mode=partial \

@@ -1,14 +1,13 @@
-## XBBR (TASK M2-T05 / PLAN §9.4): --bb-cross-reorder-emit-decision-map
+## XBBR decision map (PLAN §9.4): --bb-cross-reorder-emit-decision-map
 ## emits a `.debug_xbbr_decision` section into the output ELF. Section
 ## type is SHT_PROGBITS, flags = 0 (NOT SHF_ALLOC). The `.debug_`
 ## prefix is intentional — it makes the standard `strip --strip-debug`
 ## recognize and remove the section, matching SPEC §9.4's expectation
 ## that the decision map is strippable along with debug info.
 ##
-## In M2 the section emits only the 16-byte header with num_entries=0
-## (Stage 5 in M3 will populate the per-BB entries). This test pins
-## the format and the strip behavior so a future Stage 5 patch keeping
-## the same magic/version is observable here.
+## This test pins the on-disk header format and the strip behavior so
+## that downstream consumers (BOLT, llvm-bbreorder-dump) can rely on
+## both staying stable.
 
 # REQUIRES: x86
 

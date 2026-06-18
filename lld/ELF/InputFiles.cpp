@@ -772,9 +772,9 @@ void ObjFile<ELFT>::initializeSections(bool ignoreComdats,
                     << "] with sh_link=0 "
                        "(likely created using objcopy or ld -r)";
       }
-      // XBBR (M2-T01): SHT_LLVM_XBBR_ATTR carries SHF_EXCLUDE because
-      // it must NOT enter the loadable image (PLAN §9.3). The XBBR
-      // Stage 0 pipeline still needs to read it BEFORE that drop, so
+      // XBBR: SHT_LLVM_XBBR_ATTR carries SHF_EXCLUDE because it must
+      // NOT enter the loadable image (PLAN §9.3). The XBBR Stage 0
+      // pipeline still needs to read it BEFORE that drop, so
       // we record the section index here. The section itself is
       // discarded along with every other SHF_EXCLUDE entry — Stage 0
       // accesses it through the raw Elf_Shdr table, like CGProfile.

@@ -23,11 +23,11 @@ namespace lld::elf::xbbr {
 /// entries from the layout result, and creates BBFragment objects for
 /// physical section emission.
 ///
-/// M3: decision map is fully populated with per-BB entries (func_addr,
-/// bb_index, new_address, cluster_id, flags). Physical BB-level emission
-/// is deferred to M5 — M3 emits function-level sections using the
-/// existing hfsort+ order but records the *intended* BB layout in the
-/// decision map.
+/// Current scope: the decision map is fully populated with per-BB
+/// entries (func_addr, bb_index, new_address, cluster_id, flags).
+/// Physical BB-level emission is out of scope here — the .text layout
+/// still uses the existing hfsort+ order while the emitter records the
+/// intended BB layout in the decision map for downstream tools.
 void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
                        XBBRLayoutResult &result);
 

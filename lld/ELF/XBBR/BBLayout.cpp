@@ -143,7 +143,7 @@ std::vector<uint32_t> ExtTSPStrategy::run(const XBBRGraph &graph,
   return result;
 }
 
-/// Pettis-Hansen chain merge (unchanged from M3, but now mode-aware).
+/// Pettis-Hansen chain merge, mode-aware.
 class PHStrategy : public BBLayoutStrategy {
   XBBRMode mode;
 public:

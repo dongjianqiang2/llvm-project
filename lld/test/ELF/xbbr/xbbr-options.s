@@ -1,5 +1,5 @@
-## XBBR (TASK M2-T04): test that the new --bb-cross-reorder family of
-## options is parsed without error and that the basic combinations work.
+## XBBR linker options: ensure the --bb-cross-reorder family of options
+## is parsed without error and that the basic combinations work.
 
 # REQUIRES: x86
 
@@ -11,7 +11,8 @@
 # RUN: llvm-readelf -h out.none | FileCheck %s --check-prefix=OK
 
 ## --bb-cross-reorder=<path> with no extra flags enables Stage 0 and
-## auto-promotes the call-graph-profile sort to hfsort+ (M2 default).
+## auto-promotes the call-graph-profile sort to hfsort+ (XBBR-on
+## implies CGProfile-driven function-level clustering).
 # RUN: ld.lld -e A a.o --bb-cross-reorder=foo.profdata -o out.bcr
 # RUN: llvm-readelf -h out.bcr | FileCheck %s --check-prefix=OK
 

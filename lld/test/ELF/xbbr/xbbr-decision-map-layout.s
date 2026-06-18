@@ -1,9 +1,13 @@
-## XBBR (review-fix N4): verify decision-map binary layout properties.
+## XBBR decision-map binary layout (PLAN §9.4) — exhaustive checks of
+## what gets serialised into `.debug_xbbr_decision`:
 ##
-## M8: OrigFuncAddr placeholder = 0 in M3.
-## L12: FuncId field populated (not 0 when multiple functions present).
-## M7: header flags bit 0 = 0 when no degradation (normal pipeline).
-## H1: entry count > 0 when pipeline produces BB-level decisions.
+##   * OrigFuncAddr is a placeholder (0) until physical emission patches
+##     it to the function entry block's real linked VA.
+##   * FuncId is populated (≠ 0 when more than one function is present)
+##     so downstream tools can group entries by function.
+##   * Header `flags` field bit 0 = 0 when the pipeline ran normally
+##     (i.e. no degradation to function-level mode).
+##   * Entry count > 0 when the pipeline produces BB-level decisions.
 
 # REQUIRES: x86
 

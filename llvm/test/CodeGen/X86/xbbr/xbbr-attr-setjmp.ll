@@ -3,7 +3,7 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T05: a basic block containing a returns_twice call (e.g. setjmp) must
+; : a basic block containing a returns_twice call (e.g. setjmp) must
 ; be flagged HasSetjmp (bit 3 = 0x08), in addition to IsEntry on the entry.
 
 declare i32 @setjmp(ptr) returns_twice

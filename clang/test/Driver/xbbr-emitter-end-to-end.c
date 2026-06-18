@@ -1,17 +1,16 @@
 // REQUIRES: x86-registered-target
 
-// M1-T07: end-to-end integration of M1 features. Compiles a single C++
-// file containing every SPEC §5.3 blacklist class that XBBR can detect
-// at the IR layer in M1, plus simulated PGO via __builtin_expect-style
-// branch hints, and verifies the resulting .o carries the full XBBR
-// metadata surface:
-//   - .llvm_bb_addr_map with FuncEntryCount + BBFreq + BrProb (M1-T03)
-//   - .llvm_xbbr_attr with the right blacklist bits per BB (M1-T05)
+// XBBR compiler-side end-to-end: compiles a single C/C++ file
+// containing every SPEC §5.3 blacklist class XBBR can detect at the
+// IR layer, plus simulated PGO via __builtin_expect-style branch hints,
+// and verifies the resulting .o carries the full XBBR metadata surface:
+//   - .llvm_bb_addr_map with FuncEntryCount + BBFreq + BrProb
+//   - .llvm_xbbr_attr with the right blacklist bits per BB
 //   - .llvm.call_graph_profile (a function-level edge to declare()
-//     drives this; XBBR Stage 1 will consume it in M2)
+//     drives this; XBBR Stage 1 in lld consumes it)
 // All three are emitted by the single cc1 invocation driven from the
-// driver -fbb-cross-reorder=partial flag (M1-T06). The driver-side
-// integration is what M1-T07 closes: source → driver → cc1 → object.
+// driver -fbb-cross-reorder=partial flag — i.e. the driver-side
+// integration source → driver → cc1 → object.
 
 // RUN: %clang -target x86_64-unknown-linux-gnu -O2 \
 // RUN:     -fbb-cross-reorder=partial -c %s -o %t.o

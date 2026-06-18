@@ -3,14 +3,14 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T05 + M1-T03: a function with a normal entry/cont path and an EH
+;  + : a function with a normal entry/cont path and an EH
 ; landing pad must produce attrs:
 ;   entry:  IsEntry        = 0x01
 ;   cont:   (none)         = 0x00
 ;   lpad:   IsLandingPad   = 0x02   (mirrors BBEntry::Metadata::IsEHPad)
 ;
 ; Stage 0 in lld will sanity-check that this bit matches BBEntry::IsEHPad
-; in the same .o; M1-T05 ensures both originate from MBB.isEHPad().
+; in the same .o;  ensures both originate from MBB.isEHPad().
 
 declare void @maythrow()
 declare i32 @__gxx_personality_v0(...)

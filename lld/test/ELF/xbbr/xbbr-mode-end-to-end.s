@@ -1,7 +1,6 @@
-## XBBR (TASK M5): M5 milestone integration test.
-##
-## Exercises full mode + partial mode differentiation, physical
-## emission preparation, and end-to-end pipeline with all M5 options.
+## XBBR mode end-to-end: exercises full mode + partial mode
+## differentiation, decision-map preparation, and the full linker
+## pipeline with every option set together.
 
 # REQUIRES: x86
 
@@ -59,10 +58,10 @@
 # RUN: cmp exe.full1 exe.full2
 
 # FULLSTATS: xbbr-stats:
-# FULLSTATS: xbbr-m5: {{.*}}mode=full
+# FULLSTATS: xbbr-pipeline: {{.*}}mode=full
 
 # PARTSTATS: xbbr-stats:
-# PARTSTATS: xbbr-m5: {{.*}}mode=partial
+# PARTSTATS: xbbr-pipeline: {{.*}}mode=partial
 
 # ELFOK: Class:{{.*}}ELF64
 

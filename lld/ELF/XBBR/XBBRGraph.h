@@ -12,8 +12,10 @@
 //
 // Inputs (per ObjFile):
 //   * SHT_LLVM_BB_ADDR_MAP   — BB IDs/sizes + PGO analyses (FuncEntryCount,
-//                              BBFreq, BrProb), already produced for M1.
-//   * SHT_LLVM_XBBR_ATTR     — per-BB blacklist bitmask (M1-T05).
+//                              BBFreq, BrProb), produced by the
+//                              compiler-side XBBRMetadataEmitter pass.
+//   * SHT_LLVM_XBBR_ATTR     — per-BB blacklist bitmask, also from the
+//                              compiler-side emitter.
 //   * SHT_LLVM_CALL_GRAPH_PROFILE — cross-function call edges (lld already
 //                              parses this into ctx.arg.callGraphProfile;
 //                              we adopt it directly).
@@ -75,7 +77,8 @@ public:
   ///
   /// Returns false if a fatal inconsistency was diagnosed (e.g. a
   /// `.llvm_xbbr_attr` whose num_bbs disagrees with BB_ADDR_MAP — these
-  /// must round-trip; the M1 emitter writes both from the same MIR pass).
+  /// must round-trip; the compiler-side emitter writes both from the
+  /// same MIR pass).
   bool build(Ctx &ctx);
 
   /// Read-only views — downstream stages never mutate the graph.

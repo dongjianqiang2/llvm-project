@@ -97,9 +97,11 @@ enum class BuildIdKind { None, Fast, Md5, Sha1, Hexstring, Uuid };
 enum class CGProfileSortKind { None, Hfsort, Cdsort };
 
 /// XBBR (PLAN/SPEC §4): cross-function basic-block reordering mode.
-/// `Function` is the M2 milestone scope — function-level hfsort+
-/// reordering, equivalent to `--call-graph-profile-sort=hfsort`.
-/// `Partial`/`Full` add per-BB migration in M3.
+/// `Function` is function-level hfsort+ reordering, equivalent to
+/// `--call-graph-profile-sort=hfsort`.
+/// `Partial` and `Full` add per-BB migration on top: partial keeps cold
+/// BBs with their original function, full lets all non-§5.3-anchored
+/// BBs migrate.
 enum class XBBRMode : uint8_t { None, Function, Partial, Full };
 
 /// XBBR Stage 1 algorithm choice (SPEC §6.2).
@@ -319,16 +321,15 @@ struct Config {
   BsymbolicKind bsymbolic = BsymbolicKind::None;
   CGProfileSortKind callGraphProfileSort;
 
-  // XBBR (SPEC §6.2 / TASK M2-T04). Most fields are stored unmodified
-  // here in M2 — they're consumed by Stage 2/3/4 in M3. M2 only acts on
-  // `xbbrMode != None` (enabling the pipeline) and on the Propeller
-  // mutex check.
+  // XBBR (SPEC §6.2). Most fields are stored unmodified here and read
+  // by Stages 1–5 of the pipeline (lld/ELF/XBBR/). The Driver only
+  // gatekeeps on `xbbrEnabled` and the Propeller mutex check.
   XBBRMode xbbrMode = XBBRMode::None;
   bool xbbrEnabled = false;          ///< true when --bb-cross-reorder= was passed
   llvm::StringRef xbbrProfdataPath;  ///< value of --bb-cross-reorder=<path>
   XBBRClusterAlgo xbbrClusterAlgo = XBBRClusterAlgo::HFSortPlus;
   XBBRLayoutAlgo xbbrLayoutAlgo = XBBRLayoutAlgo::ExtTSP;
-  // Cost-function weights (Stage 3, M3). Defaults follow SPEC §4.3.
+  // Cost-function weights (Stage 3). Defaults follow SPEC §4.3.
   unsigned xbbrWeightIcache = 4;
   unsigned xbbrWeightItlb = 2;
   unsigned xbbrWeightBtb = 1;
@@ -775,9 +776,9 @@ struct Ctx : CommonLinkerContext {
 
   std::optional<AArch64PauthAbiCoreInfo> aarch64PauthAbiCoreInfo;
 
-  // M3: Stage 0 graph persisted across the link. Populated by
+  // XBBR Stage 0 graph persisted across the link. Populated by
   // buildSectionOrder() when --bb-cross-reorder= is on; consumed by the
-  // XBBR pipeline (Stages 1-4). nullptr otherwise.
+  // XBBR pipeline (Stages 1–4). nullptr otherwise.
   std::unique_ptr<xbbr::XBBRGraph> xbbrGraph;
 };
 

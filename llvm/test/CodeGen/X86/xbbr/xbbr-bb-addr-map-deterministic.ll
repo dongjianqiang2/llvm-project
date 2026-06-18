@@ -5,7 +5,7 @@
 ; RUN:     -filetype=obj -o %t2.o
 ; RUN: cmp %t1.o %t2.o
 
-; M1-T03 + SPEC §9.3: same source + flags must produce bitwise-identical
+;  + SPEC §9.3: same source + flags must produce bitwise-identical
 ; objects. This is a CI gate — a deterministic-build regression must fail
 ; here before it can poison the linker pipeline.
 

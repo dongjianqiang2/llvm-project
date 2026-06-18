@@ -3,7 +3,7 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T05-C9 (negative): an unremarkable BB — no EH, no indirect branch,
+;  (negative): an unremarkable BB — no EH, no indirect branch,
 ; no setjmp/longjmp, no musttail, no inline asm with section directives,
 ; no noreturn tail, not user-blacklisted, not (yet) cold — must produce
 ; an attr word with ALL bits clear except IsEntry on the entry block.

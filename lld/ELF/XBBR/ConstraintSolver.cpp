@@ -36,22 +36,25 @@ constexpr double GLOBAL_FALLBACK_THRESHOLD = 0.30;
 
 /// Check whether a BB violates ISA branch-range constraints.
 /// On x86_64, direct branches have ±2 GiB range — effectively never
-/// violated in practice. M5 adds AArch64 (±128 MiB) and ARM (±32/16 MiB).
+/// violated in practice. AArch64 (±128 MiB) and ARM (±32/16 MiB)
+/// support follows once thunk integration lands.
 bool violatesBranchRange(const XBBRGraph &graph,
                          const std::vector<uint32_t> &order,
                          const XBBRNode &node,
                          uint64_t /*projectedVA*/) {
   // x86_64: 2 GiB range, no practical violation possible.
-  // M5 will add arch-specific range checks for AArch64/ARM.
+  // Arch-specific range checks for AArch64/ARM follow when those
+  // backends grow XBBR thunk support.
   (void)graph;
   (void)order;
   (void)node;
   return false;
 }
 
-/// Check EH constraints. For M3, all landing pads are already anchored
+/// Check EH constraints. All landing pads are already anchored
 /// (isAnchor() returns true for IsLandingPad), so they never migrate.
-/// M4 will add full EH range conflict detection.
+/// Full EH range-conflict detection is a follow-up, after the DWARF/EH
+/// rewriter is in place.
 bool violatesEHConstraint(const XBBRNode &node) {
   return node.isLandingPad(); // already handled by isAnchor(), but belt-and-suspenders
 }
@@ -114,8 +117,8 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
         if (violatesEHConstraint(node))
           violated = true;
 
-        // 3. Thunk budget (M5).
-        // Not checked in M3 — x86_64 has no thunks.
+        // 3. Thunk budget — not checked here; x86_64 has no thunks
+        // and AArch64/ARM thunk integration is a follow-up.
 
         if (violated) {
           // Pin this BB: it reverts to original function position.

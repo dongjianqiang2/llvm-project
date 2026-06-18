@@ -9,7 +9,7 @@
 // RUN: %clang -target x86_64-unknown-linux-gnu -### -c %s 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=DEFAULT
 
-// M1-T06: each mode parses to a cc1 -fbb-cross-reorder= argument, and
+// : each mode parses to a cc1 -fbb-cross-reorder= argument, and
 // the absence of the option leaves no cc1 flag (default off).
 
 // PARTIAL: "-fbb-cross-reorder=partial"

@@ -1,4 +1,4 @@
-## XBBR (TASK M2-T02 / M2-T04-C3): with --bb-cross-reorder=, the
+## XBBR cluster/layout option split: with --bb-cross-reorder=, the
 ## function clustering algorithm is selected by
 ## --bb-cross-reorder-cluster-algo=, independent of the BB-layout
 ## algorithm chosen by --bb-cross-reorder-layout-algo=. Verify both

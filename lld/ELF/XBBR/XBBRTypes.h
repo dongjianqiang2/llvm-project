@@ -10,7 +10,7 @@
 // §4 Stages 0-5). Kept in a thin header so XBBRGraph.h and per-stage
 // implementation files don't pull in each other's heavy dependencies.
 //
-// Stability invariants (PLAN §6, M2-T01):
+// Stability invariants (PLAN §6):
 //   * `FuncId` is a small, dense integer assigned by XBBRGraph at Stage 0,
 //     in the deterministic order (input file index, section index). The
 //     mapping back to the lld InputSectionBase* lives in XBBRGraph.
@@ -18,7 +18,7 @@
 //     directly:
 //       - tests can spell concrete IDs ({0,1,2,...}); raw pointers vary
 //         per run and are useless in FileCheck output;
-//       - decision-map serialization (M4 / PLAN §9.4) is straightforward;
+//       - decision-map serialization (PLAN §9.4) is straightforward;
 //       - DenseMap<FuncId,...> is more compact than DenseMap<ptr,...>.
 //     The pointer is still the source of truth — the integer IS the
 //     pointer's stable position in the deterministic sort order, so
@@ -87,10 +87,11 @@ inline bool any(Provenance a, Provenance b) {
 struct XBBRNode {
   FuncId Func = InvalidFuncId; ///< owning function (XBBRGraph::funcSection)
   BBId BB = 0;                 ///< MBB id within the function
-  uint32_t Size = 0;           ///< BB byte size. M2-T01: from BBAddrMap
-                               ///<   (the .o-time size). M5 / §4.5
-                               ///<   ConstraintSolver may patch this to
-                               ///<   post-relaxation size.
+  uint32_t Size = 0;           ///< BB byte size from BBAddrMap (the .o-time
+                               ///<   size). The constraint solver may patch
+                               ///<   this to post-relaxation size when
+                               ///<   AArch64 linker relaxation kicks in
+                               ///<   (PLAN §4.5).
   uint64_t GlobalFreq = 0;     ///< pre-multiplied BBFreq × FuncEntryCount
                                ///<   (PLAN §3.2). Use this directly for
                                ///<   cross-function comparison; the raw
@@ -99,9 +100,8 @@ struct XBBRNode {
   uint16_t XBBRAttrs = 0;      ///< 16-bit bitmask, see xbbr::AttrBit on the
                                ///< LLVM side. The on-disk layout (PLAN
                                ///< §9.3 v0x02) is u16 little-endian; this
-                               ///< field has to match (M2 review-bug fix
-                               ///< — was uint8_t, silently dropped bit 8
-                               ///< IsNoReturnTail and any future bit).
+                               ///< field must stay u16 to carry bit 8
+                               ///< (IsNoReturnTail) and any future bits.
 
   /// Quick predicates derived from XBBRAttrs (mirroring xbbr::AttrBit
   /// in include/llvm/CodeGen/XBBRMetadata.h — Stage 0 will assert these
@@ -131,8 +131,8 @@ struct XBBRNode {
 
 /// One edge in the XBBR graph. CFG edges (intra-function, from BBAddrMap
 /// `BrProb`) and call edges (cross-function, from CGProfile, including
-/// indirect call edges from IRPGO VP — see M1-T04 / PLAN §3.3) live in
-/// the same array, distinguished by IsCrossFunc.
+/// indirect call edges derived from IRPGO VP data — see PLAN §3.3) live
+/// in the same array, distinguished by IsCrossFunc.
 struct XBBREdge {
   uint32_t SrcNode = 0;      ///< index into XBBRGraph::nodes
   uint32_t DstNode = 0;
@@ -175,7 +175,7 @@ struct BBPlacement {
   Section TargetSec = Section::Original;
 };
 
-/// The complete result of M3 processing (Stages 1-4), consumed by Stage 5.
+/// Output of Stages 1–4, consumed by Stage 5 (SectionEmitter).
 struct XBBRLayoutResult {
   std::vector<FunctionCluster> Clusters;
   /// Per-cluster BB ordering: outer vector indexed by cluster, inner

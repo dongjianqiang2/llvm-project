@@ -3,7 +3,7 @@
 ; RUN:     -filetype=obj -o %t.o
 ; RUN: llvm-readobj --hex-dump=.llvm_xbbr_attr %t.o | FileCheck %s
 
-; M1-T05: blockaddress-taken blocks must be flagged IsIndirectBrTarget
+; : blockaddress-taken blocks must be flagged IsIndirectBrTarget
 ; (bit 2 = 0x04). Both L1 and L2 are address-taken targets of indirectbr.
 
 @addrs = global [2 x ptr] [ptr blockaddress(@indir, %L1), ptr blockaddress(@indir, %L2)]

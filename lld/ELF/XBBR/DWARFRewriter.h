@@ -14,8 +14,8 @@
 //   - .debug_line: DW_LNE_set_address at each BB segment start
 //   - .debug_aranges/.debug_ranges: multi-segment lists
 //
-// M4 scope: header + skeleton. Full implementation in M5 after physical
-// BB-level section emission is complete.
+// Currently a header + stub. The full implementation lands once
+// physical BB-level section emission is in place.
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,7 +29,7 @@ struct Ctx;
 namespace lld::elf::xbbr {
 
 /// Rewrite DWARF debug info for functions whose BBs were migrated by XBBR.
-/// Called after section addresses are assigned (post-assignOffsets in M5).
+/// Called after section addresses are assigned (post-assignOffsets).
 void rewriteDWARF(Ctx &ctx);
 
 } // namespace lld::elf::xbbr

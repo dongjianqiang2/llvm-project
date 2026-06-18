@@ -1,16 +1,19 @@
-## XBBR (TASK M2-T06): M2 milestone integration test.
+## XBBR linker integration: full-spectrum link drives every option in
+## one go and asserts the result is functionally equivalent to a plain
+## CGProfile-only link (the linker stages so far do not move BBs;
+## downstream emission stages will).
 ##
-## End-to-end exercise of every M2 capability in one link:
-##   * M1-T07 / M2-T01: clang -fbb-cross-reorder=partial produces
-##     .o files containing BB_ADDR_MAP + .llvm_xbbr_attr.
-##   * M2-T01: ld.lld --bb-cross-reorder= reads them through Stage 0.
-##   * M2-T02: Stage 1 hfsort+ runs (auto-enabled when XBBR is on).
-##   * M2-T04: every SPEC §6.2 lld option parses; Propeller mutex.
-##   * M2-T05: --bb-cross-reorder-emit-decision-map writes
+## Coverage in one link:
+##   * compiler side: clang -fbb-cross-reorder=partial produces .o files
+##     with BB_ADDR_MAP + .llvm_xbbr_attr.
+##   * Stage 0: ld.lld --bb-cross-reorder= reads the metadata.
+##   * Stage 1: hfsort+ runs (auto-enabled when XBBR is on).
+##   * every SPEC §6.2 lld option parses; Propeller mutex.
+##   * --bb-cross-reorder-emit-decision-map writes
 ##     .debug_xbbr_decision with the right header.
-##   * M2-T03: with all the XBBR machinery on, the output ELF is
-##     functionally equivalent to a plain CGProfile-only link.
-##   * X-T01: bitwise-identical reproducibility under repeated link.
+##   * with all the XBBR machinery on, the output ELF is functionally
+##     equivalent to a plain CGProfile-only link.
+##   * bitwise-identical reproducibility under repeated link.
 
 # REQUIRES: x86
 
@@ -23,12 +26,12 @@
 # RUN: clang -target x86_64-unknown-linux-gnu -O2 -fbb-cross-reorder=partial \
 # RUN:     -c main.c -o main.o
 
-# Sanity: every .o has the M1 metadata.
+# Sanity: every .o has the compiler-emitted XBBR metadata.
 # RUN: llvm-readelf -SW hot.o   | FileCheck %s --check-prefix=METAOBJ
 # RUN: llvm-readelf -SW indir.o | FileCheck %s --check-prefix=METAOBJ
 # RUN: llvm-readelf -SW main.o  | FileCheck %s --check-prefix=METAOBJ
 
-# Full-spectrum link with every M2 option on.
+# Full-spectrum link with every linker XBBR option on.
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --bb-cross-reorder=foo.profdata \
 # RUN:     --bb-cross-reorder-mode=partial \
@@ -48,7 +51,7 @@
 # RUN: llvm-readelf -SW exe.xbbr | FileCheck %s --check-prefix=EXEHAS
 # RUN: llvm-readelf -SW exe.xbbr | FileCheck %s --check-prefix=EXENOT --allow-empty
 
-# Reproducibility (SPEC §9.3 / TASK X-T01): same inputs ⇒ identical ELF.
+# Reproducibility (SPEC §9.3): same inputs ⇒ identical ELF.
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --bb-cross-reorder=foo.profdata --bb-cross-reorder-mode=partial \
 # RUN:     --bb-cross-reorder-emit-decision-map --bb-cross-reorder-deterministic \
@@ -59,7 +62,8 @@
 # RUN:     --unresolved-symbols=ignore-all -o exe.run2
 # RUN: cmp exe.run1 exe.run2
 
-# Functional equivalence (M2 milestone exit, SPEC §10).
+# Functional equivalence (SPEC §10): same section list / sizes
+# regardless of XBBR being on (with no decision map being emitted).
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --unresolved-symbols=ignore-all -o exe.plain
 # RUN: ld.lld -e _start hot.o indir.o main.o \

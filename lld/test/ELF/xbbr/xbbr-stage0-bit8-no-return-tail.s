@@ -1,8 +1,10 @@
-## XBBR (review-fix #1 regression): the M1 emitter writes 16-bit attr
-## words (PLAN §9.3 v0x02), and lld's Stage 0 must read them as 16-bit
-## too — earlier the XBBRNode field was uint8_t, silently truncating
-## bit 8 (IsNoReturnTail) to zero. This test pins that the bit makes
-## it across the boundary.
+## XBBR Stage 0 attr bit 8 (IsNoReturnTail) regression test.
+##
+## The compiler-side emitter writes 16-bit attr words (PLAN §9.3
+## v0x02), and lld's Stage 0 must read them as 16-bit too. An earlier
+## revision used a uint8_t field that silently truncated bit 8
+## (IsNoReturnTail) to zero. This test pins that the bit makes it
+## across the .o → linker boundary.
 ##
 ## Two BBs in this object are noreturn-tails (SPEC §5.3 item 7):
 ##   * the `bad` block in dies() — explicit `abort_with()` then unreachable

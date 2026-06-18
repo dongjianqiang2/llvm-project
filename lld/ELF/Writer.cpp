@@ -1093,10 +1093,11 @@ static void maybeShuffle(Ctx &ctx,
 static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
   DenseMap<const InputSectionBase *, int> sectionOrder;
 
-  // XBBR (M3): when --bb-cross-reorder= is on, run Stage 0 to collect
+  // XBBR: when --bb-cross-reorder= is on, run Stage 0 to collect
   // global per-BB metadata. The graph is persisted in ctx.xbbrGraph for
-  // consumption by the M3 pipeline (Stages 1-4). M2 only prints stats;
-  // Stage 2/3/4 in M3 will consume the graph to drive BB-level layout.
+  // consumption by the rest of the pipeline (Stages 1–5). When the
+  // mode is `function`, only Stage 0 stats are printed; partial/full
+  // additionally drive the BB-level layout pipeline.
   if (ctx.arg.xbbrEnabled) {
     auto graph = std::make_unique<xbbr::XBBRGraph>();
     if (graph->build(ctx)) {
@@ -1128,7 +1129,7 @@ static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
                      << " cold=" << nCold << "\n";
       }
       ctx.xbbrGraph = std::move(graph);
-      // M3: run Stages 1-4 when XBBR is on with partial/full mode.
+      // Run Stages 1–4 when XBBR is on with partial/full mode.
       // Stage 5 (SectionEmitter) runs inside the pipeline.
       if (ctx.arg.xbbrMode >= XBBRMode::Partial)
         xbbr::runXBBRPipeline(ctx, *ctx.xbbrGraph);
