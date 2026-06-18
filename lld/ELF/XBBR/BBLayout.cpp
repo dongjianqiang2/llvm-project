@@ -33,15 +33,13 @@ public:
   const char *name() const override { return "ExtTSP"; }
 
   std::vector<uint32_t> run(const XBBRGraph &graph,
-                            const FunctionCluster &cluster,
-                            const CostWeights &weights) override;
+                            const FunctionCluster &cluster) override;
 };
 
 } // namespace
 
 std::vector<uint32_t> ExtTSPStrategy::run(const XBBRGraph &graph,
-                                          const FunctionCluster &cluster,
-                                          const CostWeights & /*weights*/) {
+                                          const FunctionCluster &cluster) {
   ArrayRef<XBBRNode> allNodes = graph.nodes();
 
   // Phase 1: separate migratable BBs from anchors.
@@ -154,6 +152,22 @@ std::vector<uint32_t> ExtTSPStrategy::run(const XBBRGraph &graph,
       result.push_back(localToGlobal[localIdx]);
   }
 
+  // Defensive: computeExtTspLayout must return all migratable nodes.
+  // If it didn't, some BBs would be missing from the order — log and
+  // fall back to original function sequence for the cluster.
+  uint32_t expectedSize = 0;
+  for (FuncId F : cluster.Members)
+    expectedSize += graph.funcs()[F].NumNodes;
+  if (result.size() != expectedSize) {
+    // ExtTSP dropped nodes; rebuild identity order.
+    result.clear();
+    for (FuncId F : cluster.Members) {
+      auto fn = graph.funcs()[F];
+      for (uint32_t I = fn.FirstNode; I < fn.FirstNode + fn.NumNodes; ++I)
+        result.push_back(I);
+    }
+  }
+
   return result;
 }
 
@@ -166,16 +180,14 @@ public:
   const char *name() const override { return "PH"; }
 
   std::vector<uint32_t> run(const XBBRGraph &graph,
-                            const FunctionCluster &cluster,
-                            const CostWeights &weights) override;
+                            const FunctionCluster &cluster) override;
 };
 
 std::vector<uint32_t> PHStrategy::run(const XBBRGraph &graph,
-                                      const FunctionCluster &cluster,
-                                      const CostWeights & /*weights*/) {
+                                      const FunctionCluster &cluster) {
   // Run ExtTSP first to get the base layout.
   ExtTSPStrategy extTsp;
-  std::vector<uint32_t> order = extTsp.run(graph, cluster, CostWeights{});
+  std::vector<uint32_t> order = extTsp.run(graph, cluster);
 
   if (order.size() <= 4)
     return order;

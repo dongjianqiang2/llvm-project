@@ -48,7 +48,7 @@ void runXBBRPipeline(Ctx &ctx, XBBRGraph &graph) {
   double totalCostBefore = 0.0, totalCostAfter = 0.0;
 
   for (const FunctionCluster &cl : result.Clusters) {
-    std::vector<uint32_t> order = strategy->run(graph, cl, cw);
+    std::vector<uint32_t> order = strategy->run(graph, cl);
     totalCostBefore +=
         computeLayoutCost(graph, order, cw, ctx.arg.xbbrMaxAlign);
     // Stage 3: local-search refinement.

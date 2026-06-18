@@ -62,10 +62,14 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
                          XBBRLayoutResult &result) {
   ArrayRef<XBBRNode> allNodes = graph.nodes();
 
-  // Count total migratable BBs across all clusters.
+  // Count migratable (non-anchor) BBs across all clusters. Anchors are
+  // placed by Stage 2 and never drift, so the 30% fallback threshold
+  // (SPEC §7 / PLAN §4.3) applies only to truly migratable BBs.
   uint32_t totalMigratable = 0;
   for (const auto &order : result.ClusterBBOrders)
-    totalMigratable += order.size();
+    for (uint32_t n : order)
+      if (!allNodes[n].isAnchor())
+        ++totalMigratable;
 
   if (totalMigratable == 0)
     return true;
@@ -156,7 +160,8 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
                 << " migratable BBs reverted (" << (fallbackLimit)
                 << " limit); degrading to function-level mode.";
 
-    // Degrade: clear all BB-level orders.
+    // Degrade: clear all BB-level orders and record in result.
+    result.Degraded = true;
     result.ClusterBBOrders.clear();
     result.Placements.clear();
   }

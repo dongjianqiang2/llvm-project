@@ -189,6 +189,9 @@ struct XBBRLayoutResult {
   double ActualCost = 0.0;
   /// Total bytes of thunks emitted (Stage 5).
   uint64_t ThunkBytes = 0;
+  /// True if Stage 4 degraded to function-level mode (SPEC §7). The
+  /// SectionEmitter uses this to set a flag in the decision-map header.
+  bool Degraded = false;
 };
 
 /// BB-level emission fragment: a contiguous byte range from an

@@ -27,7 +27,6 @@ namespace lld::elf::xbbr {
 
 class XBBRGraph;
 struct FunctionCluster;
-struct CostWeights;
 
 /// Abstract base for BB layout algorithms. Each implementation takes
 /// a cluster of functions and produces an ordered sequence of global
@@ -39,8 +38,7 @@ public:
   /// Compute the optimal BB order within the given cluster.
   /// Returns ordered sequence of global node indices.
   virtual std::vector<uint32_t>
-  run(const XBBRGraph &graph, const FunctionCluster &cluster,
-      const CostWeights &weights) = 0;
+  run(const XBBRGraph &graph, const FunctionCluster &cluster) = 0;
 
   /// Human-readable name for diagnostics / --stats output.
   virtual const char *name() const = 0;

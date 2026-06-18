@@ -89,6 +89,7 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
     return;
 
   XBBRDecisionMapSection &dm = *mainPart->xbbrDecisionMap;
+  dm.setDegraded(result.Degraded);
 
   // Build per-BB decision entries (PLAN §9.4, 32-byte stride).
   std::vector<XBBRDecisionEntry> entries;
@@ -107,11 +108,10 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
       e.DecisionFlags = 1; // moved
       ++m;
     }
-    // orig_func_addr: use owning function's entry-block VA.
-    // M3: projected offset; M5 patches to real VA after assignOffsets.
-    auto fn = graph.funcs()[node.Func];
-    if (fn.FirstNode < graph.nodes().size())
-      e.OrigFuncAddr = fn.FirstNode; // placeholder; M5 → real symbol VA
+    // orig_func_addr: placeholder 0. M5 patches to the function entry
+    // block's real linked VA after assignOffsets. (PLAN §9.4: this is
+    // the linker-time absolute address, not a node index.)
+    e.OrigFuncAddr = 0; // M5 → funcSection(Func)->getVA()
     entries.push_back(e);
   }
   dm.setEntries(std::move(entries));

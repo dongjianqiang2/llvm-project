@@ -283,9 +283,9 @@ XBBR 必须提供分级回退能力，避免单点失败导致整体编译/链�
 |---|---|---|
 | **M1** | 编译器侧元数据 sections + `XBBRMetadataEmitter` pass + clang 选项打通 | x86_64 上 `.o` 文件元数据正确，lld 暂不消费 |
 | **M2** | lld Stage 0+1：读元数据 + 函数级 hfsort+ 粗排 + section emission 框架 | x86_64 静态可执行体可生成；功能等价于 CGProfile-only |
-| **M3** | lld Stage 2+3+4：BB 级 ExtTSP + 多目标代价 + 单 BB 回退 | x86_64 上达到 §9.2 验收指标 (`partial` mode) |
-| **M4** | DWARF/CFI/EH 完整重写 + `.debug_xbbr_decision` + `llvm-bbreorder-dump` | gdb / perf annotate 可读；BOLT 可消费决策 map |
-| **M5** | AArch64 + ARM 完整支持（含 thunk）+ PIE / 动态库 + `full` mode | 嵌入式 demo（Zephyr）通过；服务端 (clang/MySQL) 通过 |
+| **M3** | lld Stage 2+3+4：BB 级 ExtTSP + 多目标代价 + 单 BB 回退 + 决策 map BB 级条目 | x86_64 上 BB 级布局管线产出完整 `XBBRLayoutResult` + 决策 map（含 per-BB 32B entry）；物理 `.text.hot/.text.unlikely` BB 级 emit 推迟到 M5 |
+| **M4** | DWARF/CFI/EH 完整重写 + `llvm-bbreorder-dump` | gdb / perf annotate 可读；BOLT 可消费决策 map |
+| **M5** | 物理 BB 级 section emission + AArch64 + ARM 完整支持（含 thunk）+ PIE / 动态库 + `full` mode + §9.2 量化门槛 | 嵌入式 demo（Zephyr）通过；服务端 (clang/MySQL) 通过；L1i↓≥10–15%、iTLB↓≥15–20% 等指标达标 |
 
 **Upstream 策略**：5 阶段以"实验性 feature"形式逐步进入 upstream LLVM (前缀 `experimental-`)，M5 完成后申请去前缀。
 

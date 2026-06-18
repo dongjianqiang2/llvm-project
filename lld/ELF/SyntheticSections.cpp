@@ -404,9 +404,9 @@ XBBRDecisionMapSection::XBBRDecisionMapSection(Ctx &ctx)
 
 void XBBRDecisionMapSection::writeTo(uint8_t *buf) {
   memcpy(buf + 0, "XBBR", 4);
-  write32le(buf + 4, 0x00010000);                  // version
-  write32le(buf + 8, static_cast<uint32_t>(Entries.size())); // num_entries
-  write32le(buf + 12, 0);                          // flags
+  write32le(buf + 4, 0x00010000);                // version
+  write32le(buf + 8, static_cast<uint32_t>(Entries.size()));
+  write32le(buf + 12, Degraded ? 1u : 0u);       // flags: bit 0 = degraded
   uint8_t *p = buf + headerSize;
   for (const XBBRDecisionEntry &E : Entries) {
     write64le(p + 0, E.OrigFuncAddr);

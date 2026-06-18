@@ -209,9 +209,13 @@ public:
 
   /// Set the full entry table. Called by M3 Stage 5 (SectionEmitter).
   void setEntries(std::vector<XBBRDecisionEntry> &&e) { Entries = std::move(e); }
+  /// Set the degraded flag (SPEC §7). When true, bit 0 of the header flags
+  /// field is set to indicate the pipeline fell back to function-level mode.
+  void setDegraded(bool d) { Degraded = d; }
 
 private:
   std::vector<XBBRDecisionEntry> Entries;
+  bool Degraded = false;
 };
 
 // BssSection is used to reserve space for copy relocations and common symbols.
