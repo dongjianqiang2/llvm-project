@@ -11,6 +11,7 @@
 #include "Config.h"
 #include "ConstraintSolver.h"
 #include "CostFunction.h"
+#include "DWARFRewriter.h"
 #include "SectionEmitter.h"
 #include "XBBR/XBBRGraph.h"
 #include "XBBR/XBBRTypes.h"
@@ -67,11 +68,15 @@ void runXBBRPipeline(Ctx &ctx, XBBRGraph &graph) {
   // Stage 5: build decision-map entries + BBFragments.
   runSectionEmitter(ctx, graph, result);
 
+  // Rewrite DWARF/CFI for migrated BBs. Only a stub today; the real
+  // pass slots in once physical emission assigns final VAs.
+  rewriteDWARF(ctx);
+
   if (ctx.arg.xbbrStats) {
     uint32_t totalBBs = 0;
     for (const auto &o : result.ClusterBBOrders)
       totalBBs += o.size();
-    errs() << "xbbr-m5: clusters=" << result.Clusters.size()
+    errs() << "xbbr-pipeline: clusters=" << result.Clusters.size()
            << " layoutBBs=" << totalBBs
            << " strategy=" << strategy->name()
            << " mode=" << (ctx.arg.xbbrMode == XBBRMode::Full ? "full" : "partial")
