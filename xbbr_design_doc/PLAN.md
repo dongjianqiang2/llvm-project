@@ -76,7 +76,7 @@
               ├─────────────────────┤
               │ Stage 5: section    │   写出 .text.hot / .text.warm /
               │   emission +        │   .text.unlikely + thunk 生成 +
-              │   DWARF/CFI 重写    │   .llvm_cross_bb_map (决策 map)
+              │   DWARF/CFI 重写    │   .debug_xbbr_decision (决策 map)
               └─────────────────────┘
 ```
 
@@ -99,7 +99,7 @@
                                                                           │
                           ┌───────────────────────────────────────────────┘
                           ▼
-                  ┌───────────────┐   .llvm_cross_bb_map    ┌──────────────────┐
+                  ┌───────────────┐   .debug_xbbr_decision    ┌──────────────────┐
                   │  最终 ELF     ├───────────────────────▶│ llvm-bbreorder-  │
                   │ (.text.hot/   │                         │ dump / perf /    │
                   │  unlikely)    │                         │ addr2line / gdb  │
@@ -108,7 +108,7 @@
 
 关键边界：
 - **编译器 → 链接器**：仅通过 `.o` 文件内的 XBBR sections（BB_ADDR_MAP PGO feature + CGProfile + `.llvm_xbbr_attr`）传递，不依赖外部文件。
-- **链接器 → 工具**：仅通过 `.llvm_cross_bb_map` 暴露决策，便于事后审计与 BOLT 二次消费。
+- **链接器 → 工具**：仅通过 `.debug_xbbr_decision` 暴露决策，便于事后审计与 BOLT 二次消费。
 - **频率归一化**（见 §3.2）：`FuncEntryCount` 与 `BBFreq` 均由 BB_ADDR_MAP 携带，链接器 Stage 0 组合得 `global_freq`——归一化在链接器侧完成，编译器只需启用 BB_ADDR_MAP 的 PGO feature。
 - **Full LTO**（SPEC §8.3）：`-flto=full` 下无独立 `.o`，`XBBRMetadataEmitter` 在 LTO CodeGen 按 partition 运行，元数据随 partition 输出流入 lld，数据流与非 LTO 等价；ThinLTO 不支持。
 
@@ -309,7 +309,7 @@ else:
 每函数原始 `.text.<fn>` 不再使用（除非该函数完全未参与重排）。同时：
 - 生成跨段跳转所需的 thunk（ARM/AArch64）。
 - 重写 DWARF/CFI/EH（见 §5）。
-- 写入 `.llvm_cross_bb_map`（见 §9.4）。
+- 写入 `.debug_xbbr_decision`（见 §9.4）。
 - 为每个迁移 BB 生成本地符号别名 `$xbbr.<orig_func>.bb<N>`（见 §5.2）。
 - **BB 对齐**：按 §4.3 Stage 3 的对齐上限（`--bb-cross-reorder-max-align`，默认 16B）放置迁移 BB，避免高对齐入口块的对齐要求污染普通 BB。对齐填充 NOP 计入可加载体积预算（§2.2）；Stage 5 末梢复核若超预算，触发末梢回退（§4.3 Stage 3）。
 
@@ -379,7 +379,7 @@ $xbbr.<orig_func>.bb<N>
 - 不可压缩表（`--exidx-unwind`）情况下段间间隔需填充 `EXIDX_CANTUNWIND`。
 - Thumb 函数的段入口需保持对齐与 `[1:0]` 位标志一致。
 
-### 5.5 决策 Map Section：`.llvm_cross_bb_map`
+### 5.5 决策 Map Section：`.debug_xbbr_decision`
 
 默认保留，可被 `strip --strip-debug` 剥离。格式见 §9.4。供后续工具反向查询：
 
@@ -390,7 +390,7 @@ $xbbr.<orig_func>.bb<N>
 ### 5.6 可视化工具：`llvm-bbreorder-dump`
 
 新增工具（`llvm/tools/llvm-bbreorder-dump/`），能力：
-- 解析 `.llvm_cross_bb_map` 与 `SHT_LLVM_BB_ADDR_MAP`。
+- 解析 `.debug_xbbr_decision` 与 `SHT_LLVM_BB_ADDR_MAP`。
 - 列出每个原函数的 BB 去向。
 - 输出 Graphviz 热路径图。
 - 与 `perf script` 协作生成"按热簇看 cycles"的报告。
@@ -572,13 +572,13 @@ struct XBBRDecision {
 };
 ```
 
-序列化为 `.llvm_cross_bb_map`（格式见 §9.4）。
+序列化为 `.debug_xbbr_decision`（格式见 §9.4）。
 
 ---
 
 ## 9. ELF Section 二进制格式
 
-> **复用优先**：频率（`FuncEntryCount`/`BBFreq`）与函数内 CFG 边权重（`BrProb`）**复用 `SHT_LLVM_BB_ADDR_MAP` 既有 PGO-analysis feature**，跨函数调用边复用 `SHT_LLVM_CALL_GRAPH_PROFILE`。故 §9.1/§9.2 的独立格式仅作"无法扩展 BB_ADDR_MAP 时的回退方案"，首期不分配其 section 类型常量。XBBR 真正新增的 section 仅为 `.llvm_xbbr_attr`（§9.3，黑名单）与 `.llvm_cross_bb_map`（§9.4，决策 map）。
+> **复用优先**：频率（`FuncEntryCount`/`BBFreq`）与函数内 CFG 边权重（`BrProb`）**复用 `SHT_LLVM_BB_ADDR_MAP` 既有 PGO-analysis feature**，跨函数调用边复用 `SHT_LLVM_CALL_GRAPH_PROFILE`。故 §9.1/§9.2 的独立格式仅作"无法扩展 BB_ADDR_MAP 时的回退方案"，首期不分配其 section 类型常量。XBBR 真正新增的 section 仅为 `.llvm_xbbr_attr`（§9.3，黑名单）与 `.debug_xbbr_decision`（§9.4，决策 map）。
 
 所有 section 采用**与所在 ELF 的 `EI_DATA` 一致的字节序**（小端 ELF 用小端、大端 ARM/AArch64 用大端，回应评审"小端假设"）、**无填充对齐**，header 固定 8 字节（决策 map 16 字节）。版本号高位为主版本、低位为次版本。函数关联一律通过 **section 依附**（元数据 section 附在函数 text section 上）或 **符号名**，**不使用 `.symtab` 索引**（回应评审 #6）。
 
@@ -653,9 +653,11 @@ Per-function section (one section per text section):
 
 链接后不保留（`SHF_EXCLUDE`）。
 
-### 9.4 `.llvm_cross_bb_map`（`SHT_PROGBITS` + 非 `SHF_ALLOC`，链接后保留）
+### 9.4 `.debug_xbbr_decision`（`SHT_PROGBITS` + 非 `SHF_ALLOC`，链接后保留）
 
 自定义二进制格式（**非** `SHT_NOTE`：note 段为 name/desc/type 三元组记录，与此处的定长表不匹配）。
+
+> **section 命名约定（M2-T05 实施时确定）**：用 `.debug_` 前缀使标准 `strip --strip-debug` 自动识别并剥离,与 SPEC §9.4 "决策 map 可被 strip 剥离" 的语义对齐。早先草案给的 `.debug_xbbr_decision` 不带 `.debug_` 前缀,llvm-strip --strip-debug 不识别该名,需要 `--remove-section=` 显式指定才能剥离——属于"运行机制不匹配 SPEC 表述"的事实矛盾。落地为 `.debug_xbbr_decision` 后矛盾消解。
 
 ```
 Header (16 bytes):
@@ -672,11 +674,11 @@ For each entry (32 bytes):
     uint32  reserved;           // 填充至 32 字节对齐
 ```
 
-默认进入二进制但不可加载（`SHF_ALLOC` 不置位，故不进 loadable 段、不计入 §2.2 体积预算），可被 `strip --strip-debug` 剥离。无需新 `SHT_LLVM_*` 类型常量——使用保留段名 `.llvm_cross_bb_map` + `SHT_PROGBITS` 即可（与 `.llvm_addrsig` 等既有"按名识别"段一致）。
+默认进入二进制但不可加载（`SHF_ALLOC` 不置位，故不进 loadable 段、不计入 §2.2 体积预算），由 `strip --strip-debug` 自动剥离（依赖 `.debug_` 前缀的标准识别行为）。无需新 `SHT_LLVM_*` 类型常量——使用保留段名 `.debug_xbbr_decision` + `SHT_PROGBITS` 即可（与 `.debug_*` 既有"按名识别"段一致）。
 
 ### 9.5 新增 section 类型号分配
 
-复用既有 `SHT_LLVM_BB_ADDR_MAP`（频率/边权重）与 `SHT_LLVM_CALL_GRAPH_PROFILE`（跨函数调用边）后，**唯一需新分配的 `SHT_LLVM_*` 类型常量是 `SHT_LLVM_XBBR_ATTR`**（§9.3）。当前 `llvm/include/llvm/BinaryFormat/ELF.h` 的 `SHT_LLVM_*` 区间止于 `SHT_LLVM_JT_SIZES = 0x6fff4c0d`，新常量取 `0x6fff4c0e`，遵循 LLVM 既有 `SHT_LLVM_*` 命名区间。`.llvm_cross_bb_map` 用保留段名 + `SHT_PROGBITS`，不占新类型号。M1 阶段优先完成此项。
+复用既有 `SHT_LLVM_BB_ADDR_MAP`（频率/边权重）与 `SHT_LLVM_CALL_GRAPH_PROFILE`（跨函数调用边）后，**唯一需新分配的 `SHT_LLVM_*` 类型常量是 `SHT_LLVM_XBBR_ATTR`**（§9.3）。当前 `llvm/include/llvm/BinaryFormat/ELF.h` 的 `SHT_LLVM_*` 区间止于 `SHT_LLVM_JT_SIZES = 0x6fff4c0d`，新常量取 `0x6fff4c0e`，遵循 LLVM 既有 `SHT_LLVM_*` 命名区间。`.debug_xbbr_decision` 用保留段名 + `SHT_PROGBITS`，不占新类型号。M1 阶段优先完成此项。
 
 ---
 
@@ -724,7 +726,7 @@ For each entry (32 bytes):
 | DWARF/CFI 重写 | `DWARFRewriter.cpp` | gdb bt 正确 |
 | EH 重写 | `EHRewriter.cpp` | 异常展开正确 |
 | ARM `.ARM.exidx` 多段 | `EHRewriter.cpp` | ARM 栈展开正确 |
-| `.llvm_cross_bb_map` 输出 | `SectionEmitter.cpp` | 反向查询正确 |
+| `.debug_xbbr_decision` 输出 | `SectionEmitter.cpp` | 反向查询正确 |
 | `llvm-bbreorder-dump` | `llvm/tools/llvm-bbreorder-dump/` | 可视化输出 |
 | BOLT 消费验证 | 外部 | BOLT 可读决策 map |
 

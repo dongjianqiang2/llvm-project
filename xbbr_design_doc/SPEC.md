@@ -48,7 +48,7 @@ XBBR 必须**同时**改善以下四个维度，单一维度回归即视为失�
 **体积预算口径（重要）**：SPEC §9.2 的体积增量门槛针对**可加载段（loadable image）**，不计入以下非加载内容：
 - `.llvm_bb_freq` / `.llvm_cfg_edge` / `.llvm_xbbr_attr` —— `SHF_EXCLUDE`，链接后丢弃；
 - `.debug_*` / `DW_AT_ranges` 膨胀 —— 非分配段，`strip --strip-debug` 可剥离；
-- `.llvm_cross_bb_map` —— 非 `SHF_ALLOC`，可剥离。
+- `.debug_xbbr_decision` —— 非 `SHF_ALLOC`，可剥离。
 
 真正计入可加载体积的增量来源（嵌入式须在 §9.2 1.5% 预算内核算）：
 1. **thunk / veneer** 字节（ARM/Thumb 尤甚），受 `--bb-cross-reorder-max-thunk-bytes` 约束；
@@ -180,7 +180,7 @@ PLAN Stage 3/4 须将上述四项纳入 `SizeOverhead` 与回退判定；超预�
 --bb-cross-reorder-weights=icache=4,itlb=2,btb=1,size=2
 --bb-cross-reorder-max-thunk-bytes=<n>               # trampoline 体积上限
 --bb-cross-reorder-fallback=auto|conservative|none
---bb-cross-reorder-emit-decision-map                 # 写 .llvm_cross_bb_map
+--bb-cross-reorder-emit-decision-map                 # 写 .debug_xbbr_decision
 --bb-cross-reorder-deterministic                     # 强制 bitwise reproducible
 ```
 
@@ -284,7 +284,7 @@ XBBR 必须提供分级回退能力，避免单点失败导致整体编译/链�
 | **M1** | 编译器侧元数据 sections + `XBBRMetadataEmitter` pass + clang 选项打通 | x86_64 上 `.o` 文件元数据正确，lld 暂不消费 |
 | **M2** | lld Stage 0+1：读元数据 + 函数级 hfsort+ 粗排 + section emission 框架 | x86_64 静态可执行体可生成；功能等价于 CGProfile-only |
 | **M3** | lld Stage 2+3+4：BB 级 ExtTSP + 多目标代价 + 单 BB 回退 | x86_64 上达到 §9.2 验收指标 (`partial` mode) |
-| **M4** | DWARF/CFI/EH 完整重写 + `.llvm_cross_bb_map` + `llvm-bbreorder-dump` | gdb / perf annotate 可读；BOLT 可消费决策 map |
+| **M4** | DWARF/CFI/EH 完整重写 + `.debug_xbbr_decision` + `llvm-bbreorder-dump` | gdb / perf annotate 可读；BOLT 可消费决策 map |
 | **M5** | AArch64 + ARM 完整支持（含 thunk）+ PIE / 动态库 + `full` mode | 嵌入式 demo（Zephyr）通过；服务端 (clang/MySQL) 通过 |
 
 **Upstream 策略**：5 阶段以"实验性 feature"形式逐步进入 upstream LLVM (前缀 `experimental-`)，M5 完成后申请去前缀。

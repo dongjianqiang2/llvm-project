@@ -231,14 +231,14 @@
   - `M2-T04-C2`：`lld/test/ELF/xbbr/xbbr-mutex-propeller.s` — `--bb-cross-reorder` + `--symbol-ordering-file` 报错退出。
   - `M2-T04-C3`：`lld/test/ELF/xbbr/xbbr-options-split-algo.s` — `cluster-algo=hfsort+,c3` 与 `layout-algo=ext-tsp,ph` 分别生效（回应检视表 C³）。
 
-### M2-T05 — 决策 map 输出框架（`.llvm_cross_bb_map`）
+### M2-T05 — 决策 map 输出框架（`.debug_xbbr_decision`）
 
-- **描述**：实现 `.llvm_cross_bb_map`（`SHT_PROGBITS` + 非 `SHF_ALLOC`，PLAN §9.4）输出。M2 阶段记录函数级决策（BB 未漂移，多数 `anchored`）；BB 级 entries 在 M3 填充。含 magic `XBBR` + version。
+- **描述**：实现 `.debug_xbbr_decision`（`SHT_PROGBITS` + 非 `SHF_ALLOC`，PLAN §9.4）输出。M2 阶段记录函数级决策（BB 未漂移，多数 `anchored`）；BB 级 entries 在 M3 填充。含 magic `XBBR` + version。
 - **涉及文件**：`lld/ELF/XBBR/SectionEmitter.cpp`
 - **依赖**：M2-T03
 - **退出条件**：输出 section 含正确 header；`strip --strip-debug` 可剥离；不进 loadable 段。
 - **测试用例**：
-  - `M2-T05-C1`：`lld/test/ELF/xbbr/xbbr-decision-map.s` — `--bb-cross-reorder-emit-decision-map` 产出 `.llvm_cross_bb_map`，`readobj -S` 显示非 `SHF_ALLOC`。
+  - `M2-T05-C1`：`lld/test/ELF/xbbr/xbbr-decision-map.s` — `--bb-cross-reorder-emit-decision-map` 产出 `.debug_xbbr_decision`，`readobj -S` 显示非 `SHF_ALLOC`。
   - `M2-T05-C2`：`lld/test/ELF/xbbr/xbbr-decision-map-strip.s` — `strip --strip-debug` 后 section 消失；`--strip-all` 行为记录为 SPEC §12 开放问题。
 
 ### M2-T06 — M2 集成测试
@@ -369,7 +369,7 @@
 
 ### M4-T04 — `llvm-bbreorder-dump` 工具
 
-- **描述**：新增工具，解析 `.llvm_cross_bb_map` + BB_ADDR_MAP，列出每函数 BB 去向、输出 Graphviz 热路径图、与 perf script 协作（PLAN §5.6）。
+- **描述**：新增工具，解析 `.debug_xbbr_decision` + BB_ADDR_MAP，列出每函数 BB 去向、输出 Graphviz 热路径图、与 perf script 协作（PLAN §5.6）。
 - **涉及文件**：`llvm/tools/llvm-bbreorder-dump/llvm-bbreorder-dump.cpp`、`llvm/test/tools/llvm-bbreorder-dump/`
 - **依赖**：M2-T05、M3-T05
 - **退出条件**：工具能 dump 决策 map 并与实际布局一致。
@@ -380,7 +380,7 @@
 
 ### M4-T05 — BOLT 消费决策 map
 
-- **描述**：验证 BOLT 可读 `.llvm_cross_bb_map` 做边角微调（SPEC §2.3、§11.5）。
+- **描述**：验证 BOLT 可读 `.debug_xbbr_decision` 做边角微调（SPEC §2.3、§11.5）。
 - **涉及文件**：外部 `bolt/`（若仓库内含则 `bolt/lib/`）
 - **依赖**：M4-T04
 - **退出条件**：BOLT 读 map 不报错且微调后可运行。

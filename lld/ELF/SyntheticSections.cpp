@@ -389,6 +389,43 @@ void BuildIdSection::writeBuildId(ArrayRef<uint8_t> buf) {
   memcpy(hashBuf, buf.data(), hashSize);
 }
 
+// XBBR decision map (PLAN §9.4 / TASK M2-T05).
+//
+// Type SHT_PROGBITS, flags 0 — preserved in the output ELF but not
+// loadable. Section name uses the .debug_ prefix so that the standard
+// `strip --strip-debug` recognizes it as debug data and removes it,
+// matching the SPEC §9.4 expectation that the decision map is
+// stripable along with debug info. M2 emits header-only
+// (NumEntries == 0); M3's Stage 5 will populate per-BB entries from
+// the XBBRGraph.
+XBBRDecisionMapSection::XBBRDecisionMapSection(Ctx &ctx)
+    : SyntheticSection(ctx, ".debug_xbbr_decision", llvm::ELF::SHT_PROGBITS,
+                       /*flags=*/0, /*addralign=*/8) {}
+
+void XBBRDecisionMapSection::writeTo(uint8_t *buf) {
+  // Header: char magic[4] + uint32 version + uint32 num_entries + uint32 flags.
+  // PLAN §9.4 fixes the magic at "XBBR" and version 0x00010000.
+  memcpy(buf + 0, "XBBR", 4);
+  write32le(buf + 4, 0x00010000);  // version
+  write32le(buf + 8, NumEntries);  // num_entries
+  write32le(buf + 12, 0);          // flags (reserved)
+  // Entries (PLAN §9.4 32-byte stride). M2 emits no entries — M3 fills.
+  // The skeleton below is left as the sole writer because M3's Stage 5
+  // needs to compose with the same buffer once it runs.
+  uint8_t *p = buf + headerSize;
+  for (uint32_t I = 0; I < NumEntries; ++I) {
+    // M2 default values; M3 will override in a follow-up patch when
+    // it has live (orig_func_addr, bb_index, new_address) data.
+    write64le(p + 0, 0);    // orig_func_addr
+    write32le(p + 8, 0);    // bb_index
+    write64le(p + 12, 0);   // new_address
+    write32le(p + 20, 0);   // cluster_id
+    write32le(p + 24, 0);   // decision_flags
+    write32le(p + 28, 0);   // reserved
+    p += entrySize;
+  }
+}
+
 BssSection::BssSection(Ctx &ctx, StringRef name, uint64_t size,
                        uint32_t alignment)
     : SyntheticSection(ctx, name, SHT_NOBITS, SHF_ALLOC | SHF_WRITE,
@@ -4796,6 +4833,15 @@ template <class ELFT> void elf::createSyntheticSections(Ctx &ctx) {
     if (ctx.arg.buildId != BuildIdKind::None) {
       part.buildId = std::make_unique<BuildIdSection>(ctx);
       add(*part.buildId);
+    }
+
+    // XBBR decision map (TASK M2-T05). Header-only in M2 — M3 Stage 5
+    // populates entries. We only attach the section when the user asked
+    // for it, so plain `--bb-cross-reorder=` with no
+    // `--bb-cross-reorder-emit-decision-map` keeps the output clean.
+    if (ctx.arg.xbbrEnabled && ctx.arg.xbbrEmitDecisionMap) {
+      part.xbbrDecisionMap = std::make_unique<XBBRDecisionMapSection>(ctx);
+      add(*part.xbbrDecisionMap);
     }
 
     // dynSymTab is always present to simplify several finalizeSections

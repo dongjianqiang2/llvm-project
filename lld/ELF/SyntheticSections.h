@@ -173,6 +173,38 @@ private:
   uint8_t *hashBuf;
 };
 
+// XBBR decision map (PLAN §9.4 / TASK M2-T05).
+//
+// Records, per BB that XBBR moved/anchored, where it ended up. The
+// section is `.llvm_cross_bb_map`, type SHT_PROGBITS, flags 0 (not
+// SHF_ALLOC) — it is preserved in the output ELF (so post-link tools
+// like BOLT and llvm-bbreorder-dump can read it) but is not part of
+// any loadable segment, and `strip --strip-debug` removes it.
+//
+// Triggered by `--bb-cross-reorder-emit-decision-map`.
+//
+// In M2 the section emits only the 16-byte header with `num_entries=0`
+// (XBBR Stage 0 is informational; no BB has actually moved yet).
+// M3's Stage 5 will populate the per-entry table from the XBBRGraph.
+class XBBRDecisionMapSection final : public SyntheticSection {
+public:
+  static const unsigned headerSize = 16;       // magic+version+num+flags
+  static const unsigned entrySize = 32;        // PLAN §9.4
+
+  XBBRDecisionMapSection(Ctx &);
+  size_t getSize() const override {
+    return headerSize + entrySize * NumEntries;
+  }
+  void writeTo(uint8_t *buf) override;
+
+  // M3 will call setNumEntries() and a writer-callback after Stage 5
+  // computes the layout. Today both default to "empty map".
+  void setNumEntries(uint32_t N) { NumEntries = N; }
+
+private:
+  uint32_t NumEntries = 0;
+};
+
 // BssSection is used to reserve space for copy relocations and common symbols.
 // We create three instances of this class for .bss, .bss.rel.ro and "COMMON",
 // that are used for writable symbols, read-only symbols and common symbols,
@@ -1508,6 +1540,7 @@ struct Partition {
 
   std::unique_ptr<ARMExidxSyntheticSection> armExidx;
   std::unique_ptr<BuildIdSection> buildId;
+  std::unique_ptr<XBBRDecisionMapSection> xbbrDecisionMap;
   std::unique_ptr<SyntheticSection> dynamic;
   std::unique_ptr<StringTableSection> dynStrTab;
   std::unique_ptr<SymbolTableBaseSection> dynSymTab;
