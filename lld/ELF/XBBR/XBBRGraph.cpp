@@ -7,12 +7,13 @@
 //===----------------------------------------------------------------------===//
 //
 // Implements XBBRGraph::build — reads, per InputFile, the per-function
-// SHT_LLVM_BB_ADDR_MAP and SHT_LLVM_XBBR_ATTR sections produced in M1,
-// then folds in the cross-function call edges that lld already parsed
-// out of SHT_LLVM_CALL_GRAPH_PROFILE into ctx.arg.callGraphProfile.
+// SHT_LLVM_BB_ADDR_MAP and SHT_LLVM_XBBR_ATTR sections produced by the
+// compiler-side XBBRMetadataEmitter pass, then folds in the
+// cross-function call edges that lld already parsed out of
+// SHT_LLVM_CALL_GRAPH_PROFILE into ctx.arg.callGraphProfile.
 //
-// Supported architectures: x86_64 and AArch64 (both ELF64LE). ARM (ELF32LE)
-// support lands after M5 thunk integration.
+// Supported architectures: x86_64 and AArch64 (both ELF64LE). ARM
+// (ELF32LE) support follows once thunk integration lands.
 //
 //===----------------------------------------------------------------------===//
 
@@ -105,18 +106,23 @@ struct BBAddrMapDecoded {
   std::vector<PGOAnalysisMap> PGO;
 };
 
-bool decodeBBAddrMapForX86_64(InputSectionBase *S, BBAddrMapDecoded &Out) {
+bool decodeBBAddrMap(InputSectionBase *S, BBAddrMapDecoded &Out) {
+  // Both x86_64 and AArch64 are ELF64LE — the same template instance
+  // serves both architectures. ARM (ELF32LE) and big-endian ELF would
+  // need their own instantiations; XBBR currently rejects those at
+  // the driver / dump-tool level (SPEC §8.1).
   using ELFT = ELF64LE;
-  ObjFile<ELFT> *OF = cast<ObjFile<ELFT>>(S->file);
+  ObjFile<ELFT> *OF = dyn_cast<ObjFile<ELFT>>(S->file);
+  if (!OF)
+    return false; // non-ELF64LE input is silently skipped at this layer.
   ELFFile<ELFT> EF = OF->getObj();
   auto Shdrs = EF.sections();
   if (!Shdrs)
     return false;
-  // M2: linear scan to find this section's index. With N functions
-  // per ObjFile this gives O(N²) total cost in collectFromObjFiles.
-  // M3 TODO: cache a DenseMap<InputSectionBase*, size_t> per ObjFile
-  // to amortize. M2 only does function-level reordering, so the cost
-  // stays well below noise on realistic inputs.
+  // Linear scan to find this section's index. With N functions per
+  // ObjFile this gives O(N²) total cost in collectFromObjFiles. A
+  // DenseMap<InputSectionBase*, size_t> cache would amortize, but at
+  // current scale the cost stays well below noise on realistic inputs.
   ArrayRef<InputSectionBase *> AllSecs = OF->getSections();
   size_t Idx = 0;
   for (; Idx < AllSecs.size(); ++Idx)
@@ -221,7 +227,7 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       if (!S || S->type != ELF::SHT_LLVM_BB_ADDR_MAP)
         continue;
       BBAddrMapDecoded D;
-      if (!decodeBBAddrMapForX86_64(S, D))
+      if (!decodeBBAddrMap(S, D))
         continue;
       DecodedMaps[S] = std::move(D);
     }
@@ -234,7 +240,14 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
     // ObjFile recorded for us. Map: sh_link → parsed attrs.
     DenseMap<uint32_t, XBBRAttrParseResult> AttrsByLink;
     {
-      ObjFile<ELF64LE> *OF = cast<ObjFile<ELF64LE>>(FB);
+      // XBBR is wired for ELF64LE (x86_64 + AArch64). Other input kinds
+      // are skipped silently here so a mixed link (e.g. one ELF32 .o
+      // accidentally in the inputs) doesn't take down the whole graph
+      // build. Driver-level checks should already have rejected those
+      // cases for partial/full mode (SPEC §8.1).
+      ObjFile<ELF64LE> *OF = dyn_cast<ObjFile<ELF64LE>>(FB);
+      if (!OF)
+        continue;
       auto Shdrs = OF->getObj().sections();
       if (!Shdrs) {
         consumeError(Shdrs.takeError());
@@ -289,11 +302,10 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       auto AIt = AttrsByLink.find(SIdx);
       if (AIt != AttrsByLink.end() && AIt->second.Ok &&
           !AIt->second.PerFunc.empty()) {
-        // M2: assume one function per text section (works under
-        // -ffunction-sections, which XBBR effectively requires for
-        // BB-level reorder anyway). M3 generalizes to N functions
-        // per section by indexing into PerFunc with the BBAddrMap
-        // entry's position.
+        // Assume one function per text section, which holds under
+        // -ffunction-sections (effectively required for BB-level
+        // reorder anyway). Generalizing to N functions per section
+        // would index into PerFunc by the BBAddrMap entry's position.
         FuncAttrs = &AIt->second.PerFunc.front();
       }
 
@@ -319,8 +331,8 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
           Flat.push_back({E.ID, E.Size});
 
       // Optional consistency check: .llvm_xbbr_attr's num_bbs must
-      // match the BB_ADDR_MAP BB count. M1 produced both from the
-      // same MIR pass; a mismatch means tampering or version skew.
+      // match the BB_ADDR_MAP BB count. The compiler emits both from
+      // the same MIR pass; a mismatch means tampering or version skew.
       if (FuncAttrs && FuncAttrs->size() != Flat.size()) {
         Err(ctx) << "XBBR Stage 0: " << Text->name << " in "
                  << FB->getName()
@@ -423,9 +435,10 @@ bool XBBRGraph::collectCallGraphEdges(Ctx &ctx) {
     XBBREdge E;
     // Stage 0 doesn't know which BB inside the caller issued the call,
     // so we attach the edge to the caller's entry block (FuncInfo's
-    // first node). Stage 2 (M3) will narrow it once it has BB-level
-    // call-site info. Same for the callee — entry block is the only
-    // landing point for an external call (function symbol = entry).
+    // first node). Stage 2 will narrow it once BB-level call-site info
+    // is available. The callee endpoint also goes to the entry block —
+    // it's the only valid landing point for an external call (function
+    // symbol = entry).
     const FuncInfo &FFrom = Funcs[From];
     const FuncInfo &FTo = Funcs[To];
     if (FFrom.NumNodes == 0 || FTo.NumNodes == 0)
@@ -435,9 +448,9 @@ bool XBBRGraph::collectCallGraphEdges(Ctx &ctx) {
     E.Weight = KV.second;
     E.IsFallthrough = false;
     E.IsCrossFunc = true;
-    // M1-T04 keeps indirect-call edges in the same CGProfile stream;
-    // we cannot tell direct vs. indirect from the section alone.
-    // M3 may want to split this; for M2 we treat all edges uniformly.
+    // VP-derived indirect-call edges live in the same CGProfile stream
+    // as direct calls; we can't tell them apart from the section alone.
+    // Treat all edges uniformly here; refinement can come later.
     E.IsIndirectCall = false;
     Edges.push_back(E);
   }
