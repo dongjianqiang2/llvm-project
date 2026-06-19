@@ -8,7 +8,7 @@
 ; --- 0-dim: entry with static only ---
 ; CHECK-LABEL: define void @static_only_entry()
 ; CHECK: jit_entry:
-; CHECK: call ptr @ejit_compile_or_get(i64 {{.*}}, ptr null)
+; CHECK: call i32 @ejit_taskpool_compile_or_get
 ; CHECK: jit_fallback:
 ; CHECK: jit_dispatch:
 
@@ -21,7 +21,7 @@ entry:
 ; --- 4-dim: max dimension support ---
 ; CHECK-LABEL: define void @four_dim_entry(i32 %d1, i32 %d2, i32 %d3, i32 %d4)
 ; CHECK: jit_entry:
-; CHECK: call ptr @ejit_compile_or_get(i64 {{.*}}, ptr null)
+; CHECK: call i32 @ejit_taskpool_compile_or_get
 
 define void @four_dim_entry(i32 %d1, i32 %d2, i32 %d3, i32 %d4) !ejit.metadata !10 {
 entry:
