@@ -108,7 +108,7 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
     e.NewAddress = frag.FinalVA;
     e.ClusterId = 0; // simplified for now; multi-cluster routing later
     const bool effectiveAnchor =
-        node.isAnchor() || (partialMode && node.isCold());
+        node.isAnchor() || node.CondInvolved || (partialMode && node.isCold());
     if (effectiveAnchor) {
       e.DecisionFlags = llvm::XBBRDecisionMap::EntryFlags::Anchored;
       ++a;
@@ -140,6 +140,29 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
                   : node.isCold()  ? BBPlacement::Section::Unlikely
                                    : BBPlacement::Section::Hot;
     result.Placements.push_back(p);
+  }
+}
+
+void backfillDecisionMapVAs(Ctx &ctx) {
+  if (!ctx.xbbrGraph || !ctx.xbbrLayoutResult)
+    return;
+  Partition *mainPart = ctx.mainPart;
+  if (!mainPart || !mainPart->xbbrDecisionMap)
+    return;
+  XBBRGraph &graph = *ctx.xbbrGraph;
+  XBBRDecisionMapSection &dm = *mainPart->xbbrDecisionMap;
+  // Real VAs are stable now (finalizeAddressDependentContent converged).
+  // Patch each entry: NewAddress = the BB's per-section final VA; OrigFuncAddr
+  // = the function entry section's VA (ABI §5.1: function symbol = entry BB).
+  for (XBBRDecisionEntry &e : dm.entries()) {
+    std::optional<uint32_t> nodeIdx = graph.findNode(e.FuncId, e.BBIndex);
+    if (!nodeIdx)
+      continue;
+    const XBBRNode &node = graph.nodes()[*nodeIdx];
+    if (node.BBSection)
+      e.NewAddress = node.BBSection->getVA();
+    if (InputSectionBase *entrySec = graph.funcSection(node.Func))
+      e.OrigFuncAddr = entrySec->getVA();
   }
 }
 

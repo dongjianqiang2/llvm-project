@@ -31,6 +31,13 @@ namespace lld::elf::xbbr {
 void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
                        XBBRLayoutResult &result);
 
+/// Phase 3: patch the decision-map entries' OrigFuncAddr/NewAddress with the
+/// real linked VAs. Called after finalizeAddressDependentContent (and after
+/// optimizeBasicBlockJumps) so outSecOff/addr are final. The entry COUNT is
+/// unchanged (set during runSectionEmitter), so no section re-finalization is
+/// needed — writeTo reads the patched entries at write time.
+void backfillDecisionMapVAs(Ctx &ctx);
+
 } // namespace lld::elf::xbbr
 
 #endif // LLD_ELF_XBBR_SECTIONEMITTER_H

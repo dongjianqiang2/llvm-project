@@ -22,8 +22,11 @@
 #include "Config.h"
 #include "InputFiles.h"
 #include "InputSection.h"
+#include "Relocations.h"
+#include "Symbols.h"
 #include "lld/Common/ErrorHandler.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Object/ELFTypes.h"
@@ -32,6 +35,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <utility>
 
 using namespace lld;
 using namespace lld::elf;
@@ -104,6 +108,12 @@ XBBRAttrParseResult parseXBBRAttr(ArrayRef<uint8_t> Bytes) {
 struct BBAddrMapDecoded {
   std::vector<BBAddrMap> Maps;
   std::vector<PGOAnalysisMap> PGO;
+  /// Per-range InputSection, parallel to Maps.front().BBRanges. Under
+  /// -fbasic-block-sections=all each range is one BB's section; resolved from
+  /// the BBAddrMap BaseAddress relocations (decodeBBAddrMap drops the symbol
+  /// and keeps only the addend, so we re-read the relocations here). Empty if
+  /// the section has no relocation data.
+  std::vector<InputSectionBase *> RangeSections;
 };
 
 bool decodeBBAddrMap(InputSectionBase *S, BBAddrMapDecoded &Out) {
@@ -155,6 +165,34 @@ bool decodeBBAddrMap(InputSectionBase *S, BBAddrMapDecoded &Out) {
   }
   Out.Maps = std::move(*Maps);
   Out.PGO = std::move(PGO);
+
+  // Resolve each BB range's BaseAddress relocation to its per-BB
+  // InputSection. Under -fbasic-block-sections=all, one BBAddrMap section
+  // carries N ranges; each range's BaseAddress is an ABS relocation against
+  // that BB's section symbol. EF.decodeBBAddrMap resolves the BaseAddress to
+  // an addend (discarding the symbol), so we re-read the RELA section here,
+  // sort by r_offset (ranges are emitted in order), and pair positionally.
+  // This is the per-BB InputSection association that the offset-based code
+  // formerly lacked.
+  if (RelaShdr) {
+    auto Rels = EF.relas(*RelaShdr);
+    if (Rels) {
+      std::vector<std::pair<uint64_t, InputSectionBase *>> ByOff;
+      ByOff.reserve(Rels->size());
+      for (const typename ELFT::Rela &R : *Rels) {
+        Symbol &sym = OF->getRelocTargetSym(R);
+        auto *d = dyn_cast<Defined>(&sym);
+        auto *sec =
+            d ? dyn_cast_or_null<InputSectionBase>(d->section) : nullptr;
+        ByOff.emplace_back(R.r_offset, sec);
+      }
+      llvm::sort(ByOff, llvm::less_first());
+      for (auto &KV : ByOff)
+        Out.RangeSections.push_back(KV.second);
+    } else {
+      consumeError(Rels.takeError());
+    }
+  }
   return true;
 }
 
@@ -189,193 +227,194 @@ uint64_t computeGlobalFreq(uint64_t BBRaw, uint64_t EntryRaw,
 } // namespace
 
 bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
-  // Step 1: deterministically enumerate (ObjFile, text section) pairs
-  // and assign each a stable FuncId. The order is (ctx.objectFiles
-  // index, section index) — pure container traversal, no DenseMap.
-  for (ELFFileBase *FB : ctx.objectFiles) {
-    ArrayRef<InputSectionBase *> Secs = FB->getSections();
-    for (InputSectionBase *S : Secs) {
-      if (!S)
-        continue;
-      // We only build XBBRGraph nodes for executable text sections.
-      if (S->type != ELF::SHT_PROGBITS)
-        continue;
-      if ((S->flags & ELF::SHF_EXECINSTR) == 0)
-        continue;
-      if (SectionToFuncId.contains(S))
-        continue;
-      FuncId Fid = static_cast<FuncId>(Funcs.size());
-      SectionToFuncId.try_emplace(S, Fid);
-      FuncInfo FI;
-      FI.Section = S;
-      Funcs.push_back(FI);
-    }
-  }
-
-  // Step 2: for each ObjFile, walk its sections looking for the per-text
-  // BB_ADDR_MAP and `.llvm_xbbr_attr`. Both use SHF_LINK_ORDER
-  // attaching them to a text section; we resolve `link` to find the
-  // owning FuncId.
+  // Under -fbasic-block-sections=all (implied by -fbb-cross-reorder=partial|full,
+  // Phase 0a), each BB is its own InputSection and one SHT_LLVM_BB_ADDR_MAP
+  // section (with N ranges) describes a whole function. The BBAddrMap is the
+  // authority for function grouping: one BBAddrMap section == one function ==
+  // one FuncId. Each range's BaseAddress relocation resolves to that BB's
+  // InputSection (decodeBBAddrMap populates RangeSections). FuncIds are
+  // assigned in (objectFiles index, BBAddrMap section index) order — pure
+  // container traversal, deterministic (PLAN §6).
   for (ELFFileBase *FB : ctx.objectFiles) {
     ArrayRef<InputSectionBase *> Secs = FB->getSections();
     if (Secs.empty())
       continue;
 
-    // Pre-decode every BB_ADDR_MAP section in this ObjFile.
-    DenseMap<InputSectionBase *, BBAddrMapDecoded> DecodedMaps;
+    // XBBR is wired for ELF64LE (x86_64 + AArch64). Other input kinds are
+    // skipped silently so a mixed link doesn't take down the whole graph
+    // build; driver checks should already reject ELF32LE/ARM for partial/full
+    // (SPEC §8.1).
+    ObjFile<ELF64LE> *OF = dyn_cast<ObjFile<ELF64LE>>(FB);
+    if (!OF)
+      continue;
+    ELFFile<ELF64LE> EF = OF->getObj();
+    auto Shdrs = EF.sections();
+    if (!Shdrs) {
+      consumeError(Shdrs.takeError());
+      continue;
+    }
+
+    // Pre-decode every BBAddrMap section in this ObjFile (with RangeSections).
+    std::vector<BBAddrMapDecoded> DecodedMaps;
     for (InputSectionBase *S : Secs) {
       if (!S || S->type != ELF::SHT_LLVM_BB_ADDR_MAP)
         continue;
       BBAddrMapDecoded D;
-      if (!decodeBBAddrMap(S, D))
+      if (!decodeBBAddrMap(S, D) || D.Maps.empty())
         continue;
-      DecodedMaps[S] = std::move(D);
+      DecodedMaps.push_back(std::move(D));
     }
 
-    // Pre-decode every .llvm_xbbr_attr section attached to this
-    // ObjFile via SHF_EXCLUDE. The sections are NOT in
-    // FB->getSections() (they were marked discarded in InputFiles —
-    // SHF_EXCLUDE means they don't enter the output), so we have to
-    // fetch them from the raw Elf_Shdr table using the indices that
-    // ObjFile recorded for us. Map: sh_link → parsed attrs.
-    DenseMap<uint32_t, XBBRAttrParseResult> AttrsByLink;
-    {
-      // XBBR is wired for ELF64LE (x86_64 + AArch64). Other input kinds
-      // are skipped silently here so a mixed link (e.g. one ELF32 .o
-      // accidentally in the inputs) doesn't take down the whole graph
-      // build. Driver-level checks should already have rejected those
-      // cases for partial/full mode (SPEC §8.1).
-      ObjFile<ELF64LE> *OF = dyn_cast<ObjFile<ELF64LE>>(FB);
-      if (!OF)
+    // EH gate (Phase 1b): collect the set of function-name suffixes that own
+    // a `.gcc_except_table.<fn>` LSDA section. A function with an LSDA cannot
+    // have its non-landing-pad BBs migrated — the call_site ranges are byte
+    // offsets that stop mapping to the right BB once they drift. Under =all
+    // the FDEs are per-BB-section (so plain unwind follows migration), but
+    // LSDA dispatch still needs the whole function pinned. Match by the
+    // suffix shared between `.text.<fn>` and `.gcc_except_table.<fn>`.
+    llvm::StringSet<> ExceptTableSuffixes;
+    for (InputSectionBase *S : Secs) {
+      if (!S)
         continue;
-      auto Shdrs = OF->getObj().sections();
-      if (!Shdrs) {
-        consumeError(Shdrs.takeError());
-      } else {
-        for (uint32_t Idx : OF->xbbrAttrSectionIndices) {
-          if (Idx >= Shdrs->size())
-            continue;
-          const auto &Shdr = (*Shdrs)[Idx];
-          auto Bytes = OF->getObj().getSectionContents(Shdr);
-          if (!Bytes) {
-            consumeError(Bytes.takeError());
-            continue;
-          }
-          AttrsByLink[Shdr.sh_link] = parseXBBRAttr(*Bytes);
-        }
-      }
+      // gcc_except_table sections are SHF_ALLOC PROGBITS named
+      // `.gcc_except_table.<fn>` (or `.gcc_except_table` for the legacy
+      // single-section case, which we treat as gating nothing here since it
+      // can't be associated to a specific function by name).
+      StringRef N = S->name;
+      if (!N.starts_with(".gcc_except_table."))
+        continue;
+      ExceptTableSuffixes.insert(N.substr(strlen(".gcc_except_table.")));
     }
 
-    // For every text section in this file, look up its decoded
-    // BB_ADDR_MAP / .llvm_xbbr_attr and create XBBRNodes.
-    for (size_t SIdx = 0, E = Secs.size(); SIdx < E; ++SIdx) {
-      InputSectionBase *Text = Secs[SIdx];
-      if (!Text || Text->type != ELF::SHT_PROGBITS)
+    // Pre-decode .llvm_xbbr_attr sections, keyed by the ENTRY text section
+    // they attach to (sh_link → entry InputSection). One xbbr_attr per
+    // function; the entry section is BBAddrMap range 0. FB->getSections() is
+    // indexed in parallel with the ELF section headers, so getSections()[sh_link]
+    // is the entry section.
+    DenseMap<InputSectionBase *, XBBRAttrParseResult> AttrsByEntrySec;
+    for (uint32_t Idx : OF->xbbrAttrSectionIndices) {
+      if (Idx >= Shdrs->size())
         continue;
-      if ((Text->flags & ELF::SHF_EXECINSTR) == 0)
+      const auto &Shdr = (*Shdrs)[Idx];
+      if (Shdr.sh_link >= Secs.size())
         continue;
-
-      // Find sibling sections that link to this text section. The
-      // BB_ADDR_MAP is in `Secs` (it's not SHF_EXCLUDE); the
-      // `.llvm_xbbr_attr` was discarded from `Secs` and is fetched
-      // from AttrsByLink, keyed on sh_link.
-      InputSectionBase *AddrMap = nullptr;
-      for (InputSectionBase *S : Secs) {
-        if (!S || S->link != SIdx)
-          continue;
-        if (S->type == ELF::SHT_LLVM_BB_ADDR_MAP)
-          AddrMap = S;
+      InputSectionBase *entrySec = Secs[Shdr.sh_link];
+      if (!entrySec)
+        continue;
+      auto Bytes = EF.getSectionContents(Shdr);
+      if (!Bytes) {
+        consumeError(Bytes.takeError());
+        continue;
       }
-      if (!AddrMap)
-        continue; // No BB_ADDR_MAP — function not compiled for XBBR.
+      AttrsByEntrySec[entrySec] = parseXBBRAttr(*Bytes);
+    }
 
-      auto MIt = DecodedMaps.find(AddrMap);
-      if (MIt == DecodedMaps.end() || MIt->second.Maps.empty())
+    // Each decoded BBAddrMap = one function = one FuncId.
+    for (BBAddrMapDecoded &DM : DecodedMaps) {
+      const BBAddrMap &BAM = DM.Maps.front();
+      const PGOAnalysisMap *PAM =
+          DM.PGO.empty() ? nullptr : &DM.PGO.front();
+      const std::vector<InputSectionBase *> &RangeSecs = DM.RangeSections;
+      if (BAM.BBRanges.empty() || RangeSecs.empty())
+        continue;
+      // Every range must resolve to a section; range 0 (entry) is mandatory
+      // (it carries the function symbol — ABI §5.1).
+      InputSectionBase *entrySec = RangeSecs[0];
+      if (!entrySec)
         continue;
 
-      const BBAddrMap &BAM = MIt->second.Maps.front();
-      const PGOAnalysisMap *PAM = MIt->second.PGO.empty()
-                                      ? nullptr
-                                      : &MIt->second.PGO.front();
-
-      const std::vector<uint16_t> *FuncAttrs = nullptr;
-      auto AIt = AttrsByLink.find(SIdx);
-      if (AIt != AttrsByLink.end() && AIt->second.Ok &&
-          !AIt->second.PerFunc.empty()) {
-        // Assume one function per text section, which holds under
-        // -ffunction-sections (effectively required for BB-level
-        // reorder anyway). Generalizing to N functions per section
-        // would index into PerFunc by the BBAddrMap entry's position.
-        FuncAttrs = &AIt->second.PerFunc.front();
-      }
-
-      FuncId Fid = SectionToFuncId.lookup(Text);
-      assert(Fid != InvalidFuncId && "text section should already be mapped");
-      FuncInfo &FI = Funcs[Fid];
+      FuncId Fid = static_cast<FuncId>(Funcs.size());
+      FuncInfo FI;
+      FI.Section = entrySec;
       FI.FirstNode = static_cast<uint32_t>(Nodes.size());
       if (PAM) {
         FI.HasProfile = true;
         FI.EntryCount = PAM->FuncEntryCount;
       }
 
-      // Collect all BB entries across the function's BB ranges.
-      // BBRanges has 1 entry for normal functions, multiple for
-      // multi-section functions (post -fbasic-block-sections=all).
+      // Map every per-BB InputSection of this function → FuncId (so CGProfile
+      // edges and any section lookup resolve correctly).
+      for (InputSectionBase *RS : RangeSecs)
+        if (RS)
+          SectionToFuncId.try_emplace(RS, Fid);
+
+      // xbbr_attr for this function (attached to the entry section).
+      const std::vector<uint16_t> *FuncAttrs = nullptr;
+      auto AIt = AttrsByEntrySec.find(entrySec);
+      if (AIt != AttrsByEntrySec.end() && AIt->second.Ok &&
+          !AIt->second.PerFunc.empty())
+        FuncAttrs = &AIt->second.PerFunc.front();
+
+      // Flatten BB entries across ranges, carrying each BB's per-range
+      // InputSection. AsmPrinter emits ranges in `for (MBB : MF)` order, so
+      // positional pairing with PAM->BBEntries (same order) is well-defined.
       struct FlatEntry {
         BBId Id;
         uint32_t Size;
+        InputSectionBase *Sec;
       };
       std::vector<FlatEntry> Flat;
-      for (const auto &Range : BAM.BBRanges)
-        for (const auto &E : Range.BBEntries)
-          Flat.push_back({E.ID, E.Size});
+      for (size_t R = 0; R < BAM.BBRanges.size(); ++R) {
+        InputSectionBase *rsec = R < RangeSecs.size() ? RangeSecs[R] : nullptr;
+        for (const auto &E : BAM.BBRanges[R].BBEntries)
+          Flat.push_back({E.ID, E.Size, rsec});
+      }
 
-      // Optional consistency check: .llvm_xbbr_attr's num_bbs must
-      // match the BB_ADDR_MAP BB count. The compiler emits both from
-      // the same MIR pass; a mismatch means tampering or version skew.
+      // Consistency: .llvm_xbbr_attr num_bbs must match BBAddrMap BB count.
+      // The compiler emits both from the same MIR pass; mismatch = tampering
+      // or version skew.
       if (FuncAttrs && FuncAttrs->size() != Flat.size()) {
-        Err(ctx) << "XBBR Stage 0: " << Text->name << " in "
-                 << FB->getName()
-                 << ": .llvm_xbbr_attr num_bbs (" << FuncAttrs->size()
-                 << ") does not match BB_ADDR_MAP (" << Flat.size() << ")";
+        Err(ctx) << "XBBR Stage 0: " << entrySec->name << " in "
+                 << FB->getName() << ": .llvm_xbbr_attr num_bbs ("
+                 << FuncAttrs->size() << ") does not match BB_ADDR_MAP ("
+                 << Flat.size() << ")";
         return false;
       }
 
-      // Compute global_freq = BBFreq * EntryCount / EntryBBFreq.
+      // global_freq = BBFreq × EntryCount / EntryBBFreq (PLAN §3.2).
       uint64_t EntryRaw = 0;
       if (PAM && !PAM->BBEntries.empty())
         EntryRaw = PAM->BBEntries.front().BlockFreq.getFrequency();
 
-      // Walk Flat (BBAddrMap entries flattened across BBRanges) and
-      // PAM->BBEntries in lock-step. Both are emitted by AsmPrinter in
-      // `for (MBB : MF)` order (see AsmPrinter::emitBBAddrMapSection),
-      // so a positional pairing is well-defined regardless of BB IDs —
-      // the index `I` is *position*, not numeric BBID. This is also
-      // why we don't index into PAM->BBEntries by Flat[I].Id: the
-      // pairing is by emission order, not by ID.
       for (size_t I = 0; I < Flat.size(); ++I) {
         XBBRNode N;
         N.Func = Fid;
         N.BB = Flat[I].Id;
         N.Size = Flat[I].Size;
+        N.BBSection = Flat[I].Sec;
         if (PAM && I < PAM->BBEntries.size())
           N.GlobalFreq = computeGlobalFreq(
               PAM->BBEntries[I].BlockFreq.getFrequency(), EntryRaw,
               FI.EntryCount);
-        else
-          N.GlobalFreq = 0;
         N.XBBRAttrs = FuncAttrs ? (*FuncAttrs)[I] : 0;
-
         BBKey K{Fid, N.BB};
         BBIndex.try_emplace(K, static_cast<uint32_t>(Nodes.size()));
         Nodes.push_back(N);
       }
       FI.NumNodes = static_cast<uint32_t>(Nodes.size()) - FI.FirstNode;
 
-      // Collect intra-function CFG edges from BBAddrMap BrProb data.
-      // PGOBBEntry::Successors carries (target-BB-ID, BranchProbability)
-      // per source BB. These edges are the primary input to ExtTSP in
-      // Stage 2, alongside the cross-function call edges from CGProfile.
+      // EH gate (Phase 1b): gate if the function has a landing pad or owns an
+      // LSDA (`.gcc_except_table.<fn>`). The entry section name is
+      // `.text.<fn>` under -ffunction-sections (implied), so the function
+      // suffix is everything after the first `.text.` component.
+      bool HasLandingPad = false;
+      for (uint32_t I = FI.FirstNode; I < Nodes.size(); ++I)
+        if (Nodes[I].isLandingPad()) {
+          HasLandingPad = true;
+          break;
+        }
+      bool HasLSDA = false;
+      StringRef EntryName = entrySec->name;
+      // Strip a leading `.text.` (or `.text.{hot,unlikely,split,eh}.`) to get
+      // the function suffix shared with `.gcc_except_table.<fn>`.
+      if (EntryName.starts_with(".text."))
+        HasLSDA = ExceptTableSuffixes.contains(EntryName.substr(strlen(".text.")));
+      FI.IsEHGated = HasLandingPad || HasLSDA;
+      Funcs.push_back(FI);
+
+      // Intra-function CFG edges from BBAddrMap BrProb (PGOBBEntry::Successors
+      // carries (target-BB-ID, BranchProbability) per source BB). Primary input
+      // to ExtTSP in Stage 2, alongside cross-function call edges from CGProfile.
       if (PAM) {
         for (size_t I = 0; I < Flat.size(); ++I) {
           if (I >= PAM->BBEntries.size())
@@ -389,15 +428,13 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
             XBBREdge E;
             E.SrcNode = SrcIdx;
             E.DstNode = *Dst;
-            // Scale the branch probability to an absolute count using the
-            // source BB's global frequency. BranchProbability::scale() does
-            // Prob/denom * GlobalFreq, yielding an approximate execution
-            // count for this edge.
+            // Scale branch probability to an absolute count using the source
+            // BB's global frequency: Prob/denom × GlobalFreq ≈ edge exec count.
             E.Weight = static_cast<uint64_t>(
                 Succ.Prob.scale(uint64_t(Nodes[SrcIdx].GlobalFreq)));
-            // Fallthrough iff the successor BB immediately follows the
-            // source BB in the original function order (BB IDs are dense
-            // and sequential after RenumberBlocks).
+            // Fallthrough iff the successor BB immediately follows the source
+            // BB in original function order (BB IDs are dense after
+            // RenumberBlocks).
             E.IsFallthrough = (Flat[I].Id + 1 == Succ.ID);
             E.IsCrossFunc = false;
             E.IsIndirectCall = false;
@@ -408,10 +445,6 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
     }
   }
 
-  // Funcs may contain entries with NumNodes==0: text sections that
-  // weren't compiled with -fbb-cross-reorder= and therefore have no
-  // BB_ADDR_MAP. Keeping them around preserves stable FuncIds and is
-  // harmless (downstream code defends with NumNodes==0 checks).
   return true;
 }
 
@@ -473,7 +506,44 @@ bool XBBRGraph::build(Ctx &ctx) {
     return false;
   if (!runConsistencyChecks(ctx))
     return false;
+  markRangeAnchors(ctx);
   return true;
+}
+
+void XBBRGraph::markRangeAnchors(Ctx &ctx) {
+  // Only AArch64 has unthunkable short-range conditional/test branches
+  // (B.cond ±1 MiB via R_AARCH64_CONDBR19, TBZ/TBNZ ±32 KiB via
+  // R_AARCH64_TSTBR14). On x86 Jcc is rel32 (never overflows); on other
+  // arches XBBR isn't wired. No-op there.
+  if (ctx.arg.emachine != ELF::EM_AARCH64)
+    return;
+
+  // Map each per-BB InputSection back to its node (under =all one section
+  // per BB). Used to resolve a conditional branch's target to the dst node.
+  DenseMap<const InputSectionBase *, uint32_t> secToNode;
+  for (uint32_t I = 0; I < Nodes.size(); ++I)
+    if (Nodes[I].BBSection)
+      secToNode.try_emplace(Nodes[I].BBSection, I);
+
+  for (uint32_t I = 0; I < Nodes.size(); ++I) {
+    InputSectionBase *src = Nodes[I].BBSection;
+    if (!src)
+      continue;
+    for (const Relocation &r : src->relocs()) {
+      if (r.type != ELF::R_AARCH64_CONDBR19 &&
+          r.type != ELF::R_AARCH64_TSTBR14)
+        continue;
+      // This BB issues a conditional/test branch — pin it (can't thunk).
+      Nodes[I].CondInvolved = true;
+      // Pin the target too: if the target BB migrates away, the branch
+      // overflows just the same. Resolve reloc target → its section → node.
+      auto *d = dyn_cast<Defined>(r.sym);
+      auto *tsec = d ? dyn_cast_or_null<InputSectionBase>(d->section) : nullptr;
+      auto it = tsec ? secToNode.find(tsec) : secToNode.end();
+      if (it != secToNode.end())
+        Nodes[it->second].CondInvolved = true;
+    }
+  }
 }
 
 FuncId XBBRGraph::sectionToFunc(const InputSectionBase *S) const {

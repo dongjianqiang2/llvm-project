@@ -62,16 +62,24 @@
 # RUN:     --unresolved-symbols=ignore-all -o exe.run2
 # RUN: cmp exe.run1 exe.run2
 
-# Functional equivalence (SPEC §10): same section list / sizes
-# regardless of XBBR being on (with no decision map being emitted).
+# Functional equivalence (SPEC §10): XBBR partial mode now physically
+# reorders BBs (Phase 2), so the .text byte layout legitimately differs
+# from a plain link. What must still hold: both links succeed, produce the
+# same set of output section NAMES, and a non-empty .text. (Byte-identical
+# section headers were a placeholder for the pre-physical-emission era; the
+# reproducibility cmp above is the real correctness gate for determinism.)
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --unresolved-symbols=ignore-all -o exe.plain
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --bb-cross-reorder=foo.profdata --bb-cross-reorder-mode=partial \
 # RUN:     --unresolved-symbols=ignore-all -o exe.xbbr.nomap
-# RUN: llvm-readelf -SW exe.plain      | sed -n '/Section Headers/,/^Key to Flags/p' > plain.sections
-# RUN: llvm-readelf -SW exe.xbbr.nomap | sed -n '/Section Headers/,/^Key to Flags/p' > xbbr.sections
+# RUN: llvm-readelf -SW exe.plain      | sed -n '/Section Headers/,/^Key to Flags/p' \
+# RUN:     | awk '{print $$2}' | sort > plain.sections
+# RUN: llvm-readelf -SW exe.xbbr.nomap | sed -n '/Section Headers/,/^Key to Flags/p' \
+# RUN:     | awk '{print $$2}' | sort > xbbr.sections
 # RUN: cmp plain.sections xbbr.sections
+# RUN: llvm-readelf -SW exe.xbbr.nomap | FileCheck %s --check-prefix=HAS-TEXT
+# HAS-TEXT: .text
 
 # Strip removes only .debug_xbbr_decision.
 # RUN: cp exe.xbbr exe.stripped

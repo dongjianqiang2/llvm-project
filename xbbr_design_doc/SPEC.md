@@ -188,11 +188,13 @@ PLAN Stage 3/4 须将上述四项纳入 `SizeOverhead` 与回退判定；超预�
 
 | 既有特性 | 关系 |
 |---|---|
-| `-fbasic-block-sections=labels` | XBBR `partial` 自动启用 `labels`，`full` 启用 `all` |
+| `-fbasic-block-sections` | XBBR `partial`/`full` **隐含 `=all`**（连同 `-ffunction-sections` + `-funique-basic-block-section-names`）：每个 BB 成为独立 InputSection，是链接期物理重排的 substrate（lld 无链接时代码碎片化机制，单 section 函数的函数内分支为 baked-in pcrel 立即数，不重编码指令无法切分）。`function` 模式不隐含 BB sections（仅 CGProfile）。AArch64 上同时禁用 BranchRelaxation——否则 `addPostBBSections` 在 BB-sections 成形后插入未跟踪 MBB 破坏图；用户手传 `-fbasic-block-sections=all` 的 AArch64 拒绝仍保留，XBBR 经 BackendUtil 绕过。 |
 | `-fsplit-machine-functions` | 提供冷热划分基线 |
 | `--call-graph-profile-sort` | 作为函数级 baseline，被 XBBR Stage 1 接管 |
 | `BOLT` | 可叠加（BOLT 消费 XBBR 决策 map）；亦可单独使用 |
 | `Propeller` (`--symbol-ordering-file`) | **互斥**，链接器侧检测：同时启用报错 |
+
+> **substrate 回写（2026-06-21）**：早先 SPEC 仅写"`full` 启用 `all`"。落地实现确认 `partial` 同样隐含 `=all`——`partial`/`full` 共享同一 per-BB-InputSection 物理重排管线，差异仅在哪些 BB 被允许迁移（`partial` 排除冷 BB）。因此 substrate 是用户可观测行为（`.o` 体积变化、AArch64 codegen 因禁松弛而异），属契约范畴，记入本表。机制细节见 PLAN §3.3/§4.3。
 
 ---
 

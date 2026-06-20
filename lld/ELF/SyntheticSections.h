@@ -208,6 +208,11 @@ public:
 
   /// Set the full entry table. Called by Stage 5 (SectionEmitter).
   void setEntries(std::vector<XBBRDecisionEntry> &&e) { Entries = std::move(e); }
+  /// Mutable access for the post-layout VA backfill (Phase 3): once
+  /// finalizeAddressDependentContent has assigned real addresses, the
+  /// SectionEmitter patches each entry's OrigFuncAddr/NewAddress from the
+  /// placeholder/projected values to the final linked VAs.
+  std::vector<XBBRDecisionEntry> &entries() { return Entries; }
   /// Set the degraded flag (SPEC §7). When true, bit 0 of the header flags
   /// field is set to indicate the pipeline fell back to function-level mode.
   void setDegraded(bool d) { Degraded |= d; } // monotonic: once degraded, never unset

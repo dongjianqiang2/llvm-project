@@ -139,9 +139,10 @@ entry_count(F)  = F 的绝对入口执行次数
 ```
 
 - **数据来源（均已存在于 `SHT_LLVM_BB_ADDR_MAP`，无需新 section）**：
-  - `local_freq(BB)` ← `BBAddrMap::BBEntry` 的 `BBFreq`（来自 `MachineBlockFrequencyInfo`）；
+  - `BBFreq(BB)` ← `BBAddrMap::BBEntry` 的 `BBFreq`，来自 `MachineBlockFrequencyInfo`。**注意**：BBAddrMap 存的是 BFI **原始**定标频率（入口块取实现最大值，**非** 1.0），故 `local_freq = P(BB|entry)` 需用入口块原始频率归一化，链接器实际计算为
+    `global_freq(BB) = BBFreq(BB) × FuncEntryCount / BBFreq(entry_block)`（`lld/ELF/XBBR/XBBRGraph.cpp::computeGlobalFreq`，128-bit 防溢出）。早先公式 `local_freq × entry_count` 把 `local_freq` 当作已归一的相对频率，与 BBAddrMap 实际存储的原始定标不符——回写 2026-06-21 修正。
   - `entry_count(F)` ← `BBAddrMap` 的 `FuncEntryCount`（来自 `MF.getFunction().getEntryCount()`，由 `PGOInstrumentationUse` 填充，**非**直接读取 `__llvm_prf_cnts`）。
-  - 两者在 BB_ADDR_MAP 中分属不同 scale（`BBFreq` 为入口相对、`FuncEntryCount` 为绝对计数），乘积即得绝对执行次数。链接器在 Stage 0 直接组合二者，无需编译器侧再发 `.llvm_bb_freq`。
+  - `FuncEntryCount` 为绝对计数、`BBFreq` 为 BFI 原始定标；归一化后的乘积即得绝对执行次数。链接器在 Stage 0 直接组合二者，无需编译器侧再发 `.llvm_bb_freq`。
 - **语义正确性（回应评审：公式非缺陷）**：`local_freq` 是条件概率 `P(BB|entry)`，已天然聚合所有 callsite。冷调用路径的 BB 其 `local_freq` 已反映低条件概率，乘积给出正确的绝对计数，不存在"高估"。提前返回函数的出口块 `local_freq < 1.0`，乘积同样正确。递归函数的 `entry_count` 是**实测的含递归总调用次数**（非会复利的乘子），`local_freq × entry_count` 正确给出绝对执行次数，无"几何放大"。上下文敏感（按 callsite 拆分）是 flat PGO 的已知限制，列入 SPEC §11 未来工作。
 - **递归函数在聚类中的去重（真正需注意处）**：Stage 1 计算函数级密度应使用 `entry_count(F)`（调用次数），**而非** `Σ_BD global_freq(BB)`——后者会随递归深度膨胀，使递归函数被过度优先。函数内 BB 级布局（Stage 2）才使用 per-BB `global_freq`。递归自调用边 `F→F` 复用 `CallGraphSort` 既有处理（自环跳过/截断）。
 - **缺失 profile 的回退**：若 `getEntryCount()` 返回 `None`（函数未被插桩/profile 不含该函数），则 `global_freq` 不可比较，该函数按 SPEC §3.1 视为冷、不参与跨函数迁移。
@@ -151,6 +152,7 @@ entry_count(F)  = F 的绝对入口执行次数
 
 - **位置**：`MachineBlockPlacement` 之后、`AsmPrinter` 之前。
 - **触发条件**：`-fbb-cross-reorder={partial,full}` 启用时（`function` 模式不需要 BB 元数据，仅需 CGProfile）。
+- **substrate 副作用（回写 2026-06-21，对应 SPEC §6.3）**：`partial`/`full` 在 `clang/lib/CodeGen/BackendUtil.cpp` 同时置 `Options.BBSections = All` + `FunctionSections = true` + `UniqueBasicBlockSectionNames = true`，使每个 BB 成为独立 InputSection——这是链接期物理重排的 substrate（§4.3 Stage 5）。AArch64 额外经 `cl::opt` 桥禁用 `aarch64-enable-branch-relax`，否则 `addPostBBSections` 在 BB-sections 成形后跑 BranchRelaxation 会插入未跟踪 MBB 破坏 BBAddrMap；用户手传 `-fbasic-block-sections=all` 的 AArch64 驱动拒绝保留，XBBR 经 BackendUtil 绕过。`function` 模式不触发上述副作用。
 - **输入**：MBFI、MBPI、`MachineFunctionSplitter` 的冷热划分、黑名单分析结果。
 - **输出**（遵循 §3.1 复用原则，避免与既有 section 重复）：
   - **频率 + 函数内 CFG 边权重**：通过启用 BB_ADDR_MAP 的 `FuncEntryCount`/`BBFreq`/`BrProb` feature 承载（`-pgo-analysis-map=...`），不再单独发 `.llvm_bb_freq`/`.llvm_cfg_edge`。
@@ -215,9 +217,10 @@ entry_count(F)  = F 的绝对入口执行次数
 
 #### Stage 0 — 全局 BB graph 构建
 
-- 遍历所有输入 `.o`，解析 `.llvm_bb_freq` / `.llvm_cfg_edge` / `.llvm_xbbr_attr` / `SHT_LLVM_BB_ADDR_MAP`。
-- 构建统一的 `XBBRGraph`（见 §8），节点 = BB，边 = CFG 边（含跨函数调用边）。
-- 用 `.llvm_xbbr_attr` 标记黑名单节点为 anchor。
+- 遍历所有输入 `.o`，解析 `SHT_LLVM_BB_ADDR_MAP`（PGO feature）+ `.llvm_xbbr_attr` + CGProfile。（§9.1/§9.2 的独立 `.llvm_bb_freq`/`.llvm_cfg_edge` 仅作回退方案，首期不复用。）
+- **per-BB InputSection 关联（回写 2026-06-21）**：在 `-fbasic-block-sections=all` substrate（§3.3）下，一个 BBAddrMap section（含 N 个 `BBRangeEntry`）描述一整个函数，每个 range 的 `BaseAddress` 是一条 `R_AARCH64_ABS64` 重定位指向该 BB 的 section 符号。`EF.decodeBBAddrMap` 解析时丢弃符号只留 addend，故 Stage 0 自行重读 RELA 段、按 `r_offset` 排序与 range 位置配对，把每个 range 解析到其 per-BB `InputSectionBase*`，挂在 `XBBRNode::BBSection`（§8.1）。**一个 BBAddrMap = 一个函数 = 一个 `FuncId`**（不是每个 text section 一个 FuncId）；`SectionToFuncId` 把该函数每个 per-BB section 都映射到同一 FuncId。读 `BBEntry::Offset`/`Size` 并与 section 大小做一致性断言。EH gate（`FuncInfo::IsEHGated`，§5.3）在此分类。
+- 构建统一的 `XBBRGraph`（见 §8），节点 = BB（携带 `BBSection` 作为物理放置单元），边 = CFG 边（含跨函数调用边）。
+- 用 `.llvm_xbbr_attr` 标记黑名单节点为 anchor；`markRangeAnchors` 在 AArch64 上额外把 `R_AARCH64_CONDBR19`/`TSTBR14` 的源与目标标 `CondInvolved`（§4.3 Stage 4）。
 - 函数入口块天然为 anchor（SPEC §5.1）。
 
 #### Stage 1 — 函数簇粗排（hfsort+）
@@ -265,6 +268,8 @@ Cost(layout) = Σ w_icache · ICacheLineCrossings(e)
 
 #### Stage 4 — 单 BB 约束求解与回退
 
+> **落地现状（回写 2026-06-21）**：下文伪码描述的是设计目标态（投影 VA + thunk 预算 + 松弛复检 + 单调 pin 回退 + 30% 整体降级）。当前 AArch64 实现采用**保守守卫**简化：`XBBRGraph::markRangeAnchors` 在 Stage 0 即把 `R_AARCH64_CONDBR19`（B.cond ±1MiB）/`R_AARCH64_TSTBR14`（TBZ/TBNZ ±32KiB）的源与目标标 `CondInvolved`，`BBLayout::collectMigratableBBs` 把它们当 anchor（永不迁移）。理由：这两类重定位**不可被 lld thunk**（只有 B/BL `JUMP26`/`CALL26` 可），迁移其端点会在写时 `checkInt` 硬报错；守卫式 pinning 100% 安全，代价是条件分支密集函数的 BB 级迁移受限（函数级聚簇仍生效）。`B`/`BL` 超距由既有 `finalizeAddressDependentContent` thunk 循环自动处理（§4.3 Stage 5），`--bb-cross-reorder-max-thunk-bytes` 预算与 30% 整体降级**尚未接通**（未来工作）。投影-VA 精确范围求解（允许范围内条件分支 BB 迁移、级联回退、末梢复核）是后续扩展。
+
 ```python
 pinned = {}          # FuncId -> set(BB)，已回退/锚定的 BB，永不再迁移
 fallback_count = 0
@@ -275,6 +280,7 @@ for iteration in range(MAX_ITERS):
     changed = False
     for each migrated BB B not in pinned:        # 仅检查仍漂移者
         if B in blacklist (assertion/sanity) \
+           or B.CondInvolved (AArch64 B.cond/TBZ 端点，已前置 pin) \
            or branch from/to B exceeds ISA range and thunk would exceed budget \
            or B's EH range conflicts with neighbor placement \
            or relax_recheck(B) violates range:    # 链接器松弛后复检（§4.5）
@@ -301,7 +307,7 @@ else:
 
 #### Stage 5 — Section Emission
 
-> **M3 范围**：M3 实现了 `XBBRLayoutResult`（各阶段布局输出）+ `SectionEmitter` 生成 BBFragment 与决策 map BB 级条目（`.debug_xbbr_decision` 含完整 `XBBRDecisionEntry`）。物理 BB 级重排 `.text.hot`/`.text.unlikely` 输出（含 thunk 生成、对齐放置、跨段跳转补丁）推迟到 M5。M3 的 `.text` 布局仍走既有 hfsort+ 函数级路径，但管线已产出完整的 per-BB 决策数据以供验证和后续消费。
+> **落地现状（回写 2026-06-21，AArch64）**：物理重排**已落地**——`Writer.cpp::buildSectionOrder` 在非降级布局时从 `XBBRLayoutResult::ClusterBBOrders` 产出 per-BB `InputSection` 优先级 map，喂入既有 `sortISDBySectionOrder`：迁移的 per-BB section 按 XBBR 序物理放置，入口/anchor/EH-gated BB 留在 unordered 集合（由符号跟踪其位置 → ABI §5.1 自动成立，ordered 块插 unordered 中点以最小化 B/BL thunk）。`B`/`BL` 超距由既有 `finalizeAddressDependentContent` thunk 循环自动插入 `AArch64Thunks`（无需 XBBR 专用 thunk 代码）。`optimizeBasicBlockJumps` 之后 `backfillDecisionMapVAs` 把决策 map 的 `OrigFuncAddr`/`NewAddress` 从占位/投影值改为真链后 VA（§9.4）。**尚未落地**（未来工作）：`.text.hot`/`.text.warm`/`.text.unlikely` 三段分离（需在 Driver 孤儿段路由前改名 + 隐含 `-z keep-text-section-prefix`）、`$xbbr.<fn>.bb<N>` 本地符号别名、对齐上限放置、末梢体积复核、`--bb-cross-reorder-max-thunk-bytes` 预算接通、DWARF/EH 完整重写（§5）。
 
 输出三段（`.text.warm` 可选）：
 - `.text.hot`：被识别为热路径簇的 BB（来自所有原函数）。
@@ -366,6 +372,8 @@ $xbbr.<orig_func>.bb<N>
 
 ### 5.3 EH 重写（`.eh_frame` / `.gcc_except_table` / `.eh_frame_hdr`）
 
+> **落地现状与关键简化（回写 2026-06-21）**：在 `-fbasic-block-sections=all` substrate 下，编译器对每个 per-BB section 发一个 FDE（实测 3-BB 函数 = 3 个 FDE），FDE 的 PC-begin 是指向该 BB section 的重定位。因此**普通 unwind 的 FDE 随 BB 迁移自动跟随**（PC-begin 重定位解析到迁移后地址）——**无需 EHRewriter 做 FDE 拆分**。唯一破坏是 **LSDA**：`.gcc_except_table.<fn>` 的 call_site 范围是相对入口的字节偏移，非 landing-pad BB 一旦个体漂移就错位。故 mechanism-first 阶段采用 **EH gate**（`FuncInfo::IsEHGated`，Stage 0 分类）：函数有 `.gcc_except_table.<fn>` 或 landing pad 即标 gated，`BBLayout::collectMigratableBBs` 把该函数**所有** BB 当 anchor（个体不漂移）；**整体移动仍允许**（LSDA 偏移是入口相对，整体平移后仍正确）。这保证 SPEC §5.4 栈展开正确，且 FDE 拆分 / `.eh_frame_hdr` 重建 / LSDA 重写可整体推迟到"解除 EH gate"的后续工作。下文 FDE 拆分 + `.eh_frame_hdr` 重建是**未来 EHRewriter** 的设计，当前未实现。
+
 - 每个独立放置的 BB 段生成单独 FDE，CIE 中 personality routine 保持一致。
 - 原 FDE 拆分为 N 个，各自 `initial_location` + `address_range` 精确覆盖该 BB 段。
 - `.gcc_except_table` 的 LSDA call_site_table 用绝对地址重写，与漂移后地址对齐。
@@ -373,7 +381,7 @@ $xbbr.<orig_func>.bb<N>
   - **顺序约束**：`EHRewriter` 必须在 `EhFrameHeader` 生成**之前**完成 FDE 拆分，使拆分后的 N 个 FDE 作为存活 FDE 被 `getFdeData()` 扫到、按 `initial_location` 重新排序建表。即 EHRewriter 产出的 FDE 列表直接喂给既有 `EhFrameHeader` 流程，无需新写建表代码。
   - 漂移函数的表项数从 1 增至 N，`.eh_frame_hdr` 体积增长计入 §2.2 体积预算（每条 ~8B）。
 - ARM `.ARM.exidx` 多段化见 §5.4。
-- 实现位置：lld Stage 5 的 `EHRewriter`（新增，复用 lld 既有 `EhFrameSection`/`EhFrameHeader` 基础设施）。
+- 实现位置：lld Stage 5 的 `EHRewriter`（新增，复用 lld 既有 `EhFrameSection`/`EhFrameHeader` 基础设施）。**当前为 stub/未实现**；EH gate 在其落地前保证正确性。
 
 ### 5.4 ARM/AArch64 栈展开（`.ARM.exidx`）
 
@@ -505,9 +513,11 @@ struct XBBRNode {
   uint32_t InputFileIdx;   // 输入 .o 索引
   uint32_t FuncId;         // ★ Stage 0 分配的内部函数 ID（非 .symtab 索引）
   uint32_t BBIndex;        // 函数内 BB 索引
+  InputSectionBase *BBSection; // ★ per-BB InputSection（=all substrate 的物理放置单元）
   uint64_t Size;           // BB 字节数（post-relaxation，见 §4.5）
-  uint64_t GlobalFreq;     // 全局频率（= BBFreq × FuncEntryCount，取自 BB_ADDR_MAP）
+  uint64_t GlobalFreq;     // 全局频率（= BBFreq × FuncEntryCount / EntryBBFreq，见 §3.2）
   uint8_t  Attrs;          // 属性位（来自 .llvm_xbbr_attr + BBEntry::Metadata 复用位）
+  bool CondInvolved;       // ★ AArch64: B.cond/TBZ 源/目标 → 不可迁移（§4.3 Stage 4）
   bool isAnchor() const {  // 入口块或黑名单 → 固定位置
     return (Attrs & IS_ENTRY) || isBlacklisted();
   }
@@ -538,6 +548,8 @@ class XBBRGraph {
 > - **函数关联**：复用 BB_ADDR_MAP 的 **section 依附**机制（元数据 section 附在函数 text section 上，AsmPrinter 已用 `FunctionSymbol` 而非 symtab 索引）。
 > - **跨函数调用边**：CGProfile 边以 **MCSymbol（符号名）** 编码（`{From, To, Count}`），链接器按符号表解析为 `FuncId`，与既有 CGProfile 消费路径一致。
 > - `FuncId` 由 Stage 0 按 `(input_file_index, function_text_section)` 稳定分配，遍历前显式排序（§6.2），保证确定性。
+
+> **数据结构回写（2026-06-21）**：本节结构为设计草图；实现源真在 `lld/ELF/XBBR/XBBRTypes.h`（`XBBRNode`/`XBBREdge`/`BBPlacement`/`XBBRLayoutResult`）与 `XBBRGraph.h`（`FuncInfo`/`XBBRGraph`）。实际字段名与草图有出入（如 `Func`/`BB`/`XBBRAttrs`(u16) 而非 `FuncId`/`BBIndex`/`Attrs`(u8)；`SectionToFuncId` 而非 `FuncToBBs`；`FuncInfo::IsEHGated` 见 §5.3）。新增的 `BBSection`（per-BB 物理放置单元，§4.3 Stage 0）与 `CondInvolved`（§4.3 Stage 4 守卫）已并入草图。`XBBRLayoutResult` 持久化于 `Ctx::xbbrLayoutResult`（Phase 3 回填真 VA）。
 
 ### 8.2 `FunctionCluster` / `BBOrder`（布局输出）
 
@@ -669,13 +681,15 @@ Header (16 bytes):
     uint32  flags;              // bit 0: degraded (Stage 4 回退到 function 模式)
                                 // bits 1-31 reserved
 For each entry (32 bytes):
-    uint64  orig_func_addr;     // 原函数入口块的链接时绝对地址 (M3: placeholder 0; M5 填真 VA)
+    uint64  orig_func_addr;     // 原函数入口块的链接时绝对地址 (已落地: 真链后 VA)
     uint32  bb_index;           // 函数内 BB 索引
-    uint64  new_address;        // 重排后地址 (M3: 投影偏移; M5 填真 VA)
+    uint64  new_address;        // 重排后地址 (已落地: 真链后 VA)
     uint32  cluster_id;         // 所属热簇编号
     uint32  decision_flags;     // moved | anchored | fallback | thunk
-    uint32  func_id;            // 内部 FuncId，标识所属函数 (M3 填写；M5 保持)
+    uint32  func_id;            // 内部 FuncId，标识所属函数
 ```
+
+> **VA 回填回写（2026-06-21）**：早先 `orig_func_addr`/`new_address` 标注为 "M3 placeholder 0 / 投影偏移，M5 填真 VA"。`SectionEmitter::backfillDecisionMapVAs`（在 `Writer::finalizeAddressDependentContent` + `optimizeBasicBlockJumps` 之后调用）已把二者改为真实链接后 VA（`orig_func_addr` = 函数入口 section VA，`new_address` = per-BB section VA），`cluster_id`/`func_id` 同步填真值。entry 数量在 `runSectionEmitter`（`buildSectionOrder` 内）已定，回填只 patch VA/flag 字段，**无需二次 finalize**（`getSize` 仅依赖 entry 数）。`decision_flags` 中 `Thunk` 位的填充（检测 BB 重定位目标是否为 thunk 符号）尚未接通，属未来工作。
 
 默认进入二进制但不可加载（`SHF_ALLOC` 不置位，故不进 loadable 段、不计入 §2.2 体积预算），由 `strip --strip-debug` 自动剥离（依赖 `.debug_` 前缀的标准识别行为）。无需新 `SHT_LLVM_*` 类型常量——使用保留段名 `.debug_xbbr_decision` + `SHT_PROGBITS` 即可（与 `.debug_*` 既有"按名识别"段一致）。
 
@@ -688,6 +702,8 @@ For each entry (32 bytes):
 ## 10. 里程碑实现分解
 
 对应 SPEC §10 的 M1–M5，每里程碑拆为可独立 review 的子任务。
+
+> **里程碑状态回写（2026-06-21，AArch64）**：物理 BB 级 section emission 机制已落地（Phase 0–3）——`-fbb-cross-reorder=partial|full` 隐含 `=all`、Stage 0 per-BB InputSection 关联、Stage 4 `CondInvolved` 距离守卫、Stage 5 经 `sectionOrder` 物理重排 + 决策 map 真 VA 回填、EH gate 保证栈展开正确。端到端在 AArch64 证明 BB 真实跨函数移动（`lld/test/ELF/xbbr/xbbr-aarch64-physical-migration.s`）。**仍未完成（M5 后续）**：`.text.hot`/`.text.unlikely` 段分离、`$xbbr.<fn>.bb<N>` 符号别名、对齐上限放置、末梢体积复核、`--bb-cross-reorder-max-thunk-bytes` 预算接通、DWARF/CFI/EH 完整重写（解除 EH gate）、ARM(ELF32LE) 支持、PIE/动态库、`full` mode 真行为差异量化、§9.2 量化门槛、`experimental-` 前缀。M1–M4 的元数据/算法/工具部分此前已落地，本回写不重复。
 
 ### M1 — 编译器元数据 + clang 选项
 

@@ -496,6 +496,33 @@ static bool initTargetOptions(const CompilerInstance &CI,
   Options.UniqueSectionNames = CodeGenOpts.UniqueSectionNames;
   Options.UniqueBasicBlockSectionNames =
       CodeGenOpts.UniqueBasicBlockSectionNames;
+
+  // XBBR partial/full implies per-BB sections as the link-time reorder
+  // substrate (SPEC §6.3 maps full→all; partial reuses it). Forced here,
+  // after the unconditional CodeGenOpts assignments above, so they aren't
+  // clobbered. Each BB becomes its own InputSection with real cross-BB
+  // branch relocations — the only way lld can physically move BBs without
+  // instruction re-encoding (intra-function branches are baked-in pcrel
+  // immediates in single-section functions).
+  //
+  // On AArch64, -fbasic-block-sections=all is normally driver-rejected
+  // (Clang.cpp ~6204) because BranchRelaxation inserts untracked MBBs after
+  // BB-sections form. XBBR sidesteps that hazard by disabling
+  // BranchRelaxation for XBBR builds and pushing all range safety to
+  // link-time Stage 4 (CONDBR19/TSTBR14 revert) + the lld thunk loop
+  // (JUMP26/CALL26). 'function' mode does NOT imply BB sections (SPEC §6.3).
+  if (BBCRMode == "partial" || BBCRMode == "full") {
+    Options.BBSections = llvm::BasicBlockSection::All;
+    Options.FunctionSections = true;
+    Options.UniqueBasicBlockSectionNames = true;
+    if (llvm::Triple(TargetOpts.Triple).isAArch64()) {
+      if (auto *BR = static_cast<llvm::cl::opt<bool> *>(
+              llvm::cl::getRegisteredOptions().lookup(
+                  "aarch64-enable-branch-relax")))
+        BR->setValue(false);
+    }
+  }
+
   Options.SeparateNamedSections = CodeGenOpts.SeparateNamedSections;
   Options.TLSSize = CodeGenOpts.TLSSize;
   Options.EnableTLSDESC = CodeGenOpts.EnableTLSDESC;

@@ -50,7 +50,12 @@ std::vector<FunctionCluster>
 clusterFunctions(const XBBRGraph &graph, XBBRClusterAlgo /*algo*/) {
   ArrayRef<FuncInfo> funcs = graph.funcs();
 
-  // Filter: only functions with BB data (NumNodes > 0) participate.
+  // Filter: only functions with BB data (NumNodes > 0) participate. EH-gated
+  // functions (Phase 1b: LSDA/landing-pad) still participate in clustering —
+  // moving a function *wholesale* (all BBs contiguous) preserves LSDA
+  // call_site offsets (they are relative to the entry). Only *individual* BB
+  // migration breaks LSDA, so collectMigratableBBs treats every BB of an
+  // EH-gated function as a non-migratable anchor.
   SmallVector<FuncId, 16> candidates;
   for (uint32_t F = 0; F < funcs.size(); ++F)
     if (funcs[F].NumNodes > 0)
@@ -69,7 +74,10 @@ clusterFunctions(const XBBRGraph &graph, XBBRClusterAlgo /*algo*/) {
       sz += N.Size;
     nodes[F].Size = sz;
     nodes[F].Weight = funcs[F].EntryCount;
-    nodes[F].Next = static_cast<int>(F);
+    // Linear list: Prev==self marks the chain head (and walks toward head);
+    // Next==-1 marks the tail. (A circular list would conflict with the
+    // Prev==self head test.)
+    nodes[F].Next = -1;
     nodes[F].Prev = static_cast<int>(F);
   }
 
@@ -125,10 +133,16 @@ clusterFunctions(const XBBRGraph &graph, XBBRClusterAlgo /*algo*/) {
     if (newDensity * MAX_DENSITY_DEGRADATION < PC.getDensity())
       continue;
 
-    // Merge chains: append myChain after predChain.
-    int lastPred = PC.Prev;
-    nodes[lastPred].Next = myChain;
-    nodes[myChain].Prev = lastPred;
+    // Merge chains: append myChain's chain after predChain's chain. Linear
+    // list with Next==-1 tail terminator — find pred's tail by walking Next,
+    // link it to my head, and my chain's tail keeps Next==-1. myHead.Prev is
+    // repointed to predTail so it is no longer a head (Prev != self); predHead
+    // keeps Prev==self and remains the head.
+    int predTail = predChain;
+    while (nodes[predTail].Next != -1)
+      predTail = nodes[predTail].Next;
+    nodes[predTail].Next = myChain;
+    nodes[myChain].Prev = predTail;
     MC.Size = PC.Size = newSize;
     MC.Weight = PC.Weight = PC.Weight + MC.Weight;
   }

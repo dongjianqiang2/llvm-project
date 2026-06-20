@@ -18,6 +18,7 @@
 #include "OutputSections.h"
 #include "XBBR/XBBRGraph.h"
 #include "XBBR/XBBRPipeline.h"
+#include "XBBR/SectionEmitter.h"
 #include "Relocations.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -1126,7 +1127,12 @@ static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
                      << " musttail=" << nMustTail
                      << " userbl=" << nUserBL
                      << " noreturntail=" << nNoRetTail
-                     << " cold=" << nCold << "\n";
+                     << " cold=" << nCold;
+        uint32_t nEHGated = 0;
+        for (const auto &F : graph->funcs())
+          if (F.IsEHGated)
+            ++nEHGated;
+        llvm::errs() << " ehgated=" << nEHGated << "\n";
       }
       ctx.xbbrGraph = std::move(graph);
       // Run Stages 1–4 when XBBR is on with partial/full mode.
@@ -1138,17 +1144,43 @@ static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
     // the existing layout to produce *some* output.
   }
 
-  if (ctx.arg.bpStartupFunctionSort || ctx.arg.bpFunctionOrderForCompression ||
-      ctx.arg.bpDataOrderForCompression) {
-    TimeTraceScope timeScope("Balanced Partitioning Section Orderer");
-    sectionOrder = runBalancedPartitioning(
-        ctx, ctx.arg.bpStartupFunctionSort ? ctx.arg.irpgoProfilePath : "",
-        ctx.arg.bpFunctionOrderForCompression,
-        ctx.arg.bpDataOrderForCompression,
-        ctx.arg.bpCompressionSortStartupFunctions,
-        ctx.arg.bpVerboseSectionOrderer);
-  } else if (!ctx.arg.callGraphProfile.empty()) {
-    sectionOrder = computeCallGraphProfileOrder(ctx);
+  // Phase 2: when XBBR produced a non-degraded BB-level layout, drive physical
+  // section ordering from it. Each per-BB InputSection (XBBRNode::BBSection,
+  // one per BB under -fbasic-block-sections=all) gets a priority in XBBR
+  // cluster order; sortISDBySectionOrder then physically places the BBs in
+  // that order (entry/anchor/EH-gated BBs are placed by Stage 2 at their
+  // function slots, so they move wholesale with their function — safe).
+  // CGProfile/BP function-level ordering is skipped because XBBR Stage 1
+  // already consumed the call graph. A degraded layout (Stage 4 fell back)
+  // leaves sectionOrder empty → CGProfile function-level order applies (SPEC §7).
+  bool xbbrDroveOrder = false;
+  if (ctx.xbbrLayoutResult && !ctx.xbbrLayoutResult->Degraded &&
+      !ctx.xbbrLayoutResult->Clusters.empty()) {
+    const xbbr::XBBRGraph &g = *ctx.xbbrGraph;
+    int prio = 0;
+    for (const std::vector<uint32_t> &order :
+         ctx.xbbrLayoutResult->ClusterBBOrders)
+      for (uint32_t nodeIdx : order) {
+        InputSectionBase *bbSec = g.nodes()[nodeIdx].BBSection;
+        if (bbSec)
+          sectionOrder.try_emplace(bbSec, prio++);
+      }
+    xbbrDroveOrder = !sectionOrder.empty();
+  }
+
+  if (!xbbrDroveOrder) {
+    if (ctx.arg.bpStartupFunctionSort || ctx.arg.bpFunctionOrderForCompression ||
+        ctx.arg.bpDataOrderForCompression) {
+      TimeTraceScope timeScope("Balanced Partitioning Section Orderer");
+      sectionOrder = runBalancedPartitioning(
+          ctx, ctx.arg.bpStartupFunctionSort ? ctx.arg.irpgoProfilePath : "",
+          ctx.arg.bpFunctionOrderForCompression,
+          ctx.arg.bpDataOrderForCompression,
+          ctx.arg.bpCompressionSortStartupFunctions,
+          ctx.arg.bpVerboseSectionOrderer);
+    } else if (!ctx.arg.callGraphProfile.empty()) {
+      sectionOrder = computeCallGraphProfileOrder(ctx);
+    }
   }
 
   if (ctx.arg.symbolOrderingFile.empty())
@@ -2216,6 +2248,13 @@ template <class ELFT> void Writer<ELFT>::finalizeSections() {
   // can relax jump instructions based on symbol offset.
   if (ctx.arg.optimizeBBJumps)
     optimizeBasicBlockJumps();
+
+  // XBBR Phase 3: addresses are final now (thunk loop converged + any
+  // bb-jump shrinkage applied). Backfill the decision-map entries' real VAs
+  // (OrigFuncAddr/NewAddress) so .debug_xbbr_decision records where each BB
+  // actually landed. No re-finalization needed — the entry count is fixed.
+  if (ctx.arg.xbbrEnabled)
+    xbbr::backfillDecisionMapVAs(ctx);
 
   // Fill other section headers. The dynamic table is finalized
   // at the end because some tags like RELSZ depend on result

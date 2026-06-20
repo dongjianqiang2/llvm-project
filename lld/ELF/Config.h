@@ -53,6 +53,7 @@ class LinkerScript;
 class TargetInfo;
 namespace xbbr {
 class XBBRGraph;
+struct XBBRLayoutResult;
 } // namespace xbbr
 struct Ctx;
 struct Partition;
@@ -780,6 +781,13 @@ struct Ctx : CommonLinkerContext {
   // buildSectionOrder() when --bb-cross-reorder= is on; consumed by the
   // XBBR pipeline (Stages 1–4). nullptr otherwise.
   std::unique_ptr<xbbr::XBBRGraph> xbbrGraph;
+
+  // XBBR layout result (Stages 1–4 output) persisted across the link.
+  // Populated by runXBBRPipeline(); consumed by the post-thunk-loop VA
+  // backfill (Phase 3) and the physical emitter. nullptr if XBBR is off or
+  // the pipeline didn't run. The XBBRPipeline.h comment historically claimed
+  // this field existed; it is now real.
+  std::unique_ptr<xbbr::XBBRLayoutResult> xbbrLayoutResult;
 };
 
 // The first two elements of versionDefinitions represent VER_NDX_LOCAL and

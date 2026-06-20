@@ -27,8 +27,19 @@ void collectMigratableBBs(const XBBRGraph &graph,
   ArrayRef<XBBRNode> allNodes = graph.nodes();
   for (FuncId F : cluster.Members) {
     auto fn = graph.funcs()[F];
+    // Phase 1b EH gate: an LSDA/landing-pad function may move wholesale (all
+    // BBs contiguous — LSDA call_site offsets are entry-relative and survive a
+    // contiguous shift) but its individual BBs must NOT migrate cross-function,
+    // which would break the call_site ranges. Treat every BB of an EH-gated
+    // function as a non-migratable anchor; ExtTSP then leaves the function
+    // intact at its cluster slot.
+    const bool ehGated = fn.IsEHGated;
     for (uint32_t I = fn.FirstNode; I < fn.FirstNode + fn.NumNodes; ++I) {
-      if (allNodes[I].isAnchor()) {
+      if (ehGated || allNodes[I].isAnchor() || allNodes[I].CondInvolved) {
+        // isAnchor: SPEC §5.3 blacklist (entry/landing-pad/musttail/...).
+        // ehGated: LSDA function — wholesale-only (Phase 1b).
+        // CondInvolved: Phase 1a — B.cond/TBZ source/target; unthunkable,
+        //   so the BB must not migrate (its B/BL-exit siblings still can).
         isAnchor[I] = true;
       } else if (mode == XBBRMode::Partial && allNodes[I].isCold()) {
         // In partial mode, cold BBs stay with their original functions

@@ -87,6 +87,13 @@ inline bool any(Provenance a, Provenance b) {
 struct XBBRNode {
   FuncId Func = InvalidFuncId; ///< owning function (XBBRGraph::funcSection)
   BBId BB = 0;                 ///< MBB id within the function
+  /// The per-BB InputSection that is this BB's physical placement unit. Under
+  /// -fbasic-block-sections=all (implied by -fbb-cross-reorder=partial|full),
+  /// each BB is its own InputSection; Stage 0 resolves it from the BBAddrMap
+  /// range's BaseAddress relocation. nullptr only if the range could not be
+  /// resolved (the node then cannot be physically emitted and is treated as
+  /// anchored/Original). PLAN §0c / SPEC §6.3.
+  InputSectionBase *BBSection = nullptr;
   uint32_t Size = 0;           ///< BB byte size from BBAddrMap (the .o-time
                                ///<   size). The constraint solver may patch
                                ///<   this to post-relaxation size when
@@ -102,6 +109,15 @@ struct XBBRNode {
                                ///< §9.3 v0x02) is u16 little-endian; this
                                ///< field must stay u16 to carry bit 8
                                ///< (IsNoReturnTail) and any future bits.
+
+  /// Phase 1a range anchor: true on AArch64 if this BB is the source or
+  /// target of a conditional/test branch (R_AARCH64_CONDBR19 B.cond ±1 MiB,
+  /// R_AARCH64_TSTBR14 TBZ/TBNZ ±32 KiB). Those relocs CANNOT be thunked by
+  /// lld (only B/BL can), so migrating either endpoint risks a hard
+  /// relocation-overflow error. Such BBs are pinned (treated as non-migratable
+  /// like an anchor) so only BBs whose exits are B/BL — which the thunk loop
+  /// can extend — migrate. Always false on x86 (Jcc rel32 never overflows).
+  bool CondInvolved = false;
 
   /// Quick predicates derived from XBBRAttrs (mirroring xbbr::AttrBit
   /// in include/llvm/CodeGen/XBBRMetadata.h — Stage 0 will assert these

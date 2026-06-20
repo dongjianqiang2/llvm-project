@@ -28,7 +28,12 @@ std::vector<FunctionCluster> clusterFunctions(const XBBRGraph &graph,
                                               XBBRClusterAlgo algo);
 
 void runXBBRPipeline(Ctx &ctx, XBBRGraph &graph) {
-  XBBRLayoutResult result;
+  // Persist the layout result on Ctx so the post-thunk-loop VA backfill
+  // (Phase 3) and physical emitter can consume Stages 1–4 output after
+  // addresses are assigned. The rest of this function treats `result` as a
+  // local reference for readability.
+  ctx.xbbrLayoutResult = std::make_unique<XBBRLayoutResult>();
+  XBBRLayoutResult &result = *ctx.xbbrLayoutResult;
 
   // Stage 1: function clustering (hfsort+/C³).
   result.Clusters =

@@ -59,6 +59,17 @@ struct FuncInfo {
   uint32_t NumNodes = 0;        ///< node count for this function
   uint64_t EntryCount = 0;      ///< from BBAddrMap PGO (FuncEntryCount)
   bool HasProfile = false;      ///< true if FuncEntryCount was present
+  /// EH gate (Phase 1b). True if migrating this function's BBs would break
+  /// exception dispatch / unwind. Under -fbasic-block-sections=all the
+  /// compiler emits one FDE per BB section, so plain unwind FDEs follow
+  /// migrations (PC-begin relocations resolve to the moved BB) and need no
+  /// rewriting. The unsafe case is LSDA (`.gcc_except_table`) functions:
+  /// their call_site ranges are byte offsets relative to the function that
+  /// stop mapping to the right BB once non-landing-pad BBs drift. Landing
+  /// pads are already anchored individually, but the whole LSDA function is
+  /// gated so its call_site table stays valid. Set when the function has a
+  /// `.gcc_except_table.<fn>` section or any landing-pad BB.
+  bool IsEHGated = false;
 
   llvm::ArrayRef<XBBRNode> nodes(const std::vector<XBBRNode> &all) const {
     return llvm::ArrayRef<XBBRNode>(&all[FirstNode], NumNodes);
@@ -121,6 +132,11 @@ private:
   bool collectFromObjFiles(Ctx &ctx);
   bool collectCallGraphEdges(Ctx &ctx);
   bool runConsistencyChecks(Ctx &ctx) const;
+  /// Phase 1a: on AArch64, mark BBs that are the source or target of a
+  /// conditional/test branch (R_AARCH64_CONDBR19/TSTBR14) as CondInvolved so
+  /// Stage 2/4 pin them — those relocs can't be thunked, so migrating either
+  /// endpoint risks a hard overflow. No-op on other arches.
+  void markRangeAnchors(Ctx &ctx);
 };
 
 } // namespace xbbr
