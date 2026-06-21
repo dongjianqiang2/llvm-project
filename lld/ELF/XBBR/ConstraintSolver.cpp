@@ -48,6 +48,7 @@
 #include "XBBR/XBBRTypes.h"
 #include "lld/Common/ErrorHandler.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/ELF.h"
 
 #include <algorithm>
@@ -300,6 +301,32 @@ collectCondPins(const XBBRGraph &graph,
   return pins;
 }
 
+/// Revert a pinned BB's per-BB InputSection name back to `.text.<rest>` so it
+/// lands in the `.text` output section at its function slot (co-located with
+/// its function's other BBs → original intra-function distance, within cond
+/// range) instead of staying in `.text.hot`/`.text.unlikely` at the
+/// sortISDBySectionOrder mid-point. Without this, pinning only drops the BB
+/// from ClusterBBOrders — its section keeps the `.text.hot.*` name
+/// renameSectionsForHotColdSplit gave it (Driver, pre-Writer) and physically
+/// remains in `.text.hot`, so a cond branch whose partner was pinned is never
+/// co-located and `collectCondPins`'s cross-section pin can't restore the
+/// in-range guarantee. Idempotent: a section already named `.text.*` is a
+/// no-op (the entry/anchor BBs were never renamed).
+void revertBBSectionToText(Ctx &ctx, const XBBRNode &node) {
+  InputSectionBase *sec = node.BBSection;
+  if (!sec)
+    return;
+  StringRef nm = sec->name;
+  StringRef rest;
+  if (nm.starts_with(".text.hot."))
+    rest = nm.substr(strlen(".text.hot."));
+  else if (nm.starts_with(".text.unlikely."))
+    rest = nm.substr(strlen(".text.unlikely."));
+  else
+    return; // already .text.* (entry/anchor never renamed) or non-text
+  sec->name = ctx.saver.save((Twine(".text.") + rest).str());
+}
+
 } // namespace
 
 bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
@@ -364,6 +391,7 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
             continue;
           pinned.insert(p);
           ++fallbackCount;
+          revertBBSectionToText(ctx, allNodes[p]);
           for (auto &order : result.ClusterBBOrders) {
             auto it = std::remove(order.begin(), order.end(), p);
             if (it != order.end())
@@ -393,6 +421,10 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
     // edges (greedy). Pinning reverts it to its function slot, removing its
     // over-range edges from the projected hot layout; subsequent BBs shift
     // closer, so the over-range count monotonically decreases.
+    //
+    // Deterministic tie-break (SPEC §9.3): `over.Involvement` is an
+    // unordered_map, so equal-involvement ties are broken by explicit
+    // lowest-node-index, never by hash-map iteration order.
     uint32_t best = ~0u;
     uint32_t bestCount = 0;
     for (const auto &kv : over.Involvement) {
@@ -400,21 +432,33 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
         continue;
       if (allNodes[kv.first].isAnchor())
         continue; // anchors don't migrate; nothing to pin
-      if (kv.second > bestCount) {
+      if (kv.second > bestCount ||
+          (kv.second == bestCount && kv.first < best)) {
         bestCount = kv.second;
         best = kv.first;
       }
     }
-    if (best == ~0u)
-      break; // no migratable node in any over-range edge — the over-range is
-             // between anchored BBs (pre-existing function-layout distance lld
-             // already thunks), not caused by XBBR migration. Leave it; the
-             // tail-end recheck (P0-2) reports real bytes.
+    if (best == ~0u) {
+      // No migratable node is in any over-range edge — every over-range edge
+      // is anchor↔anchor. Anchors ARE in ClusterBBOrders (BBLayout places
+      // them), so XBBR's cross-function layout can separate two anchored BBs
+      // (function entries / musttail) beyond the B/BL range, forcing thunks
+      // the budget forbids. Pinning can't help (anchors don't migrate), so
+      // degrade to function-level layout, which co-locates each function's
+      // BBs and eliminates the XBBR-introduced over-range. Without this,
+      // the budget cap is silently downgraded to a P0-2 warning (addresses
+      // are final by then; no revert possible) — a SPEC §7 violation.
+      degraded = true;
+      break;
+    }
 
-    // Pin `best`: drop it from its cluster order → it reverts to its function
-    // position (not prioritised by buildSectionOrder → placed at function slot).
+    // Pin `best`: drop it from its cluster order and revert its section name
+    // so it lands in `.text` at its function slot (co-located with its
+    // function's BBs → original intra-function distance), not left in
+    // `.text.hot` at the mid-point.
     pinned.insert(best);
     ++fallbackCount;
+    revertBBSectionToText(ctx, allNodes[best]);
     for (auto &order : result.ClusterBBOrders) {
       auto it = std::remove(order.begin(), order.end(), best);
       if (it != order.end())

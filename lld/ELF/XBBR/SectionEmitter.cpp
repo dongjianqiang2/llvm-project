@@ -22,10 +22,13 @@
 #include "InputSection.h"
 #include "LinkerScript.h"
 #include "OutputSections.h"
+#include "Relocations.h"
 #include "SyntheticSections.h"
+#include "Symbols.h"
 #include "XBBR/XBBRGraph.h"
 #include "XBBR/XBBRTypes.h"
 #include "lld/Common/ErrorHandler.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/BinaryFormat/XBBRDecisionMap.h"
 
 
@@ -99,6 +102,70 @@ static uint64_t computeRealThunkBytes(Ctx &ctx) {
           total += s->getSize();
     }
   return total;
+}
+
+/// #2 tail-end guard: with real (post-layout) addresses, verify every
+/// CondInvolved BB's unthunkable conditional/test branch is within ISA range.
+/// These relocs (AArch64 CONDBR19/TSTBR14; ARM Thumb-1 THM_JUMP8/THM_JUMP11)
+/// CANNOT be thunked by lld, so an overflow is a hard link error at write time
+/// — except Stage 4's projected model can miss the case where a pinned BB's
+/// real .text.hot mid-point placement (a rename-race artifact, see
+/// backfillDecisionMapVAs) separates a cond pair. Catch it here as a fatal
+/// error instead of letting lld's relocate() report it later with no XBBR
+/// context. Returns the per-arch cond range, or 0 if the arch/reloc isn't
+/// range-checked here.
+static uint64_t condRangeForReloc(uint16_t emachine, uint32_t type) {
+  switch (emachine) {
+  case ELF::EM_AARCH64:
+    if (type == ELF::R_AARCH64_TSTBR14)
+      return 0x8000; // ±32 KiB
+    if (type == ELF::R_AARCH64_CONDBR19)
+      return 0x100000; // ±1 MiB
+    return 0;
+  case ELF::EM_ARM:
+    // Thumb-1 unthunkable conditionals (markRangeAnchors pins these).
+    if (type == ELF::R_ARM_THM_JUMP8)
+      return 0x80; // ±256 B
+    if (type == ELF::R_ARM_THM_JUMP11)
+      return 0x800; // ±2 KiB
+    return 0;
+  default:
+    return 0;
+  }
+}
+
+static void verifyCondRangesFinal(Ctx &ctx, XBBRGraph &graph) {
+  for (const XBBRNode &node : graph.nodes()) {
+    if (!node.CondInvolved)
+      continue;
+    InputSectionBase *src = node.BBSection;
+    if (!src)
+      continue;
+    for (const Relocation &r : src->relocs()) {
+      uint64_t range = condRangeForReloc(ctx.arg.emachine, r.type);
+      if (range == 0)
+        continue;
+      // Real branch-site and target VAs (final addresses).
+      uint64_t branchSite = src->getVA(r.offset);
+      auto *d = dyn_cast<Defined>(r.sym);
+      if (!d)
+        continue; // undefined/external — lld reports its own error
+      uint64_t target = d->getVA(ctx, r.addend);
+      uint64_t dist = branchSite >= target ? branchSite - target
+                                          : target - branchSite;
+      if (dist > range) {
+        ErrAlways(ctx)
+            << "XBBR: unthunkable conditional branch out of range after "
+               "layout (func=" << node.Func << " bb=" << node.BB
+            << " reloc=0x" << llvm::format_hex_no_prefix(r.type, 0)
+            << " dist=" << dist << " range=" << range
+            << "). Stage 4 failed to pin this cond pair; rerun with "
+               "--bb-cross-reorder-fallback=conservative or disable "
+               "--bb-cross-reorder. Aborting to avoid a runtime SIGILL.";
+        return;
+      }
+    }
+  }
 }
 
 void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
@@ -254,6 +321,17 @@ void backfillDecisionMapVAs(Ctx &ctx) {
     errs() << "xbbr-stage5: realThunkBytes=" << result.ThunkBytes
            << " estThunkBytes=" << result.EstimatedThunkBytes
            << " overrun=" << (overrun ? 1 : 0) << "\n";
+
+  // #2 tail-end cond-overflow guard: Stage 4's pin reverts a BB's section name
+  // to .text, but that rename races orphan routing (Driver, pre-Writer) — a
+  // pinned CondInvolved BB can stay in .text.hot at the sortISDBySectionOrder
+  // mid-point, and collectCondPins skips cond edges whose endpoint is off the
+  // projected map, so an unthunkable B.cond/TBZ overflow could slip through.
+  // Addresses are final now, so verify each CondInvolved BB's unthunkable cond
+  // reloc is in range against REAL VAs. A failure here is a Stage 4/Stage 5
+  // ordering bug surfacing as a fatal link error (caught), not a silent
+  // runtime SIGILL / write-time hard error.
+  verifyCondRangesFinal(ctx, *ctx.xbbrGraph);
 
   Partition *mainPart = ctx.mainPart;
   if (!mainPart || !mainPart->xbbrDecisionMap)

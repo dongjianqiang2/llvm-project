@@ -568,21 +568,25 @@ void XBBRGraph::markRangeAnchors(Ctx &ctx) {
   //
   //   AArch64: B.cond (R_AARCH64_CONDBR19, ±1 MiB) and TBZ/TBNZ
   //            (R_AARCH64_TSTBR14, ±32 KiB) — lld has no cond-branch thunk.
-  //   ARM/Thumb: R_ARM_THM_JUMP11 (B<cond> narrow, ±2 KiB, Thumb-1) — lld's
-  //            needsThunk/inBranchRange do not handle it (the offset would be
-  //            silently truncated on overflow), so pin it defensively. Note
-  //            Thumb-2 B<cond>.W (R_ARM_THM_JUMP19, ±1 MiB) IS thunkable by
-  //            lld (ARM::needsThunk creates a Thumb thunk), so it is range-
-  //            checked by Stage 4 (isThunkableBranchReloc), not pinned here;
-  //            A32 B<cond> shares R_ARM_JUMP24 with unconditional B, which lld
-  //            thunks uniformly.
+  //   ARM/Thumb: R_ARM_THM_JUMP8 (B<cond> narrow, ±256 B, Thumb-1) and
+  //            R_ARM_THM_JUMP11 (unconditional B narrow, ±2 KiB, Thumb-1) —
+  //            lld's needsThunk/inBranchRange do not handle either (the offset
+  //            would be silently truncated on overflow), so pin both
+  //            defensively. NOTE the encoding↔reloc mapping
+  //            (ARMELFObjectWriter.cpp): THM_JUMP8 is the *conditional* B<cond>
+  //            (the shorter range — the real hazard), THM_JUMP11 is the
+  //            *unconditional* B. Thumb-2 B<cond>.W (R_ARM_THM_JUMP19, ±1 MiB)
+  //            IS thunkable by lld (ARM::needsThunk creates a Thumb thunk), so
+  //            it is range-checked by Stage 4 (isThunkableBranchReloc), not
+  //            pinned here; A32 B<cond> shares R_ARM_JUMP24 with unconditional
+  //            B, which lld thunks uniformly.
   //   x86: Jcc is rel32 (±2 GiB, never overflows in practice) — no-op.
   auto isUnthunkableCondBr = [](uint16_t emachine, uint32_t type) -> bool {
     switch (emachine) {
     case ELF::EM_AARCH64:
       return type == ELF::R_AARCH64_CONDBR19 || type == ELF::R_AARCH64_TSTBR14;
     case ELF::EM_ARM:
-      return type == ELF::R_ARM_THM_JUMP11;
+      return type == ELF::R_ARM_THM_JUMP11 || type == ELF::R_ARM_THM_JUMP8;
     default:
       return false;
     }
@@ -632,9 +636,9 @@ void XBBRGraph::markRangeAnchors(Ctx &ctx) {
   // endpoint .text.hot, the other .text — unthunkable, would hard-error)
   // propagates through the partnership graph, so a single non-hot partner pins
   // the whole component. Fixed-point: start CondSafeToMigrate = hot, then clear
-  // it on any node whose partner is not safe, until stable. ARM R_ARM_THM_JUMP11
-  // stays unconditionally pinned (lld can neither thunk nor relax it) — its
-  // CondSafeToMigrate is left false.
+  // it on any node whose partner is not safe, until stable. ARM Thumb-1
+  // R_ARM_THM_JUMP8/JUMP11 stay unconditionally pinned (lld can neither thunk
+  // nor relax them) — their CondSafeToMigrate is left false.
   if (ctx.arg.emachine == ELF::EM_AARCH64) {
     for (uint32_t I = 0; I < Nodes.size(); ++I)
       if (Nodes[I].CondInvolved)

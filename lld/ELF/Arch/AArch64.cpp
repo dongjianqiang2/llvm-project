@@ -61,6 +61,21 @@ bool elf::isAArch64BTILandingPad(Ctx &ctx, Symbol &s, int64_t a) {
 }
 
 namespace {
+
+// AArch64 NOP (HINT #0) is the single fixed 4-byte instruction 0xd503201f
+// (little-endian: 1f 20 03 d5). Unlike x86 there are no 1/2/3-byte NOPs, but
+// nopInstrFill (OutputSections.cpp) indexes this table as nopFiller[remaining-1]
+// and asserts size==remaining, so provide truncated entries for those lengths
+// defensively — in practice deleteFallThruJmpInsn removes a 4-byte B and AArch64
+// instructions are 4-aligned, so the gap it leaves is always a multiple of 4 and
+// only the 4-byte entry (back()) is ever used.
+static const std::vector<std::vector<uint8_t>> nopInstructions = {
+    {0x1f},
+    {0x1f, 0x20},
+    {0x1f, 0x20, 0x03},
+    {0x1f, 0x20, 0x03, 0xd5},
+};
+
 class AArch64 : public TargetInfo {
 public:
   AArch64(Ctx &);
@@ -131,6 +146,15 @@ AArch64::AArch64(Ctx &ctx) : TargetInfo(ctx) {
   defaultImageBase = 0x200000;
 
   needsThunks = true;
+
+  // Non-zero trap (BRK #0 = 0xd4200000, little-endian 00 00 20 d4) so
+  // OutputSection::writeTo's `nonZeroFiller` is true and gap-fill actually
+  // runs. Without this, deleteFallThruJmpInsn's `is.nopFiller = true` is dead
+  // (the whole gap-fill block is skipped), and a deleted fall-through B leaves
+  // a zero-filled (0x00000000 = UDF) gap that SIGILLs on fall-through.
+  // nopInstrs supplies the 4-byte AArch64 NOP for the `nopFiller` path.
+  trapInstr = {0x00, 0x00, 0x20, 0xd4};
+  nopInstrs = nopInstructions;
 }
 
 RelExpr AArch64::getRelExpr(RelType type, const Symbol &s,
