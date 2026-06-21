@@ -1,0 +1,101 @@
+# XBBR CI gate (SPEC §9.1 / §9.3).
+#
+# Builds clang + lld with the XBBR-fork changes (X86, AArch64, ARM targets),
+# runs the XBBR lit suite, and runs the double-link SHA256 reproducibility
+# gate across the (arch × mode × output-type) triples XBBR supports.
+#
+# Out of scope here (blocked on external resources — tracked separately under
+# SPEC §9.2 quantitative acceptance / P4-2):
+#   - SPEC CPU2017 + llvm-test-suite MicroBenchmarks runs (need the external
+#     test-suite repo + SPEC license).
+#   - Embedded (Zephyr / micropython) and server (clang / MySQL) demo builds.
+#   - PMU (L1i / iTLB / branch-miss) measurement — needs perf + bare-metal or
+#     qemu, neither available in CI by default.
+# Those land as separate, opt-in workflows once the harnesses exist.
+name: XBBR
+
+on:
+  push:
+    branches: [ bbr_dev_spec0, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache python3 git
+
+      - name: ccache cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-xbbr-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-xbbr-${{ runner.os }}-
+
+      - name: Configure (clang + lld, X86/AArch64/ARM)
+        run: |
+          cmake -S llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM" \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DLLVM_USE_LINKER=lld \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build lld + clang + llvm-readobj
+        run: cmake --build build -j --target lld clang llvm-readobj
+
+      - name: XBBR lit suite
+        run: build/bin/llvm-lit lld/test/ELF/xbbr/
+
+      - name: Reproducibility gate (SPEC §9.3)
+        run: |
+          set -e
+          S=xbbr_design_doc/scripts/xbbr-repro-check.sh
+          # Smoke source covering the hot/cold + cross-function call pattern.
+          # (A real gate feeds the same source+profile+flags the release uses;
+          # this smoke verifies the gate machinery across every supported
+          # arch × mode × output-type triple.)
+          cat > /tmp/smoke.ll <<'EOF'
+          target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-n32:64-S128"
+          target triple = "aarch64-linux-gnu"
+          declare void @ext(i32)
+          define void @a(i32 %n) noinline !prof !0 {
+          entry:
+            %c = icmp sgt i32 %n, 0
+            br i1 %c, label %hot, label %done, !prof !3
+          hot:
+            call void @b(i32 %n)
+            br label %done
+          done:
+            call void @ext(i32 1)
+            ret void
+          }
+          define void @b(i32 %n) noinline !prof !1 {
+          entry: br label %exit
+          exit: ret void
+          }
+          !0 = !{!"function_entry_count", i64 1000}
+          !1 = !{!"function_entry_count", i64 900}
+          !3 = !{!"branch_weights", i32 900, i32 100}
+          EOF
+          # AArch64: partial / full / full-PIE
+          $S /tmp/smoke.ll aarch64-linux-gnu partial
+          $S /tmp/smoke.ll aarch64-linux-gnu full
+          $S /tmp/smoke.ll aarch64-linux-gnu full a -pie
+          # ARM A32 + Thumb-2 (P2-1)
+          sed 's#aarch64-linux-gnu#armv7a-linux-gnueabi#; s#e-m:e-i8:8:32-i16:16:32-i64:64-n32:64-S128#e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64#' /tmp/smoke.ll > /tmp/smoke_arm.ll
+          $S /tmp/smoke_arm.ll armv7a-linux-gnueabi full
+          $S /tmp/smoke_arm.ll thumbv7a-linux-gnueabi full
+          # x86_64
+          sed 's#aarch64-linux-gnu#x86_64-linux-gnu#; s#e-m:e-i8:8:32-i16:16:32-i64:64-n32:64-S128#e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128#' /tmp/smoke.ll > /tmp/smoke_x64.ll
+          $S /tmp/smoke_x64.ll x86_64-linux-gnu full
