@@ -268,7 +268,12 @@ Cost(layout) = Σ w_icache · ICacheLineCrossings(e)
 
 #### Stage 4 — 单 BB 约束求解与回退
 
-> **落地现状（回写 2026-06-21）**：下文伪码描述的是设计目标态（投影 VA + thunk 预算 + 松弛复检 + 单调 pin 回退 + 30% 整体降级）。当前 AArch64 实现采用**保守守卫**简化：`XBBRGraph::markRangeAnchors` 在 Stage 0 即把 `R_AARCH64_CONDBR19`（B.cond ±1MiB）/`R_AARCH64_TSTBR14`（TBZ/TBNZ ±32KiB）的源与目标标 `CondInvolved`，`BBLayout::collectMigratableBBs` 把它们当 anchor（永不迁移）。理由：这两类重定位**不可被 lld thunk**（只有 B/BL `JUMP26`/`CALL26` 可），迁移其端点会在写时 `checkInt` 硬报错；守卫式 pinning 100% 安全，代价是条件分支密集函数的 BB 级迁移受限（函数级聚簇仍生效）。`B`/`BL` 超距由既有 `finalizeAddressDependentContent` thunk 循环自动处理（§4.3 Stage 5），`--bb-cross-reorder-max-thunk-bytes` 预算与 30% 整体降级**尚未接通**（未来工作）。投影-VA 精确范围求解（允许范围内条件分支 BB 迁移、级联回退、末梢复核）是后续扩展。
+> **落地现状（回写 2026-06-21；P0-1 更新 2026-06-21）**：下文伪码描述设计目标态。当前 AArch64 实现分两层：
+> - **CondInvolved 守卫（保守，已落地）**：`XBBRGraph::markRangeAnchors` 在 Stage 0 即把 `R_AARCH64_CONDBR19`（B.cond ±1MiB）/`R_AARCH64_TSTBR14`（TBZ/TBNZ ±32KiB）的源与目标标 `CondInvolved`，`BBLayout::collectMigratableBBs` 把它们当 anchor（永不迁移）。理由：这两类重定位**不可被 lld thunk**（只有 B/BL `JUMP26`/`CALL26` 可），迁移其端点会在写时 `checkInt` 硬报错；守卫式 pinning 100% 安全，代价是条件分支密集函数的 BB 级迁移受限（函数级聚簇仍生效）。投影-VA 精细化（允许范围内条件分支 BB 迁移）是 P1-3 后续工作。
+> - **B/BL 投影-VA 求解 + thunk 预算 + 30% 降级 + fallback=none（P0-1，已落地）**：`ConstraintSolver::runConstraintSolver` 复用 `CostFunction::computeProjectedOffsets` 把 `ClusterBBOrders` 投影到全局字节偏移，遍历每个 BB 的 per-section 重定位找 **thunkable** B/BL（`R_AARCH64_JUMP26`/`CALL26`），若投影 src→dst 距离超 ISA 范围（±128MiB）则计一条 over-range 边；`estThunkBytes = overRange × 16`（`AArch64ABSLongThunk`）。超 `--bb-cross-reorder-max-thunk-bytes` 预算时，贪心 pin（回退原函数位）涉及 over-range 边最多的可迁移 BB，单调收敛（pin 后永不再迁移，≤ `num_migratable+1` 迭代）；超 30% 阈值则整体降级 `function` 模式（SPEC §7），`--bb-cross-reorder-fallback=none` 下直接 fatal error。`XBBRLayoutResult::EstimatedOverRangeEdges`/`EstimatedThunkBytes` 记录估计值供 P0-2 末梢复核比对。B/BL 超距的**真实** thunk 仍由既有 `finalizeAddressDependentContent` thunk 循环插入（Stage 4 只做预算闸，不插 thunk）。
+> - **仍为后续工作**：P0-2 末梢体积复核（用真实 `ThunkSection` 大小填 `ThunkBytes`/`ActualCost` 并超预算告警）、松弛复检（§4.5，`relax_recheck`）、P1-3 CondInvolved 投影-VA 精细化。
+>
+> **测试钩子（hidden）**：`--bb-cross-reorder-branch-range-for-testing=N`（`Flags<[HelpHidden]>`，0=用真 ISA 范围）缩放 Stage 4 投影判距，使预算/降级路径可用极小二进制（而非 128MiB filler）测试；仅影响 XBBR 投影估计，**不**影响 lld 真实 thunk 插入（始终 ISA 范围）亦**不**影响 CondInvolved 守卫。测试：`xbbr-aarch64-jump26-thunk.s`（超距 B/BL 经 lld thunk，XBBR 不 pin）、`xbbr-thunk-budget-revert.s`（超预算单 BB 回退）、`xbbr-fallback-degrade.s`（30% 降级）、`xbbr-fallback-none.s`（fallback=none fatal）。
 
 ```python
 pinned = {}          # FuncId -> set(BB)，已回退/锚定的 BB，永不再迁移
@@ -307,7 +312,7 @@ else:
 
 #### Stage 5 — Section Emission
 
-> **落地现状（回写 2026-06-21，AArch64）**：物理重排**已落地**——`Writer.cpp::buildSectionOrder` 在非降级布局时从 `XBBRLayoutResult::ClusterBBOrders` 产出 per-BB `InputSection` 优先级 map，喂入既有 `sortISDBySectionOrder`：迁移的 per-BB section 按 XBBR 序物理放置，入口/anchor/EH-gated BB 留在 unordered 集合（由符号跟踪其位置 → ABI §5.1 自动成立，ordered 块插 unordered 中点以最小化 B/BL thunk）。`B`/`BL` 超距由既有 `finalizeAddressDependentContent` thunk 循环自动插入 `AArch64Thunks`（无需 XBBR 专用 thunk 代码）。`optimizeBasicBlockJumps` 之后 `backfillDecisionMapVAs` 把决策 map 的 `OrigFuncAddr`/`NewAddress` 从占位/投影值改为真链后 VA（§9.4）。**尚未落地**（未来工作）：`.text.hot`/`.text.warm`/`.text.unlikely` 三段分离（需在 Driver 孤儿段路由前改名 + 隐含 `-z keep-text-section-prefix`）、`$xbbr.<fn>.bb<N>` 本地符号别名、对齐上限放置、末梢体积复核、`--bb-cross-reorder-max-thunk-bytes` 预算接通、DWARF/EH 完整重写（§5）。
+> **落地现状（回写 2026-06-21，AArch64；P0-2 更新 2026-06-21）**：物理重排**已落地**——`Writer.cpp::buildSectionOrder` 在非降级布局时从 `XBBRLayoutResult::ClusterBBOrders` 产出 per-BB `InputSection` 优先级 map，喂入既有 `sortISDBySectionOrder`：迁移的 per-BB section 按 XBBR 序物理放置，入口/anchor/EH-gated BB 留在 unordered 集合（由符号跟踪其位置 → ABI §5.1 自动成立，ordered 块插 unordered 中点以最小化 B/BL thunk）。`B`/`BL` 超距由既有 `finalizeAddressDependentContent` thunk 循环自动插入 `AArch64Thunks`（无需 XBBR 专用 thunk 代码）。`optimizeBasicBlockJumps` 之后 `backfillDecisionMapVAs` 把决策 map 的 `OrigFuncAddr`/`NewAddress` 从占位/投影值改为真链后 VA（§9.4）。**P0-2 末梢体积复核（2026-06-21）已落地**：`backfillDecisionMapVAs` 遍历 `ctx.outputSections` 的所有 `.text.thunk` ThunkSection 累加真实字节数填 `XBBRLayoutResult::ThunkBytes`、`ActualCost = w_size × ThunkBytes`，与 Stage 4 的 `EstimatedThunkBytes` 比对；超 `--bb-cross-reorder-max-thunk-bytes` 则发 warning（地址已定，无法末梢回退——pre-emit 回退是 P0-1 的职责，末梢复核仅告警暴露投影估计漏计的非-BB gap 距离）。测试：`xbbr-tail-end-thunk-recheck.s`。**P1-1 热冷段分离（2026-06-21）已落地**：`Driver` 在 `processSectionCommands` 前建临时图调 `renameSectionsForHotColdSplit`，按 hot/cold/original 分类把 per-BB section 改名 `.text.hot.*`/`.text.unlikely.*`（partial 下 cold 留 `.text`，SPEC §4），并隐含 `-z keep-text-section-prefix`，使 `getOutputSectionName` 路由到独立 output section；真实布局图仍 post-ICF 在 `buildSectionOrder` 重建。测试：`xbbr-hot-unlikely-split.s`（`.text.hot` 出现、plain 无、partial/full 一致、可重现）。**.text.unlikely 路由**代码与 `.text.hot` 对称（同改名机制、`.text.unlikely.` 前缀），但 lit 未直接覆盖——cold 位经 clang driver flag 不流入 IsCold，而 llc 手工 `-basic-block-sections=all` 与 `-enable-xbbr` 组合产生 `xbbr_attr`/BBAddrMap BB 数不一致（3 vs 5），故 cold BB 构造存在编译器侧工具缺口，留待补 clang driver cold-threshold 透传后补测。**尚未落地**（未来工作）：`$xbbr.<fn>.bb<N>` 本地符号别名、对齐上限放置、DWARF/EH 完整重写（§5）。
 
 输出三段（`.text.warm` 可选）：
 - `.text.hot`：被识别为热路径簇的 BB（来自所有原函数）。
@@ -331,6 +336,8 @@ else:
 | ARM (Thumb-2) | ±16MB（B/BL） | 同上，注意 ARM↔Thumb 互操作 |
 
 thunk 总字节数受 `--bb-cross-reorder-max-thunk-bytes` 约束，超限触发对应 BB 回退（SPEC §7）。
+
+> **P1-3 条件分支放宽（回写 2026-06-21）**：上表只列 B/BL（thunkable）。AArch64 B.cond（CONDBR19 ±1MiB）/ TBZ（TSTBR14 ±32KiB）**不可 thunk**——超距是硬链接错误。`markRangeAnchors` 标记 `CondInvolved`；P1-3 不再无条件 pin，而是：当某 CondInvolved BB 所在的**条件分支连通分量全 hot**（`CondSafeToMigrate`，固定点传播计算——跨段不安全性沿伙伴图传染，一个非 hot 伙伴 pin 整个分量）时允许迁移到 .text.hot。常见 entry→target 情形（entry 为 anchor 非 hot）由 `collectMigratableBBs` 前置 pin（不计入 Stage 4 回退，避免伪降级）；Stage 4 `collectCondPins` 仅处理罕见的 .text.hot 内超距（投影距离 > range×0.9 margin → pin 双端，级联回退）。ARM `R_ARM_THM_JUMP11`（Thumb-1，lld 不支持）仍无条件 pin。测试旋钮 `--bb-cross-reorder-cond-range-for-testing=N`。溢出是**可捕获的硬链接错误**（非静默），0.9 余量覆盖投影未建模的 B/BL thunk 增量。
 
 ### 4.5 链接器松弛（Linker Relaxation）交互
 
@@ -703,7 +710,7 @@ For each entry (32 bytes):
 
 对应 SPEC §10 的 M1–M5，每里程碑拆为可独立 review 的子任务。
 
-> **里程碑状态回写（2026-06-21，AArch64）**：物理 BB 级 section emission 机制已落地（Phase 0–3）——`-fbb-cross-reorder=partial|full` 隐含 `=all`、Stage 0 per-BB InputSection 关联、Stage 4 `CondInvolved` 距离守卫、Stage 5 经 `sectionOrder` 物理重排 + 决策 map 真 VA 回填、EH gate 保证栈展开正确。端到端在 AArch64 证明 BB 真实跨函数移动（`lld/test/ELF/xbbr/xbbr-aarch64-physical-migration.s`）。**仍未完成（M5 后续）**：`.text.hot`/`.text.unlikely` 段分离、`$xbbr.<fn>.bb<N>` 符号别名、对齐上限放置、末梢体积复核、`--bb-cross-reorder-max-thunk-bytes` 预算接通、DWARF/CFI/EH 完整重写（解除 EH gate）、ARM(ELF32LE) 支持、PIE/动态库、`full` mode 真行为差异量化、§9.2 量化门槛、`experimental-` 前缀。M1–M4 的元数据/算法/工具部分此前已落地，本回写不重复。
+> **里程碑状态回写（2026-06-21，AArch64）**：物理 BB 级 section emission 机制已落地（Phase 0–3）——`-fbb-cross-reorder=partial|full` 隐含 `=all`、Stage 0 per-BB InputSection 关联、Stage 4 `CondInvolved` 距离守卫、Stage 5 经 `sectionOrder` 物理重排 + 决策 map 真 VA 回填、EH gate 保证栈展开正确。端到端在 AArch64 证明 BB 真实跨函数移动（`lld/test/ELF/xbbr/xbbr-aarch64-physical-migration.s`）。**P0-1（2026-06-21）已落地**：Stage 4 B/BL 投影-VA 范围求解 + `--bb-cross-reorder-max-thunk-bytes` 预算 + 30% 整体降级 + `fallback=none` fatal（§4.3 Stage 4）。**P1-2（2026-06-21）已落地**：`AArch64::deleteFallThruJmpInsn` 删除相邻 BB-section 间可 fall-through 的尾 `B`（`R_AARCH64_JUMP26`，精确 VA 匹配，语义安全）；`relocateAlloc` 跳过 `R_NONE`。`--optimize-bb-jumps` 在 AArch64 不再是 no-op。测试 `xbbr-aarch64-optimize-bb-jumps.s`（.text 体积下降、可重现）。**B.cond+B 翻转 case 暂缓**（需 `jumpInstrMod` 条件码反转 + `applyJumpInstrMod`，未来工作）。**仍未完成（M5 后续）**：`$xbbr.<fn>.bb<N>` 符号别名、对齐上限放置、CondInvolved 投影-VA 精细化（P1-3）、B.cond+B 翻转优化、DWARF/CFI/EH 完整重写（解除 EH gate）、ARM(ELF32LE) 支持、`full` mode 真行为差异量化、§9.2 量化门槛、`experimental-` 前缀。**P2-2（2026-06-21）已落地**：PIE（`-pie`）与动态库（`-shared`）经既有基础设施（PC-rel 由 lld 正常解析、入口块由 `isEntry` 自动锚定、thunk 循环处理超距）即正确工作——导出符号锚定入口、内部函数 BB 可漂移、PLT/GOT 不受影响。测试：`xbbr-pie.s`、`xbbr-shared-export-anchor.s`、`xbbr-shared-internal-drift.s`。M1–M4 的元数据/算法/工具部分此前已落地，本回写不重复。
 
 ### M1 — 编译器元数据 + clang 选项
 
@@ -760,6 +767,11 @@ For each entry (32 bytes):
 | `full` mode | `ConstraintSolver.cpp` | 全跨函数正确 |
 | 嵌入式 demo | Zephyr / micropython | 通过 |
 | 服务端 demo | clang/MySQL | 通过 |
+
+> **落地现状（回写 2026-06-21）**：AArch64 端到端、PIE/动态库（P2-2）、`full` mode 均已落地并通过 lit（34/34）。ARM（P2-1）Stage 0 的 ELF32LE/REL 通路已接通：修复了 `llvm/lib/Object/ELF.cpp::decodeBBAddrMapImpl`（原仅处理 SHT_RELA/CREL，ARM 的 SHT_REL 被"expected 12, got 8"拒绝）与 `XBBRGraph::collectFromObjFiles`（原用未设防 `dyn_cast<ObjFile<ELF64LE>>`，因 `ELFFileBase::classof` 对任意 ELF 返回 true 而误匹配 ELF32 ARM 文件、按 64 位误解析头）两处缺陷；`markRangeAnchors` 扩到 EM_ARM（pin 不可 thunk 的 `R_ARM_THM_JUMP11`），`isThunkableBranchReloc` 移除 JUMP11。ARM 测试：`xbbr-arm-physical-migration.s`、`xbbr-thumb-thunk.s`、`xbbr-arm-thumb-interop.s`。
+>
+> **ARM EH gate 限制**：每个 ARM 函数强制带 `.ARM.exidx.text.<fn>`，故 Stage 0 EH gate 对**所有** ARM 函数生效 → 非 entry BB 整体随函数移动、不个体漂移（正确，PLAN §5.3/§5.4）。即 ARM 当前为**函数级**重排，跨函数 BB 个体漂移收益需 `.ARM.exidx` 多段化（P2-3）解除 gate 后才有。`.text.hot` split 仍出现（rename 基于 `isAnchor()/isCold()`，不查 IsEHGated）。
+
 
 ---
 

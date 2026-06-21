@@ -47,6 +47,7 @@
 namespace lld::elf {
 
 struct Ctx;
+template <class ELFT> class ObjFile;
 
 namespace xbbr {
 
@@ -132,6 +133,10 @@ private:
   bool collectFromObjFiles(Ctx &ctx);
   bool collectCallGraphEdges(Ctx &ctx);
   bool runConsistencyChecks(Ctx &ctx) const;
+  /// Per-ObjFile Stage 0 body, templated on ELFT so the same logic serves
+  /// ELF64LE (x86_64, AArch64, RELA) and ELF32LE (ARM/Thumb, REL). Defined in
+  /// XBBRGraph.cpp; collectFromObjFiles dispatches on the file's ELF class.
+  template <class ELFT> bool collectFromFile(Ctx &ctx, ObjFile<ELFT> *OF);
   /// Phase 1a: on AArch64, mark BBs that are the source or target of a
   /// conditional/test branch (R_AARCH64_CONDBR19/TSTBR14) as CondInvolved so
   /// Stage 2/4 pin them — those relocs can't be thunked, so migrating either

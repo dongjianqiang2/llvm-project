@@ -182,6 +182,22 @@ def bb_cross_reorder_cold_threshold_eq : JJ<"bb-cross-reorder-cold-threshold=">,
            "during compilation; this option records the value for diagnostics "
            "only — pass the same value to clang for cold-classification to "
            "match.">;
+// Hidden, testing-only: shrink the branch range Stage 4 uses for its projected
+// range check so the thunk-budget / 30%-degrade paths can be exercised with a
+// tiny binary instead of a 128 MiB filler. 0 = use the real per-arch ISA range.
+// Does NOT affect lld's real thunk insertion (always ISA ranges) or the
+// CondInvolved correctness pin.
+def bb_cross_reorder_branch_range_for_testing_eq : JJ<"bb-cross-reorder-branch-range-for-testing=">,
+  Flags<[HelpHidden]>;
+
+// Hidden, testing-only (P1-3): shrink the AArch64 conditional-branch range
+// (B.cond CONDBR19 ±1 MiB / TBZ TSTBR14 ±32 KiB) Stage 4 projects against, so
+// the cond-branch over-range pin path can be exercised with a tiny binary
+// instead of a 1 MiB filler. 0 = real ISA range. Affects ONLY XBBR's projected
+// estimate; lld's real relocation is unaffected (a real overflow is a hard
+// link error — the pin exists to prevent it).
+def bb_cross_reorder_cond_range_for_testing_eq : JJ<"bb-cross-reorder-cond-range-for-testing=">,
+  Flags<[HelpHidden]>;
 
 defm irpgo_profile: EEq<"irpgo-profile",
   "Read a temporary profile file for use with --bp-startup-sort=">;

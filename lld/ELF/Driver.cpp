@@ -37,6 +37,7 @@
 #include "SyntheticSections.h"
 #include "Target.h"
 #include "Writer.h"
+#include "XBBR/SectionEmitter.h"
 #include "XBBR/XBBRGraph.h"
 #include "lld/Common/Args.h"
 #include "lld/Common/CommonLinkerContext.h"
@@ -1465,6 +1466,27 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
                      << arg->getValue() << "'";
     else
       ctx.arg.xbbrMaxThunkBytes = n;
+  }
+  if (auto *arg =
+          args.getLastArg(OPT_bb_cross_reorder_branch_range_for_testing_eq)) {
+    // Hidden testing knob (Options.td Flags<[HelpHidden]>). Shrinks the
+    // branch range Stage 4 projects against; 0 = real ISA range. See Config.h.
+    uint64_t n = 0;
+    if (StringRef(arg->getValue()).getAsInteger(0, n))
+      ErrAlways(ctx) << "invalid --bb-cross-reorder-branch-range-for-testing= "
+                        "value '"
+                     << arg->getValue() << "'";
+    else
+      ctx.arg.xbbrBranchRangeForTesting = n;
+  }
+  if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_cond_range_for_testing_eq)) {
+    uint64_t n = 0;
+    if (StringRef(arg->getValue()).getAsInteger(0, n))
+      ErrAlways(ctx) << "invalid --bb-cross-reorder-cond-range-for-testing= "
+                        "value '"
+                     << arg->getValue() << "'";
+    else
+      ctx.arg.xbbrCondRangeForTesting = n;
   }
   if (auto *arg = args.getLastArg(OPT_bb_cross_reorder_fallback_eq)) {
     StringRef v = arg->getValue();
@@ -3572,6 +3594,21 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
 
   {
     llvm::TimeTraceScope timeScope("Assign sections");
+
+    // XBBR P1-1 (SPEC §2.2 cold-code isolation): rename per-BB InputSections
+    // by hot/cold classification so the orphan grouping below routes hot
+    // migratable BBs to .text.hot and (full mode) cold BBs to .text.unlikely.
+    // This must run before processSectionCommands/addOrphanSections, which
+    // call getOutputSectionName. It builds a throwaway pre-ICF graph (ICF has
+    // not run yet); the real layout graph is rebuilt post-ICF in
+    // Writer::buildSectionOrder. -z keep-text-section-prefix is implied so the
+    // renamed prefixes form separate output sections (LinkerScript.cpp:97).
+    if (ctx.arg.xbbrEnabled && ctx.arg.xbbrMode >= XBBRMode::Partial) {
+      ctx.arg.zKeepTextSectionPrefix = true;
+      xbbr::XBBRGraph splitGraph;
+      if (splitGraph.build(ctx))
+        xbbr::renameSectionsForHotColdSplit(ctx, splitGraph);
+    }
 
     // Create output sections described by SECTIONS commands.
     ctx.script->processSectionCommands();

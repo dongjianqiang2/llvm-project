@@ -35,17 +35,26 @@ void collectMigratableBBs(const XBBRGraph &graph,
     // intact at its cluster slot.
     const bool ehGated = fn.IsEHGated;
     for (uint32_t I = fn.FirstNode; I < fn.FirstNode + fn.NumNodes; ++I) {
-      if (ehGated || allNodes[I].isAnchor() || allNodes[I].CondInvolved) {
+      if (ehGated || allNodes[I].isAnchor()) {
         // isAnchor: SPEC §5.3 blacklist (entry/landing-pad/musttail/...).
         // ehGated: LSDA function — wholesale-only (Phase 1b).
-        // CondInvolved: Phase 1a — B.cond/TBZ source/target; unthunkable,
-        //   so the BB must not migrate (its B/BL-exit siblings still can).
+        isAnchor[I] = true;
+      } else if (allNodes[I].CondInvolved && !allNodes[I].CondSafeToMigrate) {
+        // P1-3: a cond-branch BB whose connected component isn't all-hot
+        // (cross-section risk: a partner would land in .text while this BB
+        // goes to .text.hot) stays in .text. Covers cold cond BBs (never
+        // CondSafeToMigrate) and ARM R_ARM_THM_JUMP11 (unconditionally
+        // pinned). Hot cond BBs in an all-hot component may migrate; Stage 4
+        // range-checks the rare within-.text.hot over-range case.
         isAnchor[I] = true;
       } else if (mode == XBBRMode::Partial && allNodes[I].isCold()) {
         // In partial mode, cold BBs stay with their original functions
         // (SPEC §4: only hot BBs may migrate cross-function).
         isAnchor[I] = true; // treat as anchor — never migrates
       } else {
+        // Includes hot CondInvolved BBs with CondSafeToMigrate (P1-3
+        // relaxation): they enter the ExtTSP layout; Stage 4 reverts (pins)
+        // any whose B.cond/TBZ becomes over-range within .text.hot.
         migratable.push_back(I);
       }
     }

@@ -757,6 +757,22 @@ decodeBBAddrMapImpl(const ELFFile<ELFT> &EF,
       for (typename ELFFile<ELFT>::Elf_Rela Rela : std::get<1>(*Relas)) {
         FunctionOffsetTranslations[Rela.r_offset] = Rela.r_addend;
       }
+    } else if (RelaSec->sh_type == ELF::SHT_REL) {
+      // SHT_REL (e.g. ARM/Thumb A32) carries no r_addend field; relas() would
+      // reject the section ("expected entsize 12, got 8"). For
+      // SHT_LLVM_BB_ADDR_MAP the BaseAddress relocation always targets a
+      // section symbol at offset 0 — a per-BB section under
+      // -fbasic-block-sections=all, or the function's text section otherwise —
+      // so the implicit addend is 0. This matches the assert(Address == 0)
+      // contract below (the section content at the relocation offset is 0),
+      // which already governs the RELA path.
+      Expected<typename ELFFile<ELFT>::Elf_Rel_Range> Rels = EF.rels(*RelaSec);
+      if (!Rels)
+        return createError("unable to read relocations for section " +
+                           describe(EF, Sec) + ": " +
+                           toString(Rels.takeError()));
+      for (typename ELFFile<ELFT>::Elf_Rel Rel : *Rels)
+        FunctionOffsetTranslations[Rel.r_offset] = 0;
     } else {
       Expected<typename ELFFile<ELFT>::Elf_Rela_Range> Relas =
           EF.relas(*RelaSec);

@@ -12,8 +12,10 @@
 // cross-function call edges that lld already parsed out of
 // SHT_LLVM_CALL_GRAPH_PROFILE into ctx.arg.callGraphProfile.
 //
-// Supported architectures: x86_64 and AArch64 (both ELF64LE). ARM
-// (ELF32LE) support follows once thunk integration lands.
+// Supported architectures: x86_64 and AArch64 (ELF64LE, RELA) and ARM/Thumb
+// (ELF32LE, REL). ELF32LE dispatch and the SHT_REL BBAddrMap decode path are
+// wired (P2-1); the ARM EH gate (PLAN §5.3/§5.4) keeps ARM functions at
+// function-level reordering until .ARM.exidx multi-segment lands.
 //
 //===----------------------------------------------------------------------===//
 
@@ -116,15 +118,15 @@ struct BBAddrMapDecoded {
   std::vector<InputSectionBase *> RangeSections;
 };
 
+/// Decode one SHT_LLVM_BB_ADDR_MAP section. Templated on ELFT so the same
+/// logic serves ELF64LE (x86_64, AArch64, RELA) and ELF32LE (ARM/Thumb, REL).
+/// The companion relocation section may be SHT_RELA (ELF64) or SHT_REL (ARM);
+/// both are handled. Returns false on non-matching ELF class or parse error.
+template <class ELFT>
 bool decodeBBAddrMap(InputSectionBase *S, BBAddrMapDecoded &Out) {
-  // Both x86_64 and AArch64 are ELF64LE — the same template instance
-  // serves both architectures. ARM (ELF32LE) and big-endian ELF would
-  // need their own instantiations; XBBR currently rejects those at
-  // the driver / dump-tool level (SPEC §8.1).
-  using ELFT = ELF64LE;
   ObjFile<ELFT> *OF = dyn_cast<ObjFile<ELFT>>(S->file);
   if (!OF)
-    return false; // non-ELF64LE input is silently skipped at this layer.
+    return false;
   ELFFile<ELFT> EF = OF->getObj();
   auto Shdrs = EF.sections();
   if (!Shdrs)
@@ -143,22 +145,24 @@ bool decodeBBAddrMap(InputSectionBase *S, BBAddrMapDecoded &Out) {
 
   const auto &Shdr = (*Shdrs)[Idx];
 
-  // Relocatable .o files reference the function symbol through a
-  // companion SHT_RELA section whose `sh_info` points back at the
-  // BB_ADDR_MAP. decodeBBAddrMap needs that reloc data — without it
-  // it fails with "failed to get relocation data for offset N" on
-  // the function-address field.
-  const typename ELFT::Shdr *RelaShdr = nullptr;
+  // Relocatable .o files reference the function symbol through a companion
+  // relocation section whose `sh_info` points back at the BB_ADDR_MAP.
+  // ELF64LE uses SHT_RELA; ELF32LE ARM uses SHT_REL (addend in the insn).
+  // decodeBBAddrMap needs that reloc data — without it it fails with
+  // "failed to get relocation data for offset N" on the function-address
+  // field.
+  const typename ELFT::Shdr *RelShdr = nullptr;
   for (const auto &Sh : *Shdrs) {
-    if (Sh.sh_type == ELF::SHT_RELA && Sh.sh_info == Idx) {
-      RelaShdr = &Sh;
+    if ((Sh.sh_type == ELF::SHT_RELA || Sh.sh_type == ELF::SHT_REL) &&
+        Sh.sh_info == Idx) {
+      RelShdr = &Sh;
       break;
     }
   }
 
   std::vector<PGOAnalysisMap> PGO;
   Expected<std::vector<BBAddrMap>> Maps =
-      EF.decodeBBAddrMap(Shdr, RelaShdr, &PGO);
+      EF.decodeBBAddrMap(Shdr, RelShdr, &PGO);
   if (!Maps) {
     consumeError(Maps.takeError());
     return false;
@@ -168,16 +172,20 @@ bool decodeBBAddrMap(InputSectionBase *S, BBAddrMapDecoded &Out) {
 
   // Resolve each BB range's BaseAddress relocation to its per-BB
   // InputSection. Under -fbasic-block-sections=all, one BBAddrMap section
-  // carries N ranges; each range's BaseAddress is an ABS relocation against
-  // that BB's section symbol. EF.decodeBBAddrMap resolves the BaseAddress to
-  // an addend (discarding the symbol), so we re-read the RELA section here,
+  // carries N ranges; each range's BaseAddress is a relocation against that
+  // BB's section symbol. EF.decodeBBAddrMap resolves the BaseAddress to an
+  // addend (discarding the symbol), so we re-read the reloc section here,
   // sort by r_offset (ranges are emitted in order), and pair positionally.
   // This is the per-BB InputSection association that the offset-based code
-  // formerly lacked.
-  if (RelaShdr) {
-    auto Rels = EF.relas(*RelaShdr);
-    if (Rels) {
-      std::vector<std::pair<uint64_t, InputSectionBase *>> ByOff;
+  // formerly lacked. REL (ARM) and RELA (ELF64) both carry r_offset.
+  if (RelShdr) {
+    std::vector<std::pair<uint64_t, InputSectionBase *>> ByOff;
+    if (RelShdr->sh_type == ELF::SHT_RELA) {
+      auto Rels = EF.relas(*RelShdr);
+      if (!Rels) {
+        consumeError(Rels.takeError());
+        return true;
+      }
       ByOff.reserve(Rels->size());
       for (const typename ELFT::Rela &R : *Rels) {
         Symbol &sym = OF->getRelocTargetSym(R);
@@ -186,15 +194,33 @@ bool decodeBBAddrMap(InputSectionBase *S, BBAddrMapDecoded &Out) {
             d ? dyn_cast_or_null<InputSectionBase>(d->section) : nullptr;
         ByOff.emplace_back(R.r_offset, sec);
       }
-      llvm::sort(ByOff, llvm::less_first());
-      for (auto &KV : ByOff)
-        Out.RangeSections.push_back(KV.second);
     } else {
-      consumeError(Rels.takeError());
+      auto Rels = EF.rels(*RelShdr);
+      if (!Rels) {
+        consumeError(Rels.takeError());
+        return true;
+      }
+      ByOff.reserve(Rels->size());
+      for (const typename ELFT::Rel &R : *Rels) {
+        Symbol &sym = OF->getRelocTargetSym(R);
+        auto *d = dyn_cast<Defined>(&sym);
+        auto *sec =
+            d ? dyn_cast_or_null<InputSectionBase>(d->section) : nullptr;
+        ByOff.emplace_back(R.r_offset, sec);
+      }
     }
+    llvm::sort(ByOff, llvm::less_first());
+    for (auto &KV : ByOff)
+      Out.RangeSections.push_back(KV.second);
   }
   return true;
 }
+
+// Instantiate for both ELF classes we support (x86_64/AArch64 = ELF64LE,
+// ARM/Thumb = ELF32LE). Explicit instantiations let collectFromObjFiles
+// dispatch on the file's ELF class without exposing the template in the header.
+template bool decodeBBAddrMap<ELF64LE>(InputSectionBase *, BBAddrMapDecoded &);
+template bool decodeBBAddrMap<ELF32LE>(InputSectionBase *, BBAddrMapDecoded &);
 
 /// Compute global_freq(BB) from a PGOAnalysisMap entry.
 /// Per PLAN §3.2:
@@ -227,32 +253,50 @@ uint64_t computeGlobalFreq(uint64_t BBRaw, uint64_t EntryRaw,
 } // namespace
 
 bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
-  // Under -fbasic-block-sections=all (implied by -fbb-cross-reorder=partial|full,
-  // Phase 0a), each BB is its own InputSection and one SHT_LLVM_BB_ADDR_MAP
-  // section (with N ranges) describes a whole function. The BBAddrMap is the
-  // authority for function grouping: one BBAddrMap section == one function ==
-  // one FuncId. Each range's BaseAddress relocation resolves to that BB's
-  // InputSection (decodeBBAddrMap populates RangeSections). FuncIds are
-  // assigned in (objectFiles index, BBAddrMap section index) order — pure
-  // container traversal, deterministic (PLAN §6).
+  // Dispatch each input object by ELF class via `ekind` (the lld idiom), NOT
+  // dyn_cast<ObjFile<ELFx>>: ObjFile<ELFT> inherits ELFFileBase::classof,
+  // which returns true for *any* ELF file, so an unguarded
+  // dyn_cast<ObjFile<ELF64LE>> would also match an ELF32 ObjFile and misparse
+  // its 32-bit header as Elf64 — corrupting every field past the magic and
+  // silently yielding zero nodes on ARM. ekind is set at ObjFile construction
+  // (InputFiles.cpp) from the object's actual ELF class, so it is the reliable
+  // discriminator. ELF64LE (x86_64, AArch64, RELA) and ELF32LE (ARM/Thumb,
+  // REL) are handled; big-endian classes are skipped. FuncIds are assigned in
+  // (objectFiles index, BBAddrMap section index) order — pure container
+  // traversal, deterministic (PLAN §6).
   for (ELFFileBase *FB : ctx.objectFiles) {
-    ArrayRef<InputSectionBase *> Secs = FB->getSections();
-    if (Secs.empty())
-      continue;
-
-    // XBBR is wired for ELF64LE (x86_64 + AArch64). Other input kinds are
-    // skipped silently so a mixed link doesn't take down the whole graph
-    // build; driver checks should already reject ELF32LE/ARM for partial/full
-    // (SPEC §8.1).
-    ObjFile<ELF64LE> *OF = dyn_cast<ObjFile<ELF64LE>>(FB);
-    if (!OF)
-      continue;
-    ELFFile<ELF64LE> EF = OF->getObj();
-    auto Shdrs = EF.sections();
-    if (!Shdrs) {
-      consumeError(Shdrs.takeError());
-      continue;
+    switch (FB->ekind) {
+    case ELF64LEKind:
+      if (!collectFromFile(ctx, cast<ObjFile<ELF64LE>>(FB)))
+        return false;
+      break;
+    case ELF32LEKind:
+      if (!collectFromFile(ctx, cast<ObjFile<ELF32LE>>(FB)))
+        return false;
+      break;
+    default:
+      break; // ELF32BE / ELF64BE (big-endian) not supported by XBBR.
     }
+  }
+  return true;
+}
+
+// Per-ObjFile Stage 0 body. Under -fbasic-block-sections=all (implied by
+// -fbb-cross-reorder=partial|full, Phase 0a), each BB is its own InputSection
+// and one SHT_LLVM_BB_ADDR_MAP section (with N ranges) describes a whole
+// function == one FuncId. decodeBBAddrMap resolves each range's BaseAddress
+// relocation to its per-BB InputSection (RangeSections).
+template <class ELFT>
+bool XBBRGraph::collectFromFile(Ctx &ctx, ObjFile<ELFT> *OF) {
+  ArrayRef<InputSectionBase *> Secs = OF->getSections();
+  if (Secs.empty())
+    return true;
+  ELFFile<ELFT> EF = OF->getObj();
+  auto Shdrs = EF.sections();
+  if (!Shdrs) {
+    consumeError(Shdrs.takeError());
+    return true;
+  }
 
     // Pre-decode every BBAddrMap section in this ObjFile (with RangeSections).
     std::vector<BBAddrMapDecoded> DecodedMaps;
@@ -260,30 +304,32 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       if (!S || S->type != ELF::SHT_LLVM_BB_ADDR_MAP)
         continue;
       BBAddrMapDecoded D;
-      if (!decodeBBAddrMap(S, D) || D.Maps.empty())
+      if (!decodeBBAddrMap<ELFT>(S, D) || D.Maps.empty())
         continue;
       DecodedMaps.push_back(std::move(D));
     }
 
     // EH gate (Phase 1b): collect the set of function-name suffixes that own
-    // a `.gcc_except_table.<fn>` LSDA section. A function with an LSDA cannot
+    // a `.gcc_except_table.<fn>` LSDA section (ELF64 C++) or an ARM
+    // `.ARM.exidx.text.<fn>` unwind section. A function with an LSDA cannot
     // have its non-landing-pad BBs migrated — the call_site ranges are byte
-    // offsets that stop mapping to the right BB once they drift. Under =all
-    // the FDEs are per-BB-section (so plain unwind follows migration), but
-    // LSDA dispatch still needs the whole function pinned. Match by the
-    // suffix shared between `.text.<fn>` and `.gcc_except_table.<fn>`.
+    // offsets that stop mapping to the right BB once they drift. ARM exidx is
+    // per-function (NOT per-BB-section under =all, unlike ELF64 FDEs), so any
+    // ARM function with an exidx must be pinned wholesale or its unwind entry
+    // stops covering the migrated BBs. Under =all the ELF64 FDEs are
+    // per-BB-section (plain unwind follows migration), but LSDA dispatch and
+    // ARM exidx still need the whole function pinned. Match by the suffix
+    // shared with `.text.<fn>`.
     llvm::StringSet<> ExceptTableSuffixes;
+    llvm::StringSet<> ArmExidxSuffixes;
     for (InputSectionBase *S : Secs) {
       if (!S)
         continue;
-      // gcc_except_table sections are SHF_ALLOC PROGBITS named
-      // `.gcc_except_table.<fn>` (or `.gcc_except_table` for the legacy
-      // single-section case, which we treat as gating nothing here since it
-      // can't be associated to a specific function by name).
       StringRef N = S->name;
-      if (!N.starts_with(".gcc_except_table."))
-        continue;
-      ExceptTableSuffixes.insert(N.substr(strlen(".gcc_except_table.")));
+      if (N.starts_with(".gcc_except_table."))
+        ExceptTableSuffixes.insert(N.substr(strlen(".gcc_except_table.")));
+      else if (N.starts_with(".ARM.exidx.text."))
+        ArmExidxSuffixes.insert(N.substr(strlen(".ARM.exidx.text.")));
     }
 
     // Pre-decode .llvm_xbbr_attr sections, keyed by the ENTRY text section
@@ -365,7 +411,7 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
       // or version skew.
       if (FuncAttrs && FuncAttrs->size() != Flat.size()) {
         Err(ctx) << "XBBR Stage 0: " << entrySec->name << " in "
-                 << FB->getName() << ": .llvm_xbbr_attr num_bbs ("
+                 << OF->getName() << ": .llvm_xbbr_attr num_bbs ("
                  << FuncAttrs->size() << ") does not match BB_ADDR_MAP ("
                  << Flat.size() << ")";
         return false;
@@ -404,12 +450,17 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
           break;
         }
       bool HasLSDA = false;
+      bool HasArmExidx = false;
       StringRef EntryName = entrySec->name;
       // Strip a leading `.text.` (or `.text.{hot,unlikely,split,eh}.`) to get
-      // the function suffix shared with `.gcc_except_table.<fn>`.
-      if (EntryName.starts_with(".text."))
-        HasLSDA = ExceptTableSuffixes.contains(EntryName.substr(strlen(".text.")));
-      FI.IsEHGated = HasLandingPad || HasLSDA;
+      // the function suffix shared with `.gcc_except_table.<fn>` /
+      // `.ARM.exidx.text.<fn>`.
+      if (EntryName.starts_with(".text.")) {
+        StringRef Suffix = EntryName.substr(strlen(".text."));
+        HasLSDA = ExceptTableSuffixes.contains(Suffix);
+        HasArmExidx = ArmExidxSuffixes.contains(Suffix);
+      }
+      FI.IsEHGated = HasLandingPad || HasLSDA || HasArmExidx;
       Funcs.push_back(FI);
 
       // Intra-function CFG edges from BBAddrMap BrProb (PGOBBEntry::Successors
@@ -443,7 +494,6 @@ bool XBBRGraph::collectFromObjFiles(Ctx &ctx) {
         }
       }
     }
-  }
 
   return true;
 }
@@ -511,12 +561,41 @@ bool XBBRGraph::build(Ctx &ctx) {
 }
 
 void XBBRGraph::markRangeAnchors(Ctx &ctx) {
-  // Only AArch64 has unthunkable short-range conditional/test branches
-  // (B.cond ±1 MiB via R_AARCH64_CONDBR19, TBZ/TBNZ ±32 KiB via
-  // R_AARCH64_TSTBR14). On x86 Jcc is rel32 (never overflows); on other
-  // arches XBBR isn't wired. No-op there.
-  if (ctx.arg.emachine != ELF::EM_AARCH64)
+  // Unthunkable short-range conditional branches: if either endpoint migrates
+  // the branch can overflow, and lld CANNOT extend it with a range-extension
+  // thunk (only B/BL-class branches are thunkable). Pin both endpoints so they
+  // never migrate — the analog of treating them as anchors.
+  //
+  //   AArch64: B.cond (R_AARCH64_CONDBR19, ±1 MiB) and TBZ/TBNZ
+  //            (R_AARCH64_TSTBR14, ±32 KiB) — lld has no cond-branch thunk.
+  //   ARM/Thumb: R_ARM_THM_JUMP11 (B<cond> narrow, ±2 KiB, Thumb-1) — lld's
+  //            needsThunk/inBranchRange do not handle it (the offset would be
+  //            silently truncated on overflow), so pin it defensively. Note
+  //            Thumb-2 B<cond>.W (R_ARM_THM_JUMP19, ±1 MiB) IS thunkable by
+  //            lld (ARM::needsThunk creates a Thumb thunk), so it is range-
+  //            checked by Stage 4 (isThunkableBranchReloc), not pinned here;
+  //            A32 B<cond> shares R_ARM_JUMP24 with unconditional B, which lld
+  //            thunks uniformly.
+  //   x86: Jcc is rel32 (±2 GiB, never overflows in practice) — no-op.
+  auto isUnthunkableCondBr = [](uint16_t emachine, uint32_t type) -> bool {
+    switch (emachine) {
+    case ELF::EM_AARCH64:
+      return type == ELF::R_AARCH64_CONDBR19 || type == ELF::R_AARCH64_TSTBR14;
+    case ELF::EM_ARM:
+      return type == ELF::R_ARM_THM_JUMP11;
+    default:
+      return false;
+    }
+  };
+  if (ctx.arg.emachine != ELF::EM_AARCH64 && ctx.arg.emachine != ELF::EM_ARM)
     return;
+
+  // A cond-branch BB is "hot" (would land in .text.hot) iff non-anchor,
+  // non-cold, and not in an EH-gated function.
+  auto isHot = [this](uint32_t I) {
+    const XBBRNode &n = Nodes[I];
+    return !n.isAnchor() && !n.isCold() && !Funcs[n.Func].IsEHGated;
+  };
 
   // Map each per-BB InputSection back to its node (under =all one section
   // per BB). Used to resolve a conditional branch's target to the dst node.
@@ -525,23 +604,55 @@ void XBBRGraph::markRangeAnchors(Ctx &ctx) {
     if (Nodes[I].BBSection)
       secToNode.try_emplace(Nodes[I].BBSection, I);
 
+  // Mark CondInvolved and collect cond-branch partnership edges (X, Y).
+  std::vector<std::pair<uint32_t, uint32_t>> condEdges;
   for (uint32_t I = 0; I < Nodes.size(); ++I) {
     InputSectionBase *src = Nodes[I].BBSection;
     if (!src)
       continue;
     for (const Relocation &r : src->relocs()) {
-      if (r.type != ELF::R_AARCH64_CONDBR19 &&
-          r.type != ELF::R_AARCH64_TSTBR14)
+      if (!isUnthunkableCondBr(ctx.arg.emachine, r.type))
         continue;
-      // This BB issues a conditional/test branch — pin it (can't thunk).
+      // This BB issues an unthunkable conditional branch — pin it (can't thunk).
       Nodes[I].CondInvolved = true;
       // Pin the target too: if the target BB migrates away, the branch
       // overflows just the same. Resolve reloc target → its section → node.
       auto *d = dyn_cast<Defined>(r.sym);
       auto *tsec = d ? dyn_cast_or_null<InputSectionBase>(d->section) : nullptr;
       auto it = tsec ? secToNode.find(tsec) : secToNode.end();
-      if (it != secToNode.end())
+      if (it != secToNode.end()) {
         Nodes[it->second].CondInvolved = true;
+        condEdges.push_back({I, it->second});
+      }
+    }
+  }
+
+  // P1-3 (AArch64 only): a CondInvolved BB may migrate (to .text.hot) iff its
+  // entire cond-branch connected component is hot. Cross-section unsafety (one
+  // endpoint .text.hot, the other .text — unthunkable, would hard-error)
+  // propagates through the partnership graph, so a single non-hot partner pins
+  // the whole component. Fixed-point: start CondSafeToMigrate = hot, then clear
+  // it on any node whose partner is not safe, until stable. ARM R_ARM_THM_JUMP11
+  // stays unconditionally pinned (lld can neither thunk nor relax it) — its
+  // CondSafeToMigrate is left false.
+  if (ctx.arg.emachine == ELF::EM_AARCH64) {
+    for (uint32_t I = 0; I < Nodes.size(); ++I)
+      if (Nodes[I].CondInvolved)
+        Nodes[I].CondSafeToMigrate = isHot(I);
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto &E : condEdges) {
+        uint32_t X = E.first, Y = E.second;
+        if (Nodes[X].CondSafeToMigrate && !Nodes[Y].CondSafeToMigrate) {
+          Nodes[X].CondSafeToMigrate = false;
+          changed = true;
+        }
+        if (Nodes[Y].CondSafeToMigrate && !Nodes[X].CondSafeToMigrate) {
+          Nodes[Y].CondSafeToMigrate = false;
+          changed = true;
+        }
+      }
     }
   }
 }

@@ -114,10 +114,16 @@ struct XBBRNode {
   /// target of a conditional/test branch (R_AARCH64_CONDBR19 B.cond ±1 MiB,
   /// R_AARCH64_TSTBR14 TBZ/TBNZ ±32 KiB). Those relocs CANNOT be thunked by
   /// lld (only B/BL can), so migrating either endpoint risks a hard
-  /// relocation-overflow error. Such BBs are pinned (treated as non-migratable
-  /// like an anchor) so only BBs whose exits are B/BL — which the thunk loop
-  /// can extend — migrate. Always false on x86 (Jcc rel32 never overflows).
+  /// relocation-overflow error. Always false on x86 (Jcc rel32 never overflows).
   bool CondInvolved = false;
+  /// P1-3: a CondInvolved BB may migrate (to .text.hot) iff its entire
+  /// cond-branch connected component is hot (non-anchor, non-cold, non-EH-gated).
+  /// Cross-section unsafety (one endpoint .text.hot, the other .text) propagates
+  /// through the partnership graph, so a single non-hot partner pins the whole
+  /// component (computed by XBBRGraph::markRangeAnchors). CondSafeToMigrate
+  /// handles the common cross-section case upfront; Stage 4 still range-checks
+  /// the rare within-.text.hot over-range case and pins (cascading) if needed.
+  bool CondSafeToMigrate = false;
 
   /// Quick predicates derived from XBBRAttrs (mirroring xbbr::AttrBit
   /// in include/llvm/CodeGen/XBBRMetadata.h — Stage 0 will assert these
@@ -203,8 +209,19 @@ struct XBBRLayoutResult {
   double EstimatedCost = 0.0;
   /// Actual cost after emission (filled by Stage 5 terminal verification).
   double ActualCost = 0.0;
-  /// Total bytes of thunks emitted (Stage 5).
+  /// Total bytes of thunks emitted (Stage 5). Filled by the tail-end recheck
+  /// (P0-2) from real ThunkSection sizes; 0 until then.
   uint64_t ThunkBytes = 0;
+  /// Stage 4 projected-VA estimate: number of B/BL (thunkable) direct-branch
+  /// edges whose projected src→dst distance exceeds the ISA branch range and
+  /// would therefore require a linker thunk. 0 means the projected layout
+  /// needs no range-extension thunks. Used to gate the thunk-byte budget
+  /// (--bb-cross-reorder-max-thunk-bytes) and the 30% degrade (SPEC §7).
+  uint32_t EstimatedOverRangeEdges = 0;
+  /// Stage 4 projected-VA estimate of total thunk bytes the layout would
+  /// require (EstimatedOverRangeEdges × per-arch thunk size). Compared by the
+  /// tail-end recheck (P0-2) against the real ThunkBytes after emission.
+  uint64_t EstimatedThunkBytes = 0;
   /// True if Stage 4 degraded to function-level mode (SPEC §7). The
   /// SectionEmitter uses this to set a flag in the decision-map header.
   bool Degraded = false;

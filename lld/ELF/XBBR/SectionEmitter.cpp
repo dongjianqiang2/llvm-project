@@ -20,9 +20,12 @@
 #include "SectionEmitter.h"
 #include "Config.h"
 #include "InputSection.h"
+#include "LinkerScript.h"
+#include "OutputSections.h"
 #include "SyntheticSections.h"
 #include "XBBR/XBBRGraph.h"
 #include "XBBR/XBBRTypes.h"
+#include "lld/Common/ErrorHandler.h"
 #include "llvm/BinaryFormat/XBBRDecisionMap.h"
 
 
@@ -73,6 +76,31 @@ std::vector<BBFragment> buildFragments(const XBBRGraph &graph,
 
 } // namespace
 
+/// P0-2: sum the byte sizes of every ThunkSection lld emitted. ThunkSections
+/// are synthetic sections named ".text.thunk" (ThunkSection ctor,
+/// SyntheticSections.cpp) inserted into InputSectionDescriptions by the
+/// finalizeAddressDependentContent thunk loop. By the time the tail-end recheck
+/// runs that loop has converged, so these sizes are the real, final thunk
+/// overhead — the ground truth Stage 4's projected estimate is compared
+/// against (PLAN §4.3 Stage 5 "末梢复核").
+static uint64_t computeRealThunkBytes(Ctx &ctx) {
+  uint64_t total = 0;
+  for (OutputSection *os : ctx.outputSections)
+    for (SectionCommand *cmd : os->commands) {
+      auto *isd = dyn_cast<InputSectionDescription>(cmd);
+      if (!isd)
+        continue;
+      for (InputSection *s : isd->sections)
+        // name check distinguishes ThunkSections from other synthetic sections
+        // (.got/.plt/…); dyn_cast<ThunkSection> is non-null for any
+        // SyntheticSection (Relocations.cpp:1978 FIXME), so the name is the
+        // reliable discriminator.
+        if (isa<SyntheticSection>(s) && s->name == ".text.thunk")
+          total += s->getSize();
+    }
+  return total;
+}
+
 void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
                        XBBRLayoutResult &result) {
   if (!ctx.arg.xbbrEmitDecisionMap)
@@ -103,12 +131,21 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
   const bool partialMode = ctx.arg.xbbrMode == XBBRMode::Partial;
   for (const auto &frag : fragments) {
     const XBBRNode &node = graph.nodes()[frag.NodeIdx];
+    const FuncInfo &fn = graph.funcs()[node.Func];
     XBBRDecisionEntry e;
     e.BBIndex = node.BB;
     e.NewAddress = frag.FinalVA;
     e.ClusterId = 0; // simplified for now; multi-cluster routing later
+    // Mirrors BBLayout::collectMigratableBBs's anchor decision. P1-3: a hot
+    // cond-branch BB that migrated (CondSafeToMigrate, still in the layout, not
+    // Stage-4-pinned) is Moved; cond BBs whose component isn't all-hot (and the
+    // §5.3/EH-gate/partial-cold anchors) are Anchored. Stage-4-pinned BBs are
+    // absent from the layout (no fragment) and thus unlisted (anchored at
+    // original).
     const bool effectiveAnchor =
-        node.isAnchor() || node.CondInvolved || (partialMode && node.isCold());
+        node.isAnchor() || fn.IsEHGated ||
+        (node.CondInvolved && !node.CondSafeToMigrate) ||
+        (partialMode && node.isCold());
     if (effectiveAnchor) {
       e.DecisionFlags = llvm::XBBRDecisionMap::EntryFlags::Anchored;
       ++a;
@@ -143,9 +180,81 @@ void runSectionEmitter(Ctx &ctx, XBBRGraph &graph,
   }
 }
 
+void renameSectionsForHotColdSplit(Ctx &ctx, XBBRGraph &graph) {
+  if (ctx.arg.xbbrMode < XBBRMode::Partial)
+    return;
+  const bool partialMode = ctx.arg.xbbrMode == XBBRMode::Partial;
+  for (const XBBRNode &node : graph.nodes()) {
+    InputSectionBase *sec = node.BBSection;
+    if (!sec)
+      continue;
+    // Classification mirrors runSectionEmitter's BBPlacement logic, but is
+    // mode-aware for cold: SPEC §4 — in partial, cold BBs stay at their
+    // original function position (Original); only full migrates them to
+    // .text.unlikely. Entry/anchor BBs are always Original.
+    BBPlacement::Section target;
+    if (node.isAnchor())
+      target = BBPlacement::Section::Original;
+    else if (node.isCold() && !partialMode)
+      target = BBPlacement::Section::Unlikely;
+    else if (node.isCold())
+      target = BBPlacement::Section::Original; // partial: cold stays
+    else
+      target = BBPlacement::Section::Hot;
+    if (target != BBPlacement::Section::Hot &&
+        target != BBPlacement::Section::Unlikely)
+      continue;
+    // sec->name is ".text.<rest>" under -fbasic-block-sections=all; rewrite to
+    // ".text.hot.<rest>" / ".text.unlikely.<rest>" so getOutputSectionName
+    // (with -z keep-text-section-prefix) routes it to .text.hot / .text.unlikely.
+    StringRef nm = sec->name;
+    if (!nm.starts_with(".text."))
+      continue; // not a per-BB text section; leave untouched
+    StringRef rest = nm.substr(strlen(".text."));
+    StringRef prefix = target == BBPlacement::Section::Hot ? ".text.hot."
+                                                           : ".text.unlikely.";
+    sec->name = ctx.saver.save((Twine(prefix) + rest).str());
+  }
+}
+
 void backfillDecisionMapVAs(Ctx &ctx) {
   if (!ctx.xbbrGraph || !ctx.xbbrLayoutResult)
     return;
+
+  // P0-2 tail-end recheck (PLAN §4.3 Stage 5 "末梢复核"): now that
+  // finalizeAddressDependentContent has converged and optimizeBasicBlockJumps
+  // has run, measure the REAL thunk overhead from the emitted ThunkSections
+  // and compare against Stage 4's projected estimate. This runs regardless of
+  // whether the decision map is emitted — the budget check is independent.
+  XBBRLayoutResult &result = *ctx.xbbrLayoutResult;
+  result.ThunkBytes = computeRealThunkBytes(ctx);
+  // ActualCost captures the verified real size-overhead cost component
+  // (w_size × thunk bytes); a full icache/itlb/btb recompute against final
+  // addresses is future work.
+  result.ActualCost =
+      static_cast<double>(result.ThunkBytes) * ctx.arg.xbbrWeightSize;
+  const bool overrun =
+      ctx.arg.xbbrMaxThunkBytes != 0 &&
+      result.ThunkBytes > ctx.arg.xbbrMaxThunkBytes;
+  if (overrun) {
+    // Addresses are final by now, so we cannot revert BBs here — the
+    // pre-emit pinning (P0-1) is the revert mechanism. This warning surfaces
+    // cases Stage 4's projected estimate under-counted (e.g. distance created
+    // by non-BB filler it couldn't see) so the user can tighten the budget or
+    // use --bb-cross-reorder-fallback=conservative to catch it pre-emit.
+    Warn(ctx) << "XBBR tail-end recheck: real thunk bytes ("
+              << result.ThunkBytes
+              << ") exceed --bb-cross-reorder-max-thunk-bytes ("
+              << ctx.arg.xbbrMaxThunkBytes << "); Stage 4 projected "
+              << result.EstimatedThunkBytes
+              << ". Layout already emitted — rerun with a larger budget or "
+                 "--bb-cross-reorder-fallback=conservative.";
+  }
+  if (ctx.arg.xbbrStats)
+    errs() << "xbbr-stage5: realThunkBytes=" << result.ThunkBytes
+           << " estThunkBytes=" << result.EstimatedThunkBytes
+           << " overrun=" << (overrun ? 1 : 0) << "\n";
+
   Partition *mainPart = ctx.mainPart;
   if (!mainPart || !mainPart->xbbrDecisionMap)
     return;

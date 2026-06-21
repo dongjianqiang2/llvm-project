@@ -62,24 +62,24 @@
 # RUN:     --unresolved-symbols=ignore-all -o exe.run2
 # RUN: cmp exe.run1 exe.run2
 
-# Functional equivalence (SPEC §10): XBBR partial mode now physically
-# reorders BBs (Phase 2), so the .text byte layout legitimately differs
-# from a plain link. What must still hold: both links succeed, produce the
-# same set of output section NAMES, and a non-empty .text. (Byte-identical
-# section headers were a placeholder for the pre-physical-emission era; the
-# reproducibility cmp above is the real correctness gate for determinism.)
+# Functional equivalence (SPEC §10 / P1-1): XBBR partial mode physically
+# reorders BBs and splits hot migratable BBs into .text.hot (cold BBs stay in
+# .text per SPEC §4 partial semantics). A plain CGProfile-only link keeps
+# everything in .text. What must hold: both links succeed; the XBBR link has
+# .text.hot in addition to .text; the plain link has no .text.hot. (The
+# reproducibility cmp above is the determinism gate.)
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --unresolved-symbols=ignore-all -o exe.plain
 # RUN: ld.lld -e _start hot.o indir.o main.o \
 # RUN:     --bb-cross-reorder=foo.profdata --bb-cross-reorder-mode=partial \
 # RUN:     --unresolved-symbols=ignore-all -o exe.xbbr.nomap
-# RUN: llvm-readelf -SW exe.plain      | sed -n '/Section Headers/,/^Key to Flags/p' \
-# RUN:     | awk '{print $$2}' | sort > plain.sections
-# RUN: llvm-readelf -SW exe.xbbr.nomap | sed -n '/Section Headers/,/^Key to Flags/p' \
-# RUN:     | awk '{print $$2}' | sort > xbbr.sections
-# RUN: cmp plain.sections xbbr.sections
 # RUN: llvm-readelf -SW exe.xbbr.nomap | FileCheck %s --check-prefix=HAS-TEXT
+# RUN: llvm-readelf -SW exe.xbbr.nomap | FileCheck %s --check-prefix=HAS-HOT
+# RUN: llvm-readelf -SW exe.plain      | FileCheck %s --check-prefix=PLAIN-NO-HOT \
+# RUN:     --allow-empty
 # HAS-TEXT: .text
+# HAS-HOT: .text.hot
+# PLAIN-NO-HOT-NOT: .text.hot
 
 # Strip removes only .debug_xbbr_decision.
 # RUN: cp exe.xbbr exe.stripped

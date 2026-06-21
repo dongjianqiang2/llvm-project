@@ -21,6 +21,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Config.h"
+#include "CostFunction.h"
 #include "XBBR/XBBRGraph.h"
 #include "XBBR/XBBRTypes.h"
 
@@ -38,15 +39,11 @@ constexpr unsigned PAGE_SIZE = 4096;
 
 // E9 <rel32> thunk byte size — used in Stage 5 cost verification.
 
-/// Projected address for a BB: offset from the cluster base after
-/// accumulating all preceding BBs with alignment.
-struct ProjectedBB {
-  uint32_t NodeIdx;
-  uint64_t Offset; // projected byte offset from cluster base
-  uint64_t Size;
-};
+} // namespace
 
-/// Compute projected offsets for the given order.
+/// Compute projected offsets for a single cluster's BB order (PLAN §4.3
+/// Stage 3). Defined at namespace scope (not anonymous) so Stage 4 can reuse
+/// it for branch-range testing — see CostFunction.h.
 std::vector<ProjectedBB>
 computeProjectedOffsets(const XBBRGraph &graph,
                         const std::vector<uint32_t> &order,
@@ -66,6 +63,8 @@ computeProjectedOffsets(const XBBRGraph &graph,
   }
   return result;
 }
+
+namespace {
 
 double computeIcacheCrossings(const XBBRGraph &graph,
                               const std::vector<ProjectedBB> &proj,

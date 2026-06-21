@@ -336,6 +336,18 @@ struct Config {
   unsigned xbbrWeightBtb = 1;
   unsigned xbbrWeightSize = 1;
   uint64_t xbbrMaxThunkBytes = 0;    ///< 0 = unlimited
+  /// Testing-only override (hidden --bb-cross-reorder-branch-range-for-testing=):
+  /// when non-zero, replaces the ISA branch range used by Stage 4's projected
+  /// branch-range check, so budget/degrade paths can be exercised with a tiny
+  /// binary instead of a 128 MiB filler. 0 = use the real per-arch ISA range
+  /// (AArch64 B/BL ±128 MiB, …). Does NOT affect lld's real thunk insertion
+  /// (which always uses ISA ranges) nor CondInvolved pinning.
+  uint64_t xbbrBranchRangeForTesting = 0;
+  // P1-3: hidden knob shrinking the AArch64 conditional-branch range
+  // (B.cond CONDBR19 ±1 MiB / TBZ TSTBR14 ±32 KiB) Stage 4 projects against,
+  // so the cond-branch over-range pin path can be exercised with a tiny
+  // binary. 0 = real ISA range. Affects ONLY XBBR's projected estimate.
+  uint64_t xbbrCondRangeForTesting = 0;
   XBBRFallback xbbrFallback = XBBRFallback::Auto;
   bool xbbrEmitDecisionMap = false;  ///< --bb-cross-reorder-emit-decision-map
   bool xbbrDeterministic = false;    ///< --bb-cross-reorder-deterministic

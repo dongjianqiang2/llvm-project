@@ -84,6 +84,8 @@ public:
   RelExpr adjustTlsExpr(RelType type, RelExpr expr) const override;
   void relocateAlloc(InputSectionBase &sec, uint8_t *buf) const override;
   void applyBranchToBranchOpt() const override;
+  bool deleteFallThruJmpInsn(InputSection &is, InputFile *file,
+                             InputSection *nextIS) const override;
 
 private:
   void relaxTlsGdToLe(uint8_t *loc, const Relocation &rel, uint64_t val) const;
@@ -936,6 +938,8 @@ void AArch64::relocateAlloc(InputSectionBase &sec, uint8_t *buf) const {
   AArch64Relaxer relaxer(ctx, sec.relocs());
   for (size_t i = 0, size = sec.relocs().size(); i != size; ++i) {
     const Relocation &rel = sec.relocs()[i];
+    if (rel.expr == R_NONE) // See deleteFallThruJmpInsn
+      continue;
     uint8_t *loc = buf + rel.offset;
     const uint64_t val = sec.getRelocTargetVA(ctx, rel, secAddr + rel.offset);
 
@@ -1030,6 +1034,66 @@ void AArch64::applyBranchToBranchOpt() const {
   applyBranchToBranchOptImpl(ctx, getControlTransferAddend,
                              getBranchInfoAtTarget,
                              redirectControlTransferRelocations);
+}
+
+namespace {
+// P1-2 helpers for --optimize-bb-jumps on AArch64 (basic-block-sections
+// fall-through relaxation). Mirror the X86_64 helpers (Arch/X86_64.cpp) but
+// with AArch64 relocation types and branch-PC semantics: an AArch64 branch's
+// PC is the branch instruction itself (not PC+4), so target VA = addrLoc +
+// getRelocTargetVA (which returns target - PC).
+
+unsigned getRelocationWithOffsetAArch64(const InputSection &is,
+                                        uint64_t offset) {
+  unsigned size = is.relocs().size();
+  for (unsigned i = size - 1; i + 1 > 0; --i)
+    if (is.relocs()[i].offset == offset && is.relocs()[i].expr != R_NONE)
+      return i;
+  return size;
+}
+
+// True if a B (R_AARCH64_JUMP26) relocation r targets the first instruction
+// of nextIS — i.e. the branch is a redundant fall-through. target VA is exact
+// (getRelocTargetVA is the linker's own target computation), so this returns
+// true iff the B genuinely jumps to nextIS's start: a wrong formula would
+// simply miss deletions (conservative), never delete a non-fall-through.
+bool isFallThruRelocationAArch64(InputSection &is, InputSection *nextIS,
+                                 const Relocation &r) {
+  if (r.type != R_AARCH64_JUMP26)
+    return false;
+  uint64_t addrLoc = is.getOutputSection()->addr + is.outSecOff + r.offset;
+  uint64_t target = addrLoc + is.getRelocTargetVA(is.getCtx(), r, addrLoc);
+  uint64_t nextStart = nextIS->getOutputSection()->addr + nextIS->outSecOff;
+  return target == nextStart;
+}
+} // namespace
+
+bool AArch64::deleteFallThruJmpInsn(InputSection &is, InputFile *file,
+                                    InputSection *nextIS) const {
+  // Case 1: the section ends with an unconditional B (R_AARCH64_JUMP26, 4
+  // bytes) whose target is the immediately following section — a redundant
+  // fall-through. Delete the B (cancel its reloc, drop the 4 bytes, mark the
+  // section NOP-filled so the trimmed bytes stay valid).
+  //
+  // The B.cond+B flip case (where the conditional branch, not the B, targets
+  // the next section) is a follow-up: it requires inverting the B.cond
+  // condition code at write time via jumpInstrMod + applyJumpInstrMod, which
+  // is not yet wired for AArch64. Case 1 captures the common fall-through B.
+  constexpr unsigned sizeOfBranchInsn = 4;
+  if (!nextIS || is.getSize() < sizeOfBranchInsn)
+    return false;
+  unsigned rIndex =
+      getRelocationWithOffsetAArch64(is, is.getSize() - sizeOfBranchInsn);
+  if (rIndex == is.relocs().size())
+    return false;
+  Relocation &r = is.relocs()[rIndex];
+  if (!isFallThruRelocationAArch64(is, nextIS, r))
+    return false;
+  r.expr = R_NONE;
+  r.offset = 0;
+  is.drop_back(sizeOfBranchInsn);
+  is.nopFiller = true;
+  return true;
 }
 
 // AArch64 may use security features in variant PLT sequences. These are:
