@@ -1,8 +1,8 @@
 # EmbeddedJIT SRE Taskpool 编译调度机制
 
-> 适用分支：`ejit_taskpool`
-> 开关：`EJIT_SRE_TASKPOOL`（默认 **OFF**）
-> 目标平台：`aarch64_be`（SRE，无 C++ 线程库）
+> 当前分支:`ejit-taskpool-spec-worker`(v2,实现 SPEC §3.4 单 worker 模型)
+> 构建开关:`EJIT_SRE_TASKPOOL`(CMake option,默认 **OFF**;启用后 `ejit_taskpool_*` C ABI 与内部 worker 生效)
+> 目标平台:`aarch64_be`(SRE,无 C++ 线程库),host 可跑测试构建
 
 ---
 
@@ -82,8 +82,8 @@ EJitTaskPool                                       EJitCompileDriver (编译层)
   ├── 业务组件 (有状态)
   │     ├── EJitSwitchController   → 模式(Off/Async) + 每(dimType,instance)独立version
   │     ├── EJitTaskPoolCache      → 结果缓存 (32桶, 每桶 unordered_map + 独立 RwLock)
-  │     │                             cacheKey = hash(funcIndex, dims)
-  │     │                             匹配: (cacheKey, dims, versions) 逐实例比对
+  │     │                             hashKey = hash(funcIndex, dims) 定位桶,vector 内
+  │     │                             identityMatches 解 hash 冲突 + 逐维 version 验
   │     ├── EJitTaskQueue          → 去重的任务提交管理 (组合 Queue + Dedup, §4.2)
   │     │                              tryEnqueue: dedup 占位 → queue push (失败自动回滚)
   │     │                              tryDequeue / release: queue pop / dedup 释放
@@ -114,55 +114,54 @@ EJitTaskPool                                       EJitCompileDriver (编译层)
 ### 2.2 数据流
 
 ```
-compile_or_get(funcIndex, dims, numDims)
+compile_or_get(funcIndex, dims, numDims, fallback)
       │
-      ├─ 0. 维度开关检查: for each (dimType, instanceId) in dims
-      │     any disabled → InstanceDisabled, return fallback
+      ├─ 1. 参数检查: numDims ≤ 4 且 (numDims==0 || dims!=null)
+      │       不满足 → InvalidParam, 返回 fallback
       │
-      ├─ 1. cacheKey = hash(funcIndex, dims)
+      ├─ 2. 维度开关检查: for each (dimType, instanceId) in dims
+      │       any disabled → InstanceDisabled, 返回 fallback
       │
-      ├─ 2. cache.lookup(funcIndex, dims, numDims) → hit → return {fnPtr, bucketIndex}
-      │                                                (该桶 read token 外提)
-      │                                                调用方: fnPtr(args)
-      │                                                调用方: release_read(bucketIndex)
+      ├─ 3. cache.lookup(funcIndex, dims, numDims)
+      │       命中 → CacheHit, 返回 {fnPtr, bucketIndex, hasReadToken=true}
+      │              (read token 外提,调用方用完 fnPtr 后须 release_read(bucketIndex))
       │
-      ├─ 3. Off mode → return fallback
+      ├─ 4. Off mode → OffMode, 返回 fallback (不入队、不编译)
       │
-      ├─ 4. taskQueue.tryEnqueue({funcIndex, dims, versions[], fallback})
-      │     → 内部: dedup 占位 + queue push (失败自动回滚) → 立即返回 fallback
-      │
-      └─ EJitWorker (内部 task,§5.5):
-           pollOne() → taskQueue.tryDequeue() → runCompile → publish (该桶 write spin 等 readers→0)
+      └─ 5. 构造 req + 快照 versions[i] = getInstanceVersion(...)
+            taskQueue.tryEnqueue(req)        // 内部: dedup 占位 → queue push (失败自动回滚)
+              Enqueued       → EnqueuedPending, 返回 fallback
+              AlreadyPending → AlreadyPending, 返回 fallback
+              QueueFull      → QueueFullFallback, 返回 fallback
+              InvalidFunc    → InvalidParam, 返回 fallback        // funcIndex 越界
+
+EJitWorker (内部 task,§5.5,与上面在不同核):
+      pollOne() → taskQueue.tryDequeue() → runCompile (检查点 1/2 + publish 提交门,§5.3)
 ```
 
 ### 2.3 Before vs After：`ejit_compile_or_get` 流程变化
 
 ```
-                        BEFORE                                    AFTER
-                  (ejit_dev_spec4)                        (ejit_taskpool)
+                BEFORE                                  AFTER
+            (ejit_dev_spec4)                      (ejit-taskpool)
 
-ejit_compile_or_get                                   ejit_compile_or_get
-  └─ EJit::getOrCompile                                 └─ EJit::getOrCompile
-       └─ EJitCompileDriver::getOrCompile                    └─ EJitCompileDriver::getOrCompile
-            │                                                     │
-            ├─ LRU hash 查一次                                    └─ taskPool_->compileOrGet()
-            │   hit → return                                          │
-            │                                                         ├─ 维度开关检查
-            └─ miss:                                                  │   any disabled → fallback
-                 decode cacheKey                                      │
-                 load bitcode                                         ├─ 维度开关检查
-                 verify periods                                       │   any disabled → fallback
-                 OrcJIT compile                                       ├─ cache.lookup(funcIndex, dims, numDims)
-                   ↳ IR pipeline:                                     │   hit → {fnPtr, bucketIndex}
-                     ① replace params                                ├─ taskQueue_.tryEnqueue()
-                     ② InstCombine                                   │   dedup占位 → queue push
-                     ③ StructFieldPass                               │   → return fallback
-                     ④ L1/L2/L3 opts
-                 lookup symbol                                        │   → return fallback
-                 LRU cache.put()                                               │
-                 return                                                    pollOne()
-                                                                          → runCompile(worker核)
-                                                                          → publish
+ejit_compile_or_get(cacheKey)             ejit_taskpool_compile_or_get(
+  └─ getOrCompile                              funcIndex, dims, numDims, &outFn, &outBucket)
+       └─ LRU find                          └─ taskPool_->compileOrGet(funcIndex, dims, ...)
+          hit  → return pfn                       ├─ 维度开关检查 → any disabled → fallback
+          miss →                                  ├─ cache.lookup (hashKey/identity/version)
+            decode cacheKey                       │     hit → return {fnPtr, bucketIndex}
+            load bitcode                          ├─ Off mode → fallback
+            verify periods                        ├─ taskQueue.tryEnqueue(req with versions[])
+            OrcJIT compile                        │     dedup CAS + queue push
+              ↳ IR pipeline                       │     ─→ EnqueuedPending / AlreadyPending /
+            lookup symbol                         │        QueueFull / InvalidParam → fallback
+            LRU put                               └─ return fallback (异步路径)
+            return pfn
+                                                Worker (独立 SRE task,异步):
+                                                  pollOne → tryDequeue → runCompile
+                                                    检查点1 → compileFn_ → 检查点2
+                                                    → cache.publish (提交门重验 version)
 ```
 
 核心差异：
@@ -213,7 +212,104 @@ ejit_compile_or_get()                     EJitWorker::run() 循环中
                                             → taskQueue_.release()
 ```
 
-`pollOne` / `pollBudget` 仍然作为 C ABI 保留,host 测试可以**不启动 worker**,直接在测试代码里调 `pollOne` 模拟时序;集成场景下由内部 `EJitWorker` 自动驱动。
+`pollOne` / `pollBudget` 在生产构建是 taskpool 内部成员,**不导出**;只有定义了 `EJIT_SRE_TASKPOOL_TESTING` 的测试构建(§7.2)才把它们导出到 C ABI,供测试代码不启动 worker 直接驱动队列消费、精确控制时序。集成路径下由内部 `EJitWorker` 自动驱动,业务代码不接触这两个函数。
+
+### 2.5 集成与身份模型
+
+§2.1–2.4 描述 taskpool **内部**调度。本节补充 taskpool 与外部的接线——`funcIndex`/`dimType` 从哪来、worker 何时被 `ejit_init` 拉起、`compileFn_` 回调内部如何桥接到编译层、为何 legacy 与 taskpool 两个 ABI 共存但分流。这些是 v2 相对 v1 的关键集成改动,散落在 `EJitFuncRegistry.h`、`EJitLifecycleRegistry.h`、`EJit.cpp`、`EJitCompileDriver.cpp`、`EJitWrapperGen.cpp` 中。
+
+#### 2.5.1 跨模块身份注册（funcIndex / dimType）
+
+§3.5 的 dedup 把 `funcIndex` 直接当扁平数组下标,§5.1 的 switch 把 `(dimType, instanceId)` 直接当二维数组下标。因此二者必须满足:**(a) 同一函数/生命周期跨独立编译的多个模块恒同;(b) 不同函数/生命周期互不冲突**。
+
+v1 用 FNV-1a 名字哈希:`funcIndex` 4096 槽下 50 函数约 26% 碰撞、200 函数约 99%;`dimType` 仅 8 槽,`fnv("cell")%8 == fnv("tenant")%8`。碰撞落在正确性路径上不可接受。v2 改为**进程级 registry 按名字单调分配稠密 index**,注册期完成、运行时只读。
+
+| 组件 | 位置 | 职责 |
+|------|------|------|
+| `EJitFuncRegistry` | `EJitFuncRegistry.h`(header-only) | 进程单例,`resolveAssign(name)` 首次见到分配下一个稠密 `funcIndex ∈ [0,4096)`,幂等;容量耗尽返回 `kEJitInvalidFuncIndex` |
+| `EJitLifecycleRegistry` | `EJitLifecycleRegistry.h`(header-only) | 进程单例,`resolveAssign(name)` 分配稠密 `dimType ∈ [0,8)`,幂等;第 9 个不同生命周期返回 `kEJitInvalidDimType` |
+| AOT IR global | `EJitWrapperGen.cpp` (PASS3) | 每个 entry 函数生成 `@__ejit_funcidx_<name>`(i32,初值 `kEJitInvalidFuncIndex`);每个生命周期生成 `@__ejit_dimtype_<name>`(i32,初值 `kEJitInvalidDimType`),Internal linkage |
+| 回填 | `ejit_auto_register` 构造期 | `EJitRegistrationStore`(`EJitRegistrationStore.h`)在 AOT 阶段把每个待回填的 global 地址 + 名字收进静态表;`ejit_init` 消费该表,对每个条目调 registry `resolveAssign(name)`,把分配的 slot 写回对应 IR global。裸核/测试构建另有 `__ejit_registry_funcindex[]`/`__ejit_registry_lifecycle[]` 静态表兜底(与 period 注册同模式) |
+| 运行时 | `EJitModuleLoader` | 按 registry index 建 bitcode 表;wrapper 运行时从 global load `funcIndex`/`dimType` |
+
+**三项保证**:
+
+1. **跨模块一致**:同名跨任意模块、任意注册序恒得同一 index
+2. **不漂移**:新模块注册不移动已分配的 index(单调计数,只增不改)
+3. **clean reject**:容量耗尽返回哨兵,`ejit_init` 失败,绝不静默别名
+
+**并发**:`resolveAssign` 仅在注册期单线程运行(先于任何 wrapper 调用与 worker 启动),lookups 只读,happens-before 所有查询,无需锁。
+
+#### 2.5.2 初始化时序与 Async 门控
+
+worker 不能在「注册未完成 / funcIndex 未回填 / 引擎未就绪」时启动——否则会 race 无锁注册写,或消费永远无人编译的请求。taskpool 构造时 `autoStartWorker=false`,worker 建好但停着,直到 `ejit_init` 完成下列时序后才启动:
+
+```
+ejit_init → EJit 构造
+  1. 消费所有注册数据 (bitcode / period array / static var / symbol)
+  2. funcIndex / lifecycle 回填:
+       EJitRegistrationStore 中暂存的所有 (name, globalAddr) → registry.resolveAssign(name) → 写回 IR global
+  3. OrcEngine::Create 成功 → setSyncEngine(engine); engineReady=true
+  4. regPhase_ = Frozen                      // 冻结注册,杜绝 worker 与无锁注册写竞态
+  5. if (config.compileMode == Async):
+         if (!engineReady)         → recordInitError  // Async 必须有引擎
+         else if (!startTaskPoolWorker()) → recordInitError  // worker 必须启动成功
+         else                       → worker running
+     else (Sync):
+         worker remains stopped (taskpool Off)
+```
+
+**门控语义**:Async 缺任一前提(`engineReady` / worker 启动成功)`ejit_init` 直接失败,**绝不暴露一个「能收请求但没人消费」的 taskpool**。注册冻结后,`registerBitcode`/`registerPeriodArray`/`registerStaticVar` 全部拒绝(返回 false),避免单 worker 运行时与无锁 registry 写竞态。
+
+**运行时模式切换** `setCompileMode(mode)` 返回 `bool`:
+
+> **命名注意**: 上层 API 的 `CompileMode` 是 `{Sync, Async}`(`EJitOptions.h`,历史保留),但 taskpool 内部 `EJitCompileMode` 是 `{Off, Async}`(`EJitTaskPool.h`)。**"Sync 模式" 并不是 "走 taskpool 同步编译" ——v2 taskpool 是纯异步的(§1.3),没有同步路径**。两者的实际映射:
+>
+> | 上层 `CompileMode` | taskpool `EJitCompileMode` | 实际行为 |
+> |--------------------|---------------------------|---------|
+> | `Async` | `Async` | 业务请求走 taskpool 异步路径(本文档主要描述路径) |
+> | `Sync` | `Off` | taskpool 停 worker,业务请求绕过 taskpool,落到 legacy `ejit_compile_or_get` + LRU `EJitCache`(§2.5.4) |
+>
+> 因此"切到 Sync"实际是"关闭 taskpool,回退到 legacy 路径";真正的同步编译能力由 legacy 路径提供,不在本文档范围内。
+
+| 目标模式 | 前提 | 失败行为 |
+|---------|------|---------|
+| `Async`(taskpool 启用) | `hasSyncEngine()` 且(worker 已运行或 `startTaskPoolWorker()` 成功) | 返回 false,保留旧模式(避免向无 worker 的 taskpool 入队永久 pending 请求) |
+| `Sync`(taskpool 关闭) | 无 | `taskpool.setMode(Off)` + `stopTaskPoolWorker()`。**注意**:setMode(Off) 阻止**新**请求入队,但**已入队、未编完的请求**会被 worker 在 stopWorker 软停止之前正常处理完(包括 publish 到 cache)。需要"立即静默"的场景应等到 `pending_count()==0` 再切换。
+
+#### 2.5.3 编译边界内部桥接
+
+§2.1 把 `compileFn_` 当不透明回调。展开其内部链路(均在 `EJitCompileDriver.cpp`):
+
+```
+compileFn_(ctx, req, &fn)
+  → taskpoolCompileThunk(ctx, req, &fn)        // 适配:函数指针桥,无 std::function
+  → EJitCompileDriver::compileNow(req)
+       ├─ 校验 instanceId≤255、无重复 dimType
+       ├─ 从 loader_.getOrCacheFuncMeta(req.funcIndex) 读回每维 dimType slot   // 按名字从 registry 读,非重算
+       ├─ 把 req.dims 的 instanceId 按 meta.dimTypes 顺序打包成 packedDims[4]
+       ├─ cacheKey = (funcIndex<<32) | packedDims                               // 重编码为 legacy u64 key
+       └─ compileCold(cacheKey, storeLru=false)
+            ├─ loader getFuncName/getBitcodeByFuncIdx
+            ├─ 逐维 runtimeState_.isActive 校验时间窗
+            ├─ SpecializationContext{fnName, cacheKey, dims, optLevel}
+            └─ syncEngine_->loadBitcodeModule → lookup                         // IR pipeline + code pool 封固 → fnPtr
+```
+
+**dimType 一致性**:wrapper 烤进 `req.dims` 的 `dimType` 与 `compileNow` 从 `loader` meta 读回的 `dimType` 是**同一个 registry slot**(都按名字读),两侧天然一致。`compileNow` 用 meta 的 `dimTypes` 顺序重新对齐 `instanceId`,保证重编码的 `cacheKey` 与 IR 内 period 维度顺序一致——这是 `(funcIndex,dims)` 与 legacy `u64 cacheKey` 两种身份表示能互译的前提。
+
+**`storeLru` 分流**:taskpool 路径 `storeLru=false`,只 publish 到自己的 32 桶 cache,绕过 LRU `EJitCache`;legacy 同步路径 `storeLru=true` 写 LRU。两条 cache 各自独立(见 §2.5.4)。
+
+#### 2.5.4 两个 ABI 分流
+
+taskpool 构建下两个 C ABI **共存但分流**,各走各的 cache,不可混用:
+
+| ABI | 签名 | cache | 进 taskpool? |
+|-----|------|-------|-------------|
+| `ejit_compile_or_get(cacheKey, out_pfn)` | u64 单 key | LRU `EJitCache`(`EJitCache.h`,本文档不展开) | **否** |
+| `ejit_taskpool_compile_or_get(funcIndex, dims, numDims, outFn, outBucket)` | 显式 dims + bucket | taskpool 32 桶(本文档 §4.1) | **是** |
+
+**为何 legacy 不进 taskpool(安全论证)**:legacy ABI **没有 bucket / release_read 能力**。若让它进 taskpool 的 read-token cache,`lookup` 返回的 `fnPtr` 会在调用方执行它**之前**就被「内部」释放读 token → 此时 `fnPtr` 可能已被 worker 覆盖或释放 → **use-after-free 窗口**(§3.2.4 的读计数外提正是为此)。新 ABI 由 wrapper 持有 `bucket`,在 `outFn(args)` **之后**显式 `release_read`,token 生命周期覆盖整次执行。因此 legacy 仅供向后兼容,新 wrapper 一律走 taskpool ABI。该论证现仅存于 `EJitCompileDriver.cpp` 注释,本节收口。
 
 ---
 
@@ -376,7 +472,7 @@ struct EJitCompileRequest {
     uintptr_t fallbackPtr;   // AOT fallback 函数指针
     ejit_dim_pair_t dims[4]; // 维度对数组 (numDims 有效)
     uint32_t versions[4];    // 入队时刻各实例 version 快照
-    // cacheKey = hash(funcIndex, dims, numDims)  // worker dequeue 时自行计算
+    // hashKey = hash(funcIndex, dims, numDims)  // worker dequeue 时自行计算
 };
 // aarch64: 16 + 4×8 + 4×4 = 64 字节
 ```
@@ -474,6 +570,27 @@ dedup 的唯一职责是**"防止同一 key 同时被标记为 in-flight"**。�
 
 producer 和 consumer 对 dedup 的全部诉求是一个二元判断："这个 key 当前有没有人在做？" 1 bit 占位完全表达了这个语义。
 
+**为什么只按 funcIndex 去重,不按 (funcIndex, dims) 去重**
+
+dedup 粒度的取舍。同一函数 `func=5`,两个请求 dims 不同(`[(0,3)]` vs `[(0,7)]`)——它们是**不同的特化版本**。按 `funcIndex` 去重的话:
+
+```
+T0:  producer A:  compile(func=5, dims=[(0,3)])  → dedup[5]: 0→1 (Claimed) → 入队
+T1:  producer B:  compile(func=5, dims=[(0,7)])  → dedup[5]==1 → AlreadyPending → fallback
+T2:  worker:      取 A 编译完 → publish A → dedup[5]: 1→0
+T3:  producer B (下次调用): compile(func=5, dims=[(0,7)]) → dedup[5]: 0→1 → 入队
+```
+
+B 在 T1 没能为自己排队,而是被当成 A 的重复;直到 worker 处理完 A、B 下次调用时才进队。**B 走了一次额外的 AOT fallback**。这是按 funcIndex 去重的代价。
+
+**为什么仍这么选**:
+
+1. **单 worker 串行编译**:即使 (funcIndex, dims) 粒度去重把 A、B 都入队,worker 也只能一个个编。总编译时间 = N 个不同 dims 的编译耗时之和,粒度细化不缩短;只改变"何时排队"。
+2. **dedup 复杂度**:funcIndex 直接做扁平数组索引(§3.5.2),O(1) 无 hash 无扫描。改成 (funcIndex, dims) 需要 hash 表或 4096×N 二维数组——前者增加并发复杂度,后者按最坏维度组合膨胀(8 dimType × 256 instance × 4096 funcIndex 显然不可接受)。
+3. **业务模式假设**:多 dims 的初次调用通常**不在性能关键路径**——业务侧首次触发各 cell 时本来就允许 fallback,典型场景下用户更在乎"稳态后命中率",不是"冷启动期每次都命中"。
+
+**何时这个取舍会出问题**:如果业务高频在同函数的不同 dims 间切换、且每次切换都希望立即命中(不能容忍一次 AOT fallback),粒度需要细化。当前设计假设不是这种场景。
+
 #### 3.5.2 接口
 
 ```cpp
@@ -531,14 +648,16 @@ consumer (worker):
 
 ## 4. 结果缓存
 
-Cache 使用分桶索引结构：32 桶（每桶 `unordered_map`）。
+Cache 用 32 桶,每桶一个 `unordered_map<hashKey, vector<EJitCacheEntry>>` + 独立 `EJitRwLock`。hashKey 仅用于定位桶,**身份匹配靠 vector 内 identityMatches** 解 hash 冲突(详见 §4.1)。
 
-### cacheKey 计算
+### 4.1 EJitTaskPoolCache
 
-cacheKey 由 hash 算法生成，将 funcIndex 和 dim pair 数组混合：
+#### 4.1.1 hashKey 计算
+
+hashKey 由 golden ratio hash 把 funcIndex 与各维 (dimType, instanceId) 混合,只用于选桶,**不参与身份判定**:
 
 ```cpp
-uint64_t hashCacheKey(uint32_t funcIndex, const ejit_dim_pair_t* dims, uint32_t numDims) {
+uint64_t hashKey(uint32_t funcIndex, const ejit_dim_pair_t* dims, uint32_t numDims) {
     uint64_t key = funcIndex;
     for (uint32_t i = 0; i < numDims; i++) {
         key ^= ((uint64_t)dims[i].dimType << 32) | dims[i].instanceId;
@@ -548,79 +667,100 @@ uint64_t hashCacheKey(uint32_t funcIndex, const ejit_dim_pair_t* dims, uint32_t 
 }
 ```
 
-分桶公式：
+分桶公式:
 
 ```cpp
-bucket = cacheKey % EJIT_SRE_TASKPOOL_BUCKETS   // 默认 32
+bucket = hashKey % EJIT_SRE_TASKPOOL_BUCKETS   // 默认 32
 ```
 
-### 4.1 EJitTaskPoolCache
+#### 4.1.2 桶与 entry 结构
 
-32 个桶，每桶一个 `unordered_map<cacheKey, CacheEntry>` + 独立 `EJitRwLock`：
+32 个桶，每桶一个 `unordered_map` + 独立 `EJitRwLock`。**map 的 value 是 `vector<EJitCacheEntry>`**——同一 hash key 可能对应多个不同 identity（hash 冲突），靠 vector 内全身份匹配兜底：
 
+```cpp
+struct Bucket {
+    EJitRwLock lock;
+    std::unordered_map<uint64_t /*hashKey*/, std::vector<EJitCacheEntry>> entries;
+};
+
+Bucket buckets_[32];
 ```
-bucketLocks_[0]   → unordered_map<cacheKey, CacheEntry>    // 桶 0
-bucketLocks_[1]   → unordered_map<cacheKey, CacheEntry>    // 桶 1
-...
-bucketLocks_[31]  → unordered_map<cacheKey, CacheEntry>    // 桶 31
-```
 
-每个函数最多关联 4 个生命周期维度，IR 中静态确定。cache entry 存储每个维度的 version 快照：
+每个函数最多关联 4 个生命周期维度，IR 中静态确定。entry 存储完整身份（funcIndex + 全部 dims）+ 每维 version 快照，**hash 冲突场景下靠 identityMatches 区分**：
 
 ```cpp
 struct EJitCacheEntry {
-    uint32_t numDims;                      // 关联维度数 (≤4)
-    struct {
-        uint32_t dimType;                  // 维度类型编号
-        uint32_t instanceId;               // 实例 ID
-        uint32_t version;                  // 编译时刻快照
-    } dims[4];
-    uintptr_t fnPtr;                       // JIT 编译出的函数指针
+    uint32_t funcIndex;        // 完整身份 (1): funcIndex
+    uint32_t numDims;          // 关联维度数 (≤4)
+    EJitDimPair dims[4];       // 完整身份 (2): {dimType, instanceId} × numDims
+    uint32_t versions[4];      // 编译时刻每维 version 快照
+    uintptr_t fnPtr;           // JIT 编译出的函数指针
 };
-// sizeof = 4 + 4×12 + 8 = 60 bytes
 
-// bucket = cacheKey % 32
-// 桶内: unordered_map<uint64_t, EJitCacheEntry>
+bool identityMatches(const EJitCacheEntry &E, funcIndex, dims, numDims) {
+    return E.funcIndex == funcIndex && E.numDims == numDims
+        && (逐维 E.dims[i] == dims[i]);
+}
 ```
+
+**hash 冲突处理**：golden-ratio hash 是 64-bit,但仍**可能**碰撞。同一 `bucket.entries[key]` 的 vector 可挂载多个不同 identity 的 entry,lookup/publish 都遍历该 vector 并以 `identityMatches` 精确匹配——不同 identity 的请求**不会互相覆盖、不会假命中**。
 
 **分桶的核心目的**：限制 `unordered_map` rehash 的爆炸半径。单全局 map rehash 会阻塞**所有**读者；分 32 个桶后，单桶 rehash 最多阻塞该桶的读者，其余 31 个桶不受影响。
 
-**lookup**（try-read 语义，cacheKey 内部计算）：
+**lookup**（try-read 语义，hashKey 内部计算）：
 
 ```
-lookup(funcIndex, dims, numDims) → {fnPtr, bucketIndex}：
-  1. cacheKey = hash(funcIndex, dims, numDims)
-  2. bucketIndex = cacheKey % 32
-  3. bucketLocks_[bucketIndex].tryRead()  → 失败则立即返回 miss
-  4. it = bucketMaps_[bucketIndex].find(cacheKey)
-     → 未找到 → miss，readRelease()
-  5. entry = it->second
-     逐维度比对 version：
-     for i in 0..entry.numDims:
-         cur = switch_.getInstanceVersion(entry.dims[i].dimType, entry.dims[i].instanceId)
-         if cur != entry.dims[i].version → miss，readRelease()
-  6. 全部匹配 → 命中，返回 {fnPtr, bucketIndex}
+lookup(funcIndex, dims, numDims) → {fnPtr, bucketIndex, hasReadToken}：
+  1. hashKey = hash(funcIndex, dims, numDims)
+  2. bucketIndex = hashKey % 32
+  3. buckets_[bucketIndex].lock.tryRead()  → 失败则立即返回 miss(hasReadToken=false)
+  4. it = buckets_[bucketIndex].entries.find(hashKey)
+     → 未找到 → miss,readRelease()
+  5. for E in *it->second:                       // 遍历 vector,处理 hash 冲突
+       if (!identityMatches(E, funcIndex, dims, numDims)) continue
+       逐维度比对 version:
+         for i in 0..E.numDims:
+             cur = switch_.getInstanceVersion(E.dims[i].dimType, E.dims[i].instanceId)
+             if cur != E.versions[i] → 该 entry 已陈旧,break(回到 miss)
+       全部匹配 → 命中,返回 {fnPtr=E.fnPtr, bucketIndex, hasReadToken=true}
+  6. 没有 identityMatches 的 entry → miss,readRelease()
 
-命中时 lookup 不归还 read token。调用方用完 fnPtr 后：
+命中时 lookup 不归还 read token。调用方用完 fnPtr 后:
   result = cache_.lookup(funcIndex, dims, numDims);
   result.fnPtr(args, ...);
   ejit_taskpool_release_read(result.bucketIndex);
 ```
 
-**开关失效**：`set_instance_enabled(dim, id)` → version++ → 任何包含该实例的 cache entry 在步骤 4 比对失败 → 视为 miss。publish 时同 cacheKey 直接覆盖。零额外清理开销。
+**开关失效**：`set_instance_enabled(dim, id)` → version++ → 任何包含该实例的 cache entry 在步骤 5 的逐维 version 比对失败 → 视为 miss。publish 时同 identity 直接覆盖 entry.fnPtr。零额外清理开销。
 
-**为什么返回 bucketIndex**：`release_read(bucketIndex)` 直取 `bucketLocks_[bucketIndex].readRelease()`，O(1)。
+**为什么返回 bucketIndex**：`release_read(bucketIndex)` 直取 `buckets_[bucketIndex].lock.readRelease()`，O(1)。
 
 **publish**（write 语义，单 worker 线程执行）：
 
-1. `cacheKey = hash(funcIndex, dims, numDims)`
-2. `bucketIndex = cacheKey % 32`
-3. `bucketLocks_[bucketIndex].write()` —— spin 等该桶 readers_→0
-4. 快照当前 version：`entry.dims[i].version = switch_.getInstanceVersion(...)`
-5. `old = bucketMaps_[bucketIndex][cacheKey]` → 暂存 `old.fnPtr`
-6. `bucketMaps_[bucketIndex][cacheKey] = entry` → 覆盖
-7. 若 `old.fnPtr` 且 readers_=0 → 释放旧代码
-8. `bucketLocks_[bucketIndex].writeRelease()`
+```
+publish(funcIndex, dims, numDims, req.versions[], fnPtr):
+  1. hashKey   = hash(funcIndex, dims, numDims)
+  2. bucket    = hashKey % 32
+  3. buckets_[bucket].lock.write()   // spin 等该桶 readers_→0,§3.2.2
+  4. 提交门重验: for i in 0..numDims:
+       if req.versions[i] != switch_.getInstanceVersion(dims[i]):
+         writeRelease + return VersionMismatch     // 锁内 toggle 兜底,§5.3
+  5. for E in buckets_[bucket].entries[hashKey]:    // vector 链上找同 identity
+       if identityMatches(E, funcIndex, dims, numDims):
+         oldFn = E.fnPtr
+         E.versions[i] = req.versions[i]            // 用提交门已重验的快照
+         E.fnPtr = fnPtr                            // 覆盖
+         writeRelease
+         if oldFn && oldFn != fnPtr && releaseFn_:
+           releaseFn_(oldFn)                        // ★锁外释放,见下方注释
+         return Published
+  6. 未命中 identity (冲突链上无同 identity 或链为空):
+       buckets_[bucket].entries[hashKey].push_back({funcIndex, dims, versions, fnPtr})
+       writeRelease
+       return Published
+```
+
+**为什么旧 fnPtr 在锁外释放**：`releaseFn_` 可能回调 code pool / ORC / 平台分配器,**禁止**在桶写锁内执行(§10.1 短临界区约束)。`write()` 已 spin 到该桶 readers_=0 + entry 已指向新 fnPtr,因此旧 fnPtr 对该桶后续 lookup 不可达,锁外释放安全。
 
 
 ### 4.2 EJitTaskQueue：去重的任务提交管理
@@ -698,15 +838,7 @@ enabled_[dimType][instanceId]:  EJitAtomicU8   (0=禁用, 1=启用)
 version_[dimType][instanceId]:  EJitAtomicU32  (单调递增，仅 enabled 状态变化时 +1)
 ```
 
-**容量规格**：
-
-| 常量 | 值 | 说明 |
-|------|-----|------|
-| `MAX_DIM_TYPES` | 8 | 最大维度类型数，编译期常量 |
-| `MAX_INSTANCES` | 256 | 每维度最大实例数，instanceId ∈ [0, 255] |
-| enabled 数组 | 8 × 256 × 1 = **2 KiB** | `EJitAtomicU8` |
-| version 数组 | 8 × 256 × 4 = **8 KiB** | `EJitAtomicU32` |
-| 总内存占用 | **10 KiB** | 二维静态数组，零运行时分配 |
+容量(`MAX_DIM_TYPES=8`、`MAX_INSTANCES=256`、内存占用)归口在 §6.3,本节不重复。
 
 ```cpp
 static_assert(MAX_DIM_TYPES == 8 && MAX_INSTANCES == 256);
@@ -788,121 +920,157 @@ setEnabled(0, 3, false)              // CAS(enabled 1→0) + fetchAdd(version)
 
 ```cpp
 CompileOrGetResult compileOrGet(funcIndex, dims, numDims, fallback) {
-    // 0. 维度开关检查
+    // 1. 参数检查
+    if (numDims > 4 || (numDims > 0 && !dims))
+        return {InvalidParam, fallback};
+
+    // 2. 维度开关检查
     for each (dimType, instanceId) in dims:
         if (!switch_.isInstanceEnabled(dimType, instanceId))
             return {InstanceDisabled, fallback};
 
-    // 1. cache hit（内部 hash → cacheKey → bucket → 逐实例比对 version）
-    if (result = cache_.lookup(funcIndex, dims, numDims))
-        return {CacheHit, result.fnPtr, result.bucketIndex};
+    // 3. cache hit (内部 hash → bucket → 遍历 vector 全身份匹配 → 逐维 version)
+    EJitCacheLookupResult hit = cache_.lookup(funcIndex, dims, numDims);
+    if (hit.hasReadToken && hit.fnPtr)
+        return {CacheHit, hit.fnPtr, hit.bucketIndex, hasReadToken=true};
 
-    // 2. Off 模式
-    if (switch_.getMode() == Off)
-        return {DisabledFallback, fallback};
+    // 4. Off 模式
+    if (switch_.getMode() == EJitCompileMode::Off)
+        return {OffMode, fallback};
 
-    // 3. 去重入队 → 立即返回
-    //    taskQueue 内部: dedup 占位 + queue push (失败自动回滚)
-    req = {funcIndex, dims, numDims, fallback};
+    // 5. 构造请求 + 去重入队 → 立即返回
+    EJitCompileRequest req{funcIndex, dims, numDims, fallback};
     for i in 0..numDims:
         req.versions[i] = switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
-    result = taskQueue_.tryEnqueue(req);
-    if (result == Enqueued)
-        return {EnqueuedPending, fallback};
-    // AlreadyPending / QueueFull 均已由 taskQueue 内部处理 (dedup 自动回滚)
-    return {result == AlreadyPending ? AlreadyPending : QueueFullFallback, fallback};
+    switch (taskQueue_.tryEnqueue(req)) {
+        case Enqueued        : return {EnqueuedPending,   fallback};
+        case AlreadyPending  : return {AlreadyPending,    fallback};
+        case QueueFull       : return {QueueFullFallback, fallback};
+        case InvalidFuncIndex: return {InvalidParam,      fallback};  // funcIndex >= 4096
+    }
 }
 ```
 
-返回值状态全集：
+返回值状态全集（与 `enum class EJitCompileOrGetStatus` 对齐）:
 
-| 状态 | fnPtr | 含义 |
-|------|-------|------|
-| CacheHit | JIT 函数指针 + bucketIndex | 命中缓存。调用方用完 fnPtr 后须 `release_read(bucketIndex)` |
-| InstanceDisabled | fallback | 请求的某个生命周期实例被禁用 |
-| OffMode | fallback | Taskpool 全局 Off 模式 |
-| EnqueuedPending | fallback | 异步入队成功，等待 worker 编译 |
-| AlreadyPending | fallback | 同 funcIndex 已有 in-flight |
-| QueueFullFallback | fallback | 队列满，dedup 已回滚 |
-| CompileFailed | fallback | 编译失败/实例 version 中途变更 |
+| 状态 | fnPtr | bucketIndex | hasReadToken | 含义 |
+|------|-------|-------------|--------------|------|
+| `CacheHit` | JIT 函数指针 | 有效 | **true** | 命中缓存。调用方用完 fnPtr 后**必须** `release_read(bucketIndex)` |
+| `OffMode` | fallback | 0 | false | Taskpool 全局 Off 模式 |
+| `InstanceDisabled` | fallback | 0 | false | 请求的某个生命周期实例被禁用 |
+| `EnqueuedPending` | fallback | 0 | false | 异步入队成功，等待 worker 编译 |
+| `AlreadyPending` | fallback | 0 | false | 同 funcIndex 已有 in-flight |
+| `QueueFullFallback` | fallback | 0 | false | 队列满，dedup 已自动回滚 |
+| `CompileFailed` | fallback | 0 | false | 异步编译失败/version 中途变更(由 worker 路径产生,反映在 stats) |
+| `InvalidParam` | fallback | 0 | false | numDims>4 / dims==null / dimType≥8 / instanceId≥256 / funcIndex≥4096 |
+
+> `hasReadToken=true` 仅在 `CacheHit` 时出现,是「**必须** release_read」的唯一信号。所有其他状态下调用方都不持有 token,**禁止** release_read(§3.2.4 1:1 配对约束)。
 
 ### 5.3 runCompile：编译执行路径
 
-由 worker（`pollOne`/`pollBudget`）调用。核心流程 + 两次 version 检查：
+由 worker `EJitWorker::run` 循环通过 `pool.pollOne()` 间接调用。`pollOne`/`pollBudget` 在生产构建是 taskpool 内部成员函数,不暴露为 C ABI;只有测试构建(§7.2 `EJIT_SRE_TASKPOOL_TESTING`)才把它们导出到 C ABI 供测试代码手动驱动。
+
+核心流程 + 两次 version 检查:
 
 ```cpp
-void *runCompile() {
+void runCompile() {
     // 0. 从 TaskQueue 取工作
     EJitCompileRequest req;
-    if (!taskQueue_.tryDequeue(req)) return nullptr;
-    // cacheKey = hash(req.funcIndex, req.dims, req.numDims)  // 内部计算
+    if (!taskQueue_.tryDequeue(req)) return;
+    // hashKey = hash(req.funcIndex, req.dims, req.numDims)  // 由 cache 内部计算
 
-    // 1. 检查点1：逐实例比对入队时刻 version vs 当前 version
-    for i in 0..req.numDims:
-        if req.versions[i] != switch_.getInstanceVersion(req.dims[i].dimType,
-                                                          req.dims[i].instanceId)
-            { taskQueue_.release(req.funcIndex); → 丢弃 }
-
-    // 2. 编译
-    ok = compileFn_(ctx, req.funcIndex, req.dims, req.numDims, &fn);
-
-    // 3. 检查点2：编译后再次逐实例比对
-    for i in 0..req.numDims:
-        if req.versions[i] != switch_.getInstanceVersion(req.dims[i].dimType,
-                                                          req.dims[i].instanceId)
-            { taskQueue_.release(req.funcIndex); → 丢弃 }
-
-    if (!ok || !fn) {
-        taskQueue_.release(req.funcIndex); → 丢弃
+    // 1. 检查点 1: 入队后到编译开始前的失效 — 逐维比对 req.versions vs 当前 version
+    if (!versionsMatch(req)) {
+        taskQueue_.release(req.funcIndex);
+        return;                                       // 丢弃,不编译
     }
 
-    // 4. 写入 cache（内部快照当前 version；同 cacheKey 直接覆盖旧 fnPtr）
-    cache_.publish(req.funcIndex, req.dims, req.numDims, fn);
+    // 2. 编译 (跨边界回调到 EJitCompileDriver,§2.5.3)
+    void *fn = nullptr;
+    bool ok = compileFn_ && compileFn_(compileCtx_, req, &fn);
 
-    // 5. 释放 TaskQueue 占位（dedup.clear）
-    taskQueue_.release(req.funcIndex);
+    // 3. 编译失败先于检查点 2 判断 — 省一次 version 比对
+    if (!ok || !fn) {
+        taskQueue_.release(req.funcIndex);
+        return;
+    }
 
-    → fn (已发布到 cache)
+    // 4. 检查点 2: 编译期间的失效
+    if (!versionsMatch(req)) {
+        cache_.retireCode(fn);                        // 通过 releaseFn_ 释放陈旧码
+        taskQueue_.release(req.funcIndex);
+        return;
+    }
+
+    // 5. 提交门发布 (§4.1 publish): 持桶写锁后再次重验 version,失配则不覆盖
+    switch (cache_.publish(req.funcIndex, req.dims, req.numDims, req.versions, fn)) {
+        case Published:
+            taskQueue_.release(req.funcIndex);
+            return;
+        case VersionMismatch:
+        case InvalidParam:
+        case Failed:
+            cache_.retireCode(fn);                    // 释放未发布的陈旧/失败码
+            taskQueue_.release(req.funcIndex);
+            return;
+    }
 }
 ```
 
-两个检查点保证了 **实例开关竞态安全**（见 §5.4）。TaskQueue 不参与 version 校验，`release` 只承担去重占位释放；版本失效完全由 SwitchController + 这两个检查点完成。
+两个检查点保证了 **实例开关竞态安全**(见 §5.4)。TaskQueue 不参与 version 校验,`release` 只承担去重占位释放;版本失效完全由 SwitchController + 这两个检查点 + publish 提交门(§4.1)共同完成。
 
-**检查点 2 与 publish 之间的窗口**：检查点 2 通过后、publish 步骤 4 快照 version 之前，仍可能再次 toggle。这一窗口是**良性**的：
+**三层 version 检查的层级:哪层是"必须",哪层是"优化"**
 
-- publish 在 §4.1 步骤 4 内部**重新调用** `switch_.getInstanceVersion(...)` 写入 entry，**不复用** `req.versions[]`。所以 cache 中 entry 持有的始终是 publish 那一刻的 current version 快照。
-- 若 publish 之后立即 toggle 再 bump version，下一次 lookup 对该 entry 比对失败 → miss。entry 被无害"饿死"在 map 里，等下一次 publish 同 cacheKey 时覆盖。
-- 若 publish 写入的 version 已经"过时"（极小窗口内又被 bump），表现为**这一次发布的 fnPtr 立刻失效**——和"toggle 在 publish 完成后 1ns 到达"等价，不引入新的安全问题。
+总共三层 version 检查,**但它们的角色不对等**:
+
+| 层 | 位置 | 作用 | 不可省 / 可省 |
+|----|------|------|------|
+| **检查点 1** | dequeue 后,编译前 | 入队等待期间发生 toggle → 直接丢弃,**省一次编译**(嵌入式场景 ~10-100ms) | **可省**(优化层)。漏掉时:多做一次编译,结果在检查点 2 / 提交门被拦下,正确性不受损。toggle 频率高时收益大,低时几乎无收益 |
+| **检查点 2** | 编译后,publish 锁前 | 编译期间发生 toggle → 立即 retire,**省一次桶写锁竞争 + 提交门 spin**(几 µs 级) | **可省**(优化层)。漏掉时:陈旧码会去 publish 拿锁,被提交门拦下 retire,正确性不受损。边际收益最低——锁竞争开销远小于检查点 2 拦下的"重复 retireCode 调用"代价 |
+| **publish 提交门** | publish 持桶写锁后立即重验 | "检查点 2 → 拿写锁" 期间的 toggle → `VersionMismatch` 不写 entry | **必须**(正确性闸)。**没有它**任何陈旧 fnPtr 都可能被盖上发布瞬间的 version 戳,后续 lookup 误命中 |
+
+**最小满足正确性**:只需 publish 提交门。
+**当前实现**:三层全开,前两层是早期发现失效的优化,publish 提交门是兜底。
+
+**取舍依据**:嵌入式场景一次编译 ~10-100ms,检查点 1 在"业务 toggle 频率 >> 1/编译时间"时显著收益(每次 toggle 命中检查点 1 省的一次编译 ≈ 100ms,vs 检查点 1 自身开销 ~10ns)。检查点 2 边际价值最低,如果未来需要简化代码,可以先删检查点 2。
+
+如果业务侧 toggle 频率极低(分钟级以上),三层中只保留 publish 提交门也足够;但目前三层全开**总开销 ≤ 100 ns/请求**(三次原子读),不构成性能负担,代码精简价值不大。
+
+**检查点 2 与 publish 写锁之间的窗口**:检查点 2 通过后、`cache.publish` 拿到桶写锁之前,仍可能再次 toggle。这一窗口由 publish 的**提交门**(§4.1 publish 步骤 4)兜底——持桶写锁的瞬间逐维重验 `req.versions[i]` vs current version,任一不匹配返回 `VersionMismatch`,**不**写 entry,worker 走 `retireCode` 回收陈旧码。从而:
+
+- 发布的 entry 必然带着发布瞬间的 current version 快照,后续 lookup 比对失败即 miss。
+- 不存在"陈旧 fnPtr 被盖上新 version 标记"的窗口——这种结果会被提交门拦下。
+- 提交门通过之后立即又 toggle 也不构成正确性问题:entry 持有的 version 此刻确为最新,下一次 lookup 自然 miss,等下一次 publish 同 identity 覆盖(§4.1)。
 
 ### 5.4 实例开关失效机制
 
-逻辑失效不依赖逐 entry 释放，统一通过 `set_instance_enabled` 触发：
+逻辑失效不依赖逐 entry 释放,统一通过 `EJitSwitchController::setEnabled`(§5.1) 触发——一次成功的 enabled 翻转 bump 对应实例的 version,**所有**引用该实例的 cache entry 在下一次 lookup 时自然 miss,所有 in-flight 请求在 worker 检查点丢弃。本节展开这条路径并说明 `freeCode` 的边界。
 
-```cpp
-void setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled) {
-    // version++ → 所有引用该实例的 cache 条目中该 version 不匹配 → 自动失效
-    instanceState_[dimType][instanceId].storeRelease( ... );
-}
-```
+`freeCode`(即 cache 的 `releaseFn_` 回调)**不参与失效路径**,仅在两个场景被调用:
 
-`freeCode` 不参与失效路径，仅在两个场景被调用（与 dedup/SwitchController 解耦）：
+1. **模块 destroy**:`EJitTaskPoolCache::shutdown` 把所有 entry 的 fnPtr 收集后,在桶锁全部释放后统一调 `releaseFn_`。
+2. **publish 覆盖**:同 identity 写入新 fnPtr 时,旧 fnPtr 在桶 `writeRelease` 之后调 `releaseFn_`(`write()` 已 spin 到 `readers_=0`,旧 fnPtr 不再可达)。
 
-1. **模块 destroy**：整体清理 cache 时释放所有 fnPtr
-2. **publish 覆盖**：cache 同 cacheKey 写入新 fnPtr 时，旧 fnPtr 在该桶 `readers_=0` 后释放
+详见 §4.1 publish 与 §10.4。
 
-**失效路径**：
+**失效路径**:
 
 ```
-set_instance_enabled(0, 3, false)  // 关闭小区3
-  → instanceVersion(0,3): 5 → 6
-  → 任何 cache entry 中 dims[i]=(0,3): 存储的 version=5 ≠ 当前 6
-  → lookup 逐实例比对时发现不匹配 → miss
-  → in-flight compile 检查点发现 req.versions[i] 不匹配 → 丢弃
+setEnabled(dimType=0, instanceId=3, wantOn=false)        // §5.1
+  → CAS(enabled_[0][3], 1→0) 成功
+  → fetchAdd(version_[0][3], 1):  5 → 6
+  ─────────────────────────────────────────────
+  第一层 Cache  : 引用 (0,3) 的 entry.versions[i]=5 ≠ 当前 6
+                  → lookup 步骤 5 逐维 version 比对失败 → miss (§4.1)
+  第二层 Queue  : worker tryDequeue 后检查点 1
+                  req.versions[i]=5 ≠ 6 → release + 丢弃,不编译 (§5.3)
+  第三层 In-flight: 检查点 2 / publish 提交门
+                  → retireCode + 丢弃,不 publish (§4.1, §5.3)
 ```
 
-**与 runCompile 的竞态**：runCompile 的两个 version 检查点同样保护。`set_instance_enabled` → version bump → worker 在检查点 1 或检查点 2 检测到 `versions[i]` 不匹配 → `taskQueue_.release` 后丢弃结果，不写 cache。
+**与 runCompile 的竞态**:`setEnabled` 在 worker 编译进行中触发 → version bump → worker 在检查点 1 / 检查点 2 / publish 提交门**三处任一**发现 `versions[i]` 不匹配 → `taskQueue_.release` + 不写 cache。三层中只要一层捕获,陈旧结果就不会进入 cache。
 
-**物理槽位回收**：版本号逻辑失效不删除 map entry。publish 时同 cacheKey 直接覆盖，旧 fnPtr 在 readers_=0 后释放。
+**物理槽位回收**:version 失效只是逻辑 miss,不删除 map entry。物理回收靠下一次同 identity 的 publish 覆盖——cache 自身不主动收集"已失效但未覆盖"的 entry(无定时清理、无 GC)。这是有意取舍:同名特化迟早会再次发布,陈旧 entry 在内存中"饿死"一段时间是可接受的;若需更激进的回收,可在 `releaseFn_` 注入侧实现。
 
 ### 5.5 EJitWorker：调度循环模块
 
@@ -969,9 +1137,9 @@ void EJitWorker::run() {
 
 **生命周期与 EJitTaskPool 的耦合**:
 
-- `EJitTaskPool` 持有 `EJitWorker *worker_ = nullptr`(可选)
-- Runtime 初始化时调用 `pool.startWorker()` → 内部构造 `EJitWorker` 并 `start()`
-- Runtime 销毁时调用 `pool.stopWorker()` → 析构 `EJitWorker`(内部 `stop()`)
+- `EJitTaskPool` 持有 `EJitWorker worker_`(值类型成员,非可选;与 taskpool 同生共死)
+- taskpool 构造时 worker 已建好,但是否立即启动由 `autoStartWorker` 决定:**集成路径下传 `false`**(`EJitCompileDriver` 这么干),由 `ejit_init` 完成注册冻结 + 引擎就绪后再调 `startWorker()`(§2.5.2);测试可传 `true` 即起即用
+- 析构时 `EJitTaskPool::~EJitTaskPool` 先 `stopWorker()` 再 `cache_.shutdown()`,保证 worker 不会在 cache 拆除期间还在 publish
 - **Worker 不暴露给 C ABI**——和 Cache/TaskQueue 一样,是 taskpool 内部组件
 
 **单 worker 假设的传递路径**:
@@ -994,7 +1162,7 @@ EJitQueue::pop()  ← Vyukov MPSC 的 SC 端
 
 ### 6.1 hash 分布与弹性容量
 
-cacheKey 由 golden ratio hash 生成，`bucket = cacheKey % 32`。每桶内 `unordered_map`，弹性增长，无硬上限。总容量受平台内存约束。
+hashKey 由 golden ratio hash 生成(§4 hashKey 计算),`bucket = hashKey % 32`。每桶 `unordered_map<u64, vector<EJitCacheEntry>>` 弹性增长,无硬上限;hash 冲突由 vector 内 `identityMatches` 解(§4.1)。总容量受平台内存约束。
 
 ### 6.2 rehash 隔离
 
@@ -1004,27 +1172,25 @@ cacheKey 由 golden ratio hash 生成，`bucket = cacheKey % 32`。每桶内 `un
 
 ### 6.3 各层约束
 
-| 边界 | 值 | 说明 |
-|------|-----|------|
-| 单桶容量 | 弹性 | `unordered_map`，受平台内存限制 |
-| 单 funcIndex 在飞请求 | 1 | TaskQueue 去重，内部通过 Dedup 1 bit 占位（O(1) 数组索引） |
-| 维度类型上限 | 8 | `MAX_DIM_TYPES`，编译期常量 |
-| 单维度实例上限 | 256 | `MAX_INSTANCES`，instanceId ∈ [0, 255] |
-| SwitchController 内存 | 10 KiB | enabled: 8×256×1B + version: 8×256×4B，二维静态数组 |
-| 逻辑失效 | 逐实例 version 不匹配 | toggle 后 lookup 自动 miss |
+| 边界 | 值 / 标识 | 说明 |
+|------|---------|------|
+| 单 funcIndex 在飞请求 | 1 | TaskQueue 去重(Dedup 1 bit 占位,§3.5) |
+| funcIndex 总数上限 | `kEJitMaxFuncIndex` = 4096(`EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX`) | Dedup `inFlight_[]` 扁平数组容量;耗尽时新名字 → `kEJitInvalidFuncIndex`,wrapper 直接 fallback(§2.5.1) |
+| 维度类型上限 | `MAX_DIM_TYPES` = 8 | SwitchController 一维;Lifecycle registry 容量(§5.1) |
+| 单维度实例上限 | `MAX_INSTANCES` = 256 | instanceId ∈ [0, 255](§5.1) |
+| SwitchController 内存 | **10 KiB** | enabled 8×256×1B + version 8×256×4B,二维静态数组,零运行时分配 |
+| Dedup 内存 | 16 KiB | `inFlight_[4096]` × 4 B(`EJitAtomicU32`),零运行时分配 |
+| 单桶 cache 容量 | 弹性 | 桶内 `unordered_map<u64, vector<EJitCacheEntry>>`,受平台内存限制 |
+| 单维度参数上限 | 4 | `EJitCompileRequest::dims[4]`(§3.3.1) |
+| 逻辑失效粒度 | 每实例 version | toggle bump → lookup 自动 miss(§5.4) |
 
 ### 6.4 淘汰机制
 
 | 途径 | 何时 | 操作 |
 |------|------|------|
-| 同 cacheKey 覆盖 | publish | `bucketMap[cacheKey] = newEntry`，旧 fnPtr 在 readers_=0 后释放 |
-| 逻辑失效 | set_instance_enabled | 逐实例 version 不匹配 → lookup 自动 miss |
-
-调大桶数减冲突：
-
-```bash
--DEJIT_SRE_TASKPOOL_BUCKETS=64
-```
+| 同 identity 覆盖 | publish 命中已有 entry | vector 内匹配 entry 的 `fnPtr` 被覆盖;旧 fnPtr 在桶 `writeRelease` 之后调 `releaseFn_`(§4.1) |
+| 逻辑失效 | `setEnabled` bump version | 引用该实例的 entry 在 lookup 逐维 version 比对失败 → miss(§5.4);entry 占位仍在 map 中,等下一次同 identity publish 覆盖 |
+| 全量清理 | `EJitTaskPoolCache::shutdown` | 仅在 `EJitTaskPool` 析构时触发(`stopWorker` → `cache.shutdown`),遍历所有桶,锁外统一调 `releaseFn_`(§10.4)。注意:运行期 `setCompileMode(Sync)` 只停 worker(setMode(Off) + stopTaskPoolWorker),**不**调 shutdown——cache 内已发布的 entry 与 fnPtr 保留;直到 EJit 实例本身销毁才整体清理。 |
 
 ---
 
@@ -1087,23 +1253,25 @@ unsigned ejit_taskpool_poll_budget(unsigned maxItems);
 #endif
 ```
 
-**角色总结**：
+**角色总结**:
 
 ```
-开关控制:
-ejit_taskpool_set_instance_enabled(dimType, instanceId, enabled)
+开关控制 (任何时候可调):
+   ejit_taskpool_set_instance_enabled(dimType, instanceId, enabled)
 
-生产者侧 (业务 / AOT wrapper)        消费者侧 (内部 EJitWorker, 自动驱动)
-ejit_taskpool_compile_or_get(       内部 EJitSreTask 创建的 task 中循环:
-  funcIndex, dims, numDims,           pool.pollOne()
-  &fnPtr, &bucket)                  (核绑定由 SRE 实现决定)
-  → 命中 → 调用 fnPtr(...)
-           release_read(bucket)
-  → miss → 入队 → 返回 fallback
+生产者侧 (业务 / AOT wrapper)         消费者侧 (内部 EJitWorker, 自动驱动)
+   ejit_taskpool_compile_or_get(        SRE task 内循环:
+     funcIndex, dims, numDims,            pool.pollOne()
+     &fnPtr, &bucket)                       (核绑定由 SreTask SRE 实现决定)
+     │
+     ├─ 命中 → 调 fnPtr(...) → ejit_taskpool_release_read(bucket)
+     │           ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+     │           必须配对释放(§3.2.4),否则旧 fnPtr 无法回收
+     └─ 未命中 → 入队 → 立即返回 fallback,worker 后台编译
 
-释放:                                测试构建额外提供:
-ejit_taskpool_release_read(...)        ejit_taskpool_poll_one      [TESTING-ONLY]
-                                       ejit_taskpool_poll_budget   [TESTING-ONLY]
+[TESTING-ONLY,EJIT_SRE_TASKPOOL_TESTING 下才进 C ABI]
+   ejit_taskpool_poll_one() / ejit_taskpool_poll_budget(n)
+     —— 用于在测试中关掉内部 worker、手动驱动消费(§9.2)
 ```
 
 **统计结构体**：
@@ -1120,6 +1288,54 @@ typedef struct {
 
 新增 status code（additive，旧值不变）：`EJIT_ERR_QUEUE_FULL`、`EJIT_ERR_INSTANCE_DISABLED`、`EJIT_PENDING`。
 
+### 7.3 AOT Wrapper IR 结构
+
+PASS3 `EJitWrapperGen` 为每个 `ejit_entry` 函数把原函数体改写为四块结构,业务侧直接调原名,实际执行的是 wrapper:
+
+```
+jit_entry:                                    // 函数新入口,执行 allocas + funcIndex 守卫
+   %dims    = alloca [4 x EJitDimPair]
+   %outFn   = alloca ptr
+   %outBkt  = alloca i32
+   %funcIdx = load i32, @__ejit_funcidx_<name>
+   %ok      = icmp ne i32 %funcIdx, kEJitInvalidFuncIndex
+   br i1 %ok, label %jit_call, label %jit_fallback   // 未注册/容量耗尽 → 直接走 AOT 体
+
+jit_call:                                     // 构造 dims[] 并请求 taskpool
+   ; 对每个 ejit_period_arr_ind 参数 i:
+   ;   %dt = load i32, @__ejit_dimtype_<periodName_i>     ← registry 回填的 slot
+   ;   store i32 %dt,        ptr getelementptr(%dims, i, 0)
+   ;   store i32 %arg_i,     ptr getelementptr(%dims, i, 1)
+   %st = call i32 @ejit_taskpool_compile_or_get(
+              i32 %funcIdx, ptr %dims, i32 <numDims>, ptr %outFn, ptr %outBkt)
+   %fn = load ptr, ptr %outFn
+   %hit = icmp eq i32 %st, 0       ; CacheHit
+   %has = icmp ne ptr %fn, null
+   %disp = and i1 %hit, %has
+   br i1 %disp, label %jit_dispatch, label %jit_fallback
+
+jit_dispatch:                                 // 调特化码,配对 release_read 后返回
+   %bkt = load i32, ptr %outBkt
+   %ret = call <retty> %fn(<原参数>)          ; void 函数则无 %ret
+   call void @ejit_taskpool_release_read(i32 %bkt)
+   ret <retty> %ret                            ; void: 单独 ret void
+
+jit_fallback:                                 // 从原函数体 splice 来的指令序列
+   <原 entry 块全部指令>
+```
+
+**关键设计点**:
+
+| 位置 | 设计 | 理由 |
+|------|------|------|
+| `jit_entry` 守卫 | funcIndex 仍为 `kEJitInvalidFuncIndex` 时直接 fallback | 未注册函数 / `EJitFuncRegistry` 容量耗尽时绝不进 taskpool,§2.5.1 |
+| `dimType` 从 IR global load | 不是 wrapper 编译期常量 | 不同模块独立编译,只有运行时 registry 回填后才知道 slot,§2.5.1 |
+| `outBucket` + `release_read` 配对 | 仅在 `jit_dispatch` 调用 release_read,**且只在成功执行完 fn 之后** | `tryRead` 隐含 `readers_++`,fnPtr 在调用期间不可被释放,§3.2.4 |
+| 任何分支不通过 dispatch | 在 dispatch 之前/`jit_call` 失败侧均**不**调 release_read | `lookup` 未命中(`hasReadToken==false`)时 token 已在 lookup 内归还,无需配对 |
+| `noinline` 属性 | wrapper(改名后的 `ejit_entry`)添加 `noinline` | 防止 inliner 把 wrapper 折进 caller,使 wrapper 失去函数边界(可选,由 `EJitWrapperGen.cpp` 内的 `cl::opt<bool> EJitNoInlineEntry` 控制) |
+
+**与 §2.5.2 的衔接**:wrapper 加载 `@__ejit_funcidx_<name>` 时,若 `ejit_init` 失败,该 global 仍是初始哨兵值——守卫判定 false,函数静默走 fallback,不会调到一个未初始化的 taskpool。这是「`ejit_init` 失败 + 应用继续运行」场景的兜底。
+
 ---
 
 ## 8. Trace 与调试
@@ -1132,17 +1348,16 @@ typedef struct {
 #endif
 ```
 
-上板时可用 `-D'EJIT_TASKPOOL_TRACE(...)=SRE_printf(__VA_ARGS__)'` 重定义。参数限整数/指针/C 字符串。埋点覆盖：
+上板时可用 `-D'EJIT_TASKPOOL_TRACE(...)=SRE_printf(__VA_ARGS__)'` 重定义。参数限整数/指针/C 字符串。当前实际埋点(取自 `EJitTaskPool.cpp` / `EJitWorker.cpp` / `EJitSreTask_sre.cpp`):
 
 | 函数 | 埋点 |
 |------|------|
-| `compileOrGet` | enter / cacheHit / taskQueueEnqueue / instanceDisabled |
-| `EJitTaskQueue::tryEnqueue` | dedup / queuePush / dedupRollback |
-| `runCompile` | begin / compiled / published |
-| `pollOne` | empty / dequeued |
-| `setInstanceEnabled` | enter / versionBump |
-| `EJitWorker::start/stop` | started / stopRequested / exited |
-| `EJitSreTask::create/destroy` | created / destroyed |
+| `EJitTaskPool::compileOrGet` | request / reject(invalid dims) / disabled / hit / fallback(off/full) / enqueued / coalesced / reject(out of range) |
+| `EJitTaskPool::runCompile` | begin / drop before compile / failed / drop after compile / publish ok / publish drop / publish failed |
+| `EJitWorker::start` / `stop` | start name / start failed / start accepted / stop begin / stop complete (with processed/spins) |
+| `EJitSreTask::create` / `destroy`(SRE 实现) | create begin/end with handle / destroy begin/complete |
+
+`compileOrGet` 与 `runCompile` 的埋点用的是同一族 `EJIT_DIAG` 宏(默认条件展开,见 `EJitDiag.h`);上板诊断把宏点亮即可获得完整一次请求的端到端时间线。`EJitSwitchController::setEnabled` 当前未埋点——若需要观察 toggle 时机,可在 `set_instance_enabled` 调用方加一行 `EJIT_DIAG`。
 
 ---
 
@@ -1195,55 +1410,54 @@ cmake --build build-ejit-sre-taskpool --target check-ejit-taskpool -j8
 
 ---
 
-## 10. 核间语义 hardening（本轮）
+## 10. 核间语义速查
 
-本轮目标是把 taskpool 从“单进程异步骨架”推进到“可支撑核间共享的并发语义”，重点不是引入 C++ 线程库，而是加固共享状态发布协议。
+§3–§5 已沿组件展开发布协议与临界区约束的论证。本章是**面向审阅与上板适配**的浓缩清单——每一条在哪个组件落地、详细论证在哪一节,一行交代清楚。本章**不**引入新规则。
 
-### 10.1 核间锁与屏障
+### 10.1 临界区：哪里持锁,持锁里做什么
 
-- 新增 `EJitIpcBucketLock` + `EJitSharedBarrier` 封装。
-- `lock(bucketId)` / `unlock(bucketId)` / `tryLock(bucketId)` 三接口统一可用。
-- host/unit-test 默认使用 `EJitAtomicU32` spin lock；真实平台实现只做符号声明接入，不提供 weak fallback。
-- 锁仅用于短临界区状态更新：cache bucket 元数据、dedup 占位 CAS、局部统计。
+| 锁 | 持锁者 | 持锁里允许做 | 持锁里禁止做 |
+|----|-------|------------|------------|
+| 桶 `EJitRwLock::write`(§3.2.2) | publish / shutdown | 写 entry 字段、收集旧 fnPtr | 调 `releaseFn_`、调 `compileFn_`、ORC/JITLink、SRE_printf、阻塞队列 I/O |
+| 桶 `EJitRwLock::tryRead`(§3.2.1) | lookup,token 由调用方持有 | 读 entry、调 fnPtr | 等待写者(立即失败 fallback) |
+| `EJitIpcBucketLock`(§10.5) | 跨核短状态更新预留 | 见 §10.5 | 同上 |
 
-禁止在持锁状态执行重操作：
+落地点:`EJitTaskPoolCache::publish` / `shutdown` 都把 `releaseFn_` 调用**移到桶写锁释放之后**(§4.1)。
 
-- compile callback
-- ORC/JITLink
-- code pool allocate/seal
-- SRE_printf/trace 输出
-- 可能阻塞的队列读写
-- `EJitWorker` 循环本身(worker 路径不进入持锁区,以避免 worker 与持锁的业务核相互等待)
+### 10.2 发布协议：每个共享状态的写入/读取顺序
 
-### 10.2 发布协议（release/acquire）
+| 共享状态 | 写者 | 写入顺序 | 读者 | 读取顺序 |
+|---------|------|---------|------|---------|
+| `EJitQueue` cell(§3.3) | producer | 写 `EJitCompileRequest` → `sequence.storeRelease(pos+1)` | worker | `sequence.loadAcquire`(等于 pos+1) → 读 data |
+| `EJitDedupTable::inFlight_`(§3.5) | producer / worker | CAS(0,1) 抢 / `storeRelease(0)` 释放 | producer | CAS 抢的同语义,无单独 read 路径 |
+| Cache entry(§4.1) | worker 持桶写锁 | 写字段 → `writeRelease`(release) | reader 持 `tryRead`(acquire) | `tryRead` 看到 writeFlag=0 → 读 entry |
+| `EJitSwitchController::version_`(§5.1) | `setEnabled` 翻转 → `fetchAdd(1)`(acq_rel) | — | `getInstanceVersion` `loadAcquire` | — |
+| `EJitSwitchController::enabled_`(§5.1) | `setEnabled` CAS(单次 acq_rel) | — | `isInstanceEnabled` `loadRelaxed` | — |
 
-- queue producer 先写完整 `EJitCompileRequest`，再 release 发布 cell sequence。
-- queue consumer acquire 读取 sequence，随后读取 request 内容。
-- dedup 仅维护 1 bit 占位（0/1）：
-    - producer `compareExchange(0, 1)` 抢占位
-    - worker / producer 完成或回滚时 `storeRelease(0)` 释放
-    - 不持有 payload，不需要中间屏障态
-- cache publish 先写 `fnPtr/version/identity`，最后 `storeRelease(Ready)`。
-- 调用方 acquire 看到 `Ready` 后读取 `fnPtr`。
+### 10.3 version 失效：一次 toggle 三处兜底
 
-### 10.3 activate/deactivate 与版本语义
+`setEnabled(d, i, !)` 成功一次 → `version_[d][i]` 单调 +1(§5.1) → 三层独立兜底:
 
-- `EJitSwitchController` 增加 `activate(mode)` / `deactivate()`，均单调 bump version。
-- `compileOrGet` 在 Off/Disabled 时不入队，直接 fallback。
-- worker 在 dequeue 后和 compile 后两个 version 检查点丢弃过时结果；失配时 `taskQueue_.release` + 不写 cache。
-- 旧 version 结果不会覆盖新 version cache。
+1. **lookup**: entry.versions[i] 不再匹配 → miss(§4.1)
+2. **worker 检查点 1 / 检查点 2**: req.versions[i] 不再匹配 → release + 丢弃(§5.3)
+3. **publish 提交门**: 持桶写锁瞬间重验 req.versions[i] → 不匹配则 `VersionMismatch`,不写 entry(§4.1)
 
-### 10.4 FreeCode 语义
+三层都看不到陈旧 version 写入新 entry 的窗口。详细窗口分析:§5.3 检查点 2 → publish 窗口、§5.1 单调性证明。
 
-- `freeCode` 不参与失效路径，仅在以下两个场景触发：
-    - 模块 destroy：清理 cache 中所有 fnPtr
-    - cache publish 覆盖：同 cacheKey 写入新 fnPtr 时，旧 fnPtr 在该桶 `readers_=0` 后释放
-- 失效语义由 SwitchController 的 version bump + worker 检查点共同保证，不通过 `freeCode` 实现。
-- `freeCode` 与 publish 互斥由 cache 桶锁（`EJitRwLock.write`）保证：写者 spin 到 `readers_=0` 后才释放旧 fnPtr，确保无人持有该指针。
+### 10.4 旧 fnPtr 释放：`releaseFn_` 的两个唯一触发点
 
-### 10.5 大端共享结构约束
+- **publish 覆盖**(§4.1):写锁内覆盖 fnPtr,写锁外调 `releaseFn_(oldFn)`。`write()` 已 spin 到 `readers_=0`,旧 fnPtr 对该桶不再可达。
+- **`EJitTaskPoolCache::shutdown`**(§4.1):遍历所有桶收集 fnPtr,锁全部释放后统一调 `releaseFn_`。
+
+`releaseFn_` 由 `EJitCompileDriver` 注入(指向 code pool retire);未注入时退化为逻辑丢弃。**不是 C ABI 公开点**,不参与 toggle 失效路径(失效由 §10.3 完成)。
+
+### 10.5 跨核扩展点（当前未在生产路径使用）
+
+`EJitIpcBucketLock` + `EJitSharedBarrier`(`EJitIpcLock.h`)提供 32 桶 spin lock 与 `fenceAcquire/Release/Full` 屏障封装。当前 cache 桶互斥由各自的 `EJitRwLock` 实现,**不**经 `EJitIpcBucketLock`;该锁主要给测试钩子和未来的跨核短状态更新预留。真实平台符号 `EJitBucketTryLock/Lock/Unlock` 仅声明(`EJIT_SRE_TASKPOOL_PLATFORM_IPC_LOCK`),不提供 weak fallback。
+
+### 10.6 大端共享结构约束
 
 - 共享结构使用固定宽度整数与明确对齐。
-- 不使用 bitfield。
-- 不按字节解析整数，不把 native layout 持久化为跨端文件协议。
+- 不使用 bitfield(`EJitDedupSlot`/`EJitCacheEntry` 等均为标量原子字段)。
+- 不按字节解析整数,不把 native layout 持久化为跨端文件协议。
 
