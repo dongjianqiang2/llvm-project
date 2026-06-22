@@ -30,8 +30,10 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
     dst.maxCacheSize = src->maxCacheSize;
   dst.enableLogger = src->enableLogger;
   dst.forceStaticRegistry = src->forceStaticRegistry;
+#ifndef EJIT_FREESTANDING
   if (src->dumpJITDir && src->dumpJITDir[0])
     dst.dumpJITDir = src->dumpJITDir;
+#endif
 #ifdef EJIT_FREESTANDING
   dst.enableLogger = false;
 #endif

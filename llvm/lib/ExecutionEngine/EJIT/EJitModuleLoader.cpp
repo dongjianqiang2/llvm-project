@@ -20,9 +20,11 @@ void EJitModuleLoader::registerBitcode(const std::string &funcName,
   uint32_t idx = hashFuncName(funcName);
   auto &entry = entriesByFuncIdx_[idx];
   if (entry.data && entry.funcName != funcName) {
+#ifndef EJIT_FREESTANDING
     errs() << "EJIT PANIC: funcIdx collision — '" << funcName
            << "' and '" << entry.funcName
            << "' both hash to " << idx << "\n";
+#endif
     report_fatal_error("EJIT: hash collision on funcIdx, rename functions");
   }
   entry = {funcName, data, size};

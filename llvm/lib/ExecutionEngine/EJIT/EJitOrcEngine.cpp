@@ -44,8 +44,10 @@ struct EJitOrcEngine::Impl {
   /// User-registered symbols (functions + globals) for bare-metal.
   /// Populated via ejit_register_symbol() / addUserSymbol().
   std::map<std::string, void *> userSymbols;
+#ifndef EJIT_FREESTANDING
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
+#endif
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
 };
@@ -60,7 +62,9 @@ EJitOrcEngine::Create(const Config &config,
   auto engine = std::unique_ptr<EJitOrcEngine>(new EJitOrcEngine());
   engine->P->periodReg = &periodReg;
   engine->P->runtimeState = &runtimeState;
+#ifndef EJIT_FREESTANDING
   engine->P->dumpJITDir = config.dumpJITDir;
+#endif
 
   // Bare-metal / cross-compiled: use compile-time target triple.
   // Native host: auto-detect via detectHost().
@@ -160,6 +164,7 @@ EJitOrcEngine::Create(const Config &config,
           // (each compilation uses a fresh Module with new IR unit pointers).
           engine->P->optimizer->clearAnalyses();
 
+#ifndef EJIT_FREESTANDING
           // Dump pre-optimization IR (before the JIT pipeline runs).
           if (!engine->P->dumpJITDir.empty()) {
             std::string prePath = engine->P->dumpJITDir + "/" +
@@ -170,9 +175,11 @@ EJitOrcEngine::Create(const Config &config,
             if (!EC)
               M.print(preOS, nullptr);
           }
+#endif
 
           engine->P->optimizer->runPipeline(M, *ctx);
 
+#ifndef EJIT_FREESTANDING
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
             std::string path = engine->P->dumpJITDir + "/" +
@@ -183,6 +190,7 @@ EJitOrcEngine::Create(const Config &config,
             if (!EC)
               M.print(OS, nullptr);
           }
+#endif
         });
         return std::move(TSM);
       });

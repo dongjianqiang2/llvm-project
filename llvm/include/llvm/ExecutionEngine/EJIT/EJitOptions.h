@@ -32,9 +32,11 @@ struct Config {
   /// static registry table (__ejit_registry_*[]).  For bare-metal where
   /// global constructors are unavailable, or for testing.
   bool forceStaticRegistry = false;
+#ifndef EJIT_FREESTANDING
   /// If non-empty, dump JIT-optimized LLVM IR (.ll) to this directory.
   /// One file per specialization, named <funcName>_<cacheKey>.ll.
   std::string dumpJITDir;
+#endif
 };
 
 } // namespace ejit
