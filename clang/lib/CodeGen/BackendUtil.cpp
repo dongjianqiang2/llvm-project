@@ -511,6 +511,19 @@ static bool initTargetOptions(const CompilerInstance &CI,
   // BranchRelaxation for XBBR builds and pushing all range safety to
   // link-time Stage 4 (CONDBR19/TSTBR14 revert) + the lld thunk loop
   // (JUMP26/CALL26). 'function' mode does NOT imply BB sections (SPEC §6.3).
+  //
+  // AArch64 jump tables are also incompatible with BB sections: the dispatch
+  // lowers to `adr x, <base-BB>` (R_AARCH64_ADR_PREL_LO21) plus jump-table
+  // entries `(target-BB - base-BB)>>2`. Under BB sections each BB is its own
+  // section, so both the `adr` (to a section symbol) and the cross-section
+  // `(sym-sym)>>2` data expression are rejected by MC ("invalid symbol kind
+  // for ADR relocation" / "expected relocatable expression"). Upstream
+  // rejects -fbasic-block-sections=all on AArch64 partly for this reason.
+  // XBBR disables jump tables on AArch64 (switches lower to compare chains)
+  // so BB-section codegen is valid; this trades sparse-switch dispatch speed
+  // for layout correctness (XBBR targets code layout, not switch perf).
+  // Supporting jump tables under BB sections would need an absolute-address
+  // (`.xword`+`ldr`+`br`) encoding instead of the PC-relative one — future work.
   if (BBCRMode == "partial" || BBCRMode == "full") {
     Options.BBSections = llvm::BasicBlockSection::All;
     Options.FunctionSections = true;
@@ -520,6 +533,12 @@ static bool initTargetOptions(const CompilerInstance &CI,
               llvm::cl::getRegisteredOptions().lookup(
                   "aarch64-enable-branch-relax")))
         BR->setValue(false);
+      // Disable jump tables (set the minimum-entries threshold beyond any
+      // real switch so none is emitted). cl::opt<unsigned> in AArch64Subtarget.
+      if (auto *MJT = static_cast<llvm::cl::opt<unsigned> *>(
+              llvm::cl::getRegisteredOptions().lookup(
+                  "aarch64-min-jump-table-entries")))
+        MJT->setValue(UINT_MAX);
     }
   }
 

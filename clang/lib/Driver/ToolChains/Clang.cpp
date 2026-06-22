@@ -6237,13 +6237,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       D.Diag(diag::err_drv_unsupported_opt_for_target)
           << A->getAsString(Args) << TripleStr;
     } else if ((Val == "partial" || Val == "full") &&
-               !Triple.isX86() && !Triple.isAArch64()) {
-      // XBBR metadata emission is wired for x86_64 and AArch64. ARM (A32/T32)
-      // is blocked upstream: ARM CodeGen emits the BBAddrMap BaseAddress
-      // companion as SHT_REL (entsize 8), but llvm's decodeBBAddrMap assumes
-      // SHT_RELA (entsize 12), so the per-BB section association can't be
-      // decoded (lld/ELF/XBBR/XBBRGraph.cpp has the ELF32LE dispatch ready,
-      // but decode fails). Re-reject ARM at the driver until that lands.
+               !Triple.isX86() && !Triple.isAArch64() && !Triple.isARM() &&
+               !Triple.isThumb()) {
+      // XBBR metadata emission is wired for x86_64, AArch64, and ARM (A32/T32).
+      // ARM landed in P2-1: llvm/lib/Object/ELF.cpp::decodeBBAddrMapImpl handles
+      // SHT_REL (entsize 8) alongside SHT_RELA, and lld/ELF/XBBR/XBBRGraph.cpp
+      // dispatches on ekind for ELF32LE. Other non-x86/AArch64/ARM targets
+      // remain unsupported.
       D.Diag(diag::err_drv_unsupported_opt_for_target)
           << A->getAsString(Args) << TripleStr;
     } else if ((Val == "partial" || Val == "full") &&
