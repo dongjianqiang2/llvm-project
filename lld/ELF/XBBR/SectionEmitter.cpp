@@ -284,6 +284,29 @@ void renameSectionsForHotColdSplit(Ctx &ctx, XBBRGraph &graph) {
   }
 }
 
+/// P0 task #2: returns true if any relocation in `sec` targets a linker-emitted
+/// range-extension thunk. lld rewrites an over-range branch's `reloc.sym` to
+/// the thunk's own Defined symbol (Relocations.cpp: `rel.sym =
+/// t->getThunkTargetSym()`), and that Defined's section is a ThunkSection — a
+/// SyntheticSection whose name is ".text.thunk" (ThunkSection ctor). Only
+/// migration can make a branch over-range, so callers consult this only for
+/// Moved BBs; a set Thunk flag means "this BB's migration required a linker
+/// thunk". `dyn_cast<ThunkSection>` is NOT a reliable discriminator (it is
+/// non-null for any SyntheticSection, Relocations.cpp:1978 FIXME), so the name
+/// check is the reliable test — same approach as `computeRealThunkBytes`.
+static bool bbRelocTargetsThunk(InputSectionBase *sec) {
+  if (!sec)
+    return false;
+  for (const Relocation &r : sec->relocs()) {
+    auto *d = dyn_cast<Defined>(r.sym);
+    if (!d || !d->section)
+      continue;
+    if (isa<SyntheticSection>(d->section) && d->section->name == ".text.thunk")
+      return true;
+  }
+  return false;
+}
+
 void backfillDecisionMapVAs(Ctx &ctx) {
   if (!ctx.xbbrGraph || !ctx.xbbrLayoutResult)
     return;
@@ -350,6 +373,16 @@ void backfillDecisionMapVAs(Ctx &ctx) {
       e.NewAddress = node.BBSection->getVA();
     if (InputSectionBase *entrySec = graph.funcSection(node.Func))
       e.OrigFuncAddr = entrySec->getVA();
+    // P0 task #2: Thunk flag. lld rewrites an over-range branch's reloc.sym
+    // to the thunk's Defined (section ".text.thunk"); a Moved BB whose branch
+    // needed a range-extension thunk carries the Thunk flag so consumers
+    // (BOLT, llvm-bbreorder-dump) can see that migration induced thunking.
+    // Anchored BBs do not migrate, so their branches cannot be made
+    // over-range by XBBR and are not flagged. The Thunk flag is added to
+    // (not replacing) Moved, so the entry reads as moved+thunk.
+    if ((e.DecisionFlags & llvm::XBBRDecisionMap::EntryFlags::Moved) &&
+        bbRelocTargetsThunk(node.BBSection))
+      e.DecisionFlags |= llvm::XBBRDecisionMap::EntryFlags::Thunk;
   }
 }
 

@@ -38,6 +38,13 @@ llvm_config.use_default_substitutions()
 llvm_config.use_lld()
 config.substitutions.append(("%llvm_src_root", config.llvm_src_root))
 
+# Host-architecture feature, so tests that execute a freshly-linked target
+# binary can require the host to actually run it (e.g. XBBR's real-IRPGO
+# end-to-end test links AND runs an aarch64 executable). This keys off the
+# running machine, unlike the global `native` feature (host_triple ==
+# target_triple) which is unavailable here because lld's target_triple is empty.
+config.available_features.add("host-%s" % platform.machine().lower())
+
 tool_patterns = [
     "llc",
     "llvm-as",
