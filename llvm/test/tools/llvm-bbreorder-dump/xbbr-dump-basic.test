@@ -35,7 +35,7 @@
 # HUMAN: version   : 0x00010000
 # HUMAN: entries   :
 # HUMAN: Function
-# HUMAN: BB  OrigAddr      NewAddr       Cluster  Flag
+# HUMAN: BB  OrigFuncAddr  NewAddr       Cluster  Flag
 
 # DOT: digraph XBBR {
 # DOT: label="XBBR Layout

@@ -35,7 +35,7 @@
 # GHUM: version   : 0x00010000
 # GHUM: entries   : 1
 # GHUM: Function 0 (1 BBs):
-# GHUM: BB  OrigAddr      NewAddr       Cluster  Flag
+# GHUM: BB  OrigFuncAddr  NewAddr       Cluster  Flag
 # GHUM: 0  0x00000000  0x00001000        0  moved
 
 ## Graphviz must NOT contain self-loop edges (regression guard for the

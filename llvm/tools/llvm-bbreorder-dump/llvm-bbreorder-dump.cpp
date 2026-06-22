@@ -136,7 +136,7 @@ void dumpHuman(const DecisionMapHeader &H,
 
   for (const auto &[FuncId, BBs] : ByFunc) {
     outs() << "Function " << FuncId << " (" << BBs.size() << " BBs):\n";
-    outs() << "  BB  OrigAddr      NewAddr       Cluster  Flag\n";
+    outs() << "  BB  OrigFuncAddr  NewAddr       Cluster  Flag\n";
     for (const auto &E : BBs) {
       outs() << "  " << format("%3u", E.BBIndex)
              << "  " << format("0x%08" PRIX64, E.OrigFuncAddr)
