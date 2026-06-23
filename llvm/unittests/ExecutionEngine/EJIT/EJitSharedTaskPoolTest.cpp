@@ -18,6 +18,8 @@
 #include "gtest/gtest.h"
 #include <memory>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 using namespace llvm::ejit;
 
@@ -66,6 +68,59 @@ bool mockPrepareCode(void *ctx, const void * /*fnPtr*/) {
   auto *log = static_cast<PrepareLog *>(ctx);
   log->cores.push_back(EJitCoreId::current());
   return log->succeed;
+}
+
+//===----------------------------------------------------------------------===//
+// 4K page-seal mocks: a per-core split + per-page seal that log which core ran
+// them and (optionally) fail or inject a concurrent slot/generation change at a
+// chosen seal step (to exercise the re-validate-after-prepare protocol).
+//===----------------------------------------------------------------------===//
+struct FourKLog {
+  std::vector<std::pair<uintptr_t, uint32_t>> splits; // (poolBase, core)
+  std::vector<std::pair<uintptr_t, uint32_t>> seals;  // (pageVA, core)
+  bool splitOk = true;
+  int failSealAtIndex = -1;           // fail the Nth (0-based) seal call
+  void (*raceHook)(void *) = nullptr; // run during a chosen seal (no lock held)
+  void *raceCtx = nullptr;
+  int raceAtSealIndex = -1;
+};
+bool mockSplitPool(void *ctx, uintptr_t poolBase, uint64_t /*poolSize*/) {
+  auto *l = static_cast<FourKLog *>(ctx);
+  l->splits.push_back({poolBase, EJitCoreId::current()});
+  return l->splitOk;
+}
+bool mockSealPage(void *ctx, uintptr_t pageVA) {
+  auto *l = static_cast<FourKLog *>(ctx);
+  int idx = static_cast<int>(l->seals.size());
+  l->seals.push_back({pageVA, EJitCoreId::current()});
+  if (l->raceHook && idx == l->raceAtSealIndex)
+    l->raceHook(l->raceCtx); // simulate a concurrent publish during prepare
+  if (l->failSealAtIndex == idx)
+    return false;
+  return true;
+}
+
+// Owner-side resolver of a compiled pointer to a (test-controlled) executable
+// range. Mutating the RangeCtx between compiles models distinct code extents.
+struct RangeCtx {
+  uintptr_t poolBase = 0x40000000ull;
+  uint64_t poolSize = 0x200000ull; // 2 MiB
+  uintptr_t codeStart = 0x40000000ull;
+  uint64_t codeSize = 64;
+  uint32_t poolId = 0;
+  bool provide = true;
+};
+bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
+  auto *r = static_cast<RangeCtx *>(ctx);
+  if (!r->provide)
+    return false;
+  out->fnPtr = const_cast<void *>(fnPtr);
+  out->codeStart = r->codeStart;
+  out->codeSize = r->codeSize;
+  out->poolBase = r->poolBase;
+  out->poolSize = r->poolSize;
+  out->poolId = r->poolId;
+  return true;
 }
 
 // Compiler that returns a distinct, non-null pointer on every call (models a
@@ -128,6 +183,43 @@ protected:
     pool.setMode(EJitCompileMode::Async);
     pool.setCodeSharingEnabled(codeSharing);
     ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  }
+
+  // Bring up a 4K-seal owner with code sharing ON, an injected range provider,
+  // and mock per-core split + per-page seal callbacks.
+  void bringUpOwner4K(EJitSharedTaskPool &pool, FourKLog &fourK,
+                      RangeCtx &range) {
+    EJitCoreId::setCurrentForTest(0);
+    pool.bind(state_.get());
+    pool.setCompiler(&mockCompile, nullptr);
+    pool.setMode(EJitCompileMode::Async);
+    pool.setCodeSharingEnabled(true);
+    pool.setSealMode(true);
+    pool.setCodeRangeProvider(&mockCodeRange, &range);
+    pool.setSplitPoolCallback(&mockSplitPool, &fourK);
+    pool.setSealPageCallback(&mockSealPage, &fourK);
+    ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  }
+
+  // Compile + publish one (funcIndex, no-dims) entry on the owner core.
+  void publish(EJitSharedTaskPool &owner, uint32_t funcIndex) {
+    EJitCoreId::setCurrentForTest(0);
+    ASSERT_EQ(
+        owner.compileOrGet(funcIndex, nullptr, 0, codeFor(funcIndex)).status,
+        EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+  }
+
+  EJitSharedCacheSlot *findReadySlot(uint32_t funcIndex) {
+    for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+      for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+        EJitSharedCacheSlot &Slot = state_->buckets[b].slots[s];
+        if (Slot.state.loadAcquire() ==
+                static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+            Slot.funcIndex == funcIndex)
+          return &Slot;
+      }
+    return nullptr;
   }
 
   std::unique_ptr<EJitSharedTaskPoolState> state_;
@@ -1059,6 +1151,487 @@ TEST_F(SharedTaskPoolTest, RegistrationFingerprintMismatchRejected) {
   EJitCoreId::setCurrentForTest(2);
   EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::FingerprintMismatch);
   EXPECT_FALSE(peer.isOwner());
+}
+
+//===----------------------------------------------------------------------===//
+// 4K per-core shared code execute-permission preparation.
+//===----------------------------------------------------------------------===//
+
+// 1/ Single-page function: the peer splits its pool ONCE and seals ONE page.
+TEST_F(SharedTaskPoolTest, FourKPeerSplitsOnceSealsSinglePage) {
+  FourKLog fourK;
+  RangeCtx range; // codeStart 0x40000000, size 64 -> one 4K page
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(1));
+  EXPECT_TRUE(hit.hasReadToken);
+  owner.releaseRead(hit.bucketIndex);
+
+  ASSERT_EQ(fourK.splits.size(), 1u);
+  EXPECT_EQ(fourK.splits[0].first, range.poolBase);
+  EXPECT_EQ(fourK.splits[0].second, 3u);
+  ASSERT_EQ(fourK.seals.size(), 1u);
+  EXPECT_EQ(fourK.seals[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.seals[0].second, 3u);
+}
+
+// 2/3 Range spanning two pages with an unaligned start/end: seal BOTH pages.
+TEST_F(SharedTaskPoolTest, FourKPeerSealsEveryCoveredPageUnaligned) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.codeStart = 0x40000F00ull; // unaligned, near the end of page 0
+  range.codeSize = 0x200;          // crosses into page 1
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 2);
+
+  EJitCoreId::setCurrentForTest(5);
+  auto hit = owner.compileOrGet(2, nullptr, 0, codeFor(2));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  ASSERT_EQ(fourK.seals.size(), 2u);
+  EXPECT_EQ(fourK.seals[0].first, 0x40000000ull); // page-aligned down
+  EXPECT_EQ(fourK.seals[1].first, 0x40001000ull); // page-aligned up
+}
+
+// 4/ Repeated hit on the SAME core does NOT re-split or re-seal (memoized).
+TEST_F(SharedTaskPoolTest, FourKSameCoreRepeatHitNoRework) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto h1 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h1.bucketIndex);
+  auto h2 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h2.bucketIndex);
+
+  EXPECT_EQ(fourK.splits.size(), 1u); // not repeated
+  EXPECT_EQ(fourK.seals.size(), 1u);  // not repeated
+}
+
+// 5/ A second function in the SAME pool: no re-split, but seals its OWN pages.
+TEST_F(SharedTaskPoolTest, FourKSecondFuncSamePoolNoResplit) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.codeStart = 0x40000000ull; // func 1 -> page 0
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  range.codeStart = 0x40010000ull; // func 2 -> a different page, SAME pool
+  publish(owner, 2);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto h1 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h1.bucketIndex);
+  auto h2 = owner.compileOrGet(2, nullptr, 0, codeFor(2));
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h2.bucketIndex);
+
+  EXPECT_EQ(fourK.splits.size(), 1u); // split once for the shared pool
+  ASSERT_EQ(fourK.seals.size(), 2u);  // but each func sealed its own page
+  EXPECT_EQ(fourK.seals[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.seals[1].first, 0x40010000ull);
+}
+
+// 6/ Two peer cores each split + seal in their own translation context.
+TEST_F(SharedTaskPoolTest, FourKTwoPeerCoresEachPrepare) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto h3 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h3.bucketIndex);
+  EJitCoreId::setCurrentForTest(4);
+  auto h4 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h4.bucketIndex);
+
+  ASSERT_EQ(fourK.splits.size(), 2u);
+  EXPECT_EQ(fourK.splits[0].second, 3u);
+  EXPECT_EQ(fourK.splits[1].second, 4u);
+  ASSERT_EQ(fourK.seals.size(), 2u);
+  EXPECT_EQ(fourK.seals[0].second, 3u);
+  EXPECT_EQ(fourK.seals[1].second, 4u);
+}
+
+// 7/ The owner never runs peer preparation (it sealed the code itself).
+TEST_F(SharedTaskPoolTest, FourKOwnerDoesNotPeerPrepare) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(0); // owner
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+  EXPECT_TRUE(fourK.splits.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// 8/ Split failure: clean fallback, NO ready bit, NO seal; a later retry can
+// succeed once the platform recovers.
+TEST_F(SharedTaskPoolTest, FourKSplitFailureFallsBackAndRetries) {
+  FourKLog fourK;
+  fourK.splitOk = false;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto miss = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_EQ(miss.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(miss.readyButNotShareable);
+  EXPECT_FALSE(miss.hasReadToken);
+  EXPECT_TRUE(fourK.seals.empty()); // never sealed after a failed split
+  EXPECT_EQ(state_->counters.executePrepareFailed.loadAcquire(), 1u);
+  // The per-core split-done bit must NOT be set, so a retry re-attempts.
+  fourK.splitOk = true;
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+  EXPECT_EQ(fourK.splits.size(), 2u); // re-attempted
+  EXPECT_EQ(fourK.seals.size(), 1u);
+}
+
+// 9/ A mid-range seal failure: clean fallback, the slot is NOT marked ready for
+// this core (the next hit re-prepares).
+TEST_F(SharedTaskPoolTest, FourKMidSealFailureFallsBack) {
+  FourKLog fourK;
+  fourK.failSealAtIndex = 1; // first page seals, second fails
+  RangeCtx range;
+  range.codeStart = 0x40000F00ull;
+  range.codeSize = 0x200; // two pages
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto miss = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_EQ(miss.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(miss.readyButNotShareable);
+  EXPECT_EQ(fourK.seals.size(), 2u); // attempted both, second failed
+  EXPECT_EQ(state_->counters.executePrepareFailed.loadAcquire(), 1u);
+  // Not memoized: a retry (now succeeding) re-seals.
+  fourK.failSealAtIndex = -1;
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+}
+
+// 10/ Missing / zero-size / overflowing range: clean fallback, no platform
+// call.
+TEST_F(SharedTaskPoolTest, FourKMissingRangeFallsBack) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.provide = false; // owner publishes NO range (codeSize stays 0)
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  // Slot carries no range metadata.
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->codeSize, 0ull);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto miss = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_EQ(miss.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(miss.readyButNotShareable);
+  EXPECT_TRUE(fourK.splits.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// 10b/ A range whose code lies outside its pool is rejected (no seal).
+TEST_F(SharedTaskPoolTest, FourKOutOfPoolRangeRejected) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.codeStart = 0x40000000ull;
+  range.codeSize = 0x300000ull; // 3 MiB > 2 MiB pool: code escapes the pool
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto miss = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_EQ(miss.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(miss.readyButNotShareable);
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// 11/ Pool-readiness table full: a peer hitting an untracked pool cleanly falls
+// back rather than overflow the fixed table.
+TEST_F(SharedTaskPoolTest, FourKPoolTableFullFallsBack) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  // Publish kEJitSharedPoolSlots + 1 functions, each in a DISTINCT 2MiB pool.
+  const uint32_t N = kEJitSharedPoolSlots + 1;
+  for (uint32_t f = 0; f < N; ++f) {
+    range.poolBase = 0x40000000ull + static_cast<uint64_t>(f) * 0x200000ull;
+    range.codeStart = range.poolBase;
+    range.codeSize = 64;
+    publish(owner, f);
+  }
+  // A single peer core touches every pool; the table holds only
+  // kEJitSharedPoolSlots, so exactly one distinct pool cannot be tracked and
+  // that hit cleanly falls back.
+  EJitCoreId::setCurrentForTest(3);
+  uint32_t fallbacks = 0, hits = 0;
+  for (uint32_t f = 0; f < N; ++f) {
+    auto r = owner.compileOrGet(f, nullptr, 0, codeFor(f));
+    if (r.status == EJitCompileOrGetStatus::CacheHit) {
+      ++hits;
+      owner.releaseRead(r.bucketIndex);
+    } else {
+      EXPECT_EQ(r.status, EJitCompileOrGetStatus::OffMode);
+      EXPECT_TRUE(r.readyButNotShareable);
+      ++fallbacks;
+    }
+  }
+  EXPECT_EQ(hits, kEJitSharedPoolSlots);
+  EXPECT_EQ(fallbacks, 1u);
+}
+
+// 12/ Core id beyond the 64-bit memo width: no UB, and (documented) the split +
+// seal re-run on every hit since the per-core bit cannot be recorded.
+TEST_F(SharedTaskPoolTest, FourKOutOfRangeCoreRePreparesEachHit) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(100); // >= kEJitSharedMaxMemoCores
+  auto h1 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h1.fnPtr, codeFor(1));
+  owner.releaseRead(h1.bucketIndex);
+  auto h2 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h2.bucketIndex);
+  EXPECT_EQ(fourK.splits.size(), 2u); // re-prepared (no memoization)
+  EXPECT_EQ(fourK.seals.size(), 2u);
+}
+
+// 13/ Slot replaced (fnPtr changed) DURING preparation: the prepared pointer is
+// re-validated and the now-stale pointer is NOT returned.
+TEST_F(SharedTaskPoolTest, FourKSlotReplacedDuringPrepareNotReturned) {
+  static EJitSharedCacheSlot *gSlot = nullptr;
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  gSlot = findReadySlot(1);
+  ASSERT_NE(gSlot, nullptr);
+  // During the (only) seal call — after the bucket read lock was released —
+  // overwrite the slot's fnPtr to model a concurrent same-generation republish.
+  fourK.raceAtSealIndex = 0;
+  fourK.raceCtx = nullptr;
+  fourK.raceHook = [](void *) {
+    gSlot->fnPtr.storeRelease(
+        reinterpret_cast<uintptr_t>(reinterpret_cast<void *>(0xBADC0DEull)));
+  };
+
+  EJitCoreId::setCurrentForTest(3);
+  auto r = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_EQ(r.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_FALSE(r.hasReadToken);
+}
+
+// 14/ Generation changed DURING preparation: the prepared pointer is discarded.
+TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
+  static EJitSharedTaskPoolState *gState = nullptr;
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  gState = state_.get();
+  fourK.raceAtSealIndex = 0;
+  fourK.raceHook = [](void *) {
+    gState->generation.storeRelease(gState->generation.loadAcquire() + 1);
+  };
+
+  EJitCoreId::setCurrentForTest(3);
+  auto r = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_EQ(r.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(r.readyButNotShareable);
+}
+
+// 16/17 ABI v5 layout: the slot carries the executable range as fixed-width,
+// naturally-aligned scalars (read back by value — endian-safe), and the
+// pool-split table is POD.
+TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
+  EXPECT_EQ(kEJitSharedAbiVersion, 5u);
+  EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
+  EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
+  EXPECT_TRUE(
+      std::is_trivially_default_constructible<EJitSharedPoolSplit>::value);
+
+  FourKLog fourK;
+  RangeCtx range;
+  range.codeStart = 0x40012340ull;
+  range.codeSize = 0x456;
+  range.poolBase = 0x40000000ull;
+  range.poolSize = 0x200000ull;
+  range.poolId = 7;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  EXPECT_EQ(state_->abiVersion, kEJitSharedAbiVersion);
+  publish(owner, 1);
+
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->codeStart, 0x40012340ull);
+  EXPECT_EQ(slot->codeSize, 0x456ull);
+  EXPECT_EQ(slot->poolBase, 0x40000000ull);
+  EXPECT_EQ(slot->poolSize, 0x200000ull);
+  EXPECT_EQ(slot->poolId, 7u);
+  EXPECT_EQ(slot->rangeReserved, 0u);
+}
+
+// 18/ Code-sharing OFF in 4K mode: a non-owner cleanly rejects and triggers NO
+// platform split/seal call at all.
+TEST_F(SharedTaskPoolTest, FourKCodeSharingOffMakesNoPlatformCall) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(false); // capability OFF
+  owner.setSealMode(true);
+  owner.setCodeRangeProvider(&mockCodeRange, &range);
+  owner.setSplitPoolCallback(&mockSplitPool, &fourK);
+  owner.setSealPageCallback(&mockSealPage, &fourK);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_EQ(r.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_EQ(r.fnPtr, fallback);
+  EXPECT_TRUE(fourK.splits.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// 19/ Re-init scrubs EVERY ABI-v5 field. A re-initialization runs over the same
+// shared blob, so initSharedStorage must clear the per-pool split table AND the
+// per-slot executable-range metadata (plus fnPtr / executableCoreMask / state).
+// Pre-stain the raw blob with garbage and prove the owner election zeroes it.
+TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
+  // Stain the per-pool split table.
+  for (uint32_t i = 0; i < kEJitSharedPoolSlots; ++i) {
+    state_->poolSplits[i].poolBase.storeRelaxed(0xDEADBEEFull);
+    state_->poolSplits[i].splitDoneMask.storeRelaxed(~uint64_t(0));
+    state_->poolSplits[i].splitPreparingMask.storeRelaxed(~uint64_t(0));
+  }
+  // Stain every cache slot's range + sharing fields and mark it (falsely)
+  // Ready.
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      EJitSharedCacheSlot &Slot = state_->buckets[b].slots[s];
+      Slot.state.storeRelaxed(
+          static_cast<uint32_t>(EJitSharedSlotState::Ready));
+      Slot.fnPtr.storeRelaxed(0xBADC0DEull);
+      Slot.executableCoreMask.storeRelaxed(~uint64_t(0));
+      Slot.codeStart = 0x1111;
+      Slot.codeSize = 0x2222;
+      Slot.poolBase = 0x3333;
+      Slot.poolSize = 0x4444;
+      Slot.poolId = 0x5555;
+      Slot.rangeReserved = 0x6666;
+    }
+
+  // init-state was left Uninitialized, so owner election runs
+  // initSharedStorage.
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+
+  for (uint32_t i = 0; i < kEJitSharedPoolSlots; ++i) {
+    EXPECT_EQ(state_->poolSplits[i].poolBase.loadRelaxed(), 0u);
+    EXPECT_EQ(state_->poolSplits[i].splitDoneMask.loadRelaxed(), 0u);
+    EXPECT_EQ(state_->poolSplits[i].splitPreparingMask.loadRelaxed(), 0u);
+  }
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      EJitSharedCacheSlot &Slot = state_->buckets[b].slots[s];
+      EXPECT_EQ(Slot.state.loadAcquire(),
+                static_cast<uint32_t>(EJitSharedSlotState::Empty));
+      EXPECT_EQ(Slot.fnPtr.loadRelaxed(), 0u);
+      EXPECT_EQ(Slot.executableCoreMask.loadRelaxed(), 0u);
+      EXPECT_EQ(Slot.codeStart, 0u);
+      EXPECT_EQ(Slot.codeSize, 0u);
+      EXPECT_EQ(Slot.poolBase, 0u);
+      EXPECT_EQ(Slot.poolSize, 0u);
+      EXPECT_EQ(Slot.poolId, 0u);
+      EXPECT_EQ(Slot.rangeReserved, 0u);
+    }
+}
+
+// 20/ A per-core split-done bit recorded under one generation must NOT survive
+// a re-init: after the owner tears down and re-initializes (new generation),
+// the same peer core re-runs split_2m_to_4k for the rebuilt pool (a stale done
+// bit would otherwise let it seal pages that were never split in this
+// generation).
+TEST_F(SharedTaskPoolTest, FourKReinitForcesPeerToReSplit) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  // Peer core 3 prepares once: records a split + a per-core done bit.
+  EJitCoreId::setCurrentForTest(3);
+  auto h = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h.bucketIndex);
+  ASSERT_EQ(fourK.splits.size(), 1u);
+
+  // Tear down + re-init on the owner core: the whole blob (and split table) is
+  // rebuilt under a fresh generation.
+  EJitCoreId::setCurrentForTest(0);
+  owner.ownerShutdown();
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  for (uint32_t i = 0; i < kEJitSharedPoolSlots; ++i) {
+    EXPECT_EQ(state_->poolSplits[i].poolBase.loadRelaxed(), 0u);
+    EXPECT_EQ(state_->poolSplits[i].splitDoneMask.loadRelaxed(), 0u);
+  }
+  publish(owner, 1);
+
+  // The same peer core must split AGAIN for the rebuilt pool.
+  EJitCoreId::setCurrentForTest(3);
+  auto h2 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h2.bucketIndex);
+  EXPECT_EQ(fourK.splits.size(), 2u); // re-split after re-init
+  EXPECT_EQ(fourK.splits[1].second, 3u);
 }
 
 } // namespace

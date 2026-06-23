@@ -87,6 +87,11 @@ public:
   /// Atomic bitwise OR, returning the previous value (acq_rel).
   T fetchOr(T v) { return __atomic_fetch_or(&value_, v, __ATOMIC_ACQ_REL); }
 
+  /// Atomic bitwise AND, returning the previous value (acq_rel). Used to clear
+  /// individual bits of a shared mask (e.g. roll back a per-core "preparing"
+  /// bit) without a read-modify-write race.
+  T fetchAnd(T v) { return __atomic_fetch_and(&value_, v, __ATOMIC_ACQ_REL); }
+
 private:
   // mutable so const load helpers can form a non-const pointer for the builtin.
   mutable T value_;

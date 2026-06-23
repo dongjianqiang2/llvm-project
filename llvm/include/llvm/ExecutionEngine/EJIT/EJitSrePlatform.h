@@ -40,6 +40,18 @@ std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager();
 /// extent needed to seal every covered 4K page).
 bool prepareSreCodeForCurrentCore(const void *FnPtr);
 
+/// 4K page-seal mode, per-core: split the 2MiB-aligned pool
+/// [PoolBase, PoolBase + PoolSize) into 4KiB mappings in the CALLING core's
+/// translation context (split_2m_to_4k). A core must do this once per pool
+/// before it may seal any 4K page inside it. Returns true on success. A no-op
+/// returning false when 4K seal mode / the platform seal symbol is not built.
+bool ejitSreSplitPoolForCurrentCore(uintptr_t PoolBase, uint64_t PoolSize);
+
+/// 4K page-seal mode, per-core: seal one 4KiB page at \p PageVA to RX in the
+/// CALLING core's translation context (enable_ex(1, PageVA)). Returns true on
+/// success. A no-op returning false when the platform seal symbol is not built.
+bool ejitSreSealPageForCurrentCore(uintptr_t PageVA);
+
 } // namespace ejit
 } // namespace llvm
 

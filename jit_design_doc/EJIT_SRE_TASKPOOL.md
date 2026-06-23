@@ -1337,8 +1337,8 @@ Vyukov MPSC，单消费者=唯一 owner worker（§1.3 SC 前提不变）：
 - cache：固定槽 POD 表替代 `unordered_map`（共享内存不能放 STL）。
   - publish（仅 owner worker）：桶写锁 spin 到 `readers==0` → **锁内重校验逐实例 version**（commit gate，失配 `VersionMismatch` 不写）→ 同 identity 原地覆盖 / 空槽 / 桶满淘汰 → `storeRelease(state=Ready)` → **锁外**通过 owner 私有 release 回调释放旧/被淘汰 fnPtr（回调可能重入 code pool/ORC/分配器，绝不在临界区内运行）。
   - lookup：桶 `tryRead` → 扫 `Ready` 且 `generation`/identity/version 匹配 → 命中持读 token（调用方用完 `release_read`）。
-- **fnPtr 跨核可共享前提（构建开关 `EJIT_SRE_SHARED_CODE_POINTERS`，默认 OFF）：** 仅当平台保证①同一地址空间、②code pool 在所有核映射到**相同 VA**、③code pool 生命周期覆盖所有读者、④I/D-cache 跨核执行一致时才显式置 ON（`EJitCompileDriver` 据此调 `setCodeSharingEnabled`，**绝不自动猜测平台能力**）。即使地址相同，`enable_ex` 修改的执行权限也可能只属于调用核的 stage-1 映射，因此非 owner 核命中共享 fnPtr 后，必须先通过 `PrepareCodeCallback` 在**当前核**安装执行权限；成功后在 cache slot 的 64-bit `executableCoreMask` 中记录该核，后续同核命中不重复调用。准备失败时返回 `readyButNotShareable`（fallback，**不重新入队**），绝不返回不可执行指针。当前平台适配完整支持 legacy 2MiB seal：按 2MiB 对齐 fnPtr 后调用 `enable_ex(1, poolBase)`；4K seal 模式因裸 fnPtr 不携带完整代码范围而 clean reject，后续需要在 cache slot 增加代码范围后才能安全共享。owner 核读自己的 fnPtr 不重复准备。`codeSharingEnabled` 和 `executePrepareFailed` 在诊断中输出。
-- 大端/内存序：仅固定宽度标量按值访问，无 bitfield、无字节解析；所有发布/消费成对 acquire/release（§10.2）。共享状态 ABI version 因 request/dedup 变化升到 **v2**。
+- **fnPtr 跨核可共享前提（构建开关 `EJIT_SRE_SHARED_CODE_POINTERS`，默认 OFF）：** 仅当平台保证①同一地址空间、②code pool 在所有核映射到**相同 VA**、③code pool 生命周期覆盖所有读者、④I/D-cache 跨核执行一致时才显式置 ON（`EJitCompileDriver` 据此调 `setCodeSharingEnabled`，**绝不自动猜测平台能力**）。即使地址相同，`enable_ex` 修改的执行权限也可能只属于调用核的 stage-1 映射，因此非 owner 核命中共享 fnPtr 后，必须先在**当前核**安装执行权限；成功后在 cache slot 的 64-bit `executableCoreMask` 中记录该核（core id ≥ 64 无法 memo，每次命中重做），后续同核命中不重复调用。准备失败时返回 `readyButNotShareable`（fallback，**不重新入队**），绝不返回不可执行指针。两种 seal 模式均已实现：legacy **2MiB whole-pool seal** 按 2MiB 对齐 fnPtr 后调 `enable_ex(1, poolBase)`（`PrepareCodeCallback`，§6 行为不变）；**4K page seal** 复用 cache slot 携带的真实代码范围（v5），每核对 2MiB pool 先 `split_2m_to_4k` 一次、再对代码覆盖的每个 4K 页 `enable_ex`（详见 §11.11）。owner 核读自己的 fnPtr 不重复准备。`codeSharingEnabled` 和 `executePrepareFailed` 在诊断中输出。
+- 大端/内存序：仅固定宽度标量按值访问，无 bitfield、无字节解析；所有发布/消费成对 acquire/release（§10.2）。共享状态 ABI version 历经 v2（request/dedup）→ v3（registration fingerprint）→ v4（`executableCoreMask`）→ **v5（cache slot 携带可执行代码范围 + 每核每 pool 4K split 就绪表，§11.11）**。
 
 ### 11.7 worker 启动时序、栈与任务生命周期
 
@@ -1375,3 +1375,34 @@ host `EJITSharedTaskPoolTests`（单进程、注入式核 ID 确定性模拟多�
 **本轮明确记录的平台前提：** ① 各核必须看到**同一共享 section、同 VA 或正确共享映射**（否则 fnPtr/原子地址语义不成立）；② `SRE_TaskDelete` 必须是**真 join**（软停+等退），否则靠 generation-aware dedup 兜底但仍可能 worker 回调触碰已销毁 driver；③ `EJIT_SRE_SHARED_CODE_POINTERS=ON` 需同 VA + seal 完成 + I/D cache 一致。
 
 **尚需真实平台（aarch64_be 多核）验证：** ① 真实 `ejit_sre_current_core_id` 与跨核 owner election；② 共享 section 同 VA 映射 + cache coherent；③ `EJIT_SRE_SHARED_CODE_POINTERS=ON` 下跨核执行同一 fnPtr 的 I/D-cache 一致性与 seal 时序；④ host 单进程多 `EJit` 实例共享一份全局状态时，owner 用自身 ORC 为所有 producer 编译——真实平台为单一共享注册镜像，此语义才成立；⑤ 平台 `SRE_TaskCreate` 栈尺寸与 worker 长编译任务的匹配（实测栈峰值）；⑥ 平台 `SRE_TaskDelete` 必须是真 join。
+
+### 11.11 4K 页粒度跨核执行权限准备（per-core 4K shared code sealing）
+
+**为什么同 VA ≠ 同执行权限。** 共享 section 让所有核看到同一份 cache slot 与同一 `fnPtr` 数值；但 `enable_ex` 翻转的是**调用核自己 stage-1 页表**里那一页的执行权限。owner 在编译完成时 seal 了代码，只代表 **owner 核**那份映射可执行；非 owner 核若用各自的 stage-1 翻译上下文，命中同一 VA 仍可能是 NX。因此“能读到 fnPtr”与“本核能执行该地址”是两件事，后者必须**逐核**准备。
+
+**2MiB 物理大页 vs 4KiB 页表拆分。** 真实平台的代码 pool 是 2MiB 对齐的大页；`enable_ex(1, va)` 以 **4KiB 页**为单位翻权限，但前提是该 2MiB 区域已先被 `split_2m_to_4k(base, size)` 拆成 4K 映射。`split` 同样**只影响调用核**的 stage-1 页表。所以一个核要在某 pool 内 seal 任何 4K 页，必须先在本核对该 pool 调一次 `split`。
+
+**两种 peer prepare 流程（§6 的 2M 不变）。**
+- **2M whole-pool**（`EJIT_CODE_POOL_4K_SEAL=OFF`）：非 owner 命中 → 把 fnPtr 向下对齐到 2MiB pool base → `enable_ex(1, poolBase)` 一次 → 置 `executableCoreMask` 本核位。裸 fnPtr 即可，无需范围。
+- **4K page**（`EJIT_CODE_POOL_4K_SEAL=ON`）：非 owner 命中 → 从 slot 读真实范围 → 先 `ensurePoolSplitForCurrentCore`（本核对该 pool 只 split 一次）→ 对 `[alignDown(codeStart,4K), alignUp(codeStart+codeSize,4K))` 每个 4K 页 `enable_ex` → 全部成功才置 `executableCoreMask` 本核位。
+
+为遵守“平台调用期间不持跨核 bucket lock”，命中路径为**快照 → 释放读锁 → 准备（split/enable_ex）→ 重新取读锁并重校验 slot（state=Ready、generation、identity、fnPtr、version 全部不变）→ 命中**；准备期间 slot 被改写/换代则 clean fallback，绝不返回陈旧指针。owner 核命中自身代码直接返回（已 seal）。
+
+**slot 范围元数据来源（绝不估算，且只记可执行段）。** `EJitCompiledCodeInfo{fnPtr,codeStart,codeSize,poolBase,poolSize,poolId}`。owner 侧：`EJitCodePoolMemoryManager` 在布局 slab 时遍历 JITLink `BasicLayout` 的各 segment，仅对**权限含 `MemProt::Exec` 的段**（一次 allocation 可有多个、互不相邻的可执行段）记录其 `[Addr, Addr+ContentSize+ZeroFillSize)`；`finalize`（写入+重定位完成、4K 模式还逐页 seal 后）对**每个可执行段**调 `EJitCodePoolManager::recordFinalizedRange(segAddr,segSize)`。**绝不**把整块 slab（含 rodata/GOT/可写数据页）当作可执行范围记录——页对齐布局保证可执行段与数据段不共享同一 4K 页，故 peer seal 只翻可执行页，绝不把数据/GOT 页置 RX。`recordFinalizedRange` 对**完全相同**的 `[start,size)` 幂等去重（重试 finalize 不增表、不产生等价多匹配）；范围重叠（仅地址复用才可能，v1 不复用）时 `findRange` 以**追加顺序首个包含命中**确定性解析。`compileNow` 拿到 fnPtr 后经 `EJitOrcEngine::findCodeRange → EJitCodePoolManager::findRange` 用 fnPtr 反查所属可执行段（codeStart/codeSize）与所属 pool（poolBase/poolSize/poolId）。查不到（非 pool 地址 / 未记录 / 落在仅数据段 / size=0 / 溢出）→ 干净失败，slot 不带范围。
+
+**内存序链（范围发布→消费）。** owner 在 `cachePublish` 持 bucket **write lock**（`bucketWrite` 自旋到 `readers==0`）内写入全部范围标量（`codeStart/codeSize/poolBase/poolSize/poolId/rangeReserved`），**在 `fnPtr.storeRelease` 与 `state.storeRelease(Ready)` 之前**；peer 在 bucket **read lock** 内先 `state.loadAcquire()==Ready`、再 `fnPtr.loadAcquire()`，随后读范围标量。两处 acquire 与 owner 的 release 配对，故凡 release 之前写入的范围对观察到 `Ready` 的读者一致可见（大端平台亦然——全为固定宽度标量按值访问）。`poolSplits` 的 `splitDoneMask/splitPreparingMask/poolBase` 均经 acquire/release 原子（`fetchOr`/`fetchAnd`/`compareExchange` 为 ACQ_REL），done 位只在 `split` 真正成功后置位。
+
+**(re)init 必须清零全部 v5 字段。** owner 选举/重新初始化在同一份共享 blob 上逐字段重建（`initSharedStorage`），**每次都**清零：① 整张 `poolSplits[]`（`poolBase`/`splitDoneMask`/`splitPreparingMask`）——否则上一代的 stale done 位会让新一代的 peer **跳过** `split_2m_to_4k`，进而 seal 未拆分的页；② 每个 cache slot 的范围字段（`codeStart/codeSize/poolBase/poolSize/poolId/rangeReserved`）、`fnPtr`、`executableCoreMask`、`dims/versions`、`state=Empty`——杜绝跨代读到陈旧范围/陈旧可执行位/陈旧指针。`init` 每次递增 `generation`，重建后首个命中在各核重新 split+seal。
+
+
+**pool split readiness vs code executable readiness（两层 per-core 状态）。**
+- **pool split**：共享 `EJitSharedPoolSplit poolSplits[kEJitSharedPoolSlots=16]`，按 pool base **开放寻址**（同 base 各核探测序列一致，绝不产生重复条目）。每条 `splitDoneMask`/`splitPreparingMask` 为 64-bit per-core 位图。认领：done 位已置→直接复用；否则 `fetchOr` preparing 位——抢到的核调 `split`，成功置 done+清 preparing，失败清 preparing（允许重试）；同核并发时未抢到者**有界自旋**等 done，超时则 fallback。
+- **code executable**：复用每 slot 的 `executableCoreMask`（per-core per-代码范围）。4K 全页 seal 成功后置位；2M 单页 seal 成功后置位。同核后续命中靠该位短路，不重复 split/seal。
+
+**支持核数与容量边界。** memo 位图为 64-bit ⇒ core id `< kEJitSharedMaxMemoCores(64)` 可记忆；**core id ≥ 64** 无法 memo split/seal，语义为**每次命中重做** split+enable_ex（要求平台 `split`/`enable_ex` 幂等；不越界移位、无 UB）。pool readiness 表 16 槽 ⇒ 最多并行跟踪 16 个不同 2MiB pool；**表满**时命中未跟踪 pool 干净 fallback（不溢出、不重复条目）。
+
+**失败回退语义（全部不返回不可执行指针、不重新入队）。** 缺范围/size=0/溢出/代码越出 pool → fallback；`split` 失败 → fallback 且**不置 done**（可重试）、不 seal；中途任一页 `enable_ex` 失败 → fallback 且**不置 ready 位**（下次重做）；pool 表满 → fallback；准备期间 slot 换代/换指针 → fallback；`codeSharingEnabled=OFF` 或 core id 越界且平台不支持 → fallback。每次失败 `executePrepareFailed` 计数。
+
+**尚需真实平台（aarch64_be 多核）验证（4K 专项）：** ① `split_2m_to_4k` 与 `enable_ex` 确为 **per-core stage-1** 作用域、且对已拆分/已 RX 区域**幂等**（影响 core≥64 的重做与同 pool 多函数）；② seal 后跨核执行的 **I-cache / TLB 一致性**与 `enable_ex` 自带同步是否足够（当前约定不调 `__builtin___clear_cache`）；③ 真实 finalized allocation 的可执行段范围与 `recordFinalizedRange(base,size)` 记录一致（段是否含非可执行数据）；④ 多核同时首次 split 同 pool、以及同核抢占式并发命中下 readiness 表的活性（自旋上界是否够、是否需平台让出）；⑤ core id 与 `kEJitSharedMaxMemoCores`、pool 数与 `kEJitSharedPoolSlots` 的实际规模匹配。
+
+**4K 专项测试（`EJITSharedTaskPoolTests` + `EJITCodePoolTests`，mock split/seal/range，无真实线程）：** 单页 split 一次 seal 一页；跨两页非对齐 start/end seal 两页；同核重复命中不重做；同 pool 第二函数不重 split 但封自己页；两 peer 核各自 split+seal；owner 不 peer-prepare；split 失败 fallback+可重试；中途 seal 失败 fallback；缺范围/越出 pool fallback；pool 表满 fallback；core id≥64 每次重做且无 UB；准备期 slot 换指针/换代不返回旧指针；ABI v5 + `EJitSharedPoolSplit` POD + slot 范围字段大端按值语义；codeSharing OFF 下 4K 不触发任何平台调用；**(re)init 把整张 `poolSplits[]` 与每 slot 范围/`fnPtr`/`executableCoreMask`/`state` 全部清零（预写垃圾后选举仍归零）；上一代 split-done 位不跨代存活，重建后同一 peer 核对重建 pool 重新 split**。code pool 侧：`findRange` 命中记录范围/未记录 miss/非 pool 地址 reject/零长忽略/多 pool 不同 poolId；**幂等去重（同 `[start,size)` 多次记录不增表）；同 pool 两个不同可执行段各自解析；重叠范围以追加顺序确定性解析**。memory-manager 侧（`EJITCodePoolTests` 内 `EJitCodePoolMemMgr4K`）：**含 `__text(R+X)`+`__data(R+W)` 的图只 seal 可执行段那一页、不碰数据页，`findRange` 命中可执行指针、拒绝数据指针**。

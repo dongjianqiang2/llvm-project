@@ -310,6 +310,74 @@ bool EJitCodePoolManager::contains(const void *Ptr) const {
   return false;
 }
 
+void EJitCodePoolManager::recordFinalizedRange(const void *Base, size_t Size) {
+  if (!Base || Size == 0)
+    return;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  uintptr_t Start = addr(Base);
+  // Overflow guard: a range whose end wraps is malformed; ignore it (findRange
+  // would otherwise admit any pointer).
+  if (Start + Size < Start)
+    return;
+  // Idempotent record: re-finalizing the identical [Start, Size) extent (e.g. a
+  // retried finalize of the same allocation) must not grow the table or create
+  // duplicate, equally-valid matches. Pool addresses are never reused while a
+  // recorded range is live, so an exact-extent match is the only ambiguity we
+  // can see here; a *partial* overlap would imply address reuse and is treated
+  // as a distinct range (findRange resolves it deterministically: first match
+  // in append order wins).
+  for (const FinalizedRange &R : FinalizedRanges_)
+    if (R.start == Start && R.size == static_cast<uint64_t>(Size)) {
+      EJIT_CODE_POOL_TRACE("recordFinalizedRange.dup", Base,
+                           (unsigned long long)Size);
+      return;
+    }
+  FinalizedRanges_.push_back(
+      FinalizedRange{Start, static_cast<uint64_t>(Size)});
+  EJIT_CODE_POOL_TRACE("recordFinalizedRange", Base, (unsigned long long)Size);
+}
+
+bool EJitCodePoolManager::findRange(const void *Ptr,
+                                    EJitCompiledCodeInfo &Out) const {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  uintptr_t A = addr(Ptr);
+
+  // The pointer must resolve to a real, recorded executable allocation — never
+  // a guessed extent. Find the finalized range that contains it.
+  const FinalizedRange *Found = nullptr;
+  for (const FinalizedRange &R : FinalizedRanges_) {
+    if (A >= R.start && A < R.start + R.size) {
+      Found = &R;
+      break;
+    }
+  }
+  if (!Found)
+    return false;
+
+  // The allocation must also belong to a known pool (so a peer learns the
+  // 2MiB split granule). An address resolved outside the pools (e.g. a
+  // process/absolute symbol) is not handled.
+  for (size_t I = 0; I < Pools_.size(); ++I) {
+    const CodePool &P = *Pools_[I];
+    uintptr_t B = addr(P.base);
+    if (A >= B && A < B + P.size) {
+      Out.fnPtr = const_cast<void *>(Ptr);
+      Out.codeStart = Found->start;
+      Out.codeSize = Found->size;
+      Out.poolBase = B;
+      Out.poolSize = static_cast<uint64_t>(P.size);
+      Out.poolId = static_cast<uint32_t>(I);
+      Out.reserved = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
 EJitCodePoolManager::Stats EJitCodePoolManager::getStats() const {
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
@@ -318,6 +386,7 @@ EJitCodePoolManager::Stats EJitCodePoolManager::getStats() const {
   S.poolCount = Pools_.size();
   S.sealInvocations = SealInvocations_;
   S.splitInvocations = SplitInvocations_;
+  S.finalizedRangeCount = FinalizedRanges_.size();
   for (auto &P : Pools_) {
     S.reservedBytes += P->size;
     S.usedBytes += P->used;

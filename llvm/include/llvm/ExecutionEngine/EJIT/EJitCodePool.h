@@ -46,6 +46,7 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITCODEPOOL_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCODEPOOL_H
 
+#include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/Support/Error.h"
 #include <cstddef>
 #include <cstdint>
@@ -128,6 +129,8 @@ public:
                                 ///< (per 4K page in 4K seal mode)
     size_t splitInvocations = 0; ///< number of successful split_2m_to_4k calls
                                  ///< (one per pool in 4K seal mode)
+    size_t finalizedRangeCount = 0; ///< distinct executable ranges recorded
+                                    ///< (duplicates are not double-counted)
   };
 
   EJitCodePoolManager(Options Opts, RawAllocFn Alloc, SealFn Seal,
@@ -173,6 +176,23 @@ public:
   /// per whole 2MiB pool).
   bool usesPageSeal() const { return Opts_.fourKSeal; }
 
+  /// Record the executable extent of a finalized JITLink allocation
+  /// [Base, Base + Size). Called by the code-pool memory manager at finalize,
+  /// after all writes/relocations are complete (and, in 4K mode, after the
+  /// range has been sealed RX). The recorded range is the real, fully-prepared
+  /// executable allocation; findRange() later resolves a function pointer back
+  /// to it so a peer core can seal exactly the pages it covers. A zero-size
+  /// record is ignored.
+  void recordFinalizedRange(const void *Base, size_t Size);
+
+  /// Resolve a function pointer to the finalized executable allocation and pool
+  /// that contain it, filling \p Out (codeStart/codeSize from the recorded
+  /// allocation, poolBase/poolSize/poolId from the owning pool, fnPtr = Ptr).
+  /// Returns false (and leaves \p Out unspecified) when \p Ptr is not inside
+  /// any recorded finalized range owned by a known pool — the caller must then
+  /// take a clean fallback and never publish a shared pointer with no range.
+  bool findRange(const void *Ptr, EJitCompiledCodeInfo &Out) const;
+
   /// True if `Ptr` falls inside the usable range of any owned pool.
   bool contains(const void *Ptr) const;
 
@@ -195,6 +215,16 @@ private:
   CodePool *Active_ = nullptr;
   size_t SealInvocations_ = 0;
   size_t SplitInvocations_ = 0;
+
+  /// Finalized executable allocation extents (ordinary host bookkeeping; never
+  /// holds code bytes). Recorded at finalize, queried by findRange(). Append
+  /// only in v1 (pool memory is not reclaimed), so a pointer never resolves to
+  /// a stale range.
+  struct FinalizedRange {
+    uintptr_t start = 0;
+    uint64_t size = 0;
+  };
+  std::vector<FinalizedRange> FinalizedRanges_;
 
 #ifndef EJIT_FREESTANDING
   mutable std::mutex Mutex_;

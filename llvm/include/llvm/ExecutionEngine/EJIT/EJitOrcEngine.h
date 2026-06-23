@@ -75,6 +75,12 @@ public:
   /// zeroed snapshot if no pool is active. Available only with
   /// EJIT_SRE_CODE_POOL.
   EJitCodePoolManager::Stats getCodePoolStats() const;
+
+  /// Resolve a compiled function pointer to its real, finalized executable
+  /// range + owning code pool (for cross-core 4K execute-permission
+  /// preparation). Returns false if \p FnPtr is not pool-backed code with a
+  /// recorded finalized range. Available only with EJIT_SRE_CODE_POOL.
+  bool findCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
 #endif
 
 private:

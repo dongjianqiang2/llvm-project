@@ -347,4 +347,11 @@ EJitCodePoolManager::Stats EJitOrcEngine::getCodePoolStats() const {
     return P->codePool->getStats();
   return EJitCodePoolManager::Stats{};
 }
+
+bool EJitOrcEngine::findCodeRange(const void *FnPtr,
+                                  EJitCompiledCodeInfo &Out) const {
+  if (!P->codePool)
+    return false;
+  return P->codePool->findRange(FnPtr, Out);
+}
 #endif

@@ -128,4 +128,35 @@ bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {
 #endif
 }
 
+bool llvm::ejit::ejitSreSplitPoolForCurrentCore(uintptr_t PoolBase,
+                                                uint64_t PoolSize) {
+#if defined(EJIT_SRE_ENABLE_EX) && defined(EJIT_CODE_POOL_4K_SEAL)
+  if (PoolBase == 0 || PoolSize == 0)
+    return false;
+  // Per-core: this splits the 2MiB large page into 4K mappings in the calling
+  // core's stage-1 translation only. enable_ex per page follows.
+  return ejit_sre_split_2m_to_4k(static_cast<unsigned long long>(PoolBase),
+                                 static_cast<unsigned long long>(PoolSize)) ==
+         0;
+#else
+  (void)PoolBase;
+  (void)PoolSize;
+  return false;
+#endif
+}
+
+bool llvm::ejit::ejitSreSealPageForCurrentCore(uintptr_t PageVA) {
+#ifdef EJIT_SRE_ENABLE_EX
+  if (PageVA == 0)
+    return false;
+  // Per-core: flips the 4KiB page containing PageVA to RX in the calling core's
+  // translation context. enable_ex performs its own permission/cache sync, so
+  // no __builtin___clear_cache here.
+  return ejit_sre_enable_ex(1, static_cast<unsigned long long>(PageVA)) == 0;
+#else
+  (void)PageVA;
+  return false;
+#endif
+}
+
 #endif // EJIT_SRE_CODE_POOL

@@ -30,6 +30,7 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITSHAREDTASKPOOL_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSHAREDTASKPOOL_H
 
+#include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
 #include <cstdint>
@@ -88,7 +89,27 @@ public:
   using ReleaseCallback = void (*)(void *ctx, void *oldFn);
   /// Install execute permission for \p fnPtr in the calling core's translation
   /// context. Required before a non-owner core may consume a shared fnPtr.
+  /// Used for the legacy whole-2MiB-pool seal mode (the bare pointer is aligned
+  /// to its 2MiB pool base and that page is sealed). In 4K page-seal mode the
+  /// split + per-page seal callbacks below are used instead.
   using PrepareCodeCallback = bool (*)(void *ctx, const void *fnPtr);
+  /// Owner-private provider that resolves a freshly compiled function pointer
+  /// to its real, finalized executable range + owning pool (from the code-pool
+  /// allocation metadata). The owner records it into the shared cache slot at
+  /// publish so a peer core can later seal exactly the 4KiB pages the code
+  /// covers. Returns false when no range is known (clean fallback). Optional:
+  /// when unset, slots carry no range and 4K peer preparation cleanly fails.
+  using CodeRangeCallback = bool (*)(void *ctx, const void *fnPtr,
+                                     EJitCompiledCodeInfo *outInfo);
+  /// Per-core platform primitive: split a 2MiB-aligned [poolBase, poolBase +
+  /// poolSize) window into 4KiB mappings in the CALLING core's translation
+  /// context (split_2m_to_4k). Returns true on success. Used only in 4K
+  /// page-seal mode.
+  using SplitPoolCallback = bool (*)(void *ctx, uintptr_t poolBase,
+                                     uint64_t poolSize);
+  /// Per-core platform primitive: seal one 4KiB page at \p pageVA to RX in the
+  /// CALLING core's translation context (enable_ex). Returns true on success.
+  using SealPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
 
   /// Worker loop entry (provided by this class, run on the injected task).
   using WorkerEntryFn = void (*)(void *ctx);
@@ -151,6 +172,26 @@ public:
   void setPrepareCodeCallback(PrepareCodeCallback fn, void *ctx) {
     prepareCodeFn_ = fn;
     prepareCodeCtx_ = ctx;
+  }
+  /// Owner: provide the finalized code-range resolver (see CodeRangeCallback).
+  void setCodeRangeProvider(CodeRangeCallback fn, void *ctx) {
+    codeRangeFn_ = fn;
+    codeRangeCtx_ = ctx;
+  }
+  /// Select the execute-permission seal granularity for non-owner preparation:
+  /// true = 4KiB page seal (split the pool once per core, then enable_ex every
+  /// page the code covers), false = legacy whole-2MiB-pool seal. Must match the
+  /// owner's code pool. Default false.
+  void setSealMode(bool fourKSeal) { fourKSeal_ = fourKSeal; }
+  /// 4K mode: per-core split primitive (see SplitPoolCallback).
+  void setSplitPoolCallback(SplitPoolCallback fn, void *ctx) {
+    splitPoolFn_ = fn;
+    splitPoolCtx_ = ctx;
+  }
+  /// 4K mode: per-core per-page seal primitive (see SealPageCallback).
+  void setSealPageCallback(SealPageCallback fn, void *ctx) {
+    sealPageFn_ = fn;
+    sealPageCtx_ = ctx;
   }
   void setWorkerHooks(WorkerStartFn start, WorkerStopFn stop, void *ctx) {
     workerStart_ = start;
@@ -242,7 +283,40 @@ private:
                         uint32_t numDims) const;
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
-  EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr);
+  EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
+                                 const EJitCompiledCodeInfo *info);
+
+  /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
+  /// expensive per-core execute-permission preparation (split + enable_ex)
+  /// happens with NO bucket lock held, then is re-validated against the live
+  /// slot before the pointer is returned.
+  struct PeerCodeRange {
+    void *fn = nullptr;
+    uint32_t slotIndex = 0;
+    uint32_t bucket = 0;
+    uint32_t funcIndex = 0;
+    uint32_t numDims = 0;
+    uint32_t generation = 0;
+    EJitDimPair dims[4] = {};
+    uint32_t versions[4] = {};
+    uintptr_t codeStart = 0;
+    uint64_t codeSize = 0;
+    uintptr_t poolBase = 0;
+    uint64_t poolSize = 0;
+  };
+  /// Prepare execute permission for the current core over \p R's code range
+  /// WITHOUT holding any bucket lock. 2M mode delegates to prepareCodeFn_; 4K
+  /// mode ensures the pool is split for this core then seals every covered 4K
+  /// page. Returns true only when the calling core can legally execute the
+  /// code afterwards.
+  bool prepareExecForCurrentCore(const PeerCodeRange &R, uint32_t self);
+  /// Ensure the calling core has split \p poolBase once (4K mode). Coordinates
+  /// concurrent first-touch via the shared per-pool readiness table.
+  bool ensurePoolSplitForCurrentCore(uint32_t self, uintptr_t poolBase,
+                                     uint64_t poolSize);
+  /// Find (or open-address claim) the readiness entry for \p poolBase. Returns
+  /// nullptr when the fixed table is full (clean fallback).
+  EJitSharedPoolSplit *findOrClaimPoolSlot(uintptr_t poolBase);
 
   // switch/version helpers
   bool isInstanceEnabled(uint32_t dimType, uint32_t instanceId) const;
@@ -268,6 +342,13 @@ private:
   void *releaseCtx_ = nullptr;
   PrepareCodeCallback prepareCodeFn_ = nullptr;
   void *prepareCodeCtx_ = nullptr;
+  CodeRangeCallback codeRangeFn_ = nullptr;
+  void *codeRangeCtx_ = nullptr;
+  SplitPoolCallback splitPoolFn_ = nullptr;
+  void *splitPoolCtx_ = nullptr;
+  SealPageCallback sealPageFn_ = nullptr;
+  void *sealPageCtx_ = nullptr;
+  bool fourKSeal_ = false;
   WorkerStartFn workerStart_ = nullptr;
   WorkerStopFn workerStop_ = nullptr;
   void *workerCtx_ = nullptr;

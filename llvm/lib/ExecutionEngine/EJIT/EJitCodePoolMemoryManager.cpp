@@ -9,8 +9,10 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/Orc/Shared/AllocationActions.h"
+#include "llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h"
 #include "llvm/Support/MathExtras.h"
 #include <cstring>
+#include <vector>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -18,6 +20,17 @@ using namespace llvm::jitlink;
 
 using orc::ExecutorAddr;
 using WrapperFunctionCall = orc::shared::WrapperFunctionCall;
+
+namespace {
+/// One contiguous executable segment of a finalized allocation (the only kind
+/// of memory that needs execute permission). An allocation may contain several
+/// (non-contiguous) executable segments and any number of non-executable
+/// (read-only / writable / GOT) segments, which are NEVER sealed RX.
+struct ExecSegRange {
+  uintptr_t Addr = 0;
+  uint64_t Size = 0;
+};
+} // namespace
 
 /// Side record used as the FinalizedAlloc handle. Holds the dealloc actions and
 /// the pool-backed base address. Pool memory itself is not freed in v1.
@@ -30,8 +43,9 @@ class EJitCodePoolMemoryManager::InFlightAllocImpl
     : public JITLinkMemoryManager::InFlightAlloc {
 public:
   InFlightAllocImpl(EJitCodePoolMemoryManager &MM, LinkGraph &G, BasicLayout BL,
-                    void *Base, size_t Size)
-      : Pool(&MM.getPool()), G(&G), BL(std::move(BL)), Base(Base), Size(Size) {}
+                    void *Base, std::vector<ExecSegRange> ExecRanges)
+      : Pool(&MM.getPool()), G(&G), BL(std::move(BL)), Base(Base),
+        ExecRanges(std::move(ExecRanges)) {}
 
   void finalize(OnFinalizedFunction OnFinalized) override {
     // The content has already been written into working memory, which (for an
@@ -39,18 +53,28 @@ public:
     // applied before finalize() runs. Deliberately DO NOT apply any per-segment
     // memory protection here (no mprotect): the pool stays RW.
     //
-    // In 4K seal mode, seal exactly the 4KiB pages this allocation covers now
+    // In 4K seal mode, seal ONLY the executable segments' 4KiB pages now
     // that all writes/relocations are complete, before the function pointer can
     // be looked up. If any page fails to seal we must not hand back a callable
     // allocation. (Legacy whole-pool seal is driven later, at lookup, by the
     // engine.) We do not invalidate the instruction cache here either \u2014
     // enable_ex performs that sync on the target.
-    if (Pool->usesPageSeal() && Size > 0) {
-      if (auto Err = Pool->sealCodeRange(Base, Size)) {
-        OnFinalized(std::move(Err));
-        return;
-      }
+    if (Pool->usesPageSeal()) {
+      for (const ExecSegRange &R : ExecRanges)
+        if (auto Err = Pool->sealCodeRange(reinterpret_cast<void *>(R.Addr),
+                                           static_cast<size_t>(R.Size))) {
+          OnFinalized(std::move(Err));
+          return;
+        }
     }
+    // Record the real, fully-written/relocated (and, in 4K mode, RX-sealed)
+    // executable extent so a later function-pointer lookup can recover the
+    // exact [codeStart, codeSize) a peer core must seal in its own translation
+    // context. This is the only source of the cross-core code range — it is
+    // never estimated or recovered by scanning machine code.
+    for (const ExecSegRange &R : ExecRanges)
+      Pool->recordFinalizedRange(reinterpret_cast<void *>(R.Addr),
+                                 static_cast<size_t>(R.Size));
     runFinalizeActions(
         G->allocActions(),
         [this, OnFinalized = std::move(OnFinalized)](
@@ -82,7 +106,7 @@ private:
   LinkGraph *G;
   BasicLayout BL;
   void *Base;
-  size_t Size;
+  std::vector<ExecSegRange> ExecRanges;
 };
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(EJitCodePoolManager &Pool,
@@ -119,6 +143,12 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   auto NextFinalizeSegAddr =
       ExecutorAddr::fromPtr(SlabBytes + SegsSizes->StandardSegs);
 
+  // Collect the EXECUTABLE segments' assigned ranges as we lay out the slab.
+  // Only segments whose permission includes Exec need execute permission; the
+  // (page-aligned) layout guarantees an executable segment never shares a 4KiB
+  // page with a writable/read-only one, so sealing these ranges never flips a
+  // data/GOT page to RX. An allocation may have several executable segments.
+  std::vector<ExecSegRange> ExecRanges;
   for (auto &KV : BL.segments()) {
     auto &AG = KV.first;
     auto &Seg = KV.second;
@@ -129,6 +159,13 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
 
     Seg.WorkingMem = SegAddr.toPtr<char *>();
     Seg.Addr = SegAddr;
+    if ((AG.getMemProt() & orc::MemProt::Exec) != orc::MemProt::None) {
+      uint64_t SegSize =
+          static_cast<uint64_t>(Seg.ContentSize) + Seg.ZeroFillSize;
+      if (SegSize > 0)
+        ExecRanges.push_back(
+            {reinterpret_cast<uintptr_t>(SegAddr.toPtr<char *>()), SegSize});
+    }
     SegAddr += alignTo(Seg.ContentSize + Seg.ZeroFillSize, PageSize_);
   }
 
@@ -137,9 +174,8 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     return;
   }
 
-  OnAllocated(
-      std::make_unique<InFlightAllocImpl>(*this, G, std::move(BL), Slab,
-                                          static_cast<size_t>(Total)));
+  OnAllocated(std::make_unique<InFlightAllocImpl>(*this, G, std::move(BL), Slab,
+                                                  std::move(ExecRanges)));
 }
 
 void EJitCodePoolMemoryManager::deallocate(std::vector<FinalizedAlloc> Allocs,

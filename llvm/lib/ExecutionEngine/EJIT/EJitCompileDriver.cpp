@@ -38,11 +38,54 @@ bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
 }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-bool sharedPrepareCodeThunk(void * /*ctx*/, const void *fnPtr) {
+[[maybe_unused]] bool sharedPrepareCodeThunk(void * /*ctx*/,
+                                             const void *fnPtr) {
 #ifdef EJIT_SRE_CODE_POOL
   return prepareSreCodeForCurrentCore(fnPtr);
 #else
   (void)fnPtr;
+  return false;
+#endif
+}
+
+// Owner-private: resolve a freshly compiled pointer to its real, finalized
+// executable range + owning pool (from the code-pool allocation metadata) so it
+// can be published into the shared cache slot for cross-core 4K sealing.
+[[maybe_unused]] bool sharedCodeRangeThunk(void *ctx, const void *fnPtr,
+                                           EJitCompiledCodeInfo *outInfo) {
+#ifdef EJIT_SRE_CODE_POOL
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  EJitOrcEngine *eng = drv->getSyncEngine();
+  if (eng && outInfo)
+    return eng->findCodeRange(fnPtr, *outInfo);
+  return false;
+#else
+  (void)ctx;
+  (void)fnPtr;
+  (void)outInfo;
+  return false;
+#endif
+}
+
+// Per-core platform primitives wrapped so the shared taskpool core never names
+// an SRE symbol directly (spec §7). Both are no-ops returning false when the
+// code pool / seal support is not built.
+[[maybe_unused]] bool sharedSplitPoolThunk(void * /*ctx*/, uintptr_t poolBase,
+                                           uint64_t poolSize) {
+#ifdef EJIT_SRE_CODE_POOL
+  return ejitSreSplitPoolForCurrentCore(poolBase, poolSize);
+#else
+  (void)poolBase;
+  (void)poolSize;
+  return false;
+#endif
+}
+
+[[maybe_unused]] bool sharedSealPageThunk(void * /*ctx*/, uintptr_t pageVA) {
+#ifdef EJIT_SRE_CODE_POOL
+  return ejitSreSealPageForCurrentCore(pageVA);
+#else
+  (void)pageVA;
   return false;
 #endif
 }
@@ -104,9 +147,26 @@ EJitCompileDriver::EJitCompileDriver(const Config &config, EJitCache &cache,
   // EJIT_SRE_SHARED_CODE_POINTERS (default OFF -> clean fallback for non-owner
   // cores). Only the platform may assert same-VA + sealed + I/D-cache-coherent
   // code (spec §11); we never auto-detect it.
+#ifdef EJIT_SRE_CODE_POOL
+  // Owner side (always useful when a code pool exists): resolve each compiled
+  // pointer to its real executable range so the published cache slot carries
+  // the extent a peer must seal. Harmless when sharing is off (no peer reads
+  // it).
+  sharedPool_.setCodeRangeProvider(&sharedCodeRangeThunk, this);
+#endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
   sharedPool_.setCodeSharingEnabled(true);
+#ifdef EJIT_CODE_POOL_4K_SEAL
+  // 4K page seal: a non-owner core splits its 2MiB pool once and then seals
+  // exactly the 4KiB pages the code covers, in its own translation context.
+  sharedPool_.setSealMode(true);
+  sharedPool_.setSplitPoolCallback(&sharedSplitPoolThunk, this);
+  sharedPool_.setSealPageCallback(&sharedSealPageThunk, this);
+#else
+  // Legacy whole-2MiB-pool seal: align fnPtr to its pool base and enable_ex.
+  sharedPool_.setSealMode(false);
   sharedPool_.setPrepareCodeCallback(&sharedPrepareCodeThunk, this);
+#endif
 #else
   sharedPool_.setCodeSharingEnabled(false);
 #endif

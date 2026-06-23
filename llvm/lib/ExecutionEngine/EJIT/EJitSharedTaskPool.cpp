@@ -248,40 +248,217 @@ EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
     if (!fn)
       break;
 
-    // Execute permission is a per-core property on the target. The owner has
-    // already sealed the code before publishing it, but a peer may use a
-    // different stage-1 translation context. Prepare the mapping in the
-    // calling core before returning the shared pointer. A failure is a clean
-    // fallback, never an attempt to execute an unprepared address.
-    if (self != owner) {
-      const bool CanMemoize = self < 64;
-      const uint64_t CoreBit = CanMemoize ? (uint64_t{1} << self) : 0;
-      const bool AlreadyPrepared =
-          CanMemoize &&
-          ((Slot.executableCoreMask.loadAcquire() & CoreBit) != 0);
-      if (!AlreadyPrepared) {
-        if (!prepareCodeFn_ || !prepareCodeFn_(prepareCodeCtx_, fn)) {
-          state_->counters.executePrepareFailed.fetchAdd(1);
-          bucketReadRelease(B);
-          R.readyButNotShareable = true;
-          return R;
-        }
-        if (CanMemoize)
-          Slot.executableCoreMask.fetchOr(CoreBit);
-      }
+    // The owner already has execute permission (it sealed the code before
+    // publishing). Return directly while holding the read token.
+    if (self == owner) {
+      R.fnPtr = fn;
+      R.bucketIndex = bucket;
+      R.hasReadToken = true;
+      return R;
     }
-    R.fnPtr = fn;
-    R.bucketIndex = bucket;
+
+    // Non-owner: execute permission is a per-core property on the target. If
+    // this core has already prepared THIS slot's code (memoized bit), return
+    // immediately under the read lock — no platform call.
+    const bool CanMemoize = self < kEJitSharedMaxMemoCores;
+    const uint64_t CoreBit = CanMemoize ? (uint64_t{1} << self) : uint64_t{0};
+    if (CanMemoize && (Slot.executableCoreMask.loadAcquire() & CoreBit) != 0) {
+      R.fnPtr = fn;
+      R.bucketIndex = bucket;
+      R.hasReadToken = true;
+      return R;
+    }
+
+    // Not prepared yet. Snapshot the identity + the REAL code range, then DROP
+    // the bucket read lock: the per-core platform split/enable_ex calls
+    // (potentially slow) must never run while holding a cross-core bucket lock,
+    // or a concurrent owner publish (which spins for readers==0) would stall.
+    PeerCodeRange Snap;
+    Snap.fn = fn;
+    Snap.slotIndex = s;
+    Snap.bucket = bucket;
+    Snap.funcIndex = Slot.funcIndex;
+    Snap.numDims = Slot.numDims;
+    Snap.generation = Slot.generation;
+    for (uint32_t i = 0; i < Snap.numDims && i < 4; ++i) {
+      Snap.dims[i] = Slot.dims[i];
+      Snap.versions[i] = Slot.versions[i];
+    }
+    Snap.codeStart = Slot.codeStart;
+    Snap.codeSize = Slot.codeSize;
+    Snap.poolBase = Slot.poolBase;
+    Snap.poolSize = Slot.poolSize;
+    bucketReadRelease(B);
+
+    if (!prepareExecForCurrentCore(Snap, self)) {
+      state_->counters.executePrepareFailed.fetchAdd(1);
+      R.readyButNotShareable = true;
+      return R; // clean fallback: no token, no shared pointer handed back.
+    }
+
+    // Re-acquire the read lock and RE-VALIDATE the slot: a publish may have
+    // overwritten it (new code/generation) while we prepared. Only a slot that
+    // is still Ready, same generation + identity + fnPtr, with current
+    // versions, may hand back the prepared pointer; otherwise clean fallback so
+    // a replaced/stale pointer is never returned (spec §11 / §8).
+    if (!bucketTryRead(B)) {
+      R.readyButNotShareable = true;
+      return R;
+    }
+    EJitSharedCacheSlot &S2 = B.slots[Snap.slotIndex];
+    uint32_t curGen2 = state_->generation.loadAcquire();
+    bool stillValid =
+        S2.state.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+        S2.generation == curGen2 && S2.generation == Snap.generation &&
+        slotIdentityMatches(S2, Snap.funcIndex, Snap.dims, Snap.numDims) &&
+        reinterpret_cast<void *>(S2.fnPtr.loadAcquire()) == Snap.fn;
+    if (stillValid)
+      for (uint32_t i = 0; i < Snap.numDims; ++i)
+        if (S2.versions[i] !=
+            instanceVersion(Snap.dims[i].dimType, Snap.dims[i].instanceId)) {
+          stillValid = false;
+          break;
+        }
+    if (!stillValid) {
+      bucketReadRelease(B);
+      R.readyButNotShareable = true;
+      return R;
+    }
+    if (CanMemoize)
+      S2.executableCoreMask.fetchOr(CoreBit);
+    R.fnPtr = Snap.fn;
+    R.bucketIndex = Snap.bucket;
     R.hasReadToken = true;
-    return R; // token held; caller releases after using fnPtr.
+    return R; // token held (re-acquired); caller releases after using fnPtr.
   }
 
   bucketReadRelease(B);
   return R;
 }
 
+//===----------------------------------------------------------------------===//
+// Per-core execute-permission preparation (no bucket lock held). 2M mode seals
+// the whole 2MiB pool via prepareCodeFn_ (fnPtr-aligned); 4K mode splits the
+// pool once per core, then seals exactly the 4KiB pages the code covers. All
+// platform work goes through injected callbacks so this core never names a
+// platform symbol (spec §7).
+//===----------------------------------------------------------------------===//
+EJitSharedPoolSplit *EJitSharedTaskPool::findOrClaimPoolSlot(uintptr_t base) {
+  // Open addressing keyed by pool base. Every core probes the SAME slot
+  // sequence for a given base, so concurrent first-touch converges on one entry
+  // (never two entries for the same pool, which would let a core split twice).
+  uint32_t start = static_cast<uint32_t>((base / kEJitSharedSplitGranule) %
+                                         kEJitSharedPoolSlots);
+  for (uint32_t probe = 0; probe < kEJitSharedPoolSlots; ++probe) {
+    uint32_t i = (start + probe) % kEJitSharedPoolSlots;
+    EJitSharedPoolSplit &P = state_->poolSplits[i];
+    uintptr_t cur = P.poolBase.loadAcquire();
+    if (cur == base)
+      return &P;
+    if (cur == 0) {
+      uintptr_t expected = 0;
+      if (P.poolBase.compareExchange(expected, base))
+        return &P; // we claimed this empty entry for `base`.
+      // Lost the race: `expected` now holds the winner's base.
+      if (expected == base)
+        return &P; // another core claimed the same base here.
+      // Claimed by a different base — keep probing.
+    }
+    // Occupied by a different base — keep probing.
+  }
+  return nullptr; // table full: caller cleanly falls back.
+}
+
+bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
+                                                       uintptr_t poolBase,
+                                                       uint64_t poolSize) {
+  // Cores beyond the 64-bit memo width cannot record split state, so they must
+  // re-run the (idempotent) split on every hit rather than risk skipping it.
+  if (self >= kEJitSharedMaxMemoCores)
+    return splitPoolFn_ && splitPoolFn_(splitPoolCtx_, poolBase, poolSize);
+
+  EJitSharedPoolSplit *P = findOrClaimPoolSlot(poolBase);
+  if (!P)
+    return false; // table full -> clean fallback.
+
+  const uint64_t Bit = uint64_t{1} << self;
+  if ((P->splitDoneMask.loadAcquire() & Bit) != 0)
+    return true; // already split on this core.
+
+  // Claim the per-core "preparing" bit. fetchOr returns the previous mask.
+  const uint64_t Prev = P->splitPreparingMask.fetchOr(Bit);
+  if ((Prev & Bit) != 0) {
+    // Another context on THIS core is mid-split: wait (bounded) for it to
+    // publish done; if it clears preparing without done (it failed) or the
+    // bound elapses, cleanly fall back so we never proceed un-split.
+    constexpr uint32_t kSplitSpinBudget = 1u << 16;
+    for (uint32_t i = 0; i < kSplitSpinBudget; ++i) {
+      if ((P->splitDoneMask.loadAcquire() & Bit) != 0)
+        return true;
+      if ((P->splitPreparingMask.loadAcquire() & Bit) == 0)
+        break; // the other context finished without marking done -> it failed.
+      cpuRelax();
+    }
+    return (P->splitDoneMask.loadAcquire() & Bit) != 0;
+  }
+
+  // We own the split for this (pool, core). Run it, publishing done only on
+  // success; on failure roll back preparing so a later hit can retry.
+  bool ok = splitPoolFn_ && splitPoolFn_(splitPoolCtx_, poolBase, poolSize);
+  if (ok) {
+    P->splitDoneMask.fetchOr(Bit);
+    P->splitPreparingMask.fetchAnd(~Bit);
+    return true;
+  }
+  P->splitPreparingMask.fetchAnd(~Bit);
+  return false;
+}
+
+bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
+                                                   uint32_t self) {
+  if (!fourKSeal_) {
+    // Legacy whole-2MiB-pool seal: align fnPtr to its pool base and enable_ex
+    // that page. Range metadata is not required (spec §6 — 2M unchanged). When
+    // no prepare callback is wired the platform/host needs no per-core
+    // preparation (e.g. the single shared address space of the host
+    // simulation), so the pointer is already executable on this core.
+    if (!prepareCodeFn_)
+      return true;
+    return prepareCodeFn_(prepareCodeCtx_, R.fn);
+  }
+
+  // 4K page seal needs the real executable extent. A slot with no recorded
+  // range (or a malformed one) is a clean fallback, never a guessed seal.
+  if (R.codeStart == 0 || R.codeSize == 0 || R.poolBase == 0 || R.poolSize == 0)
+    return false;
+  if (R.codeStart + R.codeSize < R.codeStart) // code range overflow
+    return false;
+  if (R.poolBase + R.poolSize < R.poolBase) // pool range overflow
+    return false;
+  if (R.codeStart < R.poolBase ||
+      R.codeStart + R.codeSize > R.poolBase + R.poolSize)
+    return false; // code must lie wholly inside its pool.
+
+  // This core must have split the 2MiB pool exactly once before sealing pages.
+  if (!ensurePoolSplitForCurrentCore(self, R.poolBase, R.poolSize))
+    return false;
+
+  // Seal every 4KiB page the code overlaps: page-align start down, end up.
+  const uintptr_t Page = static_cast<uintptr_t>(kEJitSharedSealPage);
+  uintptr_t PageStart = R.codeStart & ~(Page - 1);
+  uintptr_t PageEnd =
+      (R.codeStart + static_cast<uintptr_t>(R.codeSize) + Page - 1) &
+      ~(Page - 1);
+  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page)
+    if (!sealPageFn_ || !sealPageFn_(sealPageCtx_, VA))
+      return false; // any page failure -> no callable pointer is returned.
+  return true;
+}
+
 EJitPublishStatus
-EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr) {
+EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
+                                 const EJitCompiledCodeInfo *info) {
   if (!fnPtr || req.numDims > 4)
     return EJitPublishStatus::InvalidParam;
   uint64_t key = hashIdentity(req.funcIndex, req.dims, req.numDims);
@@ -342,6 +519,25 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr) {
     target->dims[i] = req.dims[i];
     target->versions[i] = req.versions[i];
   }
+  // Copy the real executable range (v5) so a peer core can later seal exactly
+  // the 4KiB pages this code covers. Written BEFORE the fnPtr/state release
+  // below, so an acquiring reader that observes state==Ready also sees a
+  // consistent range. A null/empty info clears the range (0 codeSize), which a
+  // peer treats as "no range -> clean fallback".
+  if (info && info->codeSize != 0) {
+    target->codeStart = info->codeStart;
+    target->codeSize = info->codeSize;
+    target->poolBase = info->poolBase;
+    target->poolSize = info->poolSize;
+    target->poolId = info->poolId;
+  } else {
+    target->codeStart = 0;
+    target->codeSize = 0;
+    target->poolBase = 0;
+    target->poolSize = 0;
+    target->poolId = 0;
+  }
+  target->rangeReserved = 0;
   target->fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
   const uint32_t OwnerCore = state_->ownerCoreId.loadAcquire();
   target->executableCoreMask.storeRelease(
@@ -395,6 +591,16 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   st->counters.publishFailed.storeRelaxed(0);
   st->counters.instanceDisabled.storeRelaxed(0);
   st->counters.executePrepareFailed.storeRelaxed(0);
+  // Per-core, per-pool 4K split readiness (ABI v5). MUST be cleared on every
+  // (re)initialization: a stale splitDone bit from an earlier generation would
+  // otherwise make a peer skip split_2m_to_4k for a pool the new generation
+  // rebuilt, so it would seal pages that were never split. Cleared, the first
+  // post-reinit hit re-runs the split on each core.
+  for (uint32_t i = 0; i < kEJitSharedPoolSlots; ++i) {
+    st->poolSplits[i].poolBase.storeRelaxed(0);
+    st->poolSplits[i].splitDoneMask.storeRelaxed(0);
+    st->poolSplits[i].splitPreparingMask.storeRelaxed(0);
+  }
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
     st->buckets[b].writeFlag.storeRelaxed(0);
     st->buckets[b].readers.storeRelaxed(0);
@@ -405,9 +611,21 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       Slot.funcIndex = 0;
       Slot.numDims = 0;
       Slot.generation = 0;
+      for (uint32_t i = 0; i < 4; ++i) {
+        Slot.dims[i] = EJitDimPair{0, 0};
+        Slot.versions[i] = 0;
+      }
       Slot.identityHash = 0;
       Slot.fnPtr.storeRelaxed(0);
       Slot.executableCoreMask.storeRelaxed(0);
+      // Executable-range metadata (ABI v5): cleared so a stale range from an
+      // earlier generation can never be read back after a re-init.
+      Slot.codeStart = 0;
+      Slot.codeSize = 0;
+      Slot.poolBase = 0;
+      Slot.poolSize = 0;
+      Slot.poolId = 0;
+      Slot.rangeReserved = 0;
     }
   }
 }
@@ -631,6 +849,14 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     state_->counters.compileFailed.fetchAdd(1);
     return;
   }
+  // Resolve the real executable range for the freshly compiled pointer (from
+  // the owner's code-pool finalize metadata) so it can be published into the
+  // cache slot for cross-core 4K sealing. Optional: if no provider is wired or
+  // the pointer is not pool-backed, the slot carries no range and a 4K peer
+  // cleanly falls back.
+  EJitCompiledCodeInfo info{};
+  if (codeRangeFn_)
+    (void)codeRangeFn_(codeRangeCtx_, fn, &info);
   // Checkpoint 2: a generation bump OR a toggle during compilation invalidates
   // the result.
   if (req.generation != state_->generation.loadAcquire() ||
@@ -641,7 +867,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     state_->counters.compileFailed.fetchAdd(1);
     return;
   }
-  EJitPublishStatus PS = cachePublish(req, fn);
+  EJitPublishStatus PS = cachePublish(req, fn, &info);
   switch (PS) {
   case EJitPublishStatus::Published:
     state_->counters.asyncCompiles.fetchAdd(1);

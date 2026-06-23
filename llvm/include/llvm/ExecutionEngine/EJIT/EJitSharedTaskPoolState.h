@@ -63,6 +63,13 @@
 #ifndef EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS
 #define EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS 16u
 #endif
+// Number of distinct 2MiB code pools whose per-core 4K split state is tracked
+// in the shared blob. Open-addressed by pool base, so this is a hard capacity:
+// once full, a peer hitting an untracked pool cleanly falls back rather than
+// risking an unbounded table or a duplicate split entry.
+#ifndef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
+#define EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS 16u
+#endif
 
 namespace llvm {
 namespace ejit {
@@ -76,7 +83,15 @@ constexpr uint32_t kEJitSharedMaxFuncIndex = EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX;
 constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
+constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
+/// Execute-permission seal granularity (the platform's per-page enable_ex unit)
+/// and the large-page / split granularity. Fixed platform constants.
+constexpr uint64_t kEJitSharedSealPage = 4096u;
+constexpr uint64_t kEJitSharedSplitGranule =
+    static_cast<uint64_t>(2) * 1024 * 1024;
+/// Highest core id whose per-core readiness can be memoized in a 64-bit mask.
+constexpr uint32_t kEJitSharedMaxMemoCores = 64u;
 
 static_assert((kEJitSharedQueueSlots & (kEJitSharedQueueSlots - 1)) == 0 &&
                   kEJitSharedQueueSlots >= 2,
@@ -127,6 +142,19 @@ struct EJitSharedCacheSlot {
   /// code address. Core ids >= 64 are supported but cannot be memoized here,
   /// so they run the preparation callback on every hit.
   EJitAtomicU64 executableCoreMask;
+  /// Real executable extent of the published code, copied from the owner's
+  /// finalized code-pool allocation (v5). A non-owner core in 4K-seal mode
+  /// needs the full [codeStart, codeStart + codeSize) — not just fnPtr — to
+  /// split its pool and seal every 4KiB page the code covers in its own
+  /// translation context. All plain scalars, written under the bucket write
+  /// lock BEFORE state=Ready is released, so an acquiring reader sees them
+  /// consistently. 0 codeSize => no range metadata (peer cleanly falls back).
+  uintptr_t codeStart;    ///< start of the RX-sealed executable allocation
+  uint64_t codeSize;      ///< size in bytes of that allocation (0 = none)
+  uintptr_t poolBase;     ///< 2MiB pool base (split_2m_to_4k granule)
+  uint64_t poolSize;      ///< usable pool size
+  uint32_t poolId;        ///< stable pool index (diagnostic / convenience key)
+  uint32_t rangeReserved; ///< reserved, keeps the tail explicit (must be 0)
 };
 
 //===----------------------------------------------------------------------===//
@@ -147,6 +175,24 @@ struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {
 struct EJitSharedQueueCell {
   EJitAtomicU32 sequence;
   EJitCompileRequest data;
+};
+
+//===----------------------------------------------------------------------===//
+// EJitSharedPoolSplit: per-core readiness for ONE 2MiB code pool's 4K split.
+//
+// split_2m_to_4k and enable_ex affect only the CALLING core's stage-1 page
+// table, so each core must split a given pool exactly once before it may seal
+// any 4K page inside it. This POD tracks, per pool (open-addressed by base),
+// which cores have completed the split (splitDoneMask) and which are mid-split
+// (splitPreparingMask), so concurrent first-touch across cores and on one core
+// is coordinated without a lock and a successful split publishes ready only
+// after it actually succeeds. Core ids >= 64 cannot be memoized in the 64-bit
+// masks and re-run the split on every hit.
+//===----------------------------------------------------------------------===//
+struct EJitSharedPoolSplit {
+  EJitAtomicUPtr poolBase;          ///< claimed 2MiB pool base (0 = empty slot)
+  EJitAtomicU64 splitDoneMask;      ///< bit c => core c finished the split
+  EJitAtomicU64 splitPreparingMask; ///< bit c => core c is mid-split
 };
 
 //===----------------------------------------------------------------------===//
@@ -212,6 +258,11 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   //--- counters (own cache line)
   alignas(kEJitSharedCacheLine) EJitSharedCounters counters;
 
+  //--- per-core 4K split readiness, one entry per tracked 2MiB pool (own cache
+  //    line). Open-addressed by pool base; see EJitSharedPoolSplit.
+  alignas(kEJitSharedCacheLine)
+      EJitSharedPoolSplit poolSplits[kEJitSharedPoolSlots];
+
   //--- result cache (own cache line; each bucket is itself cache-line aligned)
   alignas(kEJitSharedCacheLine)
       EJitSharedCacheBucket buckets[kEJitSharedCacheBuckets];
@@ -254,6 +305,11 @@ static_assert(
         std::is_trivially_destructible<EJitSharedQueueCell>::value &&
         std::is_trivially_default_constructible<EJitSharedQueueCell>::value,
     "EJitSharedQueueCell must be POD-style");
+static_assert(
+    std::is_standard_layout<EJitSharedPoolSplit>::value &&
+        std::is_trivially_destructible<EJitSharedPoolSplit>::value &&
+        std::is_trivially_default_constructible<EJitSharedPoolSplit>::value,
+    "EJitSharedPoolSplit must be POD-style");
 static_assert(alignof(EJitSharedTaskPoolState) == kEJitSharedCacheLine,
               "EJitSharedTaskPoolState must be cache-line aligned");
 static_assert(

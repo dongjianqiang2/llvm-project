@@ -62,7 +62,11 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v3: the shared state carries an owner registration fingerprint (peers
 /// validate their funcIndex/dimType mapping against the owner before use).
 /// v4: each cache slot carries a per-core executable-permission ready mask.
-constexpr uint32_t kEJitSharedAbiVersion = 4u;
+/// v5: each cache slot carries the real executable code range
+/// (codeStart/codeSize/poolBase/poolSize/poolId) and the shared state gains a
+/// per-core, per-pool 4K split-readiness table, so a non-owner core in 4K-seal
+/// mode can split its pool once and seal exactly the pages the code covers.
+constexpr uint32_t kEJitSharedAbiVersion = 5u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

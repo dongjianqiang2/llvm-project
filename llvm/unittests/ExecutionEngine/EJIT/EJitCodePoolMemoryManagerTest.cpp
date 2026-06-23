@@ -215,6 +215,7 @@ constexpr size_t kFourKiB = static_cast<size_t>(4) * 1024;
 struct MockSre4K {
   std::vector<void *> Origs;
   std::vector<std::pair<uintptr_t, size_t>> Splits;
+  std::vector<uintptr_t> SealedPages;
   unsigned SplitRc = 0;
   size_t SealCalls = 0;
   int FailSealOnCall = -1; // 1-based seal index to fail; -1 = never
@@ -236,8 +237,9 @@ struct MockSre4K {
     Splits.push_back({reinterpret_cast<uintptr_t>(Base), Size});
     return SplitRc;
   }
-  unsigned seal(void *) {
+  unsigned seal(void *P) {
     ++SealCalls;
+    SealedPages.push_back(reinterpret_cast<uintptr_t>(P));
     if (FailSealOnCall > 0 && static_cast<int>(SealCalls) == FailSealOnCall)
       return SealFailRc;
     return 0;
@@ -269,6 +271,38 @@ std::unique_ptr<LinkGraph> makeBackedCodeGraph(const char *Buf, size_t Size,
   G->createContentBlock(Sec, ArrayRef<char>(Buf, Size),
                         orc::ExecutorAddr(VAddr), 16, 0);
   return G;
+}
+
+// A graph with one executable (__text, R+X) section and one writable
+// (__data, R+W) section. The two land in separate AllocGroups, so the memory
+// manager lays them out on different (page-aligned) segments.
+std::unique_ptr<LinkGraph> makeTextAndDataGraph(uint64_t TextVAddr,
+                                                uint64_t DataVAddr) {
+  auto G = std::make_unique<LinkGraph>(
+      "g", std::make_shared<orc::SymbolStringPool>(),
+      Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
+      getGenericEdgeKindName);
+  auto &Text =
+      G->createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
+  G->createContentBlock(Text, ArrayRef<char>(CodeBytes, 64),
+                        orc::ExecutorAddr(TextVAddr), 16, 0);
+  auto &Data =
+      G->createSection("__data", orc::MemProt::Read | orc::MemProt::Write);
+  G->createContentBlock(Data, ArrayRef<char>(CodeBytes, 64),
+                        orc::ExecutorAddr(DataVAddr), 16, 0);
+  return G;
+}
+
+// Returns the assigned address of the first block whose owning section's
+// executable bit matches WantExec (after allocate() has applied the layout).
+void *blockAddrByExec(LinkGraph &G, bool WantExec) {
+  for (Block *B : G.blocks()) {
+    bool IsExec = (B->getSection().getMemProt() & orc::MemProt::Exec) !=
+                  orc::MemProt::None;
+    if (IsExec == WantExec)
+      return B->getAddress().toPtr<void *>();
+  }
+  return nullptr;
 }
 
 } // namespace
@@ -371,4 +405,48 @@ TEST(EJitCodePoolMemMgr4K, SecondFunctionUsesFreshPageSamePool) {
   cantFail(MM.deallocate(std::move(FA2)));
 }
 
+// finalize() must seal ONLY the executable segment's page(s); a writable
+// (__data) segment that lands on its own page is never flipped to RX, and
+// findRange resolves only the executable pointer (the data pointer is rejected
+// because it was never recorded as code). This is the core guarantee that the
+// per-core peer seal touches exactly the executable extent, not the whole slab.
+TEST(EJitCodePoolMemMgr4K, SealsAndRecordsOnlyExecutableSegment) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
 
+  auto G = makeTextAndDataGraph(0x1000, 0x2000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrByExec(*G, /*WantExec=*/true);
+  void *DataAddr = blockAddrByExec(*G, /*WantExec=*/false);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(DataAddr, nullptr);
+  EXPECT_EQ(M.SealCalls, 0u); // allocate must not seal anything
+
+  auto pageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  ASSERT_NE(pageOf(TextAddr), pageOf(DataAddr)); // distinct pages
+
+  auto FA = cantFail(IFA->finalize());
+
+  // Exactly one page sealed, and it is the executable page (never the data
+  // one).
+  EXPECT_EQ(M.SealCalls, 1u);
+  ASSERT_EQ(M.SealedPages.size(), 1u);
+  EXPECT_EQ(M.SealedPages[0], pageOf(TextAddr));
+  for (uintptr_t Sealed : M.SealedPages)
+    EXPECT_NE(Sealed, pageOf(DataAddr));
+
+  // Only the executable pointer resolves to a recorded code range.
+  EJitCompiledCodeInfo Info{};
+  EXPECT_TRUE(Pool.findRange(TextAddr, Info));
+  EXPECT_EQ(Info.fnPtr, TextAddr);
+  EXPECT_FALSE(Pool.findRange(DataAddr, Info));
+
+  cantFail(MM.deallocate(std::move(FA)));
+}

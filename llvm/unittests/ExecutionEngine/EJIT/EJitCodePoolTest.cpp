@@ -532,4 +532,150 @@ TEST(EJitCodePool4K, SealAllWritablePoolsReturnsErrorIn4KMode) {
   EXPECT_EQ(Mgr.getStats().sealedCount, 0u);
 }
 
+//===----------------------------------------------------------------------===//
+// findRange: recover the real executable extent + owning pool for a pointer.
+// This is the cross-core 4K-seal range source — it must come from recorded
+// finalized allocations, never a guess.
+//===----------------------------------------------------------------------===//
 
+// A pointer anywhere inside a recorded finalized allocation resolves to its
+// real [codeStart, codeSize) and the owning pool's base/size/id.
+TEST(EJitCodePoolRange, FindRangeResolvesRecordedAllocation) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P = cantFail(Mgr.allocateCode(200, 64));
+  Mgr.recordFinalizedRange(P, 200);
+
+  EJitCompiledCodeInfo Info{};
+  void *Mid = reinterpret_cast<void *>(A(P) + 64); // interior pointer
+  ASSERT_TRUE(Mgr.findRange(Mid, Info));
+  EXPECT_EQ(Info.codeStart, A(P));
+  EXPECT_EQ(Info.codeSize, 200u);
+  EXPECT_EQ(Info.poolBase % kTwoMiB, 0u);
+  EXPECT_EQ(Info.poolSize, kTwoMiB);
+  EXPECT_GE(A(P), Info.poolBase);
+  EXPECT_LE(A(P) + 200, Info.poolBase + Info.poolSize);
+  EXPECT_EQ(Info.fnPtr, Mid);
+}
+
+// A pointer with NO recorded finalized range is a clean miss (no guessed extent
+// is fabricated from the pool alone).
+TEST(EJitCodePoolRange, FindRangeMissForUnrecordedPointer) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P = cantFail(Mgr.allocateCode(200, 64)); // allocated but NOT recorded
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Mgr.findRange(P, Info));
+}
+
+// A non-pool address (e.g. a stack pointer) is never mishandled.
+TEST(EJitCodePoolRange, FindRangeRejectsNonPoolAddress) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P = cantFail(Mgr.allocateCode(200, 64));
+  Mgr.recordFinalizedRange(P, 200);
+
+  int OnStack = 0;
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Mgr.findRange(&OnStack, Info));
+}
+
+// A zero-size finalized record is ignored (the pointer then misses).
+TEST(EJitCodePoolRange, RecordZeroSizeRangeIgnored) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P = cantFail(Mgr.allocateCode(200, 64));
+  Mgr.recordFinalizedRange(P, 0); // ignored
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Mgr.findRange(P, Info));
+}
+
+// Distinct pools yield distinct poolBase and poolId.
+TEST(EJitCodePoolRange, FindRangeReportsDistinctPoolIds) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P0 = cantFail(Mgr.allocateCode(kTwoMiB, 64)); // fills pool 0
+  Mgr.recordFinalizedRange(P0, 100);
+  void *P1 = cantFail(Mgr.allocateCode(100, 64)); // forces a new pool
+  Mgr.recordFinalizedRange(P1, 100);
+
+  EJitCompiledCodeInfo I0{}, I1{};
+  ASSERT_TRUE(Mgr.findRange(P0, I0));
+  ASSERT_TRUE(Mgr.findRange(P1, I1));
+  EXPECT_NE(I0.poolBase, I1.poolBase);
+  EXPECT_NE(I0.poolId, I1.poolId);
+}
+
+// Recording the IDENTICAL [start, size) extent more than once is idempotent:
+// the range table does not grow and findRange still resolves the pointer. This
+// guards against a retried finalize creating duplicate, equally-valid matches.
+TEST(EJitCodePoolRange, RecordDuplicateRangeIsIdempotent) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P = cantFail(Mgr.allocateCode(200, 64));
+  Mgr.recordFinalizedRange(P, 200);
+  Mgr.recordFinalizedRange(P, 200); // exact duplicate
+  Mgr.recordFinalizedRange(P, 200); // and again
+
+  EXPECT_EQ(Mgr.getStats().finalizedRangeCount, 1u);
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Mgr.findRange(P, Info));
+  EXPECT_EQ(Info.codeStart, A(P));
+  EXPECT_EQ(Info.codeSize, 200u);
+}
+
+// Two distinct, non-overlapping executable extents in the SAME pool are both
+// recorded and each pointer resolves to its own range.
+TEST(EJitCodePoolRange, TwoDistinctRangesResolveIndependently) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P0 = cantFail(Mgr.allocateCode(128, 64));
+  void *P1 = cantFail(Mgr.allocateCode(256, 64));
+  Mgr.recordFinalizedRange(P0, 128);
+  Mgr.recordFinalizedRange(P1, 256);
+
+  EXPECT_EQ(Mgr.getStats().finalizedRangeCount, 2u);
+
+  EJitCompiledCodeInfo I0{}, I1{};
+  ASSERT_TRUE(Mgr.findRange(P0, I0));
+  ASSERT_TRUE(Mgr.findRange(P1, I1));
+  EXPECT_EQ(I0.codeStart, A(P0));
+  EXPECT_EQ(I0.codeSize, 128u);
+  EXPECT_EQ(I1.codeStart, A(P1));
+  EXPECT_EQ(I1.codeSize, 256u);
+  // Same pool, so identical pool identity.
+  EXPECT_EQ(I0.poolBase, I1.poolBase);
+  EXPECT_EQ(I0.poolId, I1.poolId);
+}
+
+// findRange is deterministic when ranges overlap (an invariant violation that
+// could only arise from address reuse): the first recorded range that contains
+// the pointer wins, in append order. No UB, no ambiguity.
+TEST(EJitCodePoolRange, OverlappingRangesResolveDeterministically) {
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, fourKOpts());
+
+  void *P = cantFail(Mgr.allocateCode(400, 64));
+  // Two overlapping extents covering the same interior pointer, recorded in a
+  // fixed order. (In practice pool addresses are never reused while live, so
+  // this cannot occur; the test pins the deterministic resolution anyway.)
+  Mgr.recordFinalizedRange(P, 400);                                  // first
+  Mgr.recordFinalizedRange(reinterpret_cast<void *>(A(P) + 64), 64); // second
+
+  EXPECT_EQ(Mgr.getStats().finalizedRangeCount, 2u);
+
+  EJitCompiledCodeInfo Info{};
+  void *Mid = reinterpret_cast<void *>(A(P) + 100);
+  ASSERT_TRUE(Mgr.findRange(Mid, Info));
+  // First (append order) containing range wins.
+  EXPECT_EQ(Info.codeStart, A(P));
+  EXPECT_EQ(Info.codeSize, 400u);
+}
