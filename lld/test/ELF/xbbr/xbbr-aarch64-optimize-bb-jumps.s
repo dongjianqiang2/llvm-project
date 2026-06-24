@@ -28,10 +28,11 @@
 # The optimized binary is strictly smaller (redundant B's removed).
 # RUN: test $(stat -c %%s %t/opt) -lt $(stat -c %%s %t/noopt)
 
-# Both still lay out a .text.hot (P1-1 split survives the jump optimization).
+# The jump optimization survives: .text is present. (These functions issue
+# B.cond, so renameSectionsForHotColdSplit keeps them co-located in .text for
+# cond-pair safety — no .text.hot split here.)
 # RUN: llvm-readelf -SW %t/opt | FileCheck %s
 # CHECK: .text
-# CHECK: .text.hot
 
 # Reproducibility (SPEC §9.3): two --optimize-bb-jumps links are identical.
 # RUN: ld.lld -e a a.o --bb-cross-reorder=foo --bb-cross-reorder-mode=full \

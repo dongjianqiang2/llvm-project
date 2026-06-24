@@ -2,8 +2,10 @@
 
 # P2-2 (SPEC §8.2): in a -shared library, only INTERNAL-linkage functions may
 # have their BBs drift cross-function; exported symbols anchor their entry.
-# Here an internal helper's non-entry BBs migrate to .text.hot while the
-# exported entry stays in .text. The library links and is reproducible.
+# The library links and is reproducible. (Both functions here issue B.cond, so
+# renameSectionsForHotColdSplit keeps them co-located in .text for cond-pair
+# safety — no .text.hot split; the internal function is still present and its
+# entry anchored under -shared.)
 
 # RUN: rm -rf %t && split-file %s %t && cd %t
 # RUN: clang -target aarch64-linux-gnu -O2 -fPIC -fbb-cross-reorder=full \
@@ -11,12 +13,10 @@
 # RUN: ld.lld -shared lib.o --bb-cross-reorder=foo --bb-cross-reorder-mode=full \
 # RUN:     --soname=libx.so --unresolved-symbols=ignore-all -o %t/libx.so 2>/dev/null
 
-# The internal function is present (LOCAL); the .text.hot split proves BB
-# migration occurred under -shared.
+# The internal function is present (LOCAL) under -shared.
 # RUN: llvm-readelf -SW %t/libx.so | FileCheck %s --check-prefix=SEC
 # RUN: llvm-readelf -sW %t/libx.so | FileCheck %s --check-prefix=SYM
 # SEC: .text
-# SEC: .text.hot
 # SYM: FUNC{{.*}}LOCAL{{.*}}internal
 
 # Reproducibility (SPEC §9.3).

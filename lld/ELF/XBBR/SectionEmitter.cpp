@@ -259,8 +259,28 @@ void renameSectionsForHotColdSplit(Ctx &ctx, XBBRGraph &graph) {
     // mode-aware for cold: SPEC §4 — in partial, cold BBs stay at their
     // original function position (Original); only full migrates them to
     // .text.unlikely. Entry/anchor BBs are always Original.
+    //
+    // NOTE: this runs in the Driver, before scanRelocations (Writer) parses
+    // section relocs, so node.CondInvolved/CondSafeToMigrate are NOT computed
+    // yet here (markRangeAnchors finds no relocs). We therefore cannot make
+    // this routing cond-pair-aware the way collectMigratableBBs does. Two
+    // reloc-independent guards keep unthunkable cond pairs co-located (same
+    // output section) so they never overflow:
+    //  - HasCondBranch: detected from raw reloc TYPES at graph-build time
+    //    (collectFromFile). A function with any unthunkable cond branch keeps
+    //    ALL its BBs in their compiler-assigned section (Original) — never
+    //    routed to .text.hot/.text.unlikely — so the cond pair stays together.
+    //    This is over-conservative (an all-hot cond component that P1-3 would
+    //    let migrate to .text.hot stays in .text instead), traded for
+    //    correctness: the projection can't see output-section routing, so a
+    //    split pair would slip past Stage 4 and fatal at verifyCondRangesFinal.
+    //  - the section-name guard below: never re-route a section the compiler
+    //    already hot/cold-split (.text.hot.* / .text.unlikely.*), which would
+    //    double-prefix it (.text.hot.unlikely.*) and re-split the function.
     BBPlacement::Section target;
-    if (node.isAnchor())
+    if (graph.funcs()[node.Func].HasCondBranch)
+      target = BBPlacement::Section::Original;
+    else if (node.isAnchor())
       target = BBPlacement::Section::Original;
     else if (node.isCold() && !partialMode)
       target = BBPlacement::Section::Unlikely;
@@ -277,6 +297,15 @@ void renameSectionsForHotColdSplit(Ctx &ctx, XBBRGraph &graph) {
     StringRef nm = sec->name;
     if (!nm.starts_with(".text."))
       continue; // not a per-BB text section; leave untouched
+    // Respect the compiler's own hot/cold split: a section already named
+    // .text.hot.<rest> / .text.unlikely.<rest> (MachineFunctionSplitter, under
+    // -fbasic-block-sections=all) is part of a function the compiler already
+    // placed. Re-prefixing would double-name it (.text.hot.unlikely.<rest>) and
+    // re-route a hot BB out of a compiler-split function, splitting its
+    // unthunkable cond pairs across output sections. Leave it where the
+    // compiler put it.
+    if (nm.starts_with(".text.hot.") || nm.starts_with(".text.unlikely."))
+      continue;
     StringRef rest = nm.substr(strlen(".text."));
     StringRef prefix = target == BBPlacement::Section::Hot ? ".text.hot."
                                                            : ".text.unlikely.";

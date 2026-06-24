@@ -231,19 +231,31 @@ OverRangeInfo collectOverRangeEdges(const XBBRGraph &graph,
 /// validation of a tighter margin.
 constexpr double COND_RANGE_SAFETY_MARGIN = 0.9;
 
-/// P1-3: collect the set of CondSafeToMigrate nodes that must be pinned because
-/// an AArch64 B.cond (CONDBR19 ±1 MiB) / TBZ (TSTBR14 ±32 KiB) branch they
-/// issue is unsafe WITHIN .text.hot. (Cross-section unsafety is handled upfront
-/// by CondSafeToMigrate in markRangeAnchors; this only sees all-hot-component
-/// BBs that migrated into .text.hot.) Two cases:
-///  - within-.text.hot over-range: both endpoints CondSafeToMigrate and still
-///    in the projected layout, but their distance exceeds range×margin → pin
-///    BOTH (revert to .text, co-located, original in-range distance). Pinning
-///    one alone would make the branch cross-section (still unsafe).
-///  - partner already pinned (cascade): the target is CondSafeToMigrate but no
-///    longer in the layout (pinned this loop) → the branch is now cross-section
-///    → pin the source too. Monotonic; converges.
-/// `condRange` (0 = real ISA range) is the hidden testing knob.
+/// P1-3: collect the set of CondInvolved nodes that must be pinned because an
+/// AArch64 B.cond (CONDBR19 ±1 MiB) / TBZ (TSTBR14 ±32 KiB) branch they issue
+/// is unsafe in the projected layout. Cross-section unsafety between a hot and
+/// a non-hot partner is handled upfront by CondSafeToMigrate in
+/// markRangeAnchors; this scan sees the pairs that remain — both the
+/// CondSafeToMigrate pairs that migrated together into .text.hot AND the
+/// !CondSafeToMigrate (layout-anchor) pairs that never migrated but whose
+/// ExtTSP cluster-order placement separated them. Two cases:
+///  - within-layout over-range: both endpoints still in the projected layout,
+///    but their distance exceeds range×margin → pin BOTH. Pinning drops both
+///    from the cluster order (revert to .text + input-order placement), which
+///    restores their original intra-function relative position (co-located) and
+///    the in-range branch. Pinning one alone would leave the other in cluster
+///    order, still far away.
+///  - partner already pinned (cascade): the target is no longer in the layout
+///    (pinned this loop) → the branch is now cross-section → pin the source.
+///    Monotonic; converges.
+/// The scan runs over EVERY CondInvolved BB, not just CondSafeToMigrate ones:
+/// a !CondSafeToMigrate pair (e.g. a function-entry TBZ whose component
+/// includes the non-hot entry block) is anchored and never migrated, yet the
+/// ExtTSP layout still places it in cluster order with cross-function
+/// migratable BBs filled between the partners — so its unthunkable branch can
+/// overflow even though neither endpoint migrated. Such a pair is invisible to
+/// a CondSafeToMigrate-only scan. `condRange` (0 = real ISA range) is the
+/// hidden testing knob.
 std::unordered_set<uint32_t>
 collectCondPins(const XBBRGraph &graph,
                 const DenseMap<uint32_t, ProjEntry> &proj, uint64_t condRange) {
@@ -255,8 +267,8 @@ collectCondPins(const XBBRGraph &graph,
       secToNode.try_emplace(nodes[I].BBSection, I);
 
   for (uint32_t I = 0; I < nodes.size(); ++I) {
-    if (!nodes[I].CondSafeToMigrate)
-      continue; // only all-hot-component cond BBs migrate into .text.hot
+    if (!nodes[I].CondInvolved)
+      continue; // not a cond-branch BB (source or target)
     InputSectionBase *src = nodes[I].BBSection;
     if (!src)
       continue;
@@ -275,26 +287,28 @@ collectCondPins(const XBBRGraph &graph,
       if (pX == proj.end())
         continue; // I already pinned — handled via its partner
       auto pY = proj.find(J);
-      if (nodes[J].CondSafeToMigrate && pY != proj.end()) {
-        // Both still in .text.hot → within-section range check.
-        int64_t branchSite =
-            static_cast<int64_t>(pX->second.StartOff) + r.offset;
-        int64_t target =
-            static_cast<int64_t>(pY->second.StartOff) + r.addend;
-        int64_t diff = target - branchSite;
-        uint64_t dist = diff >= 0 ? static_cast<uint64_t>(diff)
-                                  : static_cast<uint64_t>(-diff);
-        uint64_t r2 = condRange ? condRange
-                                : (r.type == ELF::R_AARCH64_TSTBR14 ? 0x8000
-                                                                    : 0x100000);
-        if (dist > static_cast<uint64_t>(r2 * COND_RANGE_SAFETY_MARGIN)) {
-          pins.insert(I);
-          pins.insert(J);
-        }
-      } else {
-        // Partner not in .text.hot (pinned this loop, or — defensively — not
-        // CondSafeToMigrate): branch is now cross-section → pin the source.
+      if (pY == proj.end()) {
+        // Partner already pinned/off-map → the branch is now cross-section.
+        // Pin the source too so both revert to input-order placement together.
         pins.insert(I);
+        continue;
+      }
+      // Both endpoints still in the projected layout → within-layout range
+      // check. Covers CondSafeToMigrate pairs within .text.hot AND anchored
+      // (!CondSafeToMigrate) pairs separated by cross-function fill.
+      int64_t branchSite =
+          static_cast<int64_t>(pX->second.StartOff) + r.offset;
+      int64_t target =
+          static_cast<int64_t>(pY->second.StartOff) + r.addend;
+      int64_t diff = target - branchSite;
+      uint64_t dist = diff >= 0 ? static_cast<uint64_t>(diff)
+                                : static_cast<uint64_t>(-diff);
+      uint64_t r2 = condRange ? condRange
+                              : (r.type == ELF::R_AARCH64_TSTBR14 ? 0x8000
+                                                                  : 0x100000);
+      if (dist > static_cast<uint64_t>(r2 * COND_RANGE_SAFETY_MARGIN)) {
+        pins.insert(I);
+        pins.insert(J); // pin BOTH — co-locate to restore in-range distance
       }
     }
   }
@@ -358,7 +372,10 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
   // again. Monotonic growth guarantees convergence (PLAN §4.3 Stage 4).
   std::unordered_set<uint32_t> pinned;
   uint32_t fallbackCount = 0;
-  const uint32_t maxIters = totalMigratable + 1; // safety net
+  // Safety net: every non-converging iteration pins at least one new BB, and
+  // cond pins may include §5.3 anchors (non-migratable), so the bound is the
+  // total node count, not just migratable BBs.
+  const uint32_t maxIters = allNodes.size() + 1;
   const uint32_t fallbackLimit = std::max(
       static_cast<uint32_t>(GLOBAL_FALLBACK_THRESHOLD * totalMigratable), 1u);
 
@@ -379,18 +396,27 @@ bool runConstraintSolver(Ctx &ctx, XBBRGraph &graph,
       proj = buildGlobalProjected(graph, result.ClusterBBOrders,
                                   ctx.arg.xbbrMaxAlign);
 
-    // P1-3: hard-pin cond branches that would overflow within .text.hot (or
-    // whose partner was just pinned — cascade). No budget gate: these MUST be
-    // pinned (unthunkable). Pinning reverts a BB to its .text function slot.
+    // P1-3: hard-pin cond branches that would overflow in the projected layout
+    // (or whose partner was just pinned — cascade). No budget gate: these MUST
+    // be pinned (unthunkable). Pinning drops a BB from the cluster order and
+    // reverts its section name to .text, so it falls to input-order placement
+    // co-located with its partner (original intra-function distance, in range).
     if (condCheckActive) {
       std::unordered_set<uint32_t> condPins =
           collectCondPins(graph, proj, ctx.arg.xbbrCondRangeForTesting);
       if (!condPins.empty()) {
         for (uint32_t p : condPins) {
-          if (pinned.count(p) || allNodes[p].isAnchor())
+          if (pinned.count(p))
             continue;
           pinned.insert(p);
-          ++fallbackCount;
+          // A §5.3 anchor (e.g. the function entry issuing an entry-guard TBZ)
+          // was never migratable, so it must NOT count against the optional
+          // migrate-budget degrade threshold — but it still has to be dropped
+          // from the cluster order so it lands next to its partner. Only BBs
+          // that were actually migratable (CondSafeToMigrate) count as reverted
+          // migratable BBs.
+          if (allNodes[p].CondSafeToMigrate)
+            ++fallbackCount;
           revertBBSectionToText(ctx, allNodes[p]);
           for (auto &order : result.ClusterBBOrders) {
             auto it = std::remove(order.begin(), order.end(), p);

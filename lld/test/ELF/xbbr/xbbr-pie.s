@@ -3,7 +3,9 @@
 # P2-2: XBBR under PIE (-fPIE -pie). Physical BB reordering must preserve
 # PC-relative correctness — lld resolves PC-rel relocs normally after XBBR
 # moves the per-BB InputSections, and the thunk loop handles over-range B/BL.
-# The link succeeds, produces the .text.hot split (P1-1), and is reproducible.
+# The link succeeds and is reproducible. (These functions issue B.cond, so
+# renameSectionsForHotColdSplit keeps them co-located in .text for cond-pair
+# safety — no .text.hot split here, unlike cond-free functions.)
 
 # RUN: rm -rf %t && split-file %s %t && cd %t
 # RUN: clang -target aarch64-linux-gnu -O2 -fPIE -fbb-cross-reorder=full \
@@ -12,7 +14,6 @@
 # RUN:     --unresolved-symbols=ignore-all -o %t/pie 2>/dev/null
 # RUN: llvm-readelf -SW %t/pie | FileCheck %s
 # CHECK: .text
-# CHECK: .text.hot
 
 # Reproducibility (SPEC §9.3).
 # RUN: ld.lld -pie -e a a.o --bb-cross-reorder=foo --bb-cross-reorder-mode=full \

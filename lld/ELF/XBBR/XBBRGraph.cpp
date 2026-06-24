@@ -48,6 +48,47 @@ using llvm::support::endian::read16le;
 
 namespace {
 
+/// Unthunkable short-range conditional-branch relocation types. lld cannot
+/// range-extend these (only B/BL-class branches are thunkable), so a BB that
+/// issues one — and its target — must stay co-located or the branch overflows
+/// at link time. Shared by markRangeAnchors (cond-edge partnership) and the
+/// per-function HasCondBranch detection (used by renameSectionsForHotColdSplit
+/// to keep cond-branch functions out of .text.hot).
+static bool isUnthunkableCondRelocType(uint16_t emachine, uint32_t type) {
+  switch (emachine) {
+  case ELF::EM_AARCH64:
+    return type == ELF::R_AARCH64_CONDBR19 || type == ELF::R_AARCH64_TSTBR14;
+  case ELF::EM_ARM:
+    return type == ELF::R_ARM_THM_JUMP11 || type == ELF::R_ARM_THM_JUMP8;
+  default:
+    return false;
+  }
+}
+
+template <class RelTy>
+static bool relocRangeHasCondBranch(Relocs<RelTy> rels, uint16_t emachine) {
+  for (const RelTy &rel : rels)
+    if (isUnthunkableCondRelocType(emachine, rel.getType(false)))
+      return true;
+  return false;
+}
+
+/// True if `Sec` has any unthunkable conditional-branch relocation, read from
+/// the raw ELF reloc data (relsOrRelas). Used at graph-build time, when the
+/// section's scanned `relocations` vector is still empty (scanRelocations runs
+/// later, in the Writer).
+template <class ELFT>
+static bool sectionHasCondBranch(InputSectionBase *Sec, uint16_t emachine) {
+  if (!Sec || Sec->relSecIdx == 0)
+    return false;
+  const RelsOrRelas<ELFT> rels = Sec->template relsOrRelas<ELFT>();
+  if (rels.areRelocsCrel())
+    return relocRangeHasCondBranch(rels.crels, emachine);
+  if (rels.areRelocsRel())
+    return relocRangeHasCondBranch(rels.rels, emachine);
+  return relocRangeHasCondBranch(rels.relas, emachine);
+}
+
 /// XBBR attr-section format (PLAN §9.3, version 0x02).
 ///
 /// One section may concatenate the attr blocks for multiple functions
@@ -439,6 +480,19 @@ bool XBBRGraph::collectFromFile(Ctx &ctx, ObjFile<ELFT> *OF) {
       }
       FI.NumNodes = static_cast<uint32_t>(Nodes.size()) - FI.FirstNode;
 
+      // Detect unthunkable conditional branches from raw reloc TYPES. Section
+      // relocs are not scanned yet at this point (scanRelocations runs later,
+      // in the Writer), so read the raw ELF reloc data. A function with any
+      // such branch must keep all its BBs co-located (same output section) or
+      // the branch overflows; renameSectionsForHotColdSplit uses HasCondBranch
+      // to skip .text.hot routing for the whole function.
+      for (const FlatEntry &Fe : Flat) {
+        if (sectionHasCondBranch<ELFT>(Fe.Sec, ctx.arg.emachine)) {
+          FI.HasCondBranch = true;
+          break;
+        }
+      }
+
       // EH gate (Phase 1b): gate if the function has a landing pad or owns an
       // LSDA (`.gcc_except_table.<fn>`). The entry section name is
       // `.text.<fn>` under -ffunction-sections (implied), so the function
@@ -581,16 +635,6 @@ void XBBRGraph::markRangeAnchors(Ctx &ctx) {
   //            pinned here; A32 B<cond> shares R_ARM_JUMP24 with unconditional
   //            B, which lld thunks uniformly.
   //   x86: Jcc is rel32 (±2 GiB, never overflows in practice) — no-op.
-  auto isUnthunkableCondBr = [](uint16_t emachine, uint32_t type) -> bool {
-    switch (emachine) {
-    case ELF::EM_AARCH64:
-      return type == ELF::R_AARCH64_CONDBR19 || type == ELF::R_AARCH64_TSTBR14;
-    case ELF::EM_ARM:
-      return type == ELF::R_ARM_THM_JUMP11 || type == ELF::R_ARM_THM_JUMP8;
-    default:
-      return false;
-    }
-  };
   if (ctx.arg.emachine != ELF::EM_AARCH64 && ctx.arg.emachine != ELF::EM_ARM)
     return;
 
@@ -615,7 +659,7 @@ void XBBRGraph::markRangeAnchors(Ctx &ctx) {
     if (!src)
       continue;
     for (const Relocation &r : src->relocs()) {
-      if (!isUnthunkableCondBr(ctx.arg.emachine, r.type))
+      if (!isUnthunkableCondRelocType(ctx.arg.emachine, r.type))
         continue;
       // This BB issues an unthunkable conditional branch — pin it (can't thunk).
       Nodes[I].CondInvolved = true;

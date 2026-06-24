@@ -3,9 +3,10 @@
 # P2-2 (SPEC §8.2): in a -shared library, exported symbols strictly anchor
 # their function entry block (ABI §5.1: function symbol = entry BB). XBBR
 # anchors every entry block (isEntry), so an exported function's symbol
-# resolves to its entry in .text while its non-entry BBs may migrate to
-# .text.hot. PLT/GOT for external symbols are unaffected (they reference
-# symbols, not BBs). The link succeeds and is reproducible.
+# resolves to its entry. PLT/GOT for external symbols are unaffected (they
+# reference symbols, not BBs). The link succeeds and is reproducible.
+# (exported issues B.cond, so renameSectionsForHotColdSplit keeps it co-located
+# in .text for cond-pair safety — no .text.hot split here.)
 
 # RUN: rm -rf %t && split-file %s %t && cd %t
 # RUN: clang -target aarch64-linux-gnu -O2 -fPIC -fbb-cross-reorder=full \
@@ -13,12 +14,11 @@
 # RUN: ld.lld -shared lib.o --bb-cross-reorder=foo --bb-cross-reorder-mode=full \
 # RUN:     --soname=libx.so --unresolved-symbols=ignore-all -o %t/libx.so 2>/dev/null
 
-# exported is a GLOBAL FUNC (visible to dynamic linker); the lib has a .text.hot
-# split (non-entry BBs migrated). PLT/GOT for @ext resolved (link succeeded).
+# exported is a GLOBAL FUNC (visible to dynamic linker); PLT/GOT for @ext
+# resolved (link succeeded).
 # RUN: llvm-readelf -SW %t/libx.so | FileCheck %s --check-prefix=SEC
 # RUN: llvm-readelf -sW %t/libx.so | FileCheck %s --check-prefix=SYM
 # SEC: .text
-# SEC: .text.hot
 # SYM: FUNC{{.*}}GLOBAL{{.*}}exported
 
 # Reproducibility (SPEC §9.3).

@@ -71,6 +71,15 @@ struct FuncInfo {
   /// gated so its call_site table stays valid. Set when the function has a
   /// `.gcc_except_table.<fn>` section or any landing-pad BB.
   bool IsEHGated = false;
+  /// True if any BB of this function issues an unthunkable conditional branch
+  /// (AArch64 B.cond/TBZ; ARM Thumb-1 B<cond>/B narrow). Such branches cannot
+  /// be range-extended by lld, so their source+target must stay co-located
+  /// (same output section) or the branch overflows. Detected from raw reloc
+  /// TYPES at graph-build time (collectFromFile), because section relocs are
+  /// not yet parsed when renameSectionsForHotColdSplit runs in the Driver —
+  /// the rename uses this to keep the whole function out of .text.hot so the
+  /// cond pair is never split across output sections.
+  bool HasCondBranch = false;
 
   llvm::ArrayRef<XBBRNode> nodes(const std::vector<XBBRNode> &all) const {
     return llvm::ArrayRef<XBBRNode>(&all[FirstNode], NumNodes);
