@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EmbeddedJIT 架构汇报图</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #172554;
+      --card: #ffffff;
+      --ink: #0f172a;
+      --muted: #64748b;
+      --line: #94a3b8;
+      --blue: #2563eb;
+      --cyan: #0891b2;
+      --green: #16a34a;
+      --amber: #d97706;
+      --red: #dc2626;
+      --purple: #7c3aed;
+      --slate: #475569;
+      --soft-blue: #eff6ff;
+      --soft-cyan: #ecfeff;
+      --soft-green: #f0fdf4;
+      --soft-amber: #fffbeb;
+      --soft-purple: #f5f3ff;
+      --soft-red: #fef2f2;
+      --shadow: 0 18px 50px rgba(15, 23, 42, 0.16);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at 12% 8%, rgba(37, 99, 235, 0.20), transparent 28%),
+                  radial-gradient(circle at 88% 0%, rgba(124, 58, 237, 0.18), transparent 30%),
+                  linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+      min-height: 100vh;
+      padding: 28px;
+    }
+
+    .page {
+      max-width: 1720px;
+      margin: 0 auto;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    header {
+      color: #fff;
+      background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 58%, #7c3aed 100%);
+      padding: 28px 36px 24px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    header::after {
+      content: "";
+      position: absolute;
+      width: 520px;
+      height: 520px;
+      border-radius: 50%;
+      right: -160px;
+      top: -250px;
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .eyebrow {
+      font-size: 13px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      opacity: 0.82;
+      margin-bottom: 10px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 40px;
+      line-height: 1.18;
+      font-weight: 760;
+      position: relative;
+      z-index: 1;
+    }
+
+    .subtitle {
+      margin: 12px 0 0;
+      max-width: 1120px;
+      color: rgba(255, 255, 255, 0.86);
+      font-size: 17px;
+      line-height: 1.65;
+      position: relative;
+      z-index: 1;
+    }
+
+    .content {
+      padding: 26px 30px 32px;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(140px, 1fr));
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 10px 12px;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 999px;
+      color: #334155;
+      font-size: 13px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+    }
+
+    .dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      flex: 0 0 11px;
+    }
+
+    .blue { background: var(--blue); }
+    .cyan { background: var(--cyan); }
+    .green { background: var(--green); }
+    .amber { background: var(--amber); }
+    .purple { background: var(--purple); }
+    .red { background: var(--red); }
+
+    .diagram {
+      display: grid;
+      grid-template-columns: 1.04fr 0.90fr 1.12fr;
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .lane {
+      background: rgba(248, 250, 252, 0.88);
+      border: 1px solid #dbe3ef;
+      border-radius: 24px;
+      padding: 16px;
+      position: relative;
+      min-height: 860px;
+    }
+
+    .lane h2 {
+      margin: 0 0 14px;
+      padding: 12px 14px;
+      color: #fff;
+      border-radius: 16px;
+      font-size: 19px;
+      letter-spacing: 0.02em;
+    }
+
+    .lane.aot h2 { background: linear-gradient(135deg, var(--blue), #1e40af); }
+    .lane.bridge h2 { background: linear-gradient(135deg, var(--purple), #5b21b6); }
+    .lane.runtime h2 { background: linear-gradient(135deg, var(--green), #166534); }
+
+    .card {
+      background: var(--card);
+      border: 1px solid #e2e8f0;
+      border-radius: var(--radius);
+      padding: 13px 14px;
+      margin-bottom: 12px;
+      box-shadow: 0 9px 24px rgba(15, 23, 42, 0.07);
+      position: relative;
+    }
+
+    .card h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      color: #0f172a;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 50px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+    }
+
+    .tag.blue { background: var(--blue); }
+    .tag.cyan { background: var(--cyan); }
+    .tag.green { background: var(--green); }
+    .tag.amber { background: var(--amber); }
+    .tag.purple { background: var(--purple); }
+    .tag.red { background: var(--red); }
+    .tag.slate { background: var(--slate); }
+
+    .card p, .card li {
+      color: #475569;
+      font-size: 13px;
+      line-height: 1.58;
+    }
+
+    .card p { margin: 0; }
+    ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .pipeline {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 6px;
+    }
+
+    .step {
+      border-radius: 14px;
+      padding: 10px 11px;
+      border: 1px solid #dbeafe;
+      background: var(--soft-blue);
+      position: relative;
+    }
+
+    .step:not(:last-child)::after {
+      content: "↓";
+      position: absolute;
+      left: 50%;
+      bottom: -18px;
+      transform: translateX(-50%);
+      color: #2563eb;
+      font-weight: 800;
+      z-index: 2;
+    }
+
+    .step strong {
+      display: block;
+      color: #1e3a8a;
+      font-size: 13px;
+      margin-bottom: 3px;
+    }
+
+    .step span {
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.45;
+      display: block;
+    }
+
+    .bridge .step { background: var(--soft-purple); border-color: #ddd6fe; }
+    .bridge .step strong { color: #5b21b6; }
+    .bridge .step:not(:last-child)::after { color: var(--purple); }
+
+    .runtime .step { background: var(--soft-green); border-color: #bbf7d0; }
+    .runtime .step strong { color: #166534; }
+    .runtime .step:not(:last-child)::after { color: var(--green); }
+
+    .horizontal-flow {
+      grid-column: 1 / -1;
+      margin: 18px 0;
+      display: grid;
+      grid-template-columns: 1fr 88px 1fr 88px 1fr;
+      align-items: center;
+      gap: 0;
+    }
+
+    .flow-box {
+      background: #fff;
+      border: 2px solid #cbd5e1;
+      border-radius: 18px;
+      padding: 15px 18px;
+      min-height: 102px;
+      box-shadow: 0 9px 24px rgba(15, 23, 42, 0.07);
+    }
+
+    .flow-box h3 {
+      margin: 0 0 7px;
+      font-size: 16px;
+      color: #0f172a;
+    }
+
+    .flow-box p {
+      margin: 0;
+      font-size: 13px;
+      color: #475569;
+      line-height: 1.55;
+    }
+
+    .arrow {
+      color: #334155;
+      text-align: center;
+      font-size: 38px;
+      font-weight: 900;
+    }
+
+    .runtime-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .mini {
+      padding: 10px;
+      border-radius: 14px;
+      border: 1px solid #dbe3ef;
+      background: #f8fafc;
+    }
+
+    .mini strong {
+      display: block;
+      color: #0f172a;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+
+    .mini span {
+      color: #64748b;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .taskpool {
+      grid-column: 1 / -1;
+      margin-top: 18px;
+      background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+      border: 1px solid #dbe3ef;
+      border-radius: 24px;
+      padding: 18px;
+      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+    }
+
+    .taskpool h2 {
+      margin: 0 0 14px;
+      font-size: 20px;
+      color: #0f172a;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .taskpool-grid {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .tp-node {
+      min-height: 118px;
+      border-radius: 16px;
+      padding: 11px;
+      border: 1px solid #e2e8f0;
+      background: #fff;
+      position: relative;
+    }
+
+    .tp-node:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      top: 46%;
+      right: -14px;
+      color: #64748b;
+      font-weight: 900;
+      z-index: 3;
+    }
+
+    .tp-node strong {
+      display: block;
+      font-size: 13px;
+      color: #0f172a;
+      margin-bottom: 5px;
+    }
+
+    .tp-node span {
+      display: block;
+      font-size: 12px;
+      color: #64748b;
+      line-height: 1.45;
+    }
+
+    .notes {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 14px;
+      margin-top: 18px;
+    }
+
+    .note {
+      background: #fff;
+      border-left: 5px solid var(--blue);
+      border-radius: 16px;
+      padding: 13px 14px;
+      box-shadow: 0 9px 24px rgba(15, 23, 42, 0.06);
+    }
+
+    .note:nth-child(2) { border-left-color: var(--green); }
+    .note:nth-child(3) { border-left-color: var(--amber); }
+
+    .note h3 {
+      margin: 0 0 6px;
+      font-size: 15px;
+    }
+
+    .note p {
+      margin: 0;
+      color: #475569;
+      line-height: 1.55;
+      font-size: 13px;
+    }
+
+    .footer {
+      margin-top: 18px;
+      padding: 14px 18px;
+      color: #64748b;
+      font-size: 12px;
+      border-top: 1px solid #e2e8f0;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+      color: #1d4ed8;
+      background: #eff6ff;
+      padding: 1px 5px;
+      border-radius: 6px;
+    }
+
+    @media print {
+      body { padding: 0; background: #fff; }
+      .page { border-radius: 0; box-shadow: none; }
+      .card, .flow-box, .taskpool, .note { break-inside: avoid; box-shadow: none; }
+    }
+
+    @media (max-width: 1200px) {
+      .diagram { grid-template-columns: 1fr; }
+      .lane { min-height: auto; }
+      .legend { grid-template-columns: repeat(3, 1fr); }
+      .horizontal-flow { grid-template-columns: 1fr; gap: 10px; }
+      .arrow { transform: rotate(90deg); }
+      .taskpool-grid { grid-template-columns: repeat(2, 1fr); }
+      .tp-node::after { display: none; }
+      .notes { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div class="eyebrow">EmbeddedJIT / Time-Window Constant Specialization</div>
+      <h1>EmbeddedJIT 架构汇报图</h1>
+      <p class="subtitle">
+        面向嵌入式场景的运行时特化系统：AOT 阶段提取可 JIT 的函数闭包与元数据，运行时根据时间窗状态和维度参数生成特化版本；JIT 失败或未命中时自动回退到原始 AOT 路径。
+      </p>
+    </header>
+
+    <section class="content">
+      <div class="legend" aria-label="图例">
+        <div class="legend-item"><span class="dot blue"></span>AOT 编译期 Pass</div>
+        <div class="legend-item"><span class="dot purple"></span>ELF / 注册桥接</div>
+        <div class="legend-item"><span class="dot green"></span>运行时 JIT 引擎</div>
+        <div class="legend-item"><span class="dot cyan"></span>Metadata / 常量来源</div>
+        <div class="legend-item"><span class="dot amber"></span>异步 Taskpool</div>
+        <div class="legend-item"><span class="dot red"></span>Fallback / 失效</div>
+      </div>
+
+      <div class="diagram">
+        <section class="lane aot">
+          <h2>① AOT 编译期：从源码到可特化 Bitcode</h2>
+
+          <div class="card">
+            <h3><span class="tag cyan">Clang</span> 源码属性与 IR Metadata</h3>
+            <ul>
+              <li><code>ejit_entry</code> 标识 JIT 优化入口函数。</li>
+              <li><code>ejit_may_const</code> 标识时间窗内可视为常量的字段。</li>
+              <li><code>ejit_period</code> / <code>ejit_period_arr</code> 描述时间窗对象。</li>
+              <li><code>ejit_period_arr_ind</code> 作为特化维度参数。</li>
+              <li><code>ejit_period_lc</code> 插入激活 / 失活生命周期钩子。</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <h3><span class="tag blue">Pass</span> AOT Pipeline</h3>
+            <div class="pipeline">
+              <div class="step">
+                <strong>PASS1: EJitRegisterBitcodePass（早期）</strong>
+                <span>在标准优化前提取 <code>ejit_entry</code> 传递闭包；预优化 bitcode；恢复 <code>!ejit.may_const</code>；嵌入 ELF section。</span>
+              </div>
+              <div class="step">
+                <strong>PASS2: EJitRegisterPeriodPass</strong>
+                <span>生成时间窗变量 / 数组注册代码，为运行时 PeriodArrayRegistry 提供基地址与元信息。</span>
+              </div>
+              <div class="step">
+                <strong>PASS3: EJitWrapperGenPass</strong>
+                <span>在原 <code>ejit_entry</code> 函数入口插入单函数 Wrapper：先查 JIT 版本，失败则走原 AOT 逻辑。</span>
+              </div>
+              <div class="step">
+                <strong>PASS4: EJitPeriodHandlerPass</strong>
+                <span>在生命周期函数中插入 <code>activate</code> / <code>deactivate</code>；失活时触发版本切换与缓存失效。</span>
+              </div>
+              <div class="step">
+                <strong>标准 O2/O3 + 目标代码生成</strong>
+                <span>优化 Wrapper 和 fallback 路径，最终输出目标代码、注册构造函数和内嵌 bitcode。</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3><span class="tag slate">原则</span> 安全保守特化</h3>
+            <p>Metadata 是软注解：丢失只会减少特化机会，不影响正确性。可常量化字段同时保存在 load metadata 和 GV-level 偏移列表中，形成双保险。</p>
+          </div>
+        </section>
+
+        <section class="lane bridge">
+          <h2>② 产物与初始化桥接：ELF Section → Runtime Store</h2>
+
+          <div class="card">
+            <h3><span class="tag purple">ELF</span> 编译产物</h3>
+            <ul>
+              <li><code>.ejit.bitcode</code>：每个入口函数对应的闭包 bitcode。</li>
+              <li><code>llvm.global_ctors</code>：自动注册 bitcode、period array、外部符号。</li>
+              <li>Wrapper 生成 <code>funcIdx + dims</code> 形式的紧凑 cache key。</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <h3><span class="tag purple">Init</span> 注册生命周期</h3>
+            <div class="pipeline">
+              <div class="step">
+                <strong>OS / Loader 装载 ELF</strong>
+                <span>bitcode section、全局变量、构造函数随目标程序一起进入内存。</span>
+              </div>
+              <div class="step">
+                <strong>构造函数自动注册</strong>
+                <span><code>ejit_auto_register()</code> 写入 <code>EJitRegistrationStore</code> 单例，暂存 bitcode、period、symbol 信息。</span>
+              </div>
+              <div class="step">
+                <strong>应用调用 <code>ejit_init()</code></strong>
+                <span>消费 RegistrationStore，创建 Engine、Cache、CompileDriver、PeriodRegistry、BitcodeTracker。</span>
+              </div>
+              <div class="step">
+                <strong>裸核替代路径</strong>
+                <span>可使用静态注册表 <code>__ejit_registry_bitcode[]</code> / <code>__ejit_registry_period[]</code>，避免依赖动态构造。</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3><span class="tag red">Fallback</span> 运行时安全边界</h3>
+            <p>Wrapper 的默认行为是“先尝试 JIT，任何未命中、未激活、编译中、内存不足或失效情况都返回 NULL 并执行 AOT 原逻辑”，保证功能正确性优先。</p>
+          </div>
+        </section>
+
+        <section class="lane runtime">
+          <h2>③ Runtime：缓存、编译、链接与执行</h2>
+
+          <div class="card">
+            <h3><span class="tag green">Runtime</span> 核心对象</h3>
+            <div class="runtime-grid">
+              <div class="mini"><strong>EJitCompileDriver</strong><span>统一 <code>getOrCompile</code> 入口：查 cache、触发同步 / 异步编译。</span></div>
+              <div class="mini"><strong>EJitCache</strong><span>按 <code>funcIdx + dims + version</code> 保存函数指针，支持 LRU 与失效。</span></div>
+              <div class="mini"><strong>EJitOrcEngine</strong><span>封装 LLJIT、IRTransformLayer、JITLink 以及符号解析。</span></div>
+              <div class="mini"><strong>EJitJITLinkMemoryManager</strong><span>固定 slab / code pool，写入后切换 RX，适配嵌入式内存约束。</span></div>
+              <div class="mini"><strong>PeriodArrayRegistry</strong><span>维护时间窗对象基地址、激活状态和版本。</span></div>
+              <div class="mini"><strong>BitcodeTracker</strong><span>按函数索引定位可 JIT 的 bitcode 闭包。</span></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3><span class="tag green">JIT</span> IR Transform Pipeline</h3>
+            <div class="pipeline">
+              <div class="step">
+                <strong>参数维度替换</strong>
+                <span>将 <code>ejit_period_arr_ind</code> 参数替换为实际 dim 值，形成实例化 IR。</span>
+              </div>
+              <div class="step">
+                <strong>InstCombine + Inline</strong>
+                <span>清理 IR，并通过内联让 may_const load 的 GEP 链可回溯到根全局变量。</span>
+              </div>
+              <div class="step">
+                <strong>PASS6: EJitStructFieldPass</strong>
+                <span>确认时间窗 active 后读取字段值，把可常量化 load 替换为 LLVM 常量。</span>
+              </div>
+              <div class="step">
+                <strong>标准优化 L1/L2/L3</strong>
+                <span>SCCP、DCE、CFG Simplify、Loop 优化等基于常量折叠生成高效特化代码。</span>
+              </div>
+              <div class="step">
+                <strong>JITLink + Code Pool</strong>
+                <span>链接、重定位、分配代码内存，返回可执行函数指针并写入 cache。</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3><span class="tag red">Invalidate</span> 时间窗失效</h3>
+            <p><code>ejit_deactivate</code> 切换实例 version；cache entry、in-flight task、queue task 均按 version 校验，自然 miss，旧代码不再被新请求命中。</p>
+          </div>
+        </section>
+
+        <section class="horizontal-flow" aria-label="端到端数据流">
+          <div class="flow-box" style="border-color:#93c5fd;">
+            <h3>源码标注</h3>
+            <p>开发者用 <code>ejit_entry</code>、<code>ejit_may_const</code>、<code>ejit_period*</code> 描述“哪些函数可特化、哪些数据在时间窗内稳定”。</p>
+          </div>
+          <div class="arrow">→</div>
+          <div class="flow-box" style="border-color:#c4b5fd;">
+            <h3>AOT 产物</h3>
+            <p>Pass 提取 bitcode 闭包，生成 Wrapper 和注册代码；最终程序同时包含 AOT fallback 与 JIT 所需 IR。</p>
+          </div>
+          <div class="arrow">→</div>
+          <div class="flow-box" style="border-color:#86efac;">
+            <h3>运行时特化</h3>
+            <p>Wrapper 根据维度和时间窗状态请求 JIT；命中 cache 直接跳转，未命中先 fallback 并异步生成特化版本。</p>
+          </div>
+        </section>
+
+        <section class="taskpool">
+          <h2><span class="tag amber">SRE</span> 异步 Taskpool 调度模型</h2>
+          <div class="taskpool-grid">
+            <div class="tp-node" style="background:#fffbeb;"><strong>Wrapper 热路径</strong><span>调用 <code>ejit_compile_or_get</code>，不阻塞应用线程；无可用 JIT 时立即 fallback。</span></div>
+            <div class="tp-node"><strong>SwitchController</strong><span>检查 Off / Async 模式、period active 状态和实例 version。</span></div>
+            <div class="tp-node"><strong>TaskPoolCache</strong><span>32 桶 <code>unordered_map</code> + 独立 RwLock；try-read 失败立即 fallback。</span></div>
+            <div class="tp-node"><strong>DedupTable</strong><span>按 funcIndex / key 进行 CAS 占位，避免重复提交同一编译任务。</span></div>
+            <div class="tp-node"><strong>MPSC Queue</strong><span>多 producer、单 consumer 无锁队列；SRE 平台上固定单 worker。</span></div>
+            <div class="tp-node"><strong>EJitWorker</strong><span>后台 SRE task 消费队列，调用 <code>compileFn_</code> 生成机器码。</span></div>
+            <div class="tp-node" style="background:#f0fdf4;"><strong>Cache.put</strong><span>编译成功写入 cache；后续相同 key / version 直接命中特化函数。</span></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="notes">
+        <div class="note">
+          <h3>汇报重点 1：双阶段设计</h3>
+          <p>AOT 负责“可 JIT 资产准备”：提取 bitcode、保留 metadata、生成 wrapper 和注册逻辑；Runtime 负责“按时间窗状态特化”。两者通过 ELF section 和 RegistrationStore 解耦。</p>
+        </div>
+        <div class="note">
+          <h3>汇报重点 2：正确性优先</h3>
+          <p>任何无法确定安全性的情况都回退 AOT：metadata 丢失、period 未激活、cache miss、正在编译、内存不足、version 失效都不会破坏原程序语义。</p>
+        </div>
+        <div class="note">
+          <h3>汇报重点 3：嵌入式约束</h3>
+          <p>运行时采用固定 code pool / slab、可裁剪 LLVM 后端、单 worker 异步调度、有限锁粒度 cache，以适配 CPU、内存和实时性约束。</p>
+        </div>
+      </section>
+
+      <div class="footer">
+        <span>资料来源：jit_design_doc/SPEC4.md、PLAN4.md、CLANG_ATTR_DESIGN.md、PASS1-PASS7、EJIT_SRE_TASKPOOL.md、EJIT_SRE_CODE_POOL.md 等设计文档。</span>
+        <span>建议展示方式：浏览器全屏打开，或打印 / 导出为 PDF。</span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
