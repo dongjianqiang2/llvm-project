@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT 架构设计图</title>
+  <style>
+    :root {
+      --primary: #2c5282;
+      --primary-2: #1a365d;
+      --accent: #3182ce;
+      --green: #38a16f;
+      --orange: #dd6b20;
+      --purple: #6b46c1;
+      --dark: #2d3748;
+      --gray: #4a5568;
+      --muted: #718096;
+      --border: #d9dee6;
+      --bg: #f5f7fa;
+      --panel: #ffffff;
+      --blue-light: #ebf2fa;
+      --green-light: #f0fff4;
+      --orange-light: #fff7ed;
+      --purple-light: #f5f0ff;
+      --code-bg: #111827;
+      --code-fg: #e5e7eb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #f8fafc 0%, #ffffff 42%);
+      color: var(--dark);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.58;
+    }
+    header {
+      background: linear-gradient(135deg, var(--primary), var(--primary-2));
+      color: white;
+      padding: 38px 34px 32px;
+      border-bottom: 6px solid #bee3f8;
+    }
+    header h1 { margin: 0 0 8px; font-size: 34px; letter-spacing: .5px; }
+    header p { margin: 0; max-width: 1100px; color: #dbeafe; font-size: 16px; }
+    main { max-width: 1380px; margin: 0 auto; padding: 28px 28px 70px; }
+    section {
+      margin: 26px 0;
+      padding: 24px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 10px 28px rgba(44, 82, 130, .08);
+    }
+    h2 {
+      margin: 0 0 18px;
+      color: var(--primary);
+      font-size: 25px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    h2::before {
+      content: "";
+      display: inline-block;
+      width: 7px;
+      height: 28px;
+      border-radius: 999px;
+      background: var(--primary);
+    }
+    h3 { margin: 22px 0 10px; color: var(--dark); }
+    p { margin: 8px 0 14px; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: .92em;
+    }
+    pre {
+      background: var(--code-bg);
+      color: var(--code-fg);
+      border-radius: 12px;
+      padding: 16px 18px;
+      overflow: auto;
+      border: 1px solid #243044;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 14px 0 0;
+    }
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: #fff;
+      font-size: 13px;
+      color: var(--gray);
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .blue { background: var(--accent); }
+    .green { background: var(--green); }
+    .orange { background: var(--orange); }
+    .purple { background: var(--purple); }
+    .gray { background: var(--muted); }
+    .diagram-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: #fbfdff;
+      padding: 14px;
+    }
+    svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+    .note {
+      background: var(--blue-light);
+      border-left: 5px solid var(--accent);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: #29415f;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-left: 5px solid var(--primary);
+      border-radius: 12px;
+      padding: 14px;
+      background: #fff;
+    }
+    .card h3 { margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+    th, td { border: 1px solid var(--border); padding: 9px 10px; vertical-align: top; }
+    th { background: #edf2f7; text-align: left; }
+    tr:nth-child(even) td { background: #fafcff; }
+    footer {
+      margin-top: 30px;
+      padding-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      border-top: 1px solid var(--border);
+    }
+    .svg-title { font: 700 18px sans-serif; fill: #2d3748; }
+    .svg-small { font: 12px sans-serif; fill: #4a5568; }
+    .svg-label { font: 700 13px sans-serif; fill: #2d3748; }
+    .svg-white { font: 700 13px sans-serif; fill: white; }
+    .svg-note { font: 11px sans-serif; fill: #4a5568; }
+    .box-shadow { filter: drop-shadow(0 4px 8px rgba(44, 82, 130, .12)); }
+    @media print {
+      header { background: var(--primary); -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      section { box-shadow: none; break-inside: avoid; }
+      .diagram-wrap { overflow: visible; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>EJIT 架构设计图</h1>
+  <p>EmbeddedJIT 端到端架构、AOT/JIT 流程、时间窗生命周期、运行时组件和 bare-metal/SRE 部署关系图。本文档为纯 HTML/SVG，可离线打开。</p>
+</header>
+
+<main>
+  <section>
+    <h2>1. 总体架构一览</h2>
+    <p>EmbeddedJIT 将用户源码中的时间窗标注转化为编译期 metadata，并在 AOT 阶段嵌入可供运行时重新优化的 bitcode。运行时根据当前激活的时间窗实例生成特化机器码，并通过 cache 命中直接执行。</p>
+    <div class="diagram-wrap">
+      <svg width="1250" height="620" viewBox="0 0 1250 620" role="img" aria-label="EJIT 总体架构图">
+        <defs>
+          <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" />
+          </marker>
+          <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" />
+          </marker>
+          <marker id="arrowOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" />
+          </marker>
+          <linearGradient id="gBlue" x1="0" x2="1">
+            <stop offset="0" stop-color="#2c5282" />
+            <stop offset="1" stop-color="#3182ce" />
+          </linearGradient>
+          <linearGradient id="gGreen" x1="0" x2="1">
+            <stop offset="0" stop-color="#2f855a" />
+            <stop offset="1" stop-color="#38a16f" />
+          </linearGradient>
+          <linearGradient id="gPurple" x1="0" x2="1">
+            <stop offset="0" stop-color="#553c9a" />
+            <stop offset="1" stop-color="#805ad5" />
+          </linearGradient>
+        </defs>
+
+        <text x="30" y="32" class="svg-title">EJIT End-to-End Architecture</text>
+
+        <!-- User source -->
+        <rect x="30" y="70" width="220" height="170" rx="14" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" class="box-shadow" />
+        <text x="55" y="100" class="svg-label">用户源码</text>
+        <text x="55" y="128" class="svg-small">• ejit_may_const 字段</text>
+        <text x="55" y="152" class="svg-small">• ejit_period/static</text>
+        <text x="55" y="176" class="svg-small">• ejit_period_arr</text>
+        <text x="55" y="200" class="svg-small">• ejit_entry 函数</text>
+        <text x="55" y="224" class="svg-small">• ejit_period_lc 生命周期</text>
+
+        <!-- Clang -->
+        <rect x="310" y="70" width="220" height="170" rx="14" fill="url(#gBlue)" class="box-shadow" />
+        <text x="352" y="100" class="svg-white">Clang 前端/CodeGen</text>
+        <text x="338" y="132" class="svg-white">属性 Sema 检查</text>
+        <text x="338" y="158" class="svg-white">生成 !ejit.metadata</text>
+        <text x="338" y="184" class="svg-white">生成 !ejit.may_const</text>
+        <text x="338" y="210" class="svg-white">输出 LLVM IR</text>
+
+        <!-- AOT passes -->
+        <rect x="590" y="70" width="290" height="230" rx="14" fill="#ffffff" stroke="#2c5282" stroke-width="2" class="box-shadow" />
+        <rect x="590" y="70" width="290" height="38" rx="14" fill="#2c5282" />
+        <text x="674" y="95" class="svg-white">AOT Pass Pipeline</text>
+        <text x="615" y="132" class="svg-small">PASS1: 提取/嵌入 bitcode</text>
+        <text x="615" y="160" class="svg-small">PASS2: 注册 period/static</text>
+        <text x="615" y="188" class="svg-small">PASS3: 插入 wrapper</text>
+        <text x="615" y="216" class="svg-small">PASS4: lifecycle deactivate/activate</text>
+        <text x="615" y="244" class="svg-small">PASS5: AOT 协调</text>
+        <text x="615" y="272" class="svg-note">输出: native binary + __ejit_bitcode</text>
+
+        <!-- Binary -->
+        <rect x="950" y="80" width="240" height="210" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" class="box-shadow" />
+        <text x="1005" y="112" class="svg-label">用户程序二进制</text>
+        <text x="980" y="146" class="svg-small">• 原 AOT 代码</text>
+        <text x="980" y="172" class="svg-small">• wrapper 入口逻辑</text>
+        <text x="980" y="198" class="svg-small">• __ejit_bitcode section</text>
+        <text x="980" y="224" class="svg-small">• __ejit_registry_* 静态表</text>
+        <text x="980" y="250" class="svg-small">• 自动符号注册</text>
+
+        <!-- Runtime -->
+        <rect x="120" y="365" width="980" height="190" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
+        <rect x="120" y="365" width="980" height="42" rx="18" fill="#2d3748" />
+        <text x="516" y="392" class="svg-white">EJIT Runtime</text>
+
+        <rect x="155" y="430" width="170" height="88" rx="12" fill="#ebf2fa" stroke="#3182ce" />
+        <text x="188" y="458" class="svg-label">RuntimeState</text>
+        <text x="174" y="482" class="svg-small">Period Registry</text>
+        <text x="174" y="504" class="svg-small">Active/Invalid 状态</text>
+
+        <rect x="360" y="430" width="170" height="88" rx="12" fill="#f0fff4" stroke="#38a16f" />
+        <text x="409" y="458" class="svg-label">Cache</text>
+        <text x="386" y="482" class="svg-small">LRU / bucket</text>
+        <text x="386" y="504" class="svg-small">funcIdx + dims</text>
+
+        <rect x="565" y="430" width="170" height="88" rx="12" fill="#fff7ed" stroke="#dd6b20" />
+        <text x="592" y="458" class="svg-label">CompileDriver</text>
+        <text x="588" y="482" class="svg-small">ModuleLoader</text>
+        <text x="588" y="504" class="svg-small">Optimizer + PASS6</text>
+
+        <rect x="770" y="430" width="170" height="88" rx="12" fill="#f5f0ff" stroke="#6b46c1" />
+        <text x="808" y="458" class="svg-label">ORC/JITLink</text>
+        <text x="794" y="482" class="svg-small">目标代码生成</text>
+        <text x="794" y="504" class="svg-small">CodePool/MemoryMgr</text>
+
+        <line x1="250" y1="155" x2="310" y2="155" stroke="#2c5282" stroke-width="3" marker-end="url(#arrow)" />
+        <line x1="530" y1="155" x2="590" y2="155" stroke="#2c5282" stroke-width="3" marker-end="url(#arrow)" />
+        <line x1="880" y1="185" x2="950" y2="185" stroke="#38a16f" stroke-width="3" marker-end="url(#arrowGreen)" />
+        <path d="M1070 290 C1070 340, 980 345, 930 430" fill="none" stroke="#38a16f" stroke-width="3" marker-end="url(#arrowGreen)" />
+        <path d="M650 300 C650 340, 650 380, 650 430" fill="none" stroke="#dd6b20" stroke-width="3" marker-end="url(#arrowOrange)" />
+        <line x1="325" y1="474" x2="360" y2="474" stroke="#2c5282" stroke-width="2.5" marker-end="url(#arrow)" />
+        <line x1="530" y1="474" x2="565" y2="474" stroke="#2c5282" stroke-width="2.5" marker-end="url(#arrow)" />
+        <line x1="735" y1="474" x2="770" y2="474" stroke="#2c5282" stroke-width="2.5" marker-end="url(#arrow)" />
+
+        <text x="40" y="594" class="svg-note">关键语义：用户始终调用原函数名；wrapper 负责 JIT 查询/编译/分发；失败或未命中时 fallback 到 AOT 原函数体。</text>
+      </svg>
+    </div>
+    <div class="legend">
+      <span><i class="dot blue"></i>编译期</span>
+      <span><i class="dot green"></i>产物/执行</span>
+      <span><i class="dot orange"></i>JIT 编译</span>
+      <span><i class="dot purple"></i>代码生成/内存</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. AOT 编译期流水线</h2>
+    <p>AOT 编译期分两类 pass：PASS1 必须尽早运行，负责在优化破坏 metadata 之前提取 bitcode；PASS2-4 负责注册、wrapper 和生命周期插桩，由 PASS5 统一协调。</p>
+    <div class="diagram-wrap">
+      <svg width="1250" height="430" viewBox="0 0 1250 430" role="img" aria-label="AOT 编译期流水线图">
+        <defs>
+          <marker id="aotArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" />
+          </marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">AOT Pipeline</text>
+
+        <rect x="40" y="80" width="160" height="90" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
+        <text x="78" y="112" class="svg-label">Clang IR</text>
+        <text x="62" y="138" class="svg-small">!ejit.metadata</text>
+        <text x="62" y="160" class="svg-small">!ejit.may_const</text>
+
+        <rect x="250" y="70" width="185" height="110" rx="12" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
+        <text x="296" y="102" class="svg-label">PASS1</text>
+        <text x="272" y="128" class="svg-small">EJitRegisterBitcode</text>
+        <text x="272" y="152" class="svg-small">提取闭包 + 嵌入 bitcode</text>
+
+        <rect x="485" y="70" width="185" height="110" rx="12" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
+        <text x="532" y="102" class="svg-label">PASS2</text>
+        <text x="507" y="128" class="svg-small">EJitRegisterPeriod</text>
+        <text x="507" y="152" class="svg-small">注册 period/static</text>
+
+        <rect x="720" y="70" width="185" height="110" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
+        <text x="767" y="102" class="svg-label">PASS3</text>
+        <text x="748" y="128" class="svg-small">EJitWrapperGen</text>
+        <text x="748" y="152" class="svg-small">单函数 wrapper</text>
+
+        <rect x="955" y="70" width="185" height="110" rx="12" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" />
+        <text x="1002" y="102" class="svg-label">PASS4</text>
+        <text x="972" y="128" class="svg-small">EJitPeriodHandler</text>
+        <text x="972" y="152" class="svg-small">deactivate/activate</text>
+
+        <rect x="485" y="265" width="420" height="90" rx="12" fill="#ffffff" stroke="#2c5282" stroke-width="2" />
+        <text x="612" y="296" class="svg-label">PASS5: EJitAotModulePass</text>
+        <text x="523" y="324" class="svg-small">协调 PASS2 → PASS3 → PASS4，快速跳过无 EJIT metadata 的模块</text>
+
+        <line x1="200" y1="125" x2="250" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <line x1="435" y1="125" x2="485" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <line x1="670" y1="125" x2="720" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <line x1="905" y1="125" x2="955" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
+        <path d="M578 180 L578 265" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#aotArrow)" />
+        <path d="M812 180 L812 265" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#aotArrow)" />
+        <path d="M1048 180 C1048 230 900 245 820 265" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#aotArrow)" />
+
+        <text x="42" y="220" class="svg-note">非 LTO: PASS1 → PASS2-4 → O2/O3 → 目标代码</text>
+        <text x="42" y="246" class="svg-note">LTO: PASS1 → O2/O3 → PASS2-4 → 目标代码</text>
+        <text x="42" y="385" class="svg-note">输出产物：原 AOT 代码 + wrapper + registry + embedded bitcode。JIT 失败时继续执行原函数体。</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. 运行时 JIT 与 Cache 架构</h2>
+    <p>运行时入口由 wrapper 调用。热路径只做 cache 查询；冷路径才加载 bitcode、执行优化 pipeline 并生成机器码。</p>
+    <div class="diagram-wrap">
+      <svg width="1250" height="560" viewBox="0 0 1250 560" role="img" aria-label="运行时 JIT 与 Cache 架构图">
+        <defs>
+          <marker id="rtArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" />
+          </marker>
+          <marker id="rtGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" />
+          </marker>
+          <marker id="rtOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" />
+          </marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">Runtime Hot Path / Cold Path</text>
+
+        <rect x="45" y="80" width="200" height="84" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
+        <text x="80" y="112" class="svg-label">用户调用原函数</text>
+        <text x="76" y="140" class="svg-small">process_cell(cellIdx)</text>
+
+        <rect x="305" y="80" width="220" height="84" rx="12" fill="#ffffff" stroke="#2c5282" stroke-width="2" />
+        <text x="365" y="112" class="svg-label">Wrapper</text>
+        <text x="332" y="140" class="svg-small">cacheKey = funcIdx &lt;&lt; 32 | dims</text>
+
+        <rect x="585" y="80" width="225" height="84" rx="12" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
+        <text x="640" y="112" class="svg-label">EJitCache</text>
+        <text x="620" y="140" class="svg-small">LRU / bucket / version</text>
+
+        <polygon points="900,82 1038,122 900,162 762,122" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
+        <text x="858" y="118" class="svg-label">Cache Hit?</text>
+
+        <rect x="1020" y="65" width="180" height="90" rx="12" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
+        <text x="1050" y="100" class="svg-label">调用特化函数</text>
+        <text x="1056" y="128" class="svg-small">fast path</text>
+
+        <rect x="620" y="260" width="520" height="230" rx="16" fill="#ffffff" stroke="#d9dee6" stroke-width="2" />
+        <rect x="620" y="260" width="520" height="38" rx="16" fill="#2d3748" />
+        <text x="802" y="285" class="svg-white">Cold Compile Path</text>
+
+        <rect x="650" y="325" width="130" height="64" rx="10" fill="#ebf2fa" stroke="#3182ce" />
+        <text x="672" y="352" class="svg-label">ModuleLoader</text>
+        <text x="670" y="374" class="svg-small">加载 bitcode</text>
+
+        <rect x="820" y="325" width="130" height="64" rx="10" fill="#fff7ed" stroke="#dd6b20" />
+        <text x="844" y="352" class="svg-label">参数替换</text>
+        <text x="838" y="374" class="svg-small">dims → 常量</text>
+
+        <rect x="990" y="325" width="120" height="64" rx="10" fill="#f5f0ff" stroke="#6b46c1" />
+        <text x="1016" y="352" class="svg-label">InstCombine</text>
+        <text x="1010" y="374" class="svg-small">GEP 折叠</text>
+
+        <rect x="650" y="410" width="130" height="64" rx="10" fill="#f5f0ff" stroke="#6b46c1" />
+        <text x="695" y="437" class="svg-label">Inline</text>
+        <text x="668" y="459" class="svg-small">展开跨函数访问</text>
+
+        <rect x="820" y="410" width="130" height="64" rx="10" fill="#fff7ed" stroke="#dd6b20" />
+        <text x="842" y="437" class="svg-label">PASS6</text>
+        <text x="834" y="459" class="svg-small">字段 load→常量</text>
+
+        <rect x="990" y="410" width="120" height="64" rx="10" fill="#f0fff4" stroke="#38a16f" />
+        <text x="1016" y="437" class="svg-label">ORC/JITLink</text>
+        <text x="1004" y="459" class="svg-small">机器码入 cache</text>
+
+        <rect x="45" y="260" width="470" height="230" rx="16" fill="#ffffff" stroke="#d9dee6" stroke-width="2" />
+        <rect x="45" y="260" width="470" height="38" rx="16" fill="#2d3748" />
+        <text x="195" y="285" class="svg-white">RuntimeState / Registry</text>
+        <text x="75" y="330" class="svg-small">• PeriodArrayRegistry: periodName → arrays</text>
+        <text x="75" y="360" class="svg-small">• StaticVarRegistry: static globals</text>
+        <text x="75" y="390" class="svg-small">• Active/Invalid lifecycle 状态</text>
+        <text x="75" y="420" class="svg-small">• FuncIndex / Lifecycle dense slots</text>
+        <text x="75" y="450" class="svg-small">• RegistrationStore / static registry fallback</text>
+
+        <line x1="245" y1="122" x2="305" y2="122" stroke="#2c5282" stroke-width="3" marker-end="url(#rtArrow)" />
+        <line x1="525" y1="122" x2="585" y2="122" stroke="#2c5282" stroke-width="3" marker-end="url(#rtArrow)" />
+        <line x1="810" y1="122" x2="762" y2="122" stroke="#2c5282" stroke-width="3" marker-end="url(#rtArrow)" />
+        <line x1="1038" y1="122" x2="1020" y2="110" stroke="#38a16f" stroke-width="3" marker-end="url(#rtGreen)" />
+        <path d="M900 162 C900 215 880 230 880 260" fill="none" stroke="#dd6b20" stroke-width="3" marker-end="url(#rtOrange)" />
+        <path d="M620 375 C570 375 550 375 515 375" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#rtArrow)" />
+        <path d="M1110 490 C1110 535 660 535 700 166" fill="none" stroke="#38a16f" stroke-width="2.5" marker-end="url(#rtGreen)" />
+
+        <text x="1038" y="185" class="svg-note">Hit: O(1) 返回</text>
+        <text x="918" y="222" class="svg-note">Miss: 编译或异步提交</text>
+        <text x="44" y="535" class="svg-note">失败处理：inactive / missing bitcode / missing symbol / OOM / compile fail 均返回 NULL，wrapper fallback 到 AOT。</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. 时间窗生命周期状态机</h2>
+    <p>时间窗控制 JIT 特化是否允许使用当前内存值。修改配置前必须使相关实例失效，修改完成后重新激活，后续调用会重新编译或命中新的版本。</p>
+    <div class="diagram-wrap">
+      <svg width="980" height="360" viewBox="0 0 980 360" role="img" aria-label="时间窗生命周期状态机">
+        <defs>
+          <marker id="lifeArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" />
+          </marker>
+          <marker id="lifeOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" />
+          </marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">Period Lifecycle</text>
+
+        <circle cx="160" cy="155" r="70" fill="#f8fafc" stroke="#718096" stroke-width="3" />
+        <text x="118" y="150" class="svg-label">Inactive</text>
+        <text x="108" y="178" class="svg-small">未激活，不允许 JIT</text>
+
+        <circle cx="490" cy="155" r="70" fill="#f0fff4" stroke="#38a16f" stroke-width="3" />
+        <text x="455" y="150" class="svg-label">Active</text>
+        <text x="425" y="178" class="svg-small">可读取 may_const 值</text>
+
+        <circle cx="820" cy="155" r="70" fill="#fff7ed" stroke="#dd6b20" stroke-width="3" />
+        <text x="786" y="150" class="svg-label">Invalid</text>
+        <text x="758" y="178" class="svg-small">缓存失效，待重编译</text>
+
+        <path d="M230 155 L420 155" stroke="#2c5282" stroke-width="3" fill="none" marker-end="url(#lifeArrow)" />
+        <text x="275" y="132" class="svg-small">ejit_activate(name, idx)</text>
+
+        <path d="M560 155 L750 155" stroke="#dd6b20" stroke-width="3" fill="none" marker-end="url(#lifeOrange)" />
+        <text x="606" y="132" class="svg-small">ejit_deactivate(name, idx)</text>
+
+        <path d="M790 220 C700 310 590 310 510 225" stroke="#2c5282" stroke-width="3" fill="none" marker-end="url(#lifeArrow)" />
+        <text x="612" y="308" class="svg-small">修改完成后再次 activate</text>
+
+        <rect x="100" y="270" width="760" height="48" rx="10" fill="#ebf2fa" stroke="#3182ce" />
+        <text x="132" y="300" class="svg-label">ejit_period_lc(name)</text>
+        <text x="292" y="300" class="svg-small">函数入口自动 deactivate_array；每个 return 前自动 activate_array。</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>5. Bare-metal / SRE 部署架构</h2>
+    <p>在无操作系统或 SRE 环境下，EJIT 需要替代 host 依赖：构造函数注册、动态符号查找、线程库、mmap/mprotect 和 JIT 可执行内存管理。</p>
+    <div class="diagram-wrap">
+      <svg width="1250" height="560" viewBox="0 0 1250 560" role="img" aria-label="Bare-metal 和 SRE 部署架构图">
+        <defs>
+          <marker id="bmArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+            <path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" />
+          </marker>
+        </defs>
+        <text x="30" y="34" class="svg-title">Embedded / Bare-metal Deployment</text>
+
+        <rect x="40" y="82" width="245" height="170" rx="14" fill="#ffffff" stroke="#2c5282" stroke-width="2" class="box-shadow" />
+        <rect x="40" y="82" width="245" height="38" rx="14" fill="#2c5282" />
+        <text x="100" y="107" class="svg-white">构建/裁剪</text>
+        <text x="68" y="150" class="svg-small">• EJIT_TRIM_LLVM_BACKEND</text>
+        <text x="68" y="178" class="svg-small">• lipo merge → ejit.o</text>
+        <text x="68" y="206" class="svg-small">• no-op std/POSIX stubs</text>
+        <text x="68" y="234" class="svg-small">• custom linker script</text>
+
+        <rect x="355" y="82" width="245" height="170" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" class="box-shadow" />
+        <rect x="355" y="82" width="245" height="38" rx="14" fill="#38a16f" />
+        <text x="417" y="107" class="svg-white">静态注册路径</text>
+        <text x="383" y="150" class="svg-small">• __ejit_registry_bitcode[]</text>
+        <text x="383" y="178" class="svg-small">• __ejit_registry_period[]</text>
+        <text x="383" y="206" class="svg-small">• forceStaticRegistry</text>
+        <text x="383" y="234" class="svg-small">• 无 global_ctors 也可初始化</text>
+
+        <rect x="670" y="82" width="245" height="170" rx="14" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" class="box-shadow" />
+        <rect x="670" y="82" width="245" height="38" rx="14" fill="#dd6b20" />
+        <text x="738" y="107" class="svg-white">SRE CodePool</text>
+        <text x="698" y="150" class="svg-small">• 2MiB code pool</text>
+        <text x="698" y="178" class="svg-small">• 4K seal executable pages</text>
+        <text x="698" y="206" class="svg-small">• enable_ex / split_2m_to_4k</text>
+        <text x="698" y="234" class="svg-small">• 避免写 RX 页</text>
+
+        <rect x="985" y="82" width="225" height="170" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" class="box-shadow" />
+        <rect x="985" y="82" width="225" height="38" rx="14" fill="#6b46c1" />
+        <text x="1048" y="107" class="svg-white">SRE Taskpool</text>
+        <text x="1013" y="150" class="svg-small">• 单 worker task</text>
+        <text x="1013" y="178" class="svg-small">• MPSC queue + dedup</text>
+        <text x="1013" y="206" class="svg-small">• bucket cache</text>
+        <text x="1013" y="234" class="svg-small">• 可选跨核共享状态</text>
+
+        <rect x="180" y="345" width="890" height="120" rx="16" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
+        <rect x="180" y="345" width="890" height="38" rx="16" fill="#2d3748" />
+        <text x="535" y="370" class="svg-white">目标平台运行时</text>
+        <text x="220" y="414" class="svg-small">1. ejit_init 读取静态注册表 / 构造期暂存数据</text>
+        <text x="220" y="442" class="svg-small">2. 注册 bitcode、period arrays、static vars、external symbols</text>
+        <text x="690" y="414" class="svg-small">3. 使用 CodePool 分配 JIT 代码</text>
+        <text x="690" y="442" class="svg-small">4. Taskpool 异步编译并发布代码指针</text>
+
+        <line x1="285" y1="168" x2="355" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
+        <line x1="600" y1="168" x2="670" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
+        <line x1="915" y1="168" x2="985" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
+        <path d="M478 252 C478 300 450 318 450 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
+        <path d="M793 252 C793 300 745 318 745 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
+        <path d="M1098 252 C1098 310 900 322 900 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
+
+        <text x="42" y="520" class="svg-note">部署关键点：registry section 不能被 GC；外部符号必须可解析；JIT 代码内存要满足写入、finalize、执行权限和 I/D cache 一致性要求。</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>6. 组件职责速查</h2>
+    <table>
+      <thead>
+        <tr><th>层级</th><th>组件</th><th>职责</th><th>用户关注点</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Clang 前端</td><td>Attr.td / SemaEJIT / CGEJIT</td><td>识别属性、做约束检查、生成 EJIT metadata</td><td>属性使用是否合法，是否产生诊断</td></tr>
+        <tr><td>AOT PASS1</td><td>EJitRegisterBitcode</td><td>提取 ejit_entry 闭包 bitcode，嵌入二进制，自动注册外部符号</td><td>是否生成 <code>@__ejit_bitcode</code></td></tr>
+        <tr><td>AOT PASS2</td><td>EJitRegisterPeriod</td><td>注册 period arrays / static vars</td><td><code>ejit_activate</code> 能否找到时间窗</td></tr>
+        <tr><td>AOT PASS3</td><td>EJitWrapperGen</td><td>在原函数入口插入 JIT 查询和 dispatch/fallback</td><td>是否调用原函数名即可触发 JIT</td></tr>
+        <tr><td>AOT PASS4</td><td>EJitPeriodHandler</td><td>为生命周期函数自动插入 deactivate/activate</td><td>配置修改是否自动失效旧 cache</td></tr>
+        <tr><td>运行时状态</td><td>EJitRuntimeState / Registry</td><td>维护注册信息、active 状态、dense slot</td><td>初始化、生命周期和裸核注册</td></tr>
+        <tr><td>运行时缓存</td><td>EJitCache / Taskpool cache</td><td>按 funcIdx+dims 查找/发布特化函数</td><td>命中率、失效、内存上限</td></tr>
+        <tr><td>JIT 优化</td><td>EJitOptimizer / PASS6</td><td>参数替换、字段常量替换、LLVM 优化</td><td>是否真正折叠分支/消除死代码</td></tr>
+        <tr><td>代码生成</td><td>ORC LLJIT / JITLink / CodePool</td><td>生成目标机器码并管理可执行内存</td><td>目标后端、内存权限、SRE 适配</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. 对应源码/文档入口</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>用户手册</h3>
+        <p><a href="EJIT_USER_MANUAL.html">EJIT_USER_MANUAL.html</a></p>
+        <p class="muted">面向用户的完整使用步骤、API 和排障指南。</p>
+      </div>
+      <div class="card">
+        <h3>需求与总体方案</h3>
+        <p><a href="SPEC4.md">SPEC4.md</a> / <a href="PLAN4.md">PLAN4.md</a></p>
+        <p class="muted">时间窗常量、标注接口、AOT/JIT pipeline。</p>
+      </div>
+      <div class="card">
+        <h3>Pass 设计</h3>
+        <p><a href="PASS1_EJitRegisterBitcode.md">PASS1</a> ~ <a href="PASS7_EJitRuntime_OrcJITLink.md">PASS7</a></p>
+        <p class="muted">bitcode、period、wrapper、lifecycle、runtime、PASS6。</p>
+      </div>
+      <div class="card">
+        <h3>SRE/裁剪</h3>
+        <p><a href="EJIT_SRE_CODE_POOL.md">CodePool</a> / <a href="EJIT_SRE_TASKPOOL.md">Taskpool</a> / <a href="EJIT_TRIM_LLVM_BACKEND.md">Trim</a></p>
+        <p class="muted">裸核、小型化、代码内存和异步调度。</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    生成日期：2026-06-27。本文档是 EJIT 架构图说明，设计细节以同目录设计文档和当前源码头文件为准。
+  </footer>
+</main>
+</body>
+</html>

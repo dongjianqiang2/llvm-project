@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EmbeddedJIT 用户使用手册</title>
+  <style>
+    :root {
+      --primary: #2c5282;
+      --accent: #3182ce;
+      --dark: #2d3748;
+      --gray: #4a5568;
+      --muted: #718096;
+      --border: #d9dee6;
+      --bg: #f5f7fa;
+      --code-bg: #111827;
+      --code-fg: #e5e7eb;
+      --ok: #38a16f;
+      --warn: #dd6b20;
+      --info: #ebf2fa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      color: var(--dark);
+      background: white;
+      line-height: 1.65;
+    }
+    header {
+      background: linear-gradient(135deg, var(--primary), #1a365d);
+      color: white;
+      padding: 42px 32px 38px;
+    }
+    header h1 { margin: 0 0 8px; font-size: 34px; letter-spacing: 0.5px; }
+    header p { margin: 0; color: #dbeafe; font-size: 16px; max-width: 980px; }
+    .layout {
+      display: grid;
+      grid-template-columns: 290px minmax(0, 1fr);
+      gap: 0;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    nav {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      overflow: auto;
+      padding: 24px 18px;
+      border-right: 1px solid var(--border);
+      background: var(--bg);
+    }
+    nav .toc-title {
+      font-weight: 700;
+      color: var(--primary);
+      margin: 0 0 12px;
+    }
+    nav a {
+      display: block;
+      color: var(--gray);
+      text-decoration: none;
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    nav a:hover { background: #e6eef8; color: var(--primary); }
+    main { padding: 30px 42px 80px; max-width: 1080px; }
+    h2 {
+      margin-top: 42px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid var(--border);
+      color: var(--primary);
+      font-size: 26px;
+    }
+    h3 { margin-top: 28px; color: var(--dark); font-size: 20px; }
+    h4 { margin-top: 22px; color: var(--gray); font-size: 17px; }
+    a { color: var(--accent); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: 0.92em;
+    }
+    pre {
+      background: var(--code-bg);
+      color: var(--code-fg);
+      border-radius: 10px;
+      padding: 16px 18px;
+      overflow: auto;
+      border: 1px solid #243044;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 22px;
+      font-size: 14px;
+    }
+    th, td { border: 1px solid var(--border); padding: 9px 10px; vertical-align: top; }
+    th { background: #edf2f7; color: var(--dark); text-align: left; }
+    tr:nth-child(even) td { background: #fafcff; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-left: 5px solid var(--primary);
+      border-radius: 10px;
+      padding: 14px 16px;
+      background: white;
+    }
+    .card h3, .card h4 { margin: 0 0 6px; }
+    .note, .warn, .ok {
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin: 16px 0;
+      border: 1px solid var(--border);
+    }
+    .note { background: var(--info); border-left: 5px solid var(--accent); }
+    .warn { background: #fff7ed; border-left: 5px solid var(--warn); }
+    .ok { background: #f0fff4; border-left: 5px solid var(--ok); }
+    .badge {
+      display: inline-block;
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #e6eef8;
+      color: var(--primary);
+      font-weight: 700;
+      margin-left: 6px;
+    }
+    .muted { color: var(--muted); }
+    .flow {
+      background: #f8fafc;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      color: #334155;
+    }
+    footer {
+      margin-top: 54px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media (max-width: 900px) {
+      .layout { display: block; }
+      nav { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+      main { padding: 24px 18px 60px; }
+      header { padding: 32px 20px; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>EmbeddedJIT 用户使用手册</h1>
+  <p>面向业务开发者的 EJIT 使用指南：如何标注代码、初始化运行时、激活时间窗、构建测试，以及在 host / AArch64 / bare-metal / SRE 场景中部署。</p>
+</header>
+
+<div class="layout">
+<nav>
+  <p class="toc-title">目录</p>
+  <a href="#intro">1. EJIT 是什么</a>
+  <a href="#quick-start">2. 快速开始</a>
+  <a href="#annotations">3. 源码标注接口</a>
+  <a href="#runtime-api">4. 运行时 API</a>
+  <a href="#build">5. 构建与链接</a>
+  <a href="#pipeline">6. AOT/JIT 流程</a>
+  <a href="#tests">7. 测试与验证</a>
+  <a href="#platform">8. 裸核与 SRE 部署</a>
+  <a href="#troubleshooting">9. 排障指南</a>
+  <a href="#limits">10. 限制与建议</a>
+  <a href="#references">11. 参考文档</a>
+</nav>
+
+<main>
+<section id="intro">
+  <h2>1. EJIT 是什么</h2>
+  <p><strong>EmbeddedJIT</strong> 是面向嵌入式场景的运行时特化编译系统。它允许开发者把“某个业务时间窗内保持不变的数据”标注出来，运行时在时间窗激活后将这些数据当作编译期常量，生成针对当前配置的特化机器码。</p>
+
+  <div class="cards">
+    <div class="card">
+      <h3>核心思想</h3>
+      <p>在 <code>ejit_activate</code> 与 <code>ejit_deactivate</code> 之间，标注为 <code>ejit_may_const</code> 的字段可被 JIT 读成常量。</p>
+    </div>
+    <div class="card">
+      <h3>主要收益</h3>
+      <p>常量传播、分支折叠、死代码消除、局部内联和 CFG 简化，减少配置分支和重复判断。</p>
+    </div>
+    <div class="card">
+      <h3>安全语义</h3>
+      <p>JIT 失败、缓存未命中、时间窗未激活、内存不足等情况均回退到原 AOT 代码执行。</p>
+    </div>
+  </div>
+
+  <div class="flow">用户源码标注 → Clang 生成 EJIT metadata → AOT Pass 嵌入 bitcode 并插入 wrapper →
+运行时 activate 时间窗 → 调用 ejit_entry → cache hit 则执行特化代码，否则 fallback AOT</div>
+
+  <p>典型使用场景：</p>
+  <ul>
+    <li>板级配置、制式配置、cell/trp/channel 等在一段时间内稳定的业务配置；</li>
+    <li>配置字段决定大量分支路径，且同一实例会被重复调用；</li>
+    <li>可接受首次调用 JIT 编译成本，或使用异步模式先 fallback、后台编译。</li>
+  </ul>
+</section>
+
+<section id="quick-start">
+  <h2>2. 快速开始</h2>
+
+  <h3>2.1 引入头文件</h3>
+  <p>用户侧推荐直接包含运行时 C API 头文件。该头文件已提供 6 个属性宏；定义 <code>EJIT_DISABLE</code> 可临时关闭所有 EJIT 标注，用于 A/B 对比或非 Clang 编译。</p>
+
+<pre><code class="language-c">#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"</code></pre>
+
+  <h3>2.2 标注配置结构体和时间窗数组</h3>
+<pre><code class="language-c">#include &lt;stdint.h&gt;
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+
+#define MODE_FDD 1
+#define MODE_TDD 2
+
+struct CellConfig {
+    ejit_may_const uint32_t mode;      // 时间窗内可特化为常量
+    ejit_may_const uint32_t threshold; // 时间窗内可特化为常量
+    uint32_t runtimeCounter;           // 普通字段，不参与常量替换
+};
+
+// 每个 cell 下标是一个独立时间窗实例
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+
+static void fdd_path(int value);
+static void tdd_path(int value);
+static void default_path(int value);
+
+// 用户仍然调用原函数名；编译器会在函数入口插入 wrapper
+ejit_entry
+void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+    if (g_cellCfg[cellIdx].mode == MODE_FDD) {
+        fdd_path(value + g_cellCfg[cellIdx].threshold);
+    } else if (g_cellCfg[cellIdx].mode == MODE_TDD) {
+        tdd_path(value);
+    } else {
+        default_path(value);
+    }
+}
+
+// 修改 cell 配置的函数要标注生命周期，编译器自动插入 deactivate/activate
+ejit_period_lc(cell)
+void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                     uint32_t mode,
+                     uint32_t threshold) {
+    g_cellCfg[cellIdx].mode = mode;
+    g_cellCfg[cellIdx].threshold = threshold;
+}</code></pre>
+
+  <h3>2.3 初始化、激活并调用</h3>
+<pre><code class="language-c">int main(void) {
+    ejit_config_t cfg = {0};
+    cfg.compileMode = EJIT_COMPILE_SYNC; // 或 EJIT_COMPILE_ASYNC
+    cfg.optLevel = EJIT_OPT_L2;
+    cfg.maxCodeMemory = 2 * 1024 * 1024;
+    cfg.maxCacheEntries = 4096;
+    cfg.enableLogger = true;
+
+    if (ejit_init(&amp;cfg) != EJIT_OK) {
+        return 1;
+    }
+
+    g_cellCfg[3].mode = MODE_FDD;
+    g_cellCfg[3].threshold = 10;
+
+    // 激活 cell[3] 时间窗；之后 process_cell(3, ...) 可触发特化
+    ejit_activate("cell", 3);
+
+    process_cell(3, 100); // 首次：同步模式编译；异步模式 fallback 并提交后台编译
+    process_cell(3, 101); // 后续：命中 cache 时执行特化版本
+
+    // 修改配置时应通过生命周期函数，或手动 deactivate / activate
+    update_cell_cfg(3, MODE_TDD, 20);
+    process_cell(3, 102); // 重新特化或 fallback
+
+    ejit_shutdown();
+    return 0;
+}</code></pre>
+
+  <div class="ok"><strong>最小使用闭环：</strong> 标注 <code>ejit_may_const</code> 字段 → 标注 <code>ejit_period_arr</code> 全局数组 → 标注 <code>ejit_entry</code> 和 <code>ejit_period_arr_ind</code> → <code>ejit_init</code> → <code>ejit_activate</code> → 调用原函数。</div>
+</section>
+
+<section id="annotations">
+  <h2>3. 源码标注接口</h2>
+
+  <h3>3.1 属性总览</h3>
+  <table>
+    <thead><tr><th>宏</th><th>标记对象</th><th>作用</th><th>常见约束</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_may_const</code></td><td>结构体字段</td><td>字段在激活时间窗内可被 JIT 当作常量</td><td>支持整型、布尔、浮点、嵌套结构体及数组；<code>volatile</code> 不特化</td></tr>
+      <tr><td><code>ejit_period(static)</code></td><td>非数组全局变量</td><td>运行期不变的全局配置，默认永远激活</td><td>当前推荐只使用内置 <code>static</code> 标量时间窗</td></tr>
+      <tr><td><code>ejit_period_arr(name)</code></td><td>全局数组或指向结构体的全局指针</td><td>定义按下标独立激活的时间窗数组</td><td>固定数组建议 &lt; 100；全程序最多 1024 个数组</td></tr>
+      <tr><td><code>ejit_entry</code></td><td>函数</td><td>标记可 JIT 特化的入口函数</td><td>不支持递归；异步模式下副作用应幂等</td></tr>
+      <tr><td><code>ejit_period_arr_ind(name)</code></td><td>函数参数</td><td>声明该参数是某个时间窗数组的下标维度</td><td>必须为整数；每函数最多 4 个维度</td></tr>
+      <tr><td><code>ejit_period_lc(name)</code></td><td>函数</td><td>标记会修改时间窗数据的生命周期函数</td><td>必须存在同名 <code>ejit_period_arr_ind</code> 参数；可标多个 period</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.2 静态配置：<code>ejit_period(static)</code></h3>
+<pre><code class="language-c">struct BoardConfig {
+    ejit_may_const uint32_t boardType;
+    uint32_t flags;
+};
+
+ejit_period(static) struct BoardConfig g_boardCfg;
+
+ejit_entry
+void process_board(void) {
+    if (g_boardCfg.boardType == 1) {
+        // JIT 时 boardType 可被折叠为常量
+    }
+}</code></pre>
+
+  <p><code>static</code> 时间窗代表 JIT 运行期不变的全局配置，不需要调用 <code>ejit_activate</code>。</p>
+
+  <h3>3.3 数组时间窗：<code>ejit_period_arr(name)</code></h3>
+  <p>多个全局数组可以使用同一个时间窗名称。调用 <code>ejit_activate("cell", idx)</code> 会激活该名称下所有数组的同一下标；若只想激活某一个数组，使用 <code>ejit_activate_array</code>。</p>
+
+<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
+struct CellState  { ejit_may_const uint32_t state; };
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+ejit_period_arr(cell) struct CellState  g_cellState[16];
+
+// 激活 g_cellCfg[3] 和 g_cellState[3]
+ejit_activate("cell", 3);
+
+// 只激活 g_cellCfg[3]
+ejit_activate_array("cell", g_cellCfg, 3);</code></pre>
+
+  <h3>3.4 多维特化</h3>
+  <p>一个 <code>ejit_entry</code> 函数最多可声明 4 个时间窗数组下标。运行时 cache key 使用高 32 位函数索引 + 低 4 字节维度值编码。</p>
+
+<pre><code class="language-c">ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+ejit_period_arr(trp)  struct TrpConfig  g_trpCfg[8];
+
+ejit_entry
+void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                  ejit_period_arr_ind(trp)  uint8_t trpIdx,
+                  int payload) {
+    if (g_cellCfg[cellIdx].mode == 1 &amp;&amp; g_trpCfg[trpIdx].type == 2) {
+        // cellIdx/trpIdx 均可成为特化维度
+    }
+}</code></pre>
+
+  <h3>3.5 生命周期函数</h3>
+  <p>凡是会修改 <code>ejit_may_const</code> 字段或其所在结构体的函数，建议用 <code>ejit_period_lc</code> 标注。编译器会在函数入口插入失效操作，在所有返回点前重新激活。</p>
+
+<pre><code class="language-c">ejit_period_lc(cell) ejit_period_lc(trp)
+void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                 ejit_period_arr_ind(trp)  uint8_t trpIdx) {
+    g_cellCfg[cellIdx].mode = 2;
+    g_trpCfg[trpIdx].type = 4;
+}</code></pre>
+
+  <div class="warn"><strong>注意：</strong> 如果绕过生命周期函数直接修改已激活时间窗内的 <code>ejit_may_const</code> 字段，旧的特化代码可能基于旧值。请使用 <code>ejit_period_lc</code> 或手动 <code>ejit_deactivate</code> / 修改 / <code>ejit_activate</code>。</div>
+</section>
+
+<section id="runtime-api">
+  <h2>4. 运行时 API</h2>
+
+  <h3>4.1 初始化配置</h3>
+  <p>当前 C API 的配置结构体位于 <code>llvm/include/llvm/ExecutionEngine/EJIT/EJitRuntime.h</code>：</p>
+
+<pre><code class="language-c">typedef struct {
+  ejit_compile_mode_t compileMode; // EJIT_COMPILE_SYNC / EJIT_COMPILE_ASYNC
+  ejit_opt_level_t optLevel;       // EJIT_OPT_L1 / L2 / L3
+  size_t maxCodeMemory;            // JIT 代码内存上限
+  size_t maxDataMemory;            // 数据内存上限
+  size_t maxCacheEntries;          // cache 条目数上限
+  size_t maxCacheSize;             // cache 总大小上限
+  bool enableLogger;               // 是否启用日志
+  bool forceStaticRegistry;        // 裸核：强制使用静态注册表
+  const char *dumpJITDir;          // 非空时输出优化后的 JIT IR
+} ejit_config_t;</code></pre>
+
+  <table>
+    <thead><tr><th>接口</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_init(const ejit_config_t *config)</code></td><td>初始化 EJIT。传 <code>NULL</code> 使用默认配置。会消费构造期或静态表注册的 bitcode/period 信息。</td></tr>
+      <tr><td><code>ejit_shutdown(void)</code></td><td>释放 EJIT 运行时资源。</td></tr>
+      <tr><td><code>ejit_set_compile_mode(mode)</code></td><td>运行期切换同步/异步编译模式。</td></tr>
+      <tr><td><code>ejit_get_compile_mode()</code></td><td>查询当前编译模式。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.2 同步与异步模式</h3>
+  <table>
+    <thead><tr><th>模式</th><th>首次未命中行为</th><th>适用场景</th><th>注意事项</th></tr></thead>
+    <tbody>
+      <tr><td><code>EJIT_COMPILE_SYNC</code></td><td>阻塞等待 JIT 编译完成，成功后直接执行特化版本</td><td>可接受首次延迟，希望尽快获得性能收益</td><td>首次调用延迟更明显</td></tr>
+      <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>提交后台编译，当前调用 fallback 到 AOT</td><td>对首次延迟敏感</td><td><code>ejit_entry</code> 副作用应幂等，避免首次 AOT 与后续 JIT 行为不一致</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.3 时间窗生命周期 API</h3>
+<pre><code class="language-c">ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
+ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
+
+ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
+                                  uint8_t cellIdx);
+ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
+                                    uint8_t cellIdx);
+
+ejit_status_t ejit_activate_all(const char *periodName);
+ejit_status_t ejit_deactivate_all(const char *periodName);
+bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
+
+  <ul>
+    <li><code>activate(name, idx)</code>：激活该名称下所有数组的 <code>idx</code> 实例。</li>
+    <li><code>activate_array(name, ptr, idx)</code>：只激活指定数组指针对应的实例。</li>
+    <li><code>deactivate</code>：标记时间窗失效，并使依赖该实例的缓存条目失效。</li>
+    <li>如果同名数组长度不同，越界数组会被跳过；用户仍应保证业务下标合法。</li>
+  </ul>
+
+  <h3>4.4 Cache、统计和错误</h3>
+<pre><code class="language-c">void ejit_clear_cache(void);
+void ejit_invalidate(const char *periodName, uint8_t cellIdx);
+
+ejit_status_t ejit_get_stats(ejit_stats_t *stats);
+const ejit_error_t *ejit_get_last_error(void);</code></pre>
+
+  <p><code>ejit_stats_t</code> 包含条目数、代码大小、cache hit/miss、eviction 等信息。遇到 JIT 不生效时，建议先看 stats 和 last error，再打开 <code>dumpJITDir</code> 输出优化后 IR。</p>
+
+  <h3>4.5 外部符号注册</h3>
+<pre><code class="language-c">void ejit_register_symbol(const char *name, void *addr);</code></pre>
+  <p>host 环境下外部符号通常由 PASS1 自动扫描注册。裸核或无 <code>dlsym</code> 环境下，如果 JIT bitcode 引用了平台函数、全局变量或库函数，需要确保它们通过自动注册表或手动调用注册到 EJIT。</p>
+</section>
+
+<section id="build">
+  <h2>5. 构建与链接</h2>
+
+  <h3>5.1 构建 EJIT 编译器与运行时</h3>
+  <p>本仓库推荐使用顶层 <code>build.sh</code>：</p>
+
+<pre><code class="language-bash"># x86 开发构建：clang/opt/lld 等
+./build.sh debug x86
+
+# x86 release：用于 EJIT 运行时测试
+./build.sh release x86
+
+# AArch64 release：用于嵌入式目标或交叉验证
+./build.sh release aarch64</code></pre>
+
+  <p>资源受限机器上推荐目标化增量构建：</p>
+
+<pre><code class="language-bash"># 开发构建核心工具
+ninja -C build_debug_x86 clang opt lld
+
+# EJIT runtime + linker
+ninja -C build_release_x86 LLVMEJIT lld
+
+# AArch64 runtime
+ninja -C build_release_aarch64 LLVMEJIT lld</code></pre>
+
+  <h3>5.2 编译用户程序</h3>
+  <p>用户程序需要使用带 EJIT 属性和 AOT pass 的 Clang 编译，并链接 <code>libLLVMEJIT.a</code>。实际项目建议复用 <code>ejit_test/build.sh</code> 中的链接规则。概念上流程如下：</p>
+
+<pre><code class="language-bash"># 示例：以 build_release_x86 为例，具体 include/lib 路径按构建目录调整
+build_release_x86/bin/clang -O2 -g \
+  -Illvm/include -Ibuild_release_x86/include \
+  my_ejit_app.c \
+  build_release_x86/lib/libLLVMEJIT.a \
+  -fuse-ld=lld -o my_ejit_app</code></pre>
+
+  <div class="note"><strong>说明：</strong> EJIT 的 AOT pass 已集成到当前分支的 Clang/LLVM pipeline 中；正常使用带 EJIT 的 Clang 编译即可生成 metadata、嵌入 bitcode、插入 wrapper 和生命周期调用。</div>
+
+  <h3>5.3 关闭 EJIT 做 A/B 对比</h3>
+<pre><code class="language-bash">build_release_x86/bin/clang -DEJIT_DISABLE -O2 my_ejit_app.c -o my_aot_app</code></pre>
+  <p><code>EJIT_DISABLE</code> 会把属性宏展开为空，便于确认逻辑正确性、比较 AOT 和 EJIT 行为。</p>
+
+  <h3>5.4 裁剪与单对象打包</h3>
+  <p>面向裸核或小型化交付时，可以启用 LLVM 后端裁剪并用 lipo pipeline 将多个 LLVM archive 合并为单个 <code>ejit.o</code>。</p>
+
+<pre><code class="language-bash"># 推荐通过项目脚本生成 AArch64 单对象
+./ejit_test/lipo/run_aarch64_pipeline.sh build_release_aarch64 ejit_test/lipo/ejit.o
+
+# 使用 lipo 产物运行集成测试
+./ejit_test/build.sh --run --lipo=ejit_test/lipo/ejit.o</code></pre>
+
+  <p>稳定裁剪选项为 <code>-DEJIT_TRIM_LLVM_BACKEND=ON</code>。SRE code pool 相关选项见第 8 节。</p>
+</section>
+
+<section id="pipeline">
+  <h2>6. AOT/JIT 流程</h2>
+
+  <h3>6.1 AOT 编译期做了什么</h3>
+  <ol>
+    <li>Clang 解析 EJIT 属性，生成函数/全局变量级 <code>!ejit.metadata</code>，并在 may_const 字段 load 上生成 <code>!ejit.may_const</code>。</li>
+    <li><strong>PASS1</strong> <code>EJitRegisterBitcode</code> 在标准优化前提取 <code>ejit_entry</code> 闭包 bitcode，嵌入二进制并生成注册信息。</li>
+    <li><strong>PASS2</strong> <code>EJitRegisterPeriod</code> 生成 period 数组和 static 变量注册。</li>
+    <li><strong>PASS3</strong> <code>EJitWrapperGen</code> 在原函数入口插入 wrapper：构造 cache key，调用运行时，成功则跳转特化函数，失败则继续原 AOT 函数体。</li>
+    <li><strong>PASS4</strong> <code>EJitPeriodHandler</code> 在生命周期函数入口插入 deactivate，在所有 return 前插入 activate。</li>
+    <li><strong>PASS5</strong> <code>EJitAotModulePass</code> 协调 PASS2-4。</li>
+  </ol>
+
+  <h3>6.2 运行时 JIT 做了什么</h3>
+  <ol>
+    <li>按 cache key 查缓存，命中则返回函数指针。</li>
+    <li>未命中时加载嵌入 bitcode。</li>
+    <li>把 <code>ejit_period_arr_ind</code> 参数替换为本次调用的常量下标。</li>
+    <li>运行 InstCombine 折叠 zext/GEP 等常量链。</li>
+    <li>内联被调函数，使跨函数字段访问暴露为全局变量 GEP。</li>
+    <li><strong>PASS6</strong> <code>EJitStructFieldPass</code> 将 <code>ejit_may_const</code> 字段 load 替换为当前内存值常量。</li>
+    <li>按 L1/L2/L3 运行标准 LLVM 优化，生成机器码，放入 cache。</li>
+  </ol>
+
+  <h3>6.3 优化等级</h3>
+  <table>
+    <thead><tr><th>等级</th><th>定位</th><th>典型优化</th></tr></thead>
+    <tbody>
+      <tr><td><code>EJIT_OPT_L1</code></td><td>保守</td><td>常量传播、死代码消除、分支折叠</td></tr>
+      <tr><td><code>EJIT_OPT_L2</code></td><td>默认/均衡</td><td>L1 + CFG 简化、适度内联</td></tr>
+      <tr><td><code>EJIT_OPT_L3</code></td><td>激进</td><td>L2 + 更激进循环优化；注意代码体积</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="tests">
+  <h2>7. 测试与验证</h2>
+
+  <h3>7.1 集成测试</h3>
+<pre><code class="language-bash"># 从仓库根目录运行全部 EJIT 集成测试
+./ejit_test/build.sh --run
+
+# 运行指定测试
+./ejit_test/build.sh --run ejit_attr_test ejit_ptr_period_test
+
+# 仅构建指定测试
+./ejit_test/build.sh ejit_config_api_test</code></pre>
+
+  <p>常用测试覆盖：</p>
+  <table>
+    <thead><tr><th>测试</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_attr_test</code></td><td>6 种属性和基本使用场景</td></tr>
+      <tr><td><code>ejit_jit_verify_test</code></td><td>JIT 正确性、常量折叠、死分支消除</td></tr>
+      <tr><td><code>ejit_lifecycle_test</code></td><td>生命周期 deactivate/activate 配对</td></tr>
+      <tr><td><code>ejit_multidim_test</code></td><td>多维时间窗特化</td></tr>
+      <tr><td><code>ejit_nested_struct_test</code></td><td>嵌套结构体 may_const</td></tr>
+      <tr><td><code>ejit_config_api_test</code></td><td>配置、统计、cache、编译模式 API</td></tr>
+      <tr><td><code>ejit_perf_bench</code></td><td>编译耗时、cache hit 延迟等性能数据</td></tr>
+    </tbody>
+  </table>
+
+  <h3>7.2 IR 检查点</h3>
+  <p>如果怀疑 AOT pass 没有生效，可检查编译中间 IR 中是否存在以下特征：</p>
+  <table>
+    <thead><tr><th>检查项</th><th>期望</th></tr></thead>
+    <tbody>
+      <tr><td><code>!ejit.metadata</code></td><td>函数和全局变量包含 <code>ejit_entry</code>、<code>ejit_period</code>、<code>ejit_period_arr</code> 等 metadata</td></tr>
+      <tr><td><code>!ejit.may_const</code></td><td>标注字段的 load 指令带 may_const metadata</td></tr>
+      <tr><td><code>@__ejit_bitcode</code></td><td>嵌入 bitcode 位于专用 section</td></tr>
+      <tr><td><code>ejit_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
+      <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>存在 JIT 分发路径和 AOT fallback 路径</td></tr>
+      <tr><td><code>ejit_deactivate_array</code> / <code>ejit_activate_array</code></td><td>生命周期函数入口/出口插桩</td></tr>
+    </tbody>
+  </table>
+
+  <h3>7.3 Lit / FileCheck</h3>
+<pre><code class="language-bash"># 单个 LLVM pass 测试示例
+cd build_debug_x86
+./bin/llvm-lit -v ../llvm/test/Transforms/EmbeddedJIT/
+
+# Clang 属性测试示例
+./bin/llvm-lit -v ../clang/test/Sema/ext_attr_ejit.cpp
+./bin/llvm-lit -v ../clang/test/CodeGen/ejit_metadata.c</code></pre>
+</section>
+
+<section id="platform">
+  <h2>8. 裸核与 SRE 部署</h2>
+
+  <h3>8.1 Host 与 bare-metal 注册路径</h3>
+  <table>
+    <thead><tr><th>环境</th><th>注册机制</th><th>建议</th></tr></thead>
+    <tbody>
+      <tr><td>Host/Linux</td><td><code>llvm.global_ctors</code> 触发 <code>ejit_auto_register</code></td><td>正常调用 <code>ejit_init</code> 即可消费注册信息</td></tr>
+      <tr><td>Bare-metal</td><td>构造函数可能不可用；使用 <code>__ejit_registry_*[]</code> 静态注册表</td><td>配置 <code>forceStaticRegistry = true</code>，链接脚本保留 registry section</td></tr>
+      <tr><td>无动态符号解析</td><td>无法依赖 <code>dlsym</code></td><td>使用自动或手动 <code>ejit_register_symbol</code> 注册外部符号</td></tr>
+    </tbody>
+  </table>
+
+  <h3>8.2 SRE Code Pool</h3>
+  <p>SRE code pool 用于替代常规 <code>mmap/mprotect</code> JIT 代码内存路径，适合对可执行内存权限有严格要求的平台。</p>
+
+<pre><code class="language-bash"># CMake 选项示意
+-DEJIT_SRE_CODE_POOL=ON
+-DEJIT_CODE_POOL_4K_SEAL=ON</code></pre>
+
+  <ul>
+    <li>从 2MiB 对齐代码池分配 JIT 机器码；</li>
+    <li>4K seal 模式下只将写入的 4K 页标记为可执行；</li>
+    <li>避免写 RX 页，finalize 后不再修改；</li>
+    <li>需要平台提供 <code>enable_ex</code>、<code>split_2m_to_4k</code>、<code>SRE_MemDbgAlloc</code> 等符号。</li>
+  </ul>
+
+  <h3>8.3 SRE Taskpool</h3>
+  <p>SRE taskpool 是面向无 C++ thread 库环境的异步编译调度模式，默认关闭。它使用单 worker task、MPSC 队列、去重表和分桶 cache。跨核共享 taskpool 依赖共享内存映射、可执行权限、I/D cache 一致性和 owner 选举。</p>
+
+<pre><code class="language-bash"># 构建选项示意
+./build.sh release aarch64_be --freestanding --sre-taskpool</code></pre>
+
+  <div class="warn"><strong>状态提示：</strong> SRE taskpool / shared taskpool 属于平台相关能力，host 单测可验证核心逻辑，但最终仍需在目标 SRE 多核环境验证共享 section、跨核执行、任务删除和 cache 一致性。</div>
+</section>
+
+<section id="troubleshooting">
+  <h2>9. 排障指南</h2>
+
+  <h3>9.1 编译期常见诊断</h3>
+  <table>
+    <thead><tr><th>现象</th><th>原因</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_period</code> 用在数组上</td><td>数组应使用 <code>ejit_period_arr</code></td><td>改为 <code>ejit_period_arr(name)</code></td></tr>
+      <tr><td><code>ejit_period_arr</code> 用在非数组上</td><td>标量变量不应使用数组时间窗</td><td>静态标量使用 <code>ejit_period(static)</code></td></tr>
+      <tr><td><code>ejit_period_arr_ind</code> 参数不是整数</td><td>下标必须可编码为整数维度</td><td>使用 <code>uint8_t</code> / <code>int</code> 等整数类型</td></tr>
+      <tr><td>超过 4 个维度</td><td>cache key 只编码 4 个 8-bit 维度</td><td>减少维度或拆分函数</td></tr>
+      <tr><td><code>ejit_period_lc</code> 没有同名 index 参数</td><td>生命周期函数无法知道修改哪个实例</td><td>添加 <code>ejit_period_arr_ind(name)</code> 参数</td></tr>
+      <tr><td>递归 <code>ejit_entry</code></td><td>当前不支持递归入口特化</td><td>移除 <code>ejit_entry</code> 或改造调用结构</td></tr>
+    </tbody>
+  </table>
+
+  <h3>9.2 JIT 没有触发</h3>
+  <ol>
+    <li>确认函数是否标注 <code>ejit_entry</code>。</li>
+    <li>确认使用的是带 EJIT 的 Clang，而不是系统 Clang。</li>
+    <li>确认 <code>ejit_init</code> 已在调用 <code>ejit_entry</code> 前执行。</li>
+    <li>确认相关时间窗已经 <code>ejit_activate</code>。</li>
+    <li>确认编译产物中存在 <code>@__ejit_bitcode</code> 和 <code>ejit_compile_or_get</code>。</li>
+    <li>裸核场景确认 registry section 没被链接器垃圾回收。</li>
+    <li>查看 <code>ejit_get_last_error()</code> 和 <code>ejit_get_stats()</code>。</li>
+  </ol>
+
+  <h3>9.3 JIT 触发但分支没有被折叠</h3>
+  <ol>
+    <li>字段是否标注了 <code>ejit_may_const</code>。</li>
+    <li>字段是否为 <code>volatile</code>；volatile 字段不会被常量替换。</li>
+    <li>全局变量是否标注 <code>ejit_period(static)</code> 或 <code>ejit_period_arr(name)</code>。</li>
+    <li>入口函数参数是否标注匹配的 <code>ejit_period_arr_ind(name)</code>。</li>
+    <li>时间窗是否激活，且下标是否正确。</li>
+    <li>访问模式是否能被 InstCombine/Inline 化为常量 GEP；复杂 PHI/select 指针路径可能被跳过。</li>
+    <li>设置 <code>dumpJITDir</code>，检查优化后 IR 是否已将 load 替换为常量。</li>
+  </ol>
+
+  <h3>9.4 运行时 fallback 常见原因</h3>
+  <ul>
+    <li>时间窗未激活或已失效；</li>
+    <li>异步模式首次调用尚未编译完成；</li>
+    <li>bitcode 未找到或注册失败；</li>
+    <li>外部符号未注册；</li>
+    <li>JIT 编译失败、目标后端缺失；</li>
+    <li>内存不足、cache 已满、单函数代码量超过上限；</li>
+    <li>指针型 <code>ejit_period_arr</code> 未初始化或越界；</li>
+    <li>字段访问模式太复杂，PASS6 安全跳过。</li>
+  </ul>
+</section>
+
+<section id="limits">
+  <h2>10. 限制与建议</h2>
+
+  <h3>10.1 当前限制</h3>
+  <ul>
+    <li>仅支持 Clang 属性路径；GCC 兼容为未来工作。</li>
+    <li><code>ejit_entry</code> 不支持递归。</li>
+    <li>函数指针调用目标暂不特化。</li>
+    <li>自定义标量 <code>ejit_period(name)</code> 依赖声明为未来扩展；当前标量建议使用 <code>static</code>。</li>
+    <li>单个函数最多 4 个 <code>ejit_period_arr_ind</code> 维度。</li>
+    <li>时间窗数组建议较小；固定数组设计目标为 &lt;100，全局最多 1024 个 period array。</li>
+    <li><code>!ejit.may_const</code> 是软标注：丢失时只会少优化，不应影响正确性。</li>
+    <li>复杂指针、PHI/select、非线性下标路径可能无法替换为常量。</li>
+    <li>JIT bitcode 与运行时 LLVM 版本需要匹配。</li>
+  </ul>
+
+  <h3>10.2 使用建议</h3>
+  <div class="cards">
+    <div class="card">
+      <h4>优先选择稳定配置字段</h4>
+      <p>只把真正时间窗内不变的字段标为 <code>ejit_may_const</code>，不要标记频繁变化字段。</p>
+    </div>
+    <div class="card">
+      <h4>让维度简单</h4>
+      <p>使用 <code>uint8_t</code> 下标和直接数组访问，避免复杂指针别名。</p>
+    </div>
+    <div class="card">
+      <h4>集中修改配置</h4>
+      <p>通过 <code>ejit_period_lc</code> 函数修改配置，避免分散写 may_const 字段。</p>
+    </div>
+    <div class="card">
+      <h4>先验证再优化</h4>
+      <p>使用 <code>EJIT_DISABLE</code> 做 A/B 对比，再开启 dump IR 和 stats 验证优化收益。</p>
+    </div>
+  </div>
+
+  <h3>10.3 上线前检查清单</h3>
+  <ul>
+    <li>所有 <code>ejit_entry</code> 均有 fallback 正确性测试。</li>
+    <li>所有配置修改路径都有 <code>ejit_period_lc</code> 或手动 deactivate/activate。</li>
+    <li>同步/异步模式下行为一致，异步首次 fallback 不影响业务副作用。</li>
+    <li>cache size、单函数 size、code memory 上限符合目标设备内存约束。</li>
+    <li>裸核场景确认外部符号、registry section、代码内存权限、I/D cache 刷新路径。</li>
+    <li>性能数据包含 cold compile、hot cache hit、fallback、失效重编译四类场景。</li>
+  </ul>
+</section>
+
+<section id="references">
+  <h2>11. 参考文档</h2>
+  <p>本手册根据 <code>jit_design_doc</code> 下的设计文档和当前头文件整理，重点参考：</p>
+  <ul>
+    <li><a href="SPEC4.md">SPEC4.md</a> — 需求规格、用户标注接口、运行时 API、限制。</li>
+    <li><a href="PLAN4.md">PLAN4.md</a> — 端到端架构、AOT/JIT pipeline、数据模型。</li>
+    <li><a href="CLANG_ATTR_DESIGN.md">CLANG_ATTR_DESIGN.md</a> — 6 种 Clang 属性、Sema 诊断、CodeGen metadata。</li>
+    <li><a href="PASS1_EJitRegisterBitcode.md">PASS1_EJitRegisterBitcode.md</a> — bitcode 提取嵌入、外部符号注册。</li>
+    <li><a href="PASS2_EJitRegisterPeriod.md">PASS2_EJitRegisterPeriod.md</a> — period/static 注册。</li>
+    <li><a href="PASS3_EJitWrapperGen.md">PASS3_EJitWrapperGen.md</a> — wrapper 生成和 cache key。</li>
+    <li><a href="PASS4_EJitPeriodHandler.md">PASS4_EJitPeriodHandler.md</a> — 生命周期插桩。</li>
+    <li><a href="PASS5_EJitAotModulePass.md">PASS5_EJitAotModulePass.md</a> — AOT pass 协调。</li>
+    <li><a href="PASS6_EJitStructFieldPass.md">PASS6_EJitStructFieldPass.md</a> — may_const 字段常量替换。</li>
+    <li><a href="PASS7_EJitRuntime_OrcJITLink.md">PASS7_EJitRuntime_OrcJITLink.md</a> — 运行时、ORC/JITLink、cache、错误处理。</li>
+    <li><a href="EJIT_LIBRARY_TRIMMING.md">EJIT_LIBRARY_TRIMMING.md</a>、<a href="EJIT_TRIM_LLVM_BACKEND.md">EJIT_TRIM_LLVM_BACKEND.md</a> — 裁剪和单对象交付。</li>
+    <li><a href="EJIT_SRE_CODE_POOL.md">EJIT_SRE_CODE_POOL.md</a>、<a href="EJIT_SRE_TASKPOOL.md">EJIT_SRE_TASKPOOL.md</a> — SRE 代码池和 taskpool。</li>
+  </ul>
+
+  <footer>
+    <p>生成日期：2026-06-27。本文档是面向用户的使用手册，不替代底层设计文档；当 API 头文件与早期设计文档存在字段命名差异时，以当前头文件为准。</p>
+  </footer>
+</section>
+</main>
+</div>
+</body>
+</html>
