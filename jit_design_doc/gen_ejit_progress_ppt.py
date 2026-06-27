@@ -435,9 +435,90 @@ def page2():
         anchor=MSO_ANCHOR.MIDDLE)
 
 # ════════════════════════════════════════════════════════════════
-# 第 3 页：编译器的技术规划与畅想 (AI × 传统编译器)
+# 第 3 页：EJIT 后续工作规划
 # ════════════════════════════════════════════════════════════════
-def page3():
+def page3_roadmap():
+    s = slide()
+    header(s, "EJIT 后续工作规划", "从代码完成 → 真机验证 → 性能收益 → 可交付工程化")
+
+    bx = Inches(0.35); by = Inches(0.98); bw = Inches(12.65)
+    rect(s, bx, by, bw, Inches(0.5), PRIMARY)
+    txt(s, bx, by, bw, Inches(0.5),
+        [[("目标: 形成可复现的 EJIT 闭环证据链 —— ", 11.5, WHITE, True, FONT),
+          ("真机可跑", 11.5, RGBColor(0xCF,0xE0,0xF5), True, FONT),
+          (" / ", 11.5, WHITE, True, FONT),
+          ("收益可量化", 11.5, RGBColor(0xCF,0xE0,0xF5), True, FONT),
+          (" / ", 11.5, WHITE, True, FONT),
+          ("交付可裁剪", 11.5, RGBColor(0xCF,0xE0,0xF5), True, FONT)]],
+        align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+
+    # ── 三阶段路线图 ──
+    phases = [
+        ("近期：验证闭环", "2~4 周", GREEN, [
+            ("SRE/AArch64 真机", "验证跨核共享 worker、裸核链接、平台符号接入"),
+            ("Taskpool 压测", "MPSC 队列、去重、分桶缓存、version 失效长稳测试"),
+            ("JITLink/CodePool", "4K/2MiB 池边界、释放策略、失败 fallback 行为"),
+            ("端到端 Demo", "从属性标注到运行时特化的可复现实验脚本"),
+        ]),
+        ("中期：收益量化", "1~2 月", ACCENT, [
+            ("Benchmark 体系", "zlib/zstd/业务 kernel: cold/hot/命中率/编译耗时"),
+            ("PASS6 增强", "数组/嵌套结构/volatile/别名场景覆盖与收益分析"),
+            ("调参策略", "L1/L2/L3 pipeline、缓存上限、异步编译触发阈值"),
+            ("裁剪体积", "单 ejit.o 继续瘦身: PassBuilder/Target/JITLink 依赖收敛"),
+        ]),
+        ("远期：工程交付", "季度", PRIMARY, [
+            ("平台抽象固化", "host/SRE/bare-metal 三套配置稳定化与文档化"),
+            ("诊断与可观测", "trace/dump/错误码/统计 counters 统一输出"),
+            ("安全护栏", "注册冻结、符号白名单、内存权限切换与越界保护"),
+            ("论文/专利材料", "时间窗常量 + 运行时特化 + 裁剪 JIT 的体系化总结"),
+        ]),
+    ]
+
+    x0 = Inches(0.35); y0 = Inches(1.65); gap = Inches(0.2)
+    colw = (Inches(12.65) - gap * 2) / 3
+    for idx, (title, span, color, items) in enumerate(phases):
+        x = x0 + idx * (colw + gap)
+        rect(s, x, y0, colw, Inches(0.42), color)
+        txt(s, x + Inches(0.12), y0, colw - Inches(0.24), Inches(0.42),
+            [[(title, 12, WHITE, True, FONT), ("  ·  ", 10, WHITE, False, FONT),
+              (span, 10, RGBColor(0xE8,0xF2,0xFF), True, FONT)]],
+            anchor=MSO_ANCHOR.MIDDLE)
+        cy = y0 + Inches(0.55)
+        for no, (name, desc) in enumerate(items, 1):
+            card(s, x, cy, colw, Inches(0.72), bar=color)
+            rect(s, x + Inches(0.16), cy + Inches(0.14), Inches(0.34), Inches(0.34), color)
+            txt(s, x + Inches(0.16), cy + Inches(0.14), Inches(0.34), Inches(0.34),
+                [[(str(no), 9.5, WHITE, True, FONT)]], align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+            txt(s, x + Inches(0.58), cy + Inches(0.07), colw - Inches(0.75), Inches(0.26),
+                [[(name, 10.5, DARK, True, FONT)]], anchor=MSO_ANCHOR.MIDDLE)
+            txt(s, x + Inches(0.58), cy + Inches(0.34), colw - Inches(0.75), Inches(0.32),
+                [[(desc, 8.3, GRAY, False, FONT)]], anchor=MSO_ANCHOR.MIDDLE)
+            cy += Inches(0.8)
+
+    # ── 底部交付物 ──
+    dy = Inches(6.15)
+    txt(s, Inches(0.35), dy - Inches(0.28), Inches(12.65), Inches(0.25),
+        [[("▎阶段性交付物", 12.5, DARK, True, FONT)]])
+    deliverables = [
+        ("真机验证报告", "SRE 多核 / 裸核 / fallback"),
+        ("性能收益表", "命中率 / 耗时 / 加速比"),
+        ("裁剪构建包", "LLVMEJIT.a / 单 ejit.o"),
+        ("可复现 Demo", "脚本 + 测试 + 文档"),
+    ]
+    dw = Inches(3.05)
+    for i, (name, desc) in enumerate(deliverables):
+        x = Inches(0.35) + i * Inches(3.2)
+        rect(s, x, dy, dw, Inches(0.72), BG_GRAY, line=BORDER, line_w=0.5)
+        rect(s, x, dy, Inches(0.06), Inches(0.72), PRIMARY)
+        txt(s, x + Inches(0.18), dy + Inches(0.06), dw - Inches(0.3), Inches(0.28),
+            [[(name, 10.5, DARK, True, FONT)]], anchor=MSO_ANCHOR.MIDDLE)
+        txt(s, x + Inches(0.18), dy + Inches(0.36), dw - Inches(0.3), Inches(0.28),
+            [[(desc, 8.5, GRAY, False, FONT)]], anchor=MSO_ANCHOR.MIDDLE)
+
+# ════════════════════════════════════════════════════════════════
+# 第 4 页：编译器的技术规划与畅想 (AI × 传统编译器)
+# ════════════════════════════════════════════════════════════════
+def page4():
     s = slide()
     header(s, "编译器的技术规划与畅想", "AI × 传统编译器 · 用 AI 改造编译器本身")
 
@@ -537,10 +618,11 @@ def page3():
 
 page1()
 page2()
-page3()
+page3_roadmap()
+page4()
 
 _today = datetime.now().strftime("%Y%m%d")
 out = f"/home/ruanchen/djq/github/ejit/llvm-project/jit_design_doc/EJIT进展_{_today}.pptx"
 prs.save(out)
 print("已生成:", out)
-print("共 3 页 (通用汇报风格)")
+print("共 4 页 (通用汇报风格)")
