@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT 构建与部署手册</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1120px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{margin-top:24px}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;vertical-align:top;text-align:left}th{background:#edf2f7}tr:nth-child(even) td{background:#fafcff}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px}.warn{background:#fff7ed;border-left:5px solid #dd6b20;border-radius:10px;padding:12px 14px}.nav a{margin-right:12px;color:#3182ce}
+  </style>
+</head>
+<body>
+<header><h1>EJIT 构建与部署手册</h1><p>从开发构建、集成测试到 AArch64、bare-metal、lipo 单对象和 SRE 模式部署。</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_QUICK_START.html">快速开始</a><a href="EJIT_ARCHITECTURE.html">架构图</a></div>
+
+  <section>
+    <h2>1. 构建目录和用途</h2>
+    <table>
+      <tr><th>目录</th><th>用途</th><th>典型目标</th></tr>
+      <tr><td><code>build_debug_x86/</code></td><td>x86 Debug 开发构建，适合调试 clang/opt/lld</td><td><code>clang opt lld</code></td></tr>
+      <tr><td><code>build_release_x86/</code></td><td>x86 Release，适合 EJIT 测试和静态库链接</td><td><code>LLVMEJIT lld</code></td></tr>
+      <tr><td><code>build_debug_aarch64/</code></td><td>AArch64 Debug 交叉开发</td><td><code>clang opt lld</code></td></tr>
+      <tr><td><code>build_release_aarch64/</code></td><td>AArch64 Release runtime / lipo pipeline</td><td><code>LLVMEJIT lld</code></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>2. 推荐构建命令</h2>
+<pre><code class="language-bash"># 开发日常：x86 debug
+./build.sh debug x86
+ninja -C build_debug_x86 clang opt lld
+
+# EJIT 测试：x86 release runtime
+./build.sh release x86
+ninja -C build_release_x86 LLVMEJIT lld
+
+# AArch64 runtime
+./build.sh release aarch64
+ninja -C build_release_aarch64 LLVMEJIT lld</code></pre>
+    <div class="note">机器 CPU/内存有限时，优先使用 targeted ninja 目标，不要随意全量构建。</div>
+  </section>
+
+  <section>
+    <h2>3. 编译用户程序</h2>
+    <p>用户程序应使用本仓库构建出的 Clang，并链接对应的 EJIT runtime 静态库。</p>
+<pre><code class="language-bash">build_release_x86/bin/clang -O2 -g \
+  -Illvm/include -Ibuild_release_x86/include \
+  app.c \
+  build_release_x86/lib/libLLVMEJIT.a \
+  -fuse-ld=lld -o app</code></pre>
+    <p>建议以 <code>ejit_test/build.sh</code> 为准同步实际链接 flags。</p>
+  </section>
+
+  <section>
+    <h2>4. 集成测试</h2>
+<pre><code class="language-bash"># 构建并运行全部集成测试
+./ejit_test/build.sh --run
+
+# 运行指定测试
+./ejit_test/build.sh --run ejit_attr_test ejit_ptr_period_test
+
+# 仅构建
+./ejit_test/build.sh ejit_config_api_test</code></pre>
+    <table>
+      <tr><th>测试类型</th><th>代表测试</th><th>覆盖点</th></tr>
+      <tr><td>属性/metadata</td><td><code>ejit_attr_test</code></td><td>6 个属性、CodeGen metadata</td></tr>
+      <tr><td>正确性</td><td><code>ejit_jit_verify_test</code></td><td>常量折叠、死分支消除</td></tr>
+      <tr><td>生命周期</td><td><code>ejit_lifecycle_test</code></td><td>deactivate/activate 配对</td></tr>
+      <tr><td>多维</td><td><code>ejit_multidim_test</code></td><td>多 period 数组维度</td></tr>
+      <tr><td>性能</td><td><code>ejit_perf_bench</code></td><td>编译时间、cache hit 延迟</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. LLVM / Clang lit 测试</h2>
+<pre><code class="language-bash"># LLVM pass 测试
+cd build_debug_x86
+./bin/llvm-lit -v ../llvm/test/Transforms/EmbeddedJIT/
+
+# Clang 属性和 CodeGen 测试
+./bin/llvm-lit -v ../clang/test/Sema/ext_attr_ejit.cpp
+./bin/llvm-lit -v ../clang/test/CodeGen/ejit_metadata.c</code></pre>
+  </section>
+
+  <section>
+    <h2>6. 后端裁剪</h2>
+    <p>面向嵌入式交付时，开启稳定裁剪选项减少 EJIT runtime 依赖体积。</p>
+<pre><code class="language-bash"># CMake 选项
+-DEJIT_TRIM_LLVM_BACKEND=ON</code></pre>
+    <p>裁剪内容包括部分 AArch64 可选特性、GlobalISel、调试/EH/ObjCARC/CFGuard 等路径。</p>
+  </section>
+
+  <section>
+    <h2>7. lipo 单对象交付</h2>
+    <p>将多个 LLVM archive 抽取、GC、合并为单个 <code>ejit.o</code>，便于 bare-metal 链接。</p>
+<pre><code class="language-bash">./ejit_test/lipo/run_aarch64_pipeline.sh \
+  build_release_aarch64 \
+  ejit_test/lipo/ejit.o
+
+# 使用单对象运行集成测试
+./ejit_test/build.sh --run --lipo=ejit_test/lipo/ejit.o</code></pre>
+  </section>
+
+  <section>
+    <h2>8. Bare-metal 部署</h2>
+    <ul>
+      <li>链接脚本必须保留 <code>__ejit_registry_bitcode[]</code>、<code>__ejit_registry_period[]</code> 等 section。</li>
+      <li>构造函数不可用时，设置 <code>forceStaticRegistry = true</code>。</li>
+      <li>无 <code>dlsym</code> 时，确保外部符号通过自动或手动 <code>ejit_register_symbol</code> 注册。</li>
+      <li>POSIX/std stubs 只是链接占位；JIT 可执行内存应使用平台 code pool。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>9. SRE Code Pool</h2>
+<pre><code class="language-bash">-DEJIT_SRE_CODE_POOL=ON
+-DEJIT_CODE_POOL_4K_SEAL=ON</code></pre>
+    <table>
+      <tr><th>能力</th><th>说明</th></tr>
+      <tr><td>2MiB pool</td><td>从平台分配 2MiB 对齐代码池</td></tr>
+      <tr><td>4K seal</td><td>将写入页拆为 4K 并单独设置执行权限</td></tr>
+      <tr><td>平台符号</td><td>需要 <code>enable_ex</code>、<code>split_2m_to_4k</code>、<code>SRE_MemDbgAlloc</code></td></tr>
+      <tr><td>限制</td><td>池生命周期内通常不物理释放代码内存</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>10. SRE Taskpool</h2>
+<pre><code class="language-bash">./build.sh release aarch64_be --freestanding --sre-taskpool</code></pre>
+    <p>Taskpool 用于没有 C++ thread 库的 SRE 异步编译：单 worker、MPSC 队列、去重表、分桶 cache。跨核共享 taskpool 还需要共享内存映射、执行权限和 I/D cache 一致性验证。</p>
+    <div class="warn">SRE taskpool 属于平台相关模式，必须做目标真机验证。</div>
+  </section>
+</main>
+</body>
+</html>

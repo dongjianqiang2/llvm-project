@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT 内部流水线说明</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1120px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{margin-top:24px}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;vertical-align:top;text-align:left}th{background:#edf2f7}tr:nth-child(even) td{background:#fafcff}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.flow{background:#f8fafc;border:1px dashed #d9dee6;border-radius:10px;padding:14px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px}.nav a{margin-right:12px;color:#3182ce}
+  </style>
+</head>
+<body>
+<header><h1>EJIT 内部流水线说明</h1><p>面向 EJIT 维护者：Clang metadata、AOT PASS1~PASS5、运行时 PASS6、cache key、注册和 fallback 机制。</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_ARCHITECTURE.html">架构图</a><a href="../PLAN4.md">PLAN4</a></div>
+
+  <section>
+    <h2>1. 总体分层</h2>
+    <div class="flow">用户标注
+  ↓
+Clang Sema / CodeGen
+  ↓  生成 !ejit.metadata / !ejit.may_const
+AOT PASS1: bitcode 提取和嵌入
+AOT PASS2-4: period 注册 / wrapper / lifecycle
+AOT PASS5: 协调器
+  ↓
+运行时 wrapper 调用 ejit_compile_or_get
+  ↓
+JIT pipeline: 参数替换 → InstCombine → Inline → PASS6 → L1/L2/L3 → ORC/JITLink
+  ↓
+Code Cache / fallback AOT</div>
+  </section>
+
+  <section>
+    <h2>2. Clang metadata</h2>
+    <table>
+      <tr><th>metadata</th><th>位置</th><th>用途</th></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>Function</td><td>标记 <code>ejit_entry</code>、<code>ejit_period_arr_ind</code>、<code>ejit_period_lc</code></td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>GlobalVariable</td><td>标记 <code>ejit_period</code>、<code>ejit_period_arr</code>、may_const 字段偏移回退信息</td></tr>
+      <tr><td><code>!ejit.may_const</code></td><td>LoadInst</td><td>PASS6 主路径识别可替换 load</td></tr>
+    </table>
+<pre><code class="language-llvm">define void @process(i8 %idx) !ejit.metadata !0 { ... }
+!0 = distinct !{!1, !2}
+!1 = !{!"ejit_entry"}
+!2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+
+@g_cellCfg = global [16 x %struct.CellConfig] zeroinitializer, !ejit.metadata !3
+!3 = distinct !{!4}
+!4 = !{!"ejit_period_arr", !"cell", i32 16}
+
+%v = load i32, ptr %field, !ejit.may_const !{}</code></pre>
+  </section>
+
+  <section>
+    <h2>3. AOT Pass 职责</h2>
+    <table>
+      <tr><th>Pass</th><th>时机</th><th>职责</th><th>关键产物</th></tr>
+      <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>标准优化前</td><td>提取 <code>ejit_entry</code> 闭包，保留 metadata，嵌入 bitcode，自动注册外部符号</td><td><code>@__ejit_bitcode</code>、registry bitcode entries</td></tr>
+      <tr><td>PASS2 <code>EJitRegisterPeriod</code></td><td>非 LTO 优化前 / LTO 优化后</td><td>扫描 period/static metadata，生成注册调用或静态表</td><td>period registry entries</td></tr>
+      <tr><td>PASS3 <code>EJitWrapperGen</code></td><td>同上</td><td>在原函数入口插入 cache key 计算、runtime 调用、dispatch/fallback</td><td><code>jit_dispatch</code>、<code>jit_fallback</code></td></tr>
+      <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>同上</td><td>生命周期函数入口/出口插入 deactivate/activate</td><td><code>ejit_deactivate_array</code>、<code>ejit_activate_array</code></td></tr>
+      <tr><td>PASS5 <code>EJitAotModulePass</code></td><td>协调</td><td>按序运行 PASS2-4，快速跳过无 EJIT metadata 模块</td><td>AOT pipeline 封装</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. PASS1 为什么必须早</h2>
+    <p><code>!ejit.may_const</code> 是 load 级软 metadata，标准优化可能合并、删除或重写 load。PASS1 在优化前提取原始 bitcode，并通过 GV 偏移列表 + reAnnotate 机制尽量恢复 metadata。</p>
+    <div class="note">正确性原则：metadata 丢失只会少做特化，不应导致错误替换。</div>
+  </section>
+
+  <section>
+    <h2>5. Wrapper 模型</h2>
+<pre><code class="language-c">void process_cell(uint8_t cellIdx, int value) {
+    uint64_t key = ((uint64_t)funcIdx &lt;&lt; 32) | cellIdx;
+    PFN_process_cell pfn = (PFN_process_cell)ejit_compile_or_get(key, NULL);
+    if (pfn)
+        return pfn(cellIdx, value);
+
+    // jit_fallback: 原函数体继续执行
+    ...
+}</code></pre>
+    <ul>
+      <li>单函数混合方案：不生成单独 fallback 函数。</li>
+      <li>cache key 在寄存器中计算，避免 dims 数组分配。</li>
+      <li>返回 NULL 即 fallback。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>6. Cache Key</h2>
+<pre><code>uint64_t key:
+bit 63..32: funcIndex / funcIdx
+bit 31..24: dim[3]
+bit 23..16: dim[2]
+bit 15..8 : dim[1]
+bit 7..0  : dim[0]</code></pre>
+    <table>
+      <tr><th>场景</th><th>key 低 32 位</th></tr>
+      <tr><td>仅 static</td><td><code>0</code></td></tr>
+      <tr><td>单维 cell=3</td><td><code>0x00000003</code></td></tr>
+      <tr><td>二维 cell=1,trp=5</td><td><code>0x00000501</code></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. Runtime JIT Pipeline</h2>
+    <ol>
+      <li>ModuleLoader 根据 funcIndex/cacheKey 找到嵌入 bitcode。</li>
+      <li>替换 <code>ejit_period_arr_ind</code> 参数为当前维度常量。</li>
+      <li>InstCombine 折叠 <code>zext</code>、GEP 和常量链。</li>
+      <li>Inline 展开跨函数字段访问。</li>
+      <li>PASS6 遍历 load，识别 <code>!ejit.may_const</code> 或 GV 偏移回退。</li>
+      <li>从 RuntimeState/Registry 找到 base address + offset，读取当前内存值。</li>
+      <li>用 ConstantInt/ConstantFP 替换 load。</li>
+      <li>运行 L1/L2/L3 优化并交给 ORC/JITLink 生成机器码。</li>
+      <li>写入 cache；wrapper 后续命中。</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>8. PASS6 替换条件</h2>
+    <table>
+      <tr><th>条件</th><th>说明</th></tr>
+      <tr><td>必须是 may_const load</td><td>load metadata 或 GV 偏移回退命中</td></tr>
+      <tr><td>根对象可追溯</td><td>GlobalVariable / 支持的全局指针模式</td></tr>
+      <tr><td>offset 可计算</td><td>GEP index 在参数替换和 InstCombine 后为常量</td></tr>
+      <tr><td>时间窗 active</td><td>periodName + cellIdx 处于 Active</td></tr>
+      <tr><td>类型可构造 Constant</td><td>整数、浮点、布尔等受支持类型</td></tr>
+    </table>
+    <p>PHI/select 指针、未知别名、非 constant offset、null pointer、volatile 字段会安全跳过。</p>
+  </section>
+
+  <section>
+    <h2>9. 注册路径</h2>
+    <table>
+      <tr><th>路径</th><th>机制</th><th>场景</th></tr>
+      <tr><td>构造函数路径</td><td><code>llvm.global_ctors</code> 执行 <code>ejit_auto_register</code>，暂存到 RegistrationStore</td><td>host/Linux</td></tr>
+      <tr><td>静态表路径</td><td><code>__ejit_registry_bitcode[]</code> / <code>__ejit_registry_period[]</code></td><td>bare-metal / 无 global ctor</td></tr>
+      <tr><td>手动注册</td><td>C++ API <code>registerBitcode/registerPeriodArray/registerStaticVar</code></td><td>测试或特殊平台</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>10. 维护者排查点</h2>
+    <ul>
+      <li>新增属性时，确认 Attr.td、Sema、CodeGen metadata、lit tests 同步。</li>
+      <li>改 wrapper 时，检查 debug info、profile、calling convention、varargs、PHI/return 合并。</li>
+      <li>改 PASS6 时，遵守“无法证明就跳过”的正确性原则。</li>
+      <li>改 cache/taskpool 时，检查失效、version、并发发布、读者释放和内存生命周期。</li>
+      <li>改 bare-metal 路径时，检查 linker section、符号注册、代码权限和 I/D cache。</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

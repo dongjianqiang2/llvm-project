@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT 5 分钟快速开始</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1080px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{color:#2d3748;margin-top:24px}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.step{border:1px solid #d9dee6;border-left:6px solid #3182ce;border-radius:12px;padding:14px 16px;margin:14px 0;background:#fff}.ok{background:#f0fff4;border-left:5px solid #38a16f;border-radius:10px;padding:12px 14px}.warn{background:#fff7ed;border-left:5px solid #dd6b20;border-radius:10px;padding:12px 14px}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;text-align:left;vertical-align:top}th{background:#edf2f7}a{color:#3182ce}.nav{margin-bottom:18px}.nav a{margin-right:12px}
+  </style>
+</head>
+<body>
+<header><h1>EJIT 5 分钟快速开始</h1><p>从零到跑通一个最小 EmbeddedJIT 示例。</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_USER_MANUAL.html">完整用户手册</a><a href="EJIT_TROUBLESHOOTING.html">排障指南</a></div>
+
+  <section class="step">
+    <h2>0. 你需要什么</h2>
+    <ul>
+      <li>使用本仓库构建出的带 EJIT 支持的 Clang。</li>
+      <li>链接 EJIT runtime：<code>libLLVMEJIT.a</code>。</li>
+      <li>用户代码包含 <code>llvm/ExecutionEngine/EJIT/EJitRuntime.h</code>。</li>
+    </ul>
+<pre><code class="language-bash">./build.sh debug x86
+./build.sh release x86
+ninja -C build_release_x86 LLVMEJIT lld</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>1. 写一个可特化的配置结构体</h2>
+    <p>把时间窗内稳定的字段标记为 <code>ejit_may_const</code>。不要标记频繁变化字段。</p>
+<pre><code class="language-c">#include &lt;stdint.h&gt;
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+
+#define MODE_FAST 1
+#define MODE_SAFE 2
+
+struct CellConfig {
+    ejit_may_const uint32_t mode;
+    ejit_may_const uint32_t threshold;
+    uint32_t counter;
+};
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>2. 标记 JIT 入口函数</h2>
+    <p><code>ejit_entry</code> 标记原函数；<code>ejit_period_arr_ind(cell)</code> 告诉 EJIT 哪个参数是 <code>cell</code> 时间窗下标。</p>
+<pre><code class="language-c">static void fast_path(int v);
+static void safe_path(int v);
+static void default_path(int v);
+
+ejit_entry
+void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+    if (g_cellCfg[cellIdx].mode == MODE_FAST) {
+        fast_path(value + g_cellCfg[cellIdx].threshold);
+    } else if (g_cellCfg[cellIdx].mode == MODE_SAFE) {
+        safe_path(value);
+    } else {
+        default_path(value);
+    }
+}</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>3. 标记配置修改函数</h2>
+    <p>修改 <code>ejit_may_const</code> 字段时，用 <code>ejit_period_lc</code> 包住生命周期。编译器会自动插入 deactivate/activate。</p>
+<pre><code class="language-c">ejit_period_lc(cell)
+void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                     uint32_t mode,
+                     uint32_t threshold) {
+    g_cellCfg[cellIdx].mode = mode;
+    g_cellCfg[cellIdx].threshold = threshold;
+}</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>4. 初始化 EJIT 并激活时间窗</h2>
+<pre><code class="language-c">int main(void) {
+    ejit_config_t cfg = {0};
+    cfg.compileMode = EJIT_COMPILE_SYNC;
+    cfg.optLevel = EJIT_OPT_L2;
+    cfg.maxCodeMemory = 2 * 1024 * 1024;
+    cfg.maxCacheEntries = 4096;
+    cfg.enableLogger = true;
+
+    if (ejit_init(&amp;cfg) != EJIT_OK)
+        return 1;
+
+    g_cellCfg[3].mode = MODE_FAST;
+    g_cellCfg[3].threshold = 10;
+    ejit_activate("cell", 3);
+
+    process_cell(3, 100); // 首次编译或 fallback
+    process_cell(3, 101); // 命中 cache 后执行特化代码
+
+    update_cell_cfg(3, MODE_SAFE, 20); // 旧 cache 失效
+    process_cell(3, 102);              // 重新编译或 fallback
+
+    ejit_shutdown();
+    return 0;
+}</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>5. 编译和运行</h2>
+    <p>实际项目建议参考 <code>ejit_test/build.sh</code> 的链接规则。概念命令如下：</p>
+<pre><code class="language-bash">build_release_x86/bin/clang -O2 -g \
+  -Illvm/include -Ibuild_release_x86/include \
+  quick_start.c \
+  build_release_x86/lib/libLLVMEJIT.a \
+  -fuse-ld=lld -o quick_start
+
+./quick_start</code></pre>
+  </section>
+
+  <section>
+    <h2>6. 怎么确认 JIT 生效</h2>
+    <table>
+      <tr><th>检查点</th><th>期望</th></tr>
+      <tr><td>编译 IR</td><td>存在 <code>!ejit.metadata</code>、<code>!ejit.may_const</code>、<code>@__ejit_bitcode</code></td></tr>
+      <tr><td>wrapper</td><td>入口调用 <code>ejit_compile_or_get</code>，有 <code>jit_dispatch</code>/<code>jit_fallback</code> 路径</td></tr>
+      <tr><td>运行时 stats</td><td>首次 miss 后 cache entries 增加，后续 hits 增加</td></tr>
+      <tr><td>dumpJITDir</td><td>优化后 IR 中配置字段 load 被常量替换，分支被折叠</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. 最常见的 5 个错误</h2>
+    <ol>
+      <li>忘记调用 <code>ejit_init</code>。</li>
+      <li>忘记 <code>ejit_activate("cell", idx)</code>。</li>
+      <li>字段没标 <code>ejit_may_const</code>。</li>
+      <li><code>ejit_entry</code> 参数没标 <code>ejit_period_arr_ind(cell)</code>。</li>
+      <li>直接修改配置字段，没走 <code>ejit_period_lc</code> 或手动 deactivate/activate。</li>
+    </ol>
+    <div class="ok">如果任何一步失败，EJIT 的原则是返回 NULL 并 fallback 到 AOT，不应该影响程序正确性。</div>
+  </section>
+</main>
+</body>
+</html>

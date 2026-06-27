@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT API / 属性速查</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1120px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{margin-top:24px}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;vertical-align:top;text-align:left}th{background:#edf2f7}tr:nth-child(even) td{background:#fafcff}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px}.warn{background:#fff7ed;border-left:5px solid #dd6b20;border-radius:10px;padding:12px 14px}.nav a{margin-right:12px;color:#3182ce}.badge{display:inline-block;background:#ebf2fa;color:#2c5282;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700}
+  </style>
+</head>
+<body>
+<header><h1>EJIT API / 属性速查</h1><p>用户可见属性宏、运行时 C API、配置字段、状态码和典型调用序列。</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_QUICK_START.html">快速开始</a><a href="EJIT_USER_MANUAL.html">完整手册</a></div>
+
+  <section>
+    <h2>1. 头文件与禁用宏</h2>
+<pre><code class="language-c">#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+
+// 编译时定义 EJIT_DISABLE 后，所有属性宏展开为空：
+// clang -DEJIT_DISABLE ...</code></pre>
+  </section>
+
+  <section>
+    <h2>2. 属性宏速查</h2>
+    <table>
+      <thead><tr><th>宏</th><th>标记对象</th><th>作用</th><th>示例</th><th>关键约束</th></tr></thead>
+      <tbody>
+        <tr><td><code>ejit_may_const</code></td><td>结构体字段</td><td>时间窗内可读作常量</td><td><code>ejit_may_const uint32_t mode;</code></td><td><code>volatile</code> 跳过；支持整型/布尔/浮点/嵌套结构体/数组</td></tr>
+        <tr><td><code>ejit_period(static)</code></td><td>非数组全局变量</td><td>运行期不变配置，永远激活</td><td><code>ejit_period(static) Cfg g_cfg;</code></td><td>当前推荐只用 <code>static</code> 标量时间窗</td></tr>
+        <tr><td><code>ejit_period_arr(name)</code></td><td>全局数组/结构体指针</td><td>按下标独立激活的时间窗数组</td><td><code>ejit_period_arr(cell) Cfg g_cells[16];</code></td><td>固定数组建议 &lt;100；全局最多 1024 个</td></tr>
+        <tr><td><code>ejit_entry</code></td><td>函数</td><td>JIT 特化入口</td><td><code>ejit_entry void f(...)</code></td><td>不支持递归；异步模式下副作用应幂等</td></tr>
+        <tr><td><code>ejit_period_arr_ind(name)</code></td><td>函数参数</td><td>声明特化维度下标</td><td><code>ejit_period_arr_ind(cell) uint8_t idx</code></td><td>必须整数；每函数最多 4 个维度</td></tr>
+        <tr><td><code>ejit_period_lc(name)</code></td><td>函数</td><td>修改时间窗数据的生命周期函数</td><td><code>ejit_period_lc(cell) void update(...)</code></td><td>必须有同名 <code>ejit_period_arr_ind</code> 参数；可多 period</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>3. 状态码与枚举</h2>
+<pre><code class="language-c">typedef enum {
+  EJIT_OK = 0,
+  EJIT_ERR_INVALID_PARAM = -1,
+  EJIT_ERR_NOT_ACTIVE = -2,
+  EJIT_ERR_COMPILE_FAILED = -3,
+  EJIT_ERR_CACHE_FULL = -4,
+  EJIT_ERR_MEMORY = -5,
+  EJIT_ERR_BITCODE_NOT_FOUND = -6,
+  EJIT_ERR_QUEUE_FULL = -7,
+  EJIT_ERR_DEDUP_FULL = -8,
+  EJIT_ERR_DISABLED = -9,
+  EJIT_ERR_INSTANCE_DISABLED = -10,
+  EJIT_PENDING = 1,
+} ejit_status_t;
+
+typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
+typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;</code></pre>
+  </section>
+
+  <section>
+    <h2>4. 配置结构体</h2>
+<pre><code class="language-c">typedef struct {
+  ejit_compile_mode_t compileMode;
+  ejit_opt_level_t optLevel;
+  size_t maxCodeMemory;
+  size_t maxDataMemory;
+  size_t maxCacheEntries;
+  size_t maxCacheSize;
+  bool enableLogger;
+  bool forceStaticRegistry;
+  const char *dumpJITDir;
+} ejit_config_t;</code></pre>
+    <table>
+      <tr><th>字段</th><th>说明</th><th>建议</th></tr>
+      <tr><td><code>compileMode</code></td><td>同步/异步编译</td><td>默认先用 <code>SYNC</code> 验证；实时敏感再用 <code>ASYNC</code></td></tr>
+      <tr><td><code>optLevel</code></td><td>JIT 优化等级</td><td>通常 <code>L2</code>；代码体积敏感用 <code>L1</code></td></tr>
+      <tr><td><code>maxCodeMemory</code></td><td>JIT 代码内存上限</td><td>按目标平台 RAM 设置</td></tr>
+      <tr><td><code>maxCacheEntries</code>/<code>maxCacheSize</code></td><td>cache 条目/总大小</td><td>根据维度组合数设置</td></tr>
+      <tr><td><code>forceStaticRegistry</code></td><td>强制静态注册表路径</td><td>bare-metal/无构造函数环境开启</td></tr>
+      <tr><td><code>dumpJITDir</code></td><td>输出优化后 IR</td><td>排障和确认分支折叠时开启</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. 初始化 / 关闭</h2>
+<pre><code class="language-c">ejit_status_t ejit_init(const ejit_config_t *config);
+void ejit_shutdown(void);</code></pre>
+    <p>调用 <code>ejit_entry</code> 前必须先 <code>ejit_init</code>。传 <code>NULL</code> 使用默认配置。程序退出或不再使用 EJIT 时调用 <code>ejit_shutdown</code>。</p>
+  </section>
+
+  <section>
+    <h2>6. 生命周期 API</h2>
+<pre><code class="language-c">ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
+ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
+
+ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
+                                  uint8_t cellIdx);
+ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
+                                    uint8_t cellIdx);
+
+ejit_status_t ejit_activate_all(const char *periodName);
+ejit_status_t ejit_deactivate_all(const char *periodName);
+bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
+    <table>
+      <tr><th>接口</th><th>语义</th><th>典型使用</th></tr>
+      <tr><td><code>activate</code></td><td>激活同名 period 下所有数组的某个下标</td><td><code>ejit_activate("cell", 3)</code></td></tr>
+      <tr><td><code>deactivate</code></td><td>使同名 period 下某个下标失效并触发缓存失效</td><td>手动修改配置前</td></tr>
+      <tr><td><code>activate_array</code></td><td>只激活指定数组</td><td>同名 period 多数组但只更新其中一个</td></tr>
+      <tr><td><code>activate_all</code></td><td>激活某 period 所有实例</td><td>初始化后批量激活</td></tr>
+      <tr><td><code>is_active</code></td><td>查询状态</td><td>调试/断言</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. Cache / 统计 / 错误</h2>
+<pre><code class="language-c">void ejit_clear_cache(void);
+void ejit_invalidate(const char *periodName, uint8_t cellIdx);
+
+typedef struct {
+  size_t entryCount;
+  size_t totalCodeSize;
+  size_t maxSize;
+  uint64_t hits;
+  uint64_t misses;
+  uint64_t evictions;
+} ejit_stats_t;
+
+ejit_status_t ejit_get_stats(ejit_stats_t *stats);
+const ejit_error_t *ejit_get_last_error(void);</code></pre>
+  </section>
+
+  <section>
+    <h2>8. 内部 wrapper API</h2>
+<pre><code class="language-c">void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn);</code></pre>
+    <div class="note">普通用户不直接调用该接口。AOT wrapper 会预先计算 <code>cacheKey = funcIdx(32b) | dim[3] | dim[2] | dim[1] | dim[0]</code> 并调用它。返回 NULL 时 wrapper 自动 fallback 到原函数体。</div>
+  </section>
+
+  <section>
+    <h2>9. SRE Taskpool 扩展 API</h2>
+<pre><code class="language-c">typedef struct { uint32_t dimType; uint32_t instanceId; } ejit_dim_pair_t;
+
+ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
+                                           const ejit_dim_pair_t *dims,
+                                           uint32_t numDims,
+                                           void **outFn,
+                                           uint32_t *outBucket);
+void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
+                                        uint32_t enabled);
+void ejit_taskpool_release_read(uint32_t bucketIndex);
+unsigned ejit_taskpool_pending_count(void);
+ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);</code></pre>
+    <div class="warn">这些接口用于 <code>EJIT_SRE_TASKPOOL</code> 构建，普通 host/legacy cache 路径通常不需要直接使用。</div>
+  </section>
+
+  <section>
+    <h2>10. 推荐调用序列</h2>
+<pre><code class="language-c">ejit_init(&amp;cfg);
+
+// 初始化配置数据
+g_cellCfg[idx].mode = MODE_FAST;
+
+// 激活后调用 ejit_entry
+ejit_activate("cell", idx);
+process_cell(idx, value);
+
+// 修改配置：推荐生命周期函数
+update_cell_cfg(idx, MODE_SAFE, threshold);
+
+// 或手动：deactivate → 修改 → activate
+ejit_deactivate("cell", idx);
+g_cellCfg[idx].mode = MODE_SAFE;
+ejit_activate("cell", idx);
+
+ejit_shutdown();</code></pre>
+  </section>
+</main>
+</body>
+</html>

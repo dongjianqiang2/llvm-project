@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT 示例集</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1120px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{margin-top:24px}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.case{border:1px solid #d9dee6;border-left:6px solid #2c5282;border-radius:12px;padding:14px 16px;margin:16px 0}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px}.nav a{margin-right:12px;color:#3182ce}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;vertical-align:top;text-align:left}th{background:#edf2f7}
+  </style>
+</head>
+<body>
+<header><h1>EJIT 示例集</h1><p>常见使用场景的最小代码片段：static、单维、多维、生命周期、异步、裸核符号注册。</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_QUICK_START.html">快速开始</a><a href="EJIT_API_REFERENCE.html">API 速查</a></div>
+
+  <section class="case">
+    <h2>1. static 全局配置特化</h2>
+    <p>适合板级配置、编译后运行期不变的全局配置。无需 <code>ejit_activate</code>。</p>
+<pre><code class="language-c">struct BoardConfig {
+    ejit_may_const uint32_t boardType;
+    uint32_t flags;
+};
+
+ejit_period(static) struct BoardConfig g_boardCfg;
+
+ejit_entry
+void process_board(int x) {
+    if (g_boardCfg.boardType == 1) {
+        board_type_1_path(x);
+    } else {
+        generic_path(x);
+    }
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>2. 单维 cell 时间窗</h2>
+<pre><code class="language-c">struct CellConfig {
+    ejit_may_const uint32_t mode;
+    ejit_may_const uint32_t threshold;
+};
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+
+ejit_entry
+int process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+    if (g_cellCfg[cellIdx].mode == 1)
+        return value + g_cellCfg[cellIdx].threshold;
+    return value;
+}
+
+void run(void) {
+    g_cellCfg[2].mode = 1;
+    g_cellCfg[2].threshold = 7;
+    ejit_activate("cell", 2);
+    process_cell(2, 100);
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>3. 多维 cell + trp 特化</h2>
+<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
+struct TrpConfig  { ejit_may_const uint32_t type; };
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+ejit_period_arr(trp)  struct TrpConfig  g_trpCfg[8];
+
+ejit_entry
+void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                  ejit_period_arr_ind(trp)  uint8_t trpIdx,
+                  int payload) {
+    if (g_cellCfg[cellIdx].mode == 1 && g_trpCfg[trpIdx].type == 2)
+        fast_pair_path(payload);
+    else
+        slow_pair_path(payload);
+}</code></pre>
+    <p>调用前需要分别激活两个时间窗实例：</p>
+<pre><code class="language-c">ejit_activate("cell", cellIdx);
+ejit_activate("trp", trpIdx);
+process_pair(cellIdx, trpIdx, payload);</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>4. 嵌套结构体字段</h2>
+<pre><code class="language-c">struct Inner {
+    ejit_may_const uint32_t subMode;
+};
+struct CellConfig {
+    struct Inner inner;
+    uint32_t runtimeCounter;
+};
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+
+ejit_entry
+void process_nested(ejit_period_arr_ind(cell) uint8_t idx) {
+    if (g_cellCfg[idx].inner.subMode == 3)
+        nested_fast();
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>5. 指针型 period array</h2>
+    <p>全局指针指向结构体数组。用户必须保证在调用 <code>ejit_entry</code> 前完成初始化并保证下标不越界。</p>
+<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
+
+ejit_period_arr(cell) struct CellConfig *g_cellPtr;
+
+void init_cells(struct CellConfig *buf) {
+    g_cellPtr = buf;
+}
+
+ejit_entry
+void process_ptr(ejit_period_arr_ind(cell) uint8_t idx) {
+    if (g_cellPtr[idx].mode == 1)
+        ptr_fast();
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>6. 生命周期函数</h2>
+<pre><code class="language-c">ejit_period_lc(cell)
+void update_cell(ejit_period_arr_ind(cell) uint8_t idx, uint32_t mode) {
+    g_cellCfg[idx].mode = mode;
+}
+
+// 等价手动流程：
+ejit_deactivate("cell", idx);
+g_cellCfg[idx].mode = mode;
+ejit_activate("cell", idx);</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>7. 异步编译模式</h2>
+<pre><code class="language-c">ejit_config_t cfg = {0};
+cfg.compileMode = EJIT_COMPILE_ASYNC;
+cfg.optLevel = EJIT_OPT_L2;
+ejit_init(&amp;cfg);
+
+ejit_activate("cell", idx);
+process_cell(idx, 100); // 第一次通常 fallback，并提交后台编译
+process_cell(idx, 101); // 后续可能命中 JIT cache</code></pre>
+    <div class="note">异步模式下，<code>ejit_entry</code> 的副作用应幂等，避免首次 AOT fallback 与后续 JIT 版本产生业务差异。</div>
+  </section>
+
+  <section class="case">
+    <h2>8. 裸核外部符号注册</h2>
+<pre><code class="language-c">extern void platform_log(const char *msg);
+
+void register_platform_symbols(void) {
+    ejit_register_symbol("platform_log", (void *)&amp;platform_log);
+}</code></pre>
+    <p>通常 PASS1 会自动扫描闭包引用并生成注册调用；裸核或特殊链接场景下可手动补充。</p>
+  </section>
+
+  <section>
+    <h2>9. 示例验证表</h2>
+    <table>
+      <tr><th>示例</th><th>检查点</th></tr>
+      <tr><td>static</td><td>不调用 activate 也可 JIT；cache key 低 32 位为 0</td></tr>
+      <tr><td>单维</td><td>不同 cellIdx 生成不同版本</td></tr>
+      <tr><td>多维</td><td>cell/trp 组合形成不同 cache key</td></tr>
+      <tr><td>生命周期</td><td>修改后旧版本失效，重新 activate 后可重编译</td></tr>
+      <tr><td>异步</td><td>首次 fallback，后台编译完成后 hits 增加</td></tr>
+    </table>
+  </section>
+</main>
+</body>
+</html>
