@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>EJIT 动态流程演示</title>
   <style>
-    :root{--primary:#2c5282;--primary2:#1a365d;--accent:#3182ce;--dark:#2d3748;--gray:#4a5568;--muted:#718096;--border:#d9dee6;--bg:#f5f7fa;--blue:#ebf2fa;--green:#38a16f;--green-bg:#f0fff4;--orange:#dd6b20;--orange-bg:#fff7ed;--purple:#6b46c1;--purple-bg:#f5f0ff;--red:#c53030;--red-bg:#fff5f5;--yellow:#d69e2e;--yellow-bg:#fffff0;--code-bg:#111827;--code-fg:#e5e7eb}
-    *{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:var(--dark);line-height:1.65;background:linear-gradient(180deg,#f8fafc 0,#fff 42%)}header{background:linear-gradient(135deg,var(--primary),var(--primary2));color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe;max-width:1120px}.wrap{max-width:1500px;margin:0 auto;padding:20px 24px}h2{color:var(--primary);border-bottom:2px solid var(--border);padding-bottom:6px;margin-top:34px}h3{margin:0 0 8px;color:var(--dark)}a{color:var(--accent)}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre{background:var(--code-bg);color:var(--code-fg);border-radius:10px;padding:14px;overflow:auto}.nav{margin-bottom:18px}.nav a{margin-right:12px;color:var(--accent)}.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0;padding:9px 12px;border:1px solid var(--border);border-radius:12px;background:#fff;box-shadow:0 8px 22px rgba(44,82,130,.06)}button{border:0;border-radius:8px;padding:7px 10px;background:var(--primary);color:white;cursor:pointer;font-weight:700}button.secondary{background:#edf2f7;color:var(--primary)}button.scenario{background:#edf2f7;color:var(--dark)}button.scenario.active{background:var(--accent);color:white}button.scenario.sync.active{background:var(--orange)}button.scenario.async.active{background:var(--purple)}button.scenario.hit.active{background:var(--green)}button.scenario.fail.active{background:var(--red)}.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:4px 10px;background:#fff;color:var(--gray);font-size:13px}.pill input{width:150px}.stage{display:grid;grid-template-columns:minmax(0,1fr) 390px;gap:14px;align-items:start}.panel{background:#fff;border:1px solid var(--border);border-radius:14px;padding:12px;box-shadow:0 8px 22px rgba(44,82,130,.08)}.diagram{position:relative;height:600px;min-width:1180px;overflow:hidden;background:radial-gradient(circle at 18% 10%,#eef6ff 0,#fbfdff 36%,#fff 100%);border:1px solid var(--border);border-radius:14px}.diagram-scroll{width:100%;overflow-x:auto;overflow-y:hidden;padding-bottom:6px}.lane{position:absolute;left:14px;right:210px;border:1px dashed #cbd5e0;border-radius:14px;background:rgba(255,255,255,.58)}.lane .label{position:absolute;left:12px;top:-13px;background:#fff;color:var(--muted);font-size:12px;padding:1px 8px;border-radius:999px;border:1px solid var(--border)}#lane-aot{top:16px;height:112px}#lane-hot{top:158px;height:112px}#lane-cold{top:302px;height:126px}#lane-life{top:462px;height:96px}.node{position:absolute;width:136px;min-height:62px;border:2px solid var(--border);border-radius:12px;background:#fff;padding:7px;text-align:center;transition:transform .28s ease,box-shadow .28s ease,filter .28s ease;box-shadow:0 6px 14px rgba(44,82,130,.08);z-index:2}.node h3{font-size:14px;margin-bottom:3px}.node small{display:block;color:var(--muted);font-size:11px}.node .badge{display:inline-block;margin-top:2px;padding:1px 6px;border-radius:999px;background:#edf2f7;color:var(--gray);font-size:10px}.compile{border-color:var(--accent);background:var(--blue)}.runtime{border-color:var(--green);background:var(--green-bg)}.sync{border-color:var(--orange);background:var(--orange-bg)}.async{border-color:var(--purple);background:var(--purple-bg)}.fail{border-color:var(--red);background:var(--red-bg)}.jit{border-color:var(--green);background:#e6fffa}.node.active{transform:scale(1.08);box-shadow:0 0 0 6px rgba(49,130,206,.2),0 12px 28px rgba(44,82,130,.2);filter:saturate(1.1)}.node.done{box-shadow:0 0 0 4px rgba(56,161,111,.18),0 6px 14px rgba(44,82,130,.08)}.node.dim{filter:grayscale(.55);opacity:.55}#n-source{left:46px;top:42px}#n-clang{left:220px;top:42px}#n-pass{left:394px;top:42px}#n-binary{left:568px;top:42px}#n-call{left:46px;top:186px}#n-wrapper{left:220px;top:186px}#n-state{left:394px;top:186px}#n-cache{left:568px;top:186px}#n-jit{left:742px;top:186px}#n-fallback{left:916px;top:186px}#n-loader{left:220px;top:326px}#n-opt{left:394px;top:326px}#n-link{left:568px;top:326px}#n-worker{left:742px;top:326px}#n-publish{left:916px;top:326px}#n-deact{left:220px;top:490px}#n-update{left:394px;top:490px}#n-react{left:568px;top:490px}#n-recompile{left:742px;top:490px}.edge{position:absolute;height:3px;background:#cbd5e0;transform-origin:left center;z-index:1}.edge::after{content:"";position:absolute;right:-1px;top:-5px;border-left:10px solid #cbd5e0;border-top:6px solid transparent;border-bottom:6px solid transparent}.edge.on{background:var(--accent);box-shadow:0 0 10px rgba(49,130,206,.6)}.edge.on::after{border-left-color:var(--accent)}.edge.green.on{background:var(--green)}.edge.green.on::after{border-left-color:var(--green)}.edge.orange.on{background:var(--orange)}.edge.orange.on::after{border-left-color:var(--orange)}.edge.purple.on{background:var(--purple)}.edge.purple.on::after{border-left-color:var(--purple)}.edge.red.on{background:var(--red)}.edge.red.on::after{border-left-color:var(--red)}.packet{position:absolute;z-index:4;width:28px;height:22px;border-radius:8px;background:var(--accent);box-shadow:0 0 0 6px rgba(49,130,206,.18),0 8px 18px rgba(44,82,130,.24);opacity:0;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:900;font-size:13px;transition:left .55s cubic-bezier(.22,.8,.36,1),top .55s cubic-bezier(.22,.8,.36,1),opacity .2s,background .2s,transform .2s}.packet.show{opacity:1}.packet.pulse{animation:pulse .75s ease infinite}@keyframes pulse{50%{transform:scale(1.18)}}.spark{position:absolute;width:7px;height:7px;border-radius:50%;background:var(--accent);opacity:0;animation:spark .75s ease forwards;z-index:5}@keyframes spark{0%{transform:scale(.2);opacity:1}100%{transform:translate(var(--dx),var(--dy)) scale(0);opacity:0}}.mini{position:absolute;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.92);padding:9px;z-index:3}.cachebox{right:14px;top:24px;width:174px}.queuebox{right:14px;top:300px;width:174px}.memline{height:9px;border-radius:999px;background:#edf2f7;margin:8px 0;overflow:hidden}.memline span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--green),#68d391);transition:width .45s}.slot{display:inline-block;width:24px;height:22px;border-radius:6px;border:1px solid var(--border);margin:2px;background:#f8fafc;text-align:center;font-size:12px;color:var(--muted)}.slot.full{background:var(--green-bg);border-color:var(--green);color:var(--green)}.slot.pending{background:var(--purple-bg);border-color:var(--purple);color:var(--purple)}.slot.bad{background:var(--red-bg);border-color:var(--red);color:var(--red)}.timeline{display:grid;grid-template-columns:repeat(8,1fr);gap:6px;margin:6px 0 10px}.tick{height:8px;border-radius:999px;background:#e2e8f0}.tick.on{background:var(--accent)}.tick.sync.on{background:var(--orange)}.tick.async.on{background:var(--purple)}.tick.ok.on{background:var(--green)}.tick.bad.on{background:var(--red)}.explain{min-height:128px;border-left:5px solid var(--accent);background:var(--blue);border-radius:10px;padding:10px 12px}.explain h3{color:var(--primary)}.state-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px}.state{border:1px solid var(--border);border-radius:10px;padding:7px 8px;background:#fff}.state b{display:block;color:var(--primary);font-size:13px}.state span{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.counters{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:8px 0}.counter{border:1px solid var(--border);border-radius:10px;padding:6px;text-align:center;background:#fff}.counter b{display:block;font-size:18px;color:var(--primary)}.log{height:126px;overflow:auto;background:#111827;color:#d1d5db;border-radius:10px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}.log div{margin-bottom:6px}.log .ok{color:#86efac}.log .warn{color:#fdba74}.log .info{color:#93c5fd}.log .bad{color:#fca5a5}.code-demo .line{display:block;padding:2px 6px;border-radius:5px}.code-demo .line.on{background:#1f2937;color:#bfdbfe}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}.card{border:1px solid var(--border);border-left:5px solid var(--primary);border-radius:12px;padding:14px;background:#fff}.card.orange{border-left-color:var(--orange)}.card.purple{border-left-color:var(--purple)}.card.green{border-left-color:var(--green)}.card.red{border-left-color:var(--red)}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid var(--border);padding:9px 10px;text-align:left;vertical-align:top}th{background:#edf2f7}.muted{color:var(--muted)}footer{color:var(--muted);font-size:13px;margin-top:26px;border-top:1px solid var(--border);padding-top:14px}@media(max-width:1180px){.stage{grid-template-columns:1fr}.diagram{height:780px;overflow:auto}.mini{position:static;margin:8px}.edge,.packet{display:none}.node{position:static;display:inline-block;margin:8px;vertical-align:top}.lane{display:none}}
+    :root{--primary:#2c5282;--primary2:#1a365d;--accent:#3182ce;--dark:#2d3748;--gray:#4a5568;--muted:#718096;--border:#d9dee6;--bg:#f5f7fa;--blue:#ebf2fa;--green:#38a16f;--green-bg:#f0fff4;--orange:#dd6b20;--orange-bg:#fff7ed;--purple:#6b46c1;--purple-bg:#f5f0ff;--red:#c53030;--red-bg:#fff5f5;--code-bg:#111827;--code-fg:#e5e7eb}
+    *{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:var(--dark);line-height:1.65;background:linear-gradient(180deg,#f8fafc 0,#fff 44%)}header{background:linear-gradient(135deg,var(--primary),var(--primary2));color:white;padding:34px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe;max-width:1120px}.wrap{max-width:1500px;margin:0 auto;padding:20px 24px}h2{color:var(--primary);border-bottom:2px solid var(--border);padding-bottom:6px;margin-top:30px}h3{margin:0 0 8px;color:var(--dark)}a{color:var(--accent)}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}.nav{margin-bottom:16px}.nav a{margin-right:12px;color:var(--accent)}.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0 14px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:#fff;box-shadow:0 8px 22px rgba(44,82,130,.06)}button{border:0;border-radius:8px;padding:7px 10px;background:var(--primary);color:white;cursor:pointer;font-weight:700}button.secondary{background:#edf2f7;color:var(--primary)}button.scenario{background:#edf2f7;color:var(--dark)}button.scenario.active{background:var(--accent);color:white}button.sync.active{background:var(--orange)}button.async.active{background:var(--purple)}button.hit.active{background:var(--green)}button.fail.active{background:var(--red)}.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:4px 10px;background:#fff;color:var(--gray);font-size:13px}.pill input{width:130px}.demo-grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;align-items:start}.canvas-panel,.side-panel{background:white;border:1px solid var(--border);border-radius:14px;padding:12px;box-shadow:0 8px 22px rgba(44,82,130,.08)}.canvas-scroll{width:100%;overflow-x:auto}.diagram{display:block;min-width:1320px;width:100%;height:auto;background:#fbfdff;border:1px solid var(--border);border-radius:12px}.lane-title{font:700 15px sans-serif;fill:#2c5282}.node rect{stroke-width:2;rx:14;filter:drop-shadow(0 4px 7px rgba(44,82,130,.10));transition:stroke-width .2s,filter .2s}.node text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif}.node .title{font-size:15px;font-weight:700;fill:#2d3748}.node .sub{font-size:12px;fill:#4a5568}.node.compile rect{fill:var(--blue);stroke:var(--accent)}.node.runtime rect{fill:var(--green-bg);stroke:var(--green)}.node.sync rect{fill:var(--orange-bg);stroke:var(--orange)}.node.async rect{fill:var(--purple-bg);stroke:var(--purple)}.node.fail rect{fill:var(--red-bg);stroke:var(--red)}.node.active rect{stroke-width:5;filter:drop-shadow(0 0 10px rgba(49,130,206,.55))}.node.done rect{stroke-width:3}.edge{fill:none;stroke:#cbd5e0;stroke-width:3;marker-end:url(#arrowGray);transition:stroke .2s,stroke-width .2s}.edge.active{stroke:var(--accent);stroke-width:5;marker-end:url(#arrowBlue)}.edge.green.active{stroke:var(--green);marker-end:url(#arrowGreen)}.edge.orange.active{stroke:var(--orange);marker-end:url(#arrowOrange)}.edge.purple.active{stroke:var(--purple);marker-end:url(#arrowPurple)}.edge.red.active{stroke:var(--red);marker-end:url(#arrowRed)}.packet{transition:transform .55s cubic-bezier(.22,.8,.36,1),fill .2s;filter:drop-shadow(0 4px 7px rgba(44,82,130,.3))}.packet-label{font:700 11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:white;pointer-events:none}.state-line{stroke-dasharray:6 6}.explain{min-height:128px;border-left:5px solid var(--accent);background:var(--blue);border-radius:10px;padding:10px 12px}.explain h3{color:var(--primary)}.state-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:10px}.state{border:1px solid var(--border);border-radius:10px;padding:8px;background:#fff}.state b{display:block;color:var(--primary);font-size:13px}.state span{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}.counters{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:10px 0}.counter{border:1px solid var(--border);border-radius:10px;padding:7px;text-align:center;background:#fff}.counter b{display:block;font-size:18px;color:var(--primary)}.steps{margin:10px 0;padding:0;list-style:none;border:1px solid var(--border);border-radius:10px;overflow:hidden}.steps li{padding:6px 9px;border-bottom:1px solid var(--border);font-size:13px;color:var(--gray);background:#fff}.steps li:last-child{border-bottom:0}.steps li.active{background:var(--blue);color:var(--primary);font-weight:700}.steps li.done{color:var(--green)}.log{height:128px;overflow:auto;background:#111827;color:#d1d5db;border-radius:10px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}.log div{margin-bottom:5px}.log .ok{color:#86efac}.log .warn{color:#fdba74}.log .info{color:#93c5fd}.log .bad{color:#fca5a5}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}.card{border:1px solid var(--border);border-left:5px solid var(--primary);border-radius:12px;padding:14px;background:#fff}.card.orange{border-left-color:var(--orange)}.card.purple{border-left-color:var(--purple)}.card.green{border-left-color:var(--green)}.card.red{border-left-color:var(--red)}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid var(--border);padding:9px 10px;text-align:left;vertical-align:top}th{background:#edf2f7}.muted{color:var(--muted)}footer{color:var(--muted);font-size:13px;margin-top:26px;border-top:1px solid var(--border);padding-top:14px}@media(max-width:1180px){.demo-grid{grid-template-columns:1fr}.diagram{min-width:1320px}.side-panel{position:static}}
   </style>
 </head>
 <body>
-<header><h1>EJIT 动态流程演示</h1><p>更生动地演示 EmbeddedJIT 从 AOT 产物生成、wrapper 热路径、同步/异步编译、cache 发布、fallback 到生命周期失效的完整过程。</p></header>
+<header><h1>EJIT 动态流程演示</h1><p>用完整大图动画演示 EmbeddedJIT 的 AOT 产物、wrapper 热路径、同步/异步编译、cache 命中、fallback 和生命周期失效。</p></header>
 <main class="wrap">
   <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_ARCHITECTURE.html">架构图</a><a href="EJIT_USER_MANUAL.html">用户手册</a></div>
 
@@ -18,87 +18,75 @@
     <h2>1. 动态交互演示</h2>
     <div class="toolbar">
       <button id="play">播放</button><button id="step" class="secondary">单步</button><button id="reset" class="secondary">重置</button>
-      <button class="scenario sync active" data-scenario="sync">同步 miss：本次编译并执行</button>
-      <button class="scenario async" data-scenario="async">异步 miss：当前 fallback，后台发布</button>
-      <button class="scenario hit" data-scenario="hit">cache hit：热路径直达</button>
-      <button class="scenario fail" data-scenario="fail">失败 fallback：安全回退</button>
-      <span class="pill">速度 <input id="speed" type="range" min="420" max="1600" value="850" /></span>
+      <button class="scenario sync active" data-scenario="sync">同步 miss</button>
+      <button class="scenario async" data-scenario="async">异步 miss</button>
+      <button class="scenario hit" data-scenario="hit">cache hit</button>
+      <button class="scenario fail" data-scenario="fail">fallback</button>
+      <button class="scenario" data-scenario="life">生命周期失效</button>
+      <span class="pill">速度 <input id="speed" type="range" min="450" max="1600" value="850" /></span>
     </div>
 
-    <div class="stage">
-      <div class="panel">
-        <div class="timeline" id="timeline"></div>
-        <div class="diagram-scroll">
-        <div class="diagram" id="diagram">
-          <div class="lane" id="lane-aot"><span class="label">AOT 编译期</span></div>
-          <div class="lane" id="lane-hot"><span class="label">Runtime 热路径</span></div>
-          <div class="lane" id="lane-cold"><span class="label">JIT 冷路径 / 异步 worker</span></div>
-          <div class="lane" id="lane-life"><span class="label">生命周期与失效</span></div>
+    <div class="demo-grid">
+      <div class="canvas-panel">
+        <div class="canvas-scroll">
+          <svg id="diagram" class="diagram" viewBox="0 0 1400 760" role="img" aria-label="EJIT 完整动态流程图">
+            <defs>
+              <marker id="arrowGray" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M1,1 L9,5.5 L1,10 Z" fill="#cbd5e0"/></marker>
+              <marker id="arrowBlue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M1,1 L9,5.5 L1,10 Z" fill="#3182ce"/></marker>
+              <marker id="arrowGreen" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M1,1 L9,5.5 L1,10 Z" fill="#38a16f"/></marker>
+              <marker id="arrowOrange" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M1,1 L9,5.5 L1,10 Z" fill="#dd6b20"/></marker>
+              <marker id="arrowPurple" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M1,1 L9,5.5 L1,10 Z" fill="#6b46c1"/></marker>
+              <marker id="arrowRed" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M1,1 L9,5.5 L1,10 Z" fill="#c53030"/></marker>
+            </defs>
 
-          <div class="node compile" id="n-source"><h3>用户源码</h3><small>属性标注</small><span class="badge">ejit_entry</span></div>
-          <div class="node compile" id="n-clang"><h3>Clang</h3><small>Sema / CodeGen</small><span class="badge">metadata</span></div>
-          <div class="node compile" id="n-pass"><h3>AOT Pass</h3><small>PASS1~PASS5</small><span class="badge">bitcode</span></div>
-          <div class="node runtime" id="n-binary"><h3>二进制</h3><small>AOT + wrapper</small><span class="badge">registry</span></div>
+            <text x="28" y="38" class="lane-title">AOT 编译期：生成可 fallback 的原始二进制 + 可 JIT 的 bitcode/metadata</text>
+            <text x="28" y="232" class="lane-title">Runtime 热路径：wrapper 计算 key，先查状态和 cache</text>
+            <text x="28" y="430" class="lane-title">JIT 冷路径：sync 当前线程编译 / async worker 后台编译</text>
+            <text x="28" y="628" class="lane-title">生命周期：配置修改会让旧特化代码失效</text>
 
-          <div class="node runtime" id="n-call"><h3>业务调用</h3><small>process_cell(3)</small></div>
-          <div class="node runtime" id="n-wrapper"><h3>Wrapper</h3><small>计算 cacheKey</small></div>
-          <div class="node runtime" id="n-state"><h3>Period 状态</h3><small>active/version</small></div>
-          <div class="node runtime" id="n-cache"><h3>Cache</h3><small>hit / miss</small></div>
-          <div class="node jit" id="n-jit"><h3>JIT Dispatch</h3><small>特化代码</small></div>
-          <div class="node fail" id="n-fallback"><h3>AOT Fallback</h3><small>原函数体</small></div>
+            <path id="e-source-clang" class="edge" d="M190 90 H270"/><path id="e-clang-pass" class="edge" d="M430 90 H510"/><path id="e-pass-binary" class="edge" d="M670 90 H750"/>
+            <path id="e-binary-call" class="edge green" d="M830 130 C830 180 110 180 110 275"/><path id="e-call-wrapper" class="edge green" d="M190 285 H270"/><path id="e-wrapper-state" class="edge green" d="M430 285 H510"/><path id="e-state-cache" class="edge green" d="M670 285 H750"/>
+            <path id="e-cache-jit" class="edge green" d="M910 285 H990"/><path id="e-cache-fallback" class="edge red" d="M830 325 C830 360 1110 360 1110 315"/>
+            <path id="e-cache-load" class="edge orange" d="M830 325 C830 385 110 385 110 475"/><path id="e-load-opt" class="edge orange" d="M190 480 H270"/><path id="e-opt-link" class="edge orange" d="M430 480 H510"/><path id="e-link-publish" class="edge orange" d="M670 480 H750"/>
+            <path id="e-cache-queue" class="edge purple" d="M850 325 C905 370 940 395 990 450"/><path id="e-queue-worker" class="edge purple" d="M1150 480 H1230"/><path id="e-worker-publish" class="edge purple" d="M1230 520 C1130 580 920 550 910 505"/>
+            <path id="e-publish-jit" class="edge green" d="M830 450 C850 395 1020 380 1070 325"/>
+            <path id="e-jit-deact" class="edge red state-line" d="M1070 325 C1070 535 110 535 110 675"/><path id="e-deact-update" class="edge red" d="M190 675 H270"/><path id="e-update-activate" class="edge red" d="M430 675 H510"/><path id="e-activate-cache" class="edge green state-line" d="M670 675 C760 675 815 500 830 325"/>
 
-          <div class="node sync" id="n-loader"><h3>ModuleLoader</h3><small>加载 bitcode</small></div>
-          <div class="node sync" id="n-opt"><h3>Optimizer</h3><small>参数替换 + PASS6</small></div>
-          <div class="node sync" id="n-link"><h3>JITLink</h3><small>生成机器码</small></div>
-          <div class="node async" id="n-worker"><h3>Worker</h3><small>后台任务</small></div>
-          <div class="node runtime" id="n-publish"><h3>发布 Cache</h3><small>函数指针可见</small></div>
+            <g id="n-source" class="node compile"><rect x="30" y="58" width="160" height="64"/><text x="110" y="84" text-anchor="middle" class="title">用户源码</text><text x="110" y="105" text-anchor="middle" class="sub">ejit_* 属性</text></g>
+            <g id="n-clang" class="node compile"><rect x="270" y="58" width="160" height="64"/><text x="350" y="84" text-anchor="middle" class="title">Clang</text><text x="350" y="105" text-anchor="middle" class="sub">metadata</text></g>
+            <g id="n-pass" class="node compile"><rect x="510" y="58" width="160" height="64"/><text x="590" y="84" text-anchor="middle" class="title">AOT Pass</text><text x="590" y="105" text-anchor="middle" class="sub">bitcode + wrapper</text></g>
+            <g id="n-binary" class="node runtime"><rect x="750" y="58" width="160" height="64"/><text x="830" y="84" text-anchor="middle" class="title">用户二进制</text><text x="830" y="105" text-anchor="middle" class="sub">AOT + registry</text></g>
 
-          <div class="node fail" id="n-deact"><h3>Deactivate</h3><small>旧代码失效</small></div>
-          <div class="node fail" id="n-update"><h3>修改配置</h3><small>may_const 变化</small></div>
-          <div class="node runtime" id="n-react"><h3>Activate</h3><small>新版本生效</small></div>
-          <div class="node sync" id="n-recompile"><h3>重新编译</h3><small>新特化代码</small></div>
+            <g id="n-call" class="node runtime"><rect x="30" y="253" width="160" height="64"/><text x="110" y="279" text-anchor="middle" class="title">业务调用</text><text x="110" y="300" text-anchor="middle" class="sub">process_cell(3)</text></g>
+            <g id="n-wrapper" class="node runtime"><rect x="270" y="253" width="160" height="64"/><text x="350" y="279" text-anchor="middle" class="title">Wrapper</text><text x="350" y="300" text-anchor="middle" class="sub">cacheKey</text></g>
+            <g id="n-state" class="node runtime"><rect x="510" y="253" width="160" height="64"/><text x="590" y="279" text-anchor="middle" class="title">Period 状态</text><text x="590" y="300" text-anchor="middle" class="sub">active / version</text></g>
+            <g id="n-cache" class="node runtime"><rect x="750" y="253" width="160" height="64"/><text x="830" y="279" text-anchor="middle" class="title">Cache</text><text x="830" y="300" text-anchor="middle" class="sub">hit / miss</text></g>
+            <g id="n-jit" class="node runtime"><rect x="990" y="253" width="160" height="64"/><text x="1070" y="279" text-anchor="middle" class="title">JIT Dispatch</text><text x="1070" y="300" text-anchor="middle" class="sub">特化代码</text></g>
+            <g id="n-fallback" class="node fail"><rect x="1110" y="253" width="160" height="64"/><text x="1190" y="279" text-anchor="middle" class="title">AOT Fallback</text><text x="1190" y="300" text-anchor="middle" class="sub">原函数体</text></g>
 
-          <div class="mini cachebox">
-            <h3>Cache Table</h3>
-            <div><span class="slot" id="slot0">0</span><span class="slot" id="slot1">1</span><span class="slot" id="slot2">2</span><span class="slot" id="slot3">3</span></div>
-            <div class="memline"><span id="cacheFill"></span></div>
-            <small class="muted" id="cacheText">empty</small>
-          </div>
-          <div class="mini queuebox">
-            <h3>Async Queue</h3>
-            <div><span class="slot" id="q0">Q</span><span class="slot" id="q1">Q</span><span class="slot" id="q2">Q</span><span class="slot" id="q3">Q</span></div>
-            <div class="memline"><span id="queueFill"></span></div>
-            <small class="muted" id="queueText">idle</small>
-          </div>
-          <div class="packet" id="packet">IR</div>
-        </div>
+            <g id="n-load" class="node sync"><rect x="30" y="448" width="160" height="64"/><text x="110" y="474" text-anchor="middle" class="title">Load Bitcode</text><text x="110" y="495" text-anchor="middle" class="sub">clone module</text></g>
+            <g id="n-opt" class="node sync"><rect x="270" y="448" width="160" height="64"/><text x="350" y="474" text-anchor="middle" class="title">PASS6 + Opt</text><text x="350" y="495" text-anchor="middle" class="sub">常量替换</text></g>
+            <g id="n-link" class="node sync"><rect x="510" y="448" width="160" height="64"/><text x="590" y="474" text-anchor="middle" class="title">JITLink</text><text x="590" y="495" text-anchor="middle" class="sub">机器码</text></g>
+            <g id="n-publish" class="node runtime"><rect x="750" y="448" width="160" height="64"/><text x="830" y="474" text-anchor="middle" class="title">Publish Cache</text><text x="830" y="495" text-anchor="middle" class="sub">函数指针</text></g>
+            <g id="n-queue" class="node async"><rect x="990" y="448" width="160" height="64"/><text x="1070" y="474" text-anchor="middle" class="title">Async Queue</text><text x="1070" y="495" text-anchor="middle" class="sub">dedup task</text></g>
+            <g id="n-worker" class="node async"><rect x="1230" y="448" width="140" height="64"/><text x="1300" y="474" text-anchor="middle" class="title">Worker</text><text x="1300" y="495" text-anchor="middle" class="sub">后台编译</text></g>
+
+            <g id="n-deact" class="node fail"><rect x="30" y="643" width="160" height="64"/><text x="110" y="669" text-anchor="middle" class="title">Deactivate</text><text x="110" y="690" text-anchor="middle" class="sub">旧 cache 失效</text></g>
+            <g id="n-update" class="node fail"><rect x="270" y="643" width="160" height="64"/><text x="350" y="669" text-anchor="middle" class="title">修改配置</text><text x="350" y="690" text-anchor="middle" class="sub">may_const 变化</text></g>
+            <g id="n-activate" class="node runtime"><rect x="510" y="643" width="160" height="64"/><text x="590" y="669" text-anchor="middle" class="title">Activate</text><text x="590" y="690" text-anchor="middle" class="sub">新版本</text></g>
+
+            <g id="packet" class="packet" transform="translate(110 90)"><circle r="17" fill="#3182ce"/><text x="0" y="4" text-anchor="middle" class="packet-label">IR</text></g>
+          </svg>
         </div>
       </div>
 
-      <div class="panel">
-        <div class="explain" id="explain"><h3>准备播放</h3><p>选择场景后点击播放。动画会显示数据包在 AOT、热路径、冷编译路径和生命周期路径之间流动。</p></div>
-        <div class="counters">
-          <div class="counter"><b id="c-hit">0</b><span>hits</span></div>
-          <div class="counter"><b id="c-miss">0</b><span>misses</span></div>
-          <div class="counter"><b id="c-pending">0</b><span>pending</span></div>
-          <div class="counter"><b id="c-fallback">0</b><span>fallback</span></div>
-        </div>
-        <div class="state-grid">
-          <div class="state"><b>场景</b><span id="s-scenario">sync miss</span></div>
-          <div class="state"><b>period(cell:3)</b><span id="s-period">active:v1</span></div>
-          <div class="state"><b>cache entry</b><span id="s-cache">empty</span></div>
-          <div class="state"><b>本次调用</b><span id="s-result">not started</span></div>
-        </div>
-        <h3 style="margin-top:16px">伪代码高亮</h3>
-        <pre class="code-demo"><code><span class="line" id="code-ready">if (!ready || !active) fallback();</span>
-<span class="line" id="code-hit">if (fn = cache_lookup(key)) return fn();</span>
-<span class="line" id="code-sync">if (SYNC) fn = compile_now(key);</span>
-<span class="line" id="code-async">enqueue_compile_task(key); return aot();</span>
-<span class="line" id="code-publish">worker_publish(key, fn);</span>
-<span class="line" id="code-life">deactivate → update config → activate;</span></code></pre>
-        <h3>事件日志</h3>
+      <aside class="side-panel">
+        <div class="explain" id="explain"><h3>准备播放</h3><p>选择场景后点击播放或单步。大图会只高亮当前路径，避免同时闪烁太多元素。</p></div>
+        <div class="counters"><div class="counter"><b id="c-hit">0</b><span>hits</span></div><div class="counter"><b id="c-miss">0</b><span>misses</span></div><div class="counter"><b id="c-pending">0</b><span>pending</span></div><div class="counter"><b id="c-fallback">0</b><span>fallback</span></div></div>
+        <div class="state-grid"><div class="state"><b>场景</b><span id="s-scenario">sync miss</span></div><div class="state"><b>period</b><span id="s-period">active:v1</span></div><div class="state"><b>cache</b><span id="s-cache">empty</span></div><div class="state"><b>结果</b><span id="s-result">not started</span></div></div>
+        <ul class="steps" id="steps"></ul>
         <div class="log" id="log"></div>
-      </div>
+      </aside>
     </div>
   </section>
 
@@ -116,9 +104,9 @@
     <h2>3. 和真实 EJIT 的对应关系</h2>
     <table>
       <tr><th>动画元素</th><th>对应真实组件</th><th>关键语义</th></tr>
-      <tr><td>IR 数据包</td><td>嵌入 bitcode / cloned LLVM Module</td><td>冷路径用它重新优化入口函数闭包。</td></tr>
-      <tr><td>Cache Table</td><td><code>EJitCache</code> / taskpool bucket</td><td>以 <code>funcIdx + dims</code> 为 key 保存特化函数。</td></tr>
-      <tr><td>Async Queue</td><td>MPSC queue + dedup table</td><td>同一 cacheKey 只排一个后台编译任务。</td></tr>
+      <tr><td>用户二进制</td><td>原 AOT 函数体 + wrapper + registry + embedded bitcode</td><td>JIT 失败不影响正确性。</td></tr>
+      <tr><td>Cache</td><td><code>EJitCache</code> / taskpool bucket</td><td>以 <code>funcIdx + dims</code> 为 key 保存特化函数。</td></tr>
+      <tr><td>Async Queue / Worker</td><td>MPSC queue + dedup table + background compile worker</td><td>同一 cacheKey 只排一个后台编译任务。</td></tr>
       <tr><td>Period 状态</td><td>RuntimeState active / invalid / version</td><td>只有 active 且版本有效时才可使用 may_const 特化结果。</td></tr>
       <tr><td>Deactivate / Activate</td><td><code>ejit_period_lc</code> 或手动生命周期 API</td><td>配置修改会使旧 cache 失效，并触发下一次重新编译。</td></tr>
     </table>
@@ -128,74 +116,28 @@
 </main>
 <script>
 (function(){
-  const pos={source:[114,73],clang:[288,73],pass:[462,73],binary:[636,73],call:[114,217],wrapper:[288,217],state:[462,217],cache:[636,217],jit:[810,217],fallback:[984,217],loader:[288,357],opt:[462,357],link:[636,357],worker:[810,357],publish:[984,357],deact:[288,521],update:[462,521],react:[636,521],recompile:[810,521]};
-  const edgeDefs=[['source','clang'],['clang','pass'],['pass','binary'],['binary','call'],['call','wrapper'],['wrapper','state'],['state','cache'],['cache','jit','green'],['cache','fallback','red'],['cache','loader','orange'],['loader','opt','orange'],['opt','link','orange'],['link','publish','orange'],['cache','worker','purple'],['worker','publish','purple'],['publish','jit','green'],['jit','deact','red'],['deact','update','red'],['update','react','red'],['react','recompile','orange'],['recompile','publish','orange']];
-  const scenarioMeta={sync:['同步 miss：本次编译并执行','sync miss'],async:['异步 miss：当前 fallback，后台发布','async miss'],hit:['cache hit：热路径直达','cache hit'],fail:['失败 fallback：安全回退','failure fallback']};
-  const diagram=document.getElementById('diagram'),packet=document.getElementById('packet'),log=document.getElementById('log'),explain=document.getElementById('explain'),speed=document.getElementById('speed'),timeline=document.getElementById('timeline');
-  const state={scenario:'sync',idx:0,timer:null,stats:{hit:0,miss:0,pending:0,fallback:0},cache:false,queue:false};
-  for(let i=0;i<8;i++){const t=document.createElement('div');t.className='tick';t.id='tick'+i;timeline.appendChild(t)}
-  function edgeId(a,b){return 'e-'+a+'-'+b} function node(id){return document.getElementById('n-'+id)} function edge(a,b){return document.getElementById(edgeId(a,b))}
-  function makeEdge(a,b,kind){const [x1,y1]=pos[a], [x2,y2]=pos[b]; const dx=x2-x1,dy=y2-y1,len=Math.hypot(dx,dy),ang=Math.atan2(dy,dx)*180/Math.PI; const e=document.createElement('div');e.className='edge '+(kind||'');e.id=edgeId(a,b);e.style.left=x1+'px';e.style.top=y1+'px';e.style.width=len+'px';e.style.transform='rotate('+ang+'deg)';diagram.insertBefore(e,packet)}
-  edgeDefs.forEach(e=>makeEdge(...e));
-  function color(kind){return kind==='orange'?'var(--orange)':kind==='purple'?'var(--purple)':kind==='green'?'var(--green)':kind==='red'?'var(--red)':'var(--accent)'}
-  function clearActive(){document.querySelectorAll('.node').forEach(n=>n.classList.remove('active','dim'));document.querySelectorAll('.edge').forEach(e=>e.classList.remove('on'));document.querySelectorAll('.code-demo .line').forEach(l=>l.classList.remove('on'))}
-  function move(id,kind,label){const [x,y]=pos[id];packet.className='packet show pulse';packet.style.left=(x-14)+'px';packet.style.top=(y-11)+'px';packet.style.background=color(kind);packet.textContent=label||'IR'}
-  function sparks(id,kind){const [x,y]=pos[id];for(let i=0;i<9;i++){const s=document.createElement('div');s.className='spark';s.style.left=x+'px';s.style.top=y+'px';s.style.background=color(kind);s.style.setProperty('--dx',(Math.cos(i)*36+Math.random()*10)+'px');s.style.setProperty('--dy',(Math.sin(i)*24+Math.random()*10)+'px');diagram.appendChild(s);setTimeout(()=>s.remove(),820)}}
+  const pos={source:[110,90],clang:[350,90],pass:[590,90],binary:[830,90],call:[110,285],wrapper:[350,285],state:[590,285],cache:[830,285],jit:[1070,285],fallback:[1190,285],load:[110,480],opt:[350,480],link:[590,480],publish:[830,480],queue:[1070,480],worker:[1300,480],deact:[110,675],update:[350,675],activate:[590,675]};
+  const meta={sync:['同步 miss','sync miss'],async:['异步 miss','async miss'],hit:['cache hit','cache hit'],fail:['fallback','failure fallback'],life:['生命周期失效','lifecycle invalidation']};
+  const scenarios={
+    sync:[['source',null,'用户源码标注','ejit_entry / may_const / period 属性进入编译流程。','source: EJIT attributes',{}],['clang','source-clang','Clang metadata','Sema 检查属性，CodeGen 生成 !ejit.metadata / !ejit.may_const。','clang: emit EJIT metadata',{}],['pass','clang-pass','AOT Pass','嵌入 bitcode、生成 registry、插入 wrapper 和 lifecycle 逻辑。','aot: wrapper + registry + bitcode',{}],['binary','pass-binary','生成二进制','产物同时包含原 AOT 代码和运行时 JIT 所需信息。','binary: ready',{}],['call','binary-call','业务调用','用户仍然调用原函数名 process_cell(3)。','call: process_cell(3)',{}],['wrapper','call-wrapper','Wrapper','计算 cacheKey，并准备检查 runtime / period / cache。','wrapper: make cacheKey',{}],['state','wrapper-state','Period active','当前 cell:3 已激活，版本 v1 可用于特化。','state: active v1',{period:'active:v1'}],['cache','state-cache','Cache miss','首次调用没有特化函数，需要进入同步编译。','cache: miss',{miss:1,cache:'miss'}],['load','cache-load','加载 bitcode','当前业务线程阻塞，加载 embedded bitcode 并 clone module。','sync: load bitcode',{}],['opt','load-opt','PASS6 + 优化','替换 cellIdx 和 may_const load，触发常量传播与分支折叠。','sync: PASS6 + LLVM opts',{}],['link','opt-link','JITLink','生成机器码并解析外部符号。','sync: JITLink object',{}],['publish','link-publish','发布 cache','函数指针写入 cache。','cache: publish fn',{cache:'ready'}],['jit','publish-jit','本次执行 JIT','同步模式下本次 miss 也能执行刚生成的特化代码。','dispatch: JIT',{hit:1,result:'JIT compiled'}]],
+    async:[['binary',null,'已有 AOT 产物','从已编译好的二进制开始运行。','binary: ready',{}],['call','binary-call','业务调用','用户调用 process_cell(3)。','call: process_cell(3)',{}],['wrapper','call-wrapper','Wrapper','计算 cacheKey。','wrapper: make cacheKey',{}],['state','wrapper-state','Period active','当前实例 active，允许 JIT。','state: active v1',{period:'active:v1'}],['cache','state-cache','Cache miss','异步模式不会阻塞当前业务线程。','cache: miss',{miss:1,cache:'miss'}],['queue','cache-queue','提交异步任务','cacheKey 进入 async queue，并按 key 去重。','async: enqueue task',{pending:1}],['fallback','cache-fallback','当前 fallback','当前调用立即执行原 AOT 函数体。','current call: AOT fallback',{fallback:1,result:'AOT fallback'}],['worker','queue-worker','Worker 编译','后台 worker 加载 bitcode，执行 PASS6、优化和 JITLink。','worker: compile',{}],['publish','worker-publish','发布 cache','发布前检查版本仍有效，然后写入函数指针。','worker: publish fn',{pending:-1,cache:'ready'}],['jit','publish-jit','后续调用命中','下一次相同 cacheKey 调用直接 JIT dispatch。','next call: JIT',{hit:1,result:'next call JIT'}]],
+    hit:[['binary',null,'已有二进制和 cache','热路径开始时 cache 已有有效特化函数。','cache prefilled',{cache:'ready'}],['call','binary-call','业务调用','再次调用相同 cellIdx。','call: process_cell(3)',{}],['wrapper','call-wrapper','Wrapper','计算相同 cacheKey。','wrapper: same key',{}],['state','wrapper-state','Period active','版本仍有效。','state: active v1',{period:'active:v1'}],['cache','state-cache','Cache hit','O(1) 命中特化函数。','cache: hit',{hit:1}],['jit','cache-jit','JIT Dispatch','直接执行特化代码，没有 LLVM 编译成本。','dispatch: JIT',{result:'JIT hit'}]],
+    fail:[['call',null,'业务调用','运行时可能未初始化、period inactive 或实例 disabled。','call: process_cell(3)',{}],['wrapper','call-wrapper','Wrapper','wrapper 做安全检查。','wrapper: guard checks',{}],['state','wrapper-state','状态无效','period inactive / invalid，不能使用 may_const 特化。','state: inactive',{period:'inactive'}],['fallback','cache-fallback','安全 fallback','不查或不使用 JIT，直接执行原 AOT 函数体。','fallback: AOT body',{fallback:1,result:'AOT fallback',cache:'unchanged'}]],
+    life:[['jit',null,'已有 JIT 代码','当前 cache 中有针对 v1 配置的特化函数。','cache: v1 JIT ready',{cache:'ready',hit:1,result:'JIT v1'}],['deact','jit-deact','Deactivate','配置修改前使 cell:3 失效，旧特化代码不可再用。','lifecycle: deactivate',{period:'invalid',cache:'invalid'}],['update','deact-update','修改配置','may_const 字段发生变化。','update: mode/threshold changed',{}],['activate','update-activate','Activate','修改完成，period 进入新版本 v2。','lifecycle: activate v2',{period:'active:v2'}],['cache','activate-cache','下一次重新查 cache','旧 cache entry 已失效，下一次会 miss 并按新值编译。','next call: re-check cache',{miss:1,result:'needs recompile'}]]
+  };
+  const state={scenario:'sync',idx:0,timer:null,stats:{hit:0,miss:0,pending:0,fallback:0}};
+  const packet=document.getElementById('packet'),log=document.getElementById('log'),explain=document.getElementById('explain'),stepsEl=document.getElementById('steps'),speed=document.getElementById('speed');
+  function id(s){return document.getElementById(s)} function edge(name){return id('e-'+name)} function node(name){return id('n-'+name)}
+  function colorFor(edgeName){if(!edgeName)return '#3182ce'; const e=edge(edgeName); if(!e)return '#3182ce'; if(e.classList.contains('orange'))return '#dd6b20'; if(e.classList.contains('purple'))return '#6b46c1'; if(e.classList.contains('red'))return '#c53030'; if(e.classList.contains('green'))return '#38a16f'; return '#3182ce'}
+  function clearActive(){document.querySelectorAll('.node').forEach(n=>n.classList.remove('active'));document.querySelectorAll('.edge').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.steps li').forEach(li=>li.classList.remove('active'))}
+  function setPacket(to, edgeName){const p=pos[to]; packet.setAttribute('transform','translate('+p[0]+' '+p[1]+')'); packet.querySelector('circle').setAttribute('fill',colorFor(edgeName))}
   function describe(t,b){explain.innerHTML='<h3>'+t+'</h3><p>'+b+'</p>'} function addLog(t,cls){const d=document.createElement('div');d.className=cls||'info';d.textContent='• '+t;log.appendChild(d);log.scrollTop=log.scrollHeight}
-  function setText(id,v){document.getElementById(id).textContent=v} function stat(k,delta){state.stats[k]+=delta;setText('c-'+k,state.stats[k])}
-  function setCache(mode){state.cache=mode==='full';document.getElementById('cacheFill').style.width=mode==='full'?'76%':mode==='bad'?'45%':'0';setText('cacheText',mode==='full'?'func#7/cell=3 → JIT fn':mode==='bad'?'stale / invalid entry':'empty');['slot0','slot1','slot2','slot3'].forEach((id,i)=>{const el=document.getElementById(id);el.className='slot '+(mode==='full'&&i<3?'full':mode==='bad'&&i===2?'bad':'')})}
-  function setQueue(mode){state.queue=mode==='pending';document.getElementById('queueFill').style.width=mode==='pending'?'62%':'0';setText('queueText',mode==='pending'?'compile task pending':'idle');['q0','q1','q2','q3'].forEach((id,i)=>{document.getElementById(id).className='slot '+(mode==='pending'&&i<2?'pending':'')})}
-  function tick(i,kind){document.querySelectorAll('.tick').forEach(t=>t.className='tick');for(let n=0;n<=i;n++)document.getElementById('tick'+(n%8)).className='tick on '+(kind||'')}
-  function code(id){if(id)document.getElementById('code-'+id).classList.add('on')}
-  const aot=[
-    {id:'source',title:'1. 用户源码标注',body:'业务代码标注 ejit_entry、ejit_period_arr、ejit_may_const。动画里的 IR 数据包从源码出发。',log:'source: ejit attributes found',label:'SRC'},
-    {id:'clang',from:'source',title:'2. Clang 生成 metadata',body:'Sema 检查属性是否合法；CodeGen 在函数、全局变量和 load 上挂 EJIT metadata。',log:'clang: emit !ejit.metadata / !ejit.may_const',label:'MD'},
-    {id:'pass',from:'clang',title:'3. AOT Pass 生成产物',body:'PASS1 提取 bitcode，PASS2 注册 period，PASS3 插入 wrapper，PASS4 处理生命周期。',log:'aot: embed bitcode + registry + wrapper',label:'BC'},
-    {id:'binary',from:'pass',title:'4. 生成二进制',body:'二进制同时包含原 AOT 函数体和 JIT 冷路径需要的 bitcode/registry。',log:'binary: AOT body and JIT metadata ready',label:'BIN'}
-  ];
-  const hot=[
-    {id:'call',from:'binary',title:'5. 业务调用原函数',body:'用户仍然调用原函数名，例如 process_cell(3)。',log:'call: process_cell(cellIdx=3)',label:'CALL'},
-    {id:'wrapper',from:'call',title:'6. Wrapper 接管入口',body:'wrapper 读取参数里的 period index，计算 cacheKey = funcIdx + cellIdx。',log:'wrapper: make cacheKey func#7/cell=3',label:'KEY'},
-    {id:'state',from:'wrapper',title:'7. 检查时间窗状态',body:'只有 period active 且版本有效，JIT 特化才允许使用当前 may_const 值。',log:'state: period cell:3 active v1',label:'V1',code:'ready'},
-    {id:'cache',from:'state',title:'8. 查询 Cache',body:'cache 命中则热路径直达；miss 才进入同步/异步冷路径。',log:'cache: lookup func#7/cell=3',label:'GET',code:'hit'}
-  ];
-  function syncSteps(){return aot.concat(hot,[
-    {id:'loader',from:'cache',kind:'orange',title:'9. 同步 miss：加载 bitcode',body:'当前业务线程阻塞进入冷路径，从 __ejit_bitcode 加载并克隆模块。',log:'miss: enter synchronous compile path',cls:'warn',label:'IR',miss:1,result:'compiling',code:'sync'},
-    {id:'opt',from:'loader',kind:'orange',title:'10. 参数替换 + PASS6',body:'把 cellIdx=3 替换为常量，读取 active 时间窗内 may_const 字段，触发常量传播和分支折叠。',log:'optimizer: substitute dims, may_const load → constants',cls:'warn',label:'OPT'},
-    {id:'link',from:'opt',kind:'orange',title:'11. JITLink 生成机器码',body:'LLVM 优化后的模块生成目标机器码，并完成符号解析和可执行内存 finalize。',log:'jitlink: machine code emitted',cls:'info',label:'OBJ'},
-    {id:'publish',from:'link',kind:'orange',title:'12. 发布 Cache Entry',body:'函数指针写入 cache，后续相同 cacheKey 可直接命中。',log:'cache: publish specialized function',cls:'ok',label:'FN',cache:'full'},
-    {id:'jit',from:'publish',kind:'green',title:'13. 本次执行 JIT',body:'同步模式下，首次 miss 的本次调用也能执行刚生成的特化代码。',log:'dispatch: current call runs specialized code',cls:'ok',label:'JIT',hit:1,result:'JIT compiled'},
-    ...lifeSteps('orange')
-  ])}
-  function asyncSteps(){return aot.concat(hot,[
-    {id:'worker',from:'cache',kind:'purple',title:'9. 异步 miss：提交任务',body:'业务线程把 cacheKey 放入队列并去重，不等待 LLVM 编译。',log:'miss: enqueue compile task, dedup by cacheKey',cls:'warn',label:'TASK',miss:1,pending:1,queue:'pending',result:'pending',code:'async'},
-    {id:'fallback',from:'cache',kind:'red',title:'10. 当前调用 fallback',body:'异步模式保护实时路径：当前调用立即执行原 AOT 函数体。',log:'fallback: current call uses AOT body',cls:'warn',label:'AOT',fallback:1,result:'AOT fallback'},
-    {id:'worker',kind:'purple',title:'11. Worker 后台编译',body:'后台 worker 加载 bitcode，执行参数替换、PASS6、LLVM 优化和 JITLink。',log:'worker: compile in background',cls:'info',label:'W'},
-    {id:'publish',from:'worker',kind:'purple',title:'12. Worker 发布 Cache',body:'发布前检查 period 版本仍有效；然后原子发布函数指针。',log:'worker: version check ok, publish fn',cls:'ok',label:'FN',cache:'full',queue:'idle',pending:-1,code:'publish'},
-    {id:'jit',from:'publish',kind:'green',title:'13. 后续调用命中',body:'下一次相同 cacheKey 调用会直接走 JIT dispatch。',log:'next call: cache hit → JIT dispatch',cls:'ok',label:'JIT',hit:1,result:'next call JIT'},
-    ...lifeSteps('purple')
-  ])}
-  function hitSteps(){return aot.concat(hot.map(s=>({...s})),[
-    {id:'jit',from:'cache',kind:'green',title:'9. Cache hit 热路径',body:'cache 已有有效函数指针，wrapper 直接 dispatch，不进入 LLVM 编译。',log:'cache hit: O(1) dispatch to specialized fn',cls:'ok',label:'JIT',hit:1,result:'JIT hit',cache:'full'},
-    {id:'jit',kind:'green',title:'10. 热路径完成',body:'这就是 EJIT 期望的稳定状态：配置不变、时间窗 active、cache 命中率持续上升。',log:'stats: hits increased, no compile cost',cls:'ok',label:'✓'}
-  ])}
-  function failSteps(){return aot.concat(hot.slice(0,3),[
-    {id:'fallback',from:'state',kind:'red',title:'8. 状态检查失败',body:'如果 runtime 未初始化、period inactive 或版本失效，wrapper 不允许使用 JIT。',log:'state: inactive or invalid → fallback',cls:'bad',label:'AOT',fallback:1,result:'AOT fallback',period:'inactive',code:'ready'},
-    {id:'cache',kind:'red',title:'9. 失败不污染 Cache',body:'失败路径不会发布函数指针，cache 保持 empty 或旧 entry 被标记 invalid。',log:'cache: no publish on failure',cls:'bad',label:'BAD',cache:'bad'},
-    {id:'fallback',kind:'red',title:'10. 正确性由 AOT 保证',body:'EJIT 是加速路径，不是正确性依赖。失败时仍执行原函数体。',log:'safety: original AOT body preserves semantics',cls:'ok',label:'OK'}
-  ])}
-  function lifeSteps(kind){return [
-    {id:'deact',from:'jit',kind:'red',title:'14. 配置修改前 deactivate',body:'生命周期函数入口自动 deactivate，使旧特化代码失效。',log:'lifecycle: deactivate cell:3',cls:'warn',label:'INV',period:'invalid',cache:'bad',code:'life'},
-    {id:'update',from:'deact',kind:'red',title:'15. 修改 may_const 配置',body:'业务修改 mode/threshold 等 may_const 字段，此时不能继续使用旧常量编译出的代码。',log:'update: may_const field changed',cls:'warn',label:'CFG'},
-    {id:'react',from:'update',kind:'green',title:'16. 修改完成后 activate',body:'生命周期函数出口 activate，生成新的 period 版本。',log:'lifecycle: activate cell:3 v2',cls:'ok',label:'V2',period:'active:v2'},
-    {id:'recompile',from:'react',kind, title:'17. 下一次按新值重新编译',body:'下一次 miss 会读取新的配置值，生成新的特化代码。',log:'next miss: recompile with new constants',cls:'info',label:'NEW',result:'needs recompile'}
-  ]}
-  function steps(){return state.scenario==='sync'?syncSteps():state.scenario==='async'?asyncSteps():state.scenario==='hit'?hitSteps():failSteps()}
-  function reset(){clearInterval(state.timer);state.timer=null;state.idx=0;state.stats={hit:0,miss:0,pending:0,fallback:0};clearActive();document.querySelectorAll('.node').forEach(n=>n.classList.remove('done'));packet.className='packet';log.innerHTML='';setCache(state.scenario==='hit'?'full':'empty');setQueue('idle');['hit','miss','pending','fallback'].forEach(k=>setText('c-'+k,0));setText('s-scenario',scenarioMeta[state.scenario][1]);setText('s-period','active:v1');setText('s-cache',state.scenario==='hit'?'ready':'empty');setText('s-result','not started');describe('准备播放',scenarioMeta[state.scenario][0]+'。点击播放或单步，观察数据包和状态变化。');document.querySelectorAll('.tick').forEach(t=>t.className='tick')}
-  function applyStep(s,i){clearActive();if(s.from){const e=edge(s.from,s.id);if(e)e.classList.add('on')}node(s.id).classList.add('active');move(s.id,s.kind,s.label);sparks(s.id,s.kind);describe(s.title,s.body);addLog(s.log,s.cls);tick(i,s.kind||'');if(s.code)code(s.code);if(s.cache){setCache(s.cache);setText('s-cache',s.cache==='full'?'ready':'invalid')}if(s.queue)setQueue(s.queue);if(s.period)setText('s-period',s.period);if(s.result)setText('s-result',s.result);if(s.hit)stat('hit',s.hit);if(s.miss)stat('miss',s.miss);if(s.pending)stat('pending',s.pending);if(s.fallback)stat('fallback',s.fallback);setTimeout(()=>node(s.id).classList.add('done'),260)}
-  function doStep(){const ss=steps();if(state.idx>=ss.length){clearInterval(state.timer);state.timer=null;packet.classList.remove('pulse');addLog('演示结束，可重置或切换场景','ok');return}applyStep(ss[state.idx],state.idx);state.idx++}
-  document.getElementById('play').onclick=()=>{if(state.timer){clearInterval(state.timer);state.timer=null;packet.classList.remove('pulse');return}doStep();state.timer=setInterval(doStep,Number(speed.value))};
-  document.getElementById('step').onclick=doStep;document.getElementById('reset').onclick=reset;
+  function setText(k,v){id(k).textContent=v} function stat(k,d){state.stats[k]+=d;setText('c-'+k,state.stats[k])}
+  function applyEffects(eff){if(eff.hit)stat('hit',eff.hit);if(eff.miss)stat('miss',eff.miss);if(eff.pending)stat('pending',eff.pending);if(eff.fallback)stat('fallback',eff.fallback);if(eff.period)setText('s-period',eff.period);if(eff.cache)setText('s-cache',eff.cache);if(eff.result)setText('s-result',eff.result)}
+  function renderSteps(){stepsEl.innerHTML='';scenarios[state.scenario].forEach((s,i)=>{const li=document.createElement('li');li.textContent=(i+1)+'. '+s[2];stepsEl.appendChild(li)})}
+  function reset(){clearInterval(state.timer);state.timer=null;state.idx=0;state.stats={hit:0,miss:0,pending:0,fallback:0};clearActive();document.querySelectorAll('.node').forEach(n=>n.classList.remove('done'));log.innerHTML='';['hit','miss','pending','fallback'].forEach(k=>setText('c-'+k,0));setText('s-scenario',meta[state.scenario][1]);setText('s-period','active:v1');setText('s-cache',state.scenario==='hit'?'ready':'empty');setText('s-result','not started');describe('准备播放',meta[state.scenario][0]+'。点击播放或单步，只高亮当前相关路径。');renderSteps();setPacket(state.scenario==='sync'?'source':state.scenario==='life'?'jit':'binary')}
+  function doStep(){const arr=scenarios[state.scenario];if(state.idx>=arr.length){clearInterval(state.timer);state.timer=null;addLog('演示结束，可切换场景或重置','ok');return}const [n,e,t,b,l,eff]=arr[state.idx];clearActive();node(n).classList.add('active');if(e&&edge(e))edge(e).classList.add('active');setPacket(n,e);describe(t,b);addLog(l,eff&&eff.fallback?'warn':'info');applyEffects(eff||{});const li=stepsEl.children[state.idx];if(li)li.classList.add('active');for(let i=0;i<state.idx;i++)stepsEl.children[i]?.classList.add('done');state.idx++}
+  id('play').onclick=()=>{if(state.timer){clearInterval(state.timer);state.timer=null;return}doStep();state.timer=setInterval(doStep,Number(speed.value))}; id('step').onclick=doStep; id('reset').onclick=reset;
   document.querySelectorAll('.scenario').forEach(btn=>btn.onclick=()=>{state.scenario=btn.dataset.scenario;document.querySelectorAll('.scenario').forEach(b=>b.classList.remove('active'));btn.classList.add('active');reset()});
   reset();
 })();
