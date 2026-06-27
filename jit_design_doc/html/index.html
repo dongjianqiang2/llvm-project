@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>EJIT HTML 文档索引</title>
   <style>
-    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:#f5f7fa;color:#2d3748;line-height:1.65}header{background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:38px 34px}header h1{margin:0 0 8px;font-size:34px}header p{margin:0;color:#dbeafe}.wrap{max-width:1180px;margin:0 auto;padding:28px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.card{background:white;border:1px solid #d9dee6;border-left:6px solid #2c5282;border-radius:14px;padding:18px;box-shadow:0 8px 22px rgba(44,82,130,.08)}.card h2{margin:0 0 8px;font-size:20px;color:#2c5282}.card p{margin:0 0 12px;color:#4a5568}.card a{display:inline-block;text-decoration:none;background:#2c5282;color:white;border-radius:8px;padding:7px 12px;font-size:14px}.prio{display:inline-block;background:#ebf2fa;color:#2c5282;border-radius:999px;padding:2px 9px;font-weight:700;font-size:12px;margin-bottom:10px}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px;margin:20px 0}footer{color:#718096;font-size:13px;margin-top:26px;border-top:1px solid #d9dee6;padding-top:14px}
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:#f5f7fa;color:#2d3748;line-height:1.65}header{background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:38px 34px}header h1{margin:0 0 8px;font-size:34px}header p{margin:0;color:#dbeafe}.wrap{max-width:1180px;margin:0 auto;padding:28px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.card{background:white;border:1px solid #d9dee6;border-left:6px solid #2c5282;border-radius:14px;padding:18px;box-shadow:0 8px 22px rgba(44,82,130,.08)}.card h2{margin:0 0 8px;font-size:20px;color:#2c5282}.card p{margin:0 0 12px;color:#4a5568}.card a{display:inline-block;text-decoration:none;background:#2c5282;color:white;border-radius:8px;padding:7px 12px;font-size:14px}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px;margin:20px 0}footer{color:#718096;font-size:13px;margin-top:26px;border-top:1px solid #d9dee6;padding-top:14px}
   </style>
 </head>
 <body>
@@ -16,14 +16,14 @@
 <main class="wrap">
   <div class="note">建议阅读顺序：快速开始 → API 参考 → 示例集 → 排障指南 → 构建部署 → 架构图 → 内部流水线。</div>
   <section class="grid">
-    <article class="card"><span class="prio">P0</span><h2>5 分钟快速开始</h2><p>最短路径跑通 EJIT：标注、初始化、激活、调用、确认生效。</p><a href="EJIT_QUICK_START.html">打开</a></article>
-    <article class="card"><span class="prio">P0</span><h2>API / 属性速查</h2><p>6 个属性宏、运行时 C API、配置结构体、状态码和典型调用方式。</p><a href="EJIT_API_REFERENCE.html">打开</a></article>
-    <article class="card"><span class="prio">P0</span><h2>故障排查手册</h2><p>按“JIT 没触发 / 没优化 / fallback / 裸核失败”等症状定位问题。</p><a href="EJIT_TROUBLESHOOTING.html">打开</a></article>
-    <article class="card"><span class="prio">P1</span><h2>构建与部署手册</h2><p>x86/AArch64 构建、集成测试、lipo 单对象、bare-metal 和 SRE 部署。</p><a href="EJIT_BUILD_DEPLOYMENT.html">打开</a></article>
-    <article class="card"><span class="prio">P1</span><h2>示例集</h2><p>static、单维、多维、生命周期、异步、裸核符号注册等示例。</p><a href="EJIT_EXAMPLES.html">打开</a></article>
-    <article class="card"><span class="prio">P2</span><h2>内部流水线说明</h2><p>Clang metadata、PASS1~PASS6、runtime JIT pipeline、cache key 和 PASS6 机制。</p><a href="EJIT_INTERNAL_PIPELINE.html">打开</a></article>
-    <article class="card"><span class="prio">已有</span><h2>用户使用手册</h2><p>完整面向用户手册，覆盖概念、API、构建、平台、限制。</p><a href="EJIT_USER_MANUAL.html">打开</a></article>
-    <article class="card"><span class="prio">已有</span><h2>架构设计图</h2><p>端到端架构图、AOT/JIT、状态机、bare-metal/SRE 部署图。</p><a href="EJIT_ARCHITECTURE.html">打开</a></article>
+    <article class="card"><h2>5 分钟快速开始</h2><p>最短路径跑通 EJIT：标注、初始化、激活、调用、确认生效。</p><a href="EJIT_QUICK_START.html">打开</a></article>
+    <article class="card"><h2>API / 属性速查</h2><p>6 个属性宏、运行时 C API、配置结构体、状态码和典型调用方式。</p><a href="EJIT_API_REFERENCE.html">打开</a></article>
+    <article class="card"><h2>故障排查手册</h2><p>按“JIT 没触发 / 没优化 / fallback / 裸核失败”等症状定位问题。</p><a href="EJIT_TROUBLESHOOTING.html">打开</a></article>
+    <article class="card"><h2>构建与部署手册</h2><p>x86/AArch64 构建、集成测试、lipo 单对象、bare-metal 和 SRE 部署。</p><a href="EJIT_BUILD_DEPLOYMENT.html">打开</a></article>
+    <article class="card"><h2>示例集</h2><p>static、单维、多维、生命周期、异步、裸核符号注册等示例。</p><a href="EJIT_EXAMPLES.html">打开</a></article>
+    <article class="card"><h2>内部流水线说明</h2><p>Clang metadata、PASS1~PASS6、runtime JIT pipeline、cache key 和 PASS6 机制。</p><a href="EJIT_INTERNAL_PIPELINE.html">打开</a></article>
+    <article class="card"><h2>用户使用手册</h2><p>完整面向用户手册，覆盖概念、API、构建、平台、限制。</p><a href="EJIT_USER_MANUAL.html">打开</a></article>
+    <article class="card"><h2>架构设计图</h2><p>端到端架构图、AOT/JIT、状态机、bare-metal/SRE 部署图。</p><a href="EJIT_ARCHITECTURE.html">打开</a></article>
   </section>
   <footer>生成日期：2026-06-27。设计细节以父目录 Markdown 设计文档和当前源码头文件为准。</footer>
 </main>
