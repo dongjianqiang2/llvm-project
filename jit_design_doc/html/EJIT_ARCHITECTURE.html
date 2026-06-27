@@ -140,6 +140,7 @@
     th, td { border: 1px solid var(--border); padding: 9px 10px; vertical-align: top; }
     th { background: #edf2f7; text-align: left; }
     tr:nth-child(even) td { background: #fafcff; }
+    .nav a{margin-right:12px;color:var(--accent)}
     footer {
       margin-top: 30px;
       padding-top: 18px;
@@ -167,7 +168,8 @@
 </header>
 
 <main>
-  <section>
+  <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_USER_MANUAL.html">用户手册</a><a href="EJIT_INTERNAL_PIPELINE.html">内部流水线</a></div>
+  <section id="overview">
     <h2>1. 总体架构一览</h2>
     <p>EmbeddedJIT 将用户源码中的时间窗标注转化为编译期 metadata，并在 AOT 阶段嵌入可供运行时重新优化的 bitcode。运行时根据当前激活的时间窗实例生成特化机器码，并通过 cache 命中直接执行。</p>
     <div class="diagram-wrap">
@@ -280,7 +282,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="aot-pipeline">
     <h2>2. AOT 编译期流水线</h2>
     <p>AOT 编译期分两类 pass：PASS1 必须尽早运行，负责在优化破坏 metadata 之前提取 bitcode；PASS2-4 负责注册、wrapper 和生命周期插桩，由 PASS5 统一协调。</p>
     <div class="diagram-wrap">
@@ -336,7 +338,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="runtime-cache">
     <h2>3. 运行时 JIT 与 Cache 架构</h2>
     <p>运行时入口由 wrapper 调用。热路径只做 cache 查询；冷路径才加载 bitcode、执行优化 pipeline 并生成机器码。</p>
     <div class="diagram-wrap">
@@ -425,7 +427,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="lifecycle">
     <h2>4. 时间窗生命周期状态机</h2>
     <p>时间窗控制 JIT 特化是否允许使用当前内存值。修改配置前必须使相关实例失效，修改完成后重新激活，后续调用会重新编译或命中新的版本。</p>
     <div class="diagram-wrap">
@@ -468,7 +470,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="deployment">
     <h2>5. Bare-metal / SRE 部署架构</h2>
     <p>在无操作系统或 SRE 环境下，EJIT 需要替代 host 依赖：构造函数注册、动态符号查找、线程库、mmap/mprotect 和 JIT 可执行内存管理。</p>
     <div class="diagram-wrap">
@@ -532,7 +534,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="components">
     <h2>6. 组件职责速查</h2>
     <table>
       <thead>
@@ -552,7 +554,7 @@
     </table>
   </section>
 
-  <section>
+  <section id="references">
     <h2>7. 对应源码/文档入口</h2>
     <div class="cards">
       <div class="card">
