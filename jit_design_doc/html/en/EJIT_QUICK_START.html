@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT 5-Minute Quick Start</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{position:relative;background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1080px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{color:#2d3748;margin-top:24px}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.step{border:1px solid #d9dee6;border-left:6px solid #3182ce;border-radius:12px;padding:14px 16px;margin:14px 0;background:#fff}.ok{background:#f0fff4;border-left:5px solid #38a16f;border-radius:10px;padding:12px 14px}.warn{background:#fff7ed;border-left:5px solid #dd6b20;border-radius:10px;padding:12px 14px}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;text-align:left;vertical-align:top}th{background:#edf2f7}a{color:#3182ce}.nav{margin-bottom:18px}.nav a{margin-right:12px}.lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}.lang-switch:hover{background:rgba(255,255,255,.35)}
+  </style>
+</head>
+<body>
+<header><a class="lang-switch" href="../EJIT_QUICK_START.html">中文</a><h1>EJIT 5-Minute Quick Start</h1><p>From zero to a running minimal EmbeddedJIT example.</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← Doc index</a><a href="EJIT_USER_MANUAL.html">Full user manual</a><a href="EJIT_TROUBLESHOOTING.html">Troubleshooting</a></div>
+
+  <section class="step">
+    <h2>0. What you need</h2>
+    <ul>
+      <li>A Clang built from this repository with EJIT support.</li>
+      <li>Link the EJIT runtime: <code>libLLVMEJIT.a</code>.</li>
+      <li>User code includes <code>llvm/ExecutionEngine/EJIT/EJitRuntime.h</code>.</li>
+    </ul>
+<pre><code class="language-bash">./build.sh debug x86
+./build.sh release x86
+ninja -C build_release_x86 LLVMEJIT lld</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>1. Write a specializable config struct</h2>
+    <p>Mark the fields that stay stable within a time window as <code>ejit_may_const</code>. Do not mark frequently changing fields.</p>
+<pre><code class="language-c">#include &lt;stdint.h&gt;
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+
+#define MODE_FAST 1
+#define MODE_SAFE 2
+
+struct CellConfig {
+    ejit_may_const uint32_t mode;
+    ejit_may_const uint32_t threshold;
+    uint32_t counter;
+};
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>2. Annotate the JIT entry function</h2>
+    <p><code>ejit_entry</code> marks the original function; <code>ejit_period_arr_ind(cell)</code> tells EJIT which parameter is the <code>cell</code> time-window index.</p>
+<pre><code class="language-c">static void fast_path(int v);
+static void safe_path(int v);
+static void default_path(int v);
+
+ejit_entry
+void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+    if (g_cellCfg[cellIdx].mode == MODE_FAST) {
+        fast_path(value + g_cellCfg[cellIdx].threshold);
+    } else if (g_cellCfg[cellIdx].mode == MODE_SAFE) {
+        safe_path(value);
+    } else {
+        default_path(value);
+    }
+}</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>3. Annotate the config-modification function</h2>
+    <p>When modifying an <code>ejit_may_const</code> field, wrap the lifecycle with <code>ejit_period_lc</code>. The compiler automatically inserts deactivate/activate.</p>
+<pre><code class="language-c">ejit_period_lc(cell)
+void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                     uint32_t mode,
+                     uint32_t threshold) {
+    g_cellCfg[cellIdx].mode = mode;
+    g_cellCfg[cellIdx].threshold = threshold;
+}</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>4. Initialize EJIT and activate the time window</h2>
+<pre><code class="language-c">int main(void) {
+    ejit_config_t cfg = {0};
+    cfg.compileMode = EJIT_COMPILE_SYNC;
+    cfg.optLevel = EJIT_OPT_L2;
+    cfg.maxCodeMemory = 2 * 1024 * 1024;
+    cfg.maxCacheEntries = 4096;
+    cfg.enableLogger = true;
+
+    if (ejit_init(&amp;cfg) != EJIT_OK)
+        return 1;
+
+    g_cellCfg[3].mode = MODE_FAST;
+    g_cellCfg[3].threshold = 10;
+    ejit_activate("cell", 3);
+
+    process_cell(3, 100); // first call: compile or fallback
+    process_cell(3, 101); // after a cache hit, runs specialized code
+
+    update_cell_cfg(3, MODE_SAFE, 20); // old cache invalidated
+    process_cell(3, 102);              // recompile or fallback
+
+    ejit_shutdown();
+    return 0;
+}</code></pre>
+  </section>
+
+  <section class="step">
+    <h2>5. Build and run</h2>
+    <p>For real projects, follow the link rules in <code>ejit_test/build.sh</code>. Conceptual commands:</p>
+<pre><code class="language-bash">build_release_x86/bin/clang -O2 -g \
+  -Illvm/include -Ibuild_release_x86/include \
+  quick_start.c \
+  build_release_x86/lib/libLLVMEJIT.a \
+  -fuse-ld=lld -o quick_start
+
+./quick_start</code></pre>
+  </section>
+
+  <section>
+    <h2>6. How to confirm the JIT took effect</h2>
+    <table>
+      <tr><th>Checkpoint</th><th>Expected</th></tr>
+      <tr><td>Compiled IR</td><td>Contains <code>!ejit.metadata</code>, <code>!ejit.may_const</code>, <code>@__ejit_bitcode</code></td></tr>
+      <tr><td>wrapper</td><td>Entry calls <code>ejit_compile_or_get</code>, with <code>jit_dispatch</code>/<code>jit_fallback</code> paths</td></tr>
+      <tr><td>Runtime stats</td><td>After the first miss, cache entries increase; subsequent hits increase</td></tr>
+      <tr><td>dumpJITDir</td><td>In the optimized IR, config field loads are replaced by constants and branches are folded</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. The 5 most common mistakes</h2>
+    <ol>
+      <li>Forgetting to call <code>ejit_init</code>.</li>
+      <li>Forgetting <code>ejit_activate("cell", idx)</code>.</li>
+      <li>Not marking fields with <code>ejit_may_const</code>.</li>
+      <li>Not marking the <code>ejit_entry</code> parameter with <code>ejit_period_arr_ind(cell)</code>.</li>
+      <li>Modifying config fields directly, without <code>ejit_period_lc</code> or manual deactivate/activate.</li>
+    </ol>
+    <div class="ok">If any step fails, EJIT's principle is to return NULL and fall back to AOT — it should never affect program correctness.</div>
+  </section>
+</main>
+</body>
+</html>

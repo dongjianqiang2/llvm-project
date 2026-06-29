@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EmbeddedJIT User Manual</title>
+  <style>
+    :root {
+      --primary: #2c5282;
+      --accent: #3182ce;
+      --dark: #2d3748;
+      --gray: #4a5568;
+      --muted: #718096;
+      --border: #d9dee6;
+      --bg: #f5f7fa;
+      --code-bg: #111827;
+      --code-fg: #e5e7eb;
+      --ok: #38a16f;
+      --warn: #dd6b20;
+      --info: #ebf2fa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      color: var(--dark);
+      background: white;
+      line-height: 1.65;
+    }
+    header {
+      position: relative;
+      background: linear-gradient(135deg, var(--primary), #1a365d);
+      color: white;
+      padding: 42px 32px 38px;
+    }
+    header h1 { margin: 0 0 8px; font-size: 34px; letter-spacing: 0.5px; }
+    header p { margin: 0; color: #dbeafe; font-size: 16px; max-width: 980px; }
+    .layout {
+      display: grid;
+      grid-template-columns: 290px minmax(0, 1fr);
+      gap: 0;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    nav {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      overflow: auto;
+      padding: 24px 18px;
+      border-right: 1px solid var(--border);
+      background: var(--bg);
+    }
+    nav .toc-title {
+      font-weight: 700;
+      color: var(--primary);
+      margin: 0 0 12px;
+    }
+    .nav a{margin-right:12px;color:var(--accent)}
+    nav a {
+      display: block;
+      color: var(--gray);
+      text-decoration: none;
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    nav a:hover { background: #e6eef8; color: var(--primary); }
+    main { padding: 30px 42px 80px; max-width: 1080px; }
+    h2 {
+      margin-top: 42px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid var(--border);
+      color: var(--primary);
+      font-size: 26px;
+    }
+    h3 { margin-top: 28px; color: var(--dark); font-size: 20px; }
+    h4 { margin-top: 22px; color: var(--gray); font-size: 17px; }
+    a { color: var(--accent); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: 0.92em;
+    }
+    pre {
+      background: var(--code-bg);
+      color: var(--code-fg);
+      border-radius: 10px;
+      padding: 16px 18px;
+      overflow: auto;
+      border: 1px solid #243044;
+    }
+    pre code { background: transparent; color: inherit; padding: 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 22px;
+      font-size: 14px;
+    }
+    th, td { border: 1px solid var(--border); padding: 9px 10px; vertical-align: top; }
+    th { background: #edf2f7; color: var(--dark); text-align: left; }
+    tr:nth-child(even) td { background: #fafcff; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-left: 5px solid var(--primary);
+      border-radius: 10px;
+      padding: 14px 16px;
+      background: white;
+    }
+    .card h3, .card h4 { margin: 0 0 6px; }
+    .note, .warn, .ok {
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin: 16px 0;
+      border: 1px solid var(--border);
+    }
+    .note { background: var(--info); border-left: 5px solid var(--accent); }
+    .warn { background: #fff7ed; border-left: 5px solid var(--warn); }
+    .ok { background: #f0fff4; border-left: 5px solid var(--ok); }
+    .badge {
+      display: inline-block;
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #e6eef8;
+      color: var(--primary);
+      font-weight: 700;
+      margin-left: 6px;
+    }
+    .muted { color: var(--muted); }
+    .flow {
+      background: #f8fafc;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      color: #334155;
+    }
+    footer {
+      margin-top: 54px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}
+    .lang-switch:hover{background:rgba(255,255,255,.35)}
+    @media (max-width: 900px) {
+      .layout { display: block; }
+      nav { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+      main { padding: 24px 18px 60px; }
+      header { padding: 32px 20px; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <a class="lang-switch" href="../EJIT_USER_MANUAL.html">中文</a>
+  <h1>EmbeddedJIT User Manual</h1>
+  <p>An EJIT usage guide for business developers: how to annotate code, initialize the runtime, activate time windows, build and test, and deploy across host / AArch64 / bare-metal / SRE scenarios.</p>
+</header>
+
+<div class="layout">
+<nav>
+  <p class="toc-title">Contents</p>
+  <a href="#intro">1. What EJIT is</a>
+  <a href="#quick-start">2. Quick start</a>
+  <a href="#annotations">3. Source annotation API</a>
+  <a href="#runtime-api">4. Runtime API</a>
+  <a href="#build">5. Build and linking</a>
+  <a href="#pipeline">6. AOT/JIT pipeline</a>
+  <a href="#tests">7. Testing and verification</a>
+  <a href="#platform">8. Bare-metal and SRE deployment</a>
+  <a href="#troubleshooting">9. Troubleshooting</a>
+  <a href="#limits">10. Limitations and advice</a>
+  <a href="#references">11. Reference documents</a>
+</nav>
+
+<main>
+  <div class="nav"><a href="index.html">← Doc index</a><a href="EJIT_QUICK_START.html">Quick start</a><a href="EJIT_ARCHITECTURE.html">Architecture</a></div>
+<section id="intro">
+  <h2>1. What EJIT is</h2>
+  <p><strong>EmbeddedJIT</strong> is a runtime specialization compilation system for embedded scenarios. It lets developers annotate "data that stays constant within a certain business time window"; at runtime, once the time window is activated, it treats this data as a compile-time constant and generates specialized machine code for the current configuration.</p>
+
+  <div class="cards">
+    <div class="card">
+      <h3>Core idea</h3>
+      <p>Between <code>ejit_activate</code> and <code>ejit_deactivate</code>, fields annotated <code>ejit_may_const</code> can be read as constants by the JIT.</p>
+    </div>
+    <div class="card">
+      <h3>Main benefits</h3>
+      <p>Constant propagation, branch folding, dead code elimination, local inlining, and CFG simplification — reducing config branches and repeated checks.</p>
+    </div>
+    <div class="card">
+      <h3>Safety semantics</h3>
+      <p>JIT failure, cache miss, time window not active, out of memory, and similar cases all fall back to the original AOT code.</p>
+    </div>
+  </div>
+
+  <div class="flow">User source annotations → Clang emits EJIT metadata → AOT pass embeds bitcode and inserts the wrapper →
+runtime activates the time window → calls ejit_entry → on a cache hit runs specialized code, otherwise falls back to AOT</div>
+
+  <p>Typical scenarios:</p>
+  <ul>
+    <li>Board-level config, mode config, and business config such as cell/trp/channel that stays stable for a period of time;</li>
+    <li>Config fields that drive many branch paths, where the same instance is called repeatedly;</li>
+    <li>You can accept the JIT compile cost on the first call, or use async mode to fall back first and compile in the background.</li>
+  </ul>
+</section>
+
+<section id="quick-start">
+  <h2>2. Quick start</h2>
+
+  <h3>2.1 Include the header</h3>
+  <p>On the user side, simply include the runtime C API header. It already provides the 6 attribute macros; defining <code>EJIT_DISABLE</code> temporarily turns off all EJIT annotations, useful for A/B comparison or non-Clang compilation.</p>
+
+<pre><code class="language-c">#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"</code></pre>
+
+  <h3>2.2 Annotate the config struct and time-window array</h3>
+<pre><code class="language-c">#include &lt;stdint.h&gt;
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+
+#define MODE_FDD 1
+#define MODE_TDD 2
+
+struct CellConfig {
+    ejit_may_const uint32_t mode;      // can be specialized as a constant within the time window
+    ejit_may_const uint32_t threshold; // can be specialized as a constant within the time window
+    uint32_t runtimeCounter;           // ordinary field, does not participate in constant substitution
+};
+
+// each cell index is an independent time-window instance
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+
+static void fdd_path(int value);
+static void tdd_path(int value);
+static void default_path(int value);
+
+// the user still calls the original function name; the compiler inserts a wrapper at the function entry
+ejit_entry
+void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+    if (g_cellCfg[cellIdx].mode == MODE_FDD) {
+        fdd_path(value + g_cellCfg[cellIdx].threshold);
+    } else if (g_cellCfg[cellIdx].mode == MODE_TDD) {
+        tdd_path(value);
+    } else {
+        default_path(value);
+    }
+}
+
+// functions that modify cell config must be annotated with lifecycle; the compiler auto-inserts deactivate/activate
+ejit_period_lc(cell)
+void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                     uint32_t mode,
+                     uint32_t threshold) {
+    g_cellCfg[cellIdx].mode = mode;
+    g_cellCfg[cellIdx].threshold = threshold;
+}</code></pre>
+
+  <h3>2.3 Initialize, activate, and call</h3>
+<pre><code class="language-c">int main(void) {
+    ejit_config_t cfg = {0};
+    cfg.compileMode = EJIT_COMPILE_SYNC; // or EJIT_COMPILE_ASYNC
+    cfg.optLevel = EJIT_OPT_L2;
+    cfg.maxCodeMemory = 2 * 1024 * 1024;
+    cfg.maxCacheEntries = 4096;
+    cfg.enableLogger = true;
+
+    if (ejit_init(&amp;cfg) != EJIT_OK) {
+        return 1;
+    }
+
+    g_cellCfg[3].mode = MODE_FDD;
+    g_cellCfg[3].threshold = 10;
+
+    // activate the cell[3] time window; afterwards process_cell(3, ...) can trigger specialization
+    ejit_activate("cell", 3);
+
+    process_cell(3, 100); // first call: compiles in sync mode; falls back and submits a background compile in async mode
+    process_cell(3, 101); // subsequent: runs the specialized version on a cache hit
+
+    // when modifying config, use a lifecycle function, or manually deactivate / activate
+    update_cell_cfg(3, MODE_TDD, 20);
+    process_cell(3, 102); // recompile or fallback
+
+    ejit_shutdown();
+    return 0;
+}</code></pre>
+
+  <div class="ok"><strong>Minimal usage loop:</strong> Annotate <code>ejit_may_const</code> fields → annotate the <code>ejit_period_arr</code> global array → annotate <code>ejit_entry</code> and <code>ejit_period_arr_ind</code> → <code>ejit_init</code> → <code>ejit_activate</code> → call the original function.</div>
+</section>
+
+<section id="annotations">
+  <h2>3. Source annotation API</h2>
+
+  <h3>3.1 Attribute overview</h3>
+  <table>
+    <thead><tr><th>Macro</th><th>Applies to</th><th>Purpose</th><th>Common constraints</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_may_const</code></td><td>Struct field</td><td>The field can be treated as a constant by the JIT within an active time window</td><td>Supports integer, bool, float, nested struct, and array; <code>volatile</code> is not specialized</td></tr>
+      <tr><td><code>ejit_period(static)</code></td><td>Non-array global variable</td><td>Global config that does not change at runtime, always active by default</td><td>Currently recommended to use only the built-in <code>static</code> scalar time window</td></tr>
+      <tr><td><code>ejit_period_arr(name)</code></td><td>Global array or global pointer to a struct</td><td>Defines a time-window array activated independently per index</td><td>Fixed arrays should stay &lt; 100; at most 1024 arrays per program</td></tr>
+      <tr><td><code>ejit_entry</code></td><td>Function</td><td>Marks a JIT-specializable entry function</td><td>No recursion; side effects should be idempotent in async mode</td></tr>
+      <tr><td><code>ejit_period_arr_ind(name)</code></td><td>Function parameter</td><td>Declares that this parameter is the index dimension of a time-window array</td><td>Must be an integer; at most 4 dimensions per function</td></tr>
+      <tr><td><code>ejit_period_lc(name)</code></td><td>Function</td><td>Marks a lifecycle function that modifies time-window data</td><td>Must have a matching <code>ejit_period_arr_ind</code> parameter; multiple periods allowed</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.2 Static config: <code>ejit_period(static)</code></h3>
+<pre><code class="language-c">struct BoardConfig {
+    ejit_may_const uint32_t boardType;
+    uint32_t flags;
+};
+
+ejit_period(static) struct BoardConfig g_boardCfg;
+
+ejit_entry
+void process_board(void) {
+    if (g_boardCfg.boardType == 1) {
+        // at JIT time boardType can be folded to a constant
+    }
+}</code></pre>
+
+  <p>The <code>static</code> time window represents global config that does not change during JIT runtime; it does not require calling <code>ejit_activate</code>.</p>
+
+  <h3>3.3 Array time window: <code>ejit_period_arr(name)</code></h3>
+  <p>Multiple global arrays can share the same time-window name. Calling <code>ejit_activate("cell", idx)</code> activates the same index across all arrays of that name; to activate only one array, use <code>ejit_activate_array</code>.</p>
+
+<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
+struct CellState  { ejit_may_const uint32_t state; };
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+ejit_period_arr(cell) struct CellState  g_cellState[16];
+
+// activate g_cellCfg[3] and g_cellState[3]
+ejit_activate("cell", 3);
+
+// activate only g_cellCfg[3]
+ejit_activate_array("cell", g_cellCfg, 3);</code></pre>
+
+  <h3>3.4 Multi-dimension specialization</h3>
+  <p>A single <code>ejit_entry</code> function can declare up to 4 time-window array indices. The runtime cache key encodes the high 32 bits as the function index and the low 4 bytes as the dimension values.</p>
+
+<pre><code class="language-c">ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+ejit_period_arr(trp)  struct TrpConfig  g_trpCfg[8];
+
+ejit_entry
+void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                  ejit_period_arr_ind(trp)  uint8_t trpIdx,
+                  int payload) {
+    if (g_cellCfg[cellIdx].mode == 1 &amp;&amp; g_trpCfg[trpIdx].type == 2) {
+        // both cellIdx/trpIdx can become specialization dimensions
+    }
+}</code></pre>
+
+  <h3>3.5 Lifecycle functions</h3>
+  <p>Any function that modifies an <code>ejit_may_const</code> field or its containing struct should be annotated with <code>ejit_period_lc</code>. The compiler inserts an invalidation operation at the function entry and re-activates before every return point.</p>
+
+<pre><code class="language-c">ejit_period_lc(cell) ejit_period_lc(trp)
+void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                 ejit_period_arr_ind(trp)  uint8_t trpIdx) {
+    g_cellCfg[cellIdx].mode = 2;
+    g_trpCfg[trpIdx].type = 4;
+}</code></pre>
+
+  <div class="warn"><strong>Note:</strong> If you bypass the lifecycle function and directly modify an <code>ejit_may_const</code> field inside an already-active time window, the old specialized code may be based on the old value. Use <code>ejit_period_lc</code> or manually <code>ejit_deactivate</code> / modify / <code>ejit_activate</code>.</div>
+</section>
+
+<section id="runtime-api">
+  <h2>4. Runtime API</h2>
+
+  <h3>4.1 Initialization config</h3>
+  <p>The current C API config struct lives in <code>llvm/include/llvm/ExecutionEngine/EJIT/EJitRuntime.h</code>:</p>
+
+<pre><code class="language-c">typedef struct {
+  ejit_compile_mode_t compileMode; // EJIT_COMPILE_SYNC / EJIT_COMPILE_ASYNC
+  ejit_opt_level_t optLevel;       // EJIT_OPT_L1 / L2 / L3
+  size_t maxCodeMemory;            // JIT code memory cap
+  size_t maxDataMemory;            // data memory cap
+  size_t maxCacheEntries;          // cache entry count cap
+  size_t maxCacheSize;             // cache total size cap
+  bool enableLogger;               // whether to enable logging
+  bool forceStaticRegistry;        // bare-metal: force the static registry
+  const char *dumpJITDir;          // when non-null, dump the optimized JIT IR
+} ejit_config_t;</code></pre>
+
+  <table>
+    <thead><tr><th>API</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_init(const ejit_config_t *config)</code></td><td>Initialize EJIT. Pass <code>NULL</code> for default config. Consumes bitcode/period info registered at construction time or via the static table.</td></tr>
+      <tr><td><code>ejit_shutdown(void)</code></td><td>Release EJIT runtime resources.</td></tr>
+      <tr><td><code>ejit_set_compile_mode(mode)</code></td><td>Switch sync/async compile mode at runtime.</td></tr>
+      <tr><td><code>ejit_get_compile_mode()</code></td><td>Query the current compile mode.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.2 Sync and async modes</h3>
+  <table>
+    <thead><tr><th>Mode</th><th>First-miss behavior</th><th>Suitable scenarios</th><th>Caveats</th></tr></thead>
+    <tbody>
+      <tr><td><code>EJIT_COMPILE_SYNC</code></td><td>Blocks until JIT compilation finishes, then directly runs the specialized version on success</td><td>You can accept first-call latency and want performance gains as early as possible</td><td>First-call latency is more noticeable</td></tr>
+      <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>Submits a background compile; the current call falls back to AOT</td><td>Sensitive to first-call latency</td><td><code>ejit_entry</code> side effects should be idempotent, to avoid inconsistency between the first AOT and later JIT behavior</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.3 Time-window lifecycle API</h3>
+<pre><code class="language-c">ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx);
+ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx);
+
+ejit_status_t ejit_activate_array(const char *periodName, void *arrayPtr,
+                                  uint8_t cellIdx);
+ejit_status_t ejit_deactivate_array(const char *periodName, void *arrayPtr,
+                                    uint8_t cellIdx);
+
+ejit_status_t ejit_activate_all(const char *periodName);
+ejit_status_t ejit_deactivate_all(const char *periodName);
+bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
+
+  <ul>
+    <li><code>activate(name, idx)</code>: activates the <code>idx</code> instance across all arrays of that name.</li>
+    <li><code>activate_array(name, ptr, idx)</code>: activates only the instance for the given array pointer.</li>
+    <li><code>deactivate</code>: marks the time window invalid and invalidates cache entries that depend on that instance.</li>
+    <li>If same-named arrays have different lengths, out-of-bounds arrays are skipped; the user should still keep business indices valid.</li>
+  </ul>
+
+  <h3>4.4 Cache, stats, and errors</h3>
+<pre><code class="language-c">void ejit_clear_cache(void);
+void ejit_invalidate(const char *periodName, uint8_t cellIdx);
+
+ejit_status_t ejit_get_stats(ejit_stats_t *stats);
+const ejit_error_t *ejit_get_last_error(void);</code></pre>
+
+  <p><code>ejit_stats_t</code> includes entry count, code size, cache hit/miss, and eviction info. When JIT does not take effect, first check stats and last error, then enable <code>dumpJITDir</code> to dump the optimized IR.</p>
+
+  <h3>4.5 External symbol registration</h3>
+<pre><code class="language-c">void ejit_register_symbol(const char *name, void *addr);</code></pre>
+  <p>In a host environment, external symbols are usually auto-scanned and registered by PASS1. On bare-metal or in environments without <code>dlsym</code>, if the JIT bitcode references platform functions, global variables, or library functions, you must ensure they are registered with EJIT via the auto-registry or a manual call.</p>
+</section>
+
+<section id="build">
+  <h2>5. Build and linking</h2>
+
+  <h3>5.1 Build the EJIT compiler and runtime</h3>
+  <p>This repository recommends the top-level <code>build.sh</code>:</p>
+
+<pre><code class="language-bash"># x86 dev build: clang/opt/lld etc.
+./build.sh debug x86
+
+# x86 release: for EJIT runtime testing
+./build.sh release x86
+
+# AArch64 release: for embedded targets or cross-validation
+./build.sh release aarch64</code></pre>
+
+  <p>On resource-constrained machines, targeted incremental builds are recommended:</p>
+
+<pre><code class="language-bash"># dev build of core tools
+ninja -C build_debug_x86 clang opt lld
+
+# EJIT runtime + linker
+ninja -C build_release_x86 LLVMEJIT lld
+
+# AArch64 runtime
+ninja -C build_release_aarch64 LLVMEJIT lld</code></pre>
+
+  <h3>5.2 Compile the user program</h3>
+  <p>The user program must be compiled with a Clang that has the EJIT attributes and AOT passes, and linked with <code>libLLVMEJIT.a</code>. For real projects, reuse the link rules in <code>ejit_test/build.sh</code>. Conceptually:</p>
+
+<pre><code class="language-bash"># example: using build_release_x86; adjust include/lib paths per your build dir
+build_release_x86/bin/clang -O2 -g \
+  -Illvm/include -Ibuild_release_x86/include \
+  my_ejit_app.c \
+  build_release_x86/lib/libLLVMEJIT.a \
+  -fuse-ld=lld -o my_ejit_app</code></pre>
+
+  <div class="note"><strong>Note:</strong> The EJIT AOT passes are already integrated into the Clang/LLVM pipeline on this branch; compiling normally with an EJIT-enabled Clang produces the metadata, embedded bitcode, wrapper, and lifecycle calls.</div>
+
+  <h3>5.3 Disable EJIT for A/B comparison</h3>
+<pre><code class="language-bash">build_release_x86/bin/clang -DEJIT_DISABLE -O2 my_ejit_app.c -o my_aot_app</code></pre>
+  <p><code>EJIT_DISABLE</code> expands the attribute macros to nothing, making it easy to confirm logic correctness and compare AOT vs EJIT behavior.</p>
+
+  <h3>5.4 Trimming and single-object packaging</h3>
+  <p>For bare-metal or minimal-footprint delivery, you can enable LLVM backend trimming and use the lipo pipeline to merge multiple LLVM archives into a single <code>ejit.o</code>.</p>
+
+<pre><code class="language-bash"># recommended: generate the AArch64 single object via the project script
+./ejit_test/lipo/run_aarch64_pipeline.sh build_release_aarch64 ejit_test/lipo/ejit.o
+
+# run integration tests with the lipo artifact
+./ejit_test/build.sh --run --lipo=ejit_test/lipo/ejit.o</code></pre>
+
+  <p>The stable trimming option is <code>-DEJIT_TRIM_LLVM_BACKEND=ON</code>. SRE code pool options are covered in section 8.</p>
+</section>
+
+<section id="pipeline">
+  <h2>6. AOT/JIT pipeline</h2>
+
+  <h3>6.1 What the AOT compile phase does</h3>
+  <ol>
+    <li>Clang parses the EJIT attributes, emits function/global-level <code>!ejit.metadata</code>, and emits <code>!ejit.may_const</code> on loads of may_const fields.</li>
+    <li><strong>PASS1</strong> <code>EJitRegisterBitcode</code> extracts the <code>ejit_entry</code> closure bitcode before standard optimization, embeds it in the binary, and generates registration info.</li>
+    <li><strong>PASS2</strong> <code>EJitRegisterPeriod</code> generates period-array and static-variable registration.</li>
+    <li><strong>PASS3</strong> <code>EJitWrapperGen</code> inserts the wrapper at the original function entry: builds the cache key, calls the runtime, jumps to the specialized function on success, or continues the original AOT body on failure.</li>
+    <li><strong>PASS4</strong> <code>EJitPeriodHandler</code> inserts deactivate at lifecycle-function entries and activate before every return.</li>
+    <li><strong>PASS5</strong> <code>EJitAotModulePass</code> coordinates PASS2-4.</li>
+  </ol>
+
+  <h3>6.2 What the runtime JIT does</h3>
+  <ol>
+    <li>Look up the cache by cache key; on a hit, return the function pointer.</li>
+    <li>On a miss, load the embedded bitcode.</li>
+    <li>Substitute the <code>ejit_period_arr_ind</code> parameters with the constant indices for this call.</li>
+    <li>Run InstCombine to fold zext/GEP and other constant chains.</li>
+    <li>Inline callees so cross-function field accesses are exposed as global-variable GEPs.</li>
+    <li><strong>PASS6</strong> <code>EJitStructFieldPass</code> replaces <code>ejit_may_const</code> field loads with the current memory-value constant.</li>
+    <li>Run standard LLVM optimization at L1/L2/L3, generate machine code, and place it in the cache.</li>
+  </ol>
+
+  <h3>6.3 Optimization levels</h3>
+  <table>
+    <thead><tr><th>Level</th><th>Positioning</th><th>Typical optimizations</th></tr></thead>
+    <tbody>
+      <tr><td><code>EJIT_OPT_L1</code></td><td>Conservative</td><td>Constant propagation, dead code elimination, branch folding</td></tr>
+      <tr><td><code>EJIT_OPT_L2</code></td><td>Default / balanced</td><td>L1 + CFG simplification, moderate inlining</td></tr>
+      <tr><td><code>EJIT_OPT_L3</code></td><td>Aggressive</td><td>L2 + more aggressive loop optimization; mind code size</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="tests">
+  <h2>7. Testing and verification</h2>
+
+  <h3>7.1 Integration tests</h3>
+<pre><code class="language-bash"># run all EJIT integration tests from the repo root
+./ejit_test/build.sh --run
+
+# run specific tests
+./ejit_test/build.sh --run ejit_attr_test ejit_ptr_period_test
+
+# build specific tests only
+./ejit_test/build.sh ejit_config_api_test</code></pre>
+
+  <p>Common test coverage:</p>
+  <table>
+    <thead><tr><th>Test</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_attr_test</code></td><td>The 6 attributes and basic usage scenarios</td></tr>
+      <tr><td><code>ejit_jit_verify_test</code></td><td>JIT correctness, constant folding, dead-branch elimination</td></tr>
+      <tr><td><code>ejit_lifecycle_test</code></td><td>Lifecycle deactivate/activate pairing</td></tr>
+      <tr><td><code>ejit_multidim_test</code></td><td>Multi-dimension time-window specialization</td></tr>
+      <tr><td><code>ejit_nested_struct_test</code></td><td>Nested struct may_const</td></tr>
+      <tr><td><code>ejit_config_api_test</code></td><td>Config, stats, cache, and compile-mode API</td></tr>
+      <tr><td><code>ejit_perf_bench</code></td><td>Compile time, cache-hit latency, and other performance data</td></tr>
+    </tbody>
+  </table>
+
+  <h3>7.2 IR checkpoints</h3>
+  <p>If you suspect the AOT pass did not take effect, check whether the intermediate compile IR has these features:</p>
+  <table>
+    <thead><tr><th>Check item</th><th>Expected</th></tr></thead>
+    <tbody>
+      <tr><td><code>!ejit.metadata</code></td><td>Functions and globals carry <code>ejit_entry</code>, <code>ejit_period</code>, <code>ejit_period_arr</code>, etc. metadata</td></tr>
+      <tr><td><code>!ejit.may_const</code></td><td>Loads of annotated fields carry may_const metadata</td></tr>
+      <tr><td><code>@__ejit_bitcode</code></td><td>The embedded bitcode is in a dedicated section</td></tr>
+      <tr><td><code>ejit_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
+      <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>A JIT dispatch path and an AOT fallback path exist</td></tr>
+      <tr><td><code>ejit_deactivate_array</code> / <code>ejit_activate_array</code></td><td>Lifecycle-function entry/exit instrumentation</td></tr>
+    </tbody>
+  </table>
+
+  <h3>7.3 Lit / FileCheck</h3>
+<pre><code class="language-bash"># example: a single LLVM pass test
+cd build_debug_x86
+./bin/llvm-lit -v ../llvm/test/Transforms/EmbeddedJIT/
+
+# example: a Clang attribute test
+./bin/llvm-lit -v ../clang/test/Sema/ext_attr_ejit.cpp
+./bin/llvm-lit -v ../clang/test/CodeGen/ejit_metadata.c</code></pre>
+</section>
+
+<section id="platform">
+  <h2>8. Bare-metal and SRE deployment</h2>
+
+  <h3>8.1 Host and bare-metal registration paths</h3>
+  <table>
+    <thead><tr><th>Environment</th><th>Registration mechanism</th><th>Recommendation</th></tr></thead>
+    <tbody>
+      <tr><td>Host/Linux</td><td><code>llvm.global_ctors</code> triggers <code>ejit_auto_register</code></td><td>Just call <code>ejit_init</code> normally to consume the registration info</td></tr>
+      <tr><td>Bare-metal</td><td>Constructors may be unavailable; use the <code>__ejit_registry_*[]</code> static registry</td><td>Set <code>forceStaticRegistry = true</code> and keep the registry section in the linker script</td></tr>
+      <tr><td>No dynamic symbol resolution</td><td>Cannot rely on <code>dlsym</code></td><td>Register external symbols via auto or manual <code>ejit_register_symbol</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>8.2 SRE Code Pool</h3>
+  <p>The SRE code pool replaces the usual <code>mmap/mprotect</code> JIT code-memory path and suits platforms with strict requirements on executable-memory permissions.</p>
+
+<pre><code class="language-bash"># CMake option example
+-DEJIT_SRE_CODE_POOL=ON
+-DEJIT_CODE_POOL_4K_SEAL=ON</code></pre>
+
+  <ul>
+    <li>Allocates JIT machine code from a 2MiB-aligned code pool;</li>
+    <li>In 4K seal mode, only the written 4K pages are marked executable;</li>
+    <li>Avoids writing to RX pages; not modified after finalize;</li>
+    <li>Requires the platform to provide symbols such as <code>enable_ex</code>, <code>split_2m_to_4k</code>, and <code>SRE_MemDbgAlloc</code>.</li>
+  </ul>
+
+  <h3>8.3 SRE Taskpool</h3>
+  <p>The SRE taskpool is an async compile-scheduling mode for environments without a C++ thread library; it is off by default. It uses a single worker task, an MPSC queue, a dedup table, and a bucketed cache. Cross-core sharing of a taskpool depends on shared-memory mapping, execute permission, I/D cache coherence, and owner election.</p>
+
+<pre><code class="language-bash"># build option example
+./build.sh release aarch64_be --freestanding --sre-taskpool</code></pre>
+
+  <div class="warn"><strong>Status note:</strong> SRE taskpool / shared taskpool is a platform-dependent capability; host unit tests can validate the core logic, but shared sections, cross-core execution, task deletion, and cache coherence must ultimately be verified on the target SRE multi-core environment.</div>
+</section>
+
+<section id="troubleshooting">
+  <h2>9. Troubleshooting</h2>
+
+  <h3>9.1 Common compile-time diagnostics</h3>
+  <table>
+    <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td><code>ejit_period</code> used on an array</td><td>Arrays should use <code>ejit_period_arr</code></td><td>Change to <code>ejit_period_arr(name)</code></td></tr>
+      <tr><td><code>ejit_period_arr</code> used on a non-array</td><td>A scalar variable should not use an array time window</td><td>For a static scalar use <code>ejit_period(static)</code></td></tr>
+      <tr><td><code>ejit_period_arr_ind</code> parameter is not an integer</td><td>The index must be encodable as an integer dimension</td><td>Use an integer type such as <code>uint8_t</code> / <code>int</code></td></tr>
+      <tr><td>More than 4 dimensions</td><td>The cache key only encodes four 8-bit dimensions</td><td>Reduce dimensions or split the function</td></tr>
+      <tr><td><code>ejit_period_lc</code> has no matching index parameter</td><td>The lifecycle function cannot tell which instance to modify</td><td>Add an <code>ejit_period_arr_ind(name)</code> parameter</td></tr>
+      <tr><td>Recursive <code>ejit_entry</code></td><td>Recursive entry specialization is not supported</td><td>Drop <code>ejit_entry</code> or restructure the calls</td></tr>
+    </tbody>
+  </table>
+
+  <h3>9.2 JIT did not trigger</h3>
+  <ol>
+    <li>Confirm the function is annotated <code>ejit_entry</code>.</li>
+    <li>Confirm you are using an EJIT-enabled Clang, not a system Clang.</li>
+    <li>Confirm <code>ejit_init</code> ran before calling <code>ejit_entry</code>.</li>
+    <li>Confirm the relevant time window has been <code>ejit_activate</code>-d.</li>
+    <li>Confirm the build output contains <code>@__ejit_bitcode</code> and <code>ejit_compile_or_get</code>.</li>
+    <li>On bare-metal, confirm the registry section was not garbage-collected by the linker.</li>
+    <li>Check <code>ejit_get_last_error()</code> and <code>ejit_get_stats()</code>.</li>
+  </ol>
+
+  <h3>9.3 JIT triggered but branches were not folded</h3>
+  <ol>
+    <li>Is the field annotated <code>ejit_may_const</code>.</li>
+    <li>Is the field <code>volatile</code>; volatile fields are not substituted by constants.</li>
+    <li>Is the global annotated <code>ejit_period(static)</code> or <code>ejit_period_arr(name)</code>.</li>
+    <li>Is the entry-function parameter annotated with the matching <code>ejit_period_arr_ind(name)</code>.</li>
+    <li>Is the time window active, and is the index correct.</li>
+    <li>Can the access pattern be reduced to a constant GEP by InstCombine/Inline; complex PHI/select pointer paths may be skipped.</li>
+    <li>Set <code>dumpJITDir</code> and check whether the optimized IR has replaced the load with a constant.</li>
+  </ol>
+
+  <h3>9.4 Common causes of runtime fallback</h3>
+  <ul>
+    <li>Time window not active or already invalidated;</li>
+    <li>First call in async mode has not finished compiling;</li>
+    <li>Bitcode not found or registration failed;</li>
+    <li>External symbols not registered;</li>
+    <li>JIT compilation failed or the target backend is missing;</li>
+    <li>Out of memory, cache full, or a single function's code size exceeds the cap;</li>
+    <li>A pointer-type <code>ejit_period_arr</code> was not initialized or is out of bounds;</li>
+    <li>The field access pattern is too complex and PASS6 safely skips it.</li>
+  </ul>
+</section>
+
+<section id="limits">
+  <h2>10. Limitations and advice</h2>
+
+  <h3>10.1 Current limitations</h3>
+  <ul>
+    <li>Only the Clang attribute path is supported; GCC compatibility is future work.</li>
+    <li><code>ejit_entry</code> does not support recursion.</li>
+    <li>Function-pointer call targets are not specialized yet.</li>
+    <li>Custom scalar <code>ejit_period(name)</code> depends on declarations planned as a future extension; for now scalars should use <code>static</code>.</li>
+    <li>At most 4 <code>ejit_period_arr_ind</code> dimensions per function.</li>
+    <li>Time-window arrays should be small; fixed arrays target &lt;100, with at most 1024 period arrays globally.</li>
+    <li><code>!ejit.may_const</code> is a soft annotation: losing it only means less optimization, never incorrectness.</li>
+    <li>Complex pointers, PHI/select, and non-linear index paths may not be replaceable by constants.</li>
+    <li>The JIT bitcode and the runtime LLVM version must match.</li>
+  </ul>
+
+  <h3>10.2 Usage advice</h3>
+  <div class="cards">
+    <div class="card">
+      <h4>Prefer stable config fields</h4>
+      <p>Only mark fields that are truly constant within the time window as <code>ejit_may_const</code>; do not annotate frequently changing fields.</p>
+    </div>
+    <div class="card">
+      <h4>Keep dimensions simple</h4>
+      <p>Use <code>uint8_t</code> indices and direct array access; avoid complex pointer aliasing.</p>
+    </div>
+    <div class="card">
+      <h4>Centralize config modification</h4>
+      <p>Modify config through <code>ejit_period_lc</code> functions; avoid scattered writes to may_const fields.</p>
+    </div>
+    <div class="card">
+      <h4>Verify before optimizing</h4>
+      <p>Use <code>EJIT_DISABLE</code> for an A/B comparison, then enable dump IR and stats to verify the optimization gain.</p>
+    </div>
+  </div>
+
+  <h3>10.3 Pre-launch checklist</h3>
+  <ul>
+    <li>All <code>ejit_entry</code> functions have fallback-correctness tests.</li>
+    <li>All config-modification paths use <code>ejit_period_lc</code> or manual deactivate/activate.</li>
+    <li>Behavior is consistent across sync/async; the async first-call fallback does not affect business side effects.</li>
+    <li>Cache size, single-function size, and code-memory caps fit the target device's memory constraints.</li>
+    <li>On bare-metal, confirm external symbols, the registry section, code-memory permissions, and the I/D cache flush path.</li>
+    <li>Performance data covers four scenarios: cold compile, hot cache hit, fallback, and invalidation recompile.</li>
+  </ul>
+</section>
+
+<section id="references">
+  <h2>11. Reference documents</h2>
+  <p>This manual was compiled from the design documents under <code>jit_design_doc</code> and the current headers, with emphasis on:</p>
+  <ul>
+    <li><a href="../../SPEC4.md">SPEC4.md</a> — requirements spec, user annotation API, runtime API, limitations.</li>
+    <li><a href="../../PLAN4.md">PLAN4.md</a> — end-to-end architecture, AOT/JIT pipeline, data model.</li>
+    <li><a href="../../CLANG_ATTR_DESIGN.md">CLANG_ATTR_DESIGN.md</a> — the 6 Clang attributes, Sema diagnostics, CodeGen metadata.</li>
+    <li><a href="../../PASS1_EJitRegisterBitcode.md">PASS1_EJitRegisterBitcode.md</a> — bitcode extraction/embedding, external symbol registration.</li>
+    <li><a href="../../PASS2_EJitRegisterPeriod.md">PASS2_EJitRegisterPeriod.md</a> — period/static registration.</li>
+    <li><a href="../../PASS3_EJitWrapperGen.md">PASS3_EJitWrapperGen.md</a> — wrapper generation and cache key.</li>
+    <li><a href="../../PASS4_EJitPeriodHandler.md">PASS4_EJitPeriodHandler.md</a> — lifecycle instrumentation.</li>
+    <li><a href="../../PASS5_EJitAotModulePass.md">PASS5_EJitAotModulePass.md</a> — AOT pass coordination.</li>
+    <li><a href="../../PASS6_EJitStructFieldPass.md">PASS6_EJitStructFieldPass.md</a> — may_const field constant substitution.</li>
+    <li><a href="../../PASS7_EJitRuntime_OrcJITLink.md">PASS7_EJitRuntime_OrcJITLink.md</a> — runtime, ORC/JITLink, cache, error handling.</li>
+    <li><a href="../../EJIT_LIBRARY_TRIMMING.md">EJIT_LIBRARY_TRIMMING.md</a>, <a href="../../EJIT_TRIM_LLVM_BACKEND.md">EJIT_TRIM_LLVM_BACKEND.md</a> — trimming and single-object delivery.</li>
+    <li><a href="../../EJIT_SRE_CODE_POOL.md">EJIT_SRE_CODE_POOL.md</a>, <a href="../../EJIT_SRE_TASKPOOL.md">EJIT_SRE_TASKPOOL.md</a> — SRE code pool and taskpool.</li>
+  </ul>
+
+  <footer>
+    <p>Generated: 2026-06-27. This document is a user-facing manual and does not replace the underlying design documents; when the API headers and earlier design documents differ in field naming, the current headers take precedence.</p>
+  </footer>
+</section>
+</main>
+</div>
+</body>
+</html>

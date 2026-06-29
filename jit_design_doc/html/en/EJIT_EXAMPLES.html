@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT Examples</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{position:relative;background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1120px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{margin-top:24px}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.case{border:1px solid #d9dee6;border-left:6px solid #2c5282;border-radius:12px;padding:14px 16px;margin:16px 0}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px}.nav a{margin-right:12px;color:#3182ce}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;vertical-align:top;text-align:left}th{background:#edf2f7}.lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}.lang-switch:hover{background:rgba(255,255,255,.35)}
+  </style>
+</head>
+<body>
+<header><a class="lang-switch" href="../EJIT_EXAMPLES.html">中文</a><h1>EJIT Examples</h1><p>Minimal code snippets for common scenarios: static, single-dimension, multi-dimension, lifecycle, async, and bare-metal symbol registration.</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← Doc index</a><a href="EJIT_QUICK_START.html">Quick start</a><a href="EJIT_API_REFERENCE.html">API reference</a></div>
+
+  <section class="case">
+    <h2>1. Static global config specialization</h2>
+    <p>Suits board-level config and global config that does not change after compilation. No <code>ejit_activate</code> needed.</p>
+<pre><code class="language-c">struct BoardConfig {
+    ejit_may_const uint32_t boardType;
+    uint32_t flags;
+};
+
+ejit_period(static) struct BoardConfig g_boardCfg;
+
+ejit_entry
+void process_board(int x) {
+    if (g_boardCfg.boardType == 1) {
+        board_type_1_path(x);
+    } else {
+        generic_path(x);
+    }
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>2. Single-dimension cell time window</h2>
+<pre><code class="language-c">struct CellConfig {
+    ejit_may_const uint32_t mode;
+    ejit_may_const uint32_t threshold;
+};
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+
+ejit_entry
+int process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+    if (g_cellCfg[cellIdx].mode == 1)
+        return value + g_cellCfg[cellIdx].threshold;
+    return value;
+}
+
+void run(void) {
+    g_cellCfg[2].mode = 1;
+    g_cellCfg[2].threshold = 7;
+    ejit_activate("cell", 2);
+    process_cell(2, 100);
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>3. Multi-dimension cell + trp specialization</h2>
+<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
+struct TrpConfig  { ejit_may_const uint32_t type; };
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+ejit_period_arr(trp)  struct TrpConfig  g_trpCfg[8];
+
+ejit_entry
+void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
+                  ejit_period_arr_ind(trp)  uint8_t trpIdx,
+                  int payload) {
+    if (g_cellCfg[cellIdx].mode == 1 && g_trpCfg[trpIdx].type == 2)
+        fast_pair_path(payload);
+    else
+        slow_pair_path(payload);
+}</code></pre>
+    <p>Before calling, activate both time-window instances separately:</p>
+<pre><code class="language-c">ejit_activate("cell", cellIdx);
+ejit_activate("trp", trpIdx);
+process_pair(cellIdx, trpIdx, payload);</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>4. Nested struct fields</h2>
+<pre><code class="language-c">struct Inner {
+    ejit_may_const uint32_t subMode;
+};
+struct CellConfig {
+    struct Inner inner;
+    uint32_t runtimeCounter;
+};
+
+ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+
+ejit_entry
+void process_nested(ejit_period_arr_ind(cell) uint8_t idx) {
+    if (g_cellCfg[idx].inner.subMode == 3)
+        nested_fast();
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>5. Pointer-type period array</h2>
+    <p>A global pointer points to a struct array. The user must ensure it is initialized before calling <code>ejit_entry</code> and that indices stay in bounds.</p>
+<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
+
+ejit_period_arr(cell) struct CellConfig *g_cellPtr;
+
+void init_cells(struct CellConfig *buf) {
+    g_cellPtr = buf;
+}
+
+ejit_entry
+void process_ptr(ejit_period_arr_ind(cell) uint8_t idx) {
+    if (g_cellPtr[idx].mode == 1)
+        ptr_fast();
+}</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>6. Lifecycle function</h2>
+<pre><code class="language-c">ejit_period_lc(cell)
+void update_cell(ejit_period_arr_ind(cell) uint8_t idx, uint32_t mode) {
+    g_cellCfg[idx].mode = mode;
+}
+
+// equivalent manual flow:
+ejit_deactivate("cell", idx);
+g_cellCfg[idx].mode = mode;
+ejit_activate("cell", idx);</code></pre>
+  </section>
+
+  <section class="case">
+    <h2>7. Async compilation mode</h2>
+<pre><code class="language-c">ejit_config_t cfg = {0};
+cfg.compileMode = EJIT_COMPILE_ASYNC;
+cfg.optLevel = EJIT_OPT_L2;
+ejit_init(&amp;cfg);
+
+ejit_activate("cell", idx);
+process_cell(idx, 100); // first call usually falls back and submits a background compile
+process_cell(idx, 101); // subsequent calls may hit the JIT cache</code></pre>
+    <div class="note">In async mode, side effects of <code>ejit_entry</code> should be idempotent, to avoid business divergence between the first AOT fallback and later JIT versions.</div>
+  </section>
+
+  <section class="case">
+    <h2>8. Bare-metal external symbol registration</h2>
+<pre><code class="language-c">extern void platform_log(const char *msg);
+
+void register_platform_symbols(void) {
+    ejit_register_symbol("platform_log", (void *)&amp;platform_log);
+}</code></pre>
+    <p>Normally PASS1 automatically scans closure references and generates registration calls; on bare-metal or special linking scenarios you can add them manually.</p>
+  </section>
+
+  <section>
+    <h2>9. Example verification table</h2>
+    <table>
+      <tr><th>Example</th><th>Checkpoint</th></tr>
+      <tr><td>static</td><td>JITs without calling activate; the low 32 bits of the cache key are 0</td></tr>
+      <tr><td>single-dim</td><td>Different cellIdx produce different versions</td></tr>
+      <tr><td>multi-dim</td><td>cell/trp combinations form different cache keys</td></tr>
+      <tr><td>lifecycle</td><td>After modification the old version is invalidated; after re-activate it can be recompiled</td></tr>
+      <tr><td>async</td><td>First call falls back; after the background compile finishes, hits increase</td></tr>
+    </table>
+  </section>
+</main>
+</body>
+</html>

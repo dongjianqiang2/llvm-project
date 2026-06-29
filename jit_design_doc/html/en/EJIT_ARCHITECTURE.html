@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>EJIT 架构设计图</title>
+  <title>EJIT Architecture Diagrams</title>
   <style>
     :root {
       --primary: #2c5282;
@@ -36,6 +36,7 @@
       line-height: 1.6;
     }
     header {
+      position: relative;
       background: linear-gradient(135deg, var(--primary), var(--primary-2));
       color: white;
       padding: 38px 34px 32px;
@@ -168,7 +169,6 @@
     .green-dot { background: var(--green); }
     .orange-dot { background: var(--orange); }
     .purple-dot { background: var(--purple); }
-    .red-dot { background: var(--red); }
     .muted { color: var(--muted); }
     footer {
       margin-top: 30px;
@@ -184,47 +184,49 @@
     .svg-note { font: 11px sans-serif; fill: #4a5568; }
     .svg-step { font: 700 12px sans-serif; fill: #2c5282; }
     .box-shadow { filter: drop-shadow(0 4px 8px rgba(44, 82, 130, .12)); }
+    .lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}
+    .lang-switch:hover{background:rgba(255,255,255,.35)}
     @media print {
       header { background: var(--primary); -webkit-print-color-adjust: exact; print-color-adjust: exact; }
       section { box-shadow: none; break-inside: avoid; }
       .diagram-wrap { overflow: visible; }
     }
   </style>
-  <style>header{position:relative}.lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}.lang-switch:hover{background:rgba(255,255,255,.35)}</style>
 </head>
 <body>
-<header><a class="lang-switch" href="en/EJIT_ARCHITECTURE.html">English</a>
-  <h1>EJIT 架构设计图</h1>
-  <p>EmbeddedJIT 端到端架构、AOT/JIT 流程、同步编译、异步编译、时间窗生命周期、运行时组件和 bare-metal/SRE 部署关系图。本文档为纯 HTML/SVG，可离线打开。</p>
+<header>
+  <a class="lang-switch" href="../EJIT_ARCHITECTURE.html">中文</a>
+  <h1>EJIT Architecture Diagrams</h1>
+  <p>EmbeddedJIT end-to-end architecture, AOT/JIT flow, synchronous compilation, asynchronous compilation, time-window lifecycle, runtime components, and bare-metal/SRE deployment diagrams. This document is pure HTML/SVG and can be opened offline.</p>
 </header>
 
 <main>
-  <div class="nav"><a href="index.html">← 文档索引</a><a href="EJIT_USER_MANUAL.html">用户手册</a><a href="EJIT_INTERNAL_PIPELINE.html">内部流水线</a></div>
+  <div class="nav"><a href="index.html">← Doc index</a><a href="EJIT_USER_MANUAL.html">User manual</a><a href="EJIT_INTERNAL_PIPELINE.html">Internal pipeline</a></div>
 
   <section id="overview">
-    <h2>1. 总体架构一览</h2>
-    <p class="lead">EJIT 的核心目标是：用户仍然调用原函数名；AOT 阶段把可 JIT 的函数闭包、时间窗 metadata 和 wrapper 放进二进制；运行时根据当前时间窗实例查 cache、编译或 fallback。</p>
+    <h2>1. Overall architecture</h2>
+    <p class="lead">EJIT's core goal: the user still calls the original function name; the AOT phase places the JIT-able function closure, time-window metadata, and wrapper into the binary; at runtime the wrapper looks up the cache, compiles, or falls back based on the current time-window instance.</p>
     <div class="cards">
       <div class="card">
-        <h3>编译期</h3>
-        <p>Clang 识别 <code>ejit_*</code> 属性并生成 metadata；AOT pass 嵌入 bitcode、注册 period/static、插入 wrapper 和生命周期逻辑。</p>
+        <h3>Compile time</h3>
+        <p>Clang recognizes the <code>ejit_*</code> attributes and emits metadata; the AOT pass embeds bitcode, registers period/static, and inserts the wrapper and lifecycle logic.</p>
       </div>
       <div class="card green">
-        <h3>运行期</h3>
-        <p>wrapper 在函数入口计算 cache key；cache 命中时直接调用特化代码；未命中时按同步/异步模式进入编译路径。</p>
+        <h3>Runtime</h3>
+        <p>The wrapper computes the cache key at the function entry; on a cache hit it calls the specialized code directly; on a miss it enters the compile path in sync or async mode.</p>
       </div>
       <div class="card orange">
-        <h3>同步编译</h3>
-        <p>首次 miss 时当前线程阻塞编译；编译成功后立刻执行 JIT 代码，失败则 fallback 到 AOT 原函数体。</p>
+        <h3>Synchronous compile</h3>
+        <p>On the first miss the current thread blocks to compile; once compilation succeeds it runs the JIT code immediately, and on failure falls back to the original AOT body.</p>
       </div>
       <div class="card purple">
-        <h3>异步编译</h3>
-        <p>首次 miss 时提交后台任务并立即 fallback；worker 编译完成后发布到 cache，后续调用命中特化代码。</p>
+        <h3>Asynchronous compile</h3>
+        <p>On the first miss it submits a background task and falls back immediately; the worker publishes to the cache after compiling, and later calls hit the specialized code.</p>
       </div>
     </div>
 
     <div class="diagram-wrap">
-      <svg width="1260" height="650" viewBox="0 0 1260 650" role="img" aria-label="EJIT 端到端总体架构图">
+      <svg width="1260" height="650" viewBox="0 0 1260 650" role="img" aria-label="EJIT end-to-end architecture diagram">
         <defs>
           <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
           <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" /></marker>
@@ -239,60 +241,60 @@
         <text x="30" y="34" class="svg-title">EJIT End-to-End Architecture</text>
 
         <rect x="35" y="70" width="220" height="155" rx="14" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" class="box-shadow" />
-        <text x="64" y="100" class="svg-label">用户源码</text>
-        <text x="62" y="128" class="svg-small">• ejit_may_const 字段</text>
+        <text x="64" y="100" class="svg-label">User source</text>
+        <text x="62" y="128" class="svg-small">• ejit_may_const fields</text>
         <text x="62" y="152" class="svg-small">• ejit_period/static</text>
         <text x="62" y="176" class="svg-small">• ejit_period_arr + index</text>
         <text x="62" y="200" class="svg-small">• ejit_entry / lifecycle</text>
 
         <rect x="310" y="70" width="220" height="155" rx="14" fill="url(#gBlue)" class="box-shadow" />
-        <text x="352" y="100" class="svg-white">Clang 前端/CodeGen</text>
-        <text x="338" y="132" class="svg-white">属性 Sema 检查</text>
-        <text x="338" y="158" class="svg-white">生成 !ejit.metadata</text>
-        <text x="338" y="184" class="svg-white">生成 !ejit.may_const</text>
+        <text x="338" y="100" class="svg-white">Clang frontend/CodeGen</text>
+        <text x="340" y="132" class="svg-white">Attribute Sema checks</text>
+        <text x="338" y="158" class="svg-white">emit !ejit.metadata</text>
+        <text x="338" y="184" class="svg-white">emit !ejit.may_const</text>
 
         <rect x="585" y="60" width="290" height="205" rx="14" fill="#ffffff" stroke="#2c5282" stroke-width="2" class="box-shadow" />
         <rect x="585" y="60" width="290" height="38" rx="14" fill="#2c5282" />
         <text x="671" y="85" class="svg-white">AOT Pass Pipeline</text>
-        <text x="610" y="122" class="svg-small">PASS1: 提取闭包 bitcode</text>
-        <text x="610" y="150" class="svg-small">O2/O3: 标准优化</text>
-        <text x="610" y="178" class="svg-small">PASS2: 注册 period/static</text>
-        <text x="610" y="206" class="svg-small">PASS3: 插入 wrapper</text>
-        <text x="610" y="234" class="svg-small">PASS4: lifecycle 插桩</text>
+        <text x="610" y="122" class="svg-small">PASS1: extract closure bitcode</text>
+        <text x="610" y="150" class="svg-small">O2/O3: standard opts</text>
+        <text x="610" y="178" class="svg-small">PASS2: register period/static</text>
+        <text x="610" y="206" class="svg-small">PASS3: insert wrapper</text>
+        <text x="610" y="234" class="svg-small">PASS4: lifecycle instrumentation</text>
 
         <rect x="950" y="70" width="245" height="175" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" class="box-shadow" />
-        <text x="1004" y="102" class="svg-label">用户程序二进制</text>
-        <text x="980" y="134" class="svg-small">• 原 AOT 函数体</text>
-        <text x="980" y="160" class="svg-small">• wrapper 入口逻辑</text>
+        <text x="994" y="102" class="svg-label">User program binary</text>
+        <text x="980" y="134" class="svg-small">• original AOT body</text>
+        <text x="980" y="160" class="svg-small">• wrapper entry logic</text>
         <text x="980" y="186" class="svg-small">• __ejit_bitcode section</text>
-        <text x="980" y="212" class="svg-small">• __ejit_registry_* 静态表</text>
+        <text x="980" y="212" class="svg-small">• __ejit_registry_* static tables</text>
 
         <rect x="55" y="340" width="360" height="235" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
         <rect x="55" y="340" width="360" height="42" rx="18" fill="#2d3748" />
         <text x="165" y="367" class="svg-white">Wrapper Hot Path</text>
-        <text x="88" y="415" class="svg-small">1. 读取 entry 参数中的 period index</text>
-        <text x="88" y="443" class="svg-small">2. 计算 cacheKey = funcIdx + dims</text>
-        <text x="88" y="471" class="svg-small">3. 检查 active/invalid 状态</text>
-        <text x="88" y="499" class="svg-small">4. 查询 cache</text>
-        <text x="88" y="527" class="svg-small">5. hit → JIT dispatch；fail → fallback</text>
+        <text x="88" y="415" class="svg-small">1. read period index from entry args</text>
+        <text x="88" y="443" class="svg-small">2. compute cacheKey = funcIdx + dims</text>
+        <text x="88" y="471" class="svg-small">3. check active/invalid state</text>
+        <text x="88" y="499" class="svg-small">4. query cache</text>
+        <text x="88" y="527" class="svg-small">5. hit → JIT dispatch; fail → fallback</text>
 
         <rect x="465" y="340" width="310" height="235" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
         <rect x="465" y="340" width="310" height="42" rx="18" fill="url(#gOrange)" />
         <text x="535" y="367" class="svg-white">Sync Compile Mode</text>
-        <text x="500" y="415" class="svg-small">miss 时当前线程编译</text>
+        <text x="500" y="415" class="svg-small">on miss, current thread compiles</text>
         <text x="500" y="443" class="svg-small">bitcode → param const → PASS6</text>
         <text x="500" y="471" class="svg-small">LLVM opts → ORC/JITLink</text>
-        <text x="500" y="499" class="svg-small">发布 cache entry</text>
-        <text x="500" y="527" class="svg-small">成功：本次调用执行 JIT</text>
+        <text x="500" y="499" class="svg-small">publish cache entry</text>
+        <text x="500" y="527" class="svg-small">success: this call runs JIT</text>
 
         <rect x="825" y="340" width="340" height="235" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
         <rect x="825" y="340" width="340" height="42" rx="18" fill="url(#gPurple)" />
         <text x="913" y="367" class="svg-white">Async Compile Mode</text>
-        <text x="860" y="415" class="svg-small">miss 时提交 task / 去重</text>
-        <text x="860" y="443" class="svg-small">当前调用立即 fallback 到 AOT</text>
-        <text x="860" y="471" class="svg-small">worker 后台编译并 finalize</text>
-        <text x="860" y="499" class="svg-small">原子发布 code pointer / bucket</text>
-        <text x="860" y="527" class="svg-small">后续调用 cache hit → JIT dispatch</text>
+        <text x="860" y="415" class="svg-small">on miss, submit task / dedup</text>
+        <text x="860" y="443" class="svg-small">current call falls back to AOT</text>
+        <text x="860" y="471" class="svg-small">worker compiles &amp; finalizes</text>
+        <text x="860" y="499" class="svg-small">atomic publish code ptr / bucket</text>
+        <text x="860" y="527" class="svg-small">later calls cache hit → JIT dispatch</text>
 
         <line x1="255" y1="148" x2="310" y2="148" stroke="#2c5282" stroke-width="3" marker-end="url(#arrow)" />
         <line x1="530" y1="148" x2="585" y2="148" stroke="#2c5282" stroke-width="3" marker-end="url(#arrow)" />
@@ -301,22 +303,22 @@
         <path d="M415 456 L465 456" fill="none" stroke="#dd6b20" stroke-width="3" marker-end="url(#arrowOrange)" />
         <path d="M415 506 C560 615, 900 615, 995 575" fill="none" stroke="#6b46c1" stroke-width="3" marker-end="url(#arrowPurple)" />
 
-        <text x="36" y="620" class="svg-note">关键语义：JIT 只是加速路径；inactive、编译失败、内存不足、符号解析失败、异步 pending 等情况都必须安全 fallback 到原 AOT 函数体。</text>
+        <text x="36" y="620" class="svg-note">Key semantics: JIT is only an acceleration path; inactive, compile failure, out of memory, symbol resolution failure, and async pending must all safely fall back to the original AOT body.</text>
       </svg>
     </div>
     <div class="legend">
-      <span><i class="dot blue"></i>编译期</span>
-      <span><i class="dot green-dot"></i>产物 / 热路径</span>
-      <span><i class="dot orange-dot"></i>同步编译</span>
-      <span><i class="dot purple-dot"></i>异步编译</span>
+      <span><i class="dot blue"></i>Compile time</span>
+      <span><i class="dot green-dot"></i>Artifact / hot path</span>
+      <span><i class="dot orange-dot"></i>Sync compile</span>
+      <span><i class="dot purple-dot"></i>Async compile</span>
     </div>
   </section>
 
   <section id="aot-pipeline">
-    <h2>2. AOT 编译期流水线</h2>
-    <p>AOT 流水线的职责是把“可运行的原始 AOT 程序”和“可供运行时重新优化的 JIT 输入”同时放进最终二进制。PASS1 必须尽早运行，防止标准优化丢失原始 metadata；PASS2-4 在 late 阶段补齐 runtime 需要的入口。</p>
+    <h2>2. AOT compile pipeline</h2>
+    <p>The AOT pipeline's job is to place both "the runnable original AOT program" and "the JIT input for runtime re-optimization" into the final binary. PASS1 must run as early as possible to prevent standard optimization from losing the raw metadata; PASS2-4 fill in the runtime-needed entry points in the late stage.</p>
     <div class="diagram-wrap">
-      <svg width="1260" height="430" viewBox="0 0 1260 430" role="img" aria-label="EJIT AOT 编译期流水线图">
+      <svg width="1260" height="430" viewBox="0 0 1260 430" role="img" aria-label="EJIT AOT compile pipeline diagram">
         <defs>
           <marker id="aotArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
         </defs>
@@ -330,32 +332,32 @@
         <rect x="245" y="70" width="185" height="110" rx="12" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
         <text x="291" y="102" class="svg-label">PASS1</text>
         <text x="268" y="128" class="svg-small">EJitRegisterBitcode</text>
-        <text x="268" y="152" class="svg-small">提取闭包 + 嵌入 bitcode</text>
+        <text x="268" y="152" class="svg-small">extract closure + embed bitcode</text>
 
         <rect x="480" y="70" width="165" height="110" rx="12" fill="#f8fafc" stroke="#718096" stroke-width="2" />
         <text x="518" y="102" class="svg-label">O2 / O3</text>
-        <text x="508" y="128" class="svg-small">标准优化</text>
-        <text x="508" y="152" class="svg-small">生成 AOT 代码基础</text>
+        <text x="508" y="128" class="svg-small">standard opts</text>
+        <text x="508" y="152" class="svg-small">produce AOT code base</text>
 
         <rect x="695" y="70" width="185" height="110" rx="12" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
         <text x="742" y="102" class="svg-label">PASS2</text>
         <text x="717" y="128" class="svg-small">EJitRegisterPeriod</text>
-        <text x="717" y="152" class="svg-small">生成 period/static registry</text>
+        <text x="717" y="152" class="svg-small">generate period/static registry</text>
 
         <rect x="930" y="70" width="185" height="110" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
         <text x="977" y="102" class="svg-label">PASS3</text>
         <text x="958" y="128" class="svg-small">EJitWrapperGen</text>
-        <text x="958" y="152" class="svg-small">原函数入口插入 wrapper</text>
+        <text x="958" y="152" class="svg-small">insert wrapper at entry</text>
 
         <rect x="930" y="250" width="185" height="110" rx="12" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" />
         <text x="977" y="282" class="svg-label">PASS4</text>
         <text x="947" y="308" class="svg-small">EJitPeriodHandler</text>
-        <text x="947" y="332" class="svg-small">deactivate / activate 插桩</text>
+        <text x="947" y="332" class="svg-small">deactivate / activate instrumentation</text>
 
         <rect x="455" y="250" width="380" height="110" rx="12" fill="#ffffff" stroke="#2c5282" stroke-width="2" />
         <text x="560" y="282" class="svg-label">PASS5: EJitAotModulePass</text>
-        <text x="485" y="312" class="svg-small">协调 PASS2 → PASS3 → PASS4；无 EJIT metadata 时快速跳过</text>
-        <text x="485" y="338" class="svg-small">产物：wrapper + registry + embedded bitcode + 原 AOT 函数体</text>
+        <text x="485" y="312" class="svg-small">coordinate PASS2 → PASS3 → PASS4; skip fast when no EJIT metadata</text>
+        <text x="485" y="338" class="svg-small">artifact: wrapper + registry + embedded bitcode + original AOT body</text>
 
         <line x1="195" y1="125" x2="245" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
         <line x1="430" y1="125" x2="480" y2="125" stroke="#2c5282" stroke-width="3" marker-end="url(#aotArrow)" />
@@ -364,55 +366,55 @@
         <path d="M1022 180 L1022 250" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#aotArrow)" />
         <path d="M930 305 C880 305, 860 305, 835 305" fill="none" stroke="#2c5282" stroke-width="2.5" marker-end="url(#aotArrow)" />
 
-        <text x="36" y="400" class="svg-note">非 LTO 推荐：PASS1 早期提取 bitcode → O2/O3 → PASS2-4 late 插桩。LTO 场景需要保证 registry/wrapper 生成阶段仍能看到必要 metadata。</text>
+        <text x="36" y="400" class="svg-note">Non-LTO recommendation: PASS1 extracts bitcode early → O2/O3 → PASS2-4 late instrumentation. In LTO, ensure the registry/wrapper generation stage can still see the necessary metadata.</text>
       </svg>
     </div>
     <table>
-      <thead><tr><th>阶段</th><th>输入</th><th>输出</th><th>为什么需要</th></tr></thead>
+      <thead><tr><th>Stage</th><th>Input</th><th>Output</th><th>Why it's needed</th></tr></thead>
       <tbody>
-        <tr><td>PASS1</td><td>带 metadata 的原始 IR</td><td><code>__ejit_bitcode</code> / 函数闭包 bitcode</td><td>运行时 JIT 需要未被破坏的可优化 IR。</td></tr>
-        <tr><td>PASS2</td><td>period/static 全局 metadata</td><td>动态注册调用或静态 registry 表</td><td>运行时需要知道哪些内存对象属于哪个时间窗。</td></tr>
-        <tr><td>PASS3</td><td><code>ejit_entry</code> 函数 metadata</td><td>原函数入口 wrapper</td><td>用户不改调用点，仍调用原函数名即可触发 JIT。</td></tr>
-        <tr><td>PASS4</td><td><code>ejit_period_lc</code> metadata</td><td>deactivate / activate 插桩</td><td>配置修改时自动失效旧 cache，维持 may_const 语义。</td></tr>
+        <tr><td>PASS1</td><td>Raw IR with metadata</td><td><code>__ejit_bitcode</code> / function-closure bitcode</td><td>The runtime JIT needs intact, optimizable IR.</td></tr>
+        <tr><td>PASS2</td><td>period/static global metadata</td><td>Dynamic registration calls or a static registry table</td><td>The runtime needs to know which memory objects belong to which time window.</td></tr>
+        <tr><td>PASS3</td><td><code>ejit_entry</code> function metadata</td><td>Wrapper at the original function entry</td><td>The user does not change call sites; calling the original function name triggers JIT.</td></tr>
+        <tr><td>PASS4</td><td><code>ejit_period_lc</code> metadata</td><td>deactivate / activate instrumentation</td><td>Automatically invalidates the old cache when config changes, preserving may_const semantics.</td></tr>
       </tbody>
     </table>
   </section>
 
   <section id="runtime-decision">
-    <h2>3. Runtime 热路径与模式选择</h2>
-    <p>wrapper 热路径先做低成本判断：runtime 是否初始化、时间窗是否 active、cache 是否命中。只有 miss 且允许 JIT 时，才根据 <code>ejit_config_t::compileMode</code> 进入同步或异步路径。</p>
-    <div class="flow">用户调用 ejit_entry 原函数
+    <h2>3. Runtime hot path and mode selection</h2>
+    <p>The wrapper hot path first does cheap checks: is the runtime initialized, is the time window active, is the cache hit. Only on a miss when JIT is allowed does it enter the sync or async path based on <code>ejit_config_t::compileMode</code>.</p>
+    <div class="flow">User calls the ejit_entry original function
   ↓
-wrapper 读取 period index / 计算 cacheKey
+wrapper reads period index / computes cacheKey
   ↓
-未初始化 / inactive / disabled? ── 是 → fallback AOT
-  ↓ 否
-cache hit? ── 是 → 调用特化函数
-  ↓ 否
-compileMode == SYNC ? ── 是 → 当前线程编译 → 成功则执行 JIT，失败 fallback
-  ↓ 否
-compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 后续调用命中</div>
+uninitialized / inactive / disabled? ── yes → fallback AOT
+  ↓ no
+cache hit? ── yes → call specialized function
+  ↓ no
+compileMode == SYNC ? ── yes → current thread compiles → run JIT on success, fallback on failure
+  ↓ no
+compileMode == ASYNC → submit background compile task → current call falls back → later calls hit</div>
     <div class="cards">
       <div class="card green">
         <h3>Cache Key</h3>
-        <p>典型布局为 <code>funcIdx</code> + 最多 4 个维度下标。相同函数和相同时间窗实例组合命中同一份特化代码。</p>
+        <p>The typical layout is <code>funcIdx</code> + up to 4 dimension indices. The same function and the same time-window instance combination hit the same specialized code.</p>
       </div>
       <div class="card orange">
-        <h3>版本 / 失效</h3>
-        <p><code>deactivate</code> 或 lifecycle 插桩会标记实例 invalid，并使旧 cache entry 不再作为有效特化代码使用。</p>
+        <h3>Version / invalidation</h3>
+        <p><code>deactivate</code> or lifecycle instrumentation marks the instance invalid and makes old cache entries no longer usable as valid specialized code.</p>
       </div>
       <div class="card purple">
-        <h3>Fallback 原则</h3>
-        <p>无论 miss、pending、OOM、符号失败还是编译失败，wrapper 都必须能回到 AOT 原函数体，保持正确性。</p>
+        <h3>Fallback principle</h3>
+        <p>Whether miss, pending, OOM, symbol failure, or compile failure, the wrapper must always be able to return to the original AOT body, preserving correctness.</p>
       </div>
     </div>
   </section>
 
   <section id="sync-compile">
-    <h2>4. 同步编译模式</h2>
-    <p><code>EJIT_COMPILE_SYNC</code> 适合验证、调试和可接受首次调用延迟的场景。cache miss 后，当前业务线程直接完成 JIT 编译；编译成功则本次调用就执行特化代码。</p>
+    <h2>4. Synchronous compile mode</h2>
+    <p><code>EJIT_COMPILE_SYNC</code> suits validation, debugging, and scenarios that can accept first-call latency. After a cache miss, the current business thread directly completes the JIT compile; on success this call runs the specialized code.</p>
     <div class="diagram-wrap">
-      <svg width="1260" height="520" viewBox="0 0 1260 520" role="img" aria-label="EJIT 同步编译流程图">
+      <svg width="1260" height="520" viewBox="0 0 1260 520" role="img" aria-label="EJIT synchronous compile flow diagram">
         <defs>
           <marker id="syncArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" /></marker>
           <marker id="syncGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" /></marker>
@@ -421,37 +423,37 @@ compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 
         <text x="30" y="34" class="svg-title">Synchronous Compile Path</text>
 
         <rect x="40" y="80" width="170" height="86" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
-        <text x="78" y="112" class="svg-label">业务线程</text>
-        <text x="70" y="140" class="svg-small">调用 ejit_entry</text>
+        <text x="74" y="112" class="svg-label">Business thread</text>
+        <text x="70" y="140" class="svg-small">call ejit_entry</text>
 
         <rect x="270" y="80" width="190" height="86" rx="12" fill="#fff" stroke="#2c5282" stroke-width="2" />
         <text x="330" y="112" class="svg-label">Wrapper</text>
         <text x="303" y="140" class="svg-small">cache miss</text>
 
         <rect x="520" y="62" width="250" height="122" rx="14" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
-        <text x="586" y="96" class="svg-label">当前线程编译</text>
+        <text x="572" y="96" class="svg-label">compile on current thread</text>
         <text x="548" y="126" class="svg-small">load bitcode + clone module</text>
         <text x="548" y="152" class="svg-small">substitute dims / constants</text>
 
         <rect x="830" y="62" width="245" height="122" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" />
-        <text x="890" y="96" class="svg-label">JIT 优化/代码生成</text>
+        <text x="872" y="96" class="svg-label">JIT opt / codegen</text>
         <text x="858" y="126" class="svg-small">InstCombine → Inline → PASS6</text>
         <text x="858" y="152" class="svg-small">L1/L2/L3 → ORC/JITLink</text>
 
         <rect x="595" y="270" width="230" height="90" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
-        <text x="655" y="302" class="svg-label">发布 cache entry</text>
-        <text x="630" y="330" class="svg-small">函数指针 + code memory</text>
+        <text x="645" y="302" class="svg-label">publish cache entry</text>
+        <text x="630" y="330" class="svg-small">function pointer + code memory</text>
 
         <rect x="915" y="270" width="230" height="90" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
-        <text x="980" y="302" class="svg-label">本次执行 JIT</text>
-        <text x="952" y="330" class="svg-small">返回特化函数结果</text>
+        <text x="965" y="302" class="svg-label">this call runs JIT</text>
+        <text x="952" y="330" class="svg-small">return specialized result</text>
 
         <rect x="270" y="270" width="210" height="90" rx="14" fill="#fff5f5" stroke="#c53030" stroke-width="2" />
-        <text x="332" y="302" class="svg-label">失败路径</text>
+        <text x="330" y="302" class="svg-label">failure path</text>
         <text x="300" y="330" class="svg-small">compile/link/OOM → fallback</text>
 
         <rect x="40" y="395" width="1105" height="62" rx="14" fill="#f8fafc" stroke="#d9dee6" stroke-width="2" />
-        <text x="68" y="432" class="svg-note">同步模式特征：首次 miss 延迟较高，但调用语义直观；适合功能验证、dump IR、确认分支折叠和小规模可控热函数。</text>
+        <text x="68" y="432" class="svg-note">Sync mode characteristics: higher first-miss latency, but intuitive call semantics; suits functional validation, IR dumps, confirming branch folding, and small-scale controllable hot functions.</text>
 
         <line x1="210" y1="123" x2="270" y2="123" stroke="#dd6b20" stroke-width="3" marker-end="url(#syncArrow)" />
         <line x1="460" y1="123" x2="520" y2="123" stroke="#dd6b20" stroke-width="3" marker-end="url(#syncArrow)" />
@@ -462,22 +464,22 @@ compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 
       </svg>
     </div>
     <table>
-      <thead><tr><th>步骤</th><th>动作</th><th>失败时</th></tr></thead>
+      <thead><tr><th>Step</th><th>Action</th><th>On failure</th></tr></thead>
       <tbody>
-        <tr><td>1</td><td>wrapper miss 后调用 <code>ejit_compile_or_get</code> 的同步分支</td><td>runtime 未初始化或实例 inactive 时直接 fallback</td></tr>
-        <tr><td>2</td><td>加载嵌入 bitcode，按 <code>cacheKey</code> 克隆待优化模块</td><td>bitcode 找不到则返回 NULL</td></tr>
-        <tr><td>3</td><td>替换 period index 参数，执行 PASS6 读取当前 may_const 字段值</td><td>不可分析 load 保守跳过，不影响正确性</td></tr>
-        <tr><td>4</td><td>运行 LLVM 优化和 ORC/JITLink，生成机器码</td><td>目标后端、符号、内存失败时 fallback</td></tr>
-        <tr><td>5</td><td>发布 cache entry，并把函数指针返回 wrapper</td><td>cache 满或发布失败时 fallback</td></tr>
+        <tr><td>1</td><td>After a wrapper miss, calls the sync branch of <code>ejit_compile_or_get</code></td><td>If the runtime is uninitialized or the instance is inactive, falls back directly</td></tr>
+        <tr><td>2</td><td>Loads the embedded bitcode and clones the module to optimize by <code>cacheKey</code></td><td>If the bitcode is not found, returns NULL</td></tr>
+        <tr><td>3</td><td>Substitutes the period index parameter, runs PASS6 to read the current may_const field value</td><td>Unanalyzable loads are conservatively skipped, with no correctness impact</td></tr>
+        <tr><td>4</td><td>Runs LLVM optimization and ORC/JITLink to produce machine code</td><td>Falls back on target backend, symbol, or memory failure</td></tr>
+        <tr><td>5</td><td>Publishes the cache entry and returns the function pointer to the wrapper</td><td>Falls back if the cache is full or publish fails</td></tr>
       </tbody>
     </table>
   </section>
 
   <section id="async-compile">
-    <h2>5. 异步编译模式</h2>
-    <p><code>EJIT_COMPILE_ASYNC</code> 适合实时敏感路径：业务线程不能被首次 JIT 编译阻塞。cache miss 时，wrapper 只提交后台任务并立即 fallback；worker 编译完成后发布代码，后续调用再命中。</p>
+    <h2>5. Asynchronous compile mode</h2>
+    <p><code>EJIT_COMPILE_ASYNC</code> suits latency-sensitive paths where the business thread cannot be blocked by the first JIT compile. On a cache miss, the wrapper only submits a background task and falls back immediately; the worker publishes the code after compiling, and later calls hit.</p>
     <div class="diagram-wrap">
-      <svg width="1260" height="620" viewBox="0 0 1260 620" role="img" aria-label="EJIT 异步编译流程图">
+      <svg width="1260" height="620" viewBox="0 0 1260 620" role="img" aria-label="EJIT asynchronous compile flow diagram">
         <defs>
           <marker id="asyncArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#6b46c1" /></marker>
           <marker id="asyncGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#38a16f" /></marker>
@@ -486,47 +488,47 @@ compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 
         <text x="30" y="34" class="svg-title">Asynchronous Compile Path</text>
 
         <rect x="50" y="80" width="230" height="120" rx="14" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
-        <text x="112" y="112" class="svg-label">业务线程调用</text>
+        <text x="100" y="112" class="svg-label">Business thread call</text>
         <text x="84" y="142" class="svg-small">wrapper cache miss</text>
         <text x="84" y="168" class="svg-small">compileMode = ASYNC</text>
 
         <rect x="350" y="80" width="235" height="120" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" />
-        <text x="410" y="112" class="svg-label">提交编译任务</text>
+        <text x="402" y="112" class="svg-label">submit compile task</text>
         <text x="382" y="142" class="svg-small">MPSC queue / taskpool</text>
-        <text x="382" y="168" class="svg-small">按 cacheKey 去重</text>
+        <text x="382" y="168" class="svg-small">dedup by cacheKey</text>
 
         <rect x="660" y="80" width="230" height="120" rx="14" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" />
-        <text x="720" y="112" class="svg-label">本次调用</text>
-        <text x="695" y="142" class="svg-small">立即 fallback AOT</text>
-        <text x="695" y="168" class="svg-small">不等待 JIT 完成</text>
+        <text x="710" y="112" class="svg-label">this call</text>
+        <text x="695" y="142" class="svg-small">fallback AOT now</text>
+        <text x="695" y="168" class="svg-small">do not wait for JIT</text>
 
         <rect x="965" y="80" width="220" height="120" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" />
-        <text x="1030" y="112" class="svg-label">后续调用</text>
-        <text x="1000" y="142" class="svg-small">如果 cache 已发布</text>
-        <text x="1000" y="168" class="svg-small">直接 JIT dispatch</text>
+        <text x="1015" y="112" class="svg-label">later calls</text>
+        <text x="1000" y="142" class="svg-small">if cache published</text>
+        <text x="1000" y="168" class="svg-small">direct JIT dispatch</text>
 
         <rect x="210" y="305" width="840" height="230" rx="18" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
         <rect x="210" y="305" width="840" height="42" rx="18" fill="#2d3748" />
-        <text x="552" y="332" class="svg-white">后台 Worker / Taskpool</text>
+        <text x="540" y="332" class="svg-white">Background Worker / Taskpool</text>
 
         <rect x="245" y="375" width="150" height="74" rx="10" fill="#ebf2fa" stroke="#3182ce" />
-        <text x="284" y="405" class="svg-label">取任务</text>
+        <text x="288" y="405" class="svg-label">pop task</text>
         <text x="268" y="428" class="svg-small">pop cacheKey</text>
 
         <rect x="445" y="375" width="160" height="74" rx="10" fill="#fff7ed" stroke="#dd6b20" />
-        <text x="480" y="405" class="svg-label">加载 bitcode</text>
+        <text x="476" y="405" class="svg-label">load bitcode</text>
         <text x="470" y="428" class="svg-small">clone module</text>
 
         <rect x="655" y="375" width="160" height="74" rx="10" fill="#f5f0ff" stroke="#6b46c1" />
-        <text x="696" y="405" class="svg-label">优化编译</text>
+        <text x="688" y="405" class="svg-label">optimize &amp; compile</text>
         <text x="676" y="428" class="svg-small">PASS6 + ORC</text>
 
         <rect x="865" y="375" width="150" height="74" rx="10" fill="#f0fff4" stroke="#38a16f" />
-        <text x="904" y="405" class="svg-label">发布代码</text>
+        <text x="900" y="405" class="svg-label">publish code</text>
         <text x="890" y="428" class="svg-small">atomic publish</text>
 
         <rect x="340" y="500" width="585" height="50" rx="10" fill="#f8fafc" stroke="#d9dee6" />
-        <text x="365" y="531" class="svg-note">失败或任务被禁用：记录 last_error / stats，cache 不发布；业务调用仍由 AOT fallback 保证正确性。</text>
+        <text x="365" y="531" class="svg-note">Failure or task disabled: record last_error / stats, cache not published; business calls are still kept correct by the AOT fallback.</text>
 
         <line x1="280" y1="140" x2="350" y2="140" stroke="#6b46c1" stroke-width="3" marker-end="url(#asyncArrow)" />
         <line x1="585" y1="140" x2="660" y2="140" stroke="#dd6b20" stroke-width="3" marker-end="url(#asyncOrange)" />
@@ -539,57 +541,57 @@ compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 
     </div>
     <div class="cards">
       <div class="card purple">
-        <h3>任务去重</h3>
-        <p>同一 <code>cacheKey</code> 的 miss 只需要一个后台编译任务；其他调用继续 fallback，避免队列被重复编译填满。</p>
+        <h3>Task dedup</h3>
+        <p>A miss for the same <code>cacheKey</code> needs only one background compile task; other calls keep falling back, preventing the queue from being filled by duplicate compiles.</p>
       </div>
       <div class="card orange">
-        <h3>发布时机</h3>
-        <p>worker 完成 JITLink、内存 finalize 和必要的 I/D cache 同步后，才把函数指针发布给 cache。</p>
+        <h3>Publish timing</h3>
+        <p>The worker publishes the function pointer to the cache only after JITLink, memory finalize, and any necessary I/D cache sync are complete.</p>
       </div>
       <div class="card green">
-        <h3>实时性</h3>
-        <p>业务线程只承担排队和 fallback 成本，不承担 LLVM 优化和目标代码生成成本。</p>
+        <h3>Latency</h3>
+        <p>The business thread bears only the enqueue and fallback cost, not the LLVM optimization and target codegen cost.</p>
       </div>
       <div class="card red">
-        <h3>一致性</h3>
-        <p>如果时间窗在任务编译期间被 deactivate，发布前必须检查版本/状态，避免发布过期特化代码。</p>
+        <h3>Consistency</h3>
+        <p>If the time window is deactivated while the task is compiling, the version/state must be re-checked before publishing, to avoid publishing stale specialized code.</p>
       </div>
     </div>
   </section>
 
   <section id="jit-pipeline">
-    <h2>6. JIT 优化 Pipeline</h2>
-    <p>同步和异步模式共享同一套 JIT 优化管线，只是触发线程不同。PASS6 的核心任务是把当前时间窗内稳定的内存字段替换成常量，随后交给 LLVM 标准优化折叠分支和删除死代码。</p>
+    <h2>6. JIT optimization pipeline</h2>
+    <p>Sync and async modes share the same JIT optimization pipeline; only the triggering thread differs. PASS6's core task is to replace memory fields that are stable within the current time window with constants, then hand off to standard LLVM optimization to fold branches and delete dead code.</p>
     <div class="flow">ModuleLoader
   ↓
-参数替换：period index / static dim → LLVM 常量
+parameter substitution: period index / static dim → LLVM constant
   ↓
-InstCombine：GEP / cast / 简单算术折叠
+InstCombine: GEP / cast / simple arithmetic folding
   ↓
-Inline：把跨函数配置访问展开到 JIT 闭包内
+Inline: expand cross-function config access into the JIT closure
   ↓
-PASS6 EJitStructFieldPass：may_const load → 当前内存值常量
+PASS6 EJitStructFieldPass: may_const load → current memory-value constant
   ↓
-标准 LLVM opts：SCCP / SimplifyCFG / DCE / GVN / InstCombine
+standard LLVM opts: SCCP / SimplifyCFG / DCE / GVN / InstCombine
   ↓
-ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</div>
+ORC LLJIT / JITLink: target codegen + symbol resolution + code memory finalize</div>
     <table>
-      <thead><tr><th>阶段</th><th>作用</th><th>用户可观察结果</th></tr></thead>
+      <thead><tr><th>Stage</th><th>Role</th><th>User-observable result</th></tr></thead>
       <tbody>
-        <tr><td>参数替换</td><td>把 <code>ejit_period_arr_ind</code> 参数替换为当前实例常量</td><td>数组下标、GEP 路径变得可折叠</td></tr>
-        <tr><td>Inline</td><td>把小函数中的配置读取展开到入口闭包</td><td>跨函数读配置也可被 PASS6 识别</td></tr>
-        <tr><td>PASS6</td><td>读取 active 时间窗内 <code>ejit_may_const</code> 字段值，替换 load</td><td>IR 中 load 变成常量，分支条件固定</td></tr>
-        <tr><td>标准优化</td><td>常量传播、分支折叠、死代码删除、CFG 简化</td><td>dump IR 可看到只保留当前配置路径</td></tr>
-        <tr><td>JITLink</td><td>生成机器码，解析外部符号，放入可执行内存</td><td>cache entry 增加，后续 hits 增加</td></tr>
+        <tr><td>Parameter substitution</td><td>Substitutes <code>ejit_period_arr_ind</code> parameters with the current instance constants</td><td>Array indices and GEP paths become foldable</td></tr>
+        <tr><td>Inline</td><td>Expands config reads in small functions into the entry closure</td><td>Cross-function config reads can also be recognized by PASS6</td></tr>
+        <tr><td>PASS6</td><td>Reads the <code>ejit_may_const</code> field value within the active time window and replaces the load</td><td>Loads become constants in the IR; branch conditions are fixed</td></tr>
+        <tr><td>Standard optimization</td><td>Constant propagation, branch folding, dead code elimination, CFG simplification</td><td>The dump IR shows only the current-config path retained</td></tr>
+        <tr><td>JITLink</td><td>Generates machine code, resolves external symbols, places it in executable memory</td><td>Cache entries increase; later hits increase</td></tr>
       </tbody>
     </table>
   </section>
 
   <section id="lifecycle">
-    <h2>7. 时间窗生命周期与 Cache 失效</h2>
-    <p>时间窗控制 JIT 是否允许把内存值当作常量。只要配置可能被修改，旧的特化代码就必须失效；修改完成并再次 activate 后，后续 miss 会使用新值重新编译。</p>
+    <h2>7. Time-window lifecycle and cache invalidation</h2>
+    <p>The time window controls whether the JIT may treat a memory value as a constant. Whenever config may be modified, the old specialized code must be invalidated; after modification and re-activation, later misses recompile using the new value.</p>
     <div class="diagram-wrap">
-      <svg width="980" height="370" viewBox="0 0 980 370" role="img" aria-label="时间窗生命周期状态机">
+      <svg width="980" height="370" viewBox="0 0 980 370" role="img" aria-label="Time-window lifecycle state machine">
         <defs>
           <marker id="lifeArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
           <marker id="lifeOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#dd6b20" /></marker>
@@ -597,16 +599,16 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
         <text x="30" y="34" class="svg-title">Period Lifecycle</text>
 
         <circle cx="160" cy="155" r="70" fill="#f8fafc" stroke="#718096" stroke-width="3" />
-        <text x="118" y="150" class="svg-label">Inactive</text>
-        <text x="108" y="178" class="svg-small">未激活，不允许 JIT</text>
+        <text x="124" y="150" class="svg-label">Inactive</text>
+        <text x="96" y="178" class="svg-small">not active, JIT disallowed</text>
 
         <circle cx="490" cy="155" r="70" fill="#f0fff4" stroke="#38a16f" stroke-width="3" />
-        <text x="455" y="150" class="svg-label">Active</text>
-        <text x="425" y="178" class="svg-small">may_const 可读作常量</text>
+        <text x="462" y="150" class="svg-label">Active</text>
+        <text x="418" y="178" class="svg-small">may_const readable as constant</text>
 
         <circle cx="820" cy="155" r="70" fill="#fff7ed" stroke="#dd6b20" stroke-width="3" />
-        <text x="786" y="150" class="svg-label">Invalid</text>
-        <text x="758" y="178" class="svg-small">旧 cache 不可用</text>
+        <text x="790" y="150" class="svg-label">Invalid</text>
+        <text x="762" y="178" class="svg-small">old cache unusable</text>
 
         <path d="M230 155 L420 155" stroke="#2c5282" stroke-width="3" fill="none" marker-end="url(#lifeArrow)" />
         <text x="275" y="132" class="svg-small">ejit_activate(name, idx)</text>
@@ -615,59 +617,59 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
         <text x="606" y="132" class="svg-small">ejit_deactivate(name, idx)</text>
 
         <path d="M790 220 C700 310 590 310 510 225" stroke="#2c5282" stroke-width="3" fill="none" marker-end="url(#lifeArrow)" />
-        <text x="612" y="308" class="svg-small">修改完成后再次 activate</text>
+        <text x="612" y="308" class="svg-small">re-activate after modification</text>
 
         <rect x="100" y="270" width="760" height="48" rx="10" fill="#ebf2fa" stroke="#3182ce" />
         <text x="132" y="300" class="svg-label">ejit_period_lc(name)</text>
-        <text x="292" y="300" class="svg-small">函数入口自动 deactivate_array；每个 return 前自动 activate_array。</text>
+        <text x="292" y="300" class="svg-small">auto deactivate_array at entry; auto activate_array before every return.</text>
       </svg>
     </div>
-    <div class="warn">异步编译特别需要版本检查：任务开始时看到的 period 版本，发布时必须仍然有效；否则应丢弃编译结果，避免过期常量进入 cache。</div>
+    <div class="warn">Async compilation especially needs version checks: the period version seen when the task started must still be valid at publish time; otherwise the compile result should be discarded to avoid stale constants entering the cache.</div>
   </section>
 
   <section id="runtime-components">
-    <h2>8. 运行时组件职责</h2>
+    <h2>8. Runtime component responsibilities</h2>
     <table>
-      <thead><tr><th>组件</th><th>职责</th><th>同步模式关注点</th><th>异步模式关注点</th></tr></thead>
+      <thead><tr><th>Component</th><th>Responsibility</th><th>Sync-mode concerns</th><th>Async-mode concerns</th></tr></thead>
       <tbody>
-        <tr><td>RuntimeState / Registry</td><td>保存 period arrays、static vars、func index、active 状态</td><td>查询必须足够快，避免热路径开销过大</td><td>状态版本要支持发布前 re-check</td></tr>
-        <tr><td>EJitCache</td><td>按 cacheKey 保存特化函数、代码内存和版本</td><td>miss 后当前线程可直接插入</td><td>worker 发布与业务线程读取需要并发安全</td></tr>
-        <tr><td>CompileDriver</td><td>加载 bitcode，运行 JIT pipeline，调用 ORC/JITLink</td><td>失败直接返回 NULL 给 wrapper</td><td>失败记录到 task 状态，不能影响业务线程</td></tr>
-        <tr><td>TaskQueue / Dedup</td><td>异步模式的任务队列和去重表</td><td>通常不使用</td><td>防止同一 cacheKey 重复排队，处理 queue full</td></tr>
-        <tr><td>CodePool / MemoryMgr</td><td>分配、写入、finalize 可执行代码内存</td><td>编译结束后立即可执行</td><td>发布前必须 finalize 完成，SRE 下还需 I/D cache 同步</td></tr>
-        <tr><td>Error / Stats</td><td>记录 last_error、hits、misses、pending、evictions</td><td>用于确认是否本次调用执行 JIT</td><td>用于观察 pending 数、worker 成功率和 fallback 频率</td></tr>
+        <tr><td>RuntimeState / Registry</td><td>Holds period arrays, static vars, func index, and active state</td><td>Queries must be fast enough to avoid excessive hot-path overhead</td><td>State versioning must support pre-publish re-check</td></tr>
+        <tr><td>EJitCache</td><td>Stores specialized functions, code memory, and versions by cacheKey</td><td>After a miss the current thread can insert directly</td><td>Worker publish and business-thread reads need concurrent safety</td></tr>
+        <tr><td>CompileDriver</td><td>Loads bitcode, runs the JIT pipeline, calls ORC/JITLink</td><td>On failure returns NULL directly to the wrapper</td><td>On failure records to the task state; must not affect the business thread</td></tr>
+        <tr><td>TaskQueue / Dedup</td><td>Task queue and dedup table for async mode</td><td>Usually unused</td><td>Prevent duplicate enqueue of the same cacheKey; handle queue full</td></tr>
+        <tr><td>CodePool / MemoryMgr</td><td>Allocates, writes, and finalizes executable code memory</td><td>Immediately executable after compilation</td><td>Must finalize before publish; under SRE also needs I/D cache sync</td></tr>
+        <tr><td>Error / Stats</td><td>Records last_error, hits, misses, pending, evictions</td><td>Used to confirm whether this call ran JIT</td><td>Used to observe pending count, worker success rate, and fallback frequency</td></tr>
       </tbody>
     </table>
   </section>
 
   <section id="failure">
-    <h2>9. Fallback 与失败处理</h2>
-    <p>EJIT 的正确性边界是：JIT 失败不能改变业务语义。wrapper 只在拿到可执行、版本有效、签名匹配的函数指针后才 dispatch，否则必须执行原 AOT 函数体。</p>
+    <h2>9. Fallback and failure handling</h2>
+    <p>EJIT's correctness boundary: a JIT failure must not change business semantics. The wrapper dispatches only after obtaining an executable, version-valid, signature-matching function pointer; otherwise it must execute the original AOT body.</p>
     <div class="cards">
       <div class="card red">
-        <h3>直接 fallback</h3>
-        <p>runtime 未初始化、实例 inactive、EJIT 被禁用、cacheKey 无效、bitcode 不存在。</p>
+        <h3>Direct fallback</h3>
+        <p>Runtime uninitialized, instance inactive, EJIT disabled, cacheKey invalid, or bitcode missing.</p>
       </div>
       <div class="card orange">
-        <h3>编译失败 fallback</h3>
-        <p>LLVM 优化失败、JITLink 失败、外部符号缺失、目标后端缺失、内存不足。</p>
+        <h3>Compile-failure fallback</h3>
+        <p>LLVM optimization failure, JITLink failure, external symbol missing, target backend missing, or out of memory.</p>
       </div>
       <div class="card purple">
-        <h3>异步 pending fallback</h3>
-        <p>任务已排队或正在编译时，当前调用不等待，继续走 AOT；完成发布后后续调用命中。</p>
+        <h3>Async pending fallback</h3>
+        <p>When a task is already queued or compiling, the current call does not wait and continues with AOT; once published, later calls hit.</p>
       </div>
       <div class="card green">
-        <h3>保守跳过</h3>
-        <p>PASS6 遇到不可证明安全的 load、volatile、复杂指针来源时跳过替换，不影响正确性。</p>
+        <h3>Conservative skip</h3>
+        <p>PASS6 skips substitution for loads it cannot prove safe, volatile, or complex pointer origins — no correctness impact.</p>
       </div>
     </div>
   </section>
 
   <section id="deployment">
-    <h2>10. Bare-metal / SRE 部署架构</h2>
-    <p>在无操作系统或 SRE 环境下，EJIT 需要替代 host 依赖：构造函数注册、动态符号查找、线程库、mmap/mprotect 和 JIT 可执行内存管理。</p>
+    <h2>10. Bare-metal / SRE deployment architecture</h2>
+    <p>In an OS-less or SRE environment, EJIT must replace host dependencies: constructor registration, dynamic symbol lookup, the thread library, mmap/mprotect, and JIT executable-memory management.</p>
     <div class="diagram-wrap">
-      <svg width="1260" height="560" viewBox="0 0 1260 560" role="img" aria-label="Bare-metal 和 SRE 部署架构图">
+      <svg width="1260" height="560" viewBox="0 0 1260 560" role="img" aria-label="Bare-metal and SRE deployment architecture diagram">
         <defs>
           <marker id="bmArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L10,6 L2,10 Z" fill="#2c5282" /></marker>
         </defs>
@@ -675,7 +677,7 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
 
         <rect x="40" y="82" width="245" height="170" rx="14" fill="#ffffff" stroke="#2c5282" stroke-width="2" class="box-shadow" />
         <rect x="40" y="82" width="245" height="38" rx="14" fill="#2c5282" />
-        <text x="100" y="107" class="svg-white">构建/裁剪</text>
+        <text x="96" y="107" class="svg-white">Build / trim</text>
         <text x="68" y="150" class="svg-small">• EJIT_TRIM_LLVM_BACKEND</text>
         <text x="68" y="178" class="svg-small">• lipo merge → ejit.o</text>
         <text x="68" y="206" class="svg-small">• no-op std/POSIX stubs</text>
@@ -683,35 +685,35 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
 
         <rect x="355" y="82" width="245" height="170" rx="14" fill="#f0fff4" stroke="#38a16f" stroke-width="2" class="box-shadow" />
         <rect x="355" y="82" width="245" height="38" rx="14" fill="#38a16f" />
-        <text x="417" y="107" class="svg-white">静态注册路径</text>
+        <text x="406" y="107" class="svg-white">Static registry path</text>
         <text x="383" y="150" class="svg-small">• __ejit_registry_bitcode[]</text>
         <text x="383" y="178" class="svg-small">• __ejit_registry_period[]</text>
         <text x="383" y="206" class="svg-small">• forceStaticRegistry</text>
-        <text x="383" y="234" class="svg-small">• 无 global_ctors 也可初始化</text>
+        <text x="383" y="234" class="svg-small">• init without global_ctors</text>
 
         <rect x="670" y="82" width="245" height="170" rx="14" fill="#fff7ed" stroke="#dd6b20" stroke-width="2" class="box-shadow" />
         <rect x="670" y="82" width="245" height="38" rx="14" fill="#dd6b20" />
         <text x="738" y="107" class="svg-white">SRE CodePool</text>
-        <text x="698" y="150" class="svg-small">• 固定 code pool</text>
+        <text x="698" y="150" class="svg-small">• fixed code pool</text>
         <text x="698" y="178" class="svg-small">• seal executable pages</text>
         <text x="698" y="206" class="svg-small">• enable_ex / cache sync</text>
-        <text x="698" y="234" class="svg-small">• 避免写 RX 页</text>
+        <text x="698" y="234" class="svg-small">• avoid writing RX pages</text>
 
         <rect x="985" y="82" width="225" height="170" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2" class="box-shadow" />
         <rect x="985" y="82" width="225" height="38" rx="14" fill="#6b46c1" />
         <text x="1048" y="107" class="svg-white">SRE Taskpool</text>
-        <text x="1013" y="150" class="svg-small">• 单 worker task</text>
+        <text x="1013" y="150" class="svg-small">• single worker task</text>
         <text x="1013" y="178" class="svg-small">• MPSC queue + dedup</text>
         <text x="1013" y="206" class="svg-small">• bucket cache</text>
-        <text x="1013" y="234" class="svg-small">• 异步发布特化代码</text>
+        <text x="1013" y="234" class="svg-small">• async publish specialized code</text>
 
         <rect x="180" y="345" width="890" height="120" rx="16" fill="#ffffff" stroke="#d9dee6" stroke-width="2" class="box-shadow" />
         <rect x="180" y="345" width="890" height="38" rx="16" fill="#2d3748" />
-        <text x="535" y="370" class="svg-white">目标平台运行时</text>
-        <text x="220" y="414" class="svg-small">1. ejit_init 读取静态注册表 / 构造期暂存数据</text>
-        <text x="220" y="442" class="svg-small">2. 注册 bitcode、period arrays、static vars、external symbols</text>
-        <text x="690" y="414" class="svg-small">3. 使用 CodePool 分配 JIT 代码</text>
-        <text x="690" y="442" class="svg-small">4. 同步或异步编译并发布代码指针</text>
+        <text x="535" y="370" class="svg-white">Target platform runtime</text>
+        <text x="220" y="414" class="svg-small">1. ejit_init reads the static registry / staged ctor data</text>
+        <text x="220" y="442" class="svg-small">2. register bitcode, period arrays, static vars, external symbols</text>
+        <text x="690" y="414" class="svg-small">3. allocate JIT code via CodePool</text>
+        <text x="690" y="442" class="svg-small">4. sync/async compile and publish code pointer</text>
 
         <line x1="285" y1="168" x2="355" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
         <line x1="600" y1="168" x2="670" y2="168" stroke="#2c5282" stroke-width="3" marker-end="url(#bmArrow)" />
@@ -720,39 +722,39 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
         <path d="M793 252 C793 300 745 318 745 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
         <path d="M1098 252 C1098 310 900 322 900 345" stroke="#2c5282" stroke-width="2.5" fill="none" marker-end="url(#bmArrow)" />
 
-        <text x="42" y="520" class="svg-note">部署关键点：registry section 不能被 GC；外部符号必须可解析；JIT 代码内存要满足写入、finalize、执行权限和 I/D cache 一致性要求。</text>
+        <text x="42" y="520" class="svg-note">Deployment keys: the registry section must not be GC'd; external symbols must be resolvable; JIT code memory must satisfy write, finalize, execute-permission, and I/D cache coherence requirements.</text>
       </svg>
     </div>
   </section>
 
   <section id="references">
-    <h2>11. 对应源码/文档入口</h2>
+    <h2>11. Source / document entry points</h2>
     <div class="cards">
       <div class="card">
-        <h3>用户手册</h3>
+        <h3>User manual</h3>
         <p><a href="EJIT_USER_MANUAL.html">EJIT_USER_MANUAL.html</a></p>
-        <p class="muted">面向用户的完整使用步骤、API 和排障指南。</p>
+        <p class="muted">The complete user-facing steps, API, and troubleshooting guide.</p>
       </div>
       <div class="card green">
-        <h3>需求与总体方案</h3>
-        <p><a href="../SPEC4.md">SPEC4.md</a> / <a href="../PLAN4.md">PLAN4.md</a></p>
-        <p class="muted">时间窗常量、标注接口、AOT/JIT pipeline。</p>
+        <h3>Requirements and overall design</h3>
+        <p><a href="../../SPEC4.md">SPEC4.md</a> / <a href="../../PLAN4.md">PLAN4.md</a></p>
+        <p class="muted">Time-window constants, the annotation API, and the AOT/JIT pipeline.</p>
       </div>
       <div class="card orange">
-        <h3>Pass 设计</h3>
-        <p><a href="../PASS1_EJitRegisterBitcode.md">PASS1</a> ~ <a href="../PASS7_EJitRuntime_OrcJITLink.md">PASS7</a></p>
-        <p class="muted">bitcode、period、wrapper、lifecycle、runtime、PASS6。</p>
+        <h3>Pass design</h3>
+        <p><a href="../../PASS1_EJitRegisterBitcode.md">PASS1</a> ~ <a href="../../PASS7_EJitRuntime_OrcJITLink.md">PASS7</a></p>
+        <p class="muted">bitcode, period, wrapper, lifecycle, runtime, PASS6.</p>
       </div>
       <div class="card purple">
-        <h3>SRE/裁剪</h3>
-        <p><a href="../EJIT_SRE_CODE_POOL.md">CodePool</a> / <a href="../EJIT_SRE_TASKPOOL.md">Taskpool</a> / <a href="../EJIT_TRIM_LLVM_BACKEND.md">Trim</a></p>
-        <p class="muted">裸核、小型化、代码内存和异步调度。</p>
+        <h3>SRE / trimming</h3>
+        <p><a href="../../EJIT_SRE_CODE_POOL.md">CodePool</a> / <a href="../../EJIT_SRE_TASKPOOL.md">Taskpool</a> / <a href="../../EJIT_TRIM_LLVM_BACKEND.md">Trim</a></p>
+        <p class="muted">Bare-metal, minimal footprint, code memory, and async scheduling.</p>
       </div>
     </div>
   </section>
 
   <footer>
-    生成日期：2026-06-27。本文档是 EJIT 架构图说明，设计细节以父目录设计文档和当前源码头文件为准。
+    Generated: 2026-06-27. This document is the EJIT architecture diagram description; for design details, refer to the design documents in the parent directory and the current source headers.
   </footer>
 </main>
 </body>

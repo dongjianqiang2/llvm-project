@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT HTML Documentation Index</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:#f5f7fa;color:#2d3748;line-height:1.65}header{position:relative;background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:38px 34px}header h1{margin:0 0 8px;font-size:34px}header p{margin:0;color:#dbeafe}.wrap{max-width:1180px;margin:0 auto;padding:28px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.card{background:white;border:1px solid #d9dee6;border-left:6px solid #2c5282;border-radius:14px;padding:18px;box-shadow:0 8px 22px rgba(44,82,130,.08)}.card h2{margin:0 0 8px;font-size:20px;color:#2c5282}.card p{margin:0 0 12px;color:#4a5568}.card a{display:inline-block;text-decoration:none;background:#2c5282;color:white;border-radius:8px;padding:7px 12px;font-size:14px}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px;margin:20px 0}footer{color:#718096;font-size:13px;margin-top:26px;border-top:1px solid #d9dee6;padding-top:14px}.lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}.lang-switch:hover{background:rgba(255,255,255,.35)}
+  </style>
+</head>
+<body>
+<header><a class="lang-switch" href="../index.html">中文</a>
+  <h1>EJIT HTML Documentation Index</h1>
+  <p>The HTML documentation entry point for EmbeddedJIT — covering user guides, integration, troubleshooting, and development/maintenance.</p>
+</header>
+<main class="wrap">
+  <div class="note">Suggested reading order: Quick Start → API Reference → Examples → Troubleshooting → Architecture → Dynamic Flow Demo → Internal Pipeline.</div>
+  <section class="grid">
+    <article class="card"><h2>5-Minute Quick Start</h2><p>The shortest path to get EJIT running: annotations, initialization, activation, invocation, and verifying it took effect.</p><a href="EJIT_QUICK_START.html">Open</a></article>
+    <article class="card"><h2>API / Attribute Reference</h2><p>The 6 attribute macros, the runtime C API, the config struct, status codes, and typical call sequences.</p><a href="EJIT_API_REFERENCE.html">Open</a></article>
+    <article class="card"><h2>Troubleshooting Guide</h2><p>Locate problems by symptom: "JIT didn't trigger / didn't optimize / fallback / bare-metal failure".</p><a href="EJIT_TROUBLESHOOTING.html">Open</a></article>
+    <article class="card"><h2>Examples</h2><p>static, single-dimension, multi-dimension, lifecycle, async, and bare-metal symbol registration examples.</p><a href="EJIT_EXAMPLES.html">Open</a></article>
+    <article class="card"><h2>Internal Pipeline</h2><p>Clang metadata, PASS1~PASS6, the runtime JIT pipeline, cache key, and the PASS6 mechanism.</p><a href="EJIT_INTERNAL_PIPELINE.html">Open</a></article>
+    <article class="card"><h2>User Manual</h2><p>The complete user-facing manual: concepts, API, building, platforms, and limitations.</p><a href="EJIT_USER_MANUAL.html">Open</a></article>
+    <article class="card"><h2>Architecture Diagrams</h2><p>End-to-end architecture, AOT/JIT, state machines, and bare-metal/SRE deployment diagrams.</p><a href="EJIT_ARCHITECTURE.html">Open</a></article>
+    <article class="card"><h2>Dynamic Flow Demo</h2><p>Interactive demo of AOT, the wrapper, sync/async compilation, cache hits, and lifecycle invalidation.</p><a href="EJIT_DYNAMIC_DEMO.html">Open</a></article>
+  </section>
+  <footer>Generated: 2026-06-27. For design details, refer to the Markdown design documents in the parent directory and the current source headers.</footer>
+</main>
+</body>
+</html>

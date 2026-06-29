@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EJIT Internal Pipeline</title>
+  <style>
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;color:#2d3748;line-height:1.65;background:white}header{position:relative;background:linear-gradient(135deg,#2c5282,#1a365d);color:white;padding:36px 32px}header h1{margin:0 0 8px;font-size:32px}header p{margin:0;color:#dbeafe}.wrap{max-width:1120px;margin:0 auto;padding:28px}h2{color:#2c5282;border-bottom:2px solid #d9dee6;padding-bottom:6px;margin-top:34px}h3{margin-top:24px}table{width:100%;border-collapse:collapse;margin:14px 0}th,td{border:1px solid #d9dee6;padding:9px 10px;vertical-align:top;text-align:left}th{background:#edf2f7}tr:nth-child(even) td{background:#fafcff}pre{background:#111827;color:#e5e7eb;border-radius:10px;padding:16px;overflow:auto}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;border-radius:4px;padding:1px 5px}pre code{background:transparent;padding:0}.flow{background:#f8fafc;border:1px dashed #d9dee6;border-radius:10px;padding:14px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}.note{background:#ebf2fa;border-left:5px solid #3182ce;border-radius:10px;padding:12px 14px}.nav a{margin-right:12px;color:#3182ce}.lang-switch{position:absolute;top:14px;right:18px;z-index:20;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}.lang-switch:hover{background:rgba(255,255,255,.35)}
+  </style>
+</head>
+<body>
+<header><a class="lang-switch" href="../EJIT_INTERNAL_PIPELINE.html">中文</a><h1>EJIT Internal Pipeline</h1><p>For EJIT maintainers: Clang metadata, AOT PASS1~PASS5, runtime PASS6, cache key, registration, and the fallback mechanism.</p></header>
+<main class="wrap">
+  <div class="nav"><a href="index.html">← Doc index</a><a href="EJIT_ARCHITECTURE.html">Architecture</a><a href="../../PLAN4.md">PLAN4</a></div>
+
+  <section>
+    <h2>1. Overall layering</h2>
+    <div class="flow">User annotations
+  ↓
+Clang Sema / CodeGen
+  ↓  emits !ejit.metadata / !ejit.may_const
+AOT PASS1: bitcode extraction and embedding
+AOT PASS2-4: period registration / wrapper / lifecycle
+AOT PASS5: coordinator
+  ↓
+Runtime wrapper calls ejit_compile_or_get
+  ↓
+JIT pipeline: param substitution → InstCombine → Inline → PASS6 → L1/L2/L3 → ORC/JITLink
+  ↓
+Code Cache / fallback AOT</div>
+  </section>
+
+  <section>
+    <h2>2. Clang metadata</h2>
+    <table>
+      <tr><th>metadata</th><th>Location</th><th>Purpose</th></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>Function</td><td>Marks <code>ejit_entry</code>, <code>ejit_period_arr_ind</code>, <code>ejit_period_lc</code></td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>GlobalVariable</td><td>Marks <code>ejit_period</code>, <code>ejit_period_arr</code>, and may_const field-offset fallback info</td></tr>
+      <tr><td><code>!ejit.may_const</code></td><td>LoadInst</td><td>PASS6 main path identifies replaceable loads</td></tr>
+    </table>
+<pre><code class="language-llvm">define void @process(i8 %idx) !ejit.metadata !0 { ... }
+!0 = distinct !{!1, !2}
+!1 = !{!"ejit_entry"}
+!2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+
+@g_cellCfg = global [16 x %struct.CellConfig] zeroinitializer, !ejit.metadata !3
+!3 = distinct !{!4}
+!4 = !{!"ejit_period_arr", !"cell", i32 16}
+
+%v = load i32, ptr %field, !ejit.may_const !{}</code></pre>
+  </section>
+
+  <section>
+    <h2>3. AOT Pass responsibilities</h2>
+    <table>
+      <tr><th>Pass</th><th>Timing</th><th>Responsibility</th><th>Key artifact</th></tr>
+      <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>Before standard optimization</td><td>Extract the <code>ejit_entry</code> closure, preserve metadata, embed bitcode, auto-register external symbols</td><td><code>@__ejit_bitcode</code>, registry bitcode entries</td></tr>
+      <tr><td>PASS2 <code>EJitRegisterPeriod</code></td><td>Before non-LTO optimization / after LTO optimization</td><td>Scan period/static metadata, generate registration calls or a static table</td><td>period registry entries</td></tr>
+      <tr><td>PASS3 <code>EJitWrapperGen</code></td><td>Same</td><td>Insert cache key computation, runtime call, dispatch/fallback at the original function entry</td><td><code>jit_dispatch</code>, <code>jit_fallback</code></td></tr>
+      <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>Same</td><td>Insert deactivate/activate at lifecycle function entry/exit</td><td><code>ejit_deactivate_array</code>, <code>ejit_activate_array</code></td></tr>
+      <tr><td>PASS5 <code>EJitAotModulePass</code></td><td>Coordination</td><td>Run PASS2-4 in order; quickly skip modules without EJIT metadata</td><td>AOT pipeline wrapper</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. Why PASS1 must run early</h2>
+    <p><code>!ejit.may_const</code> is load-level soft metadata; standard optimization may merge, delete, or rewrite loads. PASS1 extracts the raw bitcode before optimization and tries to recover metadata via the GV offset list + reAnnotate mechanism.</p>
+    <div class="note">Correctness principle: losing metadata only means less specialization — it must never cause an incorrect substitution.</div>
+  </section>
+
+  <section>
+    <h2>5. Wrapper model</h2>
+<pre><code class="language-c">void process_cell(uint8_t cellIdx, int value) {
+    uint64_t key = ((uint64_t)funcIdx &lt;&lt; 32) | cellIdx;
+    PFN_process_cell pfn = (PFN_process_cell)ejit_compile_or_get(key, NULL);
+    if (pfn)
+        return pfn(cellIdx, value);
+
+    // jit_fallback: the original function body continues
+    ...
+}</code></pre>
+    <ul>
+      <li>Single-function hybrid scheme: no separate fallback function is generated.</li>
+      <li>The cache key is computed in registers, avoiding a dims array allocation.</li>
+      <li>Returning NULL means fallback.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>6. Cache Key</h2>
+<pre><code>uint64_t key:
+bit 63..32: funcIndex / funcIdx
+bit 31..24: dim[3]
+bit 23..16: dim[2]
+bit 15..8 : dim[1]
+bit 7..0  : dim[0]</code></pre>
+    <table>
+      <tr><th>Scenario</th><th>Low 32 bits of key</th></tr>
+      <tr><td>static only</td><td><code>0</code></td></tr>
+      <tr><td>single-dim cell=3</td><td><code>0x00000003</code></td></tr>
+      <tr><td>two-dim cell=1,trp=5</td><td><code>0x00000501</code></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. Runtime JIT Pipeline</h2>
+    <ol>
+      <li>ModuleLoader finds the embedded bitcode by funcIndex/cacheKey.</li>
+      <li>Substitute <code>ejit_period_arr_ind</code> parameters with the current dimension constants.</li>
+      <li>InstCombine folds <code>zext</code>, GEP, and constant chains.</li>
+      <li>Inline expands cross-function field accesses.</li>
+      <li>PASS6 walks loads, recognizing <code>!ejit.may_const</code> or GV offset fallback.</li>
+      <li>Find the base address + offset from RuntimeState/Registry and read the current memory value.</li>
+      <li>Replace the load with ConstantInt/ConstantFP.</li>
+      <li>Run L1/L2/L3 optimization and hand off to ORC/JITLink to produce machine code.</li>
+      <li>Write to the cache; subsequent wrapper calls hit.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>8. PASS6 substitution conditions</h2>
+    <table>
+      <tr><th>Condition</th><th>Description</th></tr>
+      <tr><td>Must be a may_const load</td><td>load metadata or GV offset fallback matches</td></tr>
+      <tr><td>Root object traceable</td><td>GlobalVariable / supported global-pointer mode</td></tr>
+      <tr><td>Offset computable</td><td>GEP index is constant after parameter substitution and InstCombine</td></tr>
+      <tr><td>Time window active</td><td>periodName + cellIdx is Active</td></tr>
+      <tr><td>Type can construct a Constant</td><td>Supported types such as integer, float, boolean</td></tr>
+    </table>
+    <p>PHI/select pointers, unknown aliasing, non-constant offset, null pointer, and volatile fields are safely skipped.</p>
+  </section>
+
+  <section>
+    <h2>9. Registration paths</h2>
+    <table>
+      <tr><th>Path</th><th>Mechanism</th><th>Scenario</th></tr>
+      <tr><td>Constructor path</td><td><code>llvm.global_ctors</code> runs <code>ejit_auto_register</code>, staging into RegistrationStore</td><td>host/Linux</td></tr>
+      <tr><td>Static table path</td><td><code>__ejit_registry_bitcode[]</code> / <code>__ejit_registry_period[]</code></td><td>bare-metal / no global ctor</td></tr>
+      <tr><td>Manual registration</td><td>C++ API <code>registerBitcode/registerPeriodArray/registerStaticVar</code></td><td>Testing or special platforms</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>10. Maintainer checkpoints</h2>
+    <ul>
+      <li>When adding attributes, keep Attr.td, Sema, CodeGen metadata, and lit tests in sync.</li>
+      <li>When changing the wrapper, check debug info, profile, calling convention, varargs, and PHI/return merging.</li>
+      <li>When changing PASS6, follow the "if you cannot prove it, skip it" correctness principle.</li>
+      <li>When changing the cache/taskpool, check invalidation, versioning, concurrent publish, reader release, and memory lifecycle.</li>
+      <li>When changing the bare-metal path, check linker sections, symbol registration, code permissions, and I/D cache.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>
