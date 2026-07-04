@@ -108,17 +108,29 @@ clusterFunctions(const XBBRGraph &graph, XBBRClusterAlgo /*algo*/) {
                    });
 
   // Density-merge loop.
+  // Safety: limit chain walks to the total number of candidate functions.
+  // With 150K+ candidates the merged chains can become very long, and any
+  // pointer corruption in the linear linked list (Prev/Next) would cause
+  // an infinite walk rather than a clean crash. A bounded walk converts
+  // such corruption into a graceful skip.
+  const int maxChainLen = static_cast<int>(candidates.size());
   for (FuncId F : order) {
     ClusterNode &CN = nodes[F];
     if (CN.BestPred < 0 || CN.Size == 0)
       continue;
-    // Find chain heads.
+    // Find chain heads (Prev == self).
     int predChain = CN.BestPred;
-    while (nodes[predChain].Prev != predChain)
+    for (int step = 0; nodes[predChain].Prev != predChain; ++step) {
+      if (step >= maxChainLen) { predChain = -1; break; }
       predChain = nodes[predChain].Prev;
+    }
+    if (predChain < 0) continue;
     int myChain = static_cast<int>(F);
-    while (nodes[myChain].Prev != myChain)
+    for (int step = 0; nodes[myChain].Prev != myChain; ++step) {
+      if (step >= maxChainLen) { myChain = -1; break; }
       myChain = nodes[myChain].Prev;
+    }
+    if (myChain < 0) continue;
     if (predChain == myChain)
       continue;
 
@@ -133,14 +145,13 @@ clusterFunctions(const XBBRGraph &graph, XBBRClusterAlgo /*algo*/) {
     if (newDensity * MAX_DENSITY_DEGRADATION < PC.getDensity())
       continue;
 
-    // Merge chains: append myChain's chain after predChain's chain. Linear
-    // list with Next==-1 tail terminator — find pred's tail by walking Next,
-    // link it to my head, and my chain's tail keeps Next==-1. myHead.Prev is
-    // repointed to predTail so it is no longer a head (Prev != self); predHead
-    // keeps Prev==self and remains the head.
+    // Merge chains: append myChain's chain after predChain's chain.
     int predTail = predChain;
-    while (nodes[predTail].Next != -1)
+    for (int step = 0; nodes[predTail].Next != -1; ++step) {
+      if (step >= maxChainLen) { predTail = -1; break; }
       predTail = nodes[predTail].Next;
+    }
+    if (predTail < 0) continue;
     nodes[predTail].Next = myChain;
     nodes[myChain].Prev = predTail;
     MC.Size = PC.Size = newSize;

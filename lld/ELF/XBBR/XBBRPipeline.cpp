@@ -127,6 +127,23 @@ void runXBBRPipeline(Ctx &ctx, XBBRGraph &graph) {
   ctx.xbbrLayoutResult = std::make_unique<XBBRLayoutResult>();
   XBBRLayoutResult &result = *ctx.xbbrLayoutResult;
 
+  // Safety: hfsort+ density-merge in clusterFunctions does not scale past
+  // ~50K candidate functions (the chain-walking merge loop has quadratic
+  // worst-case behaviour). For very large binaries (full LLVM: 150K+ funcs)
+  // degrade to function-level mode — the CGProfile function order is used,
+  // and per-BB sections are co-located with their function via the
+  // buildSectionOrder extension (Writer.cpp). This trades cross-function
+  // BB migration for correctness.
+  static constexpr uint32_t MAX_SAFE_FUNCS = 60000;
+  if (graph.funcs().size() > MAX_SAFE_FUNCS) {
+    if (ctx.arg.xbbrStats)
+      errs() << "xbbr-stage1: too many functions (" << graph.funcs().size()
+             << " > " << MAX_SAFE_FUNCS
+             << "), degrading to function-level mode\n";
+    result.Degraded = true;
+    return;
+  }
+
   // Stage 1: function clustering (hfsort+/C³).
   std::vector<FunctionCluster> rawClusters =
       clusterFunctions(graph, ctx.arg.xbbrClusterAlgo);

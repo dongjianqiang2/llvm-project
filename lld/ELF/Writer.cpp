@@ -1186,6 +1186,27 @@ static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
     } else if (!ctx.arg.callGraphProfile.empty()) {
       sectionOrder = computeCallGraphProfileOrder(ctx);
     }
+
+    // When XBBR is in function mode (or the pipeline degraded), per-BB
+    // sections (.text.<fn>.__part.N) have no CGProfile priority and would
+    // scatter across the output section, breaking unthunkable cond-branch
+    // range constraints. Extend each function's CGProfile priority to all
+    // its per-BB sections so they stay co-located.
+    if (ctx.xbbrGraph && !sectionOrder.empty()) {
+      const xbbr::XBBRGraph &g = *ctx.xbbrGraph;
+      for (const xbbr::XBBRNode &node : g.nodes()) {
+        InputSectionBase *bbSec = node.BBSection;
+        if (!bbSec || sectionOrder.count(bbSec))
+          continue;
+        // Look up the function's entry section priority.
+        InputSectionBase *funcSec = g.funcSection(node.Func);
+        if (!funcSec)
+          continue;
+        auto it = sectionOrder.find(funcSec);
+        if (it != sectionOrder.end())
+          sectionOrder.try_emplace(bbSec, it->second);
+      }
+    }
   }
 
   if (ctx.arg.symbolOrderingFile.empty())
