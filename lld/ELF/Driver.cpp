@@ -1405,13 +1405,15 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
       ctx.arg.xbbrMode = XBBRMode::Function;
       if (auto *modeArg = args.getLastArg(OPT_bb_cross_reorder_mode_eq)) {
         StringRef mode = modeArg->getValue();
-        if (mode == "partial")
+        if (mode == "function")
+          ctx.arg.xbbrMode = XBBRMode::Function;
+        else if (mode == "partial")
           ctx.arg.xbbrMode = XBBRMode::Partial;
         else if (mode == "full")
           ctx.arg.xbbrMode = XBBRMode::Full;
         else
           ErrAlways(ctx) << "unknown --bb-cross-reorder-mode= value '"
-                         << mode << "' (expected partial or full)";
+                         << mode << "' (expected function, partial, or full)";
       }
       // Force hfsort+ as Stage 1: XBBR-on means CGProfile-driven
       // function-level clustering, even if the user didn't pass

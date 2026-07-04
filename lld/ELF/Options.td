@@ -152,9 +152,9 @@ def bb_cross_reorder_eq : JJ<"bb-cross-reorder=">,
   HelpText<"XBBR cross-function basic-block reordering: profdata path or 'none' (experimental).">,
   MetaVarName<"<profdata-or-none>">;
 def bb_cross_reorder_mode_eq : JJ<"bb-cross-reorder-mode=">,
-  HelpText<"XBBR mode: partial (default, embedded) or full (server)">,
-  MetaVarName<"<partial|full>">,
-  Values<"partial,full">;
+  HelpText<"XBBR mode: function (hfsort+ only), partial (embedded), or full (server)">,
+  MetaVarName<"<function|partial|full>">,
+  Values<"function,partial,full">;
 def bb_cross_reorder_cluster_algo_eq : JJ<"bb-cross-reorder-cluster-algo=">,
   HelpText<"XBBR Stage 1 (function clustering) algorithm">,
   Values<"hfsort+,c3,custom">;
