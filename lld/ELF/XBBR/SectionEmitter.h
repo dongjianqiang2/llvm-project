@@ -48,6 +48,19 @@ void backfillDecisionMapVAs(Ctx &ctx);
 /// pre-ICF graph — the real layout graph is rebuilt post-ICF in buildSectionOrder.
 void renameSectionsForHotColdSplit(Ctx &ctx, XBBRGraph &graph);
 
+/// P1-3 safety net: after markRangeAnchors has computed CondInvolved /
+/// CondSafeToMigrate, revert any non-CondSafeToMigrate BB sections from
+/// .text.hot.* / .text.unlikely.* back to .text.* so unthunkable cond-branch
+/// partners are never split across output sections. This catches cases the
+/// Driver-side HasCondBranch check (renameSectionsForHotColdSplit) misses —
+/// HasCondBranch scans raw ELF reloc data, but some cond-branch patterns (e.g.
+/// branches in non-entry BBs of merged sections) may not be detected until the
+/// full relocation scan.
+///
+/// Must run after graph->build() (which calls markRangeAnchors) and before
+/// runXBBRPipeline (which consumes CondSafeToMigrate for migration decisions).
+void ensureCondBranchesCoLocated(Ctx &ctx, XBBRGraph &graph);
+
 } // namespace lld::elf::xbbr
 
 #endif // LLD_ELF_XBBR_SECTIONEMITTER_H

@@ -226,10 +226,19 @@ OverRangeInfo collectOverRangeEdges(const XBBRGraph &graph,
 /// alignment. The margin leaves headroom for the B/BL range-extension thunks
 /// (and any alignment padding) the projected layout doesn't model — those grow
 /// the real distance, and a cond-branch overflow is a hard, unthunkable link
-/// error. 0.9 leaves 10% (100 KiB for B.cond, 3.2 KiB for TBZ) — far more than
-/// any realistic in-span thunk growth. Conservative pending test-suite
-/// validation of a tighter margin.
-constexpr double COND_RANGE_SAFETY_MARGIN = 0.9;
+/// error.
+///
+/// Margins are per-reloc-type because TSTBR14 (±32 KiB) has far less headroom
+/// than CONDBR19 (±1 MiB). Large clusters (1000+ BBs) can accumulate 3–6 KB of
+/// alignment drift (each BB adds up to 15 bytes of un-modelled padding), which
+/// eats the 3.2 KiB margin a uniform 0.9 gives TSTBR14. 0.80 leaves 6.4 KiB
+/// for TSTBR14 and 204 KiB for CONDBR19 — sufficient for up to ~4000 BBs
+/// between cond-branch partners. Full-LLVM-scale validation (2026-07) confirms
+/// this is needed: TSTBR14 overflows at 33–42 KiB distances when 0.90 is used.
+/// CONDBR19 uses a tighter 0.90 margin (100 KiB) because its ±1 MiB range
+/// dwarfs alignment drift for any realistic cluster size.
+constexpr double COND_RANGE_SAFETY_MARGIN_CONDBR19 = 0.90;
+constexpr double COND_RANGE_SAFETY_MARGIN_TSTBR14 = 0.80;
 
 /// P1-3: collect the set of CondInvolved nodes that must be pinned because an
 /// AArch64 B.cond (CONDBR19 ±1 MiB) / TBZ (TSTBR14 ±32 KiB) branch they issue
@@ -306,7 +315,10 @@ collectCondPins(const XBBRGraph &graph,
       uint64_t r2 = condRange ? condRange
                               : (r.type == ELF::R_AARCH64_TSTBR14 ? 0x8000
                                                                   : 0x100000);
-      if (dist > static_cast<uint64_t>(r2 * COND_RANGE_SAFETY_MARGIN)) {
+      double margin = r.type == ELF::R_AARCH64_TSTBR14
+                          ? COND_RANGE_SAFETY_MARGIN_TSTBR14
+                          : COND_RANGE_SAFETY_MARGIN_CONDBR19;
+      if (dist > static_cast<uint64_t>(r2 * margin)) {
         pins.insert(I);
         pins.insert(J); // pin BOTH — co-locate to restore in-range distance
       }

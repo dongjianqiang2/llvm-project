@@ -1135,6 +1135,11 @@ static DenseMap<const InputSectionBase *, int> buildSectionOrder(Ctx &ctx) {
         llvm::errs() << " ehgated=" << nEHGated << "\n";
       }
       ctx.xbbrGraph = std::move(graph);
+      // P1-3 safety net: after markRangeAnchors, revert non-CondSafeToMigrate
+      // cond-branch BBs from .text.hot/.text.unlikely back to .text so unthunkable
+      // cond-branch partners are never split across output sections. This catches
+      // cases the Driver-side HasCondBranch check misses.
+      xbbr::ensureCondBranchesCoLocated(ctx, *ctx.xbbrGraph);
       // Run Stages 1–4 when XBBR is on with partial/full mode.
       // Stage 5 (SectionEmitter) runs inside the pipeline.
       if (ctx.arg.xbbrMode >= XBBRMode::Partial)

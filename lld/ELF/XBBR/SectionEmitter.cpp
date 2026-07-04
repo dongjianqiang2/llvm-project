@@ -415,4 +415,33 @@ void backfillDecisionMapVAs(Ctx &ctx) {
   }
 }
 
+void ensureCondBranchesCoLocated(Ctx &ctx, XBBRGraph &graph) {
+  // Revert non-CondSafeToMigrate CondInvolved BB sections from
+  // .text.hot.* / .text.unlikely.* back to .text.* so unthunkable cond-branch
+  // partners are never split across output sections. This catches cases the
+  // Driver-side HasCondBranch check misses (e.g. cond branches in non-entry
+  // BBs whose raw reloc data isn't visible at graph-build time).
+  //
+  // CondSafeToMigrate BBs (P1-3: all-hot connected component) are left in
+  // .text.hot — they'll be range-checked by Stage 4's collectCondPins.
+  // Non-CondInvolved BBs are already correctly routed (no cond-branch safety
+  // concern).
+  for (const XBBRNode &node : graph.nodes()) {
+    if (!node.CondInvolved || node.CondSafeToMigrate)
+      continue;
+    InputSectionBase *sec = node.BBSection;
+    if (!sec)
+      continue;
+    StringRef nm = sec->name;
+    StringRef rest;
+    if (nm.starts_with(".text.hot."))
+      rest = nm.substr(strlen(".text.hot."));
+    else if (nm.starts_with(".text.unlikely."))
+      rest = nm.substr(strlen(".text.unlikely."));
+    else
+      continue; // already .text.* or non-text section
+    sec->name = ctx.saver.save((Twine(".text.") + rest).str());
+  }
+}
+
 } // namespace lld::elf::xbbr
