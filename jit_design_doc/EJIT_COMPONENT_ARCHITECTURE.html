@@ -3,90 +3,95 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>EmbeddedJIT · 组件架构图</title>
+<title>EmbeddedJIT 组件架构图</title>
 <style>
+  :root{
+    --primary:#2c5282; --primary-2:#1a365d; --accent:#3182ce;
+    --green:#2f855a; --green-2:#22543d; --teal:#2c7a7b;
+    --orange:#c05621; --orange-2:#7b341e;
+    --purple:#6b46c1; --purple-2:#553c9a;
+    --red:#c53030; --slate:#475569;
+    --dark:#1f2937; --gray:#4a5568; --muted:#718096;
+    --border:#cbd5e1; --bg:#f7f9fc;
+  }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0}
   body{
-    background:
-      radial-gradient(1100px 640px at 14% -6%, rgba(99,102,241,.16), transparent 60%),
-      radial-gradient(1000px 640px at 100% 4%, rgba(167,139,250,.14), transparent 55%),
-      linear-gradient(180deg,#0b1120,#070b16);
-    color:#e8eefc; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;
-    min-height:100vh; padding:24px 14px 40px;
+    background:var(--bg); color:var(--dark);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;
+    line-height:1.45; font-size:13px;
   }
-  .wrap{max-width:1500px; margin:0 auto}
-  .head{text-align:center; margin-bottom:14px}
-  .eyebrow{display:inline-block; font-size:10.5px; letter-spacing:5px; font-weight:700; color:#a5b4fc;
-    padding:4px 13px; border:1px solid rgba(129,140,248,.4); border-radius:999px; background:rgba(99,102,241,.1); margin-bottom:10px; text-transform:uppercase}
-  .head h1{margin:0; font-size:30px; font-weight:800; letter-spacing:1px;
-    background:linear-gradient(90deg,#67e8f9,#a5b4fc 45%,#c4b5fd 65%,#6ee7b7); -webkit-background-clip:text; background-clip:text; color:transparent}
-  .head p{margin:7px auto 0; max-width:860px; color:#8da2c8; font-size:13px}
-  .head p b{color:#cbd5e1}
+  .poster{max-width:1500px; margin:0 auto; padding:20px 22px 26px}
+  header{
+    background:linear-gradient(135deg,var(--primary),var(--primary-2));
+    color:#fff; border-radius:14px; padding:18px 24px;
+    box-shadow:0 10px 26px rgba(44,82,130,.18);
+    display:flex; align-items:center; justify-content:space-between; gap:18px; flex-wrap:wrap;
+  }
+  header h1{margin:0; font-size:25px; letter-spacing:.5px}
+  header .sub{margin:4px 0 0; color:#cfe0f5; font-size:13.5px; max-width:1000px}
+  .panel{
+    margin-top:14px; background:#fff; border:1px solid var(--border); border-radius:14px;
+    box-shadow:0 6px 18px rgba(30,41,59,.06); padding:14px;
+  }
   svg{width:100%; height:auto; display:block}
-  .legend{display:flex; flex-wrap:wrap; gap:18px; justify-content:center; margin-top:14px; font-size:11.5px; color:#8da2c8}
+  .legend{display:flex; flex-wrap:wrap; gap:18px; justify-content:center; margin-top:14px; font-size:11.5px; color:var(--muted)}
   .legend span{display:inline-flex; align-items:center; gap:7px}
-  .legend i{display:inline-block; width:26px; height:0; border-top:2px solid #8aa0c8}
-  .legend i.dash{border-top:2px dashed #8aa0c8}
-  .legend i.thick{border-top:2.4px solid #c084fc}
+  .legend i{display:inline-block; width:26px; height:0; border-top:2px solid var(--muted)}
+  .legend i.dash{border-top:2px dashed var(--muted)}
+  .legend i.thick{border-top:2.4px solid var(--purple)}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="head">
-    <span class="eyebrow">Component Architecture</span>
-    <h1>EmbeddedJIT 组件架构图</h1>
-    <p>组件拓扑视图 · <b>编译时工具链</b> ⇄ <b>运行时库 libejit.a</b> 由可执行文件 / 嵌入 Bitcode 桥接 · 连线表示组件协作关系（非执行顺序）</p>
-  </div>
+<div class="poster">
+  <header>
+    <div>
+      <h1>EmbeddedJIT 组件架构图</h1>
+      <p class="sub">组件拓扑视图 · <b>编译时工具链</b> ⇄ <b>运行时库 libejit.a</b> 由可执行文件 / 嵌入 Bitcode 桥接 · 连线表示组件协作关系（非执行顺序）</p>
+    </div>
+  </header>
 
+  <section class="panel">
 <svg viewBox="0 0 1480 960" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="EmbeddedJIT 组件架构图">
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#8aa0c8"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#718096"/>
     </marker>
     <marker id="arrp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#c084fc"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#6b46c1"/>
     </marker>
-    <linearGradient id="corefill" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2a1856" stop-opacity=".9"/>
-      <stop offset="1" stop-color="#15103a" stop-opacity=".9"/>
-    </linearGradient>
-    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="6" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
     <style>
       text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif}
-      .t-title{font-size:15px;font-weight:700;fill:#fff}
-      .t-sub{font-size:10px;fill:#9fb3d9}
-      .t-grp{font-size:11.5px;font-weight:700;fill:#cdd9f3;letter-spacing:.3px}
-      .t-name{font-size:12px;font-weight:700;fill:#f1f5fb}
-      .t-subm{font-size:9.3px;fill:#8da2c8}
-      .t-note{font-size:9.6px;fill:#7689ab}
-      .t-clbl{font-size:10.3px;fill:#cdd9f3;font-weight:600}
-      .box{fill:#101a30;stroke-width:1.5}
-      .b-blue{stroke:#3b82f6}.b-sky{stroke:#38bdf8}.b-em{stroke:#34d399}.b-vi{stroke:#a78bfa}
-      .b-pu{stroke:#c084fc}.b-pk{stroke:#f472b6}.b-or{stroke:#fb923c}.b-am{stroke:#f59e0b}
-      .b-yl{stroke:#facc15}.b-sl{stroke:#94a3b8}.b-te{stroke:#2dd4bf}.b-in{stroke:#818cf8}
+      .t-title{font-size:15px;font-weight:700;fill:#1a365d}
+      .t-sub{font-size:10px;fill:#718096}
+      .t-grp{font-size:11.5px;font-weight:700;letter-spacing:.3px}
+      .t-name{font-size:12px;font-weight:700;fill:#1f2937}
+      .t-subm{font-size:9.3px;fill:#4a5568}
+      .t-note{font-size:9.6px;fill:#718096}
+      .t-clbl{font-size:10.3px;fill:#4a5568;font-weight:600}
+      .box{fill:#ffffff;stroke-width:1.5}
+      .b-blue{stroke:#2c5282}.b-sky{stroke:#3182ce}.b-em{stroke:#2f855a}.b-vi{stroke:#6b46c1}
+      .b-pu{stroke:#6b46c1}.b-pk{stroke:#c05621}.b-or{stroke:#c05621}.b-am{stroke:#c05621}
+      .b-yl{stroke:#2c7a7b}.b-sl{stroke:#475569}.b-te{stroke:#2c7a7b}.b-in{stroke:#2c5282}
       .bar{rx:1.6}
-      .c-blue{fill:#3b82f6}.c-sky{fill:#38bdf8}.c-em{fill:#34d399}.c-vi{fill:#a78bfa}
-      .c-pu{fill:#c084fc}.c-pk{fill:#f472b6}.c-or{fill:#fb923c}.c-am{fill:#f59e0b}
-      .c-yl{fill:#facc15}.c-sl{fill:#94a3b8}.c-te{fill:#2dd4bf}.c-in{fill:#818cf8}
+      .c-blue{fill:#2c5282}.c-sky{fill:#3182ce}.c-em{fill:#2f855a}.c-vi{fill:#6b46c1}
+      .c-pu{fill:#6b46c1}.c-pk{fill:#c05621}.c-or{fill:#c05621}.c-am{fill:#c05621}
+      .c-yl{fill:#2c7a7b}.c-sl{fill:#475569}.c-te{fill:#2c7a7b}.c-in{fill:#2c5282}
       .subsys{stroke-width:1.6;rx:16}
-      .ss-blue{fill:rgba(59,130,246,.05);stroke:rgba(59,130,246,.45)}
-      .ss-vi{fill:rgba(167,139,250,.05);stroke:rgba(167,139,250,.45)}
-      .grp{fill:none;stroke:rgba(148,163,184,.22);stroke-width:1.1;stroke-dasharray:4 3;rx:12}
-      .conn{fill:none;stroke:#8aa0c8;stroke-width:1.5}
-      .conn-d{fill:none;stroke:#8aa0c8;stroke-width:1.4;stroke-dasharray:5 4}
-      .conn-c{fill:none;stroke:#c084fc;stroke-width:2}
-      .lblbg{fill:#0b1120;opacity:.82;rx:4}
+      .ss-blue{fill:rgba(44,82,130,.03);stroke:#2c5282}
+      .ss-rt{fill:rgba(47,133,90,.03);stroke:#2f855a}
+      .grp{fill:none;stroke:#cbd5e1;stroke-width:1.1;stroke-dasharray:4 3;rx:12}
+      .conn{fill:none;stroke:#718096;stroke-width:1.5}
+      .conn-d{fill:none;stroke:#718096;stroke-width:1.4;stroke-dasharray:5 4}
+      .conn-c{fill:none;stroke:#6b46c1;stroke-width:2}
+      .lblbg{fill:#ffffff;opacity:.92;rx:4}
     </style>
   </defs>
 
   <!-- ===== User interface strip ===== -->
-  <rect x="30" y="10" width="1420" height="64" rx="12" fill="rgba(255,255,255,.03)" stroke="rgba(148,163,184,.25)"/>
-  <text x="46" y="30" class="t-grp" fill="#a5b4fc">用户接口 · User Interface</text>
-  <text x="46" y="48" class="t-subm" fill="#cdd9f3">属性宏：EJIT_PERIOD_CONST · EJIT_IN_PERIOD · EJIT_IN_PERIOD_ARRAY · EJIT_ENTRY · EJIT_DIM · EJIT_PERIOD_GUARD</text>
+  <rect x="30" y="10" width="1420" height="64" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="46" y="30" class="t-grp" fill="#6b46c1">用户接口 · User Interface</text>
+  <text x="46" y="48" class="t-subm" fill="#2c5282">属性宏：EJIT_PERIOD_CONST · EJIT_IN_PERIOD · EJIT_IN_PERIOD_ARRAY · EJIT_ENTRY · EJIT_DIM · EJIT_PERIOD_GUARD</text>
   <text x="46" y="63" class="t-subm">C API：ejit_init · activate/deactivate · taskpool_compile_or_get · release_read · register_symbol · set_compile_mode</text>
 
   <!-- ===== LEFT: Compile-time toolchain ===== -->
@@ -96,7 +101,7 @@
 
   <!-- Clang frontend group -->
   <rect class="grp" x="48" y="144" width="464" height="120"/>
-  <text x="60" y="162" class="t-grp" fill="#7dd3fc">Clang 前端</text>
+  <text x="60" y="162" class="t-grp" fill="#2c7a7b">Clang 前端</text>
   <g>
     <rect class="box b-te" x="60" y="170" width="142" height="78" rx="8"/>
     <rect class="bar c-te" x="62" y="178" width="3" height="62"/>
@@ -117,14 +122,14 @@
     <rect class="box b-te" x="364" y="170" width="134" height="78" rx="8"/>
     <rect class="bar c-te" x="366" y="178" width="3" height="62"/>
     <text x="378" y="190" class="t-name">CodeGen</text>
-    <text x="378" y="206" class="t-subm">AST → LLVM IR</text>
+    <text x="378" y="206" class="t-subm">AST -> LLVM IR</text>
     <text x="378" y="220" class="t-subm">!ejit.may_const</text>
     <text x="378" y="234" class="t-subm">!ejit.metadata</text>
   </g>
 
   <!-- AOT Pass group -->
   <rect class="grp" x="48" y="278" width="464" height="232"/>
-  <text x="60" y="296" class="t-grp" fill="#7dd3fc">AOT Pass 模块 · llvm/lib/Transforms/EmbeddedJIT</text>
+  <text x="60" y="296" class="t-grp" fill="#2c5282">AOT Pass 模块 · llvm/lib/Transforms/EmbeddedJIT</text>
   <g>
     <rect class="box b-in" x="60" y="304" width="138" height="56" rx="8"/>
     <rect class="bar c-in" x="62" y="312" width="3" height="40"/>
@@ -167,30 +172,29 @@
     <text x="370" y="406" class="t-subm">标准优化</text>
     <text x="370" y="418" class="t-subm">优化 Wrapper IR</text>
   </g>
-  <text x="60" y="448" class="t-note">时序：PASS1 早期提取 → PASS2-5 插桩（非LTO 于 O2 前 / LTO 于 O2 后）→ O2/O3 优化</text>
-  <text x="60" y="463" class="t-note">PASS1 reAnnotateMayConst 重挂元数据 · 自动注册外部符号 → RegistrationStore</text>
-  <text x="60" y="498" class="t-grp" fill="#fbbf24">编译产物 · Artifact</text>
+  <text x="60" y="448" class="t-note">时序：PASS1 早期提取 -> PASS2-5 插桩（非LTO 于 O2 前 / LTO 于 O2 后）-> O2/O3 优化</text>
+  <text x="60" y="463" class="t-note">PASS1 reAnnotateMayConst 重挂元数据 · 自动注册外部符号 -> RegistrationStore</text>
+  <text x="60" y="498" class="t-grp" fill="#c05621">编译产物 · Artifact</text>
 
   <!-- Artifact box (bridge) -->
-  <rect class="box b-am" x="60" y="506" width="452" height="150" rx="10" fill="#1a1606"/>
+  <rect class="box b-am" x="60" y="506" width="452" height="150" rx="10" fill="#fff7ed"/>
   <rect class="bar c-am" x="62" y="514" width="4" height="134"/>
-  <text x="78" y="528" class="t-name" fill="#fde68a">可执行文件（静态链接 libejit.a）</text>
-  <text x="78" y="548" class="t-subm" fill="#e5d3a0">▸ AOT 编译的用户代码 + Wrapper 入口插桩</text>
-  <text x="78" y="566" class="t-subm" fill="#e5d3a0">▸ libejit.a 运行时库（链接进可执行文件）</text>
-  <text x="78" y="584" class="t-subm" fill="#e5d3a0">▸ 嵌入 Bitcode 段（运行时按需加载）</text>
-  <text x="78" y="602" class="t-subm" fill="#e5d3a0">▸ 构造函数填充注册表 → RegistrationStore</text>
-  <text x="78" y="624" class="t-subm" fill="#fbbf24">★ 编译期产物 / 运行期输入（两子系统契约）</text>
+  <text x="78" y="528" class="t-name" fill="#7b341e">可执行文件（静态链接 libejit.a）</text>
+  <text x="78" y="548" class="t-subm" fill="#9a3412">▸ AOT 编译的用户代码 + Wrapper 入口插桩</text>
+  <text x="78" y="566" class="t-subm" fill="#9a3412">▸ libejit.a 运行时库（链接进可执行文件）</text>
+  <text x="78" y="584" class="t-subm" fill="#9a3412">▸ 嵌入 Bitcode 段（运行时按需加载）</text>
+  <text x="78" y="602" class="t-subm" fill="#9a3412">▸ 构造函数填充注册表 -> RegistrationStore</text>
+  <text x="78" y="624" class="t-subm" fill="#c05621">★ 编译期产物 / 运行期输入（两子系统契约）</text>
   <text x="78" y="690" class="t-note">部署：Bitcode 嵌入独立段 · libejit.a 独立提供 · 按需加载</text>
 
   <!-- ===== RIGHT: Runtime library ===== -->
-  <rect class="subsys ss-vi" x="730" y="92" width="720" height="700"/>
+  <rect class="subsys ss-rt" x="730" y="92" width="720" height="700"/>
   <text x="748" y="116" class="t-title">运行时库 · libejit.a</text>
   <text x="748" y="131" class="t-sub">llvm/lib/ExecutionEngine/EJIT · 调度 / 缓存 / 编译引擎 / 内存 / 状态</text>
 
   <!-- R1 groups -->
-  <!-- 调度与门控 -->
   <rect class="grp" x="748" y="148" width="206" height="156"/>
-  <text x="760" y="166" class="t-grp" fill="#7dd3fc">调度与门控</text>
+  <text x="760" y="166" class="t-grp" fill="#3182ce">调度与门控</text>
   <g>
     <rect class="box b-sky" x="758" y="174" width="186" height="50" rx="8"/>
     <rect class="bar c-sky" x="760" y="182" width="3" height="34"/>
@@ -205,9 +209,8 @@
     <text x="772" y="284" class="t-subm">+ 单调 version</text>
   </g>
 
-  <!-- 缓存 -->
   <rect class="grp" x="970" y="148" width="200" height="156"/>
-  <text x="982" y="166" class="t-grp" fill="#6ee7b7">缓存</text>
+  <text x="982" y="166" class="t-grp" fill="#2f855a">缓存</text>
   <g>
     <rect class="box b-em" x="980" y="174" width="180" height="116" rx="8"/>
     <rect class="bar c-em" x="982" y="182" width="3" height="100"/>
@@ -220,23 +223,22 @@
     <text x="994" y="282" class="t-subm">cacheKey=hash(func,dims)</text>
   </g>
 
-  <!-- 队列 -->
   <rect class="grp" x="1186" y="148" width="246" height="156"/>
-  <text x="1198" y="166" class="t-grp" fill="#c4b5fd">队列</text>
+  <text x="1198" y="166" class="t-grp" fill="#6b46c1">队列</text>
   <g>
     <rect class="box b-vi" x="1196" y="174" width="226" height="116" rx="8"/>
     <rect class="bar c-vi" x="1198" y="182" width="3" height="100"/>
     <text x="1210" y="194" class="t-name">TaskQueue + DedupTable</text>
     <text x="1210" y="212" class="t-subm">Vyukov MPSC 环 (1024)</text>
     <text x="1210" y="226" class="t-subm">sequence-per-slot</text>
-    <text x="1210" y="242" class="t-subm">dedup CAS(0→1)</text>
+    <text x="1210" y="242" class="t-subm">dedup CAS(0->1)</text>
     <text x="1210" y="258" class="t-subm">enqueue/dequeue</text>
     <text x="1210" y="276" class="t-subm">shared 模式 generation-aware</text>
   </g>
 
   <!-- R2: Worker + Compile engine -->
   <rect class="grp" x="748" y="324" width="206" height="92"/>
-  <text x="760" y="342" class="t-grp" fill="#f9a8d4">编译执行</text>
+  <text x="760" y="342" class="t-grp" fill="#c05621">编译执行</text>
   <g>
     <rect class="box b-pk" x="758" y="350" width="186" height="56" rx="8"/>
     <rect class="bar c-pk" x="760" y="358" width="3" height="40"/>
@@ -246,32 +248,31 @@
   </g>
 
   <!-- Compile engine CORE -->
-  <rect x="970" y="324" width="462" height="200" rx="14" fill="url(#corefill)" stroke="#c084fc" stroke-width="2" filter="url(#glow)"/>
-  <text x="986" y="346" class="t-grp" fill="#d8b4fe">★ JIT 编译引擎 · OrcJIT / LLJIT</text>
+  <rect x="970" y="324" width="462" height="200" rx="14" fill="#f5f0ff" stroke="#6b46c1" stroke-width="2"/>
+  <text x="986" y="346" class="t-grp" fill="#6b46c1">★ JIT 编译引擎 · OrcJIT / LLJIT</text>
   <g>
-    <rect class="box b-pu" x="982" y="354" width="438" height="44" rx="8" fill="#1a1438"/>
+    <rect class="box b-pu" x="982" y="354" width="438" height="44" rx="8"/>
     <rect class="bar c-pu" x="984" y="362" width="3" height="28"/>
     <text x="996" y="372" class="t-name">EJitCompileDriver</text>
     <text x="996" y="388" class="t-subm">owns OrcEngine + BitcodeTracker · 暴露 CompileCallback</text>
   </g>
   <g>
-    <rect class="box b-pu" x="982" y="404" width="438" height="44" rx="8" fill="#1a1438"/>
+    <rect class="box b-pu" x="982" y="404" width="438" height="44" rx="8"/>
     <rect class="bar c-pu" x="984" y="412" width="3" height="28"/>
     <text x="996" y="422" class="t-name">EJitOrcEngine</text>
     <text x="996" y="438" class="t-subm">LLJIT 封装 · JITDylib / ResourceTracker / IRTransformLayer</text>
   </g>
   <g>
-    <rect class="box b-pu" x="982" y="454" width="438" height="60" rx="8" fill="#1a1438"/>
+    <rect class="box b-pu" x="982" y="454" width="438" height="60" rx="8"/>
     <rect class="bar c-pu" x="984" y="462" width="3" height="44"/>
-    <text x="996" y="472" class="t-name">特化流水线 → IRCompile → ObjectLinking</text>
-    <text x="996" y="488" class="t-subm">参数替换 → InstCombine → Inline → PASS6 StructField</text>
-    <text x="996" y="502" class="t-subm">→ Optimizer(L1/L2/L3) → JITLink codegen</text>
+    <text x="996" y="472" class="t-name">特化流水线 -> IRCompile -> ObjectLinking</text>
+    <text x="996" y="488" class="t-subm">参数替换 -> InstCombine -> Inline -> PASS6 StructField</text>
+    <text x="996" y="502" class="t-subm">-> Optimizer(L1/L2/L3) -> JITLink codegen</text>
   </g>
 
   <!-- R3 groups -->
-  <!-- 内存 -->
   <rect class="grp" x="748" y="544" width="206" height="156"/>
-  <text x="760" y="562" class="t-grp" fill="#fdba74">内存</text>
+  <text x="760" y="562" class="t-grp" fill="#c05621">内存</text>
   <g>
     <rect class="box b-or" x="758" y="570" width="186" height="52" rx="8"/>
     <rect class="bar c-or" x="760" y="578" width="3" height="36"/>
@@ -284,12 +285,11 @@
     <rect class="bar c-or" x="760" y="640" width="3" height="42"/>
     <text x="772" y="652" class="t-name">CodePoolMemoryManager</text>
     <text x="772" y="668" class="t-subm">JITLink 分配</text>
-    <text x="772" y="682" class="t-subm">4K 页 RW→RX 密封</text>
+    <text x="772" y="682" class="t-subm">4K 页 RW->RX 密封</text>
   </g>
 
-  <!-- 平台抽象 -->
   <rect class="grp" x="970" y="544" width="200" height="156"/>
-  <text x="982" y="562" class="t-grp" fill="#cbd5e1">平台抽象</text>
+  <text x="982" y="562" class="t-grp" fill="#475569">平台抽象</text>
   <g>
     <rect class="box b-sl" x="980" y="570" width="180" height="52" rx="8"/>
     <rect class="bar c-sl" x="982" y="578" width="3" height="36"/>
@@ -305,9 +305,8 @@
     <text x="994" y="682" class="t-subm">SreTask · 无 std::thread</text>
   </g>
 
-  <!-- 状态与注册 -->
   <rect class="grp" x="1186" y="544" width="246" height="156"/>
-  <text x="1198" y="562" class="t-grp" fill="#fde68a">状态与注册</text>
+  <text x="1198" y="562" class="t-grp" fill="#2c7a7b">状态与注册</text>
   <g>
     <rect class="box b-yl" x="1196" y="570" width="226" height="52" rx="8"/>
     <rect class="bar c-yl" x="1198" y="578" width="3" height="36"/>
@@ -324,52 +323,42 @@
   </g>
 
   <!-- ===== Connectors (relationships) ===== -->
-  <!-- TaskPool -> Cache : lookup -->
   <path class="conn" d="M944,199 L980,199" marker-end="url(#arr)"/>
   <rect class="lblbg" x="940" y="183" width="44" height="13"/>
   <text x="962" y="193" class="t-clbl" text-anchor="middle">lookup</text>
 
-  <!-- TaskPool -> Queue : enqueue (over top) -->
   <path class="conn" d="M851,174 L851,138 L1309,138 L1309,174" marker-end="url(#arr)"/>
   <rect class="lblbg" x="1052" y="130" width="56" height="13"/>
   <text x="1080" y="140" class="t-clbl" text-anchor="middle">enqueue</text>
 
-  <!-- TaskPool -> SwitchController : gate -->
   <path class="conn" d="M851,224 L851,234" marker-end="url(#arr)"/>
   <rect class="lblbg" x="858" y="223" width="34" height="13"/>
   <text x="875" y="233" class="t-clbl" text-anchor="middle">gate</text>
 
-  <!-- Queue -> Worker : dequeue -->
   <path class="conn" d="M1309,290 L1309,316 L851,316 L851,350" marker-end="url(#arr)"/>
   <rect class="lblbg" x="1040" y="309" width="56" height="13"/>
   <text x="1068" y="319" class="t-clbl" text-anchor="middle">dequeue</text>
 
-  <!-- Worker -> CompileDriver : compile -->
   <path class="conn-c" d="M944,378 L982,378" marker-end="url(#arrp)"/>
   <rect class="lblbg" x="938" y="360" width="50" height="13"/>
-  <text x="963" y="370" class="t-clbl" fill="#d8b4fe" text-anchor="middle">compile</text>
+  <text x="963" y="370" class="t-clbl" fill="#6b46c1" text-anchor="middle">compile</text>
 
-  <!-- Worker -> Cache : publish -->
   <path class="conn" d="M851,350 L851,338 L1070,338 L1070,290" marker-end="url(#arr)"/>
   <rect class="lblbg" x="1042" y="331" width="50" height="13"/>
   <text x="1067" y="341" class="t-clbl" text-anchor="middle">publish</text>
 
-  <!-- CompileEngine -> Registries : read (right edge down) -->
   <path class="conn-d" d="M1420,454 L1420,540 L1309,540 L1309,570" marker-end="url(#arr)"/>
   <rect class="lblbg" x="1380" y="533" width="44" height="13"/>
   <text x="1402" y="543" class="t-clbl" text-anchor="middle">read</text>
 
-  <!-- CompileEngine -> Memory : alloc (down-left) -->
   <path class="conn" d="M982,514 L982,530 L851,530 L851,570" marker-end="url(#arr)"/>
   <rect class="lblbg" x="844" y="523" width="40" height="13"/>
   <text x="864" y="533" class="t-clbl" text-anchor="middle">alloc</text>
 
-  <!-- RuntimeState -> SwitchController : invalidate (right edge up) -->
   <path class="conn-d" d="M1309,570 L1309,524 L944,524 L944,294" marker-end="url(#arr)"/>
   <rect class="lblbg" x="1080" y="517" width="72" height="13"/>
   <text x="1116" y="527" class="t-clbl" text-anchor="middle">invalidate</text>
 
-  <!-- Memory -> Platform : seal/uses -->
   <path class="conn-d" d="M944,658 L980,658" marker-end="url(#arr)"/>
   <rect class="lblbg" x="936" y="641" width="52" height="13"/>
   <text x="962" y="651" class="t-clbl" text-anchor="middle">seal/uses</text>
@@ -377,43 +366,39 @@
   <!-- ===== Bridge: Artifact -> Runtime ===== -->
   <path class="conn-c" d="M512,581 L730,440" marker-end="url(#arrp)"/>
   <rect class="lblbg" x="556" y="498" width="150" height="26" rx="4"/>
-  <text x="631" y="510" class="t-clbl" fill="#fde68a" text-anchor="middle">libejit.a 链入</text>
-  <text x="631" y="521" class="t-clbl" fill="#fde68a" text-anchor="middle">嵌入 Bitcode 按需加载</text>
+  <text x="631" y="510" class="t-clbl" fill="#6b46c1" text-anchor="middle">libejit.a 链入</text>
+  <text x="631" y="521" class="t-clbl" fill="#6b46c1" text-anchor="middle">嵌入 Bitcode 按需加载</text>
 
-  <!-- AOT -> Artifact (产出) -->
   <path class="conn" d="M286,498 L286,506" marker-end="url(#arr)"/>
   <rect class="lblbg" x="296" y="495" width="40" height="13"/>
   <text x="316" y="505" class="t-clbl" text-anchor="middle">产出</text>
 
   <!-- ===== Bottom: trimmed backend + hardware ===== -->
-  <rect class="box b-sl" x="730" y="804" width="720" height="50" rx="10" fill="#0f1729"/>
+  <rect class="box b-sl" x="730" y="804" width="720" height="50" rx="10"/>
   <rect class="bar c-sl" x="732" y="812" width="4" height="34"/>
   <text x="748" y="824" class="t-name">LLVM 后端（裁剪）· Trimmed Backend</text>
-  <text x="748" y="840" class="t-subm">EJitPassBuilder(~20 analyses) · ARM Cortex-A CodeGen · lipo extract→gc-merge→merge → ejit.o</text>
-  <!-- CompileEngine uses backend -->
+  <text x="748" y="840" class="t-subm">EJitPassBuilder(~20 analyses) · ARM Cortex-A CodeGen · lipo extract->gc-merge->merge -> ejit.o</text>
   <path class="conn-d" d="M1201,524 L1201,804" marker-end="url(#arr)"/>
   <rect class="lblbg" x="1178" y="648" width="46" height="13"/>
   <text x="1201" y="658" class="t-clbl" text-anchor="middle">codegen</text>
 
-  <!-- Hardware (external) -->
-  <rect x="30" y="804" width="680" height="50" rx="10" fill="rgba(100,116,139,.08)" stroke="#64748b" stroke-width="1.4" stroke-dasharray="6 4"/>
-  <text x="46" y="824" class="t-name" fill="#cbd5e1">外部系统 · ARM Cortex-A 硬件</text>
+  <rect x="30" y="804" width="680" height="50" rx="10" fill="#f7f9fc" stroke="#475569" stroke-width="1.4" stroke-dasharray="6 4"/>
+  <text x="46" y="824" class="t-name" fill="#1f2937">外部系统 · ARM Cortex-A 硬件</text>
   <text x="46" y="840" class="t-subm">RAM 100KB–2MB · 软实时 · 执行 AOT 代码与 JIT 特化机器码</text>
-  <!-- Artifact -> hardware : AOT 执行 -->
   <path class="conn" d="M286,656 L286,804" marker-end="url(#arr)"/>
   <rect class="lblbg" x="258" y="720" width="56" height="13"/>
   <text x="286" y="730" class="t-clbl" text-anchor="middle">AOT 执行</text>
-  <!-- Runtime -> hardware : JIT 执行 -->
   <path class="conn-c" d="M851,700 L851,760 L370,760 L370,804" marker-end="url(#arrp)"/>
   <rect class="lblbg" x="588" y="753" width="56" height="13"/>
-  <text x="616" y="763" class="t-clbl" fill="#d8b4fe" text-anchor="middle">JIT 执行</text>
+  <text x="616" y="763" class="t-clbl" fill="#6b46c1" text-anchor="middle">JIT 执行</text>
 
 </svg>
+  </section>
 
   <div class="legend">
-    <span><i></i> 调用 / 数据流（调用方 → 被调用方）</span>
+    <span><i></i> 调用 / 数据流（调用方 -> 被调用方）</span>
     <span><i class="dash"></i> 依赖 / 读取 / 失效通知</span>
-    <span><i class="thick"></i> 编译引擎核心关系</span>
+    <span><i class="thick"></i> 核心关系（编译引擎 / 桥接 / 执行）</span>
     <span>· 虚线框 = 外部系统 · 连线为组件协作关系，非执行顺序 ·</span>
   </div>
 </div>
