@@ -148,11 +148,6 @@
       <h1>EmbeddedJIT 总体逻辑架构设计图</h1>
       <p class="sub">基于<b>时间窗常量</b>的运行时特化编译系统：AOT 阶段提取带元数据的 Bitcode 并插桩 Wrapper，运行时按时间窗实例 JIT 特化、缓存机器码，失败回退 AOT。</p>
     </div>
-    <div class="meta">
-      <div><b>目标</b>：BiSheng Embedded CPU · ARM Cortex-A</div>
-      <div><b>RAM</b> 100KB–2MB · <b>软实时</b> &lt;100ms 首编</div>
-      <div><b>基础</b>：Clang/LLVM + OrcJIT/JITLink</div>
-    </div>
   </header>
 
   <!-- ===================== 用户接口层 ===================== -->
@@ -160,12 +155,12 @@
     <div class="panel">
       <div class="ph"><span>⬛</span> 用户标注属性（Clang 前端，6 个）</div>
       <div class="chips">
-        <span class="chip">ejit_may_const<small> 成员可常量化</small></span>
-        <span class="chip">ejit_period(static)<small> 运行期不变</small></span>
-        <span class="chip">ejit_period_arr(name)<small> 数组时间窗</small></span>
-        <span class="chip">ejit_entry<small> JIT 入口函数</small></span>
-        <span class="chip">ejit_period_arr_ind(name)<small> 特化维度参数</small></span>
-        <span class="chip">ejit_period_lc(name)<small> 生命周期管理函数</small></span>
+        <span class="chip">EJIT_PERIOD_CONST<small> 成员可常量化</small></span>
+        <span class="chip">EJIT_IN_PERIOD(static)<small> 运行期不变</small></span>
+        <span class="chip">EJIT_IN_PERIOD_ARRAY(name)<small> 数组时间窗</small></span>
+        <span class="chip">EJIT_ENTRY<small> JIT 入口函数</small></span>
+        <span class="chip">EJIT_DIM(name)<small> 特化维度参数</small></span>
+        <span class="chip">EJIT_PERIOD_GUARD(name)<small> 生命周期管理函数</small></span>
       </div>
     </div>
     <div class="panel rt">
@@ -214,7 +209,7 @@
           <ul>
             <li><b>PASS2 RegisterPeriod</b>：生成 period 数组 / static 变量注册代码</li>
             <li><b>PASS3 WrapperGen</b>：单函数混合 Wrapper（入口插 <code>compile_or_get</code>+<code>release_read</code>，失败续原逻辑）</li>
-            <li><b>PASS4 PeriodHandler</b>：为 <code>ejit_period_lc</code> 入口插 deactivate / 出口插 activate</li>
+            <li><b>PASS4 PeriodHandler</b>：为 <code>EJIT_PERIOD_GUARD</code> 入口插 deactivate / 出口插 activate</li>
             <li><span class="hint">非LTO：O2 之前（优化 Wrapper IR）；LTO：O2 之后</span></li>
           </ul>
         </div>
@@ -304,7 +299,7 @@
           <div class="nt"><span class="pill">JIT</span>IRTransformLayer 特化流水线</div>
           <ul style="columns:2; column-gap:18px">
             <li><b>1. 加载 Bitcode</b>（BitcodeTracker → Module）</li>
-            <li><b>2. 参数替换</b>：ejit_period_arr_ind → 运行时常量</li>
+            <li><b>2. 参数替换</b>：EJIT_DIM 参数 → 运行时常量</li>
             <li><b>3. InstCombine</b>：折叠 zext/GEP 常量链、清 PHI</li>
             <li><b>4. Inline</b>：展开跨函数 GEP 链</li>
             <li><b>5. PASS6 EJitStructFieldPass</b>：<code>!ejit.may_const</code> load → 运行时常量（per-load 元数据 / GV 偏移回退双机制；baseAddr + accumulateConstantOffset → memcpy）</li>
