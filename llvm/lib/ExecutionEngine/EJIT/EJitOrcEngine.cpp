@@ -145,15 +145,42 @@ using DumpMutexType = std::mutex;
 // ejit_dump_func() / setDumpFuncFilter(). Read in the IR transform layer.
 // A diagnostic: set before triggering the compile of interest; concurrent
 // set/read is benign (worst case a missed or extra dump).
+static DumpMutexType gDumpMutex;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 EJitSharedTaskPoolState *gDumpSharedState = nullptr;
 #endif
 static std::string gDumpFuncFilter;
+static uint64_t gDumpFilterSeq = 0;
+static uint64_t gDumpCheckCount = 0;
+static uint64_t gDumpMissLogCount = 0;
+static uint64_t gDumpMatchLogCount = 0;
+static uint64_t gDumpMatchCount = 0;
+static uint64_t gDumpCaptureCount = 0;
+static uint64_t gDumpLastCheckKey = 0;
+static std::string gDumpLastFilter;
+static std::string gDumpLastCheckedFn;
+static std::string gDumpLastReason;
+static constexpr uint64_t kDumpCheckLogLimit = 8;
 
 void setDumpFuncFilter(const std::string &name) {
-  gDumpFuncFilter = name;
-  EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
-            gDumpFuncFilter.empty() ? "(off)" : gDumpFuncFilter.c_str(),
+  uint64_t seq = 0;
+  {
+    std::lock_guard<DumpMutexType> lock(gDumpMutex);
+    gDumpFuncFilter = name;
+    ++gDumpFilterSeq;
+    seq = gDumpFilterSeq;
+    gDumpCheckCount = 0;
+    gDumpMissLogCount = 0;
+    gDumpMatchLogCount = 0;
+    gDumpMatchCount = 0;
+    gDumpCaptureCount = 0;
+    gDumpLastCheckKey = 0;
+    gDumpLastFilter = name;
+    gDumpLastCheckedFn.clear();
+    gDumpLastReason = name.empty() ? "filter-off" : "armed-no-check-yet";
+  }
+  EJIT_DIAG("set_dump_filter seq=%llu value=%s &filter=%p",
+            (unsigned long long)seq, name.empty() ? "(off)" : name.c_str(),
             (void *)&gDumpFuncFilter);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (gDumpSharedState) {
@@ -181,8 +208,11 @@ void setDumpFuncFilter(const std::string &name) {
     D.nextSlot = 0;
     D.filterEnabled.storeRelease(len ? 1u : 0u);
     D.lock.storeRelease(0);
-    EJIT_DIAG_DEBUG("set_dump_filter shared enabled=%u len=%u &shared=%p",
+    EJIT_DIAG("set_dump_filter shared enabled=%u len=%u &shared=%p",
               len ? 1u : 0u, len, (void *)gDumpSharedState);
+  } else if (!name.empty()) {
+    EJIT_DIAG("set_dump_filter shared state not bound yet; filter will be "
+              "propagated at ejit_init if shared taskpool is used");
   }
 #endif
 }
@@ -196,8 +226,13 @@ void setDumpSharedState(EJitSharedTaskPoolState *state) {
   // propagate it into the now-bound shared state. Otherwise the owner worker
   // (possibly a different core) sees an empty shared filter and never captures,
   // even though the producer thinks dump is armed.
-  if (gDumpSharedState && !gDumpFuncFilter.empty())
-    setDumpFuncFilter(gDumpFuncFilter);
+  std::string localFilter;
+  {
+    std::lock_guard<DumpMutexType> lock(gDumpMutex);
+    localFilter = gDumpFuncFilter;
+  }
+  if (gDumpSharedState && !localFilter.empty())
+    setDumpFuncFilter(localFilter);
 }
 
 static void sharedDumpLock(EJitSharedDumpState &D) {
@@ -234,10 +269,12 @@ static bool getActiveDumpFilter(std::string &out) {
   if (getSharedDumpFilter(out))
     return true;
 #endif
-  if (gDumpFuncFilter.empty())
-    return false;
-  out = gDumpFuncFilter;
-  return true;
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  if (!gDumpFuncFilter.empty()) {
+    out = gDumpFuncFilter;
+    return true;
+  }
+  return false;
 }
 
 /// Saved IR+ASM for a captured specialization (latest per function name).
@@ -252,8 +289,50 @@ struct DumpEntry {
 // thread). Guarded by gDumpMutex. These are ordinary process statics, not part
 // of the shared taskpool state; cross-core visibility depends on the worker
 // running in the same process image (addresses are logged to diagnose this).
-static DumpMutexType gDumpMutex;
 static std::map<std::string, DumpEntry> gDumpStore;
+
+static bool recordDumpCheck(const std::string &filter, const std::string &fn,
+                            uint64_t cacheKey, bool wildcard, bool match) {
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  ++gDumpCheckCount;
+  gDumpLastFilter = filter;
+  gDumpLastCheckedFn = fn;
+  gDumpLastCheckKey = cacheKey;
+  if (match) {
+    ++gDumpMatchCount;
+    gDumpLastReason = wildcard ? "wildcard-match" : "exact-match";
+    if (wildcard && gDumpMatchLogCount >= kDumpCheckLogLimit)
+      return false;
+    ++gDumpMatchLogCount;
+    return true;
+  }
+  gDumpLastReason = wildcard ? "unexpected-wildcard-miss" : "name-mismatch";
+  // Normal DIAG is intentionally rate-limited: dump_all can see many functions.
+  if (gDumpMissLogCount < kDumpCheckLogLimit) {
+    ++gDumpMissLogCount;
+    return true;
+  }
+  return false;
+}
+
+static void snapshotDumpDiag(std::string &filter, std::string &lastFn,
+                             std::string &reason, uint64_t &seq,
+                             uint64_t &checks, uint64_t &matches,
+                             uint64_t &captures, uint64_t &lastKey,
+                             unsigned &storeSize) {
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  filter = gDumpFuncFilter;
+  if (filter.empty())
+    filter = gDumpLastFilter;
+  lastFn = gDumpLastCheckedFn;
+  reason = gDumpLastReason;
+  seq = gDumpFilterSeq;
+  checks = gDumpCheckCount;
+  matches = gDumpMatchCount;
+  captures = gDumpCaptureCount;
+  lastKey = gDumpLastCheckKey;
+  storeSize = (unsigned)gDumpStore.size();
+}
 
 static void dumpBytesSafe(const char *label, const char *data, size_t n) {
   EJIT_DIAG("=== %s begin size=%u ===", label, (unsigned)n);
@@ -349,23 +428,28 @@ static void captureSharedDump(const std::string &fnName, uint64_t cacheKey,
                               (asmTrunc ? 2u : 0u));
   Slot.valid.storeRelease(1);
   sharedDumpUnlock(D);
-  EJIT_DIAG_DEBUG("capture shared func=%s slot=%u ir=%u asm=%u trunc=0x%x &shared=%p",
+  EJIT_DIAG("capture shared func=%s slot=%u ir=%u asm=%u trunc=0x%x &shared=%p",
             fnName.c_str(), target, (unsigned)IR.size(), (unsigned)ASM.size(),
             (nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) | (asmTrunc ? 2u : 0u),
             (void *)gDumpSharedState);
 }
 
 static bool printSharedDumped(const char *name) {
-  if (!gDumpSharedState)
+  if (!gDumpSharedState) {
+    EJIT_DIAG("print_dumped shared unavailable name=%s",
+              (name && name[0]) ? name : "(all)");
     return false;
+  }
   EJitSharedDumpState &D = gDumpSharedState->dump;
   bool hasName = name && name[0];
   sharedDumpLock(D);
   bool any = false;
+  uint32_t validCount = 0;
   for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
     EJitSharedDumpSlot &Slot = D.slots[s];
     if (Slot.valid.loadAcquire() == 0)
       continue;
+    ++validCount;
     bool match = true;
     if (hasName) {
       uint32_t i = 0;
@@ -390,8 +474,8 @@ static bool printSharedDumped(const char *name) {
   }
   sharedDumpUnlock(D);
   if (!any)
-    EJIT_DIAG_DEBUG("print_dumped shared miss name=%s &shared=%p",
-                    hasName ? name : "(all)", (void *)gDumpSharedState);
+    EJIT_DIAG("print_dumped shared miss name=%s valid_slots=%u &shared=%p",
+              hasName ? name : "(all)", validCount, (void *)gDumpSharedState);
   return any;
 }
 #endif
@@ -400,13 +484,19 @@ static bool printSharedDumped(const char *name) {
 /// post-optimization IR and emitted ASM for later selective printing.
 static void captureDump(const std::string &fnName, uint64_t cacheKey,
                         std::string IR, std::string ASM) {
-  EJIT_DIAG_DEBUG("capture enter func=%s ir_size=%u asm_size=%u &store=%p",
-            fnName.c_str(), (unsigned)IR.size(), (unsigned)ASM.size(),
-            (void *)&gDumpStore);
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
-  EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)gDumpStore.size());
   gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
-  EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
+  ++gDumpCaptureCount;
+  gDumpLastCheckedFn = fnName;
+  gDumpLastCheckKey = cacheKey;
+  gDumpLastReason = "captured";
+  EJIT_DIAG("capture local func=%s key_hi=0x%08x key_lo=0x%08x ir=%u asm=%u "
+            "store_size=%u &store=%p",
+            fnName.c_str(), (uint32_t)(cacheKey >> 32),
+            (uint32_t)(cacheKey & 0xffffffffu),
+            (unsigned)gDumpStore[fnName].IR.size(),
+            (unsigned)gDumpStore[fnName].ASM.size(),
+            (unsigned)gDumpStore.size(), (void *)&gDumpStore);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   const DumpEntry &E = gDumpStore[fnName];
   captureSharedDump(fnName, cacheKey, E.IR, E.ASM);
@@ -436,7 +526,7 @@ static void printOneDumpSafe(const char *requestedName,
 /// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
 /// saved capture are reported as missing.
 void printDumped(const char *name) {
-  EJIT_DIAG_DEBUG("print_dumped enter name=%s &filter=%p &store=%p",
+  EJIT_DIAG("print_dumped enter name=%s &filter=%p &store=%p",
             (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
             (void *)&gDumpStore);
   bool hasName = name && name[0];
@@ -465,10 +555,24 @@ void printDumped(const char *name) {
   if (printSharedDumped(name))
     return;
 #endif
-  if (hasName)
-    EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
-                    (unsigned)gDumpStore.size());
-  else
+  if (hasName) {
+    std::string filter;
+    std::string lastFn;
+    std::string reason;
+    uint64_t seq = 0, checks = 0, matches = 0, captures = 0, lastKey = 0;
+    unsigned storeSize = 0;
+    snapshotDumpDiag(filter, lastFn, reason, seq, checks, matches, captures,
+                     lastKey, storeSize);
+    EJIT_DIAG("print_dumped miss name=%s store_size=%u filter=%s seq=%llu "
+              "checks=%llu matches=%llu captures=%llu last_fn=%s "
+              "last_reason=%s last_key_hi=0x%08x last_key_lo=0x%08x",
+              name, storeSize, filter.empty() ? "(off)" : filter.c_str(),
+              (unsigned long long)seq, (unsigned long long)checks,
+              (unsigned long long)matches, (unsigned long long)captures,
+              lastFn.empty() ? "(none)" : lastFn.c_str(),
+              reason.empty() ? "(none)" : reason.c_str(),
+              (uint32_t)(lastKey >> 32), (uint32_t)(lastKey & 0xffffffffu));
+  } else
     EJIT_DIAG("print_dumped: nothing saved");
 }
 
@@ -654,12 +758,23 @@ EJitOrcEngine::Create(const Config &config,
             bool hasFilter = getActiveDumpFilter(DumpFilter);
             bool wildcard = hasFilter && DumpFilter == "*";
             bool match = wildcard || (hasFilter && ctx->fnName == DumpFilter);
-            EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
-                            "key_lo=0x%08x match=%d wildcard=%d &filter=%p",
-                            hasFilter ? DumpFilter.c_str() : "(off)",
-                            ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
-                            (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
-                            wildcard ? 1 : 0, (void *)&gDumpFuncFilter);
+            if (hasFilter) {
+              bool logThisCheck =
+                  recordDumpCheck(DumpFilter, ctx->fnName, ctx->cacheKey,
+                                  wildcard, match);
+              if (logThisCheck) {
+                EJIT_DIAG("dump check filter=%s fn=%s key_hi=0x%08x "
+                          "key_lo=0x%08x match=%d wildcard=%d reason=%s "
+                          "&filter=%p",
+                          DumpFilter.c_str(), ctx->fnName.c_str(),
+                          (uint32_t)(ctx->cacheKey >> 32),
+                          (uint32_t)(ctx->cacheKey & 0xffffffffu),
+                          match ? 1 : 0, wildcard ? 1 : 0,
+                          match ? (wildcard ? "wildcard-match" : "exact-match")
+                                : "name-mismatch",
+                          (void *)&gDumpFuncFilter);
+              }
+            }
             if (match) {
               // IR capture always runs first so it succeeds even if the ASM
               // diagnostic path is disabled or fails.
