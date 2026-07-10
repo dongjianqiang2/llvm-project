@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小型化差异详解 — 毕昇编译器升级</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f0f2f5; color: #333; line-height: 1.8;
+  }
+  .header {
+    background: linear-gradient(135deg, #0a2647 0%, #0d3b6e 50%, #0a2647 100%);
+    color: #fff; padding: 48px 24px 36px; text-align: center;
+    border-bottom: 3px solid #d4a843;
+  }
+  .header .back-link {
+    display: inline-block; color: #d4a843; text-decoration: none;
+    font-size: 14px; margin-bottom: 16px; transition: opacity 0.2s;
+  }
+  .header .back-link:hover { opacity: 0.8; }
+  .header h1 { font-size: 28px; font-weight: 700; letter-spacing: 1px; }
+  .header .subtitle {
+    margin-top: 8px; font-size: 14px; color: rgba(255,255,255,0.65);
+  }
+  .container { max-width: 980px; margin: 0 auto; padding: 32px 24px 64px; }
+  .toc {
+    background: #fff; border-radius: 8px; padding: 24px 32px; margin-bottom: 36px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06); border-left: 4px solid #d4a843;
+  }
+  .toc h2 { font-size: 18px; color: #0a2647; margin-bottom: 12px; }
+  .toc ol { padding-left: 20px; }
+  .toc li { margin-bottom: 4px; }
+  .toc a { color: #0a2647; text-decoration: none; }
+  .toc a:hover { color: #d4a843; text-decoration: underline; }
+  section {
+    background: #fff; border-radius: 8px; padding: 32px; margin-bottom: 28px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+  section h2 {
+    font-size: 22px; color: #0a2647; margin-bottom: 16px;
+    padding-bottom: 10px; border-bottom: 2px solid #d4a843;
+  }
+  section h3 { font-size: 18px; color: #0a2647; margin: 24px 0 10px; }
+  section h4 { font-size: 16px; color: #555; margin: 16px 0 8px; }
+  section p { margin-bottom: 12px; }
+  section ul, section ol { padding-left: 24px; margin-bottom: 12px; }
+  section li { margin-bottom: 6px; }
+  code.inline {
+    background: #eef1f5; color: #0a2647; padding: 1px 6px;
+    border-radius: 3px; font-family: "Source Code Pro", "Fira Code", "Consolas", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: #0a2647; color: #e0e0e0; padding: 20px 24px;
+    border-radius: 6px; overflow-x: auto; font-size: 13px;
+    line-height: 1.7; margin-bottom: 16px;
+    font-family: "Source Code Pro", "Fira Code", "Consolas", monospace;
+  }
+  pre .kw { color: #d4a843; }
+  pre .str { color: #a5d6a5; }
+  pre .cmt { color: #6a8aaf; }
+  pre .num { color: #d4a843; }
+  pre .fn { color: #d4a843; }
+  pre .ty { color: #d4a843; }
+  pre .op { color: #e0e0e0; }
+  .example-box {
+    background: #f7f9fb; border-left: 4px solid #d4a843;
+    padding: 16px 20px; margin: 16px 0; border-radius: 0 6px 6px 0;
+  }
+  .example-box .label {
+    font-size: 12px; font-weight: 700; color: #d4a843; text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 6px;
+  }
+  .note {
+    background: #fffdf2; border: 1px solid #d4a843; border-radius: 6px;
+    padding: 14px 20px; margin: 16px 0; font-size: 14px;
+  }
+  .note strong { color: #0a2647; }
+  .warning {
+    background: #fff5f0; border: 1px solid #e08040; border-radius: 6px;
+    padding: 14px 20px; margin: 16px 0; font-size: 14px;
+  }
+  .warning strong { color: #c05020; }
+  .version-tag {
+    display: inline-block; background: #0a2647; color: #d4a843;
+    padding: 2px 12px; border-radius: 12px; font-weight: 700; font-size: 13px;
+    margin-right: 8px;
+  }
+  .version-tag.range {
+    background: #1e4a7a; color: #d4a843;
+  }
+  .verify-table {
+    width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px;
+  }
+  .verify-table th {
+    background: #0a2647; color: #d4a843; padding: 10px 14px;
+    text-align: left; font-weight: 600;
+  }
+  .verify-table td {
+    padding: 10px 14px; border-bottom: 1px solid #e0e0e0;
+  }
+  .verify-table tr:nth-child(even) td { background: #f7f9fb; }
+  .card-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 20px; margin: 16px 0;
+  }
+  .card {
+    background: #f7f9fb; border-radius: 8px; padding: 20px;
+    border-left: 4px solid #0a2647;
+  }
+  .card h4 { margin: 0 0 8px; color: #0a2647; font-size: 16px; }
+  .card p { font-size: 14px; color: #555; margin: 0; }
+  .footer {
+    text-align: center; padding: 24px; color: #999; font-size: 13px;
+    border-top: 1px solid #e0e0e0; margin-top: 40px;
+  }
+  .highlight-box {
+    background: linear-gradient(135deg, #f7f9fb 0%, #eef1f5 100%);
+    border: 2px solid #d4a843; border-radius: 8px; padding: 20px 24px; margin: 20px 0;
+  }
+  .highlight-box h4 { color: #0a2647; margin-bottom: 10px; }
+  table.size-compare {
+    width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px;
+  }
+  table.size-compare th {
+    background: #0a2647; color: #d4a843; padding: 8px 12px; text-align: center;
+    font-weight: 600; font-size: 13px;
+  }
+  table.size-compare td {
+    padding: 8px 12px; text-align: center; border: 1px solid #e0e0e0;
+  }
+  table.size-compare td.label { text-align: left; font-weight: 600; color: #0a2647; background: #f7f9fb; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <a class="back-link" href="index.html">&#8592; 返回主页</a>
+  <h1>小型化差异详解</h1>
+  <div class="subtitle">毕昇编译器升级 &mdash; 代码体积优化专项分析（-Oz / -Os）</div>
+</div>
+
+<div class="container">
+
+  <!-- 目录 -->
+  <div class="toc">
+    <h2>目录</h2>
+    <ol>
+      <li><a href="#opaque-ptr">不透明指针强制（LLVM 17）</a></li>
+      <li><a href="#size-block-placement">Size-aware Machine Block Placement（LLVM 20）</a></li>
+      <li><a href="#cold-hot-split">冷热路径分离优化（LLVM 19）</a></li>
+      <li><a href="#machine-outliner">Machine Outliner 改进（LLVM 16&ndash;21）</a></li>
+      <li><a href="#lld-cdsort">LLD 代码段排序 &mdash; cdsort 算法（LLVM 18）</a></li>
+      <li><a href="#inline-cost-oz">内联成本模型改进对 -Oz 的影响</a></li>
+      <li><a href="#verify">-Oz 验证建议</a></li>
+    </ol>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 1. 不透明指针强制 -->
+  <section id="opaque-ptr">
+    <h2><span class="version-tag">LLVM 17</span> 不透明指针强制（Opaque Pointers）</h2>
+
+    <p>
+      LLVM 17 起，不透明指针（Opaque Pointers）成为 IR 中唯一支持的指针表示形式。
+      在旧版 IR 中，指针带有元素类型（Typed Pointers），编译器需要频繁插入
+      <code class="inline">bitcast</code> 和复杂的 <code class="inline">getelementptr</code> 链来匹配类型。
+      这些冗余指令不仅增加 IR 的体积，也使得后端代码生成更难做全局优化。
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; IR 层面：Typed Pointers &#8594; Opaque Pointers</div>
+      <pre><span class="cmt">; === LLVM 16 及之前：Typed Pointer 需要 bitcast + 多层 GEP ===</span>
+%<span class="num">1</span> = bitcast <span class="ty">i8*</span> %base <span class="kw">to</span> <span class="ty">%struct.Foo*</span>
+%<span class="num">2</span> = getelementptr <span class="ty">%struct.Foo</span>, <span class="ty">%struct.Foo*</span> %<span class="num">1</span>, <span class="num">i32</span> <span class="num">0</span>, <span class="num">i32</span> <span class="num">3</span>
+%val = load <span class="ty">i32</span>, <span class="ty">%struct.Foo*</span> %<span class="num">2</span>
+
+<span class="cmt">; === LLVM 17+：Opaque Pointer 直接按偏移计算 ===</span>
+%gep = getelementptr <span class="ty">i8</span>, <span class="kw">ptr</span> %base, <span class="num">i64</span> <span class="num">12</span>
+%val = load <span class="ty">i32</span>, <span class="kw">ptr</span> %gep
+
+<span class="cmt">; 效果：指令数从 3 条缩减为 2 条；消除了类型转换的 IR 开销</span></pre>
+    </div>
+
+    <p>
+      <strong>对代码体积的影响链路：</strong>IR 指令减少 &#8594; 后端 SelectionDAG 节点减少
+      &#8594; 指令选择阶段需要处理的模式更少 &#8594; 最终生成的机器码更紧凑。
+      在 <code class="inline">-Oz</code> 场景下，消除冗余指针操作带来的体积缩减通常在 1-4%，
+      对于指针密集型代码（如容器遍历、虚函数调用分发）效果尤为明显。
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; C++ 虚函数调用的 IR 简化</div>
+      <pre><span class="cmt">// C++ 源码</span>
+<span class="kw">struct</span> Base { <span class="kw">virtual</span> <span class="kw">int</span> <span class="fn">f</span>(); };
+<span class="kw">int</span> <span class="fn">call</span>(Base* b) { <span class="kw">return</span> b-><span class="fn">f</span>(); }
+
+<span class="cmt">; LLVM 16（Typed）：vtable 访问需要 bitcast + 多层 GEP</span>
+%<span class="num">0</span> = bitcast <span class="ty">%struct.Base*</span> %b <span class="kw">to</span> <span class="ty">i8**</span>
+      ;  ^── 额外的类型转换指令
+%vtable = load <span class="ty">i8**</span>, <span class="ty">i8***</span> %<span class="num">0</span>
+
+<span class="cmt">; LLVM 17+（Opaque）：无需 bitcast，直接访问</span>
+%vtable = load <span class="kw">ptr</span>, <span class="kw">ptr</span> %b
+      ;  ^── 简单直接，无冗余指令</pre>
+    </div>
+
+    <div class="note">
+      <strong>注意：</strong>
+      不透明指针是 LLVM 17 的<strong>强制默认行为</strong>，不再支持 Typed Pointer 模式。
+      如果项目中有自定义的 LLVM IR Pass 或后端，需要确认其已适配不透明指针模型；
+      对于纯 C/C++ 编译用户，此变更完全透明。
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- 2. Size-aware Machine Block Placement -->
+  <section id="size-block-placement">
+    <h2><span class="version-tag">LLVM 20</span> Size-aware Machine Block Placement</h2>
+
+    <p>
+      LLVM 20 的 Machine Block Placement Pass 引入了大小感知（size-aware）的代码布局策略。
+      在 <code class="inline">-Oz</code> 和 <code class="inline">-Os</code> 模式下，
+      基本块的排列不仅考虑执行频率（fall-through 优化），也以<strong>减少跳转指令编码的字节数</strong>
+      作为优化目标。相关实现见 PR #109711。
+    </p>
+
+    <p>
+      <strong>核心原理：</strong>x86-64 跳转指令的编码长度取决于目标距离：
+    </p>
+    <ul>
+      <li><strong>短跳转（JMP rel8）：</strong>2 字节 &mdash; 目标在 &plusmn;127 字节范围内</li>
+      <li><strong>近跳转（JMP rel32）：</strong>5 字节 &mdash; 目标在 &plusmn;2GB 范围内</li>
+    </ul>
+    <p>
+      传统布局（追求执行频率最优）可能导致大量 5 字节跳转指令。
+      大小感知布局在热块执行效率可接受的范围内，优先将跳转目标放置在短跳转可达范围，
+      从而每个跳转节省 3 字节。
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 大小感知布局 vs 性能优先布局</div>
+      <pre><span class="cmt">; === 传统布局（性能优先，追求 fall-through）===</span>
+<span class="kw">.Lhot_entry:</span>
+    mov    eax, [rdi]
+    test   eax, eax
+    je     .Lcold_error     <span class="cmt">; 5 字节：E9 xx xx xx xx</span>
+    <span class="cmt">; ... 热路径代码（约 40 字节）...</span>
+    ret
+<span class="kw">.Lcold_error:</span>               <span class="cmt">; &larr; 距离 > 127，无法用短跳转</span>
+    call   log_error
+
+<span class="cmt">; === 大小感知布局（-Oz，缩短跳转距离）===</span>
+<span class="kw">.Lhot_entry:</span>
+    mov    eax, [rdi]
+    test   eax, eax
+    je     .Lcold_error     <span class="cmt">; 2 字节：EB xx（冷块移到附近）</span>
+    <span class="cmt">; ... 热路径代码 ...</span>
+    jmp    .Lreturn
+<span class="kw">.Lcold_error:</span>               <span class="cmt">; &larr; 紧邻热块，短跳转可达</span>
+    call   log_error
+<span class="kw">.Lreturn:</span>
+    ret</pre>
+    </div>
+
+    <p>
+      对于包含大量条件分支的函数（如解析器、状态机、协议处理），
+      累积的跳转指令字节节省可达函数体积的 2-5%。在固件/嵌入式等
+      严格限制 .text 段大小的场景，此优化直接贡献于整体目标。
+    </p>
+
+    <div class="note">
+      <strong>适用场景：</strong>
+      此优化仅在 <code class="inline">-Oz</code>（极致体积）和
+      <code class="inline">-Os</code>（优化体积）模式下启用。
+      在 <code class="inline">-O2</code>/<code class="inline">-O3</code>
+      模式下，编译器仍使用传统的性能优先布局。
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- 3. 冷热路径分离优化 -->
+  <section id="cold-hot-split">
+    <h2><span class="version-tag">LLVM 19</span> 冷热路径分离优化</h2>
+
+    <p>
+      LLVM 19 增强了冷热路径的识别和分离能力。编译器能够更准确地判断代码路径的冷热属性，
+      并据此调整<strong>内联策略</strong>和<strong>代码布局</strong>：
+    </p>
+    <ul>
+      <li><strong>热路径：</strong>频繁执行的核心逻辑 &rarr; 可能被内联以减少函数调用开销</li>
+      <li><strong>冷路径：</strong>错误处理、初始化、边界情况 &rarr; 保持在函数外部，避免内联膨胀</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 冷热路径分离与内联决策</div>
+      <pre><span class="kw">void</span> <span class="fn">process</span>(<span class="kw">int</span> x) {
+    <span class="fn">do_work</span>(x);                    <span class="cmt">// 热路径 &rarr; 可能内联，减少调用开销</span>
+
+    <span class="kw">if</span> (__builtin_expect(err, <span class="num">0</span>)) {  <span class="cmt">// __builtin_expect 标记冷路径</span>
+        <span class="fn">handle_error</span>(err);        <span class="cmt">// 冷路径 &rarr; 不内联，保持体积</span>
+    }
+}
+
+<span class="cmt">// LLVM 19 的处理方式：</span>
+<span class="cmt">// 1. do_work() 被识别为热路径 &rarr; 内联进 process()</span>
+<span class="cmt">// 2. handle_error() 被识别为冷路径 &rarr; 保持独立函数</span>
+<span class="cmt">// 3. 冷路径块被放置在函数末尾或独立代码段</span>
+
+<span class="cmt">// 效果：热路径紧凑高效；冷路径不膨胀核心代码体积</span></pre>
+    </div>
+
+    <p>
+      冷热分离优化的关键改进点：
+    </p>
+    <ul>
+      <li><strong>profile 信息整合：</strong>如果提供了 PGO 数据（<code class="inline">-fprofile-use</code>），
+        编译器会基于实际运行时频率精确判断冷热路径。没有 profile 时，则基于
+        <code class="inline">__builtin_expect</code>、异常处理路径、<code class="inline">noreturn</code>
+        等启发式规则。</li>
+      <li><strong>冷函数分段：</strong>在支持 <code class="inline">-function-sections</code> 的场景下，
+        冷路径函数可被放入独立的 <code class="inline">.text.unlikely</code> 段，
+        配合链接器进一步优化内存布局。</li>
+      <li><strong>减少 I-cache 污染：</strong>冷路径代码不占据热路径的指令缓存行，
+        间接提升整体性能（虽然本页面仅关注体积，但这个副作用值得了解）。</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 带 profile 的冷热分离（PGO + -Oz）</div>
+      <pre><span class="cmt">// 编译命令</span>
+<span class="cmt">// Step 1: 插桩运行</span>
+clang -fprofile-generate -Oz -o app app.c && ./app
+<span class="cmt">// Step 2: 使用 profile 构建</span>
+clang -fprofile-use -Oz -o app app.c
+
+<span class="cmt">// 源码：解析器主循环</span>
+<span class="kw">int</span> <span class="fn">parse_packet</span>(<span class="kw">const</span> <span class="kw">uint8_t</span>* buf, <span class="kw">size_t</span> len) {
+    <span class="kw">switch</span> (buf[<span class="num">0</span>]) {
+    <span class="kw">case</span> <span class="num">0x01</span>: <span class="fn">parse_data</span>(buf, len);     <span class="kw">break</span>;  <span class="cmt">// 90% 的流量 &rarr; 热路径</span>
+    <span class="kw">case</span> <span class="num">0xFF</span>: <span class="fn">parse_reset</span>(buf, len);    <span class="kw">break</span>;  <span class="cmt">// &lt;1% 流量 &rarr; 冷路径</span>
+    <span class="kw">default</span>: <span class="fn">handle_unknown</span>(buf, len);  <span class="kw">break</span>;  <span class="cmt">// &lt;0.1% &rarr; 冷路径</span>
+    }
+    <span class="kw">return</span> <span class="num">0</span>;
+}
+<span class="cmt">// LLVM 19 + PGO：仅内联 parse_data，parse_reset/handle_unknown 保持外部函数</span></pre>
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- 4. Machine Outliner 改进 -->
+  <section id="machine-outliner">
+    <h2><span class="version-tag range">LLVM 16&ndash;21</span> Machine Outliner 改进</h2>
+
+    <p>
+      Machine Outliner 是 LLVM 后端的一个重要优化 Pass，它能够识别多个函数中重复出现的
+      机器码序列，并将其提取为一个独立的共享函数（outline function），
+      原始位置替换为对该函数的调用。这是一个代码去重技术，直接减小 .text 段的大小。
+    </p>
+
+    <p>
+      在 LLVM 15 到 21 的版本迭代中，Machine Outliner 经历了多次重大重构和改进，
+      其识别能力和优化覆盖范围显著提升：
+    </p>
+
+    <div class="highlight-box">
+      <h4>Machine Outliner 跨版本演进</h4>
+      <ul>
+        <li><strong>LLVM 16：</strong>支持 AArch64 上的全局 outlining（跨编译单元），
+          不再局限于单个函数的局部序列。</li>
+        <li><strong>LLVM 17：</strong>改善 outlining 候选序列的收益评估，避免
+          "outline 后反而增大体积"的情况（考虑调用/返回指令的开销）。</li>
+        <li><strong>LLVM 18：</strong>重构候选搜索算法（PR #90074），
+          使用更高效的后缀树匹配，扩大搜索范围且不显著增加编译时间。</li>
+        <li><strong>LLVM 19-20：</strong>扩展至更多目标架构（RISC-V、MIPS），
+          优化调用约定的 outline 函数参数传递。</li>
+        <li><strong>LLVM 21：</strong>增强全局 outlining 与 LTO 的协同（PR #105398），
+          在 LTO 模式下跨整个链接单元搜索重复序列。</li>
+      </ul>
+    </div>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 全局 Outlining 效果</div>
+      <pre><span class="cmt">; === Outlining 前：三个函数中有重复的 3 条指令序列 ===</span>
+
+<span class="fn">func_a:</span>
+    mov    rdi, [rsi+<span class="num">8</span>]
+    add    rdi, <span class="num">16</span>
+    call   alloc
+    <span class="cmt">; ... 函数 A 的其他代码 ...</span>
+
+<span class="fn">func_b:</span>
+    mov    rdi, [rsi+<span class="num">8</span>]    <span class="cmt">; ← 重复序列（共 3 条指令 × 3 次 = 9 条）</span>
+    add    rdi, <span class="num">16</span>        <span class="cmt">;    每次重复占约 10+ 字节</span>
+    call   alloc
+    <span class="cmt">; ... 函数 B 的其他代码 ...</span>
+
+<span class="fn">func_c:</span>
+    mov    rdi, [rsi+<span class="num">8</span>]
+    add    rdi, <span class="num">16</span>
+    call   alloc
+    <span class="cmt">; ... 函数 C 的其他代码 ...</span>
+
+<span class="cmt">; === Outlining 后：提取为共享函数 ===</span>
+
+<span class="kw">OUTLINED_FUNCTION_0:</span>         <span class="cmt">; 提取出的共享函数（~10 字节）</span>
+    mov    rdi, [rsi+<span class="num">8</span>]
+    add    rdi, <span class="num">16</span>
+    call   alloc
+    ret
+
+<span class="fn">func_a:</span>
+    call   <span class="kw">OUTLINED_FUNCTION_0</span>   <span class="cmt">; 5 字节 call</span>
+    <span class="cmt">; ...</span>
+
+<span class="fn">func_b:</span>
+    call   <span class="kw">OUTLINED_FUNCTION_0</span>   <span class="cmt">; 5 字节 call</span>
+    <span class="cmt">; ...</span>
+
+<span class="fn">func_c:</span>
+    call   <span class="kw">OUTLINED_FUNCTION_0</span>   <span class="cmt">; 5 字节 call</span>
+    <span class="cmt">; ...</span>
+
+<span class="cmt">; 体积变化：outline 前 3 × 10 = 30 字节 → outline 后 10 + 3 × 5 = 25 字节（节省 ~17%）</span></pre>
+    </div>
+
+    <p>
+      在大型固件/嵌入式项目中，Machine Outliner 通常能节省 3-8% 的 .text 段大小。
+      结合 <code class="inline">-Oz</code>（outliner 在 -Oz 下更激进地搜索候选序列），
+      实际节省可能更高。启用方式：
+    </p>
+    <pre><span class="cmt"># Machine Outliner 在 -Oz 下默认启用，也可显式控制：</span>
+-mllvm -enable-machine-outliner        <span class="cmt"># 启用</span>
+-mllvm -enable-machine-outliner=always <span class="cmt"># 始终启用（即使是 -O0）</span></pre>
+
+    <div class="note">
+      <strong>全局 Outlining 与 LTO：</strong>
+      在 LTO（Link-Time Optimization）模式下，PR #105398 的增强使 Machine Outliner
+      能够在整个链接单元的<strong>所有编译单元</strong>之间搜索重复序列，
+      远超单文件范围。对于大型项目（数百个 .o 文件），额外的去重效果显著。
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- 5. LLD 代码段排序 - cdsort -->
+  <section id="lld-cdsort">
+    <h2><span class="version-tag">LLVM 18</span> LLD 代码段排序 &mdash; cdsort 算法</h2>
+
+    <p>
+      LLD（LLVM Linker）在 LLVM 18 中引入了 <code class="inline">cdsort</code>
+      （Call-Density Sort）算法，用于改善二进制文件中函数的物理排列顺序。
+    </p>
+
+    <p>
+      <strong>核心思想：</strong>基于调用图亲和性（call graph affinity），
+      将频繁相互调用的函数在内存中相邻排列。这直接改善指令缓存（I-cache）的空间局部性，
+      减少 I-cache miss。同时，相邻的函数可以共享同一个 cache line，
+      提高代码段的空间利用率。
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; cdsort 排序对比</div>
+      <pre><span class="cmt"># 使用 cdsort 算法进行代码段排序</span>
+clang -fuse-ld=lld -Wl,--call-graph-profile-sort=cdsort ...
+
+<span class="cmt">; === 未排序（编译顺序）===  内存地址   === cdsort 排序后 ===</span>
+<span class="cmt">;                             0x1000     </span>
+<span class="fn">func_main:</span>    <span class="cmt">; 热函数      0x1000    func_main:</span>
+<span class="fn">func_cold:</span>    <span class="cmt">; 冷函数      0x1200    func_helper:</span>  <span class="cmt">; 与 main 频繁互调</span>
+<span class="fn">func_helper:</span>  <span class="cmt">; 热辅助函数  0x1400    func_sub:</span>      <span class="cmt">; 被 helper 频繁调用</span>
+<span class="fn">func_init:</span>    <span class="cmt">; 初始化函数  0x1600    func_cold:</span>     <span class="cmt">; 冷函数移到末尾</span>
+<span class="fn">func_sub:</span>     <span class="cmt">; 热辅助函数  0x1800    func_init:</span>     <span class="cmt">; 仅启动时执行</span>
+
+<span class="cmt">; 效果：热函数聚集在连续的地址范围 &rarr; 更少的 cache line 占用 &rarr; 更好的 I-cache 命中率</span></pre>
+    </div>
+
+    <p>
+      虽然 cdsort 主要优化的是 I-cache 效率（属于性能领域），
+      但其对代码段组织的优化间接影响代码体积的感知质量：
+    </p>
+    <ul>
+      <li><strong>减少因 cache line 碎片导致的对齐填充：</strong>将紧密相关的函数连续排列，
+        减少 <code class="inline">.p2align</code> 带来的内部碎片。</li>
+      <li><strong>辅助 Cold Function Splitting：</strong>冷函数集中放置，
+        可以配合链接器脚本将其放入不同的内存区域（如低速 flash），
+        为热代码腾出更多宝贵的片上 SRAM。</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; LLD 链接选项</div>
+      <pre><span class="cmt"># 启用 cdsort（LLVM 18+，配合 PGO 使用效果最佳）</span>
+-fprofile-use                              <span class="cmt"># 使用 PGO profile</span>
+-fuse-ld=lld                               <span class="cmt"># 使用 LLD 链接器</span>
+-Wl,--call-graph-profile-sort=cdsort       <span class="cmt"># 开启 cdsort 排序</span>
+-Wl,-z,keep-text-section-prefix            <span class="cmt"># 保留 section 前缀，辅助排序</span>
+
+<span class="cmt"># 可选的排序策略</span>
+<span class="cmt"># --call-graph-profile-sort=none     : 禁用排序</span>
+<span class="cmt"># --call-graph-profile-sort=hfsort   : 传统算法（LLVM 17 及之前默认）</span>
+<span class="cmt"># --call-graph-profile-sort=cdsort   : 新算法（LLVM 18+ 推荐）</span></pre>
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- 6. 内联成本模型改进 -->
+  <section id="inline-cost-oz">
+    <h2><span class="version-tag range">LLVM 16&ndash;21</span> 内联成本模型改进对 -Oz 的影响</h2>
+
+    <p>
+      内联优化对代码体积有直接影响：内联消除了一次 <code class="inline">call</code>/<code class="inline">ret</code>
+      的开销，但如果被内联的函数体积较大，反而会增加总体代码量。
+      编译器需要在"消除调用开销"和"避免代码膨胀"之间做权衡，
+      这个权衡由<strong>内联成本模型</strong>（Inliner Cost Model）决定。
+    </p>
+    <p>
+      在 <code class="inline">-Oz</code> 模式下，内联成本模型的阈值更加保守，
+      只内联那些"内联后反而减小总体体积"的情况（如极小的 getter/setter、
+      单行转发函数等）。以下跨越多个 LLVM 版本的关键修正，直接影响 -Oz 的代码体积：
+    </p>
+
+    <h3><span class="version-tag">LLVM 18</span> switch 默认分支成本修正</h3>
+    <p>
+      此前版本中，当函数包含 <code class="inline">switch</code> 语句时，
+      <code class="inline">default</code> 分支的成本可能被高估，
+      导致编译器错误地将整个函数视为"昂贵的"且不应内联。
+      LLVM 18 修正了这一偏差，使内联决策更加准确。
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; switch default 成本修正（LLVM 18）</div>
+      <pre><span class="cmt">// 此前：default 分支被高估为"全量成本"，阻止内联</span>
+<span class="kw">static</span> <span class="kw">int</span> <span class="fn">dispatch</span>(<span class="kw">int</span> op) {
+    <span class="kw">switch</span> (op) {
+    <span class="kw">case</span> <span class="num">0</span>: <span class="kw">return</span> <span class="fn">do_a</span>();
+    <span class="kw">case</span> <span class="num">1</span>: <span class="kw">return</span> <span class="fn">do_b</span>();
+    <span class="kw">default</span>: <span class="kw">return</span> -<span class="num">1</span>;   <span class="cmt">// 实际只有 1 条 return，成本很低</span>
+    }
+}
+<span class="cmt">// LLVM 18：正确评估 default 成本，允许 -Oz 下内联此轻量级函数</span></pre>
+    </div>
+
+    <h3><span class="version-tag">LLVM 20</span> __memcpy_chk 等不再增加内联罚分</h3>
+    <p>
+      <code class="inline">__memcpy_chk</code>、<code class="inline">__memset_chk</code> 等
+      带边界检查的内存操作函数（Fortify Source），在此前版本中会显著增加调用函数的
+      内联成本评估，导致不必要的内联抑制。LLVM 20 识别出这些函数在编译时常数折叠后
+      与普通 <code class="inline">memcpy</code> 等价，不再计入内联成本罚分。
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; __memcpy_chk 内联罚分消除（LLVM 20）</div>
+      <pre><span class="cmt">// 此前：__memcpy_chk 被当作"昂贵"操作，阻止函数内联</span>
+<span class="kw">static</span> <span class="kw">void</span> <span class="fn">copy_header</span>(<span class="kw">char</span>* dst, <span class="kw">const</span> <span class="kw">char</span>* src) {
+    __builtin___memcpy_chk(dst, src, <span class="num">16</span>, __builtin_object_size(dst, <span class="num">0</span>));
+    <span class="cmt">// LLVM 20：识别为常量大小的 memcpy，不增加内联成本罚分</span>
+    <span class="cmt">// &rarr; copy_header() 在 -Oz 下可以内联到调用者</span>
+}
+
+<span class="kw">void</span> <span class="fn">caller</span>(<span class="kw">char</span>* buf) {
+    <span class="fn">copy_header</span>(buf, <span class="str">"HEAD"</span>);  <span class="cmt">// LLVM 20：成功内联，消除 call/ret 开销</span>
+}</pre>
+    </div>
+
+    <h3><span class="version-tag">LLVM 21</span> 内联汇编计入成本</h3>
+    <p>
+      此前的内联成本模型不计算内联汇编（Inline Assembly）指令的体积。
+      当函数包含大量内联汇编时，编译器可能错误地内联它，导致代码体积膨胀。
+      LLVM 21 将内联汇编的体积纳入成本计算，避免不恰当的内联膨胀。
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 内联汇编成本计数（LLVM 21）</div>
+      <pre><span class="cmt">// 此前：内联汇编被忽略，函数可能被不当内联</span>
+<span class="kw">static</span> <span class="kw">void</span> <span class="fn">cpuid</span>(<span class="kw">int</span> code, <span class="kw">int</span>* a, <span class="kw">int</span>* b, <span class="kw">int</span>* c, <span class="kw">int</span>* d) {
+    <span class="kw">asm</span> <span class="kw">volatile</span>(<span class="str">"cpuid"</span>
+         : <span class="str">"=a"</span>(*a), <span class="str">"=b"</span>(*b), <span class="str">"=c"</span>(*c), <span class="str">"=d"</span>(*d)
+         : <span class="str">"a"</span>(code));
+    <span class="cmt">// LLVM 21：此函数包含大段内联汇编 → 成本高，-Oz 下不会内联</span>
+    <span class="cmt">// → 避免在每个调用点重复展开 cpuid 指令</span>
+}</pre>
+    </div>
+
+    <div class="note">
+      <strong>总结 &mdash; 内联成本模型与 -Oz：</strong>
+      这三个修正共同作用，使 -Oz 模式的内联决策更加合理：
+      <strong>轻量级函数得以正确内联</strong>（消除调用开销而体积基本持平），
+      <strong>大体积函数避免内联</strong>（防止代码膨胀）。
+      对于包含 Fortify Source 和内联汇编的代码库，LLVM 20-21 的体积表现预计优于之前版本。
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- 7. -Oz 验证建议 -->
+  <section id="verify">
+    <h2>-Oz 验证建议</h2>
+
+    <p>
+      编译器升级后，建议按照以下流程系统性地验证代码体积变化：
+    </p>
+
+    <h3>1. 二进制体积对比</h3>
+    <table class="verify-table">
+      <tr><th>工具</th><th>用途</th><th>典型命令</th></tr>
+      <tr>
+        <td><code class="inline">size(1)</code></td>
+        <td>查看 ELF 段大小（.text / .data / .bss）</td>
+        <td><code class="inline">size -A ./output_binary</code></td>
+      </tr>
+      <tr>
+        <td><code class="inline">bloaty</code></td>
+        <td>按编译单元/符号/库分析体积构成</td>
+        <td><code class="inline">bloaty -d compileunits ./binary</code></td>
+      </tr>
+      <tr>
+        <td><code class="inline">nm --print-size</code></td>
+        <td>列出每个符号的大小，检查关键函数体积变化</td>
+        <td><code class="inline">nm --print-size --size-sort -t d ./binary</code></td>
+      </tr>
+      <tr>
+        <td><code class="inline">readelf -S</code></td>
+        <td>查看段表详细信息</td>
+        <td><code class="inline">readelf -S ./binary | grep -E '\.text|\.rodata'</code></td>
+      </tr>
+      <tr>
+        <td><code class="inline">bloaty --domain=vm</code></td>
+        <td>按虚拟内存区域分析</td>
+        <td><code class="inline">bloaty -d symbols,vmsize ./binary</code></td>
+      </tr>
+    </table>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 体积对比自动化脚本</div>
+      <pre><span class="cmt">#!/bin/bash</span>
+<span class="cmt"># size_compare.sh — 对比升级前后 .text 段体积变化</span>
+<span class="kw">set</span> -e
+
+<span class="fn">OLD_CC</span>=<span class="str">"/path/to/clang-16/bin/clang"</span>
+<span class="fn">NEW_CC</span>=<span class="str">"/path/to/clang-21/bin/clang"</span>
+<span class="fn">CFLAGS</span>=<span class="str">"-Oz -fuse-ld=lld -fno-lto"</span>
+<span class="fn">SRC_DIR</span>=<span class="str">"src/"</span>
+
+<span class="cmt"># 使用旧编译器构建</span>
+<span class="fn">CC</span>=<span class="str">"$OLD_CC"</span> make clean && <span class="fn">CC</span>=<span class="str">"$OLD_CC"</span> <span class="fn">CFLAGS</span>=<span class="str">"$CFLAGS"</span> make
+cp build/myapp build/myapp_old
+
+<span class="cmt"># 使用新编译器构建</span>
+<span class="fn">CC</span>=<span class="str">"$NEW_CC"</span> make clean && <span class="fn">CC</span>=<span class="str">"$NEW_CC"</span> <span class="fn">CFLAGS</span>=<span class="str">"$CFLAGS"</span> make
+cp build/myapp build/myapp_new
+
+<span class="cmt"># 对比体积</span>
+<span class="kw">echo</span> <span class="str">"====== ELF 段大小对比 ======"</span>
+<span class="kw">echo</span> <span class="str">"--- 旧版本 (LLVM 16) ---"</span>
+size -A build/myapp_old
+<span class="kw">echo</span> <span class="str">"--- 新版本 (LLVM 21) ---"</span>
+size -A build/myapp_new
+
+<span class="cmt"># 按编译单元分析体积差异（需要 bloaty）</span>
+<span class="kw">echo</span> <span class="str">"====== 编译单元体积差异（前 20）======"</span>
+bloaty -d compileunits build/myapp_new -- build/myapp_old 2>/dev/null | head -<span class="num">20</span></pre>
+    </div>
+
+    <h3>2. 关键函数体积检查</h3>
+    <p>
+      使用 <code class="inline">nm --print-size</code> 对比关键函数的体积变化。
+      重点关注：
+    </p>
+    <ul>
+      <li><strong>体积异常增长：</strong>某个函数的体积在新版本中显著增大（如增长超过 20%），
+        可能指向不当的内联决策或代码生成回退。</li>
+      <li><strong>体积显著缩减：</strong>可能是 Machine Outliner 或更好的指令选择带来的优化效果。</li>
+      <li><strong>新增函数：</strong>Outliner 生成的 <code class="inline">OUTLINED_FUNCTION_*</code>
+        函数是正常现象。</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 关键函数体积变化分析</div>
+      <pre><span class="cmt"># 列出所有函数，按体积降序排列，保存到文件对比</span>
+nm --print-size --size-sort -t d build/myapp_old | sort -k2 -nr > funcs_old.txt
+nm --print-size --size-sort -t d build/myapp_new | sort -k2 -nr > funcs_new.txt
+
+<span class="cmt"># 找出体积增长最大的 10 个函数</span>
+diff &lt;(awk <span class="str">'{print $NF, $2}'</span> funcs_old.txt) \
+     &lt;(awk <span class="str">'{print $NF, $2}'</span> funcs_new.txt) \
+  | grep <span class="str">'^>'</span> | sort -k2 -nr | head -<span class="num">10</span></pre>
+    </div>
+
+    <h3>3. 内联决策验证</h3>
+    <p>
+      检查是否有意外的函数内联（导致体积膨胀）或未内联（导致体积增加-调用开销），
+      使用 LLVM 的内联诊断报告功能：
+    </p>
+
+    <div class="example-box">
+      <div class="label">示例 &mdash; 内联诊断报告</div>
+      <pre><span class="cmt"># 编译时生成内联诊断信息</span>
+-Rpass=inline -Rpass-missed=inline -Rpass-analysis=inline
+
+<span class="cmt"># 保存优化记录（YAML 格式，供 tooling 分析）</span>
+-fsave-optimization-record -foptimization-record-file=inline.yaml
+
+<span class="cmt"># 示例输出片段</span>
+<span class="cmt">// 成功内联（-Oz 下只有体积收益为正时才内联）</span>
+remark: foo.cpp:42:15: <span class="str">'get_value'</span> inlined into <span class="str">'process'</span>
+  with (cost=5, threshold=15, bonus=-Oz)
+
+<span class="cmt">// 放弃内联（体积收益为负或被成本模型拒绝）</span>
+remark: bar.cpp:87:5: <span class="str">'heavy_init'</span> not inlined into <span class="str">'main'</span>
+  because it should never be inlined (cost=180, threshold=15)</pre>
+    </div>
+
+    <h3>4. 验证要点总结</h3>
+    <div class="highlight-box">
+      <h4>验证流程建议</h4>
+      <ol>
+        <li><strong>快速体积对比：</strong>使用 <code class="inline">size -A</code> 对比 .text 段总大小。如果增长超过 3-5%，需要深入分析。</li>
+        <li><strong>按编译单元分析：</strong>使用 <code class="inline">bloaty -d compileunits</code> 定位体积增长的具体来源（哪个 .o 文件变大）。</li>
+        <li><strong>异常函数定位：</strong>使用 <code class="inline">nm --print-size --size-sort</code> 找出体积异常变化的函数，结合反汇编（<code class="inline">objdump -d</code>）分析原因。</li>
+        <li><strong>内联审查：</strong>使用 <code class="inline">-Rpass-missed=inline</code> 确认关键的轻量级函数未被错误地抑制内联；同时确认大函数未被错误地内联。</li>
+        <li><strong>链接后效果验证：</strong>LTO 和 Machine Outliner 的效果只有在最终链接后才能完全体现，不要仅对比中间 .o 文件的大小。</li>
+      </ol>
+    </div>
+
+    <div class="warning">
+      <strong>注意：</strong>
+      代码体积分析要特别关注 <strong>LTO 模式</strong>下的表现。
+      许多代码体积优化（Machine Outliner 全局模式、cdsort 排序、冷热分离的跨模块效果）
+      仅在 LTO 链接时才会完全发挥。建议在验证时同时测试
+      <code class="inline">-fno-lto</code> 和 <code class="inline">-flto=thin</code>
+      两种模式的体积差异。
+    </div>
+  </section>
+
+</div>
+
+<div class="footer">
+  <p>毕昇编译器升级 &mdash; 小型化差异详解 &middot; 代码体积优化专项</p>
+</div>
+
+</body>
+</html>

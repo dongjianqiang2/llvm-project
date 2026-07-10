@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>性能差异详解 — 毕昇编译器升级</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+    background: #f0f2f5;
+    color: #1a1a2e;
+    line-height: 1.7;
+  }
+  header {
+    background: linear-gradient(135deg, #0a2647 0%, #0d3b6e 40%, #0a2647 100%);
+    color: #fff;
+    padding: 40px 24px 32px;
+    text-align: center;
+    border-bottom: 4px solid #d4a843;
+  }
+  header h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #d4a843;
+    margin-bottom: 8px;
+  }
+  header .subtitle {
+    font-size: 1rem;
+    color: rgba(255,255,255,0.75);
+    font-weight: 400;
+  }
+  .top-nav {
+    padding: 12px 24px;
+    background: #081d36;
+  }
+  .top-nav a {
+    color: #d4a843;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .top-nav a:hover { color: #e8c265; text-decoration: underline; }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+  }
+  section {
+    background: #fff;
+    border-radius: 10px;
+    padding: 28px 32px;
+    margin-bottom: 28px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    border-left: 5px solid #0a2647;
+  }
+  section h2 {
+    color: #0a2647;
+    font-size: 1.35rem;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #d4a843;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  section h2 .badge {
+    display: inline-block;
+    background: #d4a843;
+    color: #0a2647;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 12px;
+    white-space: nowrap;
+  }
+  section h3 {
+    color: #0a2647;
+    font-size: 1.1rem;
+    margin: 18px 0 8px;
+  }
+  section p {
+    margin-bottom: 10px;
+    color: #333;
+  }
+  section ul, section ol {
+    margin: 8px 0 14px 20px;
+  }
+  section li {
+    margin-bottom: 6px;
+    color: #333;
+  }
+  .example-box {
+    background: #f5f0e6;
+    border: 1px solid #d4a843;
+    border-radius: 8px;
+    margin: 14px 0;
+    overflow: hidden;
+  }
+  .example-box .label {
+    background: #d4a843;
+    color: #0a2647;
+    font-size: 0.8rem;
+    font-weight: 700;
+    padding: 5px 14px;
+    display: inline-block;
+    border-radius: 0 0 8px 0;
+  }
+  .example-box pre {
+    padding: 14px 18px;
+    margin: 0;
+    overflow-x: auto;
+    font-family: "Fira Code", "Cascadia Code", "JetBrains Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    color: #1a1a2e;
+  }
+  .example-box code {
+    font-family: inherit;
+  }
+  .warning-box {
+    background: #fff8e6;
+    border: 1px solid #d4a843;
+    border-left: 5px solid #d4a843;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .warning-box strong {
+    color: #0a2647;
+  }
+  .risk-box {
+    background: #fff0f0;
+    border: 1px solid #c0392b;
+    border-left: 5px solid #c0392b;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .risk-box strong {
+    color: #a71d2a;
+  }
+  .tip-box {
+    background: #eaf4f0;
+    border: 1px solid #2e7d55;
+    border-left: 5px solid #2e7d55;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .tip-box strong {
+    color: #1e5f3e;
+  }
+  code.inline {
+    background: #edf2f7;
+    color: #0a2647;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "Fira Code", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    font-size: 0.88em;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 0.95rem;
+  }
+  table th {
+    background: #0a2647;
+    color: #d4a843;
+    padding: 10px 14px;
+    text-align: left;
+    font-weight: 700;
+  }
+  table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid #e0ddd5;
+  }
+  table tr:nth-child(even) td {
+    background: #fafaf7;
+  }
+  footer {
+    text-align: center;
+    padding: 24px;
+    color: #888;
+    font-size: 0.85rem;
+    background: #081d36;
+  }
+  footer p { color: rgba(255,255,255,0.5); }
+  @media (max-width: 640px) {
+    header h1 { font-size: 1.5rem; }
+    section { padding: 18px 16px; }
+    main { padding: 20px 12px 40px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>性能差异详解</h1>
+  <div class="subtitle">毕昇编译器升级 &mdash; 运行性能变化分析与验证指南</div>
+</header>
+
+<div class="top-nav">
+  <a href="index.html">&larr; 返回主页</a>
+</div>
+
+<main>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 16</span> ML-inliner 稳定化</h2>
+
+  <p>
+    自 LLVM 16 起，基于机器学习的函数内联决策在 <code class="inline">Release</code> 构建模式下正式可用。ML-inliner 使用通过 TensorFlow 训练的神经网络模型替代传统的手写启发式内联代价估算，在预测函数是否需要内联时综合考虑调用上下文、函数体大小与调用频率，从而在保持或提升性能的同时减少代码膨胀。
+  </p>
+
+  <h3>对吞吐敏感函数的影响</h3>
+  <p>
+    ML 模型判断某调用点被"热"的程度超过阈值后，会针对该点采取更激进的内联策略。对于包含大量小函数调用的吞吐敏感代码（如协议栈处理循环），ML-inliner 可能产生比传统启发式更优的内联拓扑：
+  </p>
+  <ul>
+    <li>传统 <code class="inline">-O2</code> 内联主要依据调用者/被调用者 IR 大小乘积来决定</li>
+    <li>ML 模型引入"调用频率"维度，对热点路径上的中等规模函数也可能内联</li>
+    <li>增加的上下文可能使得后续优化（SROA、LICM、GVN）进一步消除开销</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">命令行示例</span>
+<pre><code># 开启 ML-inliner（LLVM 16+ Release 构建）
+clang -O2 -mllvm -enable-ml-inliner=release \
+      -Rpass=inline -Rpass-analysis=inline \
+      example.c -o example
+
+# 对比传统内联器
+clang -O2 -mllvm -enable-ml-inliner=default example.c -o example_default</code></pre>
+  </div>
+
+  <div class="example-box">
+    <span class="label">内联决策差异示例 (C)</span>
+<pre><code>// 典型场景：热循环中调用中等规模函数
+__attribute__((noinline))
+static int compute_checksum(const uint8_t *buf, size_t len) {
+    int sum = 0;
+    for (size_t i = 0; i &lt; len; i++) {
+        sum += buf[i] * (i & 1 ? 3 : 7);
+        sum ^= (sum &gt;&gt; 16);
+    }
+    return sum;
+}
+
+void process_packets(struct pkt *pkts, int n) {
+    for (int i = 0; i &lt; n; i++) {        // 热循环
+        int csum = compute_checksum(pkts[i].data, pkts[i].len);
+        pkts[i].valid = (csum == pkts[i].expected);
+    }
+}
+
+// ML-inliner 可能在 process_packets 中内联 compute_checksum，
+// 传统启发式则因函数体较大而不内联，留下 call 开销在循环内。
+// 内联后 LICM 可将循环无关计算提至循环外。</code></pre>
+  </div>
+
+  <div class="tip-box">
+    <strong>提示：</strong> 使用 <code class="inline">-Rpass=inline -Rpass-analysis=inline</code> 可查看具体哪些调用点被 ML 模型改变了决策。输出中以 <code class="inline">Remark:</code> 开头的行即内联成功点。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 17</span> nofpclass 浮点属性</h2>
+
+  <p>
+    LLVM 17 引入了 <code class="inline">nofpclass</code> 属性（no floating-point class），允许前端/优化器声明某个浮点值不属于特定的浮点类别（NaN、无穷大、负零、正规数等）。此属性使得后端能生成更积极的浮点比较指令序列，省略不必要的类别检查。
+  </p>
+
+  <h3>优化原理</h3>
+  <p>
+    默认情况下，编译器生成浮点比较时必须考虑 NaN 传播、无穷大等特殊值。若能证明操作数不会含有 NaN / Inf，则可以将昂贵的 <code class="inline">UCOMISD</code> + 多分支序列简化为单条 <code class="inline">COMISD</code> + 条件跳转，消除 NaN 检查开销。
+  </p>
+
+  <div class="example-box">
+    <span class="label">IR 层面示例</span>
+<pre><code>; 无 nofpclass —— 需要处理 NaN 情况
+define i1 @compare_f64(double %x, double %y) {
+  %cmp = fcmp ogt double %x, %y
+  ret i1 %cmp
+}
+; 生成: ucomisd + seta + 额外条件 (处理 NaN)
+
+; 含 nofpclass——声明参数非 NaN
+define i1 @compare_f64_nonan(double nofpclass(nan) %x,
+                             double nofpclass(nan) %y) {
+  %cmp = fcmp ogt double %x, %y
+  ret i1 %cmp
+}
+; 生成: comisd + seta (省略 NaN 分支，更短更快)</code></pre>
+  </div>
+
+  <div class="example-box">
+    <span class="label">C 前端示例 —— 来自 fast-math 标志的推导</span>
+<pre><code>// -ffinite-math-only 使编译器自动推导 nofpclass(nan inf)
+double compute_ratio(double a, double b) {
+    // 编译器假设 a、b 非 NaN 非 Inf
+    if (a &gt; b) return a / b;
+    else        return b / a;
+}
+// 产生的 fcmp 可省略 NaN 分支检查
+
+// 检查生成的属性:
+// clang -S -emit-llvm -ffinite-math-only example.c</code></pre>
+  </div>
+
+  <div class="warning-box">
+    <strong>注意事项：</strong> <code class="inline">-ffinite-math-only</code> 等价于声明所有浮点值不含 NaN 和 Inf。如果程序实际依赖 NaN 传播语义，则可能产生错误结果。仅在确认代码不使用 NaN/Inf 时启用。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 18</span> cdsort 算法替换 hfsort</h2>
+
+  <p>
+    LLVM 18 将 PGO（Profile-Guided Optimization）场景下的代码段布局排序算法从 <strong>hfsort</strong> 升级为 <strong>cdsort</strong>（Cache-Directed Sort）。cdsort 在利用调用图热度信息进行函数重排时，显式建模指令缓存（i-cache）的缓存行冲突，得到更优的代码布局。
+  </p>
+
+  <h3>技术要点</h3>
+  <ul>
+    <li><strong>hfsort</strong>：基于聚类的方法，将相互频繁调用的函数放在一起，但对 i-cache 容量与冲突集的建模较粗糙</li>
+    <li><strong>cdsort</strong>：显式考虑 L1 i-cache 的组相联结构与容量，优先减少"热函数组"之间的缓存行冲突</li>
+    <li>在大型二进制（如数据库引擎、浏览器渲染引擎）中，i-cache 命中率提升可达 1%-3%</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">构建系统配置示例</span>
+<pre><code># CMake 启用 cdsort（LLVM 18+）
+cmake -DCMAKE_C_FLAGS="-fprofile-use=/path/to/profdata" \
+      -DCMAKE_EXE_LINKER_FLAGS="-Wl,--call-graph-profile-sort=cdsort" \
+      ..
+
+# 或通过 lld 的链接器选项
+clang -fprofile-use=code.profdata \
+      -Wl,-mllvm,-cg-profile-sort=cdsort \
+      *.o -o app</code></pre>
+  </div>
+
+  <div class="example-box">
+    <span class="label">排序效果示意</span>
+<pre><code>; hfsort 布局 (聚类优先)
+; [func_A] [func_B] [func_C]  ← 热函数聚在一起
+; [func_D] [func_E]          ← 冷函数聚在一起
+; 问题: func_A 和 func_C 可能映射到同一 i-cache 组，互相驱逐
+
+; cdsort 布局 (缓存冲突感知)
+; [func_A] [pad] [func_C] [func_B]  ← 错开冲突的缓存组
+; [func_D]       [func_E]
+; 结果: 关键路径上的函数不再互相驱逐，i-cache 命中率提升</code></pre>
+  </div>
+
+  <div class="tip-box">
+    <strong>验证方法：</strong> 使用 <code class="inline">perf stat -e cache-misses,instructions</code> 对比升级前后的 i-cache 缺失率；或使用 <code class="inline">perf report --sort=sym</code> 观察函数级 i-cache 命中差异。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 19</span> nusw / nuw GEP 标志</h2>
+
+  <p>
+    LLVM 19 为 <code class="inline">getelementptr</code>（GEP）指令新增了 <code class="inline">nusw</code>（no unsigned signed wrap）和 <code class="inline">nuw</code>（no unsigned wrap）标志。这些标志告知优化器索引计算不会发生整型溢出，从而解锁更精确的别名分析、更积极的循环优化与边界检查消除。
+  </p>
+
+  <h3>别名分析增强</h3>
+  <p>
+    传统 GEP 在指针偏移量大到溢出地址空间时，可能回绕并"别名"到其他内存区域，迫使别名分析保守处理。有了 <code class="inline">nusw</code>/<code class="inline">nuw</code> 标志，优化器可确认地址计算不溢出，从而精确区分内存访问。
+  </p>
+
+  <div class="example-box">
+    <span class="label">IR 层面变化</span>
+<pre><code>; LLVM 18: GEP 无溢出标志
+%ptr = getelementptr inbounds i32, ptr %base, i64 %idx
+; 即使 inbounds 保证偏移不越界，仍有溢出导致回绕的风险
+
+; LLVM 19: GEP 带 nusw/nuw 标志
+%ptr = getelementptr inbounds nusw nuw i32, ptr %base, i64 %idx
+; nuw:  索引 idx 在无符号语义下不溢出
+; nusw: 索引在有符号语义下不溢出
+; 双重保证后，别名分析可安全假定此访问不与偏移差距大的访问重叠</code></pre>
+  </div>
+
+  <div class="example-box">
+    <span class="label">C 层面 —— 对循环的影响</span>
+<pre><code>void scale_buffer(float *restrict buf, float *restrict out, int n) {
+    // restrict + 已知 n >= 0 使得编译器推导 nuw
+    for (int i = 0; i &lt; n; i++) {
+        out[i] = buf[i] * 2.5f;   // buf[i] 和 out[i] 必定不别名
+    }
+    // 由于 GEP 带 nuw/nusw，即使没有 restrict，
+    // 编译器也有更多机会向量化循环、消除边界复制
+}
+
+// 编译器生成: gep inbounds nuw nusw float, ptr %buf, i64 %i
+// 别名分析: 证明 buf[i] 与 out[i] 不重叠</code></pre>
+  </div>
+
+  <div class="warning-box">
+    <strong>风险提示：</strong> 若代码中存在未定义行为（如通过越界的 <code class="inline">int</code> 循环计数器构造地址），GEP 溢出标志可能使优化器做出导致运行时错误的假设。确保循环边界类型正确匹配地址计算。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 20</span> TBAA 默认启用</h2>
+
+  <p>
+    LLVM 20 将 Type-Based Alias Analysis（基于类型的别名分析）设为默认开启。TBAA 利用 C/C++ 的类型系统规则（strict aliasing rule）来判断不同指针访问是否可能重叠：不同基础类型的指针访问视为不别名，从而允许更积极的指令重排与冗余加载消除。
+  </p>
+
+  <h3>正确模式</h3>
+  <div class="example-box">
+    <span class="label">正确写法（遵循 strict aliasing）</span>
+<pre><code>// 正确: 使用 union 或 char* 进行合法类型双关
+union { float f; int i; } u;
+u.f = 1.0f;
+int bits = u.i;              // OK: union 成员访问合法
+
+// 正确: 通过 memcpy 进行类型转换
+float val = 3.14f;
+int raw_bits;
+memcpy(&amp;raw_bits, &amp;val, sizeof(float));  // OK</code></pre>
+  </div>
+
+  <h3>错误模式（可能被 TBAA 错误优化）</h3>
+  <div class="example-box">
+    <span class="label">危险写法 —— 违反 strict aliasing</span>
+<pre><code>// 危险: 使用指针类型强制转换双关
+float val = 3.14f;
+int *p = (int *)&amp;val;   // 违反 strict aliasing
+int x = *p;             // 未定义行为!
+
+// 更隐式的例子: 函数参数类型不同但实际重叠
+void update(int *a, float *b) {
+    *a = 42;
+    *b = 1.0f;          // 编译器可能重排这两行，因认为 a 和 b 不别名
+}
+// 如果调用方传入 update(&amp;shared_int, (float*)&amp;shared_int)，
+// 则 TBAA 假设失效，导致逻辑错误。</code></pre>
+  </div>
+
+  <h3>缓解方法</h3>
+  <ul>
+    <li>使用 <code class="inline">-fno-strict-aliasing</code> 全局关闭 TBAA（但会损失性能）</li>
+    <li>使用 <code class="inline">__attribute__((__may_alias__))</code> 标记特定类型</li>
+    <li>使用 <code class="inline">union</code> 或 <code class="inline">memcpy</code> 进行合法的类型双关</li>
+  </ul>
+
+  <div class="risk-box">
+    <strong>升级风险：</strong> 这是 LLVM 20 升级中最需要注意的变更。如果代码库中遗留了违反 strict aliasing 的模式，以前编译器可能"侥幸"生成正确代码，但 TBAA 默认开启后会产生静默错误。升级前务必使用 <code class="inline">-fsanitize=undefined -fsanitize=alignment</code> 扫描代码。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 21</span> Store-to-Load Forwarding</h2>
+
+  <p>
+    LLVM 21 的优化器在内联后将启用 store-to-load forwarding 分析：当一个函数通过指针参数写入内存后立即由调用方读取相同地址，优化器可将被调用者的 store 与调用者的 load 连接起来，用寄存器传递值，完全省略内存往返。
+  </p>
+
+  <h3>优化机制</h3>
+  <p>内联后，被调用函数中的指针形参变成调用者的局部变量或已知地址。编译器扫描:</p>
+  <ol>
+    <li>被调用函数内对形参的写操作（store）</li>
+    <li>调用者后续对同一地址的读操作（load）</li>
+  </ol>
+  <p>若两者在内联后相邻且地址可证明相同，则将 load 替换为直接使用 store 的值。</p>
+
+  <div class="example-box">
+    <span class="label">代码示例</span>
+<pre><code>// 内联前
+static inline void init_counters(int *c, int n) {
+    c[0] = n;
+    c[1] = n * 2;
+    // ... 复杂初始化
+}
+
+void process(void) {
+    int counters[8];
+    init_counters(counters, 42);
+    int total = counters[0] + counters[1];  // load
+    // ...
+}
+
+// 内联后 (LLVM 21 store-to-load forwarding):
+// total = 42 + 84;  即 total = 126;
+// 不需要实际从 counters 数组加载，直接常量折叠</code></pre>
+  </div>
+
+  <div class="example-box">
+    <span class="label">对调用参数的影响</span>
+<pre><code>// 通过指针传出结果的函数
+static inline int divmod(int a, int b, int *rem) {
+    *rem = a % b;
+    return a / b;
+}
+
+int compute(int x) {
+    int remainder;
+    int quotient = divmod(x, 7, &amp;remainder);
+    // LLVM 21: remainder 直接从寄存器取值，不访问栈
+    return quotient + remainder;
+}</code></pre>
+  </div>
+
+  <div class="tip-box">
+    <strong>性能收益：</strong> 此优化在大量使用"通过指针参数返回多个值"的代码中收益显著。常见场景包括解析器、编解码器中的状态传递，以及 C++ 的 RVO/NRVO 路径旁的按引用输出参数。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2>可能回退的风险</h2>
+
+  <h3>SVE 自动向量化降级（LLVM 19）</h3>
+  <p>
+    LLVM 19 的 LoopVectorize 针对 AArch64 SVE（Scalable Vector Extension）的 Cost Model 进行了重写，部分导致之前可自动向量化的循环在新版本中放弃向量化。原因是新的 Cost Model 对可扩展向量长度的代价估算更为保守，避免生成低效的 SVE 代码。
+  </p>
+  <ul>
+    <li>影响范围：AArch64 架构上使用 <code class="inline">-march=armv8-a+sve</code> 或 <code class="inline">-march=armv9-a</code> 的目标</li>
+    <li>临时方案：使用 <code class="inline">-mllvm -force-vector-width=N</code> 或退回 LLVM 18 Cost Model</li>
+    <li>长期方案：使用手工 SVE intrinsic 或 <code class="inline">#pragma clang loop vectorize(enable)</code></li>
+  </ul>
+
+  <div class="risk-box">
+    <strong>排查方法：</strong> 使用 <code class="inline">-Rpass-analysis=loop-vectorize</code> 对比升级前后编译器输出，关注 "loop not vectorized" 的诊断信息。
+  </div>
+
+  <h3>向量化 Cost Model 变化</h3>
+  <p>
+    每个 LLVM 大版本发布时，LoopVectorize 的代价模型都可能进行调整——新的指令代价表、更精确的寄存器压力估算、或对扩展指令集（AVX-512、SVE2）的支持变化，都可能导致某些循环在升级后不再被向量化，或选择了不同的向量化宽度（VF）。
+  </p>
+  <div class="example-box">
+    <span class="label">对比向量化决策</span>
+<pre><code># 升级前（LLVM 17）导出优化备注
+clang-17 -O2 -Rpass=loop-vectorize \
+         -Rpass-analysis=loop-vectorize \
+         -fsave-optimization-record \
+         loop.c -o loop_old
+
+# 升级后（LLVM 21）对比
+clang-21 -O2 -Rpass=loop-vectorize \
+         -Rpass-analysis=loop-vectorize \
+         -fsave-optimization-record \
+         loop.c -o loop_new
+
+# 使用脚本对比 YAML 优化记录中的差异</code></pre>
+  </div>
+
+  <h3>TBAA 导致错误优化</h3>
+  <p>
+    见前述章节。这是最危险的潜在回退——它不会产生编译错误，而是在运行时产生难以发现的逻辑错误。建议升级前必须在 <code class="inline">-fsanitize=undefined</code> 下通过完整测试套件。
+  </p>
+
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2>验证建议</h2>
+
+  <h3>基准测试套件</h3>
+  <table>
+    <thead>
+      <tr><th>基准</th><th>衡量的性能维度</th><th>推荐工具链</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CoreMark</td>
+        <td>通用 CPU 整数性能（循环、状态机、链表）</td>
+        <td>直接编译运行，关注多次迭代平均值</td>
+      </tr>
+      <tr>
+        <td>Dhrystone</td>
+        <td>整数运算与字符串处理</td>
+        <td>注意现代编译器可能过度优化</td>
+      </tr>
+      <tr>
+        <td>SPEC CPU 2017</td>
+        <td>综合性能（整数 + 浮点）</td>
+        <td>使用 ref 数据集，对比 rate 分数</td>
+      </tr>
+      <tr>
+        <td>协议栈吞吐</td>
+        <td>网络/存储协议处理</td>
+        <td>iperf3、fio、自研协议压测工具</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>使用 <code class="inline">-Rpass=inline</code> 检查内联决策</h3>
+  <p>
+    对比升级前后的内联决策变化是排查性能回归的关键步骤：
+  </p>
+  <div class="example-box">
+    <span class="label">内联决策对比脚本</span>
+<pre><code>#!/bin/bash
+# 导出优化记录并对比
+CLANG_OLD=clang-17
+CLANG_NEW=clang-21
+
+$CLANG_OLD -O2 -Rpass=inline -Rpass-analysis=inline \
+           -fsave-optimization-record=old.yml \
+           hotspot.c -c -o /dev/null
+
+$CLANG_NEW -O2 -Rpass=inline -Rpass-analysis=inline \
+           -fsave-optimization-record=new.yml \
+           hotspot.c -c -o /dev/null
+
+# 使用 diff 或 llvm-remarkutil 对比
+diff &lt;(grep -E '(inlined|not inlined)' old.yml) \
+     &lt;(grep -E '(inlined|not inlined)' new.yml)</code></pre>
+  </div>
+
+  <h3>Benchmark 对比方法论</h3>
+  <ol>
+    <li><strong>环境隔离：</strong> 固定 CPU 频率（<code class="inline">cpupower frequency-set -g performance</code>）、关闭 ASLR（<code class="inline">echo 0 > /proc/sys/kernel/randomize_va_space</code>）</li>
+    <li><strong>预热与统计：</strong> 每个基准至少执行 5 次预热 + 10 次测量，取几何平均</li>
+    <li><strong>编译器隔离：</strong> 使用同一工具链路径下的 clang/lld/libcxx 全套对比</li>
+    <li><strong>对比维度：</strong> 不仅看执行时间，还应关注 IPC（<code class="inline">perf stat -e instructions,cycles</code>）、分支预测率、i-cache/d-cache 缺失率</li>
+    <li><strong>回归阈值：</strong> 将 2% 以上性能变化标记为需要深入分析的回归或提升</li>
+  </ol>
+
+  <div class="warning-box">
+    <strong>特别注意：</strong> 部分优化（如 cdsort、ML-inliner）在 PGO 训练数据质量不足时可能反而导致倒退。建议在升级路径上始终使用基于真实工作负载采集的 profile 数据，而非合成负载。
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <p>毕昇编译器升级 &mdash; 性能差异详解 &mdash; LLVM 16 ~ 21</p>
+</footer>
+
+</body>
+</html>
