@@ -271,12 +271,19 @@
     <ol>
       <li><a href="#lifetime-dse">Lifetime DSE（死对象存储消除）</a></li>
       <li><a href="#break-continue">break / continue 在循环条件/增量语句中严格化</a></li>
+      <li><a href="#line-digit-directives">行号/数字指令解析为未求值字符串</a></li>
       <li><a href="#has-feature-modules">__has_feature(modules) 语义变更</a></li>
-      <li><a href="#coroutine-abi">Coroutine ABI 稳定化</a></li>
+      <li><a href="#export-module-partition">export 在模块实现分区中拒绝</a></li>
+      <li><a href="#nested-local-classes">嵌套局部类跨块作用域拒绝</a></li>
       <li><a href="#bitint">_BitInt 模板参数推导变更</a></li>
+      <li><a href="#coroutine-abi">Coroutine ABI 稳定化</a></li>
+      <li><a href="#abi-changes">ABI 变更汇总</a></li>
+      <li><a href="#frontend-changes">Clang Frontend 变更</a></li>
       <li><a href="#float-literal">浮点字面量表示法变更</a></li>
       <li><a href="#null-ptr-arith">空指针算术优化</a></li>
       <li><a href="#inline-asm-cost">内联汇编指令影响内联成本</a></li>
+      <li><a href="#llvm-ir-changes">LLVM IR 变更</a></li>
+      <li><a href="#sanitizers">Sanitizers 变更</a></li>
     </ol>
   </div>
 
@@ -412,12 +419,60 @@ while (condition) {
   </div>
 
   <!-- ============================================================ -->
-  <!-- 3. __has_feature(modules) -->
+  <!-- 3. Line/Digit Directives as Unevaluated Strings -->
+  <!-- ============================================================ -->
+  <div class="section" id="line-digit-directives">
+    <div class="section-header">
+      <span class="tag">语言严格化</span>
+      <h2>3. 行号/数字指令解析为未求值字符串</h2>
+    </div>
+    <div class="section-body">
+
+      <p>
+        Clang 21 现在将行号指令（<code>#line</code>）、数字指令（<code># <em>digit</em></code>）中的
+        文件名、模块名和原始文件名解析为<strong>未求值字符串（unevaluated string）</strong>。
+        这意味着这些字符串中的转义序列（如 <code>\x12</code>、<code>\012</code>）不再被解析，
+        使用转义序列的代码现在会报错（ill-formed）。
+      </p>
+
+      <div class="example-box">
+        <div class="example-label">Before（旧版 Clang 允许，Clang 21 中 ill-formed）</div>
+<pre><span class="comment">// 文件名含转义序列 — 现在报错</span>
+# 1 "original\x12source.c"     <span class="comment">// error: 未求值字符串中不允许转义序列</span>
+
+<span class="comment">// 模块导入名含转义序列 — 现在报错</span>
+#pragma clang module import "\x41"  <span class="comment">// error</span>
+
+<span class="comment">// 行号控制文件名含转义序列 — 现在报错</span>
+# 50 "a\012.c"                 <span class="comment">// error</span></pre>
+      </div>
+
+      <div class="example-box">
+        <div class="example-label">After（Clang 21 — 正确写法）</div>
+<pre><span class="comment">// 文件名直接使用字面字符，不使用转义序列</span>
+# 1 "original_source.c"        <span class="comment">// 正确：直接写文件名</span>
+
+#pragma clang module import "MyModule"  <span class="comment">// 正确</span>
+
+# 50 "a.c"                     <span class="comment">// 正确</span></pre>
+      </div>
+
+      <div class="note">
+        <strong>影响范围：</strong>此变更主要影响包含特殊字符文件名的预处理器指令。
+        绝大多数代码不依赖此类转义序列，实际影响很小。如果确实需要在行号指令中表达特殊字符，
+        应直接使用字面字符而非转义序列。
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 4. __has_feature(modules) -->
   <!-- ============================================================ -->
   <div class="section" id="has-feature-modules">
     <div class="section-header">
       <span class="tag">语义变更</span>
-      <h2>3. __has_feature(modules) 语义变更</h2>
+      <h2>4. __has_feature(modules) 语义变更</h2>
     </div>
     <div class="section-body">
 
@@ -470,12 +525,182 @@ while (condition) {
   </div>
 
   <!-- ============================================================ -->
-  <!-- 4. Coroutine ABI 稳定化 -->
+  <!-- 5. export in Module Implementation Partitions -->
+  <!-- ============================================================ -->
+  <div class="section" id="export-module-partition">
+    <div class="section-header">
+      <span class="tag">C++ Modules</span>
+      <h2>5. export 声明在模块实现分区中被拒绝</h2>
+    </div>
+    <div class="section-body">
+
+      <p>
+        C++20 Modules 规范规定，<code>export</code> 声明只能在模块接口单元（interface unit）中使用，
+        不能在模块实现分区（implementation partition）中使用。旧版 Clang 在某些情况下未能正确拒绝
+        模块实现分区中的 <code>export</code> 声明。
+      </p>
+
+      <p>
+        <strong>Clang 21 修正了此行为：</strong>在模块实现分区中使用 <code>export</code> 声明现在会触发编译错误。
+        （#GH107602）
+      </p>
+
+      <div class="compare-row">
+        <div class="compare-col before">
+          <div class="col-label">Before（Clang 20 — 静默接受）</div>
+<pre><span class="comment">// math.cppm (模块实现分区)</span>
+module math:detail;
+
+<span class="comment">// 旧版 Clang 可能未报错</span>
+export int helper() { return 0; }
+<span class="comment">// 不合规：实现分区不应 export</span></pre>
+        </div>
+        <div class="compare-col after">
+          <div class="col-label">After（Clang 21 — 正确报错）</div>
+<pre><span class="comment">// math.cppm (模块实现分区)</span>
+module math:detail;
+
+int helper() { return 0; }
+<span class="comment">// 正确：实现分区中无 export，
+// 如需导出请使用接口分区</span>
+
+<span class="comment">// 如需导出，应使用接口分区：</span>
+<span class="comment">// export module math:detail;</span></pre>
+        </div>
+      </div>
+
+      <div class="note">
+        <strong>迁移建议：</strong>如果模块实现分区中使用了 <code>export</code> 声明导致编译失败，
+        根据需求选择以下任一方案：(1) 移除 <code>export</code> 关键字（如是内部实现），
+        或 (2) 将分区改为接口分区 <code>export module name:partition;</code>。
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 6. Nested Local Classes in Different Block Scope -->
+  <!-- ============================================================ -->
+  <div class="section" id="nested-local-classes">
+    <div class="section-header">
+      <span class="tag">C++ 语言</span>
+      <h2>6. 嵌套局部类跨块作用域被拒绝</h2>
+    </div>
+    <div class="section-body">
+
+      <p>
+        C++ 标准要求嵌套局部类必须定义在与父类<strong>相同的块作用域（block scope）</strong>内。
+        旧版 Clang 在某些情况下未能正确拒绝在不同于父类的块作用域中定义的嵌套局部类。
+      </p>
+
+      <p>
+        <strong>Clang 21 修正了此行为</strong>：嵌套局部类如果定义在与父类不同的块作用域中，现在会触发编译错误。
+        （#GH193472）
+      </p>
+
+      <div class="compare-row">
+        <div class="compare-col before">
+          <div class="col-label">Before（Clang 20 — 可能静默接受）</div>
+<pre>void f() {
+  struct Outer {
+    void g() {
+      <span class="comment">// Inner 定义在 g() 内，</span>
+      <span class="comment">// 而 Outer 定义在 f() 内</span>
+      <span class="comment">// — 不同块作用域：不合规</span>
+      struct Inner { int x; };
+      <span class="comment">// 旧版 Clang 可能不报错</span>
+    }
+  };
+}</pre>
+        </div>
+        <div class="compare-col after">
+          <div class="col-label">After（Clang 21 — 正确报错）</div>
+<pre><span class="comment">// 嵌套局部类必须在同一块作用域</span>
+void f() {
+  struct Outer {
+    struct Inner { int x; };  <span class="comment">// 正确</span>
+    void g() { Inner obj; }
+  };
+}
+
+<span class="comment">// 或定义为非局部类型</span>
+<span class="comment">// 如有名称冲突请调整结构</span></pre>
+        </div>
+      </div>
+
+      <div class="note">
+        <strong>迁移建议：</strong>将嵌套局部类移动到与父类相同的块作用域中定义，
+        或将嵌套类作为父类的普通成员类型定义。此模式在实践中较为罕见，影响范围有限。
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 7. _BitInt Template Deduction Change -->
+  <!-- ============================================================ -->
+  <div class="section" id="bitint">
+    <div class="section-header">
+      <span class="tag">模板推导</span>
+      <h2>7. _BitInt 模板参数推导变更</h2>
+    </div>
+    <div class="section-body">
+
+      <p>
+        <code>_BitInt(N)</code> 是 C23 标准引入的位精确整数类型，允许指定任意位宽的整数（如 <code>_BitInt(3)</code> 表示 3 位有符号整数，
+        <code>_BitInt(32)</code> 表示精确 32 位整数）。Clang 也支持在 C++ 中使用此扩展。
+      </p>
+
+      <p>
+        在 Clang 20 及之前版本中，当 <code>_BitInt(N)</code> 作为非类型模板参数（NTTP）时，<code>N</code> 被推导为 <code>int</code> 类型。
+        Clang 21 修正了此行为：<strong><code>N</code> 现在被正确推导为 <code>size_t</code></strong>（无符号类型），
+        与位宽参数的自然语义一致。（#GH195033）
+      </p>
+
+      <div class="compare-row">
+        <div class="compare-col before">
+          <div class="col-label">Before（Clang 20）</div>
+<pre>template&lt;auto N&gt;
+void f() {
+  <span class="comment">// N 被推导为 int</span>
+  <span class="comment">// 对于 _BitInt(32)，N 是 int{32}</span>
+}
+
+f&lt;_BitInt(32)&gt;();  <span class="comment">// N = int{32}</span>
+
+<span class="comment">// 问题：对于大位宽 _BitInt(1024)，
+// 1024 可能超出 int 范围</span></pre>
+        </div>
+        <div class="compare-col after">
+          <div class="col-label">After（Clang 21）</div>
+<pre>template&lt;auto N&gt;
+void f() {
+  <span class="comment">// N 被推导为 size_t</span>
+  <span class="comment">// 对于 _BitInt(32)，N 是 size_t{32}</span>
+}
+
+f&lt;_BitInt(32)&gt;();  <span class="comment">// N = size_t{32}</span>
+
+<span class="comment">// 更合理：位宽天然是非负值，
+// size_t 是更合适的类型</span></pre>
+        </div>
+      </div>
+
+      <div class="note">
+        <strong>影响分析：</strong>如果你的代码对 <code>decltype(N)</code> 做了显式类型判断（如 <code>std::is_same_v&lt;decltype(N), int&gt;</code>），
+        需要更新为 <code>size_t</code>。大多数场景下，由于 <code>auto</code> 推导会自动适配，不需要修改代码。
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 8. Coroutine ABI -->
   <!-- ============================================================ -->
   <div class="section" id="coroutine-abi">
     <div class="section-header">
       <span class="tag">ABI 变更</span>
-      <h2>4. Coroutine ABI 稳定化（C Calling Convention）</h2>
+      <h2>8. Coroutine ABI 稳定化（C Calling Convention）</h2>
     </div>
     <div class="section-body">
 
@@ -539,70 +764,154 @@ define void @my_coro.destroy(
   </div>
 
   <!-- ============================================================ -->
-  <!-- 5. _BitInt -->
+  <!-- 9. ABI Changes Summary -->
   <!-- ============================================================ -->
-  <div class="section" id="bitint">
+  <div class="section" id="abi-changes">
     <div class="section-header">
-      <span class="tag">模板推导</span>
-      <h2>5. _BitInt 模板参数推导变更</h2>
+      <span class="tag">ABI 变更</span>
+      <h2>9. ABI 变更汇总</h2>
     </div>
     <div class="section-body">
 
       <p>
-        <code>_BitInt(N)</code> 是 C23 标准引入的位精确整数类型，允许指定任意位宽的整数（如 <code>_BitInt(3)</code> 表示 3 位有符号整数，
-        <code>_BitInt(32)</code> 表示精确 32 位整数）。Clang 也支持在 C++ 中使用此扩展。
+        除上述 Coroutine ABI 变更外，LLVM 21 还包含以下多项 ABI 级别的修改。
+        以下变更在特定目标平台/场景下可能影响二进制兼容性。
       </p>
 
+      <!-- ABI Item 1 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">9a. _BitInt 位域宽度超过 255 位 MSVC ABI 修复</h3>
       <p>
-        在 Clang 20 及之前版本中，当 <code>_BitInt(N)</code> 作为非类型模板参数（NTTP）时，<code>N</code> 被推导为 <code>int</code> 类型。
-        Clang 21 修正了此行为：<strong><code>N</code> 现在被正确推导为 <code>size_t</code></strong>（无符号类型），
-        与位宽参数的自然语义一致。
+        <strong>问题：</strong>当 <code>_BitInt</code> 位域宽度超过 255 位时，在 MSVC 目标上的结构布局不正确。
+        内部位域跟踪字段使用了 <code>unsigned char</code> 类型，无法容纳超过 255 位的位宽。
+      </p>
+      <p>
+        <strong>修复：</strong>内部跟踪字段类型从 <code>unsigned char</code> 改为 <code>uint64_t</code>，解决了溢出问题。
+        此修复可能导致此类结构体与早期 Clang 版本编译的代码之间存在 ABI 不兼容。
       </p>
 
-      <div class="compare-row">
-        <div class="compare-col before">
-          <div class="col-label">Before（Clang 20）</div>
-<pre>template&lt;auto N&gt;
-void f() {
-  <span class="comment">// N 被推导为 int</span>
-  <span class="comment">// 对于 _BitInt(32)，N 是 int{32}</span>
-}
+      <!-- ABI Item 2 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">9b. __regcall 结构体传参修复（非 Windows x86-64）</h3>
+      <p>
+        <strong>问题：</strong><code>__regcall</code> 调用约定在非 Windows x86-64 目标上存在多项问题，
+        包括处理空结构体参数时的崩溃，以及包含数组、浮点类型或 <code>_Complex float</code> 类型的结构体传参不正确。
+      </p>
+      <p>
+        <strong>修复：</strong>修正了这些类型的传参行为。这可能与早期 Clang 版本编译的使用 <code>__regcall</code>
+        的代码不兼容。（#GH62999, #GH98635）
+      </p>
 
-f&lt;_BitInt(32)&gt;();  <span class="comment">// N = int{32}</span>
+      <!-- ABI Item 3 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">9c. Itanium Lambda 名称修饰修复（NSDMI）</h3>
+      <p>
+        <strong>问题：</strong>在实例化的非静态数据成员初始化器（NSDMI）中，lambda 表达式的 Itanium 名称修饰
+        （mangling）未能保留字段名闭包前缀（field-name closure-prefix）。
+      </p>
+      <p>
+        <strong>修复：</strong>修正了名称修饰算法，为受影响 lambda 表达式生成正确的符号名。
+        此修复改变了受影响 lambda 的符号名称。（#GH190555）
+      </p>
 
-<span class="comment">// 问题：对于大位宽 _BitInt(1024)，
-// 1024 可能超出 int 范围</span></pre>
-        </div>
-        <div class="compare-col after">
-          <div class="col-label">After（Clang 21）</div>
-<pre>template&lt;auto N&gt;
-void f() {
-  <span class="comment">// N 被推导为 size_t</span>
-  <span class="comment">// 对于 _BitInt(32)，N 是 size_t{32}</span>
-}
+      <!-- ABI Item 4 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">9d. AArch64 SVE MSVC Compatible Manglings</h3>
+      <p>
+        <strong>问题：</strong>当面向 Microsoft ABI 时，AArch64 SVE 内置类型使用了非 MSVC 兼容的名称修饰。
+      </p>
+      <p>
+        <strong>修复：</strong>Clang 21 现在对支持的 AArch64 SVE 内置类型使用 MSVC 兼容的名称修饰。
+        此变更会影响受影响声明的符号名。（#GH196170）
+      </p>
 
-f&lt;_BitInt(32)&gt;();  <span class="comment">// N = size_t{32}</span>
+      <!-- ABI Item 5 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">9e. Coroutine Resume/Destroy: C Calling Convention</h3>
+      <p>
+        详见第 8 节 <a href="#coroutine-abi">Coroutine ABI 稳定化</a>。
+        在 i686、MIPS O32、PowerPC64 ELFv1 和 Lanai 平台上为 ABI 断裂性变更。
+      </p>
 
-<span class="comment">// 更合理：位宽天然是非负值，
-// size_t 是更合适的类型</span></pre>
-        </div>
-      </div>
+      <!-- ABI Item 6 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">9f. x86-64 大向量结构体返回修复</h3>
+      <p>
+        <strong>问题：</strong>在 x86-64 目标上，当函数返回包含单个大型向量（256 位或 512 位）的结构体时，
+        结构体返回方式不正确。该缺陷自 Clang 21 早期引入（#GH120670）。
+      </p>
+      <p>
+        <strong>修复：</strong>修正了此类结构体的返回 ABI。（#GH203760）
+      </p>
 
-      <div class="note">
-        <strong>影响分析：</strong>如果你的代码对 <code>decltype(N)</code> 做了显式类型判断（如 <code>std::is_same_v&lt;decltype(N), int&gt;</code>），
-        需要更新为 <code>size_t</code>。大多数场景下，由于 <code>auto</code> 推导会自动适配，不需要修改代码。
+      <div class="advice">
+        <strong>ABI 变更整体建议：</strong>升级编译器版本后进行全面的 ABI 兼容性测试。
+        涉及跨模块边界的代码（动态库、插件系统等）需要使用同一编译器版本重新编译，避免 ABI 不匹配导致的运行时错误。
       </div>
 
     </div>
   </div>
 
   <!-- ============================================================ -->
-  <!-- 6. 浮点字面量表示法 -->
+  <!-- 10. Clang Frontend Changes -->
+  <!-- ============================================================ -->
+  <div class="section" id="frontend-changes">
+    <div class="section-header">
+      <span class="tag">Frontend</span>
+      <h2>10. Clang Frontend 变更</h2>
+    </div>
+    <div class="section-body">
+
+      <p>
+        Clang 21 在前端驱动层面引入了多项重要变更，主要涉及 offload 驱动、协程支持声明以及 HIPSPV 工具链的弃用。
+      </p>
+
+      <!-- Frontend Item 1 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">10a. 新 Offload 驱动默认启用</h3>
+      <p>
+        新的 offload 驱动（<code>--offload-new-driver</code>）现在为<strong>所有 offloading 编译的默认选项</strong>。
+        这改变了可重定位设备代码（relocatable device code）的 ABI。
+      </p>
+      <p>
+        <strong>影响：</strong>现有的 offload 库需要使用新驱动重新编译，或临时使用
+        <code>--no-offload-new-driver</code> 回退到旧行为。<code>--no-offload-new-driver</code>
+        选项将在下一个版本中移除。
+      </p>
+
+      <div class="note">
+        <strong>迁移路径：</strong>尽快使用新 offload 驱动重新编译所有 offload 库和依赖项。
+        如需立即恢复旧行为，使用 <code>--no-offload-new-driver</code> 作为临时缓解措施。
+      </div>
+
+      <!-- Frontend Item 2 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">10b. __cpp_impl_coroutine 在 32 位 x86 MS ABI 下不再定义</h3>
+      <p>
+        Clang 不再在 32 位 x86 Microsoft ABI 目标下定义 <code>__cpp_impl_coroutine</code> 特性测试宏，
+        因为该目标上的协程支持不完整。在该目标上使用协程时会发出警告
+        <code>-Wcoroutines-unsupported-target</code>，可用 <code>-Wno-coroutines-unsupported-target</code>
+        禁用。（参见 #GH59382）
+      </p>
+
+      <!-- Frontend Item 3 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">10c. HIPSPV 工具链弃用</h3>
+      <p>
+        HIPSPV 工具链中，<code>--offload-targets=spirv{32,64}</code> 选项已被弃用，
+        将在新 offload 驱动成为默认时移除。
+      </p>
+      <p>
+        <strong>替代方案：</strong>使用新 offload 驱动时，
+        应改用 <code>--offload-targets=spirv{32,64}-unknown-chipstar</code>。
+      </p>
+
+      <div class="advice">
+        <strong>建议：</strong>检查构建系统中是否使用了 HIPSPV 相关 offload 选项，
+        尽早迁移到新的目标三元组格式。
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 11. 浮点字面量表示法 -->
   <!-- ============================================================ -->
   <div class="section" id="float-literal">
     <div class="section-header">
       <span class="tag">新语法</span>
-      <h2>6. 浮点字面量表示法变更（f0x 前缀）</h2>
+      <h2>11. 浮点字面量表示法变更（f0x 前缀）</h2>
     </div>
     <div class="section-body">
 
@@ -644,12 +953,12 @@ auto  val = f0x1.8p1;    <span class="comment">// 3.0，类型推导为 double</
   </div>
 
   <!-- ============================================================ -->
-  <!-- 7. 空指针算术优化 -->
+  <!-- 12. 空指针算术优化 -->
   <!-- ============================================================ -->
   <div class="section" id="null-ptr-arith">
     <div class="section-header">
       <span class="tag">优化变更</span>
-      <h2>7. 空指针算术优化</h2>
+      <h2>12. 空指针算术优化</h2>
     </div>
     <div class="section-body">
 
@@ -710,12 +1019,12 @@ if (p == nullptr)  <span class="comment">// 如果之前做了算术运算，</s
   </div>
 
   <!-- ============================================================ -->
-  <!-- 8. 内联汇编影响内联成本 -->
+  <!-- 13. 内联汇编影响内联成本 -->
   <!-- ============================================================ -->
   <div class="section" id="inline-asm-cost">
     <div class="section-header">
       <span class="tag">内联决策</span>
-      <h2>8. 内联汇编指令影响内联成本计算</h2>
+      <h2>13. 内联汇编指令影响内联成本计算</h2>
     </div>
     <div class="section-body">
 
@@ -784,6 +1093,189 @@ static inline int cpuid_ecx(int leaf) {
           <li><strong>性能影响</strong>：大多数情况下，此项变更有助于整体性能（减少膨胀，提高 I-cache 命中率）。</li>
         </ul>
       </div>
+
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 14. LLVM IR Changes -->
+  <!-- ============================================================ -->
+  <div class="section" id="llvm-ir-changes">
+    <div class="section-header">
+      <span class="tag">LLVM IR</span>
+      <h2>14. LLVM IR 变更</h2>
+    </div>
+    <div class="section-body">
+
+      <p>
+        LLVM 21 在 IR 层面引入了多项重要变更。这些变更主要影响编译器开发者、IR 解析/生成工具、
+        以及直接操作 LLVM IR 的项目。普通 C/C++ 用户通常不直接受此影响，但了解这些变更有助于
+        理解编译器行为的变化。
+      </p>
+
+      <!-- IR Item 1 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14a. llvm.convert.to.fp16 / from.fp16 移除</h3>
+      <p>
+        <code>llvm.convert.to.fp16</code> 和 <code>llvm.convert.from.fp16</code> 内建函数已被移除。
+        这些内建函数等价于 <code>fptrunc</code> 和 <code>fpext</code> 配合 half 类型和 bitcast 使用。
+        现有 IR 和 bitcode 将被自动更新。
+      </p>
+
+      <!-- IR Item 2 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14b. denormal-fp-math 迁移为 denormal_fpenv 属性</h3>
+      <p>
+        <code>"denormal-fp-math"</code> 和 <code>"denormal-fp-math-f32"</code> 字符串属性已迁移至
+        一等属性（first-class attribute）<code>denormal_fpenv</code>。这是 IR 属性系统的现代化改进。
+      </p>
+
+      <!-- IR Item 3 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14c. nooutline 属性语法变更</h3>
+      <p>
+        <code>"nooutline"</code> 属性现在的标准写法是 <code>nooutline</code>（不带引号）。
+        现有 IR 和 bitcode 将被自动更新。此变更与属性系统规范化保持一致。
+      </p>
+
+      <!-- IR Item 4 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14d. ConstantPointerNull 向量 Splat</h3>
+      <p>
+        <code>ConstantPointerNull</code> 现在可以表示固定长度和可缩放向量（scalable vector）的空指针 splat。
+        此类常量可能打印为 <code>splat (ptr null)</code> 而非 <code>zeroinitializer</code>。
+      </p>
+
+      <!-- IR Item 5 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14e. 浮点字面量新格式（f0x）</h3>
+      <p>
+        详见第 11 节 <a href="#float-literal">浮点字面量表示法变更</a>。旧的十六进制按位表示法已被弃用，
+        将在下个版本中移除。标准文本输出已改为使用新的浮点字面量格式。
+      </p>
+
+      <!-- IR Item 6 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14f. Coroutine Resume/Destroy CallingConv::C</h3>
+      <p>
+        详见第 8 节 <a href="#coroutine-abi">Coroutine ABI 稳定化</a>。LLVM IR 中协程的 resume/destroy
+        函数现在使用 <code>CallingConv::C</code> 而非 <code>CallingConv::Fast</code>。
+      </p>
+
+      <!-- IR Item 7 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14g. Assume Bundles 属性限制</h3>
+      <p>
+        Assume bundles 现在只接受实际被处理的属性。具体包括：<code>align</code>、<code>cold</code>、
+        <code>dereferenceable</code>、<code>dereferenceable_or_null</code>、<code>nonnull</code>、
+        <code>noundef</code> 和 <code>separate_storage</code>。
+        使用不支持的属性将导致错误。
+      </p>
+
+      <!-- IR Item 8 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14h. Fast Math Flags on uitofp / sitofp</h3>
+      <p>
+        Fast math flags（如 <code>nnan</code>、<code>ninf</code> 等）现在允许用于
+        <code>uitofp</code> 和 <code>sitofp</code> 指令。
+      </p>
+
+      <!-- IR Item 9 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14i. noipa 属性</h3>
+      <p>
+        新增 <code>noipa</code> 属性，用于禁用所有检查函数定义的跨过程分析（interprocedural analysis）。
+        此属性<strong>不</strong>控制内联或外联（outlining）。如需同时禁用内联和外联，
+        请额外添加 <code>noinline</code> 和 <code>nooutline</code> 属性。
+      </p>
+
+      <!-- IR Item 10: AArch64 Backend -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14j. AArch64 Backend 变更</h3>
+      <ul style="margin:4px 0 0 20px; color:#333;">
+        <li>
+          <strong>sysp / mrrs / msrr 指令：</strong><code>sysp</code>、<code>mrrs</code> 和
+          <code>msrr</code> 指令现在不再需要 <code>+d128</code> 特性开关即可接受。
+          此变更扩展了这些系统寄存器和内存屏障指令的可用范围。
+        </li>
+        <li style="margin-top:10px;">
+          <strong>TLS 调试信息：</strong>新增内部选项
+          <code>-aarch64-emit-debug-tls-location</code>，允许为线程局部变量（TLS）生成
+          <code>DW_AT_location</code> 调试信息。当前默认禁用以保持与旧版 Binutils 和 LLVM 工具链的兼容性。
+        </li>
+        <li style="margin-top:10px;">
+          <strong>x29 / x30 内联汇编 Clobber 修复：</strong>修复了一个 bug，该 bug 导致 LLVM IR 内联汇编
+          中使用 xN 名称（如 <code>x29</code>、<code>x30</code>）而非 ABI 名称（如
+          <code>FP</code>、<code>LR</code>）的 clobber 声明被忽略。
+          Clang 始终使用 ABI 名称，但其他前端可能不使用。（#167783）
+        </li>
+      </ul>
+
+      <!-- IR Item 11: ARM Backend -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">14k. ARM Backend 变更</h3>
+      <ul style="margin:4px 0 0 20px; color:#333;">
+        <li>
+          <strong>r14 寄存器别名：</strong><code>r14</code> 寄存器现在可以在内联汇编中作为链接寄存器
+          <code>lr</code> 的别名使用。Clang 始终将名称规范化为 <code>lr</code>，但其他前端可能不这样做。
+        </li>
+        <li style="margin-top:10px;">
+          <strong>subs pc, lr, #imm 谓词化：</strong><code>subs pc, lr, #imm</code> 指令现在可以在 Thumb2
+          模式下被谓词化（predicated）。
+        </li>
+      </ul>
+
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 15. Sanitizers -->
+  <!-- ============================================================ -->
+  <div class="section" id="sanitizers">
+    <div class="section-header">
+      <span class="tag">Sanitizers</span>
+      <h2>15. Sanitizers 变更</h2>
+    </div>
+    <div class="section-body">
+
+      <p>
+        LLVM 21 中的 Sanitizer 工具体系引入了多项重要更新，增强了自定义抑制规则的控制能力和跨平台路径匹配的一致性。
+      </p>
+
+      <!-- Sanitizer Item 1 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">15a. UBSan __ubsan_default_suppressions</h3>
+      <p>
+        UndefinedBehaviorSanitizer (UBSan) 现在支持 <code>__ubsan_default_suppressions</code> 机制。
+        用户可以在代码中定义此变量来指定默认的抑制规则，类似于 ASan 的
+        <code>__asan_default_suppressions</code>。这允许库和应用程序以编程方式配置 UBSan 的抑制行为，
+        而无需依赖外部抑制文件。
+      </p>
+
+      <div class="example-box">
+        <div class="example-label">使用示例：定义默认抑制规则</div>
+<pre><span class="comment">// 在任意源文件中定义</span>
+extern "C" const char *__ubsan_default_suppressions() {
+  return "vla_bound\n"
+         "function:sometimes_buggy_func\n";
+}
+<span class="comment">// UBSan 会在初始化时自动加载这些抑制规则</span></pre>
+      </div>
+
+      <!-- Sanitizer Item 2 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">15b. Sanitizer Special Case List v4 / v5</h3>
+      <p>
+        Sanitizer Special Case Lists（<code>-fsanitize-ignorelist</code>）现在支持版本 4 和版本 5 的格式。
+      </p>
+      <p>
+        <strong>版本 4：</strong>引入路径规范化过渡期。版本 4 同时匹配规范化路径和非规范化路径（不含前导
+        <code>./</code>），但会对弃用的匹配发出警告。由文件头 <code>#!special-case-list-v4</code> 标识。
+      </p>
+      <p>
+        <strong>版本 5：</strong>移除向后兼容性，要求规则必须匹配规范化路径（不含前导 <code>./</code>）。
+      </p>
+
+      <div class="note">
+        <strong>迁移建议：</strong>检查 ignorelist 文件中的路径规则是否包含前导 <code>./</code>。
+        如有，移除 <code>./</code> 前缀或将文件头更新为 v4 以进入过渡期。
+      </div>
+
+      <!-- Sanitizer Item 3 -->
+      <h3 style="color:#0a2647; margin: 24px 0 12px; font-size:1.05rem;">15c. Sanitizer 路径匹配在 Windows 上的改进</h3>
+      <p>
+        在 Windows 平台上，Sanitizer Special Case Lists（<code>-fsanitize-ignorelist</code>）和
+        警告抑制映射（<code>--warning-suppression-mappings</code>）的路径匹配现在是<strong>斜杠无关的
+        （slash-agnostic）</strong>：正向斜杠（<code>/</code>）和反斜杠（<code>\</code>）在模式和路径中
+        均匹配任一路径分隔符。此变更需要版本 4 及以上格式（<code>#!special-case-list-v4</code>）。
+      </p>
 
     </div>
   </div>

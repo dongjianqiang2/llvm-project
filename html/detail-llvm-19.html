@@ -128,7 +128,7 @@
 <header class="header">
   <a class="back" href="index.html">&larr; 返回主页</a>
   <h1>LLVM 19 差异详解</h1>
-  <p class="sub">毕昇编译器升级 &mdash; 聚焦 SVE/PAuth/GCS/调试基础设施等关键变更</p>
+  <p class="sub">毕昇编译器升级 &mdash; AArch64 安全特性、C++ 语言变更、LLD 链接器、LLVM IR 全面覆盖</p>
 </header>
 
 <div class="container">
@@ -137,7 +137,7 @@
   <div class="card">
     <div class="card-title">LLVM 19 变更概览</div>
     <div class="card-body">
-      <p>LLVM 19 是 LLVM 15&rarr;21 升级路径中的第四个主要版本，于 2024 年 9 月发布。本页聚焦与<strong>数通产品线（AArch64 嵌入式网络设备）</strong>最相关的七项关键变更，提供详细说明、代码示例和迁移指引。</p>
+      <p>LLVM 19 是 LLVM 15&rarr;21 升级路径中的第四个主要版本，于 2024 年 9 月发布。本页全面覆盖<strong>数通产品线（AArch64 嵌入式网络设备）</strong>相关的关键变更，包含 AArch64 后端、C/C++ 语言、ABI 兼容性、LLD 链接器、LLVM IR、弃用与移除共六大类。</p>
       <div class="section-summary">
         <div class="summary-item">
           <div class="si-tag">AArch64 关键变更</div>
@@ -150,6 +150,21 @@
           <div class="si-desc">ELF PAuth relocations + <code>GNU_PROPERTY_AARCH64_FEATURE_PAUTH</code></div>
         </div>
         <div class="summary-item">
+          <div class="si-tag">AArch64 ABI</div>
+          <div class="si-name">FMV ifunc 全局别名移除</div>
+          <div class="si-desc">AArch64 Function Multiversioning ifunc 别名与 GlobalOpt 冲突</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">AArch64 新 CPU</div>
+          <div class="si-name">9 款新 CPU 支持</div>
+          <div class="si-desc">Cortex-R82AE/A78AE/A520AE/A720AE/A725/X925 + Neoverse-N3/V3/V3AE</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">C 语言变更</div>
+          <div class="si-name">C 原始字符串字面量</div>
+          <div class="si-desc"><code>-std=gnuXY</code> 模式下支持 raw string literals（C99+）</div>
+        </div>
+        <div class="summary-item">
           <div class="si-tag">C++ 语言变更</div>
           <div class="si-name">模板参数自阴影诊断</div>
           <div class="si-desc">函数/变量模板不能与模板参数同名</div>
@@ -160,9 +175,64 @@
           <div class="si-desc"><code>-frelaxed-template-template-args</code> 默认开启</div>
         </div>
         <div class="summary-item">
-          <div class="si-tag">ISA 移除</div>
-          <div class="si-name">3DNow! / KNL/KNM 移除</div>
-          <div class="si-desc">所有 3DNow! intrinsics 和 codegen 支持已删除</div>
+          <div class="si-tag">C++ 语言变更</div>
+          <div class="si-name">decltype 不再形成成员指针</div>
+          <div class="si-desc"><code>decltype(&amp;(foo::bar))</code> 不再误解析为 pointer-to-member</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">C++ 标准库兼容</div>
+          <div class="si-name">libstdc++ 14.1.0 兼容性</div>
+          <div class="si-desc">依赖类型运算符语义分析突破 libstdc++ 14.1.0 bug，需 14.1.1+</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">MSVC ABI 兼容</div>
+          <div class="si-name">MSVC 名称修饰修复</div>
+          <div class="si-desc">静态局部 init / 生命周期延长临时对象 / auto NTTP 指针</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">MSVC ABI 兼容</div>
+          <div class="si-name">MSVC 调用约定修复</div>
+          <div class="si-desc">模板构造函数类 / 删除的拷贝赋值运算符 返回约定</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLD 链接器</div>
+          <div class="si-name">--build-id 默认变更</div>
+          <div class="si-desc">从 fast (8-byte) 改为 sha1 (20-byte)，改善 RPM 打包兼容性</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLD 链接器</div>
+          <div class="si-name">CREL 实验性重定位</div>
+          <div class="si-desc">显式 addend 的压缩重定位格式（无版本兼容保证）</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLD 链接器</div>
+          <div class="si-name">压缩与调试增强</div>
+          <div class="si-desc">--compress-sections / --debug-names / EI_OSABI 推断</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLD 链接器</div>
+          <div class="si-name">--enable-non-contiguous-regions</div>
+          <div class="si-desc">自动溢出到后续 MEMORY 区域，减少手动打包工作</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLD 压缩</div>
+          <div class="si-name">zlib 默认 / zstd 线程</div>
+          <div class="si-desc">zlib 默认 Z_BEST_SPEED；zstd 多线程不再需要 ZSTD_MULTITHREAD</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLVM IR</div>
+          <div class="si-name">constexpr 移除</div>
+          <div class="si-desc">icmp/fcmp/shl 的常量表达式变体已移除</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLVM IR</div>
+          <div class="si-name">Debug records 切换</div>
+          <div class="si-desc">Debug intrinsics &rarr; debug records 新基础设施</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">LLVM IR</div>
+          <div class="si-name">MMRAs / MC/DC</div>
+          <div class="si-desc">Memory Model Relaxation Annotations + MC/DC 语义变更</div>
         </div>
         <div class="summary-item">
           <div class="si-tag">安全特性</div>
@@ -170,9 +240,19 @@
           <div class="si-desc"><code>-z gcs</code> / <code>-z gcs-report</code> 选项</div>
         </div>
         <div class="summary-item">
+          <div class="si-tag">弃用与移除</div>
+          <div class="si-name">-Ofast 弃用 / TERMINFO 移除</div>
+          <div class="si-desc">-Ofast 已弃用；LLVM_ENABLE_TERMINFO 标志已移除</div>
+        </div>
+        <div class="summary-item">
           <div class="si-tag">基础设施</div>
-          <div class="si-name">Debug records 切换</div>
-          <div class="si-desc">Debug intrinsics &rarr; debug records 新基础设施</div>
+          <div class="si-name">Python 3.6 &rarr; 3.8</div>
+          <div class="si-desc">最低 Python 版本要求从 3.6 提升至 3.8</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">ISA 移除</div>
+          <div class="si-name">3DNow! / KNL/KNM 移除</div>
+          <div class="si-desc">所有 3DNow! intrinsics 和 codegen 支持已删除；KNL/KNM 目标移除</div>
         </div>
       </div>
     </div>
@@ -188,7 +268,7 @@
 
       <div class="co co-r">
         <strong>破坏性变更</strong>
-        在 LLVM 19 之前，<code>-march=armv9-a</code>（以及 <code>-march=armv9.1-a</code>、<code>-march=armv9.2-a</code> 等）会<strong>隐式</strong>启用的 SVE 和 SVE2 扩展。LLVM 19 起，这些扩展从默认扩展列表中移除，变为可选特性。这与 ARM 架构手册的规范保持一致——SVE 和 SVE2 在 ARMv9.0 中确实是<strong>可选</strong>扩展。
+        在 LLVM 19 之前，<code>-march=armv9-a</code>（以及 <code>-march=armv9.1-a</code>、<code>-march=armv9.2-a</code> 等）会<strong>隐式</strong>启用 SVE 和 SVE2 扩展。LLVM 19 起，这些扩展从默认扩展列表中移除，变为可选特性。这与 ARM 架构手册的规范保持一致——SVE 和 SVE2 在 ARMv9.0 中确实是<strong>可选</strong>扩展。
       </div>
 
       <h4>变更动机</h4>
@@ -332,11 +412,11 @@ clang <span class="k">-target</span> aarch64-linux-gnu \
       <span class="k">-mbranch-protection=</span>standard \
       <span class="k">-O2</span> <span class="k">-c</span> example.c
 
-<span class="c"># standard 等价于 bti+pac-ret+leaf（含 PAuth-LR）</span>
+<span class="c"># standard 等价于 bti+pac-ret+pc（含 PAuth-LR）</span>
+<span class="c"># 当 +pauth-lr 通过 -mcpu= 传入时，standard = bti+pac-ret+pc</span>
 <span class="c"># bti: Branch Target Identification（防护 JOP）</span>
 <span class="c"># pac-ret: PAC 保护返回地址（防护 ROP）</span>
-<span class="c"># leaf: 同时保护叶子函数</span>
-<span class="c"># PAuth-LR: 使用 LR 寄存器存储 PAC（减少指令开销）</span></pre>
+<span class="c"># pc: 同时保护叶子函数</span></pre>
       </div>
 
       <div class="example-box">
@@ -357,7 +437,7 @@ clang <span class="k">-mbranch-protection=</span>standard</pre>
       <h4>示例 3：GNU_PROPERTY_AARCH64_FEATURE_PAUTH</h4>
       <div class="example-box">
         <div class="label">链接器 — GNU property note 支持</div>
-        <pre class="cb"><span class="c"># 链接时，lld 和 ld.lld 支持 GNUT_PROPERTY_AARCH64_FEATURE_PAUTH</span>
+        <pre class="cb"><span class="c"># 链接时，lld 和 ld.lld 支持 GNU_PROPERTY_AARCH64_FEATURE_PAUTH</span>
 <span class="c"># 该 note 标记 ELF 文件启用了 PAuth 特性</span>
 <span class="c"># 动态链接器（ld.so）可在加载时检查此标记</span>
 
@@ -384,6 +464,152 @@ readelf <span class="k">-n</span> libmodule.so | <span class="k">grep</span> <sp
       <div class="co co-i">
         <strong>迁移建议</strong>
         对于运行在 ARMv8.3-A+ 或 ARMv9.x-A 平台的数通设备，强烈建议在编译器标志中添加 <code>-mbranch-protection=standard</code>，以获得硬件级别的控制流完整性保护。需要在<strong>所有编译单元和链接阶段</strong>一致使用此选项。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== AArch64 FMV ifunc alias removal ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bh">AArch64 ABI 变更</span>
+      AArch64 FMV ifunc 全局别名移除
+    </div>
+    <div class="card-body">
+
+      <div class="co co-r">
+        <strong>破坏性变更</strong>
+        移除了指向 AArch64 Function Multiversioning (FMV) ifunc 的全局别名。该别名的初衷是为了在 ".ifunc" 后缀从名称修饰（name mangling）中移除后保持向后兼容性。但该别名与 GlobalOpt 优化 pass 产生不良交互，可能导致错误行为（参阅 issue <a href="https://github.com/llvm/llvm-project/issues/96197">#96197</a>）。
+      </div>
+
+      <h4>变更动机</h4>
+      <p>Function Multiversioning 允许同一函数根据运行时 CPU 特性选择不同的实现版本。在 LLVM 中，FMV 通过 ifunc（indirect function）机制实现。早期实现中，ifunc 的符号名包含 ".ifunc" 后缀，后续版本将其从名称修饰中移除。为保持向后兼容，LLVM 引入了一个不带后缀的全局别名指向实际的 ifunc 符号。</p>
+      <p>然而，该全局别名被 GlobalOpt pass 识别为"可替换"的间接引用，GlobalOpt 可能将其替换为对特定函数版本的直接调用，这破坏了 FMV 的运行时分发语义。移除该别名后，GlobalOpt 不再错误优化 FMV 函数调用。</p>
+
+      <div class="example-box">
+        <div class="label">受影响场景</div>
+        <pre class="cb"><span class="c">// AArch64 Function Multiversioning 示例</span>
+<span class="k">__attribute__</span>((target_clones(<span class="s">"default,sve"</span>)))
+<span class="k">int</span> compute(<span class="k">int</span> *data, <span class="k">int</span> len) {
+    <span class="c">// ... 实现</span>
+    <span class="k">return</span> result;
+}
+
+<span class="c">// LLVM 18: 生成 ifunc compute，以及全局别名 compute（指向 compute.ifunc）</span>
+<span class="c">// LLVM 19: 仅生成 ifunc compute，无全局别名</span>
+<span class="c">//</span>
+<span class="c">// 影响：如果代码通过 dlsym 查找 "compute" 符号并依赖别名间接调用，</span>
+<span class="c">// 需确认实际链接行为。正常的函数调用不受影响。</span></pre>
+      </div>
+
+      <div class="co co-a">
+        <strong>影响范围</strong>
+        此变更主要影响使用了 AArch64 Function Multiversioning 且依赖全局别名符号的<strong>极少数场景</strong>（如 JIT 运行时通过 dlsym 查找 ifunc）。正常的源代码函数调用完全不受影响。如果发现 FMV 函数在 LLVM 19 下行为异常（之前工作正常），可能是 GlobalOpt 错误优化的遗留问题已得到修复。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== New AArch64 CPUs ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bl">新增支持</span>
+      AArch64 新增 9 款 CPU 目标
+    </div>
+    <div class="card-body">
+
+      <div class="co co-i">
+        <strong>新 CPU 支持</strong>
+        LLVM 19 新增了对以下 9 款 AArch64 CPU 的代码生成和调优支持。
+      </div>
+
+      <h4>新增 CPU 列表</h4>
+      <table style="width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0;">
+        <thead>
+          <tr>
+            <th style="background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:7px 11px;border-bottom:2px solid var(--border);font-size:12.5px">CPU</th>
+            <th style="background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:7px 11px;border-bottom:2px solid var(--border);font-size:12.5px">系列</th>
+            <th style="background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:7px 11px;border-bottom:2px solid var(--border);font-size:12.5px">说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>cortex-r82ae</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Cortex-R (实时)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">AE 版本（Automotive Enhanced），功能安全应用</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>cortex-a78ae</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Cortex-A (应用)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">AE 版本，汽车与工业应用</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>cortex-a520ae</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Cortex-A (应用)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">AE 版本小核，汽车安全等级</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>cortex-a720ae</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Cortex-A (应用)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">AE 版本大核</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>cortex-a725</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Cortex-A (应用)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">下一代中核</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>cortex-x925</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Cortex-X (性能)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">超高性能核</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>neoverse-n3</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Neoverse (基础设施)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">下一代 N 系列，网络/数据中心</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>neoverse-v3</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Neoverse (基础设施)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">下一代 V 系列，高性能计算</td></tr>
+          <tr><td style="padding:6px 11px;border-bottom:1px solid var(--border)"><code>neoverse-v3ae</code></td><td style="padding:6px 11px;border-bottom:1px solid var(--border)">Neoverse (基础设施)</td><td style="padding:6px 11px;border-bottom:1px solid var(--border);color:var(--text2)">V3 的 AE 版本</td></tr>
+        </tbody>
+      </table>
+
+      <div class="example-box">
+        <div class="label">使用方式</div>
+        <pre class="cb"><span class="c"># 为目标 CPU 优化代码生成</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-mcpu=</span>neoverse-n3 \
+      <span class="k">-O2</span> <span class="k">-c</span> example.c
+
+<span class="c"># Neoverse-N3 适用于数通网络设备</span>
+<span class="c"># Neoverse-V3 适用于高性能数据面处理</span></pre>
+      </div>
+
+      <div class="co co-i">
+        <strong>对数通设备的价值</strong>
+        数通产品线广泛使用 Neoverse 系列 CPU。LLVM 19 对最新 Neoverse-N3/V3/V3AE 的支持意味着可以针对下一代网络处理器进行代码生成优化，提前进行软件适配。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== C Raw String Literals ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bl">C 语言扩展</span>
+      C 原始字符串字面量（Raw String Literals）
+    </div>
+    <div class="card-body">
+
+      <div class="co co-i">
+        <strong>C99+ 新扩展</strong>
+        LLVM 19 在 <code>-std=gnuXY</code> 模式下（C99 及以后）支持原始字符串字面量（raw string literals）作为 GNU 扩展。此行为可通过 <code>-f[no-]raw-string-literals</code> 覆盖。修复了 <a href="https://github.com/llvm/llvm-project/issues/85703">#85703</a>。
+      </div>
+
+      <h4>功能说明</h4>
+      <p>原始字符串字面量使用 <code>R"delimiter(...)delimiter"</code> 语法，在字符串中<strong>无需转义</strong>字符。这在包含正则表达式、JSON、嵌入脚本等场景中非常有用。</p>
+
+      <div class="example-box">
+        <div class="label">C 语言中使用原始字符串字面量</div>
+        <pre class="cb"><span class="c">// 使用 -std=gnu99 或更高版本的 GNU 模式编译</span>
+<span class="c">// clang -std=gnu99 -c example.c</span>
+
+<span class="c">// 传统方式：需要大量转义</span>
+<span class="k">const char</span> *json_old = <span class="s">"{\"name\":\"value\",\"count\":42}"</span>;
+
+<span class="c">// 原始字符串字面量：无需转义（LLVM 19 C 新增）</span>
+<span class="k">const char</span> *json_new = <span class="s">R"({"name":"value","count":42})"</span>;
+
+<span class="c">// 也可用于正则表达式</span>
+<span class="k">const char</span> *pattern = <span class="s">R"(\d+\.\d+)"</span>;
+
+<span class="c">// 多行字符串（保留换行和缩进）</span>
+<span class="k">const char</span> *multiline = R"(
+    Line 1
+    Line 2
+)"</span>;</pre>
+      </div>
+
+      <div class="example-box">
+        <div class="label">控制选项</div>
+        <pre class="cb"><span class="c"># 显式启用 C 原始字符串字面量</span>
+clang <span class="k">-fraw-string-literals</span> <span class="k">-std=</span>gnu99 example.c
+
+<span class="c"># 禁用（恢复到 LLVM 18 行为）</span>
+clang <span class="k">-fno-raw-string-literals</span> <span class="k">-std=</span>gnu99 example.c</pre>
+      </div>
+
+      <div class="co co-a">
+        <strong>注意事项</strong>
+        此扩展仅在 GNU 模式（<code>-std=gnu99</code>、<code>-std=gnu11</code>、<code>-std=gnu17</code>、<code>-std=gnu23</code>）下可用。在严格标准模式（<code>-std=c99</code> 等）或 C89/C90 模式下不可用。C++ 中的原始字符串字面量支持不受影响（自 C++11 起标准支持）。如果代码中包含 <code>R"(...)"</code> 形式的宏定义或字符串，升级后行为可能与预期一致或出现新解析——请注意检查。
       </div>
     </div>
   </div>
@@ -442,7 +668,7 @@ readelf <span class="k">-n</span> libmodule.so | <span class="k">grep</span> <sp
 
       <div class="co co-a">
         <strong>影响范围</strong>
-        此诊断主要影响使用了短模板参数名（如 <code>T</code>、<code>V</code>、<code>U</code>）的通用代码。如果代码库中有函数模板或变量模板恰好与模板参数同名（虽然罕见但可能存在于历史代码中），升级到 LLVM 19 后将导致编译失败。修复方式很简单：将函数/变量名改为与模板参数不同的名称。
+        此诊断主要影响使用了短模板参数名（如 <code>T</code>、<code>V</code>、<code>U</code>）的通用代码。如果代码库中有函数模板或变量模板恰好与模板参数同名（虽然罕见但可能存在于历史代码中），升级到 LLVM 19 后将导致编译失败。可通过 <code>-Wno-strict-primary-template-shadow</code> 临时禁用此诊断以保持与旧版本兼容。
       </div>
     </div>
   </div>
@@ -457,12 +683,12 @@ readelf <span class="k">-n</span> libmodule.so | <span class="k">grep</span> <sp
 
       <div class="co co-i">
         <strong>模板匹配规则放宽</strong>
-        LLVM 19 起，<code>-frelaxed-template-template-args</code> 编译器标志<strong>默认启用</strong>。该标志使模板模板参数（template template parameter）的匹配规则更加灵活，允许接受参数不精确匹配的模板作为模板参数。
+        LLVM 19 起，<code>-frelaxed-template-template-args</code> 编译器标志<strong>默认启用</strong>，该标志本身已废弃。该特性使模板模板参数（template template parameter）的匹配规则更加灵活，允许接受参数不精确匹配的模板作为模板参数，与 GCC 行为对齐。
       </div>
 
       <h4>问题背景</h4>
       <p>C++17 标准（P0522R0）放宽了模板模板参数的匹配规则：一个模板模板参数可以匹配一个实参模板，即使实参模板的参数列表与形参不完全匹配，只要实参模板可以接受形参所使用的参数即可。但在 C++17 标准化过程中，此变更被视为缺陷报告，理论上应追溯适用于 C++14 及更早标准。</p>
-      <p>此前，Clang 将此作为可选特性通过 <code>-frelaxed-template-template-args</code> 提供。LLVM 19 起，该行为默认启用，与 GCC 行为对齐。</p>
+      <p>此前，Clang 将此作为可选特性通过 <code>-frelaxed-template-template-args</code> 提供。LLVM 19 起，该行为默认启用。负拼写（<code>-fno-relaxed-template-template-args</code>）仍可用于兼容旧版本（伴随废弃警告，可通过 <code>-Wno-deprecated-no-relaxed-template-template-args</code> 禁用警告）。</p>
 
       <div class="example-box">
         <div class="label">示例 &mdash; 松弛匹配的具体表现</div>
@@ -477,12 +703,12 @@ readelf <span class="k">-n</span> libmodule.so | <span class="k">grep</span> <sp
 };
 
 <span class="c">// LLVM 18 及之前（-frelaxed-template-template-args 未启用）：</span>
-<span class="c">//   ❌ 错误：MyContainer 接受 2 个模板参数，</span>
-<span class="c">//          但 Container 模板模板参数期望 1 个</span>
+<span class="c">//   错误：MyContainer 接受 2 个模板参数，</span>
+<span class="c">//        但 Container 模板模板参数期望 1 个</span>
 <span class="c">//</span>
 <span class="c">// LLVM 19（默认启用松弛匹配）：</span>
-<span class="c">//   ✅ OK：MyContainer&lt;int&gt; 等价于 MyContainer&lt;int, allocator&lt;int&gt;&gt;</span>
-<span class="c">//          默认参数使其可以接受 1 个实参</span>
+<span class="c">//   OK：MyContainer&lt;int&gt; 等价于 MyContainer&lt;int, allocator&lt;int&gt;&gt;</span>
+<span class="c">//       默认参数使其可以接受 1 个实参</span>
 Processor&lt;MyContainer&gt; proc;  <span class="c">// LLVM 19 起合法</span>
 </pre>
       </div>
@@ -490,16 +716,15 @@ Processor&lt;MyContainer&gt; proc;  <span class="c">// LLVM 19 起合法</span>
       <h4>兼容性与控制</h4>
       <div class="example-box">
         <div class="label">恢复旧行为的选项（已废弃）</div>
-        <pre class="cb"><span class="c"># -frelaxed-template-template-args 标志已废弃</span>
-<span class="c"># LLVM 19 中仍可识别但无效果（始终启用）</span>
-<span class="c"># 负拼写（negative spelling）可用于兼容旧版本</span>
+        <pre class="cb"><span class="c"># -frelaxed-template-template-args 标志已废弃（始终默认启用）</span>
+<span class="c"># 负拼写可用于兼容旧版本（产生废弃警告）</span>
 
-<span class="c"># 在 LLVM 18 中禁用松弛匹配</span>
+<span class="c"># LLVM 19 中禁用松弛匹配（含废弃警告）</span>
 clang++ <span class="k">-fno-relaxed-template-template-args</span> example.cpp
 
-<span class="c"># LLVM 19 中该标志被忽略（松弛匹配始终启用）</span>
-<span class="c"># 如需在 LLVM 18 上保持旧行为，可：</span>
-clang++ <span class="k">-fno-relaxed-template-template-args</span> example.cpp  <span class="c"># 仅 LLVM 18 有效</span>
+<span class="c"># 禁用负拼写的废弃警告</span>
+clang++ <span class="k">-fno-relaxed-template-template-args</span> \
+       <span class="k">-Wno-deprecated-no-relaxed-template-template-args</span> example.cpp
 </pre>
       </div>
 
@@ -510,7 +735,346 @@ clang++ <span class="k">-fno-relaxed-template-template-args</span> example.cpp  
     </div>
   </div>
 
-  <!-- ====== 3DNow! and KNL/KNM ====== -->
+  <!-- ====== decltype pointer-to-member ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bh">C++ 行为变更</span>
+      decltype(&amp;(foo::bar)) 不再形成成员指针
+    </div>
+    <div class="card-body">
+
+      <div class="co co-r">
+        <strong>语义修正</strong>
+        LLVM 19 不再尝试在已限定且有括号的未求值上下文（unevaluated context）中将表达式 <code>decltype(&amp;(foo::bar))</code> 解析为 pointer-to-member（成员指针）。这是一个编译正确性的修正，修复了 <a href="https://github.com/llvm/llvm-project/issues/40906">#40906</a>。
+      </div>
+
+      <h4>问题说明</h4>
+      <p>在 C++ 中，<code>&amp;(foo::bar)</code> 在未求值上下文中的类型取决于 <code>foo::bar</code> 是静态成员还是非静态成员。之前的 Clang 版本在某些情况下错误地将此表达式解析为 pointer-to-member 类型（指向成员的指针），而正确的行为应该是将其解析为普通指针（如果 <code>bar</code> 是静态成员）或触发 SFINAE。</p>
+
+      <div class="example-box">
+        <div class="label">受影响的代码</div>
+        <pre class="cb"><span class="c">// 受此变更影响的模式</span>
+<span class="k">struct</span> Foo {
+    <span class="k">static int</span> bar;
+    <span class="k">void</span> baz();
+};
+
+<span class="c">// LLVM 18: 错误地将 &(Foo::bar) 解析为 pointer-to-member</span>
+<span class="c">// LLVM 19: 正确解析为普通函数指针 int (*)()</span>
+<span class="k">using</span> T1 = <span class="k">decltype</span>(&amp;(Foo::bar));  <span class="c">// 静态成员，应为 int*</span>
+
+<span class="c">// 对于非静态成员函数</span>
+<span class="k">using</span> T2 = <span class="k">decltype</span>(&amp;(Foo::baz));  <span class="c">// 成员函数指针（不变）</span>
+
+<span class="c">// 关键修正：已限定且有括号的表达式不再错误匹配</span>
+<span class="c">// 之前可能导致 SFINAE 条件错误触发或失效</span></pre>
+      </div>
+
+      <div class="co co-a">
+        <strong>影响范围</strong>
+        此变更主要影响使用了 <code>decltype(&amp;(qualified-id))</code> 模式的模板元编程代码。对于大多数用户，这是正确的修正，应使代码行为更符合 C++ 标准。如果代码依赖旧的错误行为（如将静态成员的地址误识别为成员指针触发 SFINAE），需要调整相关模板条件。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== libstdc++ 14.1.0 ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bh">标准库兼容性</span>
+      libstdc++ 14.1.0 兼容性问题（需 14.1.1+）
+    </div>
+    <div class="card-body">
+
+      <div class="co co-r">
+        <strong>编译失败</strong>
+        LLVM 19 现在对已知为非类非枚举类型的依赖类型操作数进行一元运算符（如 <code>++</code>、<code>--</code>）的语义分析，而不再推迟到模板实例化阶段。此变更暴露了 libstdc++ 14.1.0 中的一个 bug，可能导致使用该版本的系统编译失败。
+      </div>
+
+      <h4>错误表现</h4>
+      <div class="example-box">
+        <div class="label">典型错误信息</div>
+        <pre class="cb"><span class="c">// 编译时的错误输出：</span>
+<span class="r">error: expression is not assignable</span>
+    4 |     ++this;
+      |     ^ ~~~~
+
+<span class="c">// 此错误来自 libstdc++ 14.1.0 头文件内部的模板代码</span>
+<span class="c">// 当 libstdc++ 模板中对 this 指针使用 ++ 运算符时，</span>
+<span class="c">// 新的语义分析在实例化前就检测到 this 不可赋值</span></pre>
+      </div>
+
+      <h4>解决方案</h4>
+      <p>将 libstdc++ 更新到 <strong>14.1.1 或更高版本</strong>即可解决问题。这个 bug 已在 GCC/libstdc++ 端修复。此变更本身是正确的标准符合性改进，只是在过渡期间暴露了现有库代码中的潜在问题。</p>
+
+      <div class="co co-a">
+        <strong>对数通设备的影响</strong>
+        如果数通产品线使用较新的 Linux 发行版（如 Ubuntu 24.04 以上的滚动版本），需确认系统 libstdc++ 版本不低于 14.1.1。对于使用自定义工具链的场景（常见于嵌入式开发），应确保交叉编译工具链中的 libstdc++ 版本不是 14.1.0。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== -fdelayed-template-parsing ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bm">行为变更</span>
+      -fdelayed-template-parsing 不再强制需要
+    </div>
+    <div class="card-body">
+
+      <div class="co co-i">
+        <strong>MSVC 兼容性改进</strong>
+        在 LLVM 19 中，对于使用了 MSVC 兼容模式的代码，<code>-fdelayed-template-parsing</code> 不再像早期版本那样是必需选项。Clang 对模板解析的处理得到改进，许多之前在非延迟模式下无法正确解析的 MSVC 风格模板代码现在可以直接编译。
+      </div>
+
+      <h4>背景</h4>
+      <p><code>-fdelayed-template-parsing</code> 是 Clang 为兼容 MSVC 而引入的选项。它模仿 MSVC 的模板解析策略：将模板体作为词法令牌流存储，推迟到模板实例化时才进行完整的语法和语义分析。虽然这提高了与 MSVC 代码的兼容性，但也意味着模板体中的语法错误要到实例化时才会被发现。</p>
+      <p>LLVM 19 的模板解析改进减小了延迟解析与立即解析之间的差距。对于多数现代 MSVC 代码，<code>-fdelayed-template-parsing</code> 不再是必需的。</p>
+
+      <div class="example-box">
+        <div class="label">使用建议</div>
+        <pre class="cb"><span class="c"># 旧方式（LLVM 18 之前可能需要）</span>
+clang-cl <span class="k">/Zc:twoPhase-</span> example.cpp
+
+<span class="c"># LLVM 19 推荐：尝试不加延迟解析，验证代码是否可以编译</span>
+clang-cl example.cpp
+<span class="c"># 如果需要兼容旧 MSVC 头文件，仍可使用</span>
+clang-cl <span class="k">-fdelayed-template-parsing</span> example.cpp</pre>
+      </div>
+
+      <div class="co co-g">
+        <strong>迁移建议</strong>
+        建议逐步减少对 <code>-fdelayed-template-parsing</code> 的依赖。在升级到 LLVM 19 后，先尝试不加该选项编译项目。如果遇到模板相关的编译错误，再决定是否需要重新启用或修复源代码。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== MSVC ABI Changes ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bh">ABI 变更</span>
+      MSVC 名称修饰与调用约定修复
+    </div>
+    <div class="card-body">
+
+      <div class="co co-r">
+        <strong>多项 ABI 修复</strong>
+        LLVM 19 包含多项影响 MSVC ABI 兼容性的修复：名称修饰（name mangling）改进和调用约定修正。这些修复使 Clang 与 MSVC 编译的代码更好地互操作，但可能引入与较早版本 Clang 编译的代码的 ABI 不兼容。
+      </div>
+
+      <h4>MSVC 名称修饰修复</h4>
+      <p>以下四项修复修正了 Clang 在 MSVC 名称修饰中的偏差：</p>
+
+      <div class="co co-r">
+        <strong>1. 线程安全静态本地变量初始化（#GH83616）</strong>
+        修正了用于线程安全静态本地初始化（thread-safe static local init）的隐式定义变量的名称修饰。此变更解决了与 MSVC 编译代码的不兼容问题，但如果带有 <code>__declspec(dllimport)</code> 的内联成员函数中包含带动态初始化器的静态本地变量，则可能与旧版 Clang 编译的代码不兼容。
+      </div>
+
+      <div class="co co-a">
+        <strong>2. 生命周期延长临时对象（#GH85423）</strong>
+        修正了生命周期延长临时对象（lifetime extended temporaries）的名称修饰。此变更修正了缺失的反向引用注册（back reference registration），该 bug 可能导致错误的反向引用索引和令人困惑的 demangled 名称结果。由于 MSVC 对这些对象使用不同的名称修饰方式，兼容性不受影响。
+      </div>
+
+      <div class="co co-r">
+        <strong>3. auto NTTP 指针类型（MSVC 1920+）</strong>
+        修正了指针类型的 auto 非类型模板参数（auto non-type template parameter）的名称修饰，以匹配 MSVC 1920+ 的行为。此变更解决了与 MSVC 1920+ 编译代码的不兼容问题，但如果未使用 <code>-fms-compatibility-version=19.14</code> 选项来模拟 MSVC 1914 的名称修饰行为，则会引入与旧版 Clang 编译代码的不兼容。
+      </div>
+
+      <div class="co co-r">
+        <strong>4. auto NTTP 成员指针类型（MSVC 1920+）（#GH70899）</strong>
+        修正了成员指针类型的 auto 非类型模板参数的名称修饰，以匹配 MSVC 1920+ 的行为。与上述指针类型修复类似，需要使用 <code>-fms-compatibility-version=19.14</code> 来保持与旧版 Clang 编译代码的向后兼容。
+      </div>
+
+      <h4>MSVC 调用约定修复</h4>
+
+      <div class="co co-a">
+        <strong>5. 含模板构造函数的类（#GH86384）</strong>
+        如果一个类包含模板构造函数，则该类应通过间接方式返回（indirect return），即使它满足在寄存器中返回类的所有其他要求。此变更影响某些 <code>std::pair</code> 的使用场景。
+      </div>
+
+      <div class="co co-a">
+        <strong>6. 含删除拷贝赋值运算符的类</strong>
+        如果一个类包含已删除的拷贝赋值运算符（deleted copy assignment operator），则该类应通过间接方式返回（indirect return）。
+      </div>
+
+      <div class="co co-i">
+        <strong>对数通设备的影响</strong>
+        这些 MSVC ABI 修复主要影响 Windows 平台上的 MSVC 互操作场景。对于 Linux AArch64 上的数通产品线，影响范围有限。但如果存在交叉编译到 Windows/x86 的测试环境，或使用了 MSVC 兼容模式的代码与 MSVC 编译的库链接，需要注意这些 ABI 变更。使用 <code>-fms-compatibility-version=19.14</code> 可保持与旧版 Clang 的向前兼容。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== LLD Changes ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bl">链接器变更</span>
+      LLD ELF 关键变更汇总
+    </div>
+    <div class="card-body">
+
+      <div class="co co-i">
+        <strong>LLD 19 引入多项重要改进</strong>
+        LLD ELF 链接器在 LLVM 19 中引入了多项变更，涉及默认行为、压缩、调试信息、链接脚本等。
+      </div>
+
+      <h4>--build-id 默认变更</h4>
+      <div class="co co-a">
+        <strong>从 8 字节 fast 改为 20 字节 sha1</strong>
+        <code>--build-id</code> 现在默认生成 20 字节摘要（sha1），而非之前的 8 字节摘要（fast）。此变更改善了与 RPM 打包工具的兼容性。若需旧行为，可显式指定 <code>--build-id=fast</code>。（<a href="https://github.com/llvm/llvm-project/pull/93943">#93943</a>）
+      </div>
+
+      <h4>CREL 实验性重定位</h4>
+      <div class="co co-a">
+        <strong>实验性功能，无版本兼容性保证</strong>
+        现在支持带有显式 addend 的 CREL（压缩重定位）格式，使用临时节类型代码 0x40000020（<code>clang -c -Wa,--crel,--allow-experimental-crel</code>）。LLVM 将更改此代码并破坏兼容性——Clang 和不同版本的 lld 之间不保证协作。不支持隐式 addend 的 CREL。（<a href="https://github.com/llvm/llvm-project/pull/98115">#98115</a>）
+      </div>
+
+      <h4>--compress-sections</h4>
+      <div class="co co-g">
+        <strong>新增选项</strong>
+        <code>--compress-sections &lt;section-glob&gt;={none,zlib,zstd}[:level]</code> 用于压缩匹配的非 <code>SHF_ALLOC</code> 输出节。（<a href="https://github.com/llvm/llvm-project/pull/84855">#84855</a>、<a href="https://github.com/llvm/llvm-project/pull/90567">#90567</a>）
+      </div>
+
+      <h4>--debug-names</h4>
+      <div class="co co-g">
+        <strong>新增选项</strong>
+        <code>--debug-names</code> 从输入的 <code>.debug_names</code> 节创建合并的 <code>.debug_names</code> 索引。Type units 尚未处理。（<a href="https://github.com/llvm/llvm-project/pull/86508">#86508</a>）
+      </div>
+
+      <h4>EI_OSABI 推断</h4>
+      <div class="co co-g">
+        <strong>行为变更</strong>
+        输出的 <code>EI_OSABI</code> 字段现在从输入的目标文件中推断，而非总是使用默认值。（<a href="https://github.com/llvm/llvm-project/pull/97144">#97144</a>）
+      </div>
+
+      <h4>--enable-non-contiguous-regions</h4>
+      <div class="co co-g">
+        <strong>新增选项</strong>
+        <code>--enable-non-contiguous-regions</code> 允许在 MEMORY 区域溢出时自动将输入段装到匹配的后续区域。这减少了手动打包区域的繁琐工作（典型场景：嵌入式开发）。这也使得全 LTO 在这种情况下可行，因为 IR 合并之前会阻止链接脚本引用输入文件。（<a href="https://github.com/llvm/llvm-project/pull/90007">#90007</a>）
+      </div>
+
+      <h4>zlib 默认压缩级别</h4>
+      <div class="co co-a">
+        <strong>行为变更</strong>
+        zlib 的默认压缩级别现在独立于链接器优化级别，固定为 <code>Z_BEST_SPEED</code>，以获得更快的链接速度。
+      </div>
+
+      <h4>zstd 多线程</h4>
+      <div class="co co-g">
+        <strong>构建依赖变更</strong>
+        zstd 压缩的并行处理不再要求构建时启用 <code>ZSTD_MULTITHREAD</code>。
+      </div>
+
+      <h4>GNU_PROPERTY_AARCH64_FEATURE_PAUTH</h4>
+      <div class="co co-g">
+        <strong>新增支持</strong>
+        LLD 现在支持 <code>GNU_PROPERTY_AARCH64_FEATURE_PAUTH</code> notes、<code>R_AARCH64_AUTH_ABS64</code> 和 <code>R_AARCH64_AUTH_RELATIVE</code> 重定位类型。（<a href="https://github.com/llvm/llvm-project/pull/72714">#72714</a>）
+      </div>
+
+      <h4>其他 LLD 改进</h4>
+      <ul>
+        <li><strong>-z pack-relative-relocs</strong>：当 AArch64 PAuth 启用时，现在在 <code>.rela.auth.dyn</code> 中编码 <code>R_AARCH64_AUTH_RELATIVE</code> 重定位。（<a href="https://github.com/llvm/llvm-project/pull/96496">#96496</a>）</li>
+        <li><strong>-z gcs / -z gcs-report</strong>：AArch64 Guarded Control Stack 扩展支持。</li>
+        <li><strong>--default-script / -dT</strong>：指定默认链接脚本（当 <code>--script</code>/<code>-T</code> 未指定时处理）。</li>
+        <li><strong>--force-group-allocation</strong>：丢弃 <code>SHT_GROUP</code> 节并合并重定位节。</li>
+        <li><strong>-z lrodata-after-bss</strong>：将 <code>.lrodata</code> 放在 <code>.bss</code> 之后。</li>
+        <li><strong>--export-dynamic</strong> 在 <code>-no-pie</code> 静态链接时不再创建动态节。</li>
+        <li><strong>Thumb2 PLT</strong>：现在支持 Cortex-M 处理器的 Thumb PLT。（<a href="https://github.com/llvm/llvm-project/pull/93644">#93644</a>）</li>
+      </ul>
+
+      <div class="co co-i">
+        <strong>对数通设备的价值</strong>
+        <code>--enable-non-contiguous-regions</code> 对嵌入式场景尤其有用，可自动处理内存区域溢出；<code>--compress-sections</code> 和 zstd 改进可减小固件体积；GNU_PROPERTY_AARCH64_FEATURE_PAUTH 和 GCS 支持完善了 AArch64 安全特性的链接器端处理。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== LLVM IR Changes ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bm">基础设施变更</span>
+      LLVM IR 关键变更
+    </div>
+    <div class="card-body">
+
+      <div class="co co-a">
+        <strong>多项 IR 层面的重要变更</strong>
+        LLVM 19 在 IR 层面引入了多项变更，包括 constexpr 移除、debug records 切换、新 GEP 标志、MMRAs 和 MC/DC 语义变更。
+      </div>
+
+      <h4>icmp/fcmp/shl constexpr 移除</h4>
+      <div class="co co-r">
+        <strong>破坏性变更</strong>
+        以下指令的常量表达式变体已被移除：<code>icmp</code>、<code>fcmp</code>、<code>shl</code>。任何使用这些 constexpr 的 IR 可能需要在升级时更新。这些移除是 LLVM 逐步淘汰 constexpr 的持续工作的一部分。
+      </div>
+
+      <div class="example-box">
+        <div class="label">需要更新的 IR 模式</div>
+        <pre class="cb"><span class="c">; 旧 IR（LLVM 18 及之前）：允许 icmp constexpr</span>
+@g = global i1 <span class="r">icmp</span> eq (i32 ptrtoint (ptr @foo to i32), i32 0)
+
+<span class="c">; LLVM 19：不再支持 icmp constexpr，</span>
+<span class="c">; 需改为在函数体内计算或使用其他方式表达</span></pre>
+      </div>
+
+      <h4>Debug intrinsics 切换到 Debug records</h4>
+      <div class="co co-a">
+        <strong>IR 表示层重大重构</strong>
+        LLVM 19 将 LLVM IR 中的调试信息基础设施从"debug intrinsics"（<code>llvm.dbg.value</code>、<code>llvm.dbg.declare</code> 等）切换为"debug records"——一种不嵌入指令流的独立调试数据表示。这是 LLVM 调试信息子系统自 2010 年以来最大的一次架构变更。
+      </div>
+
+      <p>传统的 debug intrinsics 作为 IR 指令嵌入在基本块中，与普通指令混合。这种设计要求优化 pass 专门处理 debug intrinsics，增加了每个 pass 的复杂度，且 debug intrinsics 可能干扰优化决策。Debug records 将这些调试信息从指令流中分离，存储为指令的附加标记，使优化 pass 可以在不感知调试信息的情况下正常工作。</p>
+
+      <div class="example-box">
+        <div class="label">IR 表示对比（概念层面）</div>
+        <div class="compare">
+          <div class="compare-col">
+            <div class="col-head old">旧：Debug Intrinsics（LLVM 18 及之前）</div>
+            <div class="col-body">
+              <pre class="cb"><span class="c">; Debug info 作为 IR 指令嵌入指令流</span>
+  %x = add i32 %a, %b
+  <span class="r">call void @llvm.dbg.value</span>(metadata i32 %x, ...)
+  %y = mul i32 %x, %c
+  <span class="r">call void @llvm.dbg.value</span>(metadata i32 %y, ...)
+  store i32 %y, ptr %p
+
+<span class="c">; 所有优化 pass 必须处理这些 dbg 调用</span></pre>
+            </div>
+          </div>
+          <div class="compare-col">
+            <div class="col-head new">新：Debug Records（LLVM 19+）</div>
+            <div class="col-body">
+              <pre class="cb"><span class="c">; Debug info 作为指令的附属数据</span>
+  %x = add i32 %a, %b    <span class="c">#+dbg(value: %x)</span>
+  %y = mul i32 %x, %c    <span class="c">#+dbg(value: %y)</span>
+  store i32 %y, ptr %p
+
+<span class="c">; 优化 pass 无需感知 debug records</span>
+<span class="c">; 指令移动/删除时 debug info 自动跟随</span></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <h4>nusw / nuw GEP 标志</h4>
+      <p><code>getelementptr</code> 指令新增了 <code>nusw</code>（No Unsigned Signed Wrap）和 <code>nuw</code>（No Unsigned Wrap）标志。这些标志为指针算术提供了无符号/有符号溢出保证，使优化器能够基于这些不变式进行更激进的优化。</p>
+
+      <h4>MMRAs（Memory Model Relaxation Annotations）</h4>
+      <p>新增了 Memory Model Relaxation Annotations（MMRAs），用于标注内存访问操作的内存模型宽松语义信息。这些注解帮助优化器在符合内存模型约束的前提下进行更精确的代码变换。</p>
+
+      <h4>MC/DC 语义变更</h4>
+      <div class="co co-a">
+        <strong>MC/DC intrinsics 语义调整</strong>
+        MC/DC（Modified Condition/Decision Coverage）相关 intrinsics 的语义发生变化：<code>llvm.instprof.mcdc.parameters</code> 的第 3 个参数从字节改为位；<code>llvm.instprof.mcdc.condbitmap.update</code> 已移除；<code>llvm.instprof.mcdc.tvbitmap.update</code> 的第 3 个参数已移除，下一个参数从字节索引改为位索引。
+      </div>
+
+      <div class="co co-i">
+        <strong>对数通产品线的影响</strong>
+        icmp/fcmp/shl constexpr 移除主要影响手写 LLVM IR 的工具和下游 pass。Debug records 切换对大多数用户透明，LLVM 19 仍能读取旧式 IR 并自动转换。nusw/nuw GEP 和 MMRAs 是优化器改进，对前端用户透明。MC/DC 语义变更影响代码覆盖率工具的用户。数通设备开发者若维护了自定义 LLVM pass，需要适配 debug records API。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== 3DNow! / KNL/KNM Removal ====== -->
   <div class="card">
     <div class="card-title">
       <span class="bh">ISA 移除</span>
@@ -568,6 +1132,39 @@ clang <span class="k">-mtune=</span><span class="r">knm</span> example.c    <spa
       <div class="co co-a">
         <strong>对数通设备的影响</strong>
         数通产品线主要面向 AArch64 平台，3DNow! 和 KNL/KNM 移除<strong>基本无影响</strong>。但如果构建系统中有 x86 回退路径、仿真测试环境或交叉编译脚本引用了 <code>-march=knl</code>/<code>-march=knm</code> 或 3DNow! intrinsics，需要清理或更新这些引用。使用 3DNow! 指令的遗留 x86 代码需要迁移到 SSE/AVX 指令集。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== -Ofast Deprecated + TERMINFO ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bm">弃用与移除</span>
+      -Ofast 弃用 / LLVM_ENABLE_TERMINFO 移除 / Python 3.8
+    </div>
+    <div class="card-body">
+
+      <h4>-Ofast 已弃用</h4>
+      <div class="co co-a">
+        <strong>编译器标志变更</strong>
+        <code>-Ofast</code> 命令行选项已被弃用。该选项同时启用 <code>-O3</code> 优化级别和<strong>非标准</strong>的 <code>-ffast-math</code> 行为，因此作为"优化级别"具有误导性。建议用户改用 <code>-O3 -ffast-math</code>（如需非标准数学行为）或 <code>-O3</code>（标准行为）。详见 <a href="https://discourse.llvm.org/t/rfc-deprecate-ofast/78687">RFC</a>。
+      </div>
+
+      <h4>LLVM_ENABLE_TERMINFO 移除</h4>
+      <div class="co co-r">
+        <strong>构建系统变更</strong>
+        <code>LLVM_ENABLE_TERMINFO</code> CMake 标志已被移除。LLVM 不再依赖 terminfo，现在始终使用 <code>TERM</code> 环境变量进行颜色支持自动检测。
+      </div>
+
+      <h4>Python 最低版本 3.6 &rarr; 3.8</h4>
+      <div class="co co-r">
+        <strong>依赖变更</strong>
+        整个 LLVM 项目的最低 Python 版本已从 3.6 提升到 <strong>3.8</strong>。这使得可以使用更多现代 Python 特性，使代码更接近现代 Python 最佳实践，并改善 CI 可维护性。详见 <a href="https://github.com/llvm/llvm-project/pull/78828">#78828</a>。
+      </div>
+
+      <div class="co co-i">
+        <strong>对数通设备的影响</strong>
+        <code>-Ofast</code> 弃用意味着现有构建脚本中的 <code>-Ofast</code> 应替换为 <code>-O3 -ffast-math</code>（或仅 <code>-O3</code>）。Python 3.8 要求影响构建服务器——确保构建环境中的 Python 版本不低于 3.8（对于使用较旧 LTS 发行版的构建服务器，可能需要注意此变更）。
       </div>
     </div>
   </div>
@@ -642,107 +1239,6 @@ ld.lld <span class="k">-z</span> gcs-report <span class="k">-o</span> output *.o
     </div>
   </div>
 
-  <!-- ====== Debug records ====== -->
-  <div class="card">
-    <div class="card-title">
-      <span class="bm">基础设施变更</span>
-      Debug intrinsics &rarr; Debug records
-    </div>
-    <div class="card-body">
-
-      <div class="co co-a">
-        <strong>IR 表示层重大重构</strong>
-        LLVM 19 将 LLVM IR 中的调试信息基础设施从"debug intrinsics"（<code>llvm.dbg.value</code>、<code>llvm.dbg.declare</code> 等）切换为"debug records"——一种不嵌入指令流的独立调试数据表示。这是 LLVM 调试信息子系统自 2010 年以来最大的一次架构变更。
-      </div>
-
-      <h4>变更动机</h4>
-      <p>传统的 debug intrinsics 作为 IR 指令嵌入在基本块中，与普通指令混合。这种设计存在几个问题：</p>
-      <ul>
-        <li>优化 pass 需要<strong>专门处理</strong> debug intrinsics（跳过、保留、更新），增加了每个 pass 的复杂度</li>
-        <li>debug intrinsics 的存在可能<strong>干扰优化决策</strong>（如指令合并、重排序等）</li>
-        <li>维护 debug info 正确性在大量 pass 的流转中极其困难</li>
-      </ul>
-      <p>Debug records 将这些调试信息从指令流中分离，存储为指令的"附加标记"，使优化 pass 可以在<strong>不感知调试信息</strong>的情况下正常工作。</p>
-
-      <h4>技术细节</h4>
-      <div class="example-box">
-        <div class="label">IR 表示对比（概念层面）</div>
-        <div class="compare">
-          <div class="compare-col">
-            <div class="col-head old">旧：Debug Intrinsics（LLVM 18 及之前）</div>
-            <div class="col-body">
-              <pre class="cb"><span class="c">; Debug info 作为 IR 指令嵌入指令流</span>
-  %x = add i32 %a, %b
-  <span class="r">call void @llvm.dbg.value</span>(metadata i32 %x, ...)
-  %y = mul i32 %x, %c
-  <span class="r">call void @llvm.dbg.value</span>(metadata i32 %y, ...)
-  store i32 %y, ptr %p
-
-<span class="c">; 所有优化 pass 必须处理这些 dbg 调用</span></pre>
-            </div>
-          </div>
-          <div class="compare-col">
-            <div class="col-head new">新：Debug Records（LLVM 19+）</div>
-            <div class="col-body">
-              <pre class="cb"><span class="c">; Debug info 作为指令的附属数据</span>
-  %x = add i32 %a, %b    <span class="c">#+dbg(value: %x)</span>
-  %y = mul i32 %x, %c    <span class="c">#+dbg(value: %y)</span>
-  store i32 %y, ptr %p
-
-<span class="c">; 优化 pass 无需感知 debug records</span>
-<span class="c">; 指令移动/删除时 debug info 自动跟随</span></pre>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <h4>影响与注意事项</h4>
-      <div class="co co-a">
-        <strong>对大多数用户透明，但对以下场景有影响</strong>
-      </div>
-
-      <ul>
-        <li><strong>手写 LLVM IR 的工具</strong>：如果代码生成工具直接构造 <code>llvm.dbg.value</code> / <code>llvm.dbg.declare</code> intrinsics，需要更新为使用新的 debug records API（或者通过自动转换层兼容）</li>
-        <li><strong>LLVM IR 解析器</strong>：LLVM 19 仍能读取包含旧式 debug intrinsics 的 <code>.ll</code> 文件，并在内部自动转换为 debug records</li>
-        <li><strong>LLVM Pass 开发者</strong>：自定义 pass 中手动处理 debug intrinsics 的代码可以大幅简化——不再需要显式跳过或保留 debug 指令</li>
-        <li><strong>IR 输出</strong>：<code>llvm-dis</code> 等工具输出的 IR 文本默认为新格式。可使用 <code>--write-if-empty</code> 等选项控制输出行为</li>
-        <li><strong>LTO 调试信息体积</strong>：Debug records 的设计减少了调试信息的冗余，LTO 场景下的调试信息体积可能有所改善</li>
-      </ul>
-
-      <div class="example-box">
-        <div class="label">兼容性说明</div>
-        <pre class="cb"><span class="c"># 1. 旧的 .ll 文件仍可被解析</span>
-<span class="c"># LLVM 19 的 IR parser 会自动将旧的 dbg intrinsics</span>
-<span class="c"># 转换为 debug records，无需手动修改已有 IR</span>
-
-<span class="c"># 2. 新的 IR pass 无需处理 debug info</span>
-<span class="c"># 旧写法（LLVM 18 pass）：</span>
-<span class="k">for</span> (Instruction &amp;I : BB) {
-    <span class="k">if</span> (isa&lt;DbgInfoIntrinsic&gt;(&amp;I))
-        <span class="k">continue</span>;  <span class="c">// 手动跳过 debug 指令</span>
-    <span class="c">// ... 处理 I</span>
-}
-
-<span class="c"># 新写法（LLVM 19 pass）：</span>
-<span class="k">for</span> (Instruction &amp;I : BB) {
-    <span class="c">// 直接处理所有指令，无需过滤</span>
-    <span class="c">// debug records 会自动跟随 I 移动/删除</span>
-}
-
-<span class="c"># 3. 如需手动处理 debug records（少数场景）</span>
-<span class="k">for</span> (DbgRecord &amp;DR : I.getDbgRecordRange()) {
-    <span class="c">// DR 是与指令 I 关联的 debug record</span>
-}
-</pre>
-      </div>
-
-      <div class="co co-i">
-        <strong>对数通产品线的影响</strong>
-        对数通设备开发者而言，此项变更<strong>基本透明</strong>。主要影响在 LLVM 工具链开发者层面：如果数通团队维护了自定义的 LLVM pass（针对特定硬件优化的 pass），需要将 pass 中手动处理 debug intrinsics 的代码适配为 debug records 模式。对于纯前端使用者，调试信息质量（DWARF 输出）不受影响，甚至可能因不再干扰优化 pass 而获得更好的优化后调试体验。
-      </div>
-    </div>
-  </div>
-
   <!-- ====== SUMMARY TABLE ====== -->
   <div class="card">
     <div class="card-title">LLVM 19 变更影响矩阵</div>
@@ -770,6 +1266,24 @@ ld.lld <span class="k">-z</span> gcs-report <span class="k">-o</span> output *.o
             <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bg">P2 推荐启用</span></td>
           </tr>
           <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">FMV ifunc 别名移除</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">AArch64 ABI</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">极少数场景受影响</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 评估</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">新 CPU 支持</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">AArch64</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">正面 — 新硬件适配</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 了解</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">C 原始字符串字面量</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">C 语言</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">C 代码中 R"(...)" 可能被新解析</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 验证</span></td>
+          </tr>
+          <tr>
             <td style="padding:7px 11px;border-bottom:1px solid var(--border)">模板参数自阴影诊断</td>
             <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">C++</span></td>
             <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">可能导致编译失败</td>
@@ -782,10 +1296,76 @@ ld.lld <span class="k">-z</span> gcs-report <span class="k">-o</span> output *.o
             <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 需验证</span></td>
           </tr>
           <tr>
-            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">3DNow!/KNL/KNM 移除</td>
-            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">x86 ISA</span></td>
-            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">基本无影响</td>
-            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 清理引用</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">decltype 不再形成成员指针</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">C++</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">模板元编程 SFINAE 行为变更</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 需验证</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">libstdc++ 14.1.0 兼容性</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">C++ 标准库</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">需 14.1.1+ 版本来修复编译错误</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bh">P0 检查版本</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">-fdelayed-template-parsing</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">C++</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">不再强制需要，可尝试移除</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bg">P2 建议尝试</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">MSVC 名称修饰修复</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">ABI 兼容</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">Windows/MSVC 互操作场景</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 评估</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">MSVC 调用约定修复</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">ABI 兼容</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">Windows/MSVC 互操作场景</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 评估</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">LLD --build-id 默认变更</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">链接器</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">固件体积微增(8B&rarr;20B)</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 了解</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">LLD CREL / compress-sections</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">链接器</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">可选优化 — 减少二进制体积</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bg">P2 建议评估</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">--enable-non-contiguous-regions</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">链接器</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">正面 — 简化嵌入式链接脚本</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bg">P2 建议评估</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">icmp/fcmp/shl constexpr 移除</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">LLVM IR</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">影响手写 IR / 下游工具</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 验证</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">Debug records 切换</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">基础设施</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">对大部分用户透明</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 验证LTO</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">nusw/nuw GEP + MMRAs</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">LLVM IR</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">优化器改进，前端透明</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P3 了解</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">MC/DC 语义变更</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">LLVM IR</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">代码覆盖率工具受影响</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 评估</span></td>
           </tr>
           <tr>
             <td style="padding:7px 11px;border-bottom:1px solid var(--border)">GCS 链接器支持</td>
@@ -794,10 +1374,28 @@ ld.lld <span class="k">-z</span> gcs-report <span class="k">-o</span> output *.o
             <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bg">P2 建议评估</span></td>
           </tr>
           <tr>
-            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">Debug records 切换</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">3DNow!/KNL/KNM 移除</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">x86 ISA</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">基本无影响</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 清理引用</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">-Ofast 弃用</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">编译器标志</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">构建脚本需替换 -Ofast</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 构建脚本</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">LLVM_ENABLE_TERMINFO 移除</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">构建系统</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">构建配置需移除该标志</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 构建配置</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">Python 3.6 &rarr; 3.8</td>
             <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">基础设施</span></td>
-            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">对大部分用户透明</td>
-            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 验证LTO</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">构建服务器 Python 需升级</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bh">P0 环境检查</span></td>
           </tr>
         </tbody>
       </table>
@@ -808,7 +1406,7 @@ ld.lld <span class="k">-z</span> gcs-report <span class="k">-o</span> output *.o
 
 <footer class="footer">
   <p>LLVM 19 差异详解 &nbsp;&middot;&nbsp; 分析日期：2026-07-10 &nbsp;&middot;&nbsp; 毕昇编译器升级工程</p>
-  <p style="margin-top:4px;font-size:12px">专为数通产品线编制 &middot; 仅供内部技术评估使用</p>
+  <p style="margin-top:4px;font-size:12px">专为数通产品线编制 &middot; 基于 LLVM 19.1.0 上游发布版本 &middot; 仅供内部技术评估使用</p>
 </footer>
 
 </body>

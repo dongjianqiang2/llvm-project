@@ -170,7 +170,7 @@
 <header class="header">
   <div class="header-badge">LLVM 18.1 · 2024年3月发布</div>
   <h1>LLVM 18 差异详解</h1>
-  <p class="subtitle">毕昇编译器升级 — 函数模板 Name Mangling、__int128 ABI、PCH、常量表达式、FatLTO 等关键变更详细说明</p>
+  <p class="subtitle">毕昇编译器升级 — 函数模板 Name Mangling、__int128 ABI、PCH、常量表达式、FatLTO、C++20 Modules、AArch64、LLD 等关键变更详细说明</p>
   <a class="back" href="index.html">&larr; 返回主页</a>
 </header>
 
@@ -187,16 +187,21 @@
   </div>
   <div class="section-body">
     <p>LLVM 18 是 2024 年 3 月发布的稳定版本，在 Clang 前端、LLVM 核心、链接器等组件中引入了多个重要的行为变更。其中<strong>函数模板名称重整（Name Mangling）</strong>是最关键的 ABI Break，直接影响所有依赖动态库和插件系统的 C++ 代码。</p>
-    <p>本章节详细覆盖以下七个关键变更，每个变更都包含问题说明、代码示例、影响评估及应对方案。</p>
+    <p>本章节详细覆盖以下关键变更，每个变更都包含问题说明、代码示例、影响评估及应对方案。</p>
 
     <div class="flex flex-wrap gap-3 mt-14">
       <span class="bh">ABI Break</span> 函数模板名称重整
       <span class="bm">ABI 变更</span> __int128 x86-64 SystemV
-      <span class="bm">语言行为</span> 模板化 operator== 反转
+      <span class="bm">语言行为</span> 模板化 operator== 反转 / operator!= 修复
       <span class="bm">构建系统</span> PCH 扩展名变更
       <span class="bh">LLVM 19 Error</span> -Wenum-constexpr-conversion
-      <span class="bm">IR 变更</span> 常量表达式变体移除
+      <span class="bm">IR 变更</span> 常量表达式变体移除 / 栈内建函数
       <span class="bg">新特性</span> FatLTO 支持
+      <span class="bm">AST / C++</span> 延迟模板解析 / Modules / AST 节点
+      <span class="bm">Darwin</span> TARGET_OS_* 宏默认定义
+      <span class="bm">诊断</span> __has_cpp_attribute 修正
+      <span class="bg">LLD</span> Bsymbolic / cdsort / OVERLAY / save-temps
+      <span class="bg">AArch64</span> Cortex-A520/A720/X4 / 2023 扩展
     </div>
   </div>
 </section>
@@ -228,6 +233,14 @@
         旧版本的 Clang 在某些情况下未严格遵守此规范，LLVM 18 修复了这一问题。
       </p>
     </div>
+
+    <h4>四种受影响场景</h4>
+    <ol>
+      <li><strong>模板参数依赖于前一个参数</strong>，如 <code>template&lt;typename T, T V&gt; void f()</code></li>
+      <li><strong>函数带有任何约束（constraints）</strong>，包括 constrained template parameters 或 requires-clauses</li>
+      <li><strong>模板参数列表包含推导类型</strong>，包括 <code>auto</code>、<code>decltype(auto)</code> 或推导的类模板特化类型</li>
+      <li><strong>模板模板参数</strong>被赋予不同模板参数列表的模板模板实参</li>
+    </ol>
 
     <h4>场景一：模板参数依赖前一个参数</h4>
     <div class="example-box">
@@ -424,22 +437,22 @@ nm example_new.o | c++filt</pre>
 </section>
 
 <!-- ══════════════════════════════════════════════════════
-     3. TEMPLATE OPERATOR== REVERSAL FIX
+     3. TEMPLATE OPERATOR== REVERSAL + OPERATOR!= FIX
      ══════════════════════════════════════════════════════ -->
 <section id="operator-reversal" class="section">
   <div class="section-header">
     <span class="num">3</span>
-    <h2>模板化 operator== 反转修复</h2>
+    <h2>模板化 operator== 反转修复 &amp; operator!= 查找修复</h2>
     <span class="bm">C++20 语言行为变更</span>
   </div>
   <div class="section-body">
 
     <div class="co co-a">
       <strong>&#128993; C++20 operator== 重写规则的边界情况修正</strong>
-      LLVM 18 修复了模板化 <code>operator==</code> 在 C++20 反转重写规则下的处理，之前被接受的某些代码现在可能变为歧义。
+      LLVM 18 修复了模板化 <code>operator==</code> 在 C++20 反转重写规则下的处理，以及 <code>operator!=</code> 配合反转 <code>operator==</code> 时的查找缺陷。
     </div>
 
-    <h4>变更说明</h4>
+    <h4>变更一：模板化 operator== 反转歧义修复</h4>
     <p>C++20 引入了 <code>operator==</code> 的<strong>反转重写规则</strong>（reversed rewriting）：如果 <code>a == b</code> 找不到匹配的 <code>operator==(a, b)</code>，编译器会尝试反转参数顺序，查找 <code>operator==(b, a)</code>。</p>
     <p>LLVM 18 修复了此规则应用于<strong>模板化 operator==</strong> 时的一个问题。对于某些同时定义了正向和反向匹配的模板 operator== 场景，之前 Clang 会接受（选出一个候选），现在正确报告为<strong>歧义</strong>（ambiguous）。这可能导致之前可编译通过的代码在 LLVM 18 下编译失败。</p>
 
@@ -463,10 +476,31 @@ nm example_new.o | c++filt</pre>
 <span class="k">void</span> <span class="f">test</span>() {
     P p1, p2;
     <span class="k">if</span> (p1 == p2) {  <span class="c">// 歧义：候选1 正向匹配 (P, P)</span>
-                        <span class="c">//       候选2 反转匹配  P==P → P==P 反转</span>
+                        <span class="c">//       候选2 反转匹配  P==P -&gt; P==P 反转</span>
                         <span class="c">// LLVM 18 报告：call to 'operator==' is ambiguous</span>
     }
 }</pre>
+    </div>
+
+    <h4>变更二：operator!= 配合反转 operator== 的查找修复（P2468）</h4>
+    <p>C++20 引入了<strong>基于 operator== 自动合成 != 表达式</strong>的规则。根据 P2468R2 "The Equality Operator You Are Looking For"，编译器在查找 <code>operator!=</code> 时也需要考虑反转的 <code>operator==</code>。LLVM 18 修复了此前 Clang 在查找匹配的 <code>operator!=</code> 时的缺陷，使得带有反转 operator== 的 != 调用能正确匹配。</p>
+
+    <div class="example-box">
+      <div class="label">示例 — operator!= 通过反转 operator== 匹配</div>
+      <pre class="cb"><span class="c">// P2468R2 场景：operator!= 的查找考虑反转 operator==</span>
+
+<span class="k">struct</span> <span class="f">P</span> {};
+<span class="k">template</span>&lt;<span class="k">class</span> S&gt; <span class="k">bool</span> <span class="k">operator</span>==(<span class="k">const</span> P&amp;, <span class="k">const</span> S&amp;);
+
+<span class="k">struct</span> <span class="f">A</span> : <span class="k">public</span> P {};
+<span class="k">struct</span> <span class="f">B</span> : <span class="k">public</span> P {};
+
+<span class="c">// 这个相等比较现在在 C++20 中是歧义的</span>
+<span class="k">bool</span> <span class="f">ambiguous</span>(A a, B b) { <span class="k">return</span> a == b; }
+
+<span class="k">template</span>&lt;<span class="k">class</span> S&gt; <span class="k">bool</span> <span class="k">operator</span>!=(<span class="k">const</span> P&amp;, <span class="k">const</span> S&amp;);
+<span class="c">// OK：找到了匹配的 operator!=</span>
+<span class="k">bool</span> <span class="f">fine</span>(A a, B b) { <span class="k">return</span> a == b; }</pre>
     </div>
 
     <h4>诊断与处理</h4>
@@ -481,6 +515,7 @@ nm example_new.o | c++filt</pre>
       <li>启用 <code>-Wambiguous-reversed-operator</code> 在升级前检测潜在歧义</li>
       <li>对于确实歧义的 operator== 调用，显式指定候选（例如添加更特化的重载）</li>
       <li>检查代码中自定义的模板化 operator==，特别是涉及对称比较运算符的场景</li>
+      <li>对于依赖 operator!= 反转匹配的代码，确认升级后行为符合预期（P2468 语义）</li>
     </ul>
   </div>
 </section>
@@ -491,7 +526,7 @@ nm example_new.o | c++filt</pre>
 <section id="pch-extension" class="section">
   <div class="section-header">
     <span class="num">4</span>
-    <h2>PCH 扩展名改为 .pch</h2>
+    <h2>PCH 扩展名从 .gch 改为 .pch</h2>
     <span class="bm">构建系统适配</span>
   </div>
   <div class="section-body">
@@ -504,8 +539,9 @@ nm example_new.o | c++filt</pre>
     <h4>变更说明</h4>
     <p>预编译头部（Precompiled Header）是加速 C/C++ 编译的重要机制。LLVM 18 对 PCH 文件的处理做了两项关键变更：</p>
     <ol>
-      <li><strong>默认扩展名改为 <code>.pch</code></strong>：使用 <code>clang -x c++-header</code> 编译头部生成的预编译文件，旧版本使用 <code>.h.gch</code> 作为扩展名，LLVM 18 改为 <code>.h.pch</code></li>
+      <li><strong>默认扩展名改为 <code>.pch</code></strong>：使用 <code>clang -x c++-header</code> 编译头部生成的预编译文件，旧版本使用 <code>.h.gch</code>（GCC 兼容）作为扩展名，LLVM 18 改为 <code>.h.pch</code></li>
       <li><strong><code>-include</code> 不再查找 <code>.gch</code></strong>：<code>-include a.h</code> 在旧版本中会自动查找 <code>a.h.gch</code> 作为 PCH 文件。LLVM 18 起只查找 <code>a.h.pch</code>（如果存在），不再回退到 <code>.gch</code></li>
+      <li><strong>已有 .gch 文件的处理</strong>：如果 <code>a.h.gch</code> 不是有效的 Clang PCH 文件（或是目录但其中没有 PCH），<code>-include a.h</code> 会忽略它</li>
     </ol>
 
     <h4>影响示例</h4>
@@ -513,12 +549,12 @@ nm example_new.o | c++filt</pre>
       <div class="label">示例 — PCH 生成和使用</div>
       <pre class="cb"><span class="c"># 旧行为 (LLVM 17 及之前)：</span>
 clang++-17 -x c++-header common.h -o common.h.gch        <span class="c"># 生成 .gch</span>
-clang++-17 -include common.h main.cpp                    <span class="c"># 自动查找 common.h.gch ✓</span>
+clang++-17 -include common.h main.cpp                    <span class="c"># 自动查找 common.h.gch &#10003;</span>
 
 <span class="c"># 新行为 (LLVM 18)：</span>
 clang++-18 -x c++-header common.h -o common.h.pch        <span class="c"># 生成 .pch</span>
-clang++-18 -include common.h main.cpp                    <span class="c"># 自动查找 common.h.pch ✓</span>
-                                                         <span class="c"># 不再查找 common.h.gch ✗</span></pre>
+clang++-18 -include common.h main.cpp                    <span class="c"># 自动查找 common.h.pch &#10003;</span>
+                                                         <span class="c"># 不再查找 common.h.gch &#10007;</span></pre>
     </div>
 
     <h4>影响评估</h4>
@@ -588,13 +624,13 @@ main.o: main.cpp <span class="k">$(PCH_FILE)</span>
   <div class="section-body">
 
     <div class="co co-r">
-      <strong>&#128308; LLVM 18 在系统头文件中默认启用；LLVM 19/20 起升级为不可压制的硬 Error</strong>
-      这是一个<strong>分期收紧</strong>的变更：LLVM 18 只是默认启用告警，LLVM 19/20 将升级为强制错误。在 LLVM 18 阶段必须完成相关代码的修复。
+      <strong>&#128308; LLVM 18 在系统头文件和宏中默认启用；LLVM 19/20 起升级为不可压制的硬 Error</strong>
+      这是一个<strong>分期收紧</strong>的变更：LLVM 18 只是默认启用告警（包括系统头文件和宏），LLVM 19/20 将升级为强制错误。在 LLVM 18 阶段必须完成相关代码的修复。
     </div>
 
     <h4>变更说明</h4>
     <p><code>-Wenum-constexpr-conversion</code> 检测<strong>编译期</strong>将超出枚举范围的整数值转换为枚举类型的操作。C++ 标准规定，枚举类型的值必须在其底层类型能表示的范围内且与某个枚举器对应（或有足够的位宽表示所有枚举器的组合）。</p>
-    <p>LLVM 18 之前，此告警在<strong>系统头文件</strong>（如标准库头文件）中被默认静默。LLVM 18 起，该告警在系统头文件中<strong>默认启用</strong>。LLVM 19/20 将其升级为<strong>硬 Error</strong>，不可通过编译选项降级。</p>
+    <p>LLVM 18 之前，此告警在<strong>系统头文件和宏</strong>中被默认静默。LLVM 18 起，该告警在系统头文件和宏中<strong>默认启用</strong>。LLVM 19/20 将升级为<strong>硬 Error</strong>，不可通过编译选项降级。</p>
 
     <h4>代码示例</h4>
     <div class="example-box">
@@ -602,7 +638,7 @@ main.o: main.cpp <span class="k">$(PCH_FILE)</span>
       <pre class="cb"><span class="c">// 定义一个只有两个有效值的枚举</span>
 <span class="k">enum</span> <span class="f">E</span> { A, B };  <span class="c">// A=0, B=1, 底层类型为 int</span>
 
-<span class="c">// LLVM 18：触发 -Wenum-constexpr-conversion 告警</span>
+<span class="c">// LLVM 18：触发 -Wenum-constexpr-conversion 告警（包括系统头文件中）</span>
 <span class="c">// LLVM 19/20：编译错误</span>
 <span class="k">constexpr</span> <span class="f">E</span> v1 = (<span class="f">E</span>)10;     <span class="c">// 10 超出 [0,1] 范围，错误！</span>
 
@@ -640,12 +676,12 @@ main.o: main.cpp <span class="k">$(PCH_FILE)</span>
       <tbody>
         <tr>
           <td><strong>LLVM 17 及之前</strong></td>
-          <td>系统头文件内不告警</td>
+          <td>系统头文件和宏内不告警</td>
           <td>无影响</td>
         </tr>
         <tr>
           <td><strong>LLVM 18</strong></td>
-          <td>系统头文件中默认启用告警（warning）</td>
+          <td>系统头文件和宏中默认启用告警（warning）</td>
           <td>可暂时用 <code>-Wno-enum-constexpr-conversion</code> 降级</td>
         </tr>
         <tr>
@@ -672,26 +708,25 @@ main.o: main.cpp <span class="k">$(PCH_FILE)</span>
 </section>
 
 <!-- ══════════════════════════════════════════════════════
-     6. CONSTANT EXPRESSION VARIANTS REMOVED
+     6. LLVM IR CONSTANTEXPR REMOVAL + STACKSAVE OVERLOAD
      ══════════════════════════════════════════════════════ -->
 <section id="constantexpr-removal" class="section">
   <div class="section-header">
     <span class="num">6</span>
-    <h2>大量常量表达式变体移除</h2>
+    <h2>LLVM IR 变更：常量表达式变体移除 &amp; 栈内建函数重载</h2>
     <span class="bm">LLVM IR 变更</span>
   </div>
   <div class="section-body">
 
     <div class="co co-a">
-      <strong>&#128993; LLVM IR 中的多种 ConstantExpr 子类被移除</strong>
+      <strong>&#128993; LLVM IR 中的多种 ConstantExpr 子类被移除；栈内建函数指针重载</strong>
       直接影响手写 LLVM IR 或使用 LLVM C++ API 构建 IR 的工具。纯 C/C++ 源码编译的用户不受直接影响。
     </div>
 
-    <h4>变更说明</h4>
-    <p>LLVM IR 中的 <code>ConstantExpr</code> 表示编译期可计算的常量表达式。历史上，LLVM 为每种二元运算都定义了对应的常量表达式子类。随着 LLVM 向 opaque pointers 和其他 IR 现代化方向的演进，许多常量表达式变体变得冗余，LLVM 18 移除了一批不再需要的变体。</p>
-    <p>移除后，这些操作在编译期仍可正常计算，只是不再以独立的 ConstantExpr 子类表示，而是统一使用 <code>ConstantFold</code> 机制处理。</p>
+    <h4>变更一：常量表达式变体移除</h4>
+    <p>LLVM IR 中的 <code>ConstantExpr</code> 表示编译期可计算的常量表达式。历史上，LLVM 为每种二元运算都定义了对应的常量表达式子类。随着 LLVM 向 opaque pointers 和其他 IR 现代化方向的演进，许多常量表达式变体变得冗余。LLVM 18 移除了一批不再需要的变体。移除后，这些操作在编译期仍可正常计算，只是不再以独立的 ConstantExpr 子类表示，而是统一使用 <code>ConstantFold</code> 机制处理。</p>
 
-    <h4>移除的常量表达式变体</h4>
+    <h4>移除的常量表达式变体（共 12 种）</h4>
     <table>
       <thead><tr><th>类别</th><th>移除的 ConstantExpr 变体</th><th>说明</th></tr></thead>
       <tbody>
@@ -701,27 +736,20 @@ main.o: main.cpp <span class="k">$(PCH_FILE)</span>
           <td>按位与、或、逻辑右移、算术右移</td>
         </tr>
         <tr>
-          <td><strong>整数扩展/截断</strong></td>
-          <td><code>ZExt</code>、<code>SExt</code>、<code>Trunc</code></td>
-          <td>零扩展、符号扩展、整数截断</td>
+          <td><strong>整数扩展</strong></td>
+          <td><code>ZExt</code>、<code>SExt</code></td>
+          <td>零扩展、符号扩展</td>
         </tr>
         <tr>
           <td><strong>浮点转换</strong></td>
           <td><code>FPTrunc</code>、<code>FPExt</code>、<code>FPToUI</code>、<code>FPToSI</code>、<code>UIToFP</code>、<code>SIToFP</code></td>
-          <td>浮点截断、浮点扩展、浮点转整数（有/无符号）、整数转浮点（无/有符号）</td>
-        </tr>
-        <tr>
-          <td><strong>指针操作</strong></td>
-          <td><code>PtrToInt</code>、<code>IntToPtr</code>、<code>BitCast</code>、<code>AddrSpaceCast</code></td>
-          <td>指针与整数互转、bitcast、地址空间转换</td>
-        </tr>
-        <tr>
-          <td><strong>聚合操作</strong></td>
-          <td><code>ExtractElement</code>、<code>InsertElement</code>、<code>ShuffleVector</code></td>
-          <td>向量元素提取/插入/重排</td>
+          <td>浮点精度截断/扩展、浮点转整数、整数转浮点</td>
         </tr>
       </tbody>
     </table>
+
+    <h4>变更二：llvm.stacksave / llvm.stackrestore 指针类型重载</h4>
+    <p><code>llvm.stacksave</code> 和 <code>llvm.stackrestore</code> 内建函数现在使用<strong>重载的指针类型</strong>（overloaded pointer type），以支持非零地址空间（non-0 address spaces）。此前这些内建函数仅支持默认地址空间（address space 0），LLVM 18 扩展为支持任意地址空间，使得 GPU 等使用非零地址空间的后端也能正确使用栈操作。</p>
 
     <h4>代码示例</h4>
     <div class="example-box">
@@ -749,6 +777,18 @@ Constant *C = ConstantFoldCastOperand(Instruction::ZExt, Value, Int64Ty, DL);
 <span class="k">@g</span> = <span class="k">global</span> i64 0  <span class="c">; 改为运行时初始化或使用 ConstantFold</span></pre>
     </div>
 
+    <div class="example-box">
+      <div class="label">示例 — llvm.stacksave/llvm.stackrestore 地址空间</div>
+      <pre class="cb"><span class="c">; 旧（LLVM 17）：指针类型固定为 ptr（addrspace 0）</span>
+<span class="k">%sp</span> = <span class="k">call</span> ptr @llvm.stacksave()
+<span class="k">call</span> <span class="k">void</span> @llvm.stackrestore(ptr %sp)
+
+<span class="c">; 新（LLVM 18+）：支持非零地址空间的 ptr</span>
+<span class="k">%sp</span> = <span class="k">call</span> ptr addrspace(5) @llvm.stacksave.p5()
+<span class="k">call</span> <span class="k">void</span> @llvm.stackrestore.p5(ptr addrspace(5) %sp)
+<span class="c">; 主要影响 GPU 后端（AMDGPU、NVPTX 等）</span></pre>
+    </div>
+
     <h4>影响评估</h4>
     <table>
       <thead><tr><th style="width:22%">用户类别</th><th style="width:78%">影响</th></tr></thead>
@@ -763,7 +803,7 @@ Constant *C = ConstantFoldCastOperand(Instruction::ZExt, Value, Int64Ty, DL);
         </tr>
         <tr>
           <td><span class="bm">手写/生成 LLVM IR 的工具</span></td>
-          <td><strong>需要更新 IR 生成逻辑</strong> — 不能再在常量表达式中使用已移除的操作类型</td>
+          <td><strong>需要更新 IR 生成逻辑</strong> — 不能再在常量表达式中使用已移除的操作类型；llvm.stacksave 地址空间参数需适配</td>
         </tr>
         <tr>
           <td><span class="bh">LLVM Pass 插件</span></td>
@@ -778,6 +818,7 @@ Constant *C = ConstantFoldCastOperand(Instruction::ZExt, Value, Int64Ty, DL);
       <li><strong>有自定义 LLVM Pass</strong>：检查 Pass 代码中是否使用了已移除的 ConstantExpr API，替换为新的常量折叠接口</li>
       <li><strong>生成 IR 的工具</strong>：检查生成的 IR 中是否包含已移除的常量表达式语法，改用指令序列</li>
       <li><strong>汇编级别的 IR 测试</strong>：更新 <code>.ll</code> 测试文件，移除已废弃的常量表达式用法</li>
+      <li><strong>GPU 后端用户</strong>：确认 llvm.stacksave/llvm.stackrestore 的地址空间参数正确</li>
     </ul>
   </div>
 </section>
@@ -864,6 +905,414 @@ ld.lld --fat-lto-objects foo.o bar.o -o app
 </section>
 
 <!-- ══════════════════════════════════════════════════════
+     8. C++ LANGUAGE & AST CHANGES
+     ══════════════════════════════════════════════════════ -->
+<section id="cpp-language-ast" class="section">
+  <div class="section-header">
+    <span class="num">8</span>
+    <h2>C++ 语言与 AST 变更</h2>
+    <span class="bm">语言行为 / AST 破坏性变更</span>
+  </div>
+  <div class="section-body">
+
+    <h4>8.1 ClassScopeFunctionSpecializationDecl AST 节点移除</h4>
+    <p><code>ClassScopeFunctionSpecializationDecl</code> AST 节点已被移除。依赖类作用域的显式函数模板特化现在改用 <code>DependentFunctionTemplateSpecializationInfo</code> 来存储候选主模板和显式模板实参。</p>
+    <p>这对 <strong>Clang 作为编译器</strong>的使用者无影响，但可能破坏 <strong>Clang 工具链</strong>（如 clang-tidy、自定义 AST Matcher、Refactoring 工具）中遍历 AST 时的假设。如果工具的 AST 遍历逻辑依赖于此节点类型的存在性，需要进行适配。</p>
+
+    <div class="co co-a mt-10">
+      <strong>&#128993; 影响范围</strong>
+      仅影响基于 Clang 的AST 工具（clang-tidy 检查、AST Visitor/Matcher 插件等）。如果工具代码中有 <code>isa&lt;ClassScopeFunctionSpecializationDecl&gt;</code> 或 <code>dyn_cast&lt;ClassScopeFunctionSpecializationDecl&gt;</code> 的调用，需要更新为新的 AST 遍历方式。
+    </div>
+
+    <h4>8.2 -fdelayed-template-parsing 不再默认为 C++20 MSVC 启用</h4>
+    <p>以前，当以 MSVC 兼容模式（<code>--target=x86_64-pc-windows-msvc</code>）编译 C++20 代码时，Clang 默认开启 <code>-fdelayed-template-parsing</code>。LLVM 18 起，<strong>C++20 模式下不再默认启用此标志</strong>，以匹配 MSVC 的行为（MSVC 在 C++20 模式下也默认关闭延迟模板解析）。</p>
+    <p>延迟模板解析允许模板体在被实例化之前包含语法错误，这是一种非标准的行为扩展。关闭后，模板体中的语法错误会在解析时立即报告。</p>
+
+    <table>
+      <thead><tr><th style="width:25%">条件</th><th style="width:35%">LLVM 17 行为</th><th style="width:40%">LLVM 18 行为</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>MSVC 目标 + C++20</td>
+          <td>延迟模板解析<strong>默认启用</strong></td>
+          <td>延迟模板解析<strong>默认关闭</strong>（匹配 MSVC）</td>
+        </tr>
+        <tr>
+          <td>MSVC 目标 + C++17 及以下</td>
+          <td>延迟模板解析默认启用</td>
+          <td>延迟模板解析默认启用（不变）</td>
+        </tr>
+        <tr>
+          <td>非 MSVC 目标</td>
+          <td>延迟模板解析默认关闭</td>
+          <td>延迟模板解析默认关闭（不变）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="co co-i mt-10">
+      <strong>&#128309; 跨平台项目的注意点</strong>
+      对于在 MSVC 目标下编译的 C++20 代码，如果之前依赖延迟模板解析（即有些模板在未实例化时才暴露出语法错误），升级 LLVM 18 后这些错误会<strong>立即暴露</strong>。如果确实需要，可以显式添加 <code>-fdelayed-template-parsing</code> 标志恢复旧行为。
+    </div>
+
+    <h4>8.3 C++20 命名模块：移除硬编码导入路径</h4>
+    <p>LLVM 18 移除了 C++20 命名模块（named modules）的<strong>硬编码导入路径</strong>。现在要求<strong>所有依赖模块必须通过命令行指定</strong>（例如 <code>-fmodule-file=</code>），不再有隐式搜索路径。这符合 C++20 模块设计的明确性原则：每个导入的模块都必须显式告知编译器如何找到它。</p>
+    <p>此变更主要影响使用 C++20 模块的项目（<code>import M;</code> 语法）。如果之前依赖编译器自动查找模块文件，升级后需要在命令行中显式传递所有依赖模块的路径。（相关 Issue: <a href="https://github.com/llvm/llvm-project/issues/62707">#62707</a>）</p>
+
+    <div class="example-box">
+      <div class="label">示例 — 命令行变更</div>
+      <pre class="cb"><span class="c"># 旧行为 (LLVM 17)：依赖硬编码或隐式搜索路径</span>
+clang++-17 -std=c++20 -c foo.cpp   <span class="c"># 隐式寻找模块</span>
+
+<span class="c"># 新行为 (LLVM 18)：必须显式指定所有依赖模块文件</span>
+clang++-18 -std=c++20 -fmodule-file=MyModule=MyModule.pcm -c foo.cpp
+<span class="c"># 每个 import 的模块都需要对应的 -fmodule-file= 参数</span></pre>
+    </div>
+
+    <h4>8.4 import XXX 不再允许查找显式 Clang 模块</h4>
+    <p>在 C++ 代码中，<code>import XXX;</code> 不再允许从<strong>显式 Clang 模块</strong>（explicit clang modules，即传统的 <code>.modulemap</code> 定义的模块）中查找模块 <code>XXX</code>。这严格区分了 C++20 命名模块（named modules）和传统的 Clang 模块机制。（相关 Issue: <a href="https://github.com/llvm/llvm-project/issues/64755">#64755</a>）</p>
+
+    <div class="co co-a mt-10">
+      <strong>&#128993; 影响范围</strong>
+      影响同时使用 C++20 <code>import</code> 语法和传统 Clang 模块（<code>.modulemap</code> / <code>@import</code>）的混合项目。如果有代码依赖 <code>import XXX;</code> 来导入传统模块，需要改用 <code>@import XXX;</code> 或 <code>#include</code>，或将模块迁移到 C++20 命名模块标准。
+    </div>
+
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     9. SUGARED TYPE DUMPING SIMPLIFIED
+     ══════════════════════════════════════════════════════ -->
+<section id="sugared-type-dump" class="section">
+  <div class="section-header">
+    <span class="num">9</span>
+    <h2>Sugared 类型转储简化</h2>
+    <span class="bm">AST 转储破坏性变更</span>
+  </div>
+  <div class="section-body">
+
+    <h4>变更说明</h4>
+    <p>在 <code>-ast-dump</code> 输出（文本和 JSON 格式）中，当<strong>含糖类型</strong>（sugared type）的文本表示与去糖类型（desugared type）相同时，Clang 不再重复打印去糖类型。这意味着转储输出更加简洁，但依赖转储输出格式的工具可能需要适配。</p>
+
+    <h4>文本转储变更</h4>
+    <div class="example-box">
+      <div class="label">示例 — 文本 AST 转储</div>
+      <pre class="cb"><span class="c">// 旧（LLVM 17）：重复打印相同表示</span>
+<span class="s">'foo'</span>:<span class="s">'foo'</span>
+
+<span class="c">// 新（LLVM 18+）：仅打印一次</span>
+<span class="s">'foo'</span></pre>
+    </div>
+
+    <h4>JSON 转储变更</h4>
+    <div class="example-box">
+      <div class="label">示例 — JSON AST 转储</div>
+      <pre class="cb"><span class="c">// 旧（LLVM 17）：同时包含 qualType 和 desugaredQualType</span>
+<span class="s">"type"</span>: {
+  <span class="s">"qualType"</span>: <span class="s">"foo"</span>,
+  <span class="s">"desugaredQualType"</span>: <span class="s">"foo"</span>
+}
+
+<span class="c">// 新（LLVM 18+）：仅当表示不同时才包含 desugaredQualType</span>
+<span class="s">"type"</span>: {
+  <span class="s">"qualType"</span>: <span class="s">"foo"</span>
+}
+
+<span class="c">// 当两者不同时，仍保留 desugaredQualType 字段</span>
+<span class="s">"type"</span>: {
+  <span class="s">"qualType"</span>: <span class="s">"ElaboratedType"</span>,
+  <span class="s">"desugaredQualType"</span>: <span class="s">"int *"</span>
+}</pre>
+    </div>
+
+    <h4>影响评估</h4>
+    <p>此变更主要影响依赖 AST 转储输出的工具和脚本（如解析 <code>-ast-dump</code> 文本输出或 JSON 输出的自动化工具）。如果工具假设 <code>desugaredQualType</code> 字段始终存在，需要适配为处理该字段可能缺失的情况。</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     10. TARGET_OS_* MACROS ON DARWIN
+     ══════════════════════════════════════════════════════ -->
+<section id="target-os-macros" class="section">
+  <div class="section-header">
+    <span class="num">10</span>
+    <h2>TARGET_OS_* 宏默认定义（Darwin 平台）</h2>
+    <span class="bm">Darwin / Apple 平台</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-a">
+      <strong>&#128993; Darwin (Apple) 平台上 Clang 现在默认定义 TARGET_OS_* 系列宏</strong>
+      这是一项 Clang 扩展，可能破坏那些未正确包含 <code>TargetConditionals.h</code> 而对 <code>TARGET_OS_*</code> 宏做存在性检查的现有代码。
+    </div>
+
+    <h4>变更说明</h4>
+    <p>在 Darwin 平台上，Apple SDK 的 <code>TargetConditionals.h</code> 头文件传统上负责定义 <code>TARGET_OS_*</code> 系列宏（如 <code>TARGET_OS_IOS</code>、<code>TARGET_OS_MAC</code>、<code>TARGET_OS_WATCH</code> 等）。LLVM 18 起，Clang <strong>默认自行定义这些宏</strong>，不再依赖 SDK 头文件。</p>
+    <p>对于那些<strong>未正确包含 <code>TargetConditionals.h</code></strong> 但又依赖 <code>TARGET_OS_*</code> 宏来控制条件编译的代码，此变更可能导致编译行为变化：以前宏可能未被定义（条件分支走入 #else），现在宏被 Clang 自动定义，条件分支选择可能改变。</p>
+
+    <div class="example-box">
+      <div class="label">示例 — 受影响的代码模式</div>
+      <pre class="cb"><span class="c">// 旧代码：未包含 TargetConditionals.h，依赖 SDK 隐式定义</span>
+<span class="c">// LLVM 17：TARGET_OS_IOS 可能未定义 &rarr; 走入 #else</span>
+<span class="c">// LLVM 18：TARGET_OS_IOS 被 Clang 自动定义 &rarr; 走入 #if 分支</span>
+
+<span class="cp">#if TARGET_OS_IOS
+</span><span class="c">// 原来可能不执行，现在可能执行</span>
+<span class="cp">#else
+</span><span class="c">// 原来可能执行，现在可能不执行</span>
+<span class="cp">#endif</span>
+
+<span class="c">// 正确做法：先包含 SDK 头文件</span>
+<span class="cp">#include &lt;TargetConditionals.h&gt;
+</span><span class="c">// 现在 TARGET_OS_* 宏由 Clang 或头文件定义，行为一致</span></pre>
+    </div>
+
+    <h4>关于 TargetConditionals.h</h4>
+    <p>Apple SDK 的 <code>TargetConditionals.h</code> 现在会检查 Clang 是否已定义这些宏，如果已定义则使用 Clang 的值，保持向后兼容。但如果代码<strong>未包含此头文件</strong>（例如仅在条件编译中检查宏是否存在），行为可能改变。</p>
+
+    <h4>关闭此扩展</h4>
+    <p>可通过 <code>-fno-define-target-os-macros</code> 编译选项关闭此扩展，恢复旧行为。</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     11. __has_cpp_attribute / __has_c_attribute FIXES
+     ══════════════════════════════════════════════════════ -->
+<section id="has-attribute-fix" class="section">
+  <div class="section-header">
+    <span class="num">11</span>
+    <h2>__has_cpp_attribute / __has_c_attribute 返回值修正</h2>
+    <span class="bm">诊断行为变更</span>
+  </div>
+  <div class="section-body">
+
+    <h4>变更说明</h4>
+    <p>LLVM 18 修复了 <code>__has_cpp_attribute</code> 和 <code>__has_c_attribute</code> 对某些 C++11 风格属性返回错误值的问题。此前，某些属性的无命名空间前缀版本会错误地返回非零值（表示支持），而实际上只有带命名空间前缀的版本才是正确的。</p>
+
+    <h4>具体变更详情</h4>
+    <table>
+      <thead><tr><th>测试项</th><th>LLVM 17 值</th><th>LLVM 18 值</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>__has_cpp_attribute(unused)</code></td>
+          <td><span class="bh">201603</span></td>
+          <td><span class="bg">0</span></td>
+          <td>无前缀版本不再错误地报告支持</td>
+        </tr>
+        <tr>
+          <td><code>__has_cpp_attribute(gnu::unused)</code></td>
+          <td>201603</td>
+          <td><span class="bg">1</span></td>
+          <td>带 gnu:: 前缀的返回值修正</td>
+        </tr>
+        <tr>
+          <td><code>__has_c_attribute(unused)</code></td>
+          <td><span class="bh">202106</span></td>
+          <td><span class="bg">0</span></td>
+          <td>C 属性无前缀版本不再错误报告支持</td>
+        </tr>
+        <tr>
+          <td><code>__has_cpp_attribute(clang::fallthrough)</code></td>
+          <td>201603</td>
+          <td><span class="bg">1</span></td>
+          <td>带 clang:: 前缀的返回值修正</td>
+        </tr>
+        <tr>
+          <td><code>__has_cpp_attribute(gnu::fallthrough)</code></td>
+          <td>201603</td>
+          <td><span class="bg">1</span></td>
+          <td>带 gnu:: 前缀的返回值修正</td>
+        </tr>
+        <tr>
+          <td><code>__has_c_attribute(gnu::fallthrough)</code></td>
+          <td><span class="bh">201910</span></td>
+          <td><span class="bg">1</span></td>
+          <td>C 属性 gnu:: 版本修正</td>
+        </tr>
+        <tr>
+          <td><code>__has_cpp_attribute(warn_unused_result)</code></td>
+          <td><span class="bh">201907</span></td>
+          <td><span class="bg">0</span></td>
+          <td>无前缀版本不再错误地报告支持</td>
+        </tr>
+        <tr>
+          <td><code>__has_cpp_attribute(clang::warn_unused_result)</code></td>
+          <td>201907</td>
+          <td><span class="bg">1</span></td>
+          <td>带 clang:: 前缀的返回值修正</td>
+        </tr>
+        <tr>
+          <td><code>__has_cpp_attribute(gnu::warn_unused_result)</code></td>
+          <td>201907</td>
+          <td><span class="bg">1</span></td>
+          <td>带 gnu:: 前缀的返回值修正</td>
+        </tr>
+        <tr>
+          <td><code>__has_c_attribute(warn_unused_result)</code></td>
+          <td><span class="bh">202003</span></td>
+          <td><span class="bg">0</span></td>
+          <td>C 属性无前缀版本不再错误报告支持</td>
+        </tr>
+        <tr>
+          <td><code>__has_c_attribute(gnu::warn_unused_result)</code></td>
+          <td><span class="bh">202003</span></td>
+          <td><span class="bg">1</span></td>
+          <td>C 属性 gnu:: 版本修正</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>影响评估</h4>
+    <p><strong>核心模式</strong>：无命名空间前缀的属性（如 <code>unused</code>、<code>warn_unused_result</code>）在 LLVM 17 中 <code>__has_cpp_attribute</code> / <code>__has_c_attribute</code> 会错误地返回非零值。LLVM 18 修正后返回 0（表示不支持）。正确的做法是使用带命名空间前缀的版本（<code>gnu::unused</code>、<code>clang::fallthrough</code> 等），这些版本在 LLVM 18 中返回 1 或正确的标准版本号。</p>
+
+    <div class="co co-a mt-10">
+      <strong>&#128993; 代码适配</strong>
+      如果代码使用 <code>__has_cpp_attribute(unused)</code>（无前缀）来检测编译器是否支持 <code>[[unused]]</code> 属性，在 LLVM 18 中此检测会返回 0。应改为使用 <code>__has_cpp_attribute(gnu::unused)</code> 或直接使用标准 C++17 的 <code>[[maybe_unused]]</code>。
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     12. ADDITIONAL LLD FEATURES
+     ══════════════════════════════════════════════════════ -->
+<section id="lld-additional" class="section">
+  <div class="section-header">
+    <span class="num">12</span>
+    <h2>LLD 链接器新增功能</h2>
+    <span class="bg">新特性 / 行为变更</span>
+  </div>
+  <div class="section-body">
+
+    <p>LLD 在 LLVM 18 中除了 FatLTO（见第 7 节）外，还有多项重要新增功能和改进：</p>
+
+    <h4>12.1 -Bsymbolic-non-weak</h4>
+    <p>新增 <code>-Bsymbolic-non-weak</code> 选项。与 <code>-Bsymbolic</code> 类似地将符号绑定到本地定义，但<strong>仅适用于非弱符号（non-weak definitions）</strong>。弱符号（weak symbols）仍允许被覆盖。这对于希望减少非弱符号的 GOT 重定位、同时保留弱符号覆盖能力的场景很有用。</p>
+
+    <h4>12.2 --no-allow-shlib-undefined</h4>
+    <p>增强的 <code>--no-allow-shlib-undefined</code> 选项。当共享库引用非导出定义时，LLD 现在报告错误。增强了在构建 DSO 时对未定义符号的检测能力，有助于避免运行时符号解析失败。</p>
+
+    <h4>12.3 --save-temps 改进</h4>
+    <p><code>--save-temps</code> 和 <code>--lto-emit-asm</code> 现在从 bitcode 文件名派生 ELF/汇编输出文件名。旧行为生成 <code>out1.lto.o</code>、<code>out2.lto.o</code> 等序号命名，新行为使用更直观的命名：<code>ld.lld --save-temps a.o d/b.o -o out</code> 会生成 <code>out.lto.a.o</code> 和 <code>d/out.lto.b.o</code>。</p>
+
+    <div class="example-box">
+      <div class="label">示例 — save-temps 命名变更</div>
+      <pre class="cb"><span class="c"># LLVM 17：顺序编号</span>
+ld.lld --save-temps a.o d/b.o -o out
+<span class="c"># &rarr; out1.lto.o, out2.lto.o （难以追踪来源）</span>
+
+<span class="c"># LLVM 18：基于输入文件命名</span>
+ld.lld --save-temps a.o d/b.o -o out
+<span class="c"># &rarr; out.lto.a.o, d/out.lto.b.o （保留目录结构和源文件名）</span></pre>
+    </div>
+
+    <h4>12.4 common-page-size 可大于 system-page-size</h4>
+    <p><code>-z common-page-size=</code> 现在<strong>可以设置为大于</strong> <code>-z max-page-size=</code> 或系统页大小的值。此前这会被限制。这对于需要大对齐要求的场景（如 huge page 映射）很有用。相关 Issue: <a href="https://github.com/llvm/llvm-project/issues/57618">#57618</a></p>
+
+    <h4>12.5 OVERLAY 支持起始地址和 LMA</h4>
+    <p>链接脚本中的 <code>OVERLAY</code> 命令现在支持<strong>可选的起始地址</strong>和<strong>LMA（Load Memory Address）</strong>指定。这增强了对嵌入式系统中常见的内存覆盖（overlay）功能的支持。相关 PR: <a href="https://github.com/llvm/llvm-project/pull/77272">#77272</a></p>
+
+    <h4>12.6 cdsort：调用图剖面驱动的段排序</h4>
+    <p>当存在调用图剖面信息（通过 instrumentation 或 sample PGO 获得）时，输入段的排序现在使用新的 <strong><code>cdsort</code></strong> 算法，替代了之前的 <code>hfsort</code> 算法。cdsort 提供更好的排序结果，进一步优化指令缓存局部性和 TLB 命中率。</p>
+
+    <h4>12.7 --lto-validate-all-vtables-have-type-infos</h4>
+    <p>新增 <code>--lto-validate-all-vtables-have-type-infos</code> 选项，作为 <code>--lto-whole-program-visibility</code> 的补充，用于<strong>禁用不安全的全程序去虚化</strong>。可选的 <code>--lto-known-safe-vtables=&lt;glob&gt;</code> 可用于标记已知安全的虚函数表符号。这为 LTO 下的虚函数去虚拟化提供了更细粒度的安全控制。</p>
+
+    <h4>影响评估</h4>
+    <table>
+      <thead><tr><th style="width:25%">功能</th><th style="width:25%">类型</th><th style="width:50%">适用场景</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>-Bsymbolic-non-weak</code></td>
+          <td><span class="bg">新选项</span></td>
+          <td>希望减少 GOT 开销但保留弱符号可覆盖能力的共享库</td>
+        </tr>
+        <tr>
+          <td><code>--no-allow-shlib-undefined</code></td>
+          <td><span class="bm">行为增强</span></td>
+          <td>构建 DSO 时的严格未定义符号检测</td>
+        </tr>
+        <tr>
+          <td><code>--save-temps</code> 命名改进</td>
+          <td><span class="bm">行为变更</span></td>
+          <td>调试 LTO 编译过程的构建系统；影响 parse 输出文件名的脚本</td>
+        </tr>
+        <tr>
+          <td>common-page-size 放宽</td>
+          <td><span class="bm">行为变更</span></td>
+          <td>需要大页对齐的嵌入式或高性能场景</td>
+        </tr>
+        <tr>
+          <td>OVERLAY 起始地址/LMA</td>
+          <td><span class="bg">新功能</span></td>
+          <td>嵌入式系统的内存覆盖链接脚本</td>
+        </tr>
+        <tr>
+          <td>cdsort</td>
+          <td><span class="bg">新算法</span></td>
+          <td>使用 PGO 优化的项目（自动生效，无需额外配置）</td>
+        </tr>
+        <tr>
+          <td><code>--lto-validate-all-vtables</code></td>
+          <td><span class="bg">新选项</span></td>
+          <td>LTO 下需要安全保证的虚函数去虚拟化</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     13. AARCH64 BACKEND CHANGES
+     ══════════════════════════════════════════════════════ -->
+<section id="aarch64" class="section">
+  <div class="section-header">
+    <span class="num">13</span>
+    <h2>AArch64 后端变更</h2>
+    <span class="bg">新支持</span>
+    <span class="bm">架构级别修正</span>
+  </div>
+  <div class="section-body">
+
+    <h4>13.1 新增 CPU 支持</h4>
+    <p>LLVM 18 的 AArch64 后端新增了对以下 CPU 的支持：</p>
+    <ul>
+      <li><strong>Cortex-A520</strong>：ARM 的高效核心（LITTLE core）</li>
+      <li><strong>Cortex-A720</strong>：ARM 的中等性能核心（MID core）</li>
+      <li><strong>Cortex-X4</strong>：ARM 的高性能核心（BIG core）</li>
+    </ul>
+    <p>使用 <code>-mcpu=cortex-a520</code>、<code>-mcpu=cortex-a720</code>、<code>-mcpu=cortex-x4</code> 即可启用对应的调度模型和微架构优化。</p>
+
+    <h4>13.2 Neoverse-N2 架构级别修正</h4>
+    <p><strong>Neoverse-N2</strong> 之前被<strong>错误地标记为 Armv8.5a</strong> 核心。LLVM 18 修正为 <strong>Armv9.0a</strong> 核心。作为 Armv9 核心，crypto 选项<strong>不再默认启用</strong>，因此需要 <code>-mcpu=neoverse-n2+crypto</code> 来显式启用加密扩展。</p>
+
+    <div class="co co-a mt-10">
+      <strong>&#128993; 兼容性注意事项</strong>
+      编译方面，Armv9.0a 启用的特性与 Armv8.5a 相同，<strong>唯一的例外是 crypto</strong>（不再默认启用）。如果项目使用 <code>-mcpu=neoverse-n2</code> 且依赖 crypto 扩展（AES、SHA 等），必须在编译选项中添加 <code>+crypto</code> 后缀。
+    </div>
+
+    <div class="example-box">
+      <div class="label">示例 — Neoverse-N2 编译选项变更</div>
+      <pre class="cb"><span class="c"># LLVM 17：crypto 默认启用（错误地按 Armv8.5a 处理）</span>
+clang-17 --target=aarch64-linux-gnu -mcpu=neoverse-n2 -c foo.c
+
+<span class="c"># LLVM 18：crypto 不再默认启用（正确按 Armv9.0a 处理）</span>
+clang-18 --target=aarch64-linux-gnu -mcpu=neoverse-n2 -c foo.c
+<span class="c">#          ^-- crypto 未启用</span>
+
+<span class="c"># 需要 crypto 时，显式添加：</span>
+clang-18 --target=aarch64-linux-gnu -mcpu=neoverse-n2+crypto -c foo.c
+<span class="c">#          ^-- crypto 显式启用</span></pre>
+    </div>
+
+    <h4>13.3 2023 架构扩展支持</h4>
+    <p>汇编器和反汇编器新增了对 <strong>2023 年 ARM 架构扩展</strong>的支持。这些扩展涵盖了 ARMv8.x 和 ARMv9.x 在 2023 年发布的新指令集和系统寄存器特性。具体可参考 ARM 架构参考手册（Arm ARM）的 2023 版本。</p>
+
+    <h4>13.4 栈冲突保护（Stack Clash Protection）</h4>
+    <p>AArch64 后端新增了对<strong>栈冲突保护</strong>（Stack Clash Protection）的支持。在函数帧创建和动态栈分配期间，编译器会<strong>按固定间隔发出内存访问</strong>，确保栈顶的保护区域不会被跳过。这有助于防御栈冲突攻击（stack clash attack）。</p>
+
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
      SUMMARY: UPGRADE RECOMMENDATIONS
      ══════════════════════════════════════════════════════ -->
 <section id="summary" class="section">
@@ -888,8 +1337,8 @@ ld.lld --fat-lto-objects foo.o bar.o -o app
         <tr>
           <td><span class="bh">P0</span></td>
           <td>-Wenum-constexpr-conversion</td>
-          <td>默认启用 → LLVM 19 Error</td>
-          <td>在 LLVM 18 阶段修复所有 enum constexpr 超范围值</td>
+          <td>默认启用 &rarr; LLVM 19 Error</td>
+          <td>在 LLVM 18 阶段修复所有 enum constexpr 超范围值（含系统头文件和宏中触发的）</td>
         </tr>
         <tr>
           <td><span class="bm">P1</span></td>
@@ -905,20 +1354,68 @@ ld.lld --fat-lto-objects foo.o bar.o -o app
         </tr>
         <tr>
           <td><span class="bm">P1</span></td>
-          <td>模板化 operator== 反转修复</td>
+          <td>模板化 operator== 反转 / operator!= 修复</td>
           <td>C++20 行为变更</td>
-          <td>启用 <code>-Wambiguous-reversed-operator</code> 提前检测</td>
+          <td>启用 <code>-Wambiguous-reversed-operator</code> 提前检测歧义</td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td>__has_cpp_attribute / __has_c_attribute 修正</td>
+          <td>诊断行为变更</td>
+          <td>检查无命名空间前缀的属性检测宏，改用 gnu::/clang:: 前缀版本</td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td>TARGET_OS_* 宏默认定义（Darwin）</td>
+          <td>平台行为变更</td>
+          <td>确保 Darwin 代码正确包含 TargetConditionals.h；必要时用 <code>-fno-define-target-os-macros</code></td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td>Neoverse-N2 Armv9.0a 修正（需 +crypto）</td>
+          <td>AArch64 行为变更</td>
+          <td>检查 -mcpu=neoverse-n2 使用处，按需添加 +crypto</td>
         </tr>
         <tr>
           <td><span class="bl">P2</span></td>
-          <td>常量表达式变体移除</td>
+          <td>常量表达式变体移除 / llvm.stacksave 重载</td>
           <td>LLVM IR 变更</td>
           <td>仅影响自定义 LLVM Pass 或 IR 生成工具</td>
         </tr>
         <tr>
           <td><span class="bl">P2</span></td>
-          <td>FatLTO 支持</td>
-          <td>新特性（可选）</td>
+          <td>ClassScopeFunctionSpecializationDecl 移除</td>
+          <td>AST 变更</td>
+          <td>仅影响 Clang AST 工具（clang-tidy 检查、AST Visitor 插件等）</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td>-fdelayed-template-parsing C++20 MSVC</td>
+          <td>C++ 行为变更</td>
+          <td>仅影响 MSVC 目标 + C++20 的项目</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td>C++20 命名模块 / import XXX 禁止</td>
+          <td>C++20 行为变更</td>
+          <td>仅影响使用 C++20 模块或混合 Clang 模块的项目</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td>Sugared 类型转储简化</td>
+          <td>AST 转储变更</td>
+          <td>仅影响解析 AST dump 输出的自动化工具</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td>LLD 新增功能（可选用）</td>
+          <td>新特性</td>
+          <td>按需评估：-Bsymbolic-non-weak、cdsort、--lto-validate-all-vtables 等</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td>FatLTO 支持（可选）</td>
+          <td>新特性</td>
           <td>评估是否在构建流程中引入 FatLTO 以简化 LTO/非LTO 构建管理</td>
         </tr>
       </tbody>
@@ -927,7 +1424,9 @@ ld.lld --fat-lto-objects foo.o bar.o -o app
     <div class="co co-i mt-14">
       <strong>&#128309; 关键结论</strong>
       对于数通产品线，<strong>函数模板名称重整</strong>是 LLVM 18 影响最大、最需要优先关注的变更。如果产品使用了动态加载插件或预编译动态库，必须在升级前完成符号兼容性评估。<br><br>
-      <strong>-Wenum-constexpr-conversion</strong> 虽然在 LLVM 18 中只是告警，但因为 LLVM 19 起将升级为不可压制的错误，<strong>必须在 LLVM 18 阶段完成所有修复</strong>，为后续升级铺平道路。
+      <strong>-Wenum-constexpr-conversion</strong> 虽然在 LLVM 18 中只是告警，但因为 LLVM 19 起将升级为不可压制的错误，<strong>必须在 LLVM 18 阶段完成所有修复</strong>，为后续升级铺平道路。<br><br>
+      <strong>Darwin 平台</strong>的 TARGET_OS_* 宏变更、<strong>AArch64 平台</strong>的 Neoverse-N2 修正、<strong>C++20 模块</strong>的导入路径变化是需要关注的平台/特性特定变更。<br><br>
+      <strong>LLD 的 cdsort、OVERLAY、--save-temps 命名改进</strong>等虽为默认行为变更，但影响相对可控，主要是改进和增强。
     </div>
   </div>
 </section>
@@ -935,8 +1434,8 @@ ld.lld --fat-lto-objects foo.o bar.o -o app
 </div><!-- /container -->
 
 <footer class="footer">
-  <p>LLVM 18 差异详解 &nbsp;·&nbsp; 毕昇编译器升级工程 &nbsp;·&nbsp; 分析日期：2026-07-10</p>
-  <p style="margin-top:4px;font-size:12px">专为数通产品线编制 &nbsp;·&nbsp; 仅供内部技术评估使用</p>
+  <p>LLVM 18 差异详解 &nbsp;&middot;&nbsp; 毕昇编译器升级工程 &nbsp;&middot;&nbsp; 分析日期：2026-07-10</p>
+  <p style="margin-top:4px;font-size:12px">专为数通产品线编制 &nbsp;&middot;&nbsp; 仅供内部技术评估使用</p>
 </footer>
 
 </body>

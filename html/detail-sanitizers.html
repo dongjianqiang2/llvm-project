@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sanitizers 变化详解 — 毕昇编译器升级</title>
+<style>
+  :root {
+    --primary: #0a2647;
+    --primary-light: #1e4a7a;
+    --primary-extra: #eef4fb;
+    --accent: #d4a843;
+    --accent-light: #f5e6b8;
+    --bg: #f6f8fc;
+    --card: #fff;
+    --text: #111827;
+    --text2: #4b5563;
+    --border: #e5e7eb;
+    --red: #dc2626; --red-bg: #fef2f2;
+    --amber: #d97706; --amber-bg: #fffbeb;
+    --green: #059669; --green-bg: #ecfdf5;
+    --blue: #2563eb; --blue-bg: #eff6ff;
+    --radius: 12px;
+    --shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
+  }
+
+  /* Header */
+  .header{
+    background:linear-gradient(135deg,#071225 0%,#0a2647 45%,#1e4a7a 100%);
+    color:#fff;padding:48px 24px 36px;text-align:center;position:relative;overflow:hidden;
+  }
+  .header::after{
+    content:'';position:absolute;inset:0;
+    background:radial-gradient(ellipse 60% 40% at 30% 50%,rgba(212,168,67,.10) 0%,transparent 70%);
+    pointer-events:none;
+  }
+  .header .back{
+    display:inline-block;color:var(--accent);text-decoration:none;font-size:14px;
+    border:1px solid rgba(212,168,67,.4);padding:6px 18px;border-radius:6px;
+    transition:all .15s;margin-bottom:20px;position:relative;z-index:1;
+  }
+  .header .back:hover{background:rgba(212,168,67,.15);border-color:rgba(212,168,67,.6)}
+  .header h1{font-size:30px;font-weight:700;margin-bottom:8px;position:relative;z-index:1}
+  .header .sub{font-size:15px;opacity:.78;max-width:680px;margin:0 auto;position:relative;z-index:1}
+
+  /* Container & Sections */
+  .container{max-width:1100px;margin:0 auto;padding:0 20px}
+  .section{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin:24px auto;overflow:hidden}
+  .section-header{
+    padding:20px 28px 12px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:10px;
+  }
+  .section-header .num{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;border-radius:7px;
+    background:var(--primary);color:#fff;font-size:14px;font-weight:700;flex-shrink:0;
+  }
+  .section-header h2{font-size:19px;font-weight:700;color:var(--primary)}
+  .section-body{padding:20px 28px 28px}
+
+  /* Version timeline */
+  .timeline{position:relative;padding-left:28px;margin:16px 0}
+  .timeline::before{
+    content:'';position:absolute;left:9px;top:4px;bottom:4px;
+    width:2px;background:var(--border);
+  }
+  .timeline-item{position:relative;margin-bottom:22px}
+  .timeline-item:last-child{margin-bottom:0}
+  .timeline-dot{
+    position:absolute;left:-25px;top:4px;
+    width:16px;height:16px;border-radius:50%;
+    background:var(--primary);border:3px solid #fff;
+    box-shadow:0 0 0 2px var(--primary);
+  }
+  .timeline-dot.v16{background:#2563eb}
+  .timeline-dot.v17{background:#7c3aed}
+  .timeline-dot.v18{background:#059669}
+  .timeline-dot.v19{background:#d97706}
+  .timeline-dot.v20{background:#dc2626}
+  .timeline-dot.v21{background:#0a2647}
+  .timeline-head{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap}
+  .timeline-head strong{font-size:15px;white-space:nowrap}
+  .timeline-body{color:var(--text2);font-size:13.5px;line-height:1.7}
+  .timeline-body code{
+    background:#eef2f6;padding:1px 6px;border-radius:4px;
+    font-size:12.5px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+
+  /* Badges */
+  .bh{display:inline-block;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bm{display:inline-block;background:var(--amber-bg);color:var(--amber);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bl{display:inline-block;background:var(--blue-bg);color:var(--blue);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bg{display:inline-block;background:var(--green-bg);color:var(--green);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bflag{
+    display:inline-block;background:#f1f5f9;color:var(--primary-light);
+    font-size:12px;font-weight:500;padding:2px 10px;border-radius:4px;
+    font-family:"SF Mono",Menlo,monospace;
+  }
+
+  /* Version tag */
+  .vt{
+    display:inline-block;background:var(--primary-extra);color:var(--primary-light);
+    font-size:11px;font-weight:600;padding:2px 10px;border-radius:4px;white-space:nowrap;
+  }
+
+  /* Callout */
+  .co{
+    padding:14px 18px;border-radius:7px;margin:12px 0;font-size:13.5px;
+    border-left:4px solid;line-height:1.75;
+  }
+  .co-r{background:var(--red-bg);border-color:var(--red);color:#7f1d1d}
+  .co-a{background:var(--amber-bg);border-color:var(--amber);color:#713f12}
+  .co-i{background:var(--blue-bg);border-color:var(--blue);color:#1e3a5f}
+  .co-g{background:var(--green-bg);border-color:var(--green);color:#064e3b}
+  .co strong{display:block;margin-bottom:3px}
+  .co code{background:rgba(0,0,0,.06);padding:1px 6px;border-radius:3px;font-size:12.5px}
+
+  /* Example box */
+  .example-box{
+    background:#fafbfc;border:1px solid var(--border);border-radius:8px;
+    padding:18px 22px;margin:14px 0;
+  }
+  .example-box .label{
+    font-size:12px;font-weight:700;color:var(--text2);
+    text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px;
+  }
+
+  /* Code block */
+  pre.cb{
+    background:#0a1a2e;color:#e2e8f0;padding:16px 20px;border-radius:8px;
+    overflow-x:auto;font-size:13px;line-height:1.6;
+    font-family:"SF Mono",Menlo,monospace;margin:8px 0;border:none;
+  }
+  pre.cb .c{color:#6b7280}
+  pre.cb .k{color:#93c5fd}
+  pre.cb .s{color:#a7f3d0}
+
+  /* Tables */
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0}
+  thead th{
+    background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;
+    padding:8px 12px;border-bottom:2px solid var(--border);font-size:12.5px;white-space:nowrap;
+  }
+  tbody td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#f8fafc}
+  table code,.inline-code{
+    background:#eef2f6;padding:1px 6px;border-radius:4px;
+    font-size:12.5px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+
+  /* Sub-block headings */
+  h3{margin:24px 0 10px;color:var(--primary);font-size:17px}
+  h3:first-child{margin-top:0}
+  h4{margin:18px 0 8px;color:var(--primary);font-size:15px}
+  h4:first-child{margin-top:0}
+  .text-s{font-size:13px;color:var(--text2)}
+  .text-s code{font-size:12px}
+  .mt-10{margin-top:10px}
+  .mt-16{margin-top:16px}
+  .mb-12{margin-bottom:12px}
+  ul,ol{padding-left:20px;font-size:13.5px}
+  li{margin:4px 0}
+  hr{border:none;border-top:1px solid var(--border);margin:20px 0}
+
+  /* Sanitizer type card */
+  .san-card{
+    border:1px solid var(--border);border-radius:9px;padding:20px 22px;margin:16px 0;
+    border-left:4px solid var(--primary);
+  }
+  .san-card h3{margin:0 0 8px;font-size:16px}
+  .san-card.as{border-left-color:#dc2626}
+  .san-card.ms{border-left-color:#7c3aed}
+  .san-card.ub{border-left-color:#d97706}
+  .san-card.new{border-left-color:#059669}
+  .san-card.int{border-left-color:#2563eb}
+
+  /* Footer */
+  .footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1100px;margin:32px auto 0}
+
+  @media(max-width:700px){
+    .header h1{font-size:23px}
+    .header{padding:32px 16px 28px}
+    .section-body{padding:14px 16px 20px}
+    .timeline{padding-left:22px}
+  }
+</style>
+</head>
+<body>
+
+<!-- ========== HEADER ========== -->
+<header class="header">
+  <a class="back" href="index.html">&#8592; 返回主页</a>
+  <h1>Sanitizers 变化详解</h1>
+  <p class="sub">毕昇编译器升级 &mdash; LLVM 15.0.4 &#8594; 21.1.8 各类 Sanitizer 的演进与新增</p>
+</header>
+
+<div class="container">
+
+<!-- ========== OVERVIEW ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">&#9881;</span>
+    <h2>概述</h2>
+  </div>
+  <div class="section-body">
+    <p style="color:var(--text2);line-height:1.8">
+      从 LLVM 15 到 21，LLVM 的 Sanitizer 生态系统经历了显著扩展：
+      <strong style="color:var(--primary)">3 个全新 Sanitizer 被引入</strong>
+      (Numerical/Realtime/Metadata)，ASan/MSan/UBSan 均有重要功能增强，
+      此外还引入了 GPU Sanitizer、Sanitizer Special Case List v4/v5 以及覆盖率增强等工具链改进。
+    </p>
+    <div class="co co-i mt-10">
+      <strong>&#128203; 阅读建议</strong>
+      如果你正在规划从旧版 LLVM 升级到毕昇编译器 21，建议先浏览"版本演进时间线"了解各版本增量，
+      再按你所用的 Sanitizer 类型（ASan/MSan/UBSan/新 Sanitizer）查阅具体小节。
+    </div>
+  </div>
+</section>
+
+<!-- ========== VERSION TIMELINE ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">T</span>
+    <h2>版本演进时间线</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">
+      以下按 LLVM 版本列出 Clang 文档中 Sanitizers 章节记录的关键变化。
+    </p>
+    <div class="timeline">
+
+      <!-- LLVM 16 -->
+      <div class="timeline-item">
+        <div class="timeline-dot v16"></div>
+        <div class="timeline-head">
+          <strong>LLVM 16</strong>
+          <span class="vt">16.0.0</span>
+          <span class="bg">ASan / MSan</span>
+        </div>
+        <div class="timeline-body">
+          <ul>
+            <li><code>-fsanitize-memory-param-retval</code> <strong>默认启用</strong> &mdash;
+              使用 <code>-fsanitize=memory</code> 时，传入函数的未初始化变量和返回的未初始化变量会得到更激进的检测。
+              可通过 <code>-fno-sanitize-memory-param-retval</code> 恢复旧行为。</li>
+            <li>ASan: 栈使用后返回 (stack-use-after-return) 的检测精度持续改进。</li>
+            <li>UBSan: 持续的边界检查改进。</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- LLVM 17 -->
+      <div class="timeline-item">
+        <div class="timeline-dot v17"></div>
+        <div class="timeline-head">
+          <strong>LLVM 17</strong>
+          <span class="vt">17.0.0</span>
+          <span class="bg">平台 / ASan / MSan</span>
+        </div>
+        <div class="timeline-body">
+          <ul>
+            <li>多个 Sanitizer 移植到 <strong>LoongArch</strong> 架构: MSan, DFsan, Profile, XRay 和 libFuzzer。</li>
+            <li>ASan: use-after-scope 检测精度提升，减少误报。</li>
+            <li>MSan: 新增 use-after-destroy 检测能力。</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- LLVM 18 -->
+      <div class="timeline-item">
+        <div class="timeline-dot v18"></div>
+        <div class="timeline-head">
+          <strong>LLVM 18</strong>
+          <span class="vt">18.1.0</span>
+          <span class="bl">新 Sanitizer</span>
+        </div>
+        <div class="timeline-body">
+          <ul>
+            <li><strong>Numerical Sanitizer (NSan)</strong> 引入 &mdash; 检测浮点运算中的精度问题和异常值（NaN/Inf）。</li>
+            <li>ASan: 支持自定义 <code>operator new[]</code> 的数组 cookie 投毒 (array cookie poisoning)。</li>
+            <li>MSan: use-after-destroy 检测从 HWASan 扩展到 MSan。</li>
+            <li>HWASan 默认启用 use-after-scope 检测。</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- LLVM 19 -->
+      <div class="timeline-item">
+        <div class="timeline-dot v19"></div>
+        <div class="timeline-head">
+          <strong>LLVM 19</strong>
+          <span class="vt">19.1.0</span>
+          <span class="bl">新 Sanitizer</span>
+        </div>
+        <div class="timeline-body">
+          <ul>
+            <li><strong>Realtime Sanitizer (RTSan)</strong> 引入 &mdash; 检测实时上下文中不安全的系统调用。</li>
+            <li>ASan: 引入稳定 ABI 选项 <code>-fsanitize-stable-abi</code>。</li>
+            <li>UBSan: 持续的溢出检测改进。</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- LLVM 20 -->
+      <div class="timeline-item">
+        <div class="timeline-dot v20"></div>
+        <div class="timeline-head">
+          <strong>LLVM 20</strong>
+          <span class="vt">20.1.0</span>
+          <span class="bl">新 Sanitizer</span>
+        </div>
+        <div class="timeline-body">
+          <ul>
+            <li><strong>Realtime Sanitizer 正式可用</strong> &mdash; 通过 <code>-fsanitize=realtime</code> 激活。
+              检测 <code>[[clang::nonblocking]]</code> 函数中调用的不安全系统库函数（如内存分配和互斥锁操作）。</li>
+            <li><strong>Metadata Sanitizer</strong> 引入 &mdash; 通过 <code>-fexperimental-sanitize-metadata=</code> 激活。</li>
+            <li><strong>GPU Sanitizer</strong> &mdash; <code>-fgpu-sanitize</code> 用于 GPU 内核代码。</li>
+            <li>UBSan: 增强聚集类型的 null/alignment 检查 (<a href="https://github.com/llvm/llvm-project/issues/164548" target="_blank">#164548</a>)。</li>
+            <li>覆盖率: <code>-fsanitize-coverage-stack-depth-callback-min=</code> 选项引入，支持设置栈深度回调的最小阈值。</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- LLVM 21 -->
+      <div class="timeline-item">
+        <div class="timeline-dot v21"></div>
+        <div class="timeline-head">
+          <strong>LLVM 21</strong>
+          <span class="vt">21.1.8</span>
+          <span class="bm">工具链</span>
+        </div>
+        <div class="timeline-body">
+          <ul>
+            <li><strong>Sanitizer Special Case List (SSCL) v4/v5</strong> &mdash;
+              引入格式版本 4（过渡期，兼容旧路径匹配但发出警告）和版本 5（完全规范化路径匹配，去除 <code>./</code> 前缀）。
+              Windows 上路径分隔符变为斜杠无关（<code>/</code> 和 <code>\</code> 互相匹配）。</li>
+            <li>UBSan: 新增 <code>__ubsan_default_suppressions</code> 支持，允许程序在编译时指定默认抑制规则。</li>
+            <li>TSan: 新增随机延迟功能，帮助发现稀有的线程交错。</li>
+          </ul>
+        </div>
+      </div>
+
+    </div><!-- /timeline -->
+  </div>
+</section>
+
+<!-- ========== ASAN ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">A</span>
+    <h2>ASan (AddressSanitizer) 变化</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">AddressSanitizer 在多个版本中获得持续改进，覆盖栈、堆、全局变量的更多类别内存错误。</p>
+
+    <div class="san-card as">
+      <h3>Stack-use-after-return (LLVM 16+)</h3>
+      <p class="text-s">栈使用后返回检测精度持续改进。LLVM 16 开始对函数返回后的栈变量访问有更准确的检测。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 启用栈返回检测</div>
+<pre class="cb"><span class="c"># 默认模式 - 栈返回检测已启用</span>
+clang <span class="k">-fsanitize=address</span> <span class="k">-fno-omit-frame-pointer</span> program.c
+
+<span class="c"># 显式控制栈返回检测模式</span>
+<span class="c"># ASAN_OPTIONS=detect_stack_use_after_return=1</span></pre>
+      </div>
+    </div>
+
+    <div class="san-card as">
+      <h3>Use-after-scope 检测 (LLVM 17+)</h3>
+      <p class="text-s">作用域后使用检测精度大幅提升。LLVM 17 开始更准确地追踪变量离开作用域后的访问，减少误报。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 启用 scope 检测</div>
+<pre class="cb">clang <span class="k">-fsanitize=address</span> <span class="k">-fsanitize-address-use-after-scope</span> program.c</pre>
+      </div>
+    </div>
+
+    <div class="san-card as">
+      <h3>Array Cookie 投毒 (LLVM 18+)</h3>
+      <p class="text-s">支持自定义 <code>operator new[]</code> 的数组 cookie 投毒。当使用带数组 cookie 的 <code>new[]</code> 分配时，ASan 会正确标记 cookie 区域，检测越界访问。此修复解决了 PR19838 &mdash; 含数组 cookie 的 new[] 分配左越界访问未被检测到的问题。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 数组越界检测</div>
+<pre class="cb"><span class="c">// 编译时 ASan 自动处理 array cookie</span>
+clang++ <span class="k">-fsanitize=address</span> <span class="k">-O1</span> <span class="k">-g</span> test.cpp
+
+<span class="c">// 运行时默认自动检测 (LLVM 18+)</span>
+<span class="c">// 无需额外选项，与普通 ASan 使用方式一致</span></pre>
+      </div>
+    </div>
+
+    <div class="san-card as">
+      <h3>稳定 ABI 选项 (LLVM 19+)</h3>
+      <p class="text-s">引入 <code>-fsanitize-stable-abi</code> 选项，提供跨版本的稳定 ABI 接口，使得使用 ASan 编译的库可以在不同 minor 版本的 LLVM 运行时之间兼容工作。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 启用稳定 ABI</div>
+<pre class="cb"><span class="c"># 编译时启用稳定 ABI 模式</span>
+clang <span class="k">-fsanitize=address</span> <span class="k">-fsanitize-stable-abi</span> program.c
+
+<span class="c"># 适用于需要跨版本兼容共享库的场景</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== MSAN ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">M</span>
+    <h2>MSan (MemorySanitizer) 变化</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">MemorySanitizer 检测未初始化内存的读取。在 LLVM 15 到 21 期间主要增强了函数边界检测能力。</p>
+
+    <div class="san-card ms">
+      <h3>-fsanitize-memory-param-retval 默认启用 (LLVM 16)</h3>
+      <p class="text-s">这是 MSan 在 LLVM 15&#8594;21 期间<strong>最重要的行为变化</strong>。
+      使用 <code>-fsanitize=memory</code> 时，传入函数的未初始化参数和函数返回的未初始化值会得到更激进的检测。
+      如果旧代码依赖旧行为，需要使用 <code>-fno-sanitize-memory-param-retval</code> 恢复。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 对比新旧行为</div>
+<pre class="cb"><span class="c"># LLVM 15 (旧行为): param-retval 默认关闭</span>
+clang <span class="k">-fsanitize=memory</span> program.c
+
+<span class="c"># LLVM 16+ (新行为): param-retval 默认启用</span>
+<span class="c"># 更积极地检测函数边界的未初始化内存</span>
+clang <span class="k">-fsanitize=memory</span> program.c
+
+<span class="c"># 恢复旧行为</span>
+clang <span class="k">-fsanitize=memory</span> <span class="k">-fno-sanitize-memory-param-retval</span> program.c</pre>
+      </div>
+    </div>
+
+    <div class="san-card ms">
+      <h3>Use-after-destroy 检测 (LLVM 17+/18+)</h3>
+      <p class="text-s">LLVM 17 起 MSan 新增了对 use-after-destroy 的检测能力。LLVM 18 进一步在 HWASan 中将 use-after-scope 设为默认开启。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 启用 use-after-destroy</div>
+<pre class="cb"><span class="c"># 启用 MSan + use-after-destroy</span>
+clang <span class="k">-fsanitize=memory</span> <span class="k">-fsanitize-memory-use-after-dtor</span> program.c</pre>
+      </div>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 迁移注意</strong>
+      LLVM 16 的 MSan 行为变更 (<code>-fsanitize-memory-param-retval</code> 默认开启) 可能导致
+      升级后出现<strong>大量新的未初始化内存报告</strong>。请在升级前在测试环境中使用 CI 验证，
+      确认报告为真实缺陷后修复，或使用 <code>-fno-sanitize-memory-param-retval</code> 作为临时缓解措施。
+    </div>
+  </div>
+</section>
+
+<!-- ========== UBSAN ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">U</span>
+    <h2>UBSan (UndefinedBehaviorSanitizer) 变化</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">UBSan 在多个版本中获得持续改进，从边界检查到聚集类型的对齐检测。</p>
+
+    <div class="san-card ub">
+      <h3>持续改进 (LLVM 16+)</h3>
+      <p class="text-s">LLVM 16 起 UBSan 获得了持续的边界检查改进，包括更精确的有符号整数溢出检测、移位操作检测和类型转换检查。</p>
+    </div>
+
+    <div class="san-card ub">
+      <h3>聚集类型的 Null/Alignment 检查 (LLVM 20+)</h3>
+      <p class="text-s">UBSan 现在可以检测聚集类型（struct/class 对象）成员的 null 指针解引用和对齐违规。此前这些检查仅适用于基本类型。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 聚集类型对齐检查</div>
+<pre class="cb"><span class="c"># UBSan 现在对 struct 成员也进行 null/alignment 检查</span>
+clang <span class="k">-fsanitize=undefined</span> <span class="k">-O1</span> <span class="k">-g</span> program.c</pre>
+      </div>
+    </div>
+
+    <div class="san-card ub">
+      <h3>__ubsan_default_suppressions (LLVM 21+)</h3>
+      <p class="text-s">新增 <code>__ubsan_default_suppressions</code> 支持。用户可以在程序中定义一个返回抑制规则字符串的函数，允许在编译时指定默认的 UBSan 抑制规则，无需依赖外部抑制文件。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 编译时抑制规则</div>
+<pre class="cb"><span class="c">// 在源代码中定义默认抑制规则</span>
+<span class="k">const char *</span>__ubsan_default_suppressions() {
+  <span class="k">return</span> <span class="s">"vptr_check:somelib.so\n"</span>
+         <span class="s">"function:specific_func\n"</span>;
+}</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== NEW SANITIZERS ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">N</span>
+    <h2>全新 Sanitizer 类型</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">LLVM 15 到 21 期间引入了 3 个全新的 Sanitizer，涵盖数值精度、实时安全和元数据领域。</p>
+
+    <div class="san-card new">
+      <h3>Numerical Sanitizer (NSan) &mdash; LLVM 18+</h3>
+      <p class="text-s">检测浮点运算中的精度问题、异常值（NaN/Inf）和数值稳定性问题。适用于科学计算和金融应用中对数值精度要求极高的场景。通过 <code>-fsanitize=numerical</code> 启用。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 启用数值检测</div>
+<pre class="cb">clang <span class="k">-fsanitize=numerical</span> <span class="k">-g</span> math_heavy.c</pre>
+      </div>
+    </div>
+
+    <div class="san-card new">
+      <h3>Realtime Sanitizer (RTSan) &mdash; LLVM 19+/20+</h3>
+      <p class="text-s">检测实时上下文中不安全的系统库调用（如内存分配 <code>malloc</code>、互斥锁 <code>pthread_mutex_lock</code> 等）。适用于音频处理、游戏引擎、嵌入式实时系统等场景。由 <code>-fsanitize=realtime</code> 激活。标记为 <code>[[clang::nonblocking]]</code> 的函数中调用不安全系统函数时会报错并退出。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 启用实时检测</div>
+<pre class="cb"><span class="c">// 编译时启用 RTSan</span>
+clang <span class="k">-fsanitize=realtime</span> audio_callback.c
+
+<span class="c">// 标记实时函数</span>
+<span class="k">[[clang::nonblocking]]</span>
+<span class="k">void</span> audio_callback(<span class="k">float</span> *buffer) {
+  <span class="c">// RTSan 会检测: malloc, free, pthread_mutex_lock 等</span>
+  process_audio(buffer);
+}</pre>
+      </div>
+    </div>
+
+    <div class="san-card new">
+      <h3>Metadata Sanitizer &mdash; LLVM 20+</h3>
+      <p class="text-s">通过 <code>-fexperimental-sanitize-metadata=</code> 激活，将元数据附加到 IR 级别，支持自定义分析工具。当前为实验性特性，适用于研究用途和定制化分析。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 启用元数据</div>
+<pre class="cb"><span class="c"># 实验性元数据 Sanitizer</span>
+clang <span class="k">-fexperimental-sanitize-metadata=all</span> program.c</pre>
+      </div>
+    </div>
+
+    <div class="san-card new">
+      <h3>GPU Sanitizer &mdash; LLVM 20+</h3>
+      <p class="text-s">通过 <code>-fgpu-sanitize</code> 对 GPU 内核代码启用 Sanitizer 检测。适用于 CUDA/HIP/OpenMP 等 GPU 编程模型，帮助检测 GPU 设备代码中的内存错误和数据竞争。</p>
+      <div class="example-box mt-10">
+        <div class="label">示例: GPU Sanitizer</div>
+<pre class="cb">clang <span class="k">-fgpu-sanitize</span> <span class="k">-x cuda</span> kernel.cu</pre>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ========== INTEGRATION ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">I</span>
+    <h2>Sanitizer 集成与工具链改进</h2>
+  </div>
+  <div class="section-body">
+
+    <div class="san-card int">
+      <h3>Sanitizer Special Case List (SSCL) v4/v5 (LLVM 21+)</h3>
+      <p class="text-s">
+        Sanitizer 特殊清单 (<code>-fsanitize-ignorelist</code>) 和警告抑制映射 (<code>--warning-suppression-mappings</code>)
+        现在支持格式版本 4 和版本 5（由 <code>#!special-case-list-v4</code> 指示）。
+      </p>
+      <ul class="mt-10" style="font-size:13px;color:var(--text2)">
+        <li><strong>版本 4:</strong> 过渡期，同时匹配规范化和非规范化路径（对旧匹配发出警告）。</li>
+        <li><strong>版本 5:</strong> 完全要求规范化路径匹配（去除 <code>./</code> 前缀）。</li>
+        <li><strong>Windows:</strong> 路径分隔符变为斜杠无关 &mdash; <code>/</code> 和 <code>\</code> 互相匹配。</li>
+      </ul>
+      <div class="example-box mt-10">
+        <div class="label">示例: SSCL v4/v5 格式</div>
+<pre class="cb"><span class="c"># Version 4 (过渡格式) — 兼容旧路径</span>
+<span class="c">#!special-case-list-v4</span>
+<span class="c"># 旧格式 ./src/file.cpp 仍然匹配但发出警告</span>
+src:src/file.cpp
+
+<span class="c"># Version 5 (新格式) — 规范化路径</span>
+<span class="c">#!special-case-list-v5</span>
+<span class="c"># 路径必须不含 ./ 前缀</span>
+src:src/file.cpp</pre>
+      </div>
+    </div>
+
+    <div class="san-card int">
+      <h3>覆盖率增强 (LLVM 20+)</h3>
+      <p class="text-s">
+        新增 <code>-fsanitize-coverage-stack-depth-callback-min=&lt;N&gt;</code> 选项。
+        设置栈深度回调的最小阈值，仅当函数调用栈深度超过 N 时才触发覆盖率回调，减少冗余的覆盖率数据。
+      </p>
+      <div class="example-box mt-10">
+        <div class="label">示例: 栈深度阈值</div>
+<pre class="cb"><span class="c"># 仅栈深度 >= 8 时触发覆盖率回调</span>
+clang <span class="k">-fsanitize-coverage=trace-pc-guard</span> \
+      <span class="k">-fsanitize-coverage-stack-depth</span> \
+      <span class="k">-fsanitize-coverage-stack-depth-callback-min=8</span> \
+      program.c</pre>
+      </div>
+    </div>
+
+    <div class="san-card int">
+      <h3>TSan 随机延迟 (LLVM 21+)</h3>
+      <p class="text-s">
+        ThreadSanitizer 新增随机延迟功能，在线程调度中引入随机延迟，帮助发现稀有的线程交错和竞争条件。
+      </p>
+    </div>
+
+  </div>
+</section>
+
+<!-- ========== MIGRATION ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">&#9888;</span>
+    <h2>迁移注意事项</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">从 LLVM 15 升级到 21 时，以下 Sanitizer 行为变化需要特别关注。</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>变更项</th>
+          <th>影响版本</th>
+          <th>影响描述</th>
+          <th>建议操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>-fsanitize-memory-param-retval</code> 默认启用</td>
+          <td><span class="vt">LLVM 16</span></td>
+          <td>使用 MSan 时产生大量新的未初始化内存报告</td>
+          <td>验证报告真实性后修复；或使用 <code>-fno-sanitize-memory-param-retval</code> 回退</td>
+        </tr>
+        <tr>
+          <td>HWASan use-after-scope 默认启用</td>
+          <td><span class="vt">LLVM 18</span></td>
+          <td>HWASan 用户将默认获得 use-after-scope 检测</td>
+          <td>通常无负面影响；如遇误报可回退</td>
+        </tr>
+        <tr>
+          <td>SSCL v4 路径匹配行为变更</td>
+          <td><span class="vt">LLVM 21</span></td>
+          <td><code>./</code> 前缀路径匹配将发出警告（v4），未来版本将完全移除</td>
+          <td>更新 ignorelist 文件中的路径，移除 <code>./</code> 前缀</td>
+        </tr>
+        <tr>
+          <td>新 Sanitizer 可用</td>
+          <td><span class="vt">LLVM 18-20</span></td>
+          <td>NSan/RTSan/Metadata Sanitizer 可选择性启用</td>
+          <td>评估是否需要引入到 CI 流水线中</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="co co-i mt-16">
+      <strong>&#128161; 升级策略建议</strong>
+      建议分阶段升级：先使用与 LLVM 15 兼容的 Sanitizer 选项在 LLVM 21 上构建并运行测试，
+      确认无新增误报后，再逐步启用新版本特有的检测能力（如 NSan、RTSan 等）。
+    </div>
+  </div>
+</section>
+
+<!-- ========== SUMMARY ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">S</span>
+    <h2>总结</h2>
+  </div>
+  <div class="section-body">
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sanitizer</th>
+          <th>LLVM 15 状态</th>
+          <th>LLVM 21 状态</th>
+          <th>关键变化</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>ASan</strong></td>
+          <td>基础地址检测</td>
+          <td>增强的栈/heap/全局变量检测</td>
+          <td>Stack-use-after-return, use-after-scope, array cookie, 稳定 ABI</td>
+        </tr>
+        <tr>
+          <td><strong>MSan</strong></td>
+          <td>基础未初始化内存检测</td>
+          <td>增强的函数边界检测</td>
+          <td>param-retval 默认启用, use-after-destroy</td>
+        </tr>
+        <tr>
+          <td><strong>UBSan</strong></td>
+          <td>基础未定义行为检测</td>
+          <td>增强的类型对齐检查</td>
+          <td>聚集类型 null/alignment 检查, __ubsan_default_suppressions</td>
+        </tr>
+        <tr>
+          <td><strong>TSan</strong></td>
+          <td>标准数据竞争检测</td>
+          <td>增强的线程交错检测</td>
+          <td>随机延迟功能 (LLVM 21)</td>
+        </tr>
+        <tr>
+          <td><strong>NSan</strong></td>
+          <td>不存在</td>
+          <td><span class="bg">新增 (LLVM 18+)</span></td>
+          <td>浮点精度与异常值检测</td>
+        </tr>
+        <tr>
+          <td><strong>RTSan</strong></td>
+          <td>不存在</td>
+          <td><span class="bg">新增 (LLVM 19+/20+)</span></td>
+          <td>实时上下文安全检测</td>
+        </tr>
+        <tr>
+          <td><strong>Metadata Sanitizer</strong></td>
+          <td>不存在</td>
+          <td><span class="bm">实验性 (LLVM 20+)</span></td>
+          <td>IR 级别元数据附加</td>
+        </tr>
+        <tr>
+          <td><strong>GPU Sanitizer</strong></td>
+          <td>不存在</td>
+          <td><span class="bg">新增 (LLVM 20+)</span></td>
+          <td>GPU 内核代码检测</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</div><!-- /container -->
+
+<footer class="footer">
+  <p>专为数通产品线毕昇编译器升级工程编制 &middot; 仅供内部技术评估使用</p>
+  <p style="margin-top:4px;font-size:12px;opacity:.7">基于 LLVM 15.0.4 &#8594; 21.1.8 Release Notes 与源码差异分析 &middot; 2026-07-10</p>
+</footer>
+
+</body>
+</html>

@@ -239,6 +239,7 @@
     <a href="#size">📏小型化</a><span class="toc-div">｜</span>
     <a href="#warnings">⚠️告警</a><span class="toc-div">｜</span>
     <a href="#ub">🚫未定义行为</a><span class="toc-div">｜</span>
+    <a href="#sanitizers">🛡️Sanitizers</a><span class="toc-div">｜</span>
     <a href="#inline">🔗内联</a><span class="toc-div">｜</span>
     <a href="#flags">⚙️编译选项</a><span class="toc-div">｜</span>
     <a href="#libcxx">📚C++标准库</a><span class="toc-div">｜</span>
@@ -523,6 +524,57 @@
     </div>
     <div style="text-align:right;margin-top:14px">
       <a href="detail-ub.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看全部 UB 详解 →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     SANITIZERS
+     ══════════════════════════════════════════════════════ -->
+<section id="sanitizers" class="section">
+  <div class="section-header">
+    <span class="num">🛡️</span>
+    <h2>Sanitizers 增强</h2>
+    <span class="h2-tag">ASan · MSan · UBSan · New Tools</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 数通产品线关注点</strong>
+      LLVM 15→21 引入了多个全新 Sanitizer 工具（Numerical Sanitizer、Realtime Sanitizer、Metadata Sanitizer），
+      并对已有 ASan/MSan/UBSan 进行了大幅增强。这些工具在开发和 CI 阶段可有效捕捉 UB、内存错误和数据竞争。
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:16px 0 8px">🛠️ 各版本关键 Sanitizer 新增和增强</h4>
+    <table>
+      <thead><tr><th>版本</th><th>Sanitizer</th><th>变更类型</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><strong>16</strong></td><td>MSan</td><td><span class="bg">增强</span></td><td><code>-fsanitize-memory-param-retval</code> 默认启用，检测未初始化参数传递</td></tr>
+        <tr><td><strong>16</strong></td><td>UBSan</td><td><span class="bg">增强</span></td><td>新增更多浮点异常检测模式</td></tr>
+        <tr><td><strong>17</strong></td><td>ASan</td><td><span class="bg">增强</span></td><td>stack-use-after-return 检测改进，减少误报</td></tr>
+        <tr><td><strong>17</strong></td><td>TSan</td><td><span class="bg">增强</span></td><td>数据竞争检测覆盖更多同步原语</td></tr>
+        <tr><td><strong>18</strong></td><td><strong>Numerical Sanitizer</strong></td><td><span class="bh">新增</span></td><td>检测数值计算异常：除零、整数溢出、浮点异常 (<span class="inline-code">#94322</span>)</td></tr>
+        <tr><td><strong>18</strong></td><td>UBSan</td><td><span class="bg">增强</span></td><td>enum constexpr 范围检查集成</td></tr>
+        <tr><td><strong>19</strong></td><td><strong>Realtime Sanitizer</strong></td><td><span class="bh">新增</span></td><td>实时系统内存安全检查，适用于 RTOS/嵌入式场景 (<span class="inline-code">#92460</span>)</td></tr>
+        <tr><td><strong>19</strong></td><td>ASan</td><td><span class="bg">增强</span></td><td>stack-buffer-overflow 检测粒度提升</td></tr>
+        <tr><td><strong>20</strong></td><td>UBSan</td><td><span class="bg">增强</span></td><td>新增 <code>null</code> / <code>alignment</code> 检查 for aggregates；pointer-overflow 独立检测</td></tr>
+        <tr><td><strong>20</strong></td><td><strong>Metadata Sanitizer</strong></td><td><span class="bl">实验性新增</span></td><td>二进制分析元数据注入，支持后处理漏洞分析 (<span class="inline-code">-fexperimental-sanitize-metadata=</span>)</td></tr>
+        <tr><td><strong>20</strong></td><td>GPU Sanitizer</td><td><span class="bl">新增</span></td><td>卸载设备 sanitizer 支持 (<span class="inline-code">-fgpu-sanitize</span>)</td></tr>
+        <tr><td><strong>21</strong></td><td>ASan</td><td><span class="bg">增强</span></td><td>use-after-scope / use-after-return 检测持续改进</td></tr>
+      </tbody>
+    </table>
+
+    <div class="co co-a mt-10">
+      <strong>🟡 数通产品线 Sanitizer 推荐策略</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li><strong>CI 必开</strong>：<code>-fsanitize=address,undefined,pointer-overflow</code> — 覆盖内存错误 + UB + 指针溢出</li>
+        <li><strong>嵌入式专项</strong>：评估启用 <strong>Realtime Sanitizer</strong>（LLVM 19+），针对 RTOS 场景检测非实时安全的内存操作</li>
+        <li><strong>数值敏感模块</strong>：评估启用 <strong>Numerical Sanitizer</strong>（LLVM 18+），检测协议栈/加密中的数值异常</li>
+        <li><strong>安全审计</strong>：关注 <strong>Metadata Sanitizer</strong>（LLVM 20+ 实验性），用于二进制后处理漏洞分析</li>
+        <li><strong>生产环境</strong>：不启用 Sanitizer（有运行时开销），改用 libc++ Fast hardening + PAuth 等低开销方案</li>
+      </ul>
+    </div>
+    <div style="text-align:right;margin-top:14px">
+      <a href="detail-sanitizers.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">🛡️ 查看 Sanitizers 详解 →</a>
     </div>
   </div>
 </section>

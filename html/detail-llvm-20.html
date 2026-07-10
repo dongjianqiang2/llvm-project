@@ -53,6 +53,7 @@
   .badge-danger{background:var(--red);color:#fff}
   .badge-warn{background:var(--amber);color:#fff}
   .badge-info{background:var(--blue);color:#fff}
+  .badge-ok{background:var(--green);color:#fff}
 
   /* ── Layout ── */
   .container{max-width:960px;margin:0 auto;padding:32px 20px 64px}
@@ -70,6 +71,10 @@
   .section h2 .anchor{font-size:18px;opacity:.5}
   .section .desc{
     color:var(--text2);margin:8px 0 16px;font-size:14.5px;
+  }
+  .section h3{
+    font-size:17px;color:var(--primary-light);margin:18px 0 8px;
+    padding-bottom:6px;border-bottom:1px solid var(--border);
   }
 
   /* ── Tags row ── */
@@ -119,6 +124,13 @@
   .advice-box strong{color:var(--amber)}
   .advice-box p{margin:4px 0}
 
+  /* ── Info Box ── */
+  .info-box{
+    background:var(--blue-bg);border:1px solid #bfdbfe;
+    border-radius:8px;padding:16px 20px;margin-top:20px;
+  }
+  .info-box strong{color:var(--blue)}
+
   /* ── Footer ── */
   .footer{
     text-align:center;padding:32px 20px;color:var(--text2);
@@ -136,6 +148,10 @@
   .toc ol{padding-left:22px;font-size:14px;line-height:2.1}
   .toc a{color:var(--blue);text-decoration:none}
   .toc a:hover{text-decoration:underline}
+
+  /* ── Item List ── */
+  .item-list{margin:10px 0;padding-left:20px}
+  .item-list li{margin:6px 0;font-size:14px;color:var(--text2)}
 
   /* ── Responsive ── */
   @media(max-width:700px){
@@ -160,11 +176,20 @@
     <ol>
       <li><a href="#tbaa">TBAA 默认启用 <span class="badge badge-danger">最高风险</span></a></li>
       <li><a href="#ptr-ub">指针溢出 UB 积极优化 <span class="badge badge-danger">最高风险</span></a></li>
-      <li><a href="#fwrapv-ptr">-fwrapv-pointer 新标志 <span class="badge badge-warn">行为变更</span></a></li>
-      <li><a href="#enum-constexpr">enum constexpr 转换不可压制 <span class="badge badge-warn">编译报错</span></a></li>
-      <li><a href="#le32-le64">le32 / le64 目标移除</a></li>
-      <li><a href="#extra-template">多余 template header 默认报错</a></li>
-      <li><a href="#itanium-vtable">Itanium 构造 vtable 名称修正</a></li>
+      <li><a href="#fwrapv-ptr">-fwrapv / -fwrapv-pointer 语义变更 <span class="badge badge-warn">行为变更</span></a></li>
+      <li><a href="#enum-constexpr">enum constexpr 转换不可压制 <span class="badge badge-warn">硬错误</span></a></li>
+      <li><a href="#builtins">__is_nullptr 移除 / __is_referenceable 弃用</a></li>
+      <li><a href="#complex-bitint">_Complex _BitInt 被拒绝</a></li>
+      <li><a href="#deprecated-literal">-Wdeprecated-literal-operator 默认启用</a></li>
+      <li><a href="#extra-template">多余 template header 默认报错 <span class="badge badge-warn">硬错误</span></a></li>
+      <li><a href="#cwg2765">字符串字面量比较 CWG2765 <span class="badge badge-warn">行为变更</span></a></li>
+      <li><a href="#lifetimebound">[[clang::lifetimebound]] 错误诊断 <span class="badge badge-warn">硬错误</span></a></li>
+      <li><a href="#abi">ABI 名称修饰变更 <span class="badge badge-warn">ABI 变更</span></a></li>
+      <li><a href="#removals">目标平台与工具移除</a></li>
+      <li><a href="#sparc">SPARC: clang -m32 默认 -mcpu=v9</a></li>
+      <li><a href="#lld">LLD 20 重要改进 <span class="badge badge-info">新功能</span></a></li>
+      <li><a href="#aarch64">AArch64 后端改进 <span class="badge badge-info">新功能</span></a></li>
+      <li><a href="#sanitizers">Realtime Sanitizer (RTSan) + Sanitizer 改进 <span class="badge badge-info">新功能</span></a></li>
       <li><a href="#machine-block">Size-aware Machine Block Placement</a></li>
     </ol>
   </div>
@@ -229,7 +254,7 @@ int foo_correct(float *f, int *i) {
   </div>
 </section>
 
-<!-- ═══════════ 2. 指针溢出 UB ═══════════ -->
+<!-- ═══════════ 2. Pointer Overflow UB ═══════════ -->
 <section class="section" id="ptr-ub">
   <h2><span class="anchor">&#128737;</span> 2. 指针溢出 UB 积极优化 <span class="badge badge-danger">最高风险</span></h2>
   <div class="desc">
@@ -287,31 +312,38 @@ void process_buffer(char *buf, size_t len) {
   </div>
 
   <div class="example-box">
-    <h4>&#9989; 修复方案 2：使用编译选项</h4>
-    <p class="example-title"><span class="code-label label-fix">编译标志修复</span></p>
-    <pre># 注意：-fwrapv 在 LLVM 20 不再影响指针溢出！
-# 需要单独使用新标志
-clang -fwrapv-pointer ...</pre>
+    <h4>&#9989; 修复方案 2：只用偏移量比较</h4>
+    <p class="example-title"><span class="code-label label-fix">替代方案</span></p>
+    <pre>// 将 "ptr+offset &lt; end_ptr && ptr+offset >= ptr"
+// 改写为纯偏移量比较
+if (offset &lt; (uintptr_t)(end_ptr - ptr)) {
+  // offset 在有效范围内
+}</pre>
   </div>
 
   <div class="advice-box">
     <strong>&#128161; 关键提醒</strong>
     <p>1. <strong><code>-fwrapv</code> 不再有效</strong>：LLVM 20 中该标志只控制有符号整数溢出，不控制指针溢出。必须单独使用 <code>-fwrapv-pointer</code>。</p>
     <p>2. <strong>排查范围</strong>：搜索代码库中 <code>ptr + N &lt; ptr</code>、<code>ptr + N &gt;= ptr</code> 等涉及指针溢出的比较模式。</p>
-    <p>3. <strong>推荐方案</strong>：将指针比较改为 <code>uintptr_t</code> 整数比较，这是最可移植且不依赖编译器标志的修复方式。</p>
+    <p>3. <strong>检测工具</strong>：可使用 <code>-fsanitize=pointer-overflow</code> 在运行时检测指针溢出 UB。</p>
+    <p>4. <strong>推荐方案</strong>：将指针比较改为 <code>uintptr_t</code> 整数比较，这是最可移植且不依赖编译器标志的修复方式。</p>
   </div>
 </section>
 
-<!-- ═══════════ 3. -fwrapv-pointer ═══════════ -->
+<!-- ═══════════ 3. -fwrapv / -fwrapv-pointer ═══════════ -->
 <section class="section" id="fwrapv-ptr">
-  <h2><span class="anchor">&#9888;</span> 3. -fwrapv-pointer 新标志 <span class="badge badge-warn">行为变更</span></h2>
+  <h2><span class="anchor">&#9888;</span> 3. -fwrapv / -fwrapv-pointer 语义变更 <span class="badge badge-warn">行为变更</span></h2>
   <div class="desc">
-    LLVM 20 新增 <code>-fwrapv-pointer</code> 编译标志，用于<strong>独立控制</strong>指针溢出行为。
-    在此之前，一些项目依赖 <code>-fwrapv</code> 同时覆盖整数和指针溢出 —— 这一假设在 LLVM 20 中不再成立。
+    LLVM 20 对几个关键的溢出控制标志进行了重新定义，使其与 GCC 行为对齐：
+    <ul style="margin:8px 0 0 20px;color:var(--text2);">
+      <li><code>-fwrapv</code>：<strong>仅</strong>控制有符号整数溢出（不再影响指针溢出）</li>
+      <li><code>-fwrapv-pointer</code>：<strong>新增</strong>标志，独立控制指针溢出行为</li>
+      <li><code>-fno-strict-overflow</code>：现在隐含 <code>-fwrapv</code> 和 <code>-fwrapv-pointer</code> 两者</li>
+    </ul>
   </div>
   <div class="tag-row">
     <span class="tag tag-warn">&#9888; 行为变更</span>
-    <span class="tag tag-note">&#128161; 需评估</span>
+    <span class="tag tag-note">&#128161; 需评估构建系统</span>
   </div>
 
   <div class="example-box">
@@ -329,8 +361,14 @@ clang -fwrapv -O2 foo.c
 
 # 正确做法：同时添加两个标志
 clang -fwrapv -fwrapv-pointer -O2 foo.c
-#   有符号整数溢出 → wrapping
-#   指针加法溢出   → wrapping </pre>
+
+# 或使用 -fno-strict-overflow（等价于两者）
+clang -fno-strict-overflow -O2 foo.c</pre>
+  </div>
+
+  <div class="info-box">
+    <strong>&#128161; clang-cl 注意事项</strong>
+    <p>LLVM 20 中 clang-cl 也支持 <code>-fno-strict-overflow</code>、<code>-fwrapv</code> 和 <code>-fwrapv-pointer</code>，行为与 clang 一致。</p>
   </div>
 
   <div class="advice-box">
@@ -343,11 +381,12 @@ clang -fwrapv -fwrapv-pointer -O2 foo.c
 
 <!-- ═══════════ 4. enum constexpr ═══════════ -->
 <section class="section" id="enum-constexpr">
-  <h2><span class="anchor">&#128218;</span> 4. enum constexpr 转换不可压制 <span class="badge badge-warn">编译报错</span></h2>
+  <h2><span class="anchor">&#128218;</span> 4. enum constexpr 转换不可压制 <span class="badge badge-warn">硬错误</span></h2>
   <div class="desc">
     C++ 标准要求 <code>constexpr</code> 上下文中枚举值必须在声明的枚举器范围内。
     LLVM 20 开始严格执行这一规则：将超出范围的整数值显式转换为枚举类型不再被允许为常量表达式，
     且此错误<strong>无法通过 <code>-Wno-*</code> 等警告标志压制</strong>。
+    LLVM 16~19 期间可用 <code>-Wno-enum-constexpr-conversion</code> 压制，现在该选项不再有效。
   </div>
   <div class="tag-row">
     <span class="tag tag-risk">&#10060; 硬错误</span>
@@ -356,80 +395,141 @@ clang -fwrapv -fwrapv-pointer -O2 foo.c
 
   <div class="example-box">
     <h4>&#128030; 示例：超出范围的 enum constexpr</h4>
-    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
-    <pre>enum E { Zero, One, Two };
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM 16–19)</span></p>
+    <pre>enum E { Zero, One, Two, Three, Four };
 
-// 旧版本：警告（可用 -Wno-enum-constexpr-conversion 压制）
-constexpr E v = (E)8;   // 8 超出 {0,1,2} 范围
-// 仍可编译通过，v 值为 8（未定义行为但编译器放行）</pre>
+constexpr E Val1 = (E)3;   // Ok
+constexpr E Val2 = (E)7;   // Ok, 在范围 [0,7] 内
+constexpr E Val3 = (E)8;   // 警告（可用 -Wno-enum-constexpr-conversion 压制）
+constexpr E Val4 = (E)-1;  // 警告（可压制）</pre>
     <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
-    <pre>enum E { Zero, One, Two };
+    <pre>enum E { Zero, One, Two, Three, Four };
 
-constexpr E v = (E)8;   // error: 常量表达式中枚举值超出范围
-// 无法用 -Wno-* 压制，必须修复源代码
-</pre>
+constexpr E Val3 = (E)8;   // error: 常量表达式中枚举值超出范围 [0,7]
+constexpr E Val4 = (E)-1;  // error: 超出范围
+// -Wno-enum-constexpr-conversion 不再有效，必须修复源代码</pre>
   </div>
 
   <div class="example-box">
     <h4>&#9989; 修复方案</h4>
     <p class="example-title"><span class="code-label label-fix">做法 1：去掉 constexpr</span></p>
-    <pre>enum E { Zero, One, Two };
-
-E v = (E)8;  // 去掉 constexpr，不再是常量表达式上下文</pre>
-    <p class="example-title"><span class="code-label label-fix">做法 2：使用底层类型 (C++11 scoped enum)</span></p>
-    <pre>enum class E : int { Zero, One, Two };
-
-constexpr E v = static_cast&lt;E&gt;(8);  // scoped enum 允许任意底层类型值
-// 注意：这是未指定枚举器值，但语法上合法</pre>
-    <p class="example-title"><span class="code-label label-fix">做法 3：定义所需枚举器</span></p>
-    <pre>enum E { Zero, One, Two, Eight = 8 };  // 添加所需值到枚举定义
+    <pre>E v = (E)8;  // 去掉 constexpr，不再是常量表达式上下文</pre>
+    <p class="example-title"><span class="code-label label-fix">做法 2：使用固定底层类型的 scoped enum</span></p>
+    <pre>enum class E : int { Zero, One, Two, Three, Four };
+constexpr E v = static_cast&lt;E&gt;(8);  // scoped enum + 固定底层类型允许任意值</pre>
+    <p class="example-title"><span class="code-label label-fix">做法 3：扩展枚举定义</span></p>
+    <pre>enum E { Zero, One, Two, Three, Four, Five, Six, Seven, Eight = 8 };
 constexpr E v = Eight;</pre>
   </div>
 
   <div class="advice-box">
     <strong>&#128161; 建议</strong>
-    <p>&#8226; 用 <code>grep -r "constexpr.*(E)"</code> 搜索代码中涉及的 constexpr 枚举转换。</p>
+    <p>&#8226; 用 <code>grep -rn "constexpr.*(E)\|constexpr.*static_cast.*enum"</code> 搜索涉及的 constexpr 枚举转换。</p>
     <p>&#8226; 优先采用方案 1（去掉 constexpr）或方案 3（扩展枚举定义），避免未定义行为。</p>
   </div>
 </section>
 
-<!-- ═══════════ 5. le32/le64 ═══════════ -->
-<section class="section" id="le32-le64">
-  <h2><span class="anchor">&#128260;</span> 5. le32 / le64 目标移除</h2>
+<!-- ═══════════ 5. __is_nullptr / __is_referenceable ═══════════ -->
+<section class="section" id="builtins">
+  <h2><span class="anchor">&#128218;</span> 5. __is_nullptr 移除 / __is_referenceable 弃用</h2>
   <div class="desc">
-    LLVM 20 已移除对小端 32 位 (<code>le32</code>) 和小端 64 位 (<code>le64</code>) 目标平台的支持。
-    这些目标主要用于 PNaCl（Portable Native Client），该技术已不再活跃维护。
+    LLVM 20 对两个使用率极低的 Clang 内置类型特征进行了清理。
   </div>
   <div class="tag-row">
-    <span class="tag tag-warn">&#9888; 目标移除</span>
-    <span class="tag tag-note">&#128161; 需检查构建配置</span>
+    <span class="tag tag-risk">&#10060; __is_nullptr 已移除</span>
+    <span class="tag tag-warn">&#9888; __is_referenceable 已弃用</span>
+    <span class="tag tag-fix">&#128295; 需代码修复</span>
   </div>
 
+  <h3>5.1 __is_nullptr 已移除</h3>
+  <div class="desc">
+    <code>__is_nullptr(T)</code> 内置类型特征已被直接移除。该特征使用量极少，且可用 GCC 兼容写法替代。
+  </div>
   <div class="example-box">
-    <h4>&#128030; 影响</h4>
-    <pre># 以下目标三元组不再有效
--target le32-unknown-nacl
--target le64-unknown-nacl
-
-# 编译报错示例
-$ clang -target le32-unknown-nacl hello.c
-error: unknown target triple 'le32-unknown-nacl'</pre>
+    <h4>&#9989; 替代写法</h4>
+    <pre>// 取代 __is_nullptr(T)
+// 等价于 GCC 也支持的写法
+__is_same(__remove_cv(T), decltype(nullptr))</pre>
   </div>
 
+  <h3>5.2 __is_referenceable 已弃用</h3>
+  <div class="desc">
+    <code>__is_referenceable(T)</code> 已被标记为弃用，将在 Clang 21 中移除。该特征使用量极少，
+    且标准库中所有可能依赖它的类型特征均已拥有专用的内置实现。
+  </div>
   <div class="advice-box">
-    <strong>&#128161; 应对措施</strong>
-    <p>&#8226; <strong>一般项目不受影响</strong>：le32/le64 仅在 PNaCl 生态中使用，主流 Linux/x86-64/ARM 项目无需关注。</p>
-    <p>&#8226; <strong>检查构建脚本</strong>：搜索构建配置中是否包含 <code>le32</code> 或 <code>le64</code> 字符串，若有则需移除或替换为实际目标平台。</p>
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 搜索代码中 <code>__is_nullptr</code> 和 <code>__is_referenceable</code> 的使用，替换为标准类型特征。</p>
+    <p>&#8226; 这些特征极少在业务代码中直接使用，大多数项目不受影响。</p>
   </div>
 </section>
 
-<!-- ═══════════ 6. 多余 template header ═══════════ -->
+<!-- ═══════════ 6. _Complex _BitInt ═══════════ -->
+<section class="section" id="complex-bitint">
+  <h2><span class="anchor">&#128218;</span> 6. _Complex _BitInt 被拒绝</h2>
+  <div class="desc">
+    Clang 20 现在拒绝 <code>_Complex _BitInt(N)</code> 类型组合。这个组合在标准中没有明确定义，
+    之前 Clang 可能接受但生成不正确的代码。现在编译器直接报错拒绝。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-risk">&#10060; 编译报错</span>
+    <span class="tag tag-fix">&#128295; 需代码修复</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例</h4>
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
+    <pre>_Complex _BitInt(128) x;  // 可能通过编译，行为不明</pre>
+    <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
+    <pre>_Complex _BitInt(128) x;  // error: _Complex _BitInt is not supported</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 此组合极少被使用，绝大多数项目不受影响。</p>
+    <p>&#8226; 如需表示高精度复数，使用两个独立的 <code>_BitInt</code> 变量分别表示实部和虚部，或使用结构体封装。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 7. -Wdeprecated-literal-operator ═══════════ -->
+<section class="section" id="deprecated-literal">
+  <h2><span class="anchor">&#128218;</span> 7. -Wdeprecated-literal-operator 默认启用</h2>
+  <div class="desc">
+    <code>-Wdeprecated-literal-operator</code> 警告现在<strong>默认启用</strong>。
+    WG21 已表示有兴趣从语言中移除此语法，Clang 20 开始默认警告。
+    使用 <code>-Werror</code> 的项目将会因此编译失败。
+    此变更与 CWG2521 决议一致。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; 警告变更</span>
+    <span class="tag tag-fix">&#128295; 修复简单</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例：字面量运算符声明</h4>
+    <p class="example-title"><span class="code-label label-before">旧写法（已弃用）</span></p>
+    <pre>// operator"" 与后缀名之间有空格 — 已弃用
+unsigned operator"" _udl_name(unsigned long long);</pre>
+    <p class="example-title"><span class="code-label label-after">正确写法</span></p>
+    <pre>// 去掉空格即可，修复极其简单
+unsigned operator""_udl_name(unsigned long long);</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 搜索代码中 <code>operator"" </code>（带空格）的模式，将空格删除即可。</p>
+    <p>&#8226; 此修复简单直接，风险极低。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 8. Extraneous Template Head ═══════════ -->
 <section class="section" id="extra-template">
-  <h2><span class="anchor">&#128218;</span> 6. 多余 template header 默认报错</h2>
+  <h2><span class="anchor">&#128218;</span> 8. 多余 template header 默认报错 <span class="badge badge-warn">硬错误</span></h2>
   <div class="desc">
     C++ 标准要求显式特化声明前不应有多余的 <code>template&lt;&gt;</code> 头。
     例如嵌套的 <code>template&lt;&gt; template &lt;typename T&gt;</code> 在规范上非法，
     LLVM 20 将此从警告升级为<strong>默认报错</strong>。
+    可使用 <code>-Wno-error=extraneous-template-head</code> 临时降级为警告。
   </div>
   <div class="tag-row">
     <span class="tag tag-risk">&#10060; 硬错误</span>
@@ -464,50 +564,366 @@ void f();</pre>
   </div>
 </section>
 
-<!-- ═══════════ 7. Itanium vtable ═══════════ -->
-<section class="section" id="itanium-vtable">
-  <h2><span class="anchor">&#128179;</span> 7. Itanium 构造 vtable 名称修正</h2>
+<!-- ═══════════ 9. CWG2765 String Literal Comparison ═══════════ -->
+<section class="section" id="cwg2765">
+  <h2><span class="anchor">&#128218;</span> 9. 字符串字面量比较 CWG2765 <span class="badge badge-warn">行为变更</span></h2>
   <div class="desc">
-    LLVM 20 修正了 Itanium C++ ABI 下<strong>构造 vtable (construction vtable)</strong> 的名称生成错误。
-    构造 vtable 用于虚基类子对象的构造/析构期间，名称修正可能导致<strong>ABI 不兼容</strong>，
-    新旧编译器生成的符号名称可能不同，影响链接兼容性。
+    Clang 20 按照核心议题 <a href="http://wg21.link/CWG2765" target="_blank">CWG2765</a> 的预期方向，
+    修改了常量求值中对字符串字面量比较的处理。
+    同一字符串字面量的<strong>不同求值结果</strong>之间的比较现在被视为<strong>非常量</strong>（因为它们可能指向不同内存），
+    而绝不可能重叠的字符串字面量之间的比较现在被视为常量。
+    注意：此行为仍可能在 CWG2765 决议后变化。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; 行为变更</span>
+    <span class="tag tag-note">&#128161; 影响 constexpr 代码</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例：constexpr 中字符串比较</h4>
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
+    <pre>constexpr const char *f() { return "hello"; }
+constexpr const char *g() { return "world"; }
+// 旧行为：求值为 false
+constexpr bool a = f() == f();
+// 旧行为：因无法确定是否重叠而报错
+constexpr bool b = f() == g();</pre>
+    <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
+    <pre>constexpr const char *f() { return "hello"; }
+constexpr const char *g() { return "world"; }
+// 新行为：error: 非常量比较（不同求值可能返回不同地址）
+constexpr bool a = f() == f();
+// 运行时仍然有效
+bool at_runtime() { return f() == f(); }
+// 新行为：求值为 false（"hello" 与 "world" 不可能重叠）
+constexpr bool b = f() == g();</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 在 constexpr 上下文中，避免依赖字符串字面量地址的比较。使用 <code>__builtin_strcmp</code> 或比较内容。</p>
+    <p>&#8226; 如果使用编译期字符串散列或类似技术，需要考虑此变更的影响。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 10. lifetimebound ═══════════ -->
+<section class="section" id="lifetimebound">
+  <h2><span class="anchor">&#128218;</span> 10. [[clang::lifetimebound]] 错误诊断 <span class="badge badge-warn">硬错误</span></h2>
+  <div class="desc">
+    <code>[[clang::lifetimebound]]</code> 属性现在有更严格的语法检查。
+    以前被静默忽略的错误用法现在会<strong>直接编译报错</strong>。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-risk">&#10060; 硬错误</span>
+    <span class="tag tag-fix">&#128295; 需代码修复</span>
+  </div>
+
+  <h3>10.1 void 返回函数上使用 lifetimebound — 现在报错</h3>
+  <div class="example-box">
+    <p class="example-title"><span class="code-label label-after">LLVM 20+ 报错</span></p>
+    <pre>// error: 'lifetimebound' attribute cannot be applied to a parameter of
+//        a function that returns void
+void f(int& i [[clang::lifetimebound]]);</pre>
+  </div>
+
+  <h3>10.2 在类型（非参数）上使用 lifetimebound — 现在报错</h3>
+  <div class="example-box">
+    <p class="example-title"><span class="code-label label-after">LLVM 20+ 报错</span></p>
+    <pre>// error: 'lifetimebound' attribute only applies to function parameters
+int* [[clang::lifetimebound]] x;
+
+// error: 在类型上（非参数声明）
+void f(int* [[clang::lifetimebound]] i);
+
+// error: 未命名参数
+void g(int* [[clang::lifetimebound]]);</pre>
+  </div>
+
+  <div class="info-box">
+    <strong>&#128161; 补充</strong>
+    <p>LLVM 20 还新增了 <code>[[clang::lifetime_capture_by(X)]]</code> 属性，可指定函数参数引用的生命周期被实体 X 捕获。</p>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 将 lifetimebound 属性仅应用在有返回值的函数参数上（且参数为引用或指针类型）。</p>
+    <p>&#8226; 在 void 返回函数上使用 lifetimebound 本就是无意义的用法，直接删除即可。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 11. ABI Name Mangling Changes ═══════════ -->
+<section class="section" id="abi">
+  <h2><span class="anchor">&#128179;</span> 11. ABI 名称修饰变更 <span class="badge badge-warn">ABI 变更</span></h2>
+  <div class="desc">
+    LLVM 20 包含三项 ABI 层面的名称修饰 (name mangling) 修正。
+    这些修正可能导致与旧版本 Clang 编译的代码<strong>链接不兼容</strong>。
+    影响 C++ ABI 的符号名称，需要使用统一编译器版本全量重编，或使用兼容选项。
   </div>
   <div class="tag-row">
     <span class="tag tag-warn">&#9888; ABI 变更</span>
-    <span class="tag tag-note">&#128161; 可恢复旧行为</span>
+    <span class="tag tag-note">&#128161; 可用 -fclang-abi-compat=19</span>
   </div>
 
+  <h3>11.1 Itanium 构造 vtable 名称修正</h3>
+  <div class="desc">
+    修正了 Itanium C++ ABI 下<strong>构造 vtable (construction vtable)</strong> 的符号名称生成错误。
+    构造 vtable 用于虚基类子对象的构造/析构期间，受影响的场景包括包含虚基类的继承层次结构。
+    可使用 <code>-fclang-abi-compat=19</code> 恢复旧行为。
+  </div>
   <div class="example-box">
-    <h4>&#128030; 影响场景</h4>
     <pre>// 涉及虚基类的继承层次结构
 struct Base { virtual ~Base(); };
 struct Derived : virtual Base { virtual ~Derived(); };
-
-// LLVM 20 修正后，构造 vtable 的符号名称可能改变
-// 导致与旧版本编译的库链接时出现未定义符号错误</pre>
+// LLVM 20: 构造 vtable 符号名称可能改变</pre>
   </div>
 
-  <div class="example-box">
-    <h4>&#9989; 修复方案</h4>
-    <p class="example-title"><span class="code-label label-fix">临时恢复旧行为</span></p>
-    <pre># 使用 ABI 兼容标志回到 LLVM 19 的命名方式
-clang -fclang-abi-compat=19 ...</pre>
-    <p class="example-title"><span class="code-label label-fix">根本修复</span></p>
-    <pre># 确保所有依赖库使用相同的 LLVM 版本重新编译
-# 消除跨版本 ABI 混用</pre>
+  <h3>11.2 成员式友元函数模板名称修饰</h3>
+  <div class="desc">
+    成员式的友元函数模板 (member-like friend function templates) 现在被修饰为
+    <strong>封闭类的成员</strong>。这更符合 Itanium ABI 规范。
+    可使用 <code>-fclang-abi-compat=19</code> 恢复旧行为。
+  </div>
+
+  <h3>11.3 MSVC 名称修饰修正</h3>
+  <div class="desc">
+    修正了 MSVC 1920+ 下 <code>placeholder</code>、<code>auto</code> 和 <code>decltype(auto)</code>
+    返回类型的名称修饰，与 MSVC 行为对齐。与早期 Clang 版本不兼容，
+    除非使用 <code>-fms-compatibility-version=19.14</code> 模拟 MSVC 1914 修饰行为。
   </div>
 
   <div class="advice-box">
     <strong>&#128161; 建议</strong>
     <p>&#8226; <strong>全量重编</strong>：升级编译器后对所有 C++ 代码进行全量重编译，避免新旧 ABI 混用。</p>
-    <p>&#8226; <strong>过渡期</strong>：如有无法立即重编的预编译库，使用 <code>-fclang-abi-compat=19</code> 保持兼容。</p>
-    <p>&#8226; <strong>影响面</strong>：仅涉及带虚基类的复杂继承体系，大多数项目不受影响。</p>
+    <p>&#8226; <strong>过渡期</strong>：如有无法立即重编的预编译库，使用 <code>-fclang-abi-compat=19</code> 或 <code>-fms-compatibility-version=19.14</code> 保持兼容。</p>
+    <p>&#8226; <strong>影响面</strong>：Item 11.1 仅涉及带虚基类的复杂继承体系；Item 11.2 涉及类内友元模板；Item 11.3 仅影响 Windows MSVC ABI。</p>
   </div>
 </section>
 
-<!-- ═══════════ 8. Machine Block Placement ═══════════ -->
+<!-- ═══════════ 12. Platform & Tool Removals ═══════════ -->
+<section class="section" id="removals">
+  <h2><span class="anchor">&#128260;</span> 12. 目标平台与工具移除</h2>
+  <div class="desc">
+    LLVM 20 移除了几个不再活跃维护的目标平台和工具。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; 移除</span>
+    <span class="tag tag-note">&#128161; 需检查构建配置</span>
+  </div>
+
+  <h3>12.1 le32 / le64 目标移除</h3>
+  <div class="desc">
+    <code>le32</code> 和 <code>le64</code> 目标已移除。这些目标主要用于 PNaCl (Portable Native Client)，该技术已不再活跃维护。
+  </div>
+  <div class="example-box">
+    <pre># 以下目标三元组不再有效
+-target le32-unknown-nacl
+-target le64-unknown-nacl
+# error: unknown target triple</pre>
+  </div>
+
+  <h3>12.2 RenderScript 目标移除</h3>
+  <div class="desc">
+    RenderScript 目标支持已被移除。Android 已<a href="https://developer.android.com/guide/topics/renderscript/compute" target="_blank">正式弃用 RenderScript</a>，
+    用户应<a href="https://developer.android.com/guide/topics/renderscript/migrate" target="_blank">迁移至 Vulkan</a> 或其他方案。
+  </div>
+
+  <h3>12.3 clang-rename 工具移除</h3>
+  <div class="desc">
+    <code>clang-rename</code> 工具已被移除。该工具使用率低，建议使用 clangd 的 rename 功能或其他替代方案。
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; <strong>le32/le64 / RenderScript</strong>：一般 Linux/x86-64/ARM 项目不受影响。</p>
+    <p>&#8226; <strong>clang-rename</strong>：检查 CI 或构建脚本中是否使用了 <code>clang-rename</code>，迁移至 clangd。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 13. SPARC -m32 default ═══════════ -->
+<section class="section" id="sparc">
+  <h2><span class="anchor">&#128218;</span> 13. SPARC: clang -m32 默认 -mcpu=v9</h2>
+  <div class="desc">
+    在 SPARC Linux 上，<code>clang -m32</code> 现在默认使用 <code>-mcpu=v9</code>。
+    仍需要支持 SPARC V8 CPU 的发行版需要通过
+    <a href="https://clang.llvm.org/docs/UsersManual.html#configuration-files" target="_blank">配置文件</a>
+    显式指定 <code>-mcpu=v8</code>。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; 行为变更</span>
+    <span class="tag tag-note">&#128161; 仅影响 SPARC</span>
+  </div>
+
+  <div class="example-box">
+    <pre># SPARC Linux 上
+clang -m32 foo.c    # 默认 -mcpu=v9（新增行为）
+clang -m32 -mcpu=v8 foo.c  # 如需兼容 V8 需显式指定</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 非 SPARC 平台完全不受影响。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 14. LLD 20 ═══════════ -->
+<section class="section" id="lld">
+  <h2><span class="anchor">&#128269;</span> 14. LLD 20 重要改进 <span class="badge badge-info">新功能</span></h2>
+  <div class="desc">
+    LLD 20 引入了多项重要新功能和行为变更，涵盖 ELF、COFF、MinGW 和 MachO 后端。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-note">&#128161; ELF 新功能</span>
+    <span class="tag tag-warn">&#9888; 行为变更</span>
+  </div>
+
+  <h3>14.1 ELF 重要新功能</h3>
+  <ul class="item-list">
+    <li><strong>-z nosectionheader</strong>：省略 section header table，类似 <code>llvm-objcopy --strip-sections</code>，可用于减小二进制体积。</li>
+    <li><strong>--randomize-section-padding=&lt;seed&gt;</strong>：在输入 section 之间和每个 segment 起始处插入随机填充，可用于 A/B 实验测量偏差控制。</li>
+    <li><strong>--symbol-ordering-file</strong> 与 call graph profile 现在可以同时使用，两者共同优化函数布局。</li>
+    <li><strong>--call-graph-ordering-file</strong>：指定此选项后，可重定位文件中的 <code>.llvm.call-graph-profile</code> 段不再被使用。</li>
+    <li><strong>--lto-basic-block-sections=labels</strong> 已弃用，使用 <code>--lto-basic-block-address-map</code> 替代。</li>
+  </ul>
+
+  <h3>14.2 ELF 行为变更</h3>
+  <ul class="item-list">
+    <li><strong>.note.GNU-stack exec 检查</strong>：非可重定位链接中，带有 <code>SHF_EXECINSTR</code> 标志的 <code>.note.GNU-stack</code> 段现在被拒绝，除非指定 <code>-z execstack</code>。</li>
+    <li><strong>Section CLASS 语法</strong>：链接器脚本新增 CLASS 语法，可将输入 section 绑定到命名类别，提供对 <code>--enable-non-contiguous-regions</code> 自动溢出的精细控制。</li>
+    <li><strong>INCLUDE 循环检测</strong>：链接器脚本的 INCLUDE 循环检测已修复，同一个脚本可以被包含两次。</li>
+    <li><strong>archivename: 语法</strong>：匹配输入 section 时现在支持 <code>archivename:</code> 前缀语法。</li>
+  </ul>
+
+  <h3>14.3 AArch64 / x86-64 / LoongArch 改进</h3>
+  <ul class="item-list">
+    <li><strong>AArch64</strong>：支持 BTI-aware 长分支 thunk 到无 BTI 指令的目标函数；支持 GOT/TLSDESC 的指针认证 ABI 重定位。</li>
+    <li><strong>x86-64</strong>：新增多种 GOT/TPOFF/TLSDESC 的 CODE_4/CODE_6 重定位类型支持。</li>
+    <li><strong>LoongArch</strong>：支持 TLS LD/GD/DESC 的 PCREL20_S2 重定位类型。</li>
+  </ul>
+
+  <h3>14.4 COFF / MinGW / MachO</h3>
+  <ul class="item-list">
+    <li><strong>COFF</strong>：<code>/includeglob</code>（匹配 ELF 的 <code>--undefined-glob</code>）；<code>/lldsavetemps</code> 保存 LTO 中间结果；<code>/machine:arm64ec</code> 支持 ARM64EC 镜像链接；COFF weak anti-dependency alias 符号支持。</li>
+    <li><strong>MinGW</strong>：<code>--undefined-glob</code> 现在通过转换为 <code>/includeglob</code> 标志支持。</li>
+    <li><strong>Break change</strong>：已移除对 RISC-V 已弃用的 <code>R_RISCV_RVC_LUI</code> 重定位支持。</li>
+  </ul>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; <strong>-z nosectionheader</strong> 可用于减小生产二进制体积，但会丢失 section header 信息（影响某些调试工具）。</p>
+    <p>&#8226; <strong>.note.GNU-stack exec 检查</strong> 可能影响使用手写汇编且未正确标注栈可执行属性的项目。</p>
+    <p>&#8226; <strong>--randomize-section-padding</strong> 对安全和 A/B 测试有用，但会小幅增加二进制体积。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 15. AArch64 Backend ═══════════ -->
+<section class="section" id="aarch64">
+  <h2><span class="anchor">&#128269;</span> 15. AArch64 后端改进 <span class="badge badge-info">新功能</span></h2>
+  <div class="desc">
+    AArch64 后端在 LLVM 20 中有多项重要更新，包括对齐填充行为变更和新 CPU 支持。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; 行为变更</span>
+    <span class="tag tag-info">&#128161; 新架构支持</span>
+  </div>
+
+  <h3>15.1 .balign N,0 对齐填充行为变更</h3>
+  <div class="desc">
+    在代码段中，<code>.balign N, 0</code>、<code>.p2align N, 0</code>、<code>.align N, 0</code>
+    现在<strong>使用 0x0 字节序列填充</strong>，而非 NOP 指令。
+    此变更同时影响 AArch64、ARM、RISC-V、LoongArch 等多个后端。
+    如果仍需要 NOP 填充，省略填充值参数即可（<code>.balign N</code> 等）。
+  </div>
+  <div class="example-box">
+    <pre># 代码段中
+.balign 16, 0     # LLVM 20: 填充 0x00 字节（而非 NOP 指令）
+.balign 16        # 仍然填充优化的 NOP 指令（未指定填充值）</pre>
+  </div>
+
+  <h3>15.2 Armv9.6-A 架构支持</h3>
+  <div class="desc">
+    汇编器/反汇编器已添加对 Armv9.6-A (2024) 架构扩展的支持，包括 FEAT_FAMINMAX、FEAT_LUT、FEAT_FP8 等特性。
+  </div>
+
+  <h3>15.3 FUJITSU-MONAKA CPU 支持</h3>
+  <div class="desc">
+    新增对 FUJITSU-MONAKA CPU 的支持，可通过 <code>-mcpu=fujitsu-monaka</code> 启用。
+  </div>
+
+  <h3>15.4 其他改进</h3>
+  <ul class="item-list">
+    <li>SVE2.1 和 SME2.1 的 ACLE 实现现已可用。</li>
+    <li>SME 关键字属性现在体现在函数类型的名称修饰中。</li>
+    <li>新增 <code>__arm_agnostic</code> 关键字属性。</li>
+    <li>Function Multi Versioning 的运行时特性检测已按 ACLE 规范实现。</li>
+  </ul>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; <strong>.balign N,0 变更</strong>：如果项目中的手写汇编或内联汇编依赖 NOP 填充（例如某些安全加固技术），需要检查并适配。</p>
+    <p>&#8226; 一般 C/C++ 项目代码不受 AArch64 对齐变更影响，编译器自动生成的填充行为不变。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 16. Sanitizers ═══════════ -->
+<section class="section" id="sanitizers">
+  <h2><span class="anchor">&#128269;</span> 16. Realtime Sanitizer (RTSan) + Sanitizer 改进 <span class="badge badge-info">新功能</span></h2>
+  <div class="desc">
+    LLVM 20 引入了全新的 Realtime Sanitizer 以及多项 Sanitizer 基础设施改进。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-note">&#128161; 新 Sanitizer</span>
+    <span class="tag tag-fix">&#128295; 诊断增强</span>
+  </div>
+
+  <h3>16.1 Realtime Sanitizer (RTSan)</h3>
+  <div class="desc">
+    RTSan 是一个全新的 Sanitizer，通过 <code>-fsanitize=realtime</code> 启用。
+    它可以检测<strong>实时上下文中的不安全系统库调用</strong>，如内存分配和互斥锁操作。
+    如果任何此类函数在标记为 <code>[[clang::nonblocking]]</code> 的函数中被调用，
+    RTSan 会输出错误信息并异常退出。
+  </div>
+  <div class="example-box">
+    <h4>&#128030; 示例</h4>
+    <pre>[[clang::nonblocking]]
+void process_audio() {
+  // RTSan 会在运行时检测并报错：
+  void *buf = malloc(1024);  // 错误：在 nonblocking 上下文中调用 malloc
+  mutex.lock();              // 错误：在 nonblocking 上下文中获取互斥锁
+}
+
+// 编译时启用 RTSan
+// clang -fsanitize=realtime audio.c</pre>
+  </div>
+
+  <h3>16.2 Sanitizer Special Case List (SSCL) 改进</h3>
+  <div class="desc">
+    SSCL 现在对更多 sanitizer 类型正确支持 <code>type:</code> 前缀，
+    包括 <code>signed-integer-overflow</code>、<code>unsigned-integer-overflow</code>、
+    <code>implicit-signed-integer-truncation</code>、<code>implicit-unsigned-integer-truncation</code>、
+    <code>enum</code> 等类型。
+    这允许在 supression 文件中按类型精确控制 sanitizer 行为。
+  </div>
+
+  <h3>16.3 其他 Sanitizer 改进</h3>
+  <ul class="item-list">
+    <li><strong>-fsanitize-undefined-ignore-overflow-pattern</strong>：新标志，可忽略特定整数溢出模式（如 <code>add-mul</code>、<code>negated-unsigned-const</code>、<code>unsigned-post-decr-while</code>），减少已有项目启用整数 sanitizer 时的噪音。</li>
+    <li><strong>Type Sanitizer (实验性)</strong>：通过 <code>-fsanitize=type</code> 启用，检测 C/C++ 基于类型的别名违规。</li>
+    <li><strong>-f[no-]sanitize-trap=local-bounds</strong> 和 <strong>-f[no-]sanitize-recover=local-bounds</strong> 已实现。</li>
+    <li><strong>-fsanitize-merge / -fno-sanitize-merge</strong> 新增，用于控制 sanitizer 检查合并。</li>
+    <li><strong>-fsanitize=pointer-overflow</strong> 可用于检测指针溢出 UB（建议在测试环境中启用）。</li>
+  </ul>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; <strong>RTSan</strong>：适合音频处理、嵌入式实时系统、游戏引擎等需要保证实时性的场景。</p>
+    <p>&#8226; <strong>SSCL type 前缀</strong>：如果项目使用了 suppression 文件，可以利用此功能更精细地控制 sanitizer 行为。</p>
+    <p>&#8226; <strong>Type Sanitizer</strong>：作为 TBAA 变更的配套工具，可用于检测 strict aliasing 违规。但当前为实验性，建议在非生产环境使用。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 17. Machine Block Placement ═══════════ -->
 <section class="section" id="machine-block">
-  <h2><span class="anchor">&#128269;</span> 8. Size-aware Machine Block Placement</h2>
+  <h2><span class="anchor">&#128269;</span> 17. Size-aware Machine Block Placement</h2>
   <div class="desc">
     LLVM 20 引入了<strong>代码大小感知的基本块布局优化</strong>（Size-aware Machine Block Placement）。
     该优化在 <code>-Oz</code>（最小体积）和 <code>-Os</code>（优化体积）场景下尤为有效，

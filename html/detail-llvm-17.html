@@ -1,11 +1,8 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LLVM 17 差异详解 — 毕昇编译器升级</title>
-<style>
-  :root {
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>LLVM 17 差异详解 — 毕昇编译器升级</title>
+<style>  :root {
     --primary: #0a2647;
     --primary-light: #1e4a7a;
     --primary-extra: #eef4fb;
@@ -29,8 +26,6 @@
     font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
     background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
   }
-
-  /* Header */
   .header{
     background:linear-gradient(135deg,#071225 0%,#0a2647 45%,#1e4a7a 100%);
     color:#fff;padding:48px 24px 40px;text-align:center;position:relative;overflow:hidden;
@@ -53,8 +48,6 @@
     transition:all .15s;position:relative;z-index:1;
   }
   .header .back:hover{background:rgba(212,168,67,.15);color:#fff}
-
-  /* TOC */
   .toc-bar{
     position:sticky;top:0;z-index:100;
     background:rgba(255,255,255,.93);backdrop-filter:blur(14px);
@@ -71,8 +64,6 @@
   }
   .toc-bar-inner a:hover{color:var(--primary);background:var(--primary-extra)}
   .toc-div{color:#d1d5db;font-size:11px;flex-shrink:0}
-
-  /* Section */
   .section{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin:24px auto;max-width:1100px;overflow:hidden}
   .section-header{
     padding:18px 28px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;
@@ -88,8 +79,6 @@
     padding:2px 10px;border-radius:4px;margin-left:6px;white-space:nowrap;
   }
   .section-body{padding:18px 28px 24px}
-
-  /* Example Box */
   .example-box{
     background:#fafbfc;border:1px solid var(--border);border-radius:8px;
     padding:18px 20px;margin:14px 0;
@@ -101,8 +90,6 @@
   .example-box .ex-label .ver{font-size:11px;font-weight:500;padding:1px 8px;border-radius:3px}
   .example-box .ex-label .ver.old{background:#fee2e2;color:#991b1b}
   .example-box .ex-label .ver.new{background:#d1fae5;color:#065f46}
-
-  /* Code block */
   pre.cb{
     background:#0a1a2e;color:#e2e8f0;padding:14px 18px;border-radius:7px;
     overflow-x:auto;font-size:13px;line-height:1.55;font-family:"SF Mono",Menlo,monospace;
@@ -113,13 +100,10 @@
   pre.cb .s{color:#a7f3d0}
   pre.cb .r{color:#fca5a5}
   pre.cb .g{color:#86efac}
-
   code,.inline-code{
     background:#eef2f6;padding:1px 6px;border-radius:4px;
     font-size:13px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
   }
-
-  /* Badges */
   .bh{display:inline-block;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
   .bm{display:inline-block;background:var(--amber-bg);color:var(--amber);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
   .bl{display:inline-block;background:var(--blue-bg);color:var(--blue);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
@@ -128,8 +112,6 @@
     display:inline-block;background:#f1f5f9;color:var(--primary-light);
     font-size:12px;font-weight:500;padding:2px 10px;border-radius:4px;font-family:"SF Mono",Menlo,monospace;
   }
-
-  /* Callout */
   .co{padding:12px 16px;border-radius:7px;margin:12px 0;font-size:13.5px;border-left:4px solid}
   .co-r{background:var(--red-bg);border-color:var(--red);color:#7f1d1d}
   .co-a{background:var(--amber-bg);border-color:var(--amber);color:#713f12}
@@ -137,15 +119,11 @@
   .co-g{background:var(--green-bg);border-color:var(--green);color:#064e3b}
   .co strong{display:block;margin-bottom:2px}
   .co code{background:rgba(0,0,0,.06);padding:1px 5px;border-radius:3px}
-
-  /* Tables */
   table{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0}
   thead th{background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:8px 12px;border-bottom:2px solid var(--border);font-size:12.5px}
   tbody td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
   tbody tr:last-child td{border-bottom:none}
   tbody tr:hover{background:#f8fafc}
-
-  /* Side-by-side */
   .side-by-side{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:8px 0}
   @media(max-width:700px){.side-by-side{grid-template-columns:1fr}}
   .side-col{background:#fff;border:1px solid var(--border);border-radius:6px;overflow:hidden}
@@ -153,8 +131,6 @@
   .side-col .sc-head.old-head{background:#fef2f2;color:var(--red)}
   .side-col .sc-head.new-head{background:#ecfdf5;color:var(--green)}
   .side-col .sc-body{padding:10px 14px}
-
-  /* Tags / Summary Cards */
   .sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin:14px 0}
   .sc{border:1px solid var(--border);border-radius:8px;padding:16px 18px;position:relative;overflow:hidden}
   .sc::before{content:'';position:absolute;top:0;left:0;width:4px;height:100%;border-radius:0 2px 2px 0}
@@ -167,1228 +143,807 @@
   .sc-g .sc-b{color:var(--green)}
   .sc-t{font-size:14px;font-weight:700;margin-bottom:3px}
   .sc-d{font-size:13px;color:var(--text2);line-height:1.6}
-
   p{margin-bottom:10px;color:var(--text2);font-size:14px}
   ul,ol{padding-left:20px;font-size:14px;color:var(--text2);margin:6px 0}
   li{margin:4px 0}
   h4{margin:16px 0 8px;color:var(--primary);font-size:15px}
   hr{border:none;border-top:1px solid var(--border);margin:18px 0}
-
   .mt-8{margin-top:8px}.mt-10{margin-top:10px}.mb-8{margin-bottom:8px}
   .text-s{font-size:13px;color:var(--text2)}
   .flex{display:flex}.flex-wrap{flex-wrap:wrap}.gap-2{gap:6px}
-
-  /* Footer */
-  .footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1100px;margin:32px auto 0}
-</style>
+  .footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1100px;margin:32px auto 0}</style>
 </head>
 <body>
-
-<!-- HEADER -->
 <header class="header">
   <div class="header-badge">LLVM 17.0.0 &nbsp;·&nbsp; 2023-09-05</div>
   <h1>LLVM 17 差异详解</h1>
-  <p class="subtitle">毕昇编译器升级专项 &nbsp;—&nbsp; LLVM 16.0.4 → 17.0.0 关键变更与迁移指南</p>
-  <a class="back" href="index.html">← 返回主页</a>
+  <p class="subtitle">毕昇编译器升级专项 &nbsp;—&nbsp; LLVM 16.0.4 &#8594; 17.0.0 关键变更与迁移指南</p>
+  <a class="back" href="index.html">&#8592; 返回主页</a>
 </header>
-
-<!-- TOC -->
 <nav class="toc-bar">
   <div class="toc-bar-inner">
-    <a href="#overview">概览</a><span class="toc-div">｜</span>
-    <a href="#opaque-ptr">不透明指针</a><span class="toc-div">｜</span>
-    <a href="#asm-goto">asm goto</a><span class="toc-div">｜</span>
-    <a href="#void-ptr">void* 解引用</a><span class="toc-div">｜</span>
-    <a href="#coroutine">协程traits</a><span class="toc-div">｜</span>
-    <a href="#cwg2518">static_assert(false)</a><span class="toc-div">｜</span>
-    <a href="#aarch64-gcs">AArch64 GCS</a><span class="toc-div">｜</span>
-    <a href="#lld-threads">LLD线程数</a>
+    <a href="#overview">概览</a><span class="toc-div">|</span>
+    <a href="#opaque-ptr">不透明指针</a><span class="toc-div">|</span>
+    <a href="#asm-goto">asm goto</a><span class="toc-div">|</span>
+    <a href="#void-ptr">void* 解引用</a><span class="toc-div">|</span>
+    <a href="#coroutine">协程traits</a><span class="toc-div">|</span>
+    <a href="#cwg2518">static_assert(false)</a><span class="toc-div">|</span>
+    <a href="#enum-constexpr">enum constexpr</a><span class="toc-div">|</span>
+    <a href="#builtin-object-size">FAM obj size</a><span class="toc-div">|</span>
+    <a href="#inline-std">namespace std</a><span class="toc-div">|</span>
+    <a href="#dynamic-cast-final">dynamic_cast</a><span class="toc-div">|</span>
+    <a href="#aarch64-all">AArch64</a><span class="toc-div">|</span>
+    <a href="#llvm-ir">LLVM IR</a><span class="toc-div">|</span>
+    <a href="#backends">后端/汇编</a><span class="toc-div">|</span>
+    <a href="#lld">LLD 链接器</a>
   </div>
 </nav>
-
 <div class="container" style="max-width:1100px;margin:0 auto;padding:0 20px">
-
-<!-- ══════════════════════════════════════════════════════
-     OVERVIEW
-     ══════════════════════════════════════════════════════ -->
 <section id="overview" class="section">
-  <div class="section-header">
-    <span class="num">17</span>
-    <h2>版本概览</h2>
-    <span class="h2-tag">LLVM 17.0.0 · 2023-09-05</span>
-  </div>
+  <div class="section-header"><span class="num">17</span><h2>版本概览</h2><span class="h2-tag">LLVM 17.0.0 · 2023-09-05</span></div>
   <div class="section-body">
-    <p>
-      LLVM 17 是 LLVM 项目的第 17 个大版本，于 2023 年 9 月 5 日发布。
-      本页面聚焦 LLVM 16 → 17 的核心变更，按对数通产品线影响从高到低排列。
-      每个变更均配有 <strong>Before/After</strong> 代码示例，方便直接对照迁移。
-    </p>
+    <p>LLVM 17 于 2023 年 9 月 5 日发布。本页面全面覆盖 LLVM 16 &#8594; 17 的所有关键变更，涵盖 Clang 前端、LLVM IR、各后端及 LLD 链接器。每个变更均配有 <strong>Before/After</strong> 代码示例。</p>
     <div class="sg mt-10">
-      <div class="sc sc-r">
-        <div class="sc-b">破坏性变更</div>
-        <div class="sc-t">不透明指针完全强制</div>
-        <div class="sc-d"><code>-opaque-pointers=0</code> 选项移除，typed pointers 不再被支持。影响涉及 LLVM IR 生成、Pass 编写、JIT 工具。</div>
-      </div>
-      <div class="sc sc-r">
-        <div class="sc-b">破坏性变更</div>
-        <div class="sc-t">asm goto 间接边拆分</div>
-        <div class="sc-d">内联汇编中指向同一 label 的多个输入不再保证相等。嵌入式驱动中的内联汇编需检查。</div>
-      </div>
-      <div class="sc sc-r">
-        <div class="sc-b">破坏性变更 · C++</div>
-        <div class="sc-t">void* 解引用 → 硬 Error</div>
-        <div class="sc-d">C++ 中 void* 解引用从 warning-as-error 变为硬错误，不可压制为 warning。</div>
-      </div>
-      <div class="sc sc-a">
-        <div class="sc-b">迁移提醒</div>
-        <div class="sc-t">std::experimental 协程 traits 搜索移除</div>
-        <div class="sc-d">使用 <code>std::experimental</code> 命名空间的协程代码需要迁移到 <code>std</code> 命名空间。</div>
-      </div>
-      <div class="sc sc-g">
-        <div class="sc-b">模板编程改进</div>
-        <div class="sc-t">CWG2518: static_assert(false) 合法</div>
-        <div class="sc-d">未实例化模板中 <code>static_assert(false)</code> 不再立即触发错误，对模板库编写有正面影响。</div>
-      </div>
-      <div class="sc sc-g">
-        <div class="sc-b">安全特性</div>
-        <div class="sc-t">AArch64 FEAT_GCS 汇编支持</div>
-        <div class="sc-d">Guarded Control Stack 硬件安全特性的汇编器/反汇编器支持。</div>
-      </div>
-      <div class="sc sc-a">
-        <div class="sc-b">链接器变更</div>
-        <div class="sc-t">LLD 线程数上限 16 核</div>
-        <div class="sc-d"><code>--threads=</code> 超过 16 时被 cap，防止 glibc malloc 性能下降。</div>
-      </div>
+      <div class="sc sc-r"><div class="sc-b">破坏性变更</div><div class="sc-t">不透明指针完全强制</div><div class="sc-d"><code>-opaque-pointers=0</code> 选项移除，typed pointers 不再被支持。影响 LLVM IR 生成、Pass 编写。</div></div>
+      <div class="sc sc-r"><div class="sc-b">破坏性变更</div><div class="sc-t">asm goto 间接边拆分</div><div class="sc-d">指向同一 label 的多个输入不再保证相等，每条产生独立间接边。</div></div>
+      <div class="sc sc-r"><div class="sc-b">破坏性变更 · C++</div><div class="sc-t">void* 解引用 硬 Error</div><div class="sc-d">C++ 中 void* 解引用变为硬错误，不可降级。C 语言不受影响。</div></div>
+      <div class="sc sc-r"><div class="sc-b">破坏性变更 · C++</div><div class="sc-t">namespace std 禁止声明为 inline</div><div class="sc-d">遵循 [namespace.std]p7，inline namespace std 被禁止。</div></div>
+      <div class="sc sc-a"><div class="sc-b">行为变更</div><div class="sc-t">__builtin_object_size 与 FAM</div><div class="sc-d">指定初始化器中的 FAM 元素计入 sizeof，与 GCC 行为一致。</div></div>
+      <div class="sc sc-g"><div class="sc-b">C++ 模板</div><div class="sc-t">CWG2518: static_assert(false)</div><div class="sc-d">未实例化模板中 static_assert(false) 不再立即报错。</div></div>
+      <div class="sc sc-g"><div class="sc-b">C++ 性能</div><div class="sc-t">final 类型 dynamic_cast 优化</div><div class="sc-d">直接比较 vtable 指针，无需 RTTI 运行时调用。</div></div>
+      <div class="sc sc-g"><div class="sc-b">诊断改进</div><div class="sc-t">enum constexpr 诊断增强</div><div class="sc-d">超出范围的枚举常数值诊断包含类型名称。</div></div>
+      <div class="sc sc-g"><div class="sc-b">安全特性</div><div class="sc-t">AArch64 GCS/CHK/ATS1A + preserve_all</div><div class="sc-d">v9.4-A 硬件安全扩展汇编支持; preserve_all 调用约定。</div></div>
+      <div class="sc sc-g"><div class="sc-b">LLVM IR</div><div class="sc-t">nofpclass, ldexp/frexp, select 移除</div><div class="sc-d">新增浮点属性与内建函数；select constexpr 变体移除。</div></div>
+      <div class="sc sc-g"><div class="sc-b">后端</div><div class="sc-t">LoongArch 官方目标 / RISC-V GP 松弛 / CMSE</div><div class="sc-d">LoongArch 全平台支持; AArch64 short range thunk; x86-64 大数据段。</div></div>
+      <div class="sc sc-a"><div class="sc-b">LLD</div><div class="sc-t">线程 cap 16; 多项新选项</div><div class="sc-d">--remap-inputs, --lto-CGO, --check-dynamic-relocations, --print-memory-usage, REVERSE, BE-8/BE-32。</div></div>
     </div>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     OPAQUE POINTERS
-     ══════════════════════════════════════════════════════ -->
 <section id="opaque-ptr" class="section">
-  <div class="section-header">
-    <span class="num">1</span>
-    <h2>不透明指针（Opaque Pointers）完全强制</h2>
-    <span class="h2-tag">Breaking Change</span>
-  </div>
+  <div class="section-header"><span class="num">1</span><h2>不透明指针（Opaque Pointers）完全强制</h2><span class="h2-tag">Breaking Change</span></div>
   <div class="section-body">
-
     <h4>变更说明</h4>
-    <p>
-      LLVM 15 开始默认启用 opaque pointers，LLVM 16 中 typed pointers 已标记为废弃但仍可通过
-      <code class="inline-code">-opaque-pointers=0</code> 使用。到了 <strong>LLVM 17</strong>，
-      <code class="inline-code">-opaque-pointers</code> 选项<strong>彻底移除</strong>，typed pointers 不再被支持。
-      这是 LLVM IR 最重要的一次语法简化。
-    </p>
-
-    <div class="co co-r">
-      <strong>影响范围</strong>
-      主要影响手写 LLVM IR、使用 LLVM C++ API 的工具/Pass、基于 IR 文本的处理脚本。
-      普通 C/C++ 代码通过 Clang 编译<strong>不受影响</strong>（Clang 从 LLVM 15 起已默认生成 opaque pointer IR）。
-    </div>
-
-    <h4>代码示例：LLVM IR 中指针类型的变化</h4>
-
+    <p>LLVM 15 开始默认启用 opaque pointers，LLVM 16 中 typed pointers 已标记为废弃但仍可通过 <code class="inline-code">-opaque-pointers=0</code> 使用。到了 <strong>LLVM 17</strong>，<code class="inline-code">-opaque-pointers</code> 选项<strong>彻底移除</strong>，typed pointers 不再被支持。</p>
+    <div class="co co-r"><strong>影响范围</strong>主要影响手写 LLVM IR、使用 LLVM C++ API 的工具/Pass、基于 IR 文本的处理脚本。普通 C/C++ 代码通过 Clang 编译<strong>不受影响</strong>（Clang 从 LLVM 15 起已默认生成 opaque pointer IR）。</div>
+    <h4>LLVM IR 文本对照</h4>
     <div class="example-box">
-      <div class="ex-label">
-        示例 1：基本指针类型
-        <span class="ver old">LLVM 16 (typed pointers)</span>
-        <span class="ver new">LLVM 17 (opaque pointers)</span>
-      </div>
-
+      <div class="ex-label">基本指针类型<span class="ver old">LLVM 16 (typed)</span><span class="ver new">LLVM 17 (opaque)</span></div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: Typed Pointer</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">; 指针携带完整的元素类型信息</span>
+        <div class="side-col"><div class="sc-head old-head">Before: Typed Pointer</div><div class="sc-body"><pre class="cb"><span class="c">; 指针携带完整元素类型</span>
 <span class="k">define</span> i32 @add(<span class="r">i32*</span> %p) {
   %v = <span class="k">load</span> <span class="r">i32, i32*</span> %p
   <span class="k">ret</span> i32 %v
 }
-
-<span class="c">; 结构体指针: 类型信息在指针中</span>
+<span class="c">; GEP 第一个参数为元素类型指针</span>
 <span class="k">define</span> i32 @get_x(<span class="r">{ i32, i32 }*</span> %s) {
   %p = <span class="k">getelementptr</span> <span class="r">{ i32, i32 }, { i32, i32 }*</span> %s, i32 0, i32 0
   %v = <span class="k">load</span> <span class="r">i32, i32*</span> %p
   <span class="k">ret</span> i32 %v
-}</pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: Opaque Pointer</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">; 指针类型统一为 ptr</span>
+}</pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: Opaque Pointer</div><div class="sc-body"><pre class="cb"><span class="c">; 指针类型统一为 ptr</span>
 <span class="k">define</span> i32 @add(<span class="g">ptr</span> %p) {
   %v = <span class="k">load</span> i32, <span class="g">ptr</span> %p
   <span class="k">ret</span> i32 %v
 }
-
-<span class="c">; 结构体指针: 也是 ptr，类型取指 load/store 指定</span>
+<span class="c">; GEP 第一个参数为元素类型本身</span>
 <span class="k">define</span> i32 @get_x(<span class="g">ptr</span> %s) {
   %p = <span class="k">getelementptr</span> <span class="r">{ i32, i32 }</span>, <span class="g">ptr</span> %s, i32 0, i32 0
   %v = <span class="k">load</span> i32, <span class="g">ptr</span> %p
   <span class="k">ret</span> i32 %v
-}</pre>
-          </div>
-        </div>
+}</pre></div></div>
       </div>
     </div>
-
     <div class="example-box">
-      <div class="ex-label">示例 2：bitcast 消除</div>
+      <div class="ex-label">bitcast 消除</div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: 需要 bitcast 转换指针类型</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="k">define</span> i32 @example(float %f) {
+        <div class="side-col"><div class="sc-head old-head">Before: 需要 bitcast</div><div class="sc-body"><pre class="cb"><span class="k">define</span> i32 @example(float %f) {
   %a = <span class="k">alloca</span> i32
   <span class="k">store</span> i32 42, i32* %a
-  <span class="c">; 需要 bitcast 把 i32* 转成 float*</span>
   %bc = <span class="k">bitcast</span> i32* %a <span class="k">to</span> float*
   <span class="k">store</span> float %f, float* %bc
   %v = <span class="k">load</span> i32, i32* %a
   <span class="k">ret</span> i32 %v
-}</pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: bitcast 不再需要</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="k">define</span> i32 @example(float %f) {
+}</pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: bitcast 不需要</div><div class="sc-body"><pre class="cb"><span class="k">define</span> i32 @example(float %f) {
   %a = <span class="k">alloca</span> i32
   <span class="k">store</span> i32 42, <span class="g">ptr</span> %a
-  <span class="c">; 所有指针都是 ptr，不需要 bitcast</span>
   <span class="k">store</span> float %f, <span class="g">ptr</span> %a
   %v = <span class="k">load</span> i32, <span class="g">ptr</span> %a
   <span class="k">ret</span> i32 %v
-}</pre>
-          </div>
-        </div>
+}</pre></div></div>
       </div>
     </div>
-
-    <h4>C++ API 代码迁移</h4>
     <div class="example-box">
-      <div class="ex-label">
-        示例 3：LLVM C++ API 中创建指针类型的变更
-        <span class="ver old">LLVM 16 API</span>
-        <span class="ver new">LLVM 17 API</span>
-      </div>
+      <div class="ex-label">C++ API 迁移<span class="ver old">LLVM 16</span><span class="ver new">LLVM 17</span></div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: getPointerTo() / getInt8PtrTy()</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// 创建指向 i32 的指针类型</span>
-Type *Int32Ptr = Type::getInt32Ty(Ctx)
-                   -><span class="r">getPointerTo</span>();
-
-<span class="c">// 获取地址空间 0 的 i8*</span>
+        <div class="side-col"><div class="sc-head old-head">Before: getPointerTo()</div><div class="sc-body"><pre class="cb">Type *I32Ptr = Type::getInt32Ty(Ctx)
+                 -><span class="r">getPointerTo</span>();
 Type *I8Ptr = Type::<span class="r">getInt8PtrTy</span>(Ctx);
-
-<span class="c">// 获取地址空间 1 的 i32*</span>
 Type *I32PtrAS1 = PointerType::<span class="r">get</span>(
-    Type::getInt32Ty(Ctx), 1);
-
-<span class="c">// 检查是否是指针</span>
-<span class="k">if</span> (Ty-><span class="r">isPointerTy</span>()) { ... }</pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: PointerType::get() 统一入口</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// 创建 opaque pointer（默认地址空间 0）</span>
+    Type::getInt32Ty(Ctx), 1);</pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: PointerType::get()</div><div class="sc-body"><pre class="cb">Type *PtrTy = PointerType::<span class="g">get</span>(Ctx, 0);
 Type *PtrTy = PointerType::<span class="g">get</span>(Ctx, 0);
-
-<span class="c">// 获取地址空间 0 的 ptr</span>
-Type *PtrTy = PointerType::<span class="g">get</span>(Ctx, 0);
-
-<span class="c">// 获取地址空间 1 的 ptr</span>
-Type *PtrAS1 = PointerType::<span class="g">get</span>(Ctx, 1);
-
-<span class="c">// 检查是否是指针（同上）</span>
-<span class="k">if</span> (Ty-><span class="g">isPointerTy</span>()) { ... }</pre>
-          </div>
-        </div>
+Type *PtrAS1 = PointerType::<span class="g">get</span>(Ctx, 1);</pre></div></div>
       </div>
     </div>
-
-    <div class="co co-i mt-10">
-      <strong>迁移要点</strong>
-      <ul style="margin:6px 0 0 0">
-        <li>LLVM IR 文本处理脚本：移除所有指针元素的类型标注</li>
-        <li>C++ Pass/工具：将 <code>getPointerTo()</code>、<code>getInt8PtrTy()</code> 替换为 <code>PointerType::get(Context, AddrSpace)</code></li>
-        <li>GEP 类型参数：第一个参数从元素类型指针改为元素类型本身（<code>getelementptr { i32, i32 }, ptr %s, ...</code> 而非 <code>getelementptr { i32, i32 }, { i32, i32 }* %s, ...</code>）</li>
-        <li>对 JIT 工具影响较大，需全面适配 LLVM 17 的 <code>llvm::Type</code> API</li>
-      </ul>
-    </div>
+    <div class="co co-i mt-10"><strong>迁移要点</strong><ul><li>IR 处理脚本：移除指针元素类型标注</li><li>C++ Pass：将 <code>getPointerTo()</code> 替换为 <code>PointerType::get(Context, AddrSpace)</code></li><li>GEP：第一个参数从元素类型指针改为元素类型本身</li><li>对 JIT 工具影响较大，需全面适配</li></ul></div>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     ASM GOTO INDIRECT BRANCH SPLITTING
-     ══════════════════════════════════════════════════════ -->
 <section id="asm-goto" class="section">
-  <div class="section-header">
-    <span class="num">2</span>
-    <h2>asm goto 间接边拆分</h2>
-    <span class="h2-tag">行为变更</span>
-  </div>
+  <div class="section-header"><span class="num">2</span><h2>asm goto 间接边拆分</h2><span class="h2-tag">行为变更</span></div>
   <div class="section-body">
-
     <h4>变更说明</h4>
-    <p>
-      在 GCC/Clang 扩展 <code class="inline-code">asm goto</code> 中，同一个 label 如果有多个输出（即多个输入引用同一个 label），
-      在 LLVM 16 及之前的版本中这些引用被合并为一条间接边。这种合并行为是不正确的——它可能导致编译优化基于错误的假设进行。
-      LLVM 17 修复了这个问题：<strong>指向同一 label 的多个输入不再保证相等</strong>，每个输入产生一条独立的间接边。
-    </p>
-
-    <div class="co co-a">
-      <strong>影响场景</strong>
-      嵌入式设备驱动、固件和内核代码中广泛使用的内联汇编跳转（如 kernel 的 <code>_ASM_EXTABLE</code> 模式、错误处理跳转表），
-      如果使用同一 label 引用多次，编译产物的控制流图会发生变化。
-    </div>
-
-    <h4>代码示例</h4>
-
+    <p>在 GCC/Clang 扩展 <code class="inline-code">asm goto</code> 中，同一个 label 如果有多个输出（即多个输入引用同一个 label），在 LLVM 16 及之前这些引用被合并为一条间接边，这种合并行为是不正确的。LLVM 17 修复了这个问题：<strong>指向同一 label 的多个输入不再保证相等</strong>，每个输入产生一条独立的间接边。同时，LLVM 17 还支持了 asm goto 沿间接边的<strong>输出操作数</strong>。</p>
+    <div class="co co-a"><strong>影响场景</strong>嵌入式设备驱动、固件和内核代码中广泛使用的内联汇编跳转（如 kernel 的 <code>_ASM_EXTABLE</code> 模式、错误处理跳转表）。</div>
     <div class="example-box">
-      <div class="ex-label">
-        示例：asm goto 中同一 label 被两个输入引用
-      </div>
-
+      <div class="ex-label">asm goto 同一 label 被两个输入引用</div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: LLVM 16 — 两个输入合并为一条间接边</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="k">int</span> example(<span class="k">int</span> x) {
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16 — 合并为一条边</div><div class="sc-body"><pre class="cb"><span class="c">// 两个条件分支指向同一个 label</span>
+<span class="k">int</span> example(<span class="k">int</span> x) {
   <span class="k">int</span> result = 0;
   <span class="k">asm</span> <span class="k">goto</span>(
     <span class="s">"cmp %1, #0\n\t"</span>
     <span class="s">"beq %l[zero]\n\t"</span>
     <span class="s">"bne %l[zero]"</span>
-    <span class="c">/* 两个条件分支指向同一个 label */</span>
-    : <span class="c">/* 无输出 */</span>
-    : <span class="s">"r"</span>(x), <span class="s">"i"</span>(&&zero)
+    : : <span class="s">"r"</span>(x), <span class="s">"i"</span>(&&zero)
     : : zero
   );
   result = 1;
 zero:
   <span class="k">return</span> result;
 }
-
-<span class="c">// LLVM 16 行为:
-// 两个跳转合并为一条间接边
-// 优化器可能错误地认为
-// 只有一个零条件到达 zero label</span></pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: LLVM 17 — 每个输入生成独立间接边</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="k">int</span> example(<span class="k">int</span> x) {
+<span class="c">// LLVM 16: 两个跳转合并为一条间接边</span>
+<span class="c">// 优化器可能错误地认为只有一个</span>
+<span class="c">// 零条件到达 zero label</span></pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17 — 独立间接边</div><div class="sc-body"><pre class="cb"><span class="c">// 两个条件分支指向同一个 label</span>
+<span class="k">int</span> example(<span class="k">int</span> x) {
   <span class="k">int</span> result = 0;
   <span class="k">asm</span> <span class="k">goto</span>(
     <span class="s">"cmp %1, #0\n\t"</span>
     <span class="s">"beq %l[zero]\n\t"</span>
     <span class="s">"bne %l[zero]"</span>
-    <span class="c">/* 两个条件分支指向同一个 label */</span>
-    : <span class="c">/* 无输出 */</span>
-    : <span class="s">"r"</span>(x), <span class="s">"i"</span>(&&zero)
+    : : <span class="s">"r"</span>(x), <span class="s">"i"</span>(&&zero)
     : : zero
   );
   result = 1;
 zero:
   <span class="k">return</span> result;
 }
-
-<span class="c">// LLVM 17 行为:
-// 两个跳转生成两条独立的间接边
-// 控制流图更准确地反映
-// assembler 的真实行为</span></pre>
-          </div>
-        </div>
+<span class="c">// LLVM 17: 每个输入生成独立间接边</span>
+<span class="c">// 控制流图更准确反映 assembler 的真实行为</span>
+<span class="c">// 同时支持间接边上的输出操作数</span></pre></div></div>
       </div>
     </div>
-
-    <div class="example-box">
-      <div class="ex-label">示例：更简洁的差异展示</div>
-      <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: LLVM 16</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">; asm goto "# %0 %1"</span>
-<span class="c">;   :: "i"(&&foo), "i"(&&foo)</span>
-<span class="c">;   :: foo;</span>
-<span class="c">;</span>
-<span class="c">; 两个 %label 输入被合并，</span>
-<span class="c">; 编译认为它们取值相同。</span>
-<span class="c">; 如果优化器基于"它们相同"</span>
-<span class="c">; 做常数折叠，可能出错。</span></pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: LLVM 17</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">; asm goto "# %0 %1"</span>
-<span class="c">;   :: "i"(&&foo), "i"(&&foo)</span>
-<span class="c">;   :: foo;</span>
-<span class="c">;</span>
-<span class="c">; 两个 %label 输入独立处理，</span>
-<span class="c">; 每个生成一条间接边。</span>
-<span class="c">; 优化器不再假设它们等价，</span>
-<span class="c">; 控制流分析更精确。</span></pre>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="co co-i mt-10">
-      <strong>对数通产品线的影响</strong>
-      <ul style="margin:6px 0 0 0">
-        <li>设备驱动和固件中的内联汇编跳转模式需要检查</li>
-        <li>如果代码依赖旧行为（假设同一 label 的多个输入等价），需调整逻辑</li>
-        <li>产生的二进制大小可能有微小变化（额外的间接边）</li>
-        <li>内核风格的异常表 / 跳转表宏通常不受影响，因为它们使用不同的 label</li>
-      </ul>
-    </div>
+    <div class="co co-i mt-10"><strong>对数通产品线的影响</strong><ul><li>设备驱动和固件中的内联汇编跳转模式需要检查</li><li>如果代码依赖旧行为（假设同一 label 的多个输入等价），需调整逻辑</li><li>LLVM 17 新增支持 asm goto 间接边上的输出操作数（Issue #53562）</li></ul></div>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     VOID* DEREFERENCE
-     ══════════════════════════════════════════════════════ -->
 <section id="void-ptr" class="section">
-  <div class="section-header">
-    <span class="num">3</span>
-    <h2>void* 解引用 (C++) 从 warning-as-error → 硬 Error</h2>
-    <span class="h2-tag">C++ · Breaking Change</span>
-  </div>
+  <div class="section-header"><span class="num">3</span><h2>void* 解引用 (C++) 从 warning-as-error 变为硬 Error</h2><span class="h2-tag">C++ · Breaking Change</span></div>
   <div class="section-body">
-
     <h4>变更说明</h4>
-    <p>
-      在 LLVM 16 中，C++ 代码中对 <code class="inline-code">void*</code> 进行解引用已被设为
-      <strong>warning-as-error</strong>（默认 -Werror 下报错），但可以通过
-      <code class="inline-code">-Wno-error=void-ptr-dereference</code> 降级为 warning。
-      到了 <strong>LLVM 17</strong>，这项检查被收紧为<strong>硬错误</strong>（hard error），即使用
-      <code class="inline-code">-Wno-error=</code> 也无法降级。
-    </p>
-
-    <div class="co co-r">
-      <strong>破坏性</strong>
-      如果代码中存在 <code>void*</code> 解引用的模式，在 LLVM 17 下<strong>直接编译失败</strong>。
-      虽然这种写法本身是语言扩展（非标准 C++），但在老旧的嵌入式 C 代码中被混入 C++ 编译时可能出现。
-    </div>
-
-    <h4>代码示例</h4>
-
+    <p>LLVM 16 中 C++ 代码的 <code class="inline-code">void*</code> 解引用被设为 <strong>warning-as-error</strong>（可通过 <code class="inline-code">-Wno-error=void-ptr-dereference</code> 降级）。LLVM 17 中这被收紧为<strong>硬错误</strong>，无法降级。</p>
+    <div class="co co-r"><strong>破坏性</strong>如果代码中有 void* 解引用模式，LLVM 17 下直接编译失败。</div>
     <div class="example-box">
-      <div class="ex-label">
-        示例：void* 解引用
-      </div>
+      <div class="ex-label">void* 解引用修复</div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: LLVM 16 — warning-as-error（可降级）</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// C++ 代码</span>
-<span class="k">void</span> func(<span class="k">void</span> *p) {
-    *p;  <span class="c">// LLVM 16: warning-as-error</span>
-         <span class="c">// -Wno-error=void-ptr-dereference 可降级</span>
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16</div><div class="sc-body"><pre class="cb"><span class="k">void</span> func(<span class="k">void</span> *p) {
+    *p;  <span class="c">// warning-as-error</span>
 }
-
 <span class="k">void</span> *buf = malloc(128);
-<span class="c">// 某些代码直接对 void* 做算术</span>
-<span class="k">void</span> *next = buf + 16;  <span class="c">// 也涉及 void* 算术</span></pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: LLVM 17 — 硬 Error（不可降级）</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// C++ 代码 — 必须修复</span>
-<span class="k">void</span> func(<span class="k">void</span> *p) {
-    *p;  <span class="c">// ERROR: 硬错误，编译失败</span>
+<span class="k">void</span> *next = buf + 16;  <span class="c">// void* 算术</span></pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17</div><div class="sc-body"><pre class="cb"><span class="k">void</span> func(<span class="k">void</span> *p) {
+    *(<span class="k">char</span> *)p;  <span class="c">// OK: 显式转换</span>
 }
-
-<span class="c">// 修复方案 1：转为 char* 再解引用</span>
-<span class="k">void</span> func(<span class="k">void</span> *p) {
-    *(<span class="k">char</span> *)p;  <span class="c">// OK</span>
-}
-
-<span class="c">// 修复方案 2：void* 算术改为 char* 算术</span>
 <span class="k">char</span> *buf = (<span class="k">char</span> *)malloc(128);
-<span class="k">char</span> *next = buf + 16;  <span class="c">// OK</span></pre>
-          </div>
-        </div>
+<span class="k">char</span> *next = buf + 16;  <span class="c">// OK</span></pre></div></div>
       </div>
     </div>
-
-    <div class="example-box">
-      <div class="ex-label">常见 void* 解引用模式与修复</div>
-      <table>
-        <thead><tr><th>旧代码模式</th><th>LLVM 17 状态</th><th>修复方案</th></tr></thead>
-        <tbody>
-          <tr>
-            <td><code>void *p = ...; *p;</code></td>
-            <td><span class="bh">硬 Error</span></td>
-            <td><code>*(char *)p;</code> 或 <code>*(int *)p;</code></td>
-          </tr>
-          <tr>
-            <td><code>void *p = ...; p + offset;</code></td>
-            <td><span class="bh">硬 Error</span></td>
-            <td><code>(char *)p + offset;</code></td>
-          </tr>
-          <tr>
-            <td><code>void *p = ...; p++;</code></td>
-            <td><span class="bh">硬 Error</span></td>
-            <td><code>p = (char *)p + 1;</code></td>
-          </tr>
-          <tr>
-            <td><code>sizeof(*p)</code> where <code>p</code> is <code>void*</code></td>
-            <td><span class="bh">硬 Error</span></td>
-            <td>直接写目标大小，如 <code>sizeof(int)</code></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <div class="co co-a mt-10">
-      <strong>应对策略</strong>
-      <ul style="margin:6px 0 0 0">
-        <li>LLVM 17 下无法通过编译选项降级，<strong>必须修复源代码</strong></li>
-        <li>在升级前，先在 LLVM 16 上开启 <code>-Wvoid-ptr-dereference</code> 找出所有违规点</li>
-        <li>典型修复：将 <code>void*</code> 显式转换为 <code>char*</code>（编译器对 char* 别名有例外，优化不会出问题）</li>
-        <li>如果代码量大，可使用 clang-tidy 的 <code>modernize-replace-disallow-copy</code> 等进行批量修复</li>
-        <li>此变更仅限于 C++ 模式；C 语言下 void* 解引用行为不变</li>
-      </ul>
-    </div>
+    <table><thead><tr><th>旧代码模式</th><th>LLVM 17 状态</th><th>修复方案</th></tr></thead><tbody>
+      <tr><td><code>void *p = ...; *p;</code></td><td><span class="bh">硬 Error</span></td><td><code>*(char *)p;</code></td></tr>
+      <tr><td><code>void *p = ...; p + offset;</code></td><td><span class="bh">硬 Error</span></td><td><code>(char *)p + offset;</code></td></tr>
+      <tr><td><code>void *p = ...; p++;</code></td><td><span class="bh">硬 Error</span></td><td><code>p = (char *)p + 1;</code></td></tr>
+      <tr><td><code>sizeof(*p)</code> where <code>p</code> is <code>void*</code></td><td><span class="bh">硬 Error</span></td><td>直接写目标大小</td></tr>
+    </tbody></table>
+    <div class="co co-a mt-10"><strong>应对策略</strong><ul><li>LLVM 17 下无法通过编译选项降级，<strong>必须修复源代码</strong></li><li>在升级前使用 <code>-Wvoid-ptr-dereference</code> 找出所有违规点</li><li>将 <code>void*</code> 显式转换为 <code>char*</code>（编译器对 char* 别名有例外）</li><li>此变更仅限于 C++ 模式；C 语言下 void* 解引用行为不变</li></ul></div>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     STD::EXPERIMENTAL::COROUTINE_TRAITS
-     ══════════════════════════════════════════════════════ -->
 <section id="coroutine" class="section">
-  <div class="section-header">
-    <span class="num">4</span>
-    <h2>std::experimental::coroutine_traits 不再搜索</h2>
-    <span class="h2-tag">C++ 协程 · 迁移提醒</span>
-  </div>
+  <div class="section-header"><span class="num">4</span><h2>std::experimental::coroutine_traits 不再搜索</h2><span class="h2-tag">C++ 协程 · 迁移提醒</span></div>
   <div class="section-body">
-
     <h4>变更说明</h4>
-    <p>
-      在 C++20 协程正式标准化之前，Clang 支持 <code class="inline-code">std::experimental::coroutine_traits</code>
-      作为 TS（技术规范）的实现。随着 C++20 协程（<code class="inline-code">std::coroutine_traits</code>）的标准化和广泛采用，
-      LLVM 17 移除了对 <code class="inline-code">std::experimental</code> 命名空间中协程 traits 的搜索。
-      编译器<strong>只会在 <code>std</code> 命名空间中查找 <code>coroutine_traits</code></strong>。
-    </p>
-
-    <div class="co co-a">
-      <strong>影响范围</strong>
-      使用 <code>std::experimental</code> 命名空间编写协程的代码（常见于早期 C++20 协程实验项目）。
-      已经迁移到标准 <code>std::coroutine_traits</code> 的代码不受影响。
-    </div>
-
-    <h4>代码示例</h4>
-
+    <p>LLVM 17 移除了对 <code class="inline-code">std::experimental</code> 命名空间中协程 traits 的搜索。编译器<strong>只会在 <code>std</code> 命名空间中查找 <code>coroutine_traits</code></strong>。</p>
+    <div class="co co-a"><strong>影响范围</strong>使用 <code>std::experimental</code> 命名空间的协程代码。已迁移到标准 <code>std::coroutine_traits</code> 的代码不受影响。</div>
     <div class="example-box">
-      <div class="ex-label">
-        示例：协程 traits 命名空间迁移
-      </div>
+      <div class="ex-label">协程 traits 命名空间迁移</div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: experimental 命名空间 (LLVM 16 可用)</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// 实验性协程 TS 风格</span>
-<span class="k">#include</span> <span class="s">&lt;experimental/coroutine&gt;</span>
-
+        <div class="side-col"><div class="sc-head old-head">Before: experimental (LLVM 16)</div><div class="sc-body"><pre class="cb"><span class="k">#include</span> <span class="s">&lt;experimental/coroutine&gt;</span>
 <span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>, <span class="k">class</span>... Args&gt;
 <span class="k">struct</span> std::<span class="r">experimental</span>::coroutine_traits&lt;T, Args...&gt; {
   <span class="k">using</span> promise_type = <span class="k">typename</span> T::promise_type;
-};
-
-<span class="k">struct</span> my_task {
-  <span class="k">struct</span> promise_type { <span class="c">/* ... */</span> };
-};
-
-<span class="c">// LLVM 16 同时搜索 experimental 和 std</span>
-my_task foo() {
-  <span class="k">co_return</span>;
-}</pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: 标准命名空间 (LLVM 17 要求)</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// 标准 C++20 协程风格</span>
-<span class="k">#include</span> <span class="s">&lt;coroutine&gt;</span>  <span class="c">// 注意头文件变化</span>
-
+};</pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: 标准 (LLVM 17)</div><div class="sc-body"><pre class="cb"><span class="k">#include</span> <span class="s">&lt;coroutine&gt;</span>
 <span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>, <span class="k">class</span>... Args&gt;
-<span class="k">struct</span> std::coroutine_traits&lt;T, Args...&gt; {  <span class="c">// 去掉 experimental</span>
+<span class="k">struct</span> std::coroutine_traits&lt;T, Args...&gt; {
   <span class="k">using</span> promise_type = <span class="k">typename</span> T::promise_type;
-};
-
-<span class="k">struct</span> my_task {
-  <span class="k">struct</span> promise_type { <span class="c">/* ... */</span> };
-};
-
-<span class="c">// LLVM 17 只搜索 std 命名空间</span>
-my_task foo() {
-  <span class="k">co_return</span>;
-}</pre>
-          </div>
-        </div>
+};</pre></div></div>
       </div>
     </div>
-
-    <div class="example-box">
-      <div class="ex-label">常见需要修改的地方</div>
-      <table>
-        <thead><tr><th>项目</th><th>旧 (experimental TS)</th><th>新 (C++20 标准)</th></tr></thead>
-        <tbody>
-          <tr>
-            <td>头文件</td>
-            <td><code>#include &lt;experimental/coroutine&gt;</code></td>
-            <td><code>#include &lt;coroutine&gt;</code></td>
-          </tr>
-          <tr>
-            <td>traits</td>
-            <td><code>std::experimental::coroutine_traits</code></td>
-            <td><code>std::coroutine_traits</code></td>
-          </tr>
-          <tr>
-            <td>handle</td>
-            <td><code>std::experimental::coroutine_handle</code></td>
-            <td><code>std::coroutine_handle</code></td>
-          </tr>
-          <tr>
-            <td>trivial_awaitables</td>
-            <td><code>std::experimental::suspend_never</code></td>
-            <td><code>std::suspend_never</code></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <div class="co co-i mt-10">
-      <strong>迁移建议</strong>
-      <ul style="margin:6px 0 0 0">
-        <li>全局搜索 <code>experimental/coroutine</code> 和 <code>experimental::coroutine_traits</code></li>
-        <li>替换为 <code>&lt;coroutine&gt;</code> 和 <code>std::coroutine_traits</code></li>
-        <li>同时确认 <code>-fcoroutines-ts</code> 编译选项已被移除（LLVM 17 不再支持该选项）</li>
-        <li>如果同时需要支持旧版 LLVM，可使用条件编译：<code>#if __has_include(&lt;coroutine&gt;)</code></li>
-      </ul>
-    </div>
+    <table><thead><tr><th>项目</th><th>旧 (experimental TS)</th><th>新 (C++20 标准)</th></tr></thead><tbody>
+      <tr><td>头文件</td><td><code>#include &lt;experimental/coroutine&gt;</code></td><td><code>#include &lt;coroutine&gt;</code></td></tr>
+      <tr><td>traits</td><td><code>std::experimental::coroutine_traits</code></td><td><code>std::coroutine_traits</code></td></tr>
+      <tr><td>handle</td><td><code>std::experimental::coroutine_handle</code></td><td><code>std::coroutine_handle</code></td></tr>
+    </tbody></table>
+    <div class="co co-i mt-10"><strong>迁移建议</strong><ul><li>全局搜索 <code>experimental/coroutine</code></li><li>替换为 <code>&lt;coroutine&gt;</code> 和 <code>std::coroutine_traits</code></li><li><code>-fcoroutines-ts</code> 选项也在此版本移除</li></ul></div>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     CWG2518: STATIC_ASSERT(FALSE) IN TEMPLATES
-     ══════════════════════════════════════════════════════ -->
 <section id="cwg2518" class="section">
-  <div class="section-header">
-    <span class="num">5</span>
-    <h2>CWG2518: static_assert(false) 在模板中合法</h2>
-    <span class="h2-tag">C++ 标准缺陷修复</span>
-  </div>
+  <div class="section-header"><span class="num">5</span><h2>CWG2518: static_assert(false) 在模板中合法</h2><span class="h2-tag">C++ 缺陷修复</span></div>
   <div class="section-body">
-
     <h4>变更说明</h4>
-    <p>
-      在 C++ 标准缺陷报告 <a href="https://cplusplus.github.io/CWG/issues/2518.html" target="_blank" rel="noopener">CWG2518</a>
-      之前，在模板声明中写 <code class="inline-code">static_assert(false)</code> 会<strong>立即触发断言失败</strong>，
-      即使模板从未被实例化。这迫使模板库作者使用一些"脏"技巧（如 <code>static_assert(sizeof(T) == 0)</code> 或依赖某个总是为 false 的表达式）
-      来延迟断言求值，直到模板实例化时。
-    </p>
-
-    <p>
-      LLVM 17 实现了 CWG2518 的修复：<strong>未实例化的模板中的 <code>static_assert(false)</code> 不再立即报错，
-      而是等到模板被实例化时才求值</strong>。这使得模板库的编写更加直观和安全。
-    </p>
-
-    <div class="co co-g">
-      <strong>正面影响</strong>
-      对于模板库编写者（尤其是 C++ 模板元编程），这消除了一个常见的痛点。
-      在数通产品线中，如果存在自定义的 C++ 泛型容器或协议处理模板，可以利用此特性简化代码。
-    </div>
-
-    <h4>代码示例</h4>
-
+    <p>LLVM 17 实现 CWG2518 修复：<strong>未实例化的模板中的 <code>static_assert(false)</code> 不再立即报错，而是等到模板被实例化时才求值</strong>。此前模板库作者需使用 <code>sizeof(T)==0</code> 等 workaround 来延迟断言。</p>
+    <div class="co co-g"><strong>正面影响</strong>对于模板库编写者（尤其是 C++ 模板元编程），消除了一个常见的痛点。</div>
     <div class="example-box">
-      <div class="ex-label">
-        示例 1：经典模板约束场景
-      </div>
+      <div class="ex-label">经典模板约束场景</div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: LLVM 16 — static_assert(false) 立即报错</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// ERROR: 即使模板从未实例化也报错</span>
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16 立即报错</div><div class="sc-body"><pre class="cb"><span class="c">// 即时错误！即使模板未实例化</span>
 <span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
 <span class="k">void</span> process(<span class="k">const</span> T&amp; val) {
-    <span class="r">static_assert</span>(<span class="k">false</span>,
-        <span class="s">"未特化的 process 不可用"</span>);
-    <span class="c">// ^ LLVM 16: 立即报错，编译失败</span>
+    <span class="r">static_assert</span>(<span class="k">false</span>, <span class="s">"不可用"</span>);
 }
-
-<span class="c">// 旧式 workaround：依赖模板参数</span>
-<span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
-<span class="k">void</span> process_workaround(<span class="k">const</span> T&amp; val) {
-    <span class="r">static_assert</span>(<span class="k">sizeof</span>(T) == 0,
-        <span class="s">"未特化的 process 不可用"</span>);
-    <span class="c">// sizeof(T) 依赖 T，等到实例化时才求值</span>
-}</pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: LLVM 17 — 等到实例化时才报错</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">// CWG2518 后：合法！</span>
+<span class="c">// Workaround: 依赖 T 延迟求值</span>
 <span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
 <span class="k">void</span> process(<span class="k">const</span> T&amp; val) {
-    <span class="r">static_assert</span>(<span class="k">false</span>,
-        <span class="s">"未特化的 process 不可用"</span>);
-    <span class="c">// LLVM 17: 不报错，等实例化时才求值</span>
+    <span class="r">static_assert</span>(<span class="k">sizeof</span>(T) == 0, <span class="s">"不可用"</span>);
+}</pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17 延迟求值</div><div class="sc-body"><pre class="cb"><span class="c">// CWG2518: 合法！延迟到实例化时</span>
+<span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
+<span class="k">void</span> process(<span class="k">const</span> T&amp; val) {
+    <span class="r">static_assert</span>(<span class="k">false</span>, <span class="s">"不可用"</span>);
 }
-
-<span class="c">// 特化正常工作</span>
+<span class="c">// 特化正常</span>
 <span class="k">template</span>&lt;&gt;
 <span class="k">void</span> process&lt;<span class="k">int</span>&gt;(<span class="k">const</span> <span class="k">int</span>&amp; val) {
     printf(<span class="s">"processing int\n"</span>);
 }
-
-<span class="c">// 只有这行才会触发 static_assert</span>
-<span class="c">// process("hello"); // 实例化时报错</span></pre>
-          </div>
-        </div>
+<span class="c">// process("hello"); // 实例化时才触发</span></pre></div></div>
       </div>
     </div>
-
-    <div class="example-box">
-      <div class="ex-label">
-        示例 2：实用场景 — 编译时接口契约检查
-      </div>
-      <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: 需要 ugly workaround</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
-<span class="k">struct</span> serializer {
-    <span class="c">// 旧方法：用 always_false&lt;T&gt; 依赖 T</span>
-    <span class="k">template</span>&lt;<span class="k">class</span>&gt;
-    <span class="k">struct</span> always_false : std::false_type {};
-
-    <span class="k">static</span> <span class="k">void</span> serialize(<span class="k">const</span> T&amp;) {
-        <span class="r">static_assert</span>(
-            always_false&lt;T&gt;::value,
-            <span class="s">"需要特化 serializer"</span>);
-    }
-};</pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: 简洁直观的写法</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
-<span class="k">struct</span> serializer {
-    <span class="c">// CWG2518: 直接写 false，干净利落</span>
-    <span class="k">static</span> <span class="k">void</span> serialize(<span class="k">const</span> T&amp;) {
-        <span class="r">static_assert</span>(<span class="k">false</span>,
-            <span class="s">"需要特化 serializer"</span>);
-    }
-};
-
-<span class="c">// 特化</span>
-<span class="k">template</span>&lt;&gt;
-<span class="k">struct</span> serializer&lt;packet_header&gt; {
-    <span class="k">static</span> <span class="k">void</span> serialize(
-        <span class="k">const</span> packet_header&amp; h) {
-        <span class="c">/* 实际的序列化逻辑 */</span>
-    }
-};</pre>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="co co-i mt-10">
-      <strong>使用注意事项</strong>
-      <ul style="margin:6px 0 0 0">
-        <li><code>static_assert(false, ...)</code> 仅在<strong>模板声明内部</strong>被延迟求值</li>
-        <li>非模板上下文中写 <code>static_assert(false)</code> <strong>仍然立即报错</strong></li>
-        <li>需要 LLVM 17+ 且以 <strong>C++20 或更高标准</strong>编译（CWG2518 被追溯应用到所有标准版本）</li>
-        <li>如果模板确实被实例化且没有合适的特化，static_assert 仍会触发编译错误，行为符合预期</li>
-        <li>建议将旧的 <code>sizeof(T)==0</code> / <code>always_false&lt;T&gt;</code> workaround 替换为直接使用 <code>false</code></li>
-      </ul>
-    </div>
+    <div class="co co-i mt-10"><strong>使用注意事项</strong><ul><li>仅模板声明内部延迟求值；非模板上下文中仍立即报错</li><li>需 C++20 或更高标准编译</li></ul></div>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     AARCH64 FEAT_GCS
-     ══════════════════════════════════════════════════════ -->
-<section id="aarch64-gcs" class="section">
-  <div class="section-header">
-    <span class="num">6</span>
-    <h2>AArch64 FEAT_GCS 汇编支持</h2>
-    <span class="h2-tag">安全特性</span>
-  </div>
+<section id="enum-constexpr" class="section">
+  <div class="section-header"><span class="num">6</span><h2>enum 常量超出范围诊断增强</h2><span class="h2-tag">诊断改进</span></div>
   <div class="section-body">
-
     <h4>变更说明</h4>
-    <p>
-      LLVM 17 新增了对 AArch64 <strong>FEAT_GCS（Guarded Control Stack）</strong> 硬件安全特性的汇编器和反汇编器支持。
-      GCS 是 ARMv9.4-A 引入的控制流完整性（CFI）保护机制，通过硬件维护一个独立的"影子栈"来保护函数返回地址不被篡改。
-      这是对 ROP（Return-Oriented Programming）攻击的重要硬件级防御。
-    </p>
-
-    <p>
-      LLVM 17 支持以下 GCS 相关指令和系统寄存器的汇编/反汇编，为后续编译器自动生成 GCS 保护代码奠定基础。
-      注意：LLVM 17 中仅在汇编层面支持这些指令；编译器自动插入 GCS 保护（如 prologue/epilogue 中的 GCS 操作）在后续版本（LLVM 19+）中才完整实现。
-    </p>
-
-    <div class="co co-i">
-      <strong>对数通产品线的价值</strong>
-      基于 ARM 架构的数通设备（如使用 ARM Neoverse 处理器的路由器/交换机）如果目标硬件支持 GCS，
-      可以利用此特性防御控制流劫持攻击，提升设备安全性。
-    </div>
-
-    <h4>代码示例：GCS 汇编指令</h4>
-
+    <p>LLVM 17 改进了当非固定底层类型的枚举在常量表达式中被设置为超出范围的值时的诊断信息：<strong>现在会输出枚举类型的名称</strong>，大幅提升错误定位效率。</p>
+    <p>该诊断由 <code class="inline-code">-Wenum-constexpr-conversion</code> 控制（该标志在 LLVM 16 中首次引入，LLVM 17 中增强了诊断内容）。在 LLVM 16 中此诊断可降级为 warning；LLVM 17 保留相同行为。后续 LLVM 18 中将在系统头文件中也启用此诊断，再后续版本将转为硬错误。</p>
     <div class="example-box">
-      <div class="ex-label">
-        示例 1：GCS 控制指令
-      </div>
-
+      <div class="ex-label">enum 常量超出范围诊断对比</div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">For Reference: 类似 PAC (Pointer Authentication)</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">; PAC 指令 (LLVM 15+ 已支持)</span>
-<span class="c">; 签名返回地址</span>
-paciasp
-
-<span class="c">; 验证并返回</span>
-autiasp
-
-<span class="c">; 使用 PAC 签名的间接调用</span>
-blraa   x17, x16</pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">LLVM 17 新增: GCS 指令</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c">; GCS 压栈：将返回地址压入 GCS</span>
-<span class="c">; 类似硬件影子栈的 push</span>
-gcspushx
-
-<span class="c">; GCS 弹栈并比较：验证返回地址</span>
-<span class="c">; 类似硬件影子栈的 pop + 校验</span>
-gcspopx
-
-<span class="c">; GCS 条件压栈</span>
-gcdspsx
-
-<span class="c">; GCS 条件弹栈</span>
-gcsstp</pre>
-          </div>
-        </div>
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16 — 无类型名</div><div class="sc-body"><pre class="cb"><span class="k">enum</span> Color { Red = 0, Green = 1, Blue = 2 };
+<span class="k">static</span> <span class="k">constexpr</span> Color c =
+    <span class="k">static_cast</span>&lt;Color&gt;(7);
+<span class="c">// LLVM 16 诊断:</span>
+<span class="c">// error: integer value 7 is outside</span>
+<span class="c">// the valid range of values [0, 3]</span>
+<span class="c">// for this enumeration type</span>
+<span class="c">//          ^ 没有显示类型名</span></pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17 — 显示类型名</div><div class="sc-body"><pre class="cb"><span class="k">enum</span> Color { Red = 0, Green = 1, Blue = 2 };
+<span class="k">static</span> <span class="k">constexpr</span> Color c =
+    <span class="k">static_cast</span>&lt;Color&gt;(7);
+<span class="c">// LLVM 17 诊断:</span>
+<span class="c">// error: integer value 7 is outside</span>
+<span class="c">// the valid range of values [0, 3]</span>
+<span class="c">// for this enumeration type 'Color'</span>
+<span class="c">//                           ^^^^^^</span>
+<span class="c">// 现在显示了枚举类型名!</span></pre></div></div>
       </div>
     </div>
-
     <div class="example-box">
-      <div class="ex-label">
-        示例 2：GCS 系统寄存器与函数调用模式
+      <div class="ex-label">实用场景：大项目中定位问题</div>
+      <pre class="cb"><span class="c">// v8/src/base/bit-field.h 中常见模式</span>
+<span class="k">enum</span> MyBitField { kValue0, kValue1, kValue2 };
+<span class="k">static</span> <span class="k">constexpr</span> <span class="k">int</span> kMax =
+    <span class="k">static_cast</span>&lt;<span class="k">int</span>&gt;(kValue2 - 1);
+<span class="c">// LLVM 17 诊断明确指出 'MyBitField'</span>
+<span class="c">// 在大型项目中快速定位到具体枚举定义</span></pre>
+    </div>
+    <div class="co co-a mt-10"><strong>升级影响</strong><ul><li>此变更不改变编译成功/失败的判断，仅改善诊断质量</li><li>如果代码中已有此类超出范围的枚举转换，LLVM 17 的诊断更易定位修复</li><li><code>-Wno-enum-constexpr-conversion</code> 可抑制此诊断（但不推荐）</li></ul></div>
+  </div>
+</section>
+<section id="builtin-object-size" class="section">
+  <div class="section-header"><span class="num">7</span><h2>__builtin_object_size 与柔性数组成员指定初始化器</h2><span class="h2-tag">行为变更 · 与 GCC 对齐</span></div>
+  <div class="section-body">
+    <h4>变更说明</h4>
+    <p><code class="inline-code">__builtin_object_size</code> 和 <code class="inline-code">__builtin_dynamic_object_size</code> 现在在计算包含柔性数组成员（flexible array member, FAM）的结构体大小时，会<strong>计入指定初始化器中指定元素的 sizeof</strong>。这是为了与 GCC 的行为保持一致。</p>
+    <div class="co co-a"><strong>潜在影响</strong>此变更可能影响依赖 <code>__builtin_object_size</code> 进行缓冲区溢出检测的代码（如 <code>_FORTIFY_SOURCE</code>）。如果代码期望旧的（较小的）对象大小，可能在 LLVM 17 下出现误报或行为变化。</div>
+    <div class="example-box">
+      <div class="ex-label">FAM 指定初始化器大小计算</div>
+      <div class="side-by-side">
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16</div><div class="sc-body"><pre class="cb"><span class="k">struct</span> S {
+  <span class="k">int</span> a;
+  <span class="k">int</span> fam[];  <span class="c">// 柔性数组成员</span>
+};
+<span class="c">// 指定初始化器给 FAM 分配空间</span>
+<span class="k">struct</span> S s = { .a = 1, .fam = {2, 3, 4} };
+<span class="c">// LLVM 16: sizeof(S) = 4 (不含 FAM)</span>
+<span class="c">// __builtin_object_size(&s, 0) 可能返回 4</span></pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17</div><div class="sc-body"><pre class="cb"><span class="k">struct</span> S {
+  <span class="k">int</span> a;
+  <span class="k">int</span> fam[];  <span class="c">// 柔性数组成员</span>
+};
+<span class="c">// 指定初始化器给 FAM 分配空间</span>
+<span class="k">struct</span> S s = { .a = 1, .fam = {2, 3, 4} };
+<span class="c">// LLVM 17: 计入 FAM 元素的 sizeof</span>
+<span class="c">// __builtin_object_size(&s, 0) = 4 + 3*4 = 16</span>
+<span class="c">// 与 GCC 行为一致</span></pre></div></div>
       </div>
-      <pre class="cb"><span class="c">; ════════════════════════════════════════</span>
-<span class="c">; GCS 系统寄存器 (LLVM 17 新增支持)</span>
-<span class="c">; ════════════════════════════════════════</span>
+    </div>
+    <div class="example-box">
+      <div class="ex-label">_FORTIFY_SOURCE 场景可能受影响</div>
+      <pre class="cb"><span class="c">// 如果代码依赖 __builtin_object_size 检测溢出</span>
+<span class="k">struct</span> header { <span class="k">int</span> len; <span class="k">char</span> data[]; };
+<span class="k">struct</span> header h = { .len = 3, .data = {1, 2, 3} };
 
-<span class="c">; 读取 GCS 控制寄存器</span>
-mrs     x0, GCSCR_EL1         <span class="c">; GCS Control Register</span>
-mrs     x0, GCSPR_EL1         <span class="c">; GCS Pointer Register</span>
-mrs     x0, GCSCRE0_EL1       <span class="c">; GCS Current Record El0</span>
+<span class="k">void</span> copy_data(<span class="k">char</span> *buf, <span class="k">size_t</span> sz) {
+  <span class="c">// LLVM 17: __builtin_object_size(&h, 0) 返回 sizeof(header)+3</span>
+  <span class="c">// 而非 sizeof(header)。_FORTIFY_SOURCE 的 __memcpy_chk</span>
+  <span class="c">// 将基于新的大小做检查，可能改变运行时行为。</span>
+  <span class="k">memcpy</span>(buf, &h, sz);
+}</pre>
+    </div>
+    <div class="co co-i mt-10"><strong>检查建议</strong><ul><li>如果代码中使用 <code>__builtin_object_size</code> 或启用了 <code>_FORTIFY_SOURCE</code>，需验证 FAM 指定初始化器场景</li><li>此变更是向 GCC 行为的靠拢，长期看是正确方向</li><li>如果期望旧行为，可考虑显式使用 sizeof 而非 __builtin_object_size</li></ul></div>
+  </div>
+</section>
+<section id="inline-std" class="section">
+  <div class="section-header"><span class="num">8</span><h2>namespace std 禁止声明为 inline namespace</h2><span class="h2-tag">C++ · Breaking Change</span></div>
+  <div class="section-body">
+    <h4>变更说明</h4>
+    <p>C++ 标准 <code>[namespace.std]p7</code> 明确禁止将 <code>std</code> 声明为 inline namespace。LLVM 17 实现了此规则：<strong>将 <code>namespace std</code> 声明为 inline 现在会产生编译错误</strong>。</p>
+    <div class="co co-r"><strong>破坏性</strong>少数代码在自定义实现标准库组件时会使用 <code>inline namespace std</code> 模式，这些代码在 LLVM 17 下将编译失败。</div>
+    <div class="example-box">
+      <div class="ex-label">inline namespace std 禁止</div>
+      <div class="side-by-side">
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16 — 允许</div><div class="sc-body"><pre class="cb"><span class="c">// LLVM 16 允许: 自定义 std 组件</span>
+<span class="k">inline</span> <span class="k">namespace</span> std {
+  <span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
+  <span class="k">struct</span> hash;
+  <span class="c">// 可以为自定义类型特化 std::hash</span>
+}
+<span class="c">// 无编译错误</span></pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17 — 禁止</div><div class="sc-body"><pre class="cb"><span class="c">// LLVM 17: 编译错误!</span>
+<span class="r">inline</span> <span class="k">namespace</span> std {   <span class="c">// ERROR</span>
+  <span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
+  <span class="k">struct</span> hash;
+}
+<span class="c">// error: cannot declare namespace 'std'</span>
+<span class="c">//        to be inline</span>
+<span class="c">// 正确做法: 移除 inline 关键字</span>
+<span class="k">namespace</span> std {  <span class="c">// OK</span>
+  <span class="k">template</span>&lt;<span class="k">class</span> <span class="r">T</span>&gt;
+  <span class="k">struct</span> hash;
+}</pre></div></div>
+      </div>
+    </div>
+    <div class="co co-i mt-10"><strong>修复方案</strong><ul><li>将 <code>inline namespace std { ... }</code> 改为 <code>namespace std { ... }</code></li><li>标准库 component 的特化仍可在非 inline 的 <code>namespace std</code> 中进行</li><li>此规则适用于所有版本 C++ 标准</li></ul></div>
+  </div>
+</section>
+<section id="dynamic-cast-final" class="section">
+  <div class="section-header"><span class="num">9</span><h2>final 类型 dynamic_cast 优化：直接 vtable 比较</h2><span class="h2-tag">C++ · 性能优化</span></div>
+  <div class="section-body">
+    <h4>变更说明</h4>
+    <p>LLVM 17 优化了到 <code class="inline-code">final</code> 类型的 <code>dynamic_cast</code>。在 ABI 要求 vtable 地址唯一的平台上（如 Itanium ABI），Clang 现在<strong>直接比较 vtable 指针</strong>，而不是调用 RTTI 运行时函数。这避免了 <code>__dynamic_cast</code> 的运行时开销。</p>
+    <p>此优化可通过 <code class="inline-code">-fno-assume-unique-vtables</code> 禁用，目前尚未在 MS C++ ABI 上实现。</p>
+    <div class="co co-g"><strong>性能意义</strong>对大量使用 <code>dynamic_cast</code> 的代码（如序列化框架、消息分发系统），此优化可减少虚函数调用开销。</div>
+    <div class="example-box">
+      <div class="ex-label">final 类型 dynamic_cast 优化</div>
+      <div class="side-by-side">
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16 — 运行时函数调用</div><div class="sc-body"><pre class="cb"><span class="k">struct</span> Base { <span class="k">virtual</span> ~Base(); };
+<span class="k">struct</span> Derived <span class="k">final</span> : Base { };
 
-<span class="c">; 写 GCS 控制寄存器</span>
+<span class="k">void</span> check(Base* b) {
+  <span class="k">auto</span>* d = <span class="k">dynamic_cast</span>&lt;Derived*&gt;(b);
+  <span class="c">// LLVM 16 生成: 调用 __dynamic_cast</span>
+  <span class="c">// 运行时通过 RTTI 字符串比较类型</span>
+}
+
+<span class="c">; LLVM 16 生成的 IR 伪代码:</span>
+<span class="c">;   call @__dynamic_cast(Base* b, ...)</span></pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17 — vtable 指针比较</div><div class="sc-body"><pre class="cb"><span class="k">struct</span> Base { <span class="k">virtual</span> ~Base(); };
+<span class="k">struct</span> Derived <span class="k">final</span> : Base { };
+
+<span class="k">void</span> check(Base* b) {
+  <span class="k">auto</span>* d = <span class="k">dynamic_cast</span>&lt;Derived*&gt;(b);
+  <span class="c">// LLVM 17 生成: 直接比较 vtable 指针</span>
+  <span class="c">// 因为 Derived 是 final, vtable 唯一</span>
+}
+
+<span class="c">; LLVM 17 生成的 IR 伪代码:</span>
+<span class="c">;   %vtable = load ptr, ptr %b</span>
+<span class="c">;   %cmp = icmp eq ptr %vtable, @vtable.Derived</span>
+<span class="c">;   %result = select i1 %cmp, ptr %b, ptr null</span></pre></div></div>
+      </div>
+    </div>
+    <div class="example-box">
+      <div class="ex-label">禁用此优化</div>
+      <pre class="cb"><span class="c"># 如果 vtable 合并场景导致问题，可禁用:</span>
+clang -fno-assume-unique-vtables file.cpp
+<span class="c"># 默认行为 (-f[no-]assume-unique-vtables 是新增选项)</span></pre>
+    </div>
+    <div class="co co-i mt-10"><strong>影响</strong><ul><li>仅当目标类型标记为 <code>final</code> 且使用 Itanium ABI 时触发</li><li>可能改变 <code>dynamic_cast</code> 失败时的行为路径（但结果一致）</li><li>新增 <code>-f[no-]assume-unique-vtables</code> 控制选项</li></ul></div>
+  </div>
+</section>
+<section id="aarch64-all" class="section">
+  <div class="section-header"><span class="num">10</span><h2>AArch64 综合变更</h2><span class="h2-tag">后端 · 安全 · 调用约定 · 汇编</span></div>
+  <div class="section-body">
+    <p>LLVM 17 为 AArch64 带来了多项重要增强：硬件安全扩展汇编支持、<code>preserve_all</code> 调用约定修复、<code>.arch</code> 指令修正、short range thunk、MEMTAG 动态标签、BTI+range extension 等。</p>
+
+    <h4>10.1 FEAT_GCS / FEAT_CHK / FEAT_ATS1A 汇编支持</h4>
+    <p>LLVM 17 新增了对 AArch64 2022 A-profile 扩展的汇编器/反汇编器支持：<strong>FEAT_GCS</strong>（Guarded Control Stack）、<strong>FEAT_CHK</strong>（Check Feature Status）、<strong>FEAT_ATS1A</strong>。GCS 是 ARMv9.4-A 通过硬件影子栈防御 ROP 攻击的机制。</p>
+    <div class="example-box">
+      <div class="ex-label">GCS 汇编指令示例</div>
+      <pre class="cb"><span class="c">; GCS 压栈/弹栈指令</span>
+gcspushx              <span class="c">; 将返回地址压入 GCS (硬件影子栈)</span>
+gcspopx               <span class="c">; 弹栈并验证返回地址</span>
+gcspushm  x29, x30    <span class="c">; 批量压入多个寄存器</span>
+
+<span class="c">; GCS 系统寄存器</span>
+mrs     x0, GCSCR_EL1      <span class="c">; GCS Control Register</span>
+mrs     x0, GCSPR_EL1      <span class="c">; GCS Pointer Register</span>
 msr     GCSCR_EL1, x0
 msr     GCSPR_EL1, x0
 
-<span class="c">; ════════════════════════════════════════</span>
-<span class="c">; GCS 保护下的函数序言示意</span>
-<span class="c">; ════════════════════════════════════════</span>
+<span class="c">; FEAT_CHK: 特性状态检查</span>
+<span class="c">; FEAT_ATS1A: 地址翻译阶段 1 增强</span></pre>
+    </div>
+    <div class="example-box">
+      <div class="ex-label">GCS 保护下的函数序言/结语示意</div>
+      <pre class="cb"><span class="c">; GCS 保护下的完整函数模式</span>
 my_function:
-    <span class="c">; 序言：将返回地址压入 GCS</span>
-    str     x30, [sp, #-16]!   <span class="c">; 常规栈帧保存 LR</span>
-    gcspushx                   <span class="c">; GCS 记录返回地址</span>
+    str     x30, [sp, #-16]!  <span class="c">; 常规栈帧</span>
+    gcspushx                  <span class="c">; GCS 记录返回地址</span>
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
-
     <span class="c">; ... 函数体 ...</span>
-
-    <span class="c">; 结语：从 GCS 验证返回地址</span>
     ldp     x29, x30, [sp], #16
-    gcspopx                    <span class="c">; 验证返回地址未被篡改</span>
+    gcspopx                   <span class="c">; 验证返回地址未被篡改</span>
     ldr     x30, [sp], #16
     ret</pre>
     </div>
+    <p class="text-s">汇编时需指定 <code>-march=armv9.4-a+gcs</code>，反汇编时使用 <code>-mattr=+gcs</code>。</p>
 
+    <h4>10.2 preserve_all 调用约定</h4>
+    <p>LLVM 17 修复了在 AArch64 上使用 <code class="inline-code">preserve_all</code> 调用约定时的崩溃问题（Issue #58145），并为该调用约定添加了完整的支持。</p>
     <div class="example-box">
-      <div class="ex-label">示例 3: C/C++ 中使用内联汇编调用 GCS 指令</div>
-      <pre class="cb"><span class="c">// 在 C/C++ 中通过内联汇编读取 GCS 指针</span>
-<span class="k">#include</span> <span class="s">&lt;stdint.h&gt;</span>
-
-<span class="c">// 读取 GCS 指针寄存器 (GCSPR_EL1)</span>
-<span class="k">static</span> <span class="k">inline</span> <span class="kt">uint64_t</span> read_gcs_pointer(<span class="k">void</span>) {
-    <span class="kt">uint64_t</span> gcspr;
-    <span class="k">asm</span> <span class="k">volatile</span>(
-        <span class="s">"mrs %0, GCSPR_EL1\n"</span>
-        : <span class="s">"=r"</span>(gcspr)
-    );
-    <span class="k">return</span> gcspr;
-}
-
-<span class="c">// 读取 GCS 控制寄存器</span>
-<span class="k">static</span> <span class="k">inline</span> <span class="kt">uint64_t</span> read_gcs_control(<span class="k">void</span>) {
-    <span class="kt">uint64_t</span> gcscr;
-    <span class="k">asm</span> <span class="k">volatile</span>(
-        <span class="s">"mrs %0, GCSCR_EL1\n"</span>
-        : <span class="s">"=r"</span>(gcscr)
-    );
-    <span class="k">return</span> gcscr;
-}
-
-<span class="c">// 在初始化代码中验证 GCS 特性存在</span>
-<span class="k">void</span> check_gcs_support(<span class="k">void</span>) {
-    <span class="kt">uint64_t</span> gcscr = read_gcs_control();
-    <span class="c">// bit 0 表示 GCS 启用</span>
-    <span class="k">if</span> (gcscr &amp; 1) {
-        printf(<span class="s">"GCS enabled, ptr=0x%lx\n"</span>,
-               read_gcs_pointer());
-    }
+      <div class="ex-label">preserve_all 调用约定</div>
+      <pre class="cb"><span class="c">// preserve_all: 被调用者保存所有寄存器</span>
+<span class="k">__attribute__</span>((preserve_all))
+<span class="k">void</span> my_interrupt_handler(<span class="k">void</span>) {
+  <span class="c">// 此函数不会修改任何调用者寄存器</span>
+  <span class="c">// 适用于中断处理、信号处理等场景</span>
+  <span class="c">// LLVM 16: AArch64 上可能崩溃</span>
+  <span class="c">// LLVM 17: 正常工作</span>
 }</pre>
     </div>
 
-    <div class="co co-i mt-10">
-      <strong>使用说明</strong>
-      <ul style="margin:6px 0 0 0">
-        <li>汇编时需要指定支持 GCS 的目标架构，如 <code class="inline-code">-march=armv9.4-a+gcs</code></li>
-        <li>反汇编时使用 <code class="inline-code">-mattr=+gcs</code> 以正确解码 GCS 指令</li>
-        <li>此特性仅在 <strong>AArch64 (ARM64) 架构</strong>上可用</li>
-        <li>LLVM 17 仅提供汇编/反汇编支持，编译器自动插入 GCS 保护在 LLVM 19+ 中通过 <code>-mbranch-protection=</code> 实现</li>
-        <li>需要 ARMv9.4-A 或更高版本的硬件（或具备 FEAT_GCS 特性的 ARMv8.x 实现）</li>
-      </ul>
+    <h4>10.3 .arch 指令修复</h4>
+    <p>LLVM 17 修复了汇编指令 <code class="inline-code">.arch &lt;level&gt;</code> 在没有 <code>+&lt;ext&gt;</code> 后缀时的行为。此前该指令完全没有效果；现在 <code>.arch &lt;level&gt;</code> 可以正确地启用更高级别中包含的所有扩展，或用作降低级别以禁用不需要的扩展。同时新增了 <code>.arch_extension</code> 指令支持缺失的 arch 扩展。</p>
+    <div class="example-box">
+      <div class="ex-label">.arch 指令修复</div>
+      <pre class="cb"><span class="c">// 修复前 (LLVM 16): .arch armv8.5-a 无任何效果</span>
+<span class="c">// 修复后 (LLVM 17): 正确启用/禁用对应的扩展</span>
+.arch armv8.5-a        <span class="c">; 现在正确启用 armv8.5-a 的扩展</span>
+.arch_extension crypto  <span class="c">; 新增: 启用缺失的扩展</span></pre>
+    </div>
+
+    <h4>10.4 AArch64 short range thunk</h4>
+    <p>LLD 17 实现了 AArch64 <strong>short range thunk</strong>，用于缓解长跳转 thunk 的性能损失。当代码距离在短跳转范围内时，使用更高效的短 thunk 而非完整的 long range thunk，减少指令开销。</p>
+
+    <h4>10.5 DT_AARCH64_MEMTAG_* 动态标签</h4>
+    <p>LLD 17 新增对 <code class="inline-code">DT_AARCH64_MEMTAG_*</code> 系列动态标签的支持，这是 AArch64 内存标签扩展 (MTE) 的 ELF 动态链接基础设施。</p>
+
+    <h4>10.6 BTI landing pad 与 range extension thunk</h4>
+    <p>LLD 17 为通过 <strong>range extension thunk</strong> 或 <strong>relative vtable</strong> 访问的 PLT 条目添加了 BTI landing pad，确保间接分支目标符合 BTI 要求，增强 AArch64 控制流完整性。</p>
+
+    <hr>
+    <h4>额外 AArch64 亮点</h4>
+    <ul>
+      <li><code>__arithmetic_fence</code> 内建函数和 <code>-fprotect-parens</code> 选项现在支持 AArch64</li>
+      <li>内联汇编现在支持 NZCV 标志输出操作数（如 <code>"=@cceq"(*b)</code>），与 GCC 行为一致</li>
+      <li>新增对非法目标三元组 <code>--target=aarch64-*-eabi</code> 的警告诊断</li>
+    </ul>
+    <div class="example-box">
+      <div class="ex-label">AArch64 NZCV 标志输出操作数（新增）</div>
+      <pre class="cb"><span class="c">// AArch64 内联汇编的条件标志输出</span>
+<span class="k">int</span> a = foo();
+<span class="k">int</span>* b = bar();
+<span class="k">asm</span>(<span class="s">"ands %w[a], %w[a], #3"</span>
+    : [a] <span class="s">"+r"</span>(a), <span class="s">"=@cceq"</span>(*b));
+<span class="c">// 如果 a & 3 == 0, 则 *b 被设置</span>
+<span class="c">// LLVM 17 新增: =@cceq, =@ccne, =@cccs 等</span></pre>
     </div>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     LLD THREAD CAP
-     ══════════════════════════════════════════════════════ -->
-<section id="lld-threads" class="section">
-  <div class="section-header">
-    <span class="num">7</span>
-    <h2>LLD 线程数上限 16 核</h2>
-    <span class="h2-tag">链接器 · 默认行为变更</span>
-  </div>
+<section id="llvm-ir" class="section">
+  <div class="section-header"><span class="num">11</span><h2>LLVM IR 变更</h2><span class="h2-tag">核心基础设施</span></div>
   <div class="section-body">
 
-    <h4>变更说明</h4>
-    <p>
-      LLD（LLVM 链接器）的 <code class="inline-code">--threads=N</code> 选项用于控制链接时的并行线程数。
-      在 LLVM 17 之前，<code>--threads=</code> 的上限为 256 核，实际上等于没有限制。
-      但在实践中发现，当线程数超过 16 时，<strong>glibc 的 malloc 实现会出现严重的锁竞争，
-      导致性能反而下降</strong>——线程数越多，链接越慢。
-    </p>
+    <h4>11.1 nofpclass 属性</h4>
+    <p>LLVM 17 引入了 <code class="inline-code">nofpclass</code> 属性，用于指示浮点值<strong>不属于哪些特殊类别</strong>（如 NaN、无穷大、负零、正零、非正规数等）。这使编译器可以在浮点比较优化中做更激进的常数折叠。</p>
+    <div class="example-box">
+      <div class="ex-label">nofpclass 属性用法</div>
+      <pre class="cb"><span class="c">; nofpclass 属性: 告诉优化器该值不属于指定类别</span>
+<span class="c">; nofpclass(nan inf) = 该值不是 NaN, 也不是无穷大</span>
+<span class="k">define</span> float @example(float <span class="r">nofpclass(nan inf)</span> %x) {
+  <span class="c">; 优化器知道 %x 不是 NaN, 可以简化 fcmp</span>
+  %cmp = <span class="k">fcmp</span> oeq float %x, %x
+  <span class="c">; 这将折叠为 true（不是 NaN 则总是与自己相等）</span>
+  <span class="k">ret</span> float %x
+}
 
-    <p>
-      LLVM 17 将 <code class="inline-code">--threads=</code> 的<strong>默认值从 CPU 核心数改为 min(CPU 核心数, 16)</strong>，
-      并且在自动检测时也限制不超过 16。显式指定超过 16 的值也会被 cap 到 16。
-      此变更旨在防止过度并行带来的性能反噬。
-    </p>
-
-    <div class="co co-a">
-      <strong>实际场景</strong>
-      在高端服务器（如 64 核 / 128 核机器）上构建大型项目时，旧版本 LLD 可能默认启动 64+ 线程，
-      导致大量的 malloc/free 竞争。LLVM 17 的 cap 机制使链接性能更加可预测。
+<span class="c">; 可用的类别: nan, inf, norm, sub, zero, all, 以及</span>
+<span class="c">; 正负变体: ninf, pinf, nnorm, pnorm, nsub, psub, nzero, pzero</span>
+<span class="c">; nofpclass(nan pinf ninf nzero) 排除 NaN, +/-inf, -0</span></pre>
     </div>
 
-    <h4>代码示例</h4>
-
+    <h4>11.2 ldexp / frexp 内建函数</h4>
+    <p>LLVM 17 引入了 <code class="inline-code">llvm.ldexp</code>（加载指数）和 <code class="inline-code">llvm.frexp</code>（分解浮点数）内建函数，以及其约束浮点变体 <code class="inline-code">llvm.experimental.constrained.ldexp</code>。</p>
     <div class="example-box">
-      <div class="ex-label">
-        示例：编译脚本中 LLD 线程参数的行为差异
-      </div>
+      <div class="ex-label">ldexp / frexp intrinsics</div>
+      <pre class="cb"><span class="c">; ldexp: x * 2^exp</span>
+<span class="c">; 计算 x 乘以 2 的 exp 次方</span>
+%result = <span class="k">call</span> float @llvm.ldexp.f32(float %x, i32 %exp)
+
+<span class="c">; frexp: 分解 x 为 significand 和 exponent</span>
+<span class="c">; x = significand * 2^exponent, 0.5 <= |significand| < 1.0</span>
+%struct = <span class="k">call</span> { float, i32 } @llvm.frexp.f32(float %x)
+%sig = <span class="k">extractvalue</span> { float, i32 } %struct, 0
+%exp = <span class="k">extractvalue</span> { float, i32 } %struct, 1
+
+<span class="c">; 约束浮点变体 (保留舍入模式和异常行为)</span>
+%result = <span class="k">call</span> float @llvm.experimental.constrained.ldexp.f32(
+    float %x, i32 %exp, metadata !"round.tonearest",
+    metadata !"fpexcept.strict")</pre>
+    </div>
+
+    <h4>11.3 select 常量表达式变体移除</h4>
+    <p>LLVM 17 移除了 <code class="inline-code">select</code> 指令的<strong>常量表达式变体</strong>。此前可以在常量表达式中使用 <code>select</code>（如全局变量初始化器中），现在这些需要改用其他方式表达。</p>
+    <div class="example-box">
+      <div class="ex-label">select 常量表达式移除</div>
       <div class="side-by-side">
-        <div class="side-col">
-          <div class="sc-head old-head">Before: LLVM 16 — 无上限限制</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c"># 128 核服务器上</span>
-<span class="c"># LLD 16 默认使用全部 128 线程</span>
-clang -fuse-ld=lld foo.o bar.o \
-    -o output
-
-<span class="c"># 等效于</span>
-clang -fuse-ld=lld foo.o bar.o \
-    -Wl,--threads=128 -o output
-
-<span class="c"># 显式指定超多线程</span>
-clang -fuse-ld=lld foo.o bar.o \
-    -Wl,--threads=64 -o output
-<span class="c"># LLVM 16: 实际使用 64 线程 ✓</span>
-<span class="c"># 但可能比 16 线程还慢！</span></pre>
-          </div>
-        </div>
-        <div class="side-col">
-          <div class="sc-head new-head">After: LLVM 17 — cap 到 16</div>
-          <div class="sc-body">
-            <pre class="cb"><span class="c"># 128 核服务器上</span>
-<span class="c"># LLD 17 默认最大 16 线程</span>
-clang -fuse-ld=lld foo.o bar.o \
-    -o output
-
-<span class="c"># 等效于</span>
-clang -fuse-ld=lld foo.o bar.o \
-    -Wl,--threads=16 -o output
-
-<span class="c"># 显式指定超多线程会被 cap</span>
-clang -fuse-ld=lld foo.o bar.o \
-    -Wl,--threads=64 -o output
-<span class="c"># LLVM 17: 实际只用 16 线程</span>
-<span class="c"># 并输出一条 warning</span></pre>
-          </div>
-        </div>
+        <div class="side-col"><div class="sc-head old-head">Before: LLVM 16</div><div class="sc-body"><pre class="cb"><span class="c">; 常量表达式中的 select (已移除)</span>
+@global = <span class="k">global</span> i32 <span class="r">select</span> (
+    i1 icmp eq (i32 ptrtoint (...), i32 0),
+    i32 42, i32 0)
+<span class="c">; LLVM 16: 常量 select 仍然可用</span></pre></div></div>
+        <div class="side-col"><div class="sc-head new-head">After: LLVM 17</div><div class="sc-body"><pre class="cb"><span class="c">; select 常量表达式已移除</span>
+<span class="c">; 如果源码生成此类 IR, 需要改用</span>
+<span class="c">; 其他方式（如全局构造函数）</span>
+<span class="c">; 或确保前端不再生成此类模式</span></pre></div></div>
       </div>
     </div>
 
-    <div class="example-box">
-      <div class="ex-label">LLD 线程数 cap 行为总结</div>
-      <table>
-        <thead>
-          <tr><th>场景</th><th>LLVM 16 行为</th><th>LLVM 17 行为</th><th>说明</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>不指定 <code>--threads</code></td>
-            <td>使用全部 CPU 核心数</td>
-            <td><code>min(CPU核心数, 16)</code></td>
-            <td>自动限制</td>
-          </tr>
-          <tr>
-            <td><code>--threads=8</code></td>
-            <td>8 线程</td>
-            <td>8 线程</td>
-            <td>小于 16 无影响</td>
-          </tr>
-          <tr>
-            <td><code>--threads=16</code></td>
-            <td>16 线程</td>
-            <td>16 线程</td>
-            <td>等于上限，行为不变</td>
-          </tr>
-          <tr>
-            <td><code>--threads=32</code></td>
-            <td>32 线程</td>
-            <td>16 线程 + warning</td>
-            <td><span class="bh">被 cap</span></td>
-          </tr>
-          <tr>
-            <td><code>--threads=64</code></td>
-            <td>64 线程</td>
-            <td>16 线程 + warning</td>
-            <td><span class="bh">被 cap</span></td>
-          </tr>
-          <tr>
-            <td><code>--threads=1</code></td>
-            <td>单线程（等同于 --no-threads）</td>
-            <td>单线程</td>
-            <td>确定性构建</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
+    <h4>11.4 传统优化管线移除</h4>
+    <p>LLVM 17 移除了传统优化管线（<code class="inline-code">PassManagerBuilder.h</code>）。所有 Pass 必须迁移到新 Pass Manager API。详见 <a href="https://llvm.org/docs/NewPassManager.html">NewPassManager 文档</a>。</p>
 
-    <div class="example-box">
-      <div class="ex-label">CMake / Makefile 中的适配</div>
-      <pre class="cb"><span class="c"># 如果 CMakeLists.txt 中有这样的配置：</span>
-<span class="c"># set(CMAKE_EXE_LINKER_FLAGS "-Wl,--threads=32")</span>
-<span class="c"># 在 LLVM 17 下会被 cap 到 16，且输出 warning</span>
-
-<span class="c"># 推荐做法：移除显式的 --threads 设置</span>
-<span class="c"># 让 LLD 自行决定最优线程数</span>
-<span class="c"># set(CMAKE_EXE_LINKER_FLAGS "")  # 不设 --threads</span>
-
-<span class="c"># 如果有特殊需求（如仅用 8 线程），设定合理值即可</span>
-<span class="c"># set(CMAKE_EXE_LINKER_FLAGS "-Wl,--threads=8")</span></pre>
-    </div>
-
-    <div class="co co-i mt-10">
-      <strong>对数通产品线的影响</strong>
-      <ul style="margin:6px 0 0 0">
-        <li>绝大多数场景下，此变更是<strong>正面优化</strong>（避免过度并行导致性能下降）</li>
-        <li>如果构建脚本中硬编码了 <code>--threads=32</code> 或更高值，会看到 warning 输出</li>
-        <li>在构建日志中检查是否存在 <code>--threads</code> 超过 16 的情况，建议直接移除显式设置</li>
-        <li>对于 CI 构建服务器，移除硬编码线程数后可能反而获得更稳定的链接时间</li>
-        <li>如果坚持使用超过 16 线程，需自行编译 LLD 并修改源码中的上限常量</li>
-      </ul>
-    </div>
+    <h4>11.5 收敛控制内建函数（实验性）</h4>
+    <p>引入一组实验性收敛控制内建函数，用于显式定义收敛操作的语义。</p>
   </div>
 </section>
-
-<!-- ══════════════════════════════════════════════════════
-     ADDITIONAL NOTABLE CHANGES
-     ══════════════════════════════════════════════════════ -->
-<section class="section">
-  <div class="section-header">
-    <span class="num">+</span>
-    <h2>其他值得关注的 LLVM 17 变更</h2>
-    <span class="h2-tag">补充</span>
-  </div>
+<section id="backends" class="section">
+  <div class="section-header"><span class="num">12</span><h2>后端与汇编层改进</h2><span class="h2-tag">多架构</span></div>
   <div class="section-body">
-    <table>
-      <thead><tr><th style="width:20%">类别</th><th style="width:40%">变更</th><th style="width:40%">对数通产品线的意义</th></tr></thead>
-      <tbody>
-        <tr>
-          <td><strong>C 语言</strong></td>
-          <td><code>-fcoroutines-ts</code> 选项移除</td>
-          <td>使用 C++20 协程标准替代，TS 实验性协程不再支持</td>
-        </tr>
-        <tr>
-          <td><strong>C++ 模块</strong></td>
-          <td><code>-fmodules-ts</code> 选项移除</td>
-          <td>改为使用标准 C++20 modules 语法</td>
-        </tr>
-        <tr>
-          <td><strong>浮点优化</strong></td>
-          <td>新增 <code>nofpclass</code> 属性：指示浮点值所属类别</td>
-          <td>编译器可以做更激进的浮点比较优化，数值密集代码可能受益</td>
-        </tr>
-        <tr>
-          <td><strong>Inliner</strong></td>
-          <td>always inliner 路径清理和可靠性提升</td>
-          <td><code>__attribute__((always_inline))</code> 更可靠地保证内联</td>
-        </tr>
-        <tr>
-          <td><strong>AArch64</strong></td>
-          <td>新增 <code>-mcpu=</code> 对更多 ARM 核心的支持</td>
-          <td>新硬件目标可以有更优的指令调度和代码生成</td>
-        </tr>
-        <tr>
-          <td><strong>LoongArch</strong></td>
-          <td>LoongArch 后端持续完善</td>
-          <td>如果使用龙芯平台需关注</td>
-        </tr>
-        <tr>
-          <td><strong>RISC-V</strong></td>
-          <td>RISC-V 向量扩展 (RVV) 和 bitmanip 扩展改进</td>
-          <td>如果使用 RISC-V 平台需关注</td>
-        </tr>
-        <tr>
-          <td><strong>libc++</strong></td>
-          <td><code>std::expected</code> (C++23)、<code>std::mdspan</code> (C++23)、<code>std::print</code> (C++23) 支持</td>
-          <td>新的标准库组件可用</td>
-        </tr>
-        <tr>
-          <td><strong>Clang 前端</strong></td>
-          <td>C++23 <code>if consteval</code> 支持</td>
-          <td>编译时条件判断的新方式，模板代码可简化</td>
-        </tr>
-        <tr>
-          <td><strong>工具链</strong></td>
-          <td>Resource dir 使用 major 版本号（17）而非完整版本</td>
-          <td>工具链路径可能变化</td>
-        </tr>
-      </tbody>
-    </table>
+
+    <h4>12.1 LoongArch 提升为官方目标</h4>
+    <p>LLD 17 中 <strong>LoongArch 已作为正式支持的目标</strong>，不再是实验性质。LLVM 17 中 LoongArch 后端持续完善：</p>
+    <ul>
+      <li><strong>汇编器/反汇编器</strong>：新增 LSX、LASX、LVZ 和 LBT ISA 扩展支持</li>
+      <li><strong>ABI</strong>：<code>lp64s</code> ABI 现已支持（已通过 Rust bare-metal 目标测试）</li>
+      <li><strong>代码模型</strong>：新增 <code>large</code> 代码模型支持，等同于 GCC 的 <code>extreme</code></li>
+      <li><strong>unaligned access</strong>：引入 <code>ual</code> 目标特性，允许非对齐内存访问（generic 64-bit 处理器默认启用）</li>
+      <li><strong>函数入口补丁</strong>：<code>-fpatchable-function-entry</code> 在 LoongArch 上已支持</li>
+      <li><strong>Sanitizer</strong>：MSan、DFsan、Profile、XRay、libFuzzer 已移植到 LoongArch</li>
+      <li><strong>llvm-objcopy</strong>：现已支持处理 LoongArch 目标文件</li>
+    </ul>
+
+    <h4>12.2 Arm Cortex-M Security Extensions (CMSE)</h4>
+    <p>LLD 17 实现了 <strong>Arm Cortex-M Security Extensions</strong>，支持 Armv8-M 架构的 TrustZone 安全扩展所需的链接器功能，包括 secure gateway (SG) 指令和 secure/non-secure 函数调用的特殊处理。</p>
+    <div class="example-box">
+      <div class="ex-label">CMSE 安全/非安全调用</div>
+      <pre class="cb"><span class="c">// Armv8-M CMSE: secure gateway</span>
+<span class="k">__attribute__</span>((cmse_nonsecure_entry))
+<span class="k">void</span> secure_function(<span class="k">void</span>) {
+  <span class="c">// 从 non-secure 世界调用的安全函数</span>
+  <span class="c">// LLVM 17 的 LLD 正确生成 SG 桩代码</span>
+}
+<span class="c">// LLD 17 正确处理 secure/non-secure 重定位</span>
+<span class="c">// 并生成正确的导入/导出表</span></pre>
+    </div>
+
+    <h4>12.3 x86-64 大数据段布局优化</h4>
+    <p>LLD 17 将 <strong>x86-64 large data sections</strong> 放置到远离代码段的位置，缓解重定位溢出压力。在处理大型二进制文件时，32 位相对重定位可能溢出；将大数据段移到远离代码段的位置可以减少此类问题。</p>
+
+    <h4>12.4 AArch32 BE-8 / BE-32 大端模式</h4>
+    <p>LLD 17 的 AArch32 端口现在支持 <strong>BE-8</strong>（字节不变大端）和 <strong>BE-32</strong>（字不变大端）两种大端模式，支持 <code>R_ARM_THM_ALU_ABS_G*</code> 重定位。</p>
+
+    <h4>12.5 RISC-V 全局指针（GP）松弛</h4>
+    <p>LLD 17 实现了 <strong>RISC-V 全局指针松弛</strong>优化。通过 <code class="inline-code">--relax-gp</code> 选项启用链接器松弛，利用 gp 寄存器缩短全局数据的访问指令序列，减少代码大小和提升性能。同时新增 <code>R_RISCV_PLT32</code> 重定位支持 C++ relative vtables，以及 <code>PT_RISCV_ATTRIBUTES</code> 程序头部。</p>
+    <div class="example-box">
+      <div class="ex-label">RISC-V GP 松弛</div>
+      <pre class="cb"><span class="c"># 启用 RISC-V 全局指针松弛</span>
+ld.lld --relax-gp -o output input.o
+
+<span class="c"># RISC-V GP 松弛说明:</span>
+<span class="c"># 正常: lui + lw (两条指令, 8 bytes)</span>
+<span class="c"># GP松弛后: lw gp, offset (一条指令, 4 bytes)</span>
+<span class="c"># 前提: 数据在 gp +/- 2KB 范围内</span></pre>
+    </div>
   </div>
 </section>
+<section id="lld" class="section">
+  <div class="section-header"><span class="num">13</span><h2>LLD 链接器新选项与功能</h2><span class="h2-tag">ELF · COFF · MinGW</span></div>
+  <div class="section-body">
+    <p>LLD 17 带来了大量新选项和功能增强。</p>
 
-<!-- ══════════════════════════════════════════════════════
-     MIGRATION CHECKLIST
-     ══════════════════════════════════════════════════════ -->
-<section class="section">
-  <div class="section-header">
-    <span class="num">✓</span>
-    <h2>LLVM 17 升级检查清单</h2>
-    <span class="h2-tag">Checklist</span>
+    <h4>13.1 --remap-inputs 和 --remap-inputs-file</h4>
+    <p>新增输入文件重映射功能。可以动态替换输入文件的路径，适合在构建系统需要根据平台/配置切换输入文件时使用，无需修改链接命令本身。</p>
+    <div class="example-box">
+      <div class="ex-label">--remap-inputs 用法</div>
+      <pre class="cb"><span class="c"># 将 old.o 替换为 new.o</span>
+ld.lld --remap-inputs=old.o=new.o ...
+<span class="c"># 等效的批量文件模式:</span>
+ld.lld --remap-inputs-file=remap.txt ...
+<span class="c"># remap.txt 内容格式:</span>
+<span class="c">#   old1.o new1.o</span>
+<span class="c">#   old2.o new2.o</span></pre>
+    </div>
+
+    <h4>13.2 --lto-CGO[0-3]</h4>
+    <p>新增 <code class="inline-code">--lto-CGO[0-3]</code> 选项，允许<strong>独立于 LTO 优化级别</strong>来控制 <code>CodeGenOpt::Level</code>。此前 LTO 优化级别和代码生成优化级别绑定在一起；现在可以分别控制（如 LTO 用 O2 优化，但 CodeGen 用 O3）。</p>
+    <div class="example-box">
+      <div class="ex-label">--lto-CGO 用法</div>
+      <pre class="cb"><span class="c"># LTO 优化级别 O2, CodeGen 优化级别 O3</span>
+ld.lld --lto=thin --lto-O2 --lto-CGO3 ...
+<span class="c"># LTO 优化级别 O1, CodeGen 优化级别 O0 (快速调试)</span>
+ld.lld --lto=thin --lto-O1 --lto-CGO0 ...</pre>
+    </div>
+
+    <h4>13.3 --check-dynamic-relocations</h4>
+    <p>修复了 32 位目标上 <code class="inline-code">--check-dynamic-relocations</code> 选项在 addend 大于 <code>0x80000000</code> 时的正确性。此选项用于验证动态重定位中的 addend 值是否在合法范围内。</p>
+
+    <h4>13.4 --print-memory-usage</h4>
+    <p>实现了内存区域（memory regions）的 <code class="inline-code">--print-memory-usage</code>，可以按内存区域打印链接后的内存使用统计。</p>
+    <div class="example-box">
+      <div class="ex-label">--print-memory-usage 输出示例</div>
+      <pre class="cb"><span class="c"># LD 链接时启用内存使用报告</span>
+ld.lld --print-memory-usage -o output ...
+<span class="c"># 输出示例:</span>
+<span class="c"># Memory region         Used Size  Region Size  %age Used</span>
+<span class="c">#             RAM:        12 KB       256 KB      4.69%</span>
+<span class="c">#           FLASH:        48 KB       512 KB      9.38%</span></pre>
+    </div>
+
+    <h4>13.5 REVERSE 与链接脚本增强</h4>
+    <p>LLD 17 新增多项链接脚本功能：</p>
+    <div class="example-box">
+      <div class="ex-label">REVERSE 与链接脚本增强</div>
+      <pre class="cb"><span class="c">/* REVERSE: 反转输入段的顺序 */</span>
+SECTIONS {
+  .text : { *(.text) }
+  .rodata : { <span class="g">REVERSE</span>(*(.rodata)) }
+  <span class="c">/* .rodata 中的输入段按反转顺序排列 */</span>
+}
+
+<span class="c">/* MEMORY 可不带 SECTIONS 使用 */</span>
+MEMORY { ROM (rx) : ORIGIN = 0, LENGTH = 256K }
+<span class="c">/* LLVM 17: 无需 SECTIONS 命令即可定义内存区域 */</span>
+
+<span class="c">/* 输出段名现在支持引号 */</span>
+SECTIONS {
+  <span class="s">"my section"</span> : { *(.data) }
+}
+
+<span class="c">/* OVERLAY 中可使用程序头分配 (之前丢失的功能) */</span></pre>
+    </div>
+
+    <h4>13.6 LLD 线程数上限 16（默认行为变更）</h4>
+    <p>当未指定 <code>--threads=</code> 时，并行线程数上限被 cap 到 <strong>16</strong>。超过 16 线程在使用 glibc malloc 时会产生严重的锁竞争导致性能反而下降。显式指定超过 16 的值也会被 cap 并输出 warning。</p>
+    <div class="example-box">
+      <div class="ex-label">线程数 cap 行为</div>
+      <table><thead><tr><th>场景</th><th>LLVM 16</th><th>LLVM 17</th></tr></thead><tbody>
+        <tr><td>不指定 <code>--threads</code></td><td>全部 CPU 核心</td><td><code>min(CPU, 16)</code></td></tr>
+        <tr><td><code>--threads=8</code></td><td>8 线程</td><td>8 线程</td></tr>
+        <tr><td><code>--threads=32</code></td><td>32 线程</td><td>16 线程 + warning</td></tr>
+        <tr><td><code>--threads=1</code></td><td>单线程</td><td>单线程（确定性构建）</td></tr>
+      </tbody></table>
+    </div>
+
+    <h4>13.7 其他 LLD 亮点</h4>
+    <ul>
+      <li><strong>SHF_MERGE / ICF / build-id=fast</strong> 切换到 64-bit xxh3 哈希，性能提升</li>
+      <li><strong>LoongArch</strong>：LLD 现已支持 LoongArch 作为正式目标</li>
+      <li><strong>PowerPC64</strong>：<code>--no-power10-stubs</code> 现在生效；<code>DT_PPC64_OPT</code> 动态标签支持</li>
+      <li><strong>AVR</strong>：新增多个重定位类型支持</li>
+      <li><strong>COFF (lld-link)</strong>：支持相对路径库查找；新增 <code>-print-search-paths</code>；默认搜索 toolchain 目录</li>
+      <li><strong>MinGW</strong>：对过窄的运行时伪重定位发出警告，避免加载位置过远导致运行时错误</li>
+    </ul>
   </div>
+</section>
+<section id="other" class="section">
+  <div class="section-header"><span class="num">+</span><h2>其他值得关注的变更</h2><span class="h2-tag">C/C++ 语言 · 编译器标志 · 库</span></div>
+  <div class="section-body">
+
+    <h4>C/C++ 语言变更</h4>
+    <table><thead><tr><th style="width:22%">类别</th><th style="width:50%">变更</th><th style="width:28%">影响</th></tr></thead><tbody>
+      <tr><td><strong>C 语言: _Generic</strong></td><td>新增类型操作数扩展。第一个操作数可以是类型而非表达式，类型不经历转换。</td><td>可匹配限定类型、不完整类型、函数/数组类型。</td></tr>
+      <tr><td><strong>C 语言: const 结构体</strong></td><td><code>struct</code>、<code>union</code>、<code>const</code> 数组现在可作为常量表达式。</td><td>与 GCC 行为一致。</td></tr>
+      <tr><td><strong>C++: CTAD for aggregates</strong></td><td>实现 P1816R0 + P2082R1，聚合类型类模板实参推导。</td><td>C++20 聚合初始化可用 CTAD。</td></tr>
+      <tr><td><strong>C++23: static operator[]</strong></td><td>实现 P2589R1，下标运算符可为 static。</td><td>多维数组访问的新语法。</td></tr>
+      <tr><td><strong>C++23: if consteval</strong></td><td>C++23 <code>if consteval</code> 支持。</td><td>编译时条件判断更直观。</td></tr>
+      <tr><td><strong>C++23: constexpr 放松</strong></td><td>P2448R2 部分实现。显式默认函数只需 constexpr-suitable。</td><td>更多函数可为 constexpr。</td></tr>
+      <tr><td><strong>C++23: consteval 传播</strong></td><td>P2564R3: consteval 向上传播。</td><td>consteval 函数调用链更合理。</td></tr>
+      <tr><td><strong>C++2c 实验性</strong></td><td><code>-std=c++2c</code> / <code>-std=gnu++2c</code> 标志。constexpr cast from void*。user-generated static_assert messages。</td><td>提前体验 C++26 特性。</td></tr>
+      <tr><td><strong>CWG2521</strong></td><td>用户自定义字面量后缀中保留 <code>__</code>（-Wuser-defined-literals）。弃用带空格的声明（-Wdeprecated-literal-operator）。</td><td>字面量命名规范强化。</td></tr>
+      <tr><td><strong>CWG2397</strong></td><td>允许指向和引用数组的 <code>auto</code> 声明。</td><td>auto 用法更灵活。</td></tr>
+    </tbody></table>
+
+    <h4>编译器标志变更</h4>
+    <table><thead><tr><th style="width:22%">类别</th><th style="width:50%">变更</th><th style="width:28%">影响</th></tr></thead><tbody>
+      <tr><td><strong>新增</strong></td><td><code>-dumpdir</code> 指定辅助输出和 dump 文件路径（如 -gsplit-dwarf 用）</td><td>调试信息输出路径可控</td></tr>
+      <tr><td><strong>新增</strong></td><td><code>-fcaret-diagnostics-max-lines=N</code> 控制诊断代码行数（默认 16）</td><td>更好的诊断展示</td></tr>
+      <tr><td><strong>新增</strong></td><td><code>-fdiagnostics-show-line-numbers</code> 在诊断中显示行号左边距</td><td>默认启用</td></tr>
+      <tr><td><strong>新增</strong></td><td><code>-fkeep-persistent-storage-variables</code> 保留所有全局/静态/TLS 变量可寻址</td><td>增加重定位数量</td></tr>
+      <tr><td><strong>新增</strong></td><td><code>-f[no-]assume-unique-vtables</code> 控制 unique vtable 假设</td><td>影响 final dynamic_cast 优化</td></tr>
+      <tr><td><strong>新增</strong></td><td><code>-std=c++23</code> 作为 <code>-std=c++2b</code> 的正式名称</td><td>C++23 标准正式版本</td></tr>
+      <tr><td><strong>新增</strong></td><td><code>-p</code> GCC 兼容标志，类似 -pg 但用于 prof 工具</td><td>AIX/Linux prof 支持</td></tr>
+      <tr><td><strong>移除</strong></td><td><code>-fcoroutines-ts</code> 移除</td><td>使用标准 C++20 协程</td></tr>
+      <tr><td><strong>移除</strong></td><td><code>-fmodules-ts</code> 移除</td><td>使用标准 C++20 modules</td></tr>
+      <tr><td><strong>弃用</strong></td><td><code>-fdouble-square-bracket-attributes</code> 弃用，现被忽略</td><td>LLVM 18 将移除</td></tr>
+      <tr><td><strong>行为变更</strong></td><td><code>clang -g -gsplit-dwarf a.c -o obj/x</code> 的 .dwo 文件路径改为 <code>obj/x-a.dwo</code></td><td>不再是临时目录</td></tr>
+    </tbody></table>
+
+    <h4>libc++ 与工具链</h4>
+    <table><thead><tr><th style="width:22%">类别</th><th style="width:50%">变更</th><th style="width:28%">影响</th></tr></thead><tbody>
+      <tr><td><strong>libc++</strong></td><td><code>std::expected</code> (C++23)、<code>std::mdspan</code> (C++23)、<code>std::print</code> (C++23)、<code>std::ranges::to</code> 等新组件</td><td>标准库新增可用</td></tr>
+      <tr><td><strong>Resource Dir</strong></td><td>Resource 目录使用 major 版本号（如 <code>17</code>）而非完整版本号</td><td>工具链路径变化</td></tr>
+      <tr><td><strong>static_assert 诊断</strong></td><td>"static assertion failed" 现在指向表达式而非 <code>static_assert</code> 关键字</td><td>更好的定位</td></tr>
+      <tr><td><strong>-Wshadow</strong></td><td>现在也警告静态局部变量的遮蔽</td><td>更严格的作用域检查</td></tr>
+      <tr><td><strong>ABI 修复</strong></td><td>修复特殊成员函数资格评估 bug，某些类现在可能变为 trivially copyable</td><td>Issue #62555</td></tr>
+    </tbody></table>
+  </div>
+</section>
+<section class="section">
+  <div class="section-header"><span class="num">&#10003;</span><h2>LLVM 17 升级检查清单</h2><span class="h2-tag">Checklist</span></div>
   <div class="section-body">
 
     <h4>P0 · 必须处理（会导致编译失败或行为改变）</h4>
-    <table>
-      <thead><tr><th>#</th><th>检查项</th><th>说明</th><th>处理方式</th></tr></thead>
-      <tbody>
-        <tr>
-          <td>1</td>
-          <td>LLVM IR 生成/消费工具适配</td>
-          <td>Opaque pointers 强制，typed pointers API 移除</td>
-          <td>迁移到 <code>PointerType::get()</code>；更新 IR 文本处理脚本</td>
-        </tr>
-        <tr>
-          <td>2</td>
-          <td>C++ void* 解引用</td>
-          <td>从 warning-as-error 变为硬 error</td>
-          <td>替换为 <code>*(char*)p</code> 或使用具体类型指针</td>
-        </tr>
-        <tr>
-          <td>3</td>
-          <td>asm goto 间接边</td>
-          <td>同一 label 多个输入不再合并</td>
-          <td>检查驱动/固件中的 asm goto 用法</td>
-        </tr>
-        <tr>
-          <td>4</td>
-          <td>协程 traits 迁移</td>
-          <td><code>std::experimental::coroutine_traits</code> 不再搜索</td>
-          <td>迁移到 <code>std::coroutine_traits</code></td>
-        </tr>
-        <tr>
-          <td>5</td>
-          <td><code>-fcoroutines-ts</code> 移除</td>
-          <td>实验性协程选项不再支持</td>
-          <td>移除构建脚本中的该选项</td>
-        </tr>
-        <tr>
-          <td>6</td>
-          <td><code>-fmodules-ts</code> 移除</td>
-          <td>实验性模块选项不再支持</td>
-          <td>移除构建脚本中的该选项</td>
-        </tr>
-      </tbody>
-    </table>
+    <table><thead><tr><th>#</th><th>检查项</th><th>说明</th><th>处理方式</th></tr></thead><tbody>
+      <tr><td>1</td><td>LLVM IR 生成/消费工具适配</td><td>Opaque pointers 强制，typed pointers API 移除</td><td>迁移到 <code>PointerType::get()</code>；更新 IR 文本处理脚本</td></tr>
+      <tr><td>2</td><td>C++ void* 解引用</td><td>从 warning-as-error 变为硬 error</td><td>替换为 <code>*(char*)p</code> 或使用具体类型指针</td></tr>
+      <tr><td>3</td><td>asm goto 间接边</td><td>同一 label 多个输入不再合并</td><td>检查驱动/固件中的 asm goto 用法</td></tr>
+      <tr><td>4</td><td>协程 traits 迁移</td><td><code>std::experimental::coroutine_traits</code> 不再搜索</td><td>迁移到 <code>std::coroutine_traits</code></td></tr>
+      <tr><td>5</td><td><code>-fcoroutines-ts</code> / <code>-fmodules-ts</code> 移除</td><td>实验性选项不再支持</td><td>移除构建脚本中的该选项</td></tr>
+      <tr><td>6</td><td><code>inline namespace std</code></td><td>禁止声明</td><td>移除 <code>inline</code> 关键字</td></tr>
+      <tr><td>7</td><td>传统 Pass Manager 移除</td><td><code>PassManagerBuilder.h</code> 不再可用</td><td>迁移到新 Pass Manager API</td></tr>
+    </tbody></table>
 
     <h4>P1 · 建议检查（可能影响性能或行为）</h4>
-    <table>
-      <thead><tr><th>#</th><th>检查项</th><th>说明</th></tr></thead>
-      <tbody>
-        <tr>
-          <td>7</td>
-          <td>LLD --threads 参数</td>
-          <td>超过 16 的值会被 cap</td>
-        </tr>
-        <tr>
-          <td>8</td>
-          <td>static_assert(false) 用法</td>
-          <td>确认模板中的 static_assert(false) 行为符合预期</td>
-        </tr>
-        <tr>
-          <td>9</td>
-          <td>AArch64 GCS 汇编</td>
-          <td>如果目标硬件支持，可利用新指令</td>
-        </tr>
-        <tr>
-          <td>10</td>
-          <td>nofpclass 浮点属性</td>
-          <td>数值密集代码的性能可能有变化</td>
-        </tr>
-        <tr>
-          <td>11</td>
-          <td>Resource dir 路径变化</td>
-          <td>从完整版本号改为 major 版本号（17）</td>
-        </tr>
-      </tbody>
-    </table>
+    <table><thead><tr><th>#</th><th>检查项</th><th>说明</th></tr></thead><tbody>
+      <tr><td>8</td><td><code>__builtin_object_size</code> 与 FAM</td><td>指定初始化器中的 FAM 元素计入对象大小</td></tr>
+      <tr><td>9</td><td>LLD --threads 参数</td><td>超过 16 的值会被 cap</td></tr>
+      <tr><td>10</td><td>static_assert(false) 在模板中</td><td>确认行为符合预期，可简化旧 workaround</td></tr>
+      <tr><td>11</td><td>final 类型 dynamic_cast</td><td>确认优化不会因 vtable 非唯一而受影响</td></tr>
+      <tr><td>12</td><td>AArch64 GCS/CHK/ATS1A 汇编</td><td>如果目标硬件支持，可利用新指令</td></tr>
+      <tr><td>13</td><td>AArch64 preserve_all</td><td>如果使用此调用约定，确认不再崩溃</td></tr>
+      <tr><td>14</td><td>AArch64 .arch 指令</td><td>汇编代码中 .arch 的行为已修复</td></tr>
+      <tr><td>15</td><td>nofpclass 浮点属性</td><td>数值密集代码的性能可能有变化</td></tr>
+      <tr><td>16</td><td>LLD --remap-inputs / --lto-CGO</td><td>构建系统可利用新增的链接器选项</td></tr>
+      <tr><td>17</td><td>RISC-V --relax-gp</td><td>如果使用 RISC-V 且启用 GP 松弛，检查代码大小变化</td></tr>
+      <tr><td>18</td><td>LoongArch 工具链适配</td><td>如果使用龙芯平台，LLD 现已正式支持</td></tr>
+      <tr><td>19</td><td>Resource dir / libc++ 路径变化</td><td>major 版本号路径可能影响工具链配置</td></tr>
+    </tbody></table>
   </div>
 </section>
-
 </div><!-- /container -->
 
 <footer class="footer">

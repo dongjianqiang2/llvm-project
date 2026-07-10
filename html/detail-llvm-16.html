@@ -270,9 +270,16 @@ body {
   <!-- 概览 -->
   <div class="intro">
     <p>
-      LLVM 16.0.0 于 2023 年 3 月正式发布。相比 LLVM 15，本次大版本升级引入了多项编译
-      警告升级为错误、默认 C++ 标准切换、ABI 调整以及链接器性能优化等重要变更。本页面
-      逐项梳理关键差异，并给出代码示例与应对方案，辅助毕昇编译器用户平滑迁移。
+      LLVM 16.0.0 (2023 年 3 月) 相比 LLVM 15，引入了多项影响广泛的变更：
+      <strong>4 项 Warning 升级为 Error</strong>（隐式函数声明、隐式 int、不兼容函数指针、void* 解引用）、
+      <strong>默认 C++ 标准切换为 gnu++17</strong>、
+      <strong>2 项 ABI 调整</strong>（packed struct 非 POD 成员对齐、POD 判定规则）、
+      <strong>资源目录路径变更</strong>（仅含主版本号）、
+      <strong>MSan 参数/返回值检测默认启用</strong>、
+      <strong>LLD 并行化与多项新功能</strong>、
+      <strong>AArch64/x86 新 CPU 及 ISA 支持</strong>、
+      <strong>libc++ 多项废弃与移除</strong>。
+      本页面逐项梳理关键差异，附代码示例与应对方案，辅助毕昇编译器用户平滑迁移。
     </p>
   </div>
 
@@ -283,16 +290,16 @@ body {
       <div class="label">Warning 升级为 Error</div>
     </div>
     <div class="summary-card">
-      <div class="count" style="color:#e65100;">2</div>
+      <div class="count" style="color:#e65100;">5</div>
       <div class="label">行为变化 / ABI 调整</div>
     </div>
     <div class="summary-card">
-      <div class="count" style="color:#0d47a1;">1</div>
-      <div class="label">标志移除 / 清理</div>
+      <div class="count" style="color:#0d47a1;">6</div>
+      <div class="label">标志废弃 / 移除 / 清理</div>
     </div>
     <div class="summary-card">
-      <div class="count" style="color:#1b5e20;">2</div>
-      <div class="label">性能提升 / 正向变更</div>
+      <div class="count" style="color:#1b5e20;">10+</div>
+      <div class="label">新功能 / 性能提升 / 新硬件支持</div>
     </div>
   </div>
 
@@ -304,34 +311,29 @@ body {
       <span class="icon">&#x1F4DC;</span> 默认 C++ 标准升级为 gnu++17
       <span class="badge badge-bm">中影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #1 &middot; 编译器前端 &middot; Clang</div>
+    <div class="section-subtitle">变更 #1 &middot; 编译器前端 &middot; Clang (C++/ObjC++)</div>
 
     <p>
-      自 LLVM 16 起，Clang 的默认 C++ 标准从 <code>gnu++14</code> (C++14 + GNU 扩展)
-      升级为 <strong>gnu++17</strong> (C++17 + GNU 扩展)。这意味着未显式指定
-      <code>-std=</code> 标志的 C++ 代码将默认以 C++17 模式编译，可能暴露旧代码中
-      与 C++17 新特性冲突的写法。
+      自 LLVM 16 起，Clang 的默认 C++/ObjC++ 标准从 <code>gnu++14</code> (C++14 + GNU 扩展)
+      升级为 <strong>gnu++17</strong> (C++17 + GNU 扩展)。未显式指定 <code>-std=</code> 标志的
+      C++ 代码将默认以 C++17 模式编译，可能暴露旧代码中与 C++17 新特性冲突的写法。
     </p>
 
     <h3 style="margin-top:1.2rem; color:#0a2647; font-size:1.05rem;">潜在影响场景</h3>
     <ul style="padding-left:1.5rem; margin:0.5rem 0; color:#3a4a5a;">
-      <li><strong>if constexpr</strong> — 旧代码可能用 <code>if constexpr</code> 作为
-          变量名，升级后被解析为关键字导致编译失败。</li>
-      <li><strong>折叠表达式</strong> — C++17 引入的折叠表达式可能与宏展开产生冲突。</li>
-      <li><strong>结构化绑定</strong> — <code>auto [a, b] = ...</code> 语法在 C++14 模式
-          下是非法的，但在 C++17 下合法，改变了旧代码的含义。</li>
-      <li><strong>register 关键字移除</strong> — C++17 中 <code>register</code>
-          存储类说明符被移除，使用它会产生错误。</li>
-      <li><strong>noexcept 成为类型系统的一部分</strong> — 函数指针、虚函数等签名匹配
-          更严格。</li>
+      <li><strong>if constexpr</strong> — 旧代码可能用 <code>if constexpr</code> 作为变量名，升级后被解析为关键字。</li>
+      <li><strong>register 关键字</strong> — C++17 中 register 存储类说明符被移除，使用即报错。</li>
+      <li><strong>noexcept</strong> — 成为类型系统的一部分，函数指针与虚函数签名匹配更严格。</li>
+      <li><strong>折叠表达式</strong> — 与宏展开可能产生冲突。</li>
+      <li><strong>结构化绑定</strong> — <code>auto [a, b] = ...</code> 语义在 C++14/C++17 下不同。</li>
     </ul>
 
-    <!-- 示例 1: if constexpr -->
+    <!-- 示例: if constexpr -->
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> 问题代码（C++17 下编译失败）</div>
+      <div class="example-label"><span class="dot dot-before"></span> 问题代码 (C++17 下编译失败)</div>
       <div class="code-block"><span class="cmt">// 旧代码中 if constexpr 作为变量名</span>
 <span class="kw">void</span> <span class="fn">foo</span>() {
-    <span class="kw">int</span> if <span class="err">constexpr</span> = <span class="num">42</span>;  <span class="cmt">// C++17: "if" 是关键字，"constexpr" 紧随其后，非法</span>
+    <span class="kw">int</span> if <span class="err">constexpr</span> = <span class="num">42</span>;  <span class="cmt">// C++17: "if"是关键字, "constexpr"紧随其后, 非法</span>
     <span class="kw">return</span>;
 }</div>
     </div>
@@ -339,14 +341,14 @@ body {
     <div class="example-box">
       <div class="example-label"><span class="dot dot-after"></span> 修复后</div>
       <div class="code-block"><span class="kw">void</span> <span class="fn">foo</span>() {
-    <span class="kw">int</span> if_constexpr = <span class="num">42</span>;  <span class="cmt">// 重命名变量，避免成为关键字</span>
+    <span class="kw">int</span> if_constexpr = <span class="num">42</span>;  <span class="cmt">// 重命名变量</span>
     <span class="kw">return</span>;
 }</div>
     </div>
 
-    <!-- 示例 2: register -->
+    <!-- 示例: register -->
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> register 关键字（C++17 中非法）</div>
+      <div class="example-label"><span class="dot dot-before"></span> register 关键字 (C++17 中非法)</div>
       <div class="code-block"><span class="kw">void</span> <span class="fn">bar</span>() {
     <span class="kw">register</span> <span class="kw">int</span> x = <span class="num">1</span>;  <span class="cmt">// C++17: error: ISO C++17 does not allow 'register'</span>
 }</div>
@@ -359,27 +361,12 @@ body {
 }</div>
     </div>
 
-    <!-- 示例 3: 结构化绑定冲突 -->
-    <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> 结构化绑定 — 旧写法语义变化</div>
-      <div class="code-block"><span class="cmt">// C++14: auto [a, b] 可能被解析为逗号表达式加 lambda 捕获</span>
-<span class="cmt">// C++17: 被解析为结构化绑定声明</span>
-<span class="kw">auto</span> [x, y] = std::make_pair(<span class="num">1</span>, <span class="num">2</span>);  <span class="cmt">// C++17 下合法，但 C++14 不合法</span></div>
-    </div>
-
-    <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 明确意图</div>
-      <div class="code-block"><span class="kw">auto</span> p = std::make_pair(<span class="num">1</span>, <span class="num">2</span>);
-<span class="kw">auto</span> x = p.first;
-<span class="kw">auto</span> y = p.second;  <span class="cmt">// 显式展开，兼容所有 C++ 标准</span></div>
-    </div>
-
     <div class="alert alert-co-a">
       <strong>&#x26A0; 应对措施</strong>
       若项目尚未准备好迁移到 C++17，请显式添加编译选项：
       <code style="background:#ffe0b2; padding:2px 6px; border-radius:3px;">-std=gnu++14</code>
       或 <code style="background:#ffe0b2; padding:2px 6px; border-radius:3px;">-std=c++14</code>。
-      建议尽早完成 C++17 适配，以获得更好的语言特性和性能。
+      建议尽早完成 C++17 适配以获得更好的语言特性与性能。
     </div>
   </div>
 
@@ -391,21 +378,20 @@ body {
       <span class="icon">&#x26D4;</span> -Wimplicit-function-declaration 升级为 Error
       <span class="badge badge-bh">高影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #2 &middot; C 语言前端 &middot; Clang</div>
+    <div class="section-subtitle">变更 #2 &middot; C 语言前端 &middot; Clang</div>
 
     <p>
-      在 C99 及之后的标准中，隐式函数声明早已被移除。但在 LLVM 15 及之前版本中，
-      调用未声明的函数仅为 Warning；从 <strong>LLVM 16 起，该诊断升级为 Error</strong>，
-      直接导致编译失败。这项变更对历史悠久的 C 代码库影响最大。
+      在 C99 及之后的标准中，隐式函数声明 (implicit function declaration) 早已被移除。LLVM 15 及以前调用
+      未声明函数仅为 Warning；从 <strong>LLVM 16 起，该诊断升级为 Error</strong>，直接导致编译失败。
+      对历史悠久的 C 代码库影响最大。在 C2x 模式下，隐式函数声明被彻底删除，该警告选项不再生效。
     </p>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: 仅 Warning（编译通过）</div>
-      <div class="code-block"><span class="cmt">/* legacy.c — LLVM 15 仅警告，LLVM 16 报错 */</span>
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: 仅 Warning (编译通过)</div>
+      <div class="code-block"><span class="cmt">/* legacy.c -- LLVM 15 仅警告, LLVM 16 报错 */</span>
 <span class="kw">void</span> <span class="fn">foo</span>() {
-    <span class="fn">bar</span>(<span class="num">42</span>);          <span class="cmt">// bar() 未声明，隐式假定返回 int</span>
+    <span class="fn">bar</span>(<span class="num">42</span>);          <span class="cmt">// bar() 未声明, 隐式假定返回 int</span>
 }
-
 <span class="kw">int</span> <span class="fn">main</span>() {
     <span class="fn">foo</span>();
     <span class="kw">return</span> <span class="num">0</span>;
@@ -413,7 +399,7 @@ body {
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> LLVM 16: Error — 编译失败</div>
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 16: Error -- 编译失败</div>
       <div class="code-block">$ clang -c legacy.c
 <span class="err">legacy.c:2:5: error: call to undeclared function 'bar';
   ISO C99 and later do not support implicit function declarations
@@ -423,20 +409,18 @@ body {
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 修复方式 A：添加函数声明</div>
-      <div class="code-block"><span class="cmt">/* legacy.c — 修复后 */</span>
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 A: 添加函数声明</div>
+      <div class="code-block"><span class="cmt">/* legacy.c -- 修复后 */</span>
 <span class="kw">void</span> <span class="fn">bar</span>(<span class="kw">int</span> x);   <span class="cmt">// 显式声明</span>
-
 <span class="kw">void</span> <span class="fn">foo</span>() {
     <span class="fn">bar</span>(<span class="num">42</span>);
 }</div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 修复方式 B：引入正确的头文件</div>
-      <div class="code-block"><span class="cmt">/* legacy.c — 修复后 */</span>
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 B: 引入正确的头文件</div>
+      <div class="code-block"><span class="cmt">/* legacy.c -- 修复后 */</span>
 <span class="kw">#include</span> <span class="str">&lt;other.h&gt;</span>   <span class="cmt">// bar() 在此头文件中声明</span>
-
 <span class="kw">void</span> <span class="fn">foo</span>() {
     <span class="fn">bar</span>(<span class="num">42</span>);
 }</div>
@@ -444,15 +428,12 @@ body {
 
     <div class="alert alert-co-r">
       <strong>&#x1F6A8; 应对措施</strong>
-      <strong>短期（紧急绕过）：</strong><br>
+      <strong>短期 (紧急绕过):</strong><br>
       添加编译选项
       <code style="background:#f5c6cb; padding:2px 6px; border-radius:3px;">-Wno-error=implicit-function-declaration</code>
       将 Error 降级回 Warning。<br><br>
-      <strong>长期（推荐）：</strong><br>
-      逐步为所有隐式调用添加函数声明或包含正确的头文件。可使用
-      <code>-Wimplicit-function-declaration</code> 配合
-      <code>-Wno-error=implicit-function-declaration</code>
-      先生成完整 Warning 清单，再逐项修复。
+      <strong>长期 (推荐):</strong><br>
+      逐步为所有隐式调用添加函数声明或包含正确的头文件。建议 configure 脚本在设置此选项前后验证结果一致性。
     </div>
   </div>
 
@@ -464,28 +445,27 @@ body {
       <span class="icon">&#x26D4;</span> -Wimplicit-int 升级为 Error
       <span class="badge badge-bh">高影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #3 &middot; C 语言前端 &middot; Clang</div>
+    <div class="section-subtitle">变更 #3 &middot; C 语言前端 &middot; Clang</div>
 
     <p>
-      在 K&amp;R C 及 C89 时代，允许省略类型说明符而默认为 <code>int</code>（如
-      <code>static flag = 1;</code> 等价于 <code>static int flag = 1;</code>）。
-      C99 标准已移除此特性。LLVM 16 将 <code>-Wimplicit-int</code> 从 Warning
-      升级为 <strong>Error</strong>。
+      在 K&amp;R C 及 C89 时代，允许省略类型说明符而默认为 <code>int</code> (如 <code>static flag = 1;</code>
+      等价于 <code>static int flag = 1;</code>)。C99 标准已移除此特性。LLVM 16 将 <code>-Wimplicit-int</code>
+      从 Warning 升级为 <strong>Error</strong>。在 C89 模式下指定 <code>-Wimplicit-int</code> 现在也会产生警告
+      (此前为 noop)。
     </p>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: Warning（编译通过）</div>
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: Warning (编译通过)</div>
       <div class="code-block"><span class="cmt">/* legacy.c */</span>
-<span class="kw">static</span> flag = <span class="num">1</span>;               <span class="cmt">// 省略 int，C89 风格</span>
+<span class="kw">static</span> flag = <span class="num">1</span>;               <span class="cmt">// 省略 int, C89 风格</span>
 <span class="kw">const</span> MAX_SIZE = <span class="num">1024</span>;         <span class="cmt">// 省略 int</span>
-
 <span class="kw">int</span> <span class="fn">main</span>() {
     <span class="kw">return</span> flag;
 }</div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> LLVM 16: Error — 编译失败</div>
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 16: Error -- 编译失败</div>
       <div class="code-block">$ clang -c legacy.c
 <span class="err">legacy.c:1:8: error: type specifier missing, defaults to 'int';
   ISO C99 and later do not support implicit int [-Wimplicit-int]</span>
@@ -500,7 +480,6 @@ body {
       <div class="example-label"><span class="dot dot-after"></span> 修复后</div>
       <div class="code-block"><span class="kw">static</span> <span class="kw">int</span> flag = <span class="num">1</span>;          <span class="cmt">// 显式补充 int 类型</span>
 <span class="kw">const</span> <span class="kw">int</span> MAX_SIZE = <span class="num">1024</span>;    <span class="cmt">// 显式补充 int 类型</span>
-
 <span class="kw">int</span> <span class="fn">main</span>() {
     <span class="kw">return</span> flag;
 }</div>
@@ -508,11 +487,11 @@ body {
 
     <div class="alert alert-co-r">
       <strong>&#x1F6A8; 应对措施</strong>
-      <strong>短期绕过：</strong>
+      <strong>短期绕过:</strong>
       <code style="background:#f5c6cb; padding:2px 6px; border-radius:3px;">-Wno-error=implicit-int</code><br><br>
-      <strong>长期修复：</strong>
-      为所有省略类型的声明显式添加 <code>int</code> 类型说明符。大多数情况下，
-      这是机械性的修复 — 在变量/函数声明前补上 <code>int</code> 即可。
+      <strong>长期修复:</strong>
+      为所有省略类型的声明补充 <code>int</code> 类型说明符，大多数情况下是机械性修复。
+      建议 configure 脚本验证设置此选项前后的结果一致性。
     </div>
   </div>
 
@@ -524,28 +503,26 @@ body {
       <span class="icon">&#x26D4;</span> -Wincompatible-function-pointer-types 升级为 Error
       <span class="badge badge-bh">高影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #4 &middot; C 语言前端 &middot; Clang</div>
+    <div class="section-subtitle">变更 #4 &middot; C 语言前端 &middot; Clang</div>
 
     <p>
-      当函数指针赋值或传递时，如果目标类型与源类型不兼容（如参数类型不匹配、
-      返回类型不一致），LLVM 16 从 Warning 升级为 <strong>Error</strong>。
-      这在回调函数、插件系统、动态加载等场景中尤为常见。
+      当函数指针赋值或传递时，如果目标类型与源类型不兼容 (如参数类型不匹配、返回类型不一致)，
+      LLVM 16 在所有 C 语言模式中从 Warning 升级为 <strong>Error</strong>。
+      在回调函数、插件系统、dlsym 动态加载等场景中尤为常见。
     </p>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: Warning（编译通过）</div>
-      <div class="code-block"><span class="cmt">/* 函数指针类型不兼容 — LLVM 15 仅警告 */</span>
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: Warning (编译通过)</div>
+      <div class="code-block"><span class="cmt">/* 函数指针类型不兼容 -- LLVM 15 仅警告 */</span>
 <span class="kw">typedef</span> <span class="kw">void</span> (*callback_t)(<span class="kw">int</span>);
-
 <span class="kw">void</span> <span class="fn">my_handler</span>(<span class="kw">long</span> x) { <span class="cmt">/* ... */</span> }
-
 <span class="kw">void</span> <span class="fn">register_cb</span>() {
     callback_t cb = my_handler;  <span class="cmt">// 参数类型不兼容: int vs long</span>
 }</div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> LLVM 16: Error — 编译失败</div>
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 16: Error -- 编译失败</div>
       <div class="code-block">$ clang -c callback.c
 <span class="err">callback.c:6:20: error: incompatible function pointer types
   assigning to 'callback_t' (aka 'void (*)(int)') from
@@ -555,27 +532,23 @@ body {
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> void* 与函数指针混用</div>
-      <div class="code-block"><span class="cmt">/* 常见于 dlsym / GetProcAddress 场景 */</span>
-<span class="kw">typedef</span> <span class="kw">int</span> (*fn_t)(<span class="kw">int</span>);
-
+      <div class="example-label"><span class="dot dot-before"></span> void* 与函数指针混用 (常见于 dlsym 场景)</div>
+      <div class="code-block"><span class="kw">typedef</span> <span class="kw">int</span> (*fn_t)(<span class="kw">int</span>);
 <span class="kw">void</span>* ptr = <span class="fn">dlsym</span>(handle, <span class="str">"my_func"</span>);
 fn_t fn = ptr;  <span class="cmt">// LLVM 16: error: void* 赋值给函数指针</span></div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 修复方式 A：显式类型转换</div>
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 A: 显式类型转换</div>
       <div class="code-block"><span class="kw">typedef</span> <span class="kw">int</span> (*fn_t)(<span class="kw">int</span>);
 <span class="kw">void</span>* ptr = <span class="fn">dlsym</span>(handle, <span class="str">"my_func"</span>);
-fn_t fn = (fn_t)ptr;  <span class="cmt">// 显式转换，明确意图</span></div>
+fn_t fn = (fn_t)ptr;  <span class="cmt">// 显式转换, 明确意图</span></div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 修复方式 B：修正函数签名</div>
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 B: 修正函数签名</div>
       <div class="code-block"><span class="kw">typedef</span> <span class="kw">void</span> (*callback_t)(<span class="kw">int</span>);
-
-<span class="kw">void</span> <span class="fn">my_handler</span>(<span class="kw">int</span> x) { <span class="cmt">/* ... */</span> }  <span class="cmt">// 修正为匹配回调签名的 int</span>
-
+<span class="kw">void</span> <span class="fn">my_handler</span>(<span class="kw">int</span> x) { <span class="cmt">/* ... */</span> }  <span class="cmt">// 修正为 int, 匹配回调签名</span>
 <span class="kw">void</span> <span class="fn">register_cb</span>() {
     callback_t cb = my_handler;  <span class="cmt">// 类型完全匹配</span>
 }</div>
@@ -583,13 +556,12 @@ fn_t fn = (fn_t)ptr;  <span class="cmt">// 显式转换，明确意图</span></d
 
     <div class="alert alert-co-r">
       <strong>&#x1F6A8; 应对措施</strong>
-      <strong>短期绕过：</strong>
+      <strong>短期绕过:</strong>
       <code style="background:#f5c6cb; padding:2px 6px; border-radius:3px;">-Wno-error=incompatible-function-pointer-types</code><br><br>
-      <strong>长期修复：</strong>
-      逐个审查不兼容的函数指针赋值，选择以下方案之一：<br>
-      1) 修正函数签名，使其与目标指针类型匹配；<br>
-      2) 使用显式类型转换（cast），明确表明这是有意为之；<br>
-      3) 重构 API 使用更通用的回调签&#x53F7;（如 <code>void (*)(void*)</code>）。
+      <strong>长期修复:</strong>
+      逐个审查不兼容的函数指针赋值：1) 修正函数签名以匹配目标指针类型；
+      2) 使用显式类型转换 (cast) 表明有意为之；
+      3) 重构 API 使用通用回调签名 (如 <code>void (*)(void*)</code>)。
     </div>
   </div>
 
@@ -598,42 +570,34 @@ fn_t fn = (fn_t)ptr;  <span class="cmt">// 显式转换，明确意图</span></d
   <!-- ================================================================== -->
   <div class="section" id="void-ptr-deref">
     <div class="section-title">
-      <span class="icon">&#x26D4;</span> void* 间接访问（C++）升级为 Error
+      <span class="icon">&#x26D4;</span> void* 间接访问 (C++) 升级为 Error
       <span class="badge badge-bm">中影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #5 &middot; C++ 前端 &middot; Clang</div>
+    <div class="section-subtitle">变更 #5 &middot; C++ 前端 &middot; Clang</div>
 
     <p>
-      在 C++ 中，对 <code>void*</code> 指针进行解引用（dereference）在语义上是非法的
-      — 因为 <code>void</code> 类型没有大小，编译器无法确定读取多少字节。LLVM 16 将
-      此诊断从 Warning/ExtWarn 升级为不可绕过的 <strong>硬 Error</strong>。
+      在 C++ 中，对 <code>void*</code> 指针进行解引用 (dereference) 在语义上是非法的 --
+      因为 <code>void</code> 类型没有大小。LLVM 16 将此诊断从 Warning/ExtWarn 升级为
+      <strong>硬 Error</strong>, 且是 SFINAE 错误 (与其他编译器行为一致)。
     </p>
 
     <div class="example-box">
       <div class="example-label"><span class="dot dot-before"></span> C++ 区域中 void* 解引用</div>
-      <div class="code-block"><span class="cmt">// C++ 代码：对 void* 解引用</span>
+      <div class="code-block"><span class="cmt">// C++ 代码: 对 void* 解引用</span>
 <span class="kw">void</span>* ptr = get_buffer();
-<span class="kw">int</span> value = *(ptr);     <span class="cmt">// LLVM 16: error: 不能解引用 void*</span>
-<span class="kw">int</span> value2 = ptr[<span class="num">0</span>];  <span class="cmt">// 同样错误：下标操作等价于 *(ptr+0)</span></div>
+<span class="kw">int</span> value = *(ptr);     <span class="cmt">// LLVM 16: error: 'void *' is not a pointer-to-object type</span>
+<span class="kw">int</span> value2 = ptr[<span class="num">0</span>];  <span class="cmt">// 同样错误: 下标操作等价于 *(ptr+0)</span></div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> LLVM 16 编译错误</div>
-      <div class="code-block">$ clang++ -c deref.cpp -std=c++17
-<span class="err">deref.cpp:3:15: error: 'void *' is not a pointer-to-object type</span>
-    <span class="kw">int</span> value = *(ptr);
-              ^</div>
-    </div>
-
-    <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 修复方式 A：先转型为具体类型再解引用</div>
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 A: 先转型再解引用</div>
       <div class="code-block"><span class="kw">void</span>* ptr = get_buffer();
 <span class="kw">int</span> value = *<span class="kw">static_cast</span>&lt;<span class="kw">int</span>*&gt;(ptr);    <span class="cmt">// 先转为 int* 再解引用</span>
 <span class="kw">int</span> value2 = <span class="kw">static_cast</span>&lt;<span class="kw">int</span>*&gt;(ptr)[<span class="num">0</span>]; <span class="cmt">// 转为 int* 再下标</span></div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 修复方式 B：使用 memcpy 读取（类型无关）</div>
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 B: 使用 memcpy 读取 (类型无关)</div>
       <div class="code-block"><span class="kw">void</span>* ptr = get_buffer();
 <span class="kw">int</span> value;
 <span class="fn">memcpy</span>(&amp;value, ptr, <span class="kw">sizeof</span>(value));  <span class="cmt">// 安全地从 void* 复制数据</span></div>
@@ -641,58 +605,147 @@ fn_t fn = (fn_t)ptr;  <span class="cmt">// 显式转换，明确意图</span></d
 
     <div class="alert alert-co-a">
       <strong>&#x26A0; 应对措施</strong>
-      这类错误通常意味着代码原本就有类型安全隐患。<br>
-      <strong>推荐修复：</strong>使用 <code>static_cast</code> 将 <code>void*</code>
-      转换为具体的对象指针类型后再解引用。如不确定目标类型，使用
-      <code>memcpy</code> 按字节数安全读取。<br>
-      <strong>注意：</strong>此变更为硬 Error，无法通过 <code>-Wno-error=</code> 降级。
+      此变更为硬 Error, 无法通过 <code>-Wno-error=</code> 降级。<br>
+      推荐使用 <code>static_cast</code> 将 <code>void*</code> 转换为具体对象指针类型后再解引用。
+      如不确定目标类型, 使用 <code>memcpy</code> 按字节数安全读取。
     </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- 6. packed struct ABI 变化 -->
+  <!-- 6. 资源目录路径变更 -->
+  <!-- ================================================================== -->
+  <div class="section" id="resource-dir">
+    <div class="section-title">
+      <span class="icon">&#x1F4C1;</span> 资源目录路径变更 (仅含主版本号)
+      <span class="badge badge-bl">低影响</span>
+    </div>
+    <div class="section-subtitle">变更 #6 &middot; 构建/部署 &middot; Clang</div>
+
+    <p>
+      Clang 的资源目录 (resource directory) 路径此前包含完整的版本号 (如 <code>16.0.0</code>)。
+      从 LLVM 16 起，路径中<strong>仅包含主版本号</strong> (major version)。
+      新路径格式为 <code>$prefix/lib/clang/$CLANG_MAJOR_VERSION</code>。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> 旧路径 vs 新路径对比</div>
+      <div class="code-block"><span class="cmt"># LLVM 15 及之前: 完整版本号</span>
+/usr/lib/clang/15.0.7/include/stddef.h
+/usr/lib/clang/15.0.7/lib/linux/libclang_rt.builtins-x86_64.a
+
+<span class="cmt"># LLVM 16 起: 仅主版本号</span>
+/usr/lib/clang/<span class="num">16</span>/include/stddef.h
+/usr/lib/clang/<span class="num">16</span>/lib/linux/libclang_rt.builtins-x86_64.a</div>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> 查询资源目录</div>
+      <div class="code-block">$ clang -print-resource-dir
+/usr/lib/clang/<span class="num">16</span></div>
+    </div>
+
+    <div class="alert alert-co-i">
+      <strong>&#x2139; 应对措施</strong>
+      如果你的构建脚本或工具链通过硬编码路径引用 Clang 资源目录 (如 <code>lib/clang/15.0.7/</code>),
+      需要更新为只含主版本号的路径 (如 <code>lib/clang/16/</code>)。
+      建议始终使用 <code>clang -print-resource-dir</code> 动态获取路径。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 7. __ppc64__ 不再定义 和 -p 标志拒绝 -->
+  <!-- ================================================================== -->
+  <div class="section" id="ppc64-p-flag">
+    <div class="section-title">
+      <span class="icon">&#x1F4DC;</span> __ppc64__ 移除 / -p 标志拒绝
+      <span class="badge badge-bl">低影响</span>
+    </div>
+    <div class="section-subtitle">变更 #7 &middot; 平台兼容性 &middot; Clang</div>
+
+    <p>
+      LLVM 16 为了与 GCC 保持一致，进行了以下两项平台相关的调整：
+    </p>
+
+    <h3 style="margin-top:1.2rem; color:#0a2647; font-size:1.05rem;">__ppc64__ 宏不再定义</h3>
+    <p>
+      在 PowerPC64 目标上，<code>__ppc64__</code> 不再被预定义。请改用 <code>__powerpc64__</code>。
+      这是为了与 GCC 行为对齐。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> 受影响的代码</div>
+      <div class="code-block"><span class="cmt">/* 编译目标: powerpc64-linux */</span>
+<span class="kw">#ifdef</span> __ppc64__
+<span class="kw">#error</span> <span class="str">"__ppc64__ is no longer defined in LLVM 16"</span>  <span class="cmt">// 不会触发!</span>
+<span class="kw">#endif</span>
+
+<span class="kw">#ifdef</span> __powerpc64__
+  <span class="cmt">// LLVM 16 中仍然定义, 请使用此宏</span>
+<span class="kw">#endif</span></div>
+    </div>
+
+    <h3 style="margin-top:1.2rem; color:#0a2647; font-size:1.05rem;">-p 标志仅限 AIX/OpenBSD</h3>
+    <p>
+      <code>-p</code> 标志 (生成 prof 性能分析代码) 现在<strong>仅在 AIX 或 OpenBSD 目标上被接受</strong>。
+      在其他目标上使用将被拒绝 (此前仅产生 unused argument 警告)。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> Linux 上使用 -p 标志</div>
+      <div class="code-block">$ clang -p hello.c -o hello
+<span class="err">clang: error: unsupported option '-p' for target 'x86_64-linux-gnu'</span></div>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式</div>
+      <div class="code-block"><span class="cmt"># Linux/x86_64 上使用 -pg 替代 -p</span>
+$ clang -pg hello.c -o hello
+
+<span class="cmt"># 或在 AIX/OpenBSD 上 -p 仍然可用</span>
+$ clang -p hello.c -o hello</div>
+    </div>
+
+    <div class="alert alert-co-i">
+      <strong>&#x2139; 应对措施</strong>
+      在非 AIX/OpenBSD 目标的构建系统中，将 <code>-p</code> 替换为 <code>-pg</code>。
+      将 PowerPC64 平台上的 <code>__ppc64__</code> 宏检查替换为 <code>__powerpc64__</code>。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 8. Packed struct ABI 变化 (非 POD 成员) -->
   <!-- ================================================================== -->
   <div class="section" id="packed-struct-abi">
     <div class="section-title">
-      <span class="icon">&#x1F4E6;</span> Packed Struct ABI 行为变化
+      <span class="icon">&#x1F4E6;</span> Packed Struct ABI 变化 (非 POD 成员对齐)
       <span class="badge badge-bm">中影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #6 &middot; ABI &middot; Clang</div>
+    <div class="section-subtitle">变更 #8 &middot; ABI &middot; Clang</div>
 
     <p>
-      LLVM 16 修改了带 <code>__attribute__((packed))</code> 属性的结构体中
-      <strong>非 POD 成员</strong>的对齐和布局行为。在 LLVM 15 中，某些 packed struct
-      中的非 POD 成员可能被赋予非预期的对齐；LLVM 16 修正了这一行为，
-      使其更严格地遵循 packed 语义。这可能导致 ABI 不兼容。
+      LLVM 16 修改了带 <code>__attribute__((packed))</code> 属性的结构体中<strong>非 POD 成员</strong>
+      的对齐和布局行为。GCC 不会打包 packed struct 中的非 POD 成员 (除非成员本身也标记 packed)。
+      Clang 现在与 GCC 行为对齐 (Darwin、PS4、AIX 除外)。这可能导致 ABI 不兼容。
     </p>
 
     <div class="example-box">
       <div class="example-label"><span class="dot dot-before"></span> 受影响的 packed struct 示例</div>
-      <div class="code-block"><span class="cmt">// 非 POD 类型</span>
+      <div class="code-block"><span class="cmt">// 非 POD 类型 (有用户定义构造函数)</span>
 <span class="kw">struct</span> NonPOD {
     <span class="kw">int</span> x;
-    NonPOD() : x(<span class="num">0</span>) {}      <span class="cmt">// 用户定义构造函数使其成为非 POD</span>
+    NonPOD() : x(<span class="num">0</span>) {}
 };
 
 <span class="kw">struct</span> <span class="kw">__attribute__</span>((packed)) Packed {
     <span class="kw">char</span>    c;
     <span class="kw">short</span>   s;
-    NonPOD  np;                    <span class="cmt">// 非 POD 成员 — LLVM 15/16 行为可能不同</span>
+    NonPOD  np;                    <span class="cmt">// 非 POD 成员 -- LLVM 15/16 行为可能不同</span>
     <span class="kw">int</span>     i;
 };</div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> ABI 差异示意图</div>
-      <div class="code-block"><span class="cmt">// LLVM 15: NonPOD 成员可能被赋予 4 字节对齐（即使外层 packed）</span>
-<span class="cmt">//   偏移: c[0]  s[1,2]  pad[3]  np.x[4..7]  i[8..11]  sizeof=12</span>
-
-<span class="cmt">// LLVM 16: NonPOD 成员也遵循 packed，按最小对齐</span>
-<span class="cmt">//   偏移: c[0]  s[1,2]  np.x[3..6]  i[7..10]  sizeof=11 (可能)</span></div>
-    </div>
-
-    <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 跨编译单元二进制兼容问题</div>
+      <div class="example-label"><span class="dot dot-before"></span> 跨编译单元二进制兼容问题</div>
       <div class="code-block"><span class="cmt">// TU1 (libfoo.so): 用 LLVM 15 编译</span>
 <span class="kw">struct</span> <span class="kw">__attribute__</span>((packed)) Packed {
     <span class="kw">char</span> c; <span class="kw">short</span> s; NonPOD np; <span class="kw">int</span> i;
@@ -702,163 +755,589 @@ fn_t fn = (fn_t)ptr;  <span class="cmt">// 显式转换，明确意图</span></d
 <span class="cmt">// TU2 (main): 用 LLVM 16 编译</span>
 <span class="fn">main</span>() {
     Packed p;                    <span class="cmt">// 按 LLVM 16 布局创建</span>
-    <span class="fn">process</span>(&amp;p);               <span class="cmt">// 传递给 LLVM 15 编译的代码 → 布局不一致!</span>
+    <span class="fn">process</span>(&amp;p);               <span class="cmt">// 传递给 LLVM 15 编译的代码 -> 布局不一致!</span>
 }</div>
     </div>
 
     <div class="alert alert-co-a">
       <strong>&#x26A0; 应对措施</strong>
-      <strong>兼容性开关：</strong><br>
-      添加
-      <code style="background:#ffe0b2; padding:2px 6px; border-radius:3px;">-fclang-abi-compat=15.0</code>
+      <strong>兼容性开关:</strong> 添加 <code style="background:#ffe0b2; padding:2px 6px; border-radius:3px;">-fclang-abi-compat=15.0</code>
       以保持与 LLVM 15 一致的 ABI 行为。<br><br>
-      <strong>最佳实践：</strong><br>
-      1) 避免在 packed struct 中放置非 POD 类型成员；<br>
-      2) 如确实需要，确保跨模块编译使用相同的 Clang 版本；<br>
-      3) 在 ABI 边界（共享库、插件接口）优先使用 C 语言接口。
+      <strong>最佳实践:</strong> 1) 避免在 packed struct 中放置非 POD 类型成员;
+      2) 如确实需要, 确保跨模块编译使用相同的 Clang 版本;
+      3) 在 ABI 边界优先使用 C 语言接口。
     </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- 7. LLD 链接器并行化 -->
+  <!-- 9. POD 判定规则 ABI 变化 -->
   <!-- ================================================================== -->
-  <div class="section" id="lld-parallel">
+  <div class="section" id="pod-abi">
     <div class="section-title">
-      <span class="icon">&#x26A1;</span> LLD 链接器并行化改进
-      <span class="badge badge-bg">正向变更</span>
+      <span class="icon">&#x1F4E6;</span> POD 类型判定规则 ABI 变化
+      <span class="badge badge-bm">中影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #7 &middot; 链接器 &middot; LLD (ELF)</div>
+    <div class="section-subtitle">变更 #9 &middot; ABI &middot; Clang (Itanium ABI)</div>
 
     <p>
-      LLVM 16 的 LLD 链接器在多个阶段实现了并行化处理，包括
-      <strong>输入段初始化</strong>（input section initialization）
-      和 <strong>重定位扫描</strong>（relocation scanning）。
-      这些改进显著降低了大型项目的链接时间。
+      GCC 允许拥有 defaulted (显式默认) 特殊成员函数的类型被视为 POD (用于 Itanium ABI)。
+      Clang 此前将此类类型归类为非 POD。LLVM 16 与 GCC 行为对齐
+      (Darwin、PS4、AIX、z/OS 除外)。这会影响 Itanium ABI 下结构体的传参方式。
     </p>
 
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> 受 POD 判定影响的结构体</div>
+      <div class="code-block"><span class="cmt">// LLVM 15: 视为 non-POD (使用栈传参)</span>
+<span class="cmt">// LLVM 16: 视为 POD (可能通过寄存器传参)</span>
+<span class="kw">struct</span> MyType {
+    <span class="kw">int</span> a;
+    <span class="kw">double</span> b;
+    MyType() = <span class="kw">default</span>;          <span class="cmt">// defaulted 构造函数</span>
+    ~MyType() = <span class="kw">default</span>;         <span class="cmt">// defaulted 析构函数</span>
+};
+
+<span class="kw">void</span> <span class="fn">func</span>(MyType t);  <span class="cmt">// LLVM 15 和 LLVM 16 可能使用不同传参方式</span></div>
+    </div>
+
+    <div class="alert alert-co-a">
+      <strong>&#x26A0; 应对措施</strong>
+      使用 <code style="background:#ffe0b2; padding:2px 6px; border-radius:3px;">-fclang-abi-compat=15.0</code>
+      恢复 LLVM 15 的 POD 判定行为。若跨模块使用不同编译器版本，注意传参 ABI 差异。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 10. enum constexpr 转换诊断 -->
+  <!-- ================================================================== -->
+  <div class="section" id="enum-constexpr">
+    <div class="section-title">
+      <span class="icon">&#x26A0;</span> enum constexpr 范围检查升级
+      <span class="badge badge-bm">中影响</span>
+    </div>
+    <div class="section-subtitle">变更 #10 &middot; C++ 前端 &middot; Clang</div>
+
+    <p>
+      LLVM 16 现在会正确诊断常量表达式中将没有固定底层类型的 enum 设置为超出枚举值范围的情况。
+      此前这是一个长期存在的 bug (与主要 C++ 实现一致的错误行为)。
+      该错误可通过 <code>-Wno-error=enum-constexpr-conversion</code> 降级为警告。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: 编译通过 (行为不一致)</div>
+      <div class="code-block"><span class="kw">enum</span> E { Zero, One, Two, Three, Four };
+<span class="kw">constexpr</span> E Val1 = (E)<span class="num">3</span>;   <span class="cmt">// Ok</span>
+<span class="kw">constexpr</span> E Val2 = (E)<span class="num">7</span>;   <span class="cmt">// Ok (最大值为 7, 即 4->8 范围的边界)</span>
+<span class="kw">constexpr</span> E Val3 = (E)<span class="num">8</span>;   <span class="cmt">// LLVM 16: error: 超出范围 [0, 7]</span>
+<span class="kw">constexpr</span> E Val4 = (E)-<span class="num">1</span>;  <span class="cmt">// LLVM 16: error: 超出范围 [0, 7]</span></div>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> 修复: 使用具有固定底层类型的 enum</div>
+      <div class="code-block"><span class="kw">enum</span> E : <span class="kw">int</span> { Zero, One, Two, Three, Four };  <span class="cmt">// 固定底层类型</span>
+<span class="kw">constexpr</span> E Val3 = (E)<span class="num">8</span>;   <span class="cmt">// OK: int 范围足够大</span>
+<span class="kw">constexpr</span> E Val4 = (E)-<span class="num">1</span>;  <span class="cmt">// OK</span></div>
+    </div>
+
+    <div class="alert alert-co-a">
+      <strong>&#x26A0; 应对措施</strong>
+      短期降级:
+      <code style="background:#ffe0b2; padding:2px 6px; border-radius:3px;">-Wno-error=enum-constexpr-conversion</code>。<br>
+      长期修复: 为需要宽范围值的 enum 添加固定底层类型 (如 <code>enum E : int</code>)。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 11. MSan 参数/返回值检测默认启用 -->
+  <!-- ================================================================== -->
+  <div class="section" id="msan-param-retval">
+    <div class="section-title">
+      <span class="icon">&#x1F9EA;</span> MSan 参数/返回值检测默认启用
+      <span class="badge badge-bm">中影响</span>
+    </div>
+    <div class="section-subtitle">变更 #11 &middot; Sanitizer &middot; Clang (MemorySanitizer)</div>
+
+    <p>
+      <code>-fsanitize-memory-param-retval</code> 现在是<strong>默认开启</strong>的。
+      当使用 <code>-fsanitize=memory</code> (MemorySanitizer) 时,
+      传递未初始化变量给函数以及从函数返回未初始化变量将被更加积极地报告。
+      使用 <code>-fno-sanitize-memory-param-retval</code> 可恢复旧行为。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 15: 可能不报告</div>
+      <div class="code-block"><span class="cmt">// 编译: clang -fsanitize=memory -g test.c</span>
+<span class="kw">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+<span class="kw">int</span> <span class="fn">helper</span>(<span class="kw">int</span> x) {
+    <span class="kw">return</span> x * <span class="num">2</span>;          <span class="cmt">// LLVM 15: 可能不报告 x 未初始化</span>
+}
+
+<span class="kw">int</span> <span class="fn">main</span>() {
+    <span class="kw">int</span> a;                 <span class="cmt">// 未初始化</span>
+    <span class="kw">return</span> <span class="fn">helper</span>(a);       <span class="cmt">// LLVM 16: 报 use-of-uninitialized-value</span>
+}</div>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> MSan 编译器检查的新行为</div>
+      <div class="code-block"><span class="cmt"># LLVM 16: -fsanitize-memory-param-retval 默认为 on</span>
+$ clang -fsanitize=memory -g test.c -o test
+$ ./test
+<span class="err">== WARNING: MemorySanitizer: use-of-uninitialized-value
+  #0 in helper test.c:4
+  #1 in main test.c:9</span>
+
+<span class="cmt"># 如需恢复 LLVM 15 行为:</span>
+$ clang -fno-sanitize-memory-param-retval -fsanitize=memory -g test.c</div>
+    </div>
+
+    <div class="alert alert-co-a">
+      <strong>&#x26A0; 应对措施</strong>
+      这是一项安全加固，帮助发现更多未初始化内存使用。如果造成大量误报 (如旧库 ABI 边界处),
+      可使用 <code style="background:#ffe0b2; padding:2px 6px; border-radius:3px;">-fno-sanitize-memory-param-retval</code> 暂时关闭。
+      建议修复代码中的未初始化变量问题。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 12. C2x 新特性与 C 语言变更 -->
+  <!-- ================================================================== -->
+  <div class="section" id="c2x-c-changes">
+    <div class="section-title">
+      <span class="icon">&#x1F4D0;</span> C2x 特性 / C 语言变更 / 已废弃标志
+      <span class="badge badge-bl">低影响</span>
+    </div>
+    <div class="section-subtitle">变更 #12 &middot; C 语言前端 &middot; Clang</div>
+
+    <h3 style="margin-top:0.8rem; color:#0a2647; font-size:1.05rem;">C2x 新增特性</h3>
+    <ul style="padding-left:1.5rem; margin:0.3rem 0 0.8rem; color:#3a4a5a;">
+      <li><strong>typeof / typeof_unqual 运算符</strong> (N2927/N2930): C2x 模式下支持
+        <code>typeof(expr)</code> 获取表达式类型, <code>typeof_unqual(expr)</code> 移除所有限定符。</li>
+      <li><strong>标签任意位置</strong> (N2508): 标签可放在复合语句中的任何位置。</li>
+      <li><strong>[[maybe_unused]] 用于标签</strong> (N2662): 可应用于标签以抑制 -Wunused-label 警告。</li>
+      <li><strong>va_start 放宽要求</strong> (N2975): C2x 模式下函数可声明为完全可变参数, va_start 不再需要第二参数。</li>
+    </ul>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">C 语言格式化警告调整</h3>
+    <p>
+      <code>-Wformat</code> 警告根据 WG14 N2562 调整, 考虑默认参数提升。
+      <code>int</code> 参数使用 <code>%hhd</code>/<code>%hd</code> 不再产生不必要的警告。
+    </p>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">已废弃的编译器标志</h3>
     <table class="info-table">
       <thead>
-        <tr>
-          <th>并行化阶段</th>
-          <th>说明</th>
-          <th>预期加速</th>
-        </tr>
+        <tr><th>标志</th><th>说明</th><th>移除版本</th></tr>
       </thead>
       <tbody>
         <tr>
-          <td>输入段初始化</td>
-          <td>多个 .o 文件的 Section 解析并行进行</td>
-          <td>中等项目快 10%-20%</td>
+          <td><code>-fcoroutines-ts</code></td>
+          <td>协程 TS 标志已废弃, 请使用 <code>-std=c++20</code> 或更高</td>
+          <td>Clang 17</td>
         </tr>
         <tr>
-          <td>重定位扫描</td>
-          <td>扫描和处理重定位条目并行化</td>
-          <td>大型项目快 15%-30%</td>
+          <td><code>-fmodules-ts</code></td>
+          <td>模块 TS 标志已废弃, 请使用 <code>-std=c++20</code> 或更高</td>
+          <td>Clang 17</td>
         </tr>
         <tr>
-          <td>字符串表合并</td>
-          <td>.strtab / .dynstr 合并优化</td>
-          <td>小幅但稳定提升</td>
+          <td><code>-enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang</code></td>
+          <td>请使用 <code>-ftrivial-auto-var-init=zero</code> (现已无条件可用)</td>
+          <td>Clang 18</td>
         </tr>
       </tbody>
     </table>
 
-    <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 使用示例（无需任何代码改动）</div>
-      <div class="code-block"><span class="cmt"># LLVM 16 中 LLD 链接速度自动提升，无需额外标志</span>
-$ clang -fuse-ld=lld -o myapp *.o
-<span class="cmt"># 同样的命令行，LLVM 16 的 LLD 链接明显更快</span>
-
-<span class="cmt"># 可通过环境变量控制并行度（通常自动管理）</span>
-$ <span class="kw">export</span> LLD_IN_TEST=<span class="num">2</span>  <span class="cmt"># 限制线程数用于测试</span></div>
-    </div>
-
-    <div class="alert alert-co-g">
-      <strong>&#x2705; 应对措施</strong>
-      这是一项<strong>透明优化</strong>，无需任何代码或构建系统改动即可自动受益。
-      链接阶段耗时越长（大型 C++ 项目、大量模板实例化），改善越显著。<br>
-      建议在 CI 中对比 LLVM 15 vs 16 的链接耗时，量化实际收益。
+    <div class="alert alert-co-i">
+      <strong>&#x2139; 应对措施</strong>
+      如果在构建脚本中使用上述已废弃标志, 请按表格中的替代方案更新。
+      C2x 特性仅在显式指定 <code>-std=c2x</code> 时启用, 不影响默认编译模式。
     </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- 8. 旧 Pass Manager 标志移除 -->
+  <!-- 13. 旧 Pass Manager 标志移除 -->
   <!-- ================================================================== -->
   <div class="section" id="old-pm-flags">
     <div class="section-title">
       <span class="icon">&#x1F5D1;</span> 旧 Pass Manager 相关标志移除
       <span class="badge badge-bl">低影响</span>
     </div>
-    <div class="section-subtitle">变更编号 #8 &middot; 优化框架 &middot; Clang / LLVM</div>
+    <div class="section-subtitle">变更 #13 &middot; 优化框架 &middot; Clang / LLVM</div>
 
     <p>
-      LLVM 的新 Pass Manager（New PM）自 LLVM 12 起已是默认选项。LLVM 15 仍保留了
-      旧 Pass Manager 的切换标志作为兼容过渡。LLVM 16 正式<strong>移除了这些已无效的标志</strong>，
-      包括 <code>-fexperimental-new-pass-manager</code> 等。
-    </p>
-
-    <p>
-      如果你的构建系统（Makefile / CMakeLists.txt / shell 脚本）仍在使用这些标志，
-      升级到 LLVM 16 后会收到 unknown argument 警告或错误。
+      LLVM 的新 Pass Manager (New PM) 自 LLVM 12 起已是默认。LLVM 16 正式<strong>移除了已无效的标志</strong>:
+      <code>-fexperimental-new-pass-manager</code> 和 <code>-fno-legacy-pass-manager</code>
+      (自 Clang 15 起已被静默忽略)。
     </p>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> 需要删除的标志（LLVM 16 不再识别）</div>
+      <div class="example-label"><span class="dot dot-before"></span> 需要删除的标志 (LLVM 16 不再识别)</div>
       <div class="code-block"><span class="cmt"># Makefile / CMakeLists.txt 中移除以下标志</span>
 -fexperimental-new-pass-manager         <span class="cmt"># 早已是默认选项</span>
 -fno-experimental-new-pass-manager      <span class="cmt"># 不再支持退回旧 PM</span>
--mllvm -enable-new-pm=<span class="num">1</span>               <span class="cmt"># LLVM 内部标志，已移除</span></div>
+-fno-legacy-pass-manager                <span class="cmt"># 不再需要</span>
+-mllvm -enable-new-pm=<span class="num">1</span>               <span class="cmt"># LLVM 内部标志, 已移除</span></div>
     </div>
 
     <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> 典型场景 — CMakeLists.txt</div>
+      <div class="example-label"><span class="dot dot-before"></span> 典型场景 -- CMakeLists.txt</div>
       <div class="code-block"><span class="cmt"># 旧 CMakeLists.txt (LLVM 15 可用)</span>
 <span class="fn">target_compile_options</span>(myapp PRIVATE
-    -fexperimental-new-pass-manager    <span class="cmt"># ← 删除此行</span>
+    -fexperimental-new-pass-manager    <span class="cmt"># &lt;-- 删除此行</span>
 )
-
 <span class="cmt"># LLVM 16 修复后</span>
 <span class="fn">target_compile_options</span>(myapp PRIVATE
-    -O2                               <span class="cmt"># New PM 已默认启用，无需显式指定</span>
+    -O2                               <span class="cmt"># New PM 已默认启用, 无需显式指定</span>
 )</div>
-    </div>
-
-    <div class="example-box">
-      <div class="example-label"><span class="dot dot-before"></span> 典型场景 — Makefile</div>
-      <div class="code-block"><span class="cmt"># 旧 Makefile</span>
-CXXFLAGS += -fexperimental-new-pass-manager     <span class="cmt"># ← 删除此行</span>
-CXXFLAGS += -mllvm -enable-new-pm=1               <span class="cmt"># ← 删除此行</span>
-
-<span class="cmt"># LLVM 16 — 直接删除后</span>
-CXXFLAGS += -O2 -Wall</div>
-    </div>
-
-    <div class="example-box">
-      <div class="example-label"><span class="dot dot-after"></span> 检查并清理脚本</div>
-      <div class="code-block"><span class="cmt">#!/bin/bash</span>
-<span class="cmt"># 扫描项目中残留的旧 Pass Manager 标志</span>
-<span class="fn">grep</span> -rn <span class="str">'fexperimental-new-pass-manager\|enable-new-pm'</span> \
-    CMakeLists.txt Makefile *.cmake *.mk <span class="num">2</span>>/dev/null
-
-<span class="cmt"># 输出示例（旧版）:</span>
-<span class="cmt"># CMakeLists.txt:15:   -fexperimental-new-pass-manager</span>
-
-<span class="cmt"># LLVM 16 修复后: 无输出 → 已清理干净</span></div>
     </div>
 
     <div class="alert alert-co-i">
       <strong>&#x2139; 应对措施</strong>
-      在项目的 Makefile、CMakeLists.txt 及构建脚本中搜索并<strong>直接删除</strong>
-      所有旧 Pass Manager 相关标志：<br>
-      <code style="background:#bbdefb; padding:2px 6px; border-radius:3px;">-fexperimental-new-pass-manager</code><br>
-      <code style="background:#bbdefb; padding:2px 6px; border-radius:3px;">-fno-experimental-new-pass-manager</code><br>
-      <code style="background:#bbdefb; padding:2px 6px; border-radius:3px;">-mllvm -enable-new-pm=0|1</code><br>
-      LLVM 16 的 New PM 已完全替代旧 PM，这些标志不再有任何作用。
+      在项目的 Makefile、CMakeLists.txt 及构建脚本中搜索并直接删除所有旧 Pass Manager 相关标志。
+      LLVM 16 的 New PM 已完全替代旧 PM, 这些标志不再有任何作用。
     </div>
   </div>
 
   <!-- ================================================================== -->
-  <!-- 附录：快速应对速查表 -->
+  <!-- 14. LLD 链接器变更 -->
+  <!-- ================================================================== -->
+  <div class="section" id="lld-changes">
+    <div class="section-title">
+      <span class="icon">&#x1F517;</span> LLD 链接器: 并行化与新功能
+      <span class="badge badge-bg">正向变更</span>
+    </div>
+    <div class="section-subtitle">变更 #14 &middot; 链接器 &middot; LLD (ELF / MinGW / COFF)</div>
+
+    <h3 style="margin-top:0.8rem; color:#0a2647; font-size:1.05rem;">ELF 链接器改进</h3>
+
+    <p><strong>链接速度大幅提升:</strong> 输入段初始化 (input section initialization) 和重定位扫描 (relocation scanning) 现已并行化, 大型项目链接时间显著缩短。</p>
+
+    <p style="margin-top:0.6rem;"><strong>新功能:</strong></p>
+    <ul style="padding-left:1.5rem; margin:0.3rem 0 0.8rem; color:#3a4a5a;">
+      <li><code>--no-warnings</code> / <code>-w</code> — 抑制链接器警告。</li>
+      <li><code>--compress-debug-sections=zstd</code> — 使用 Zstandard 压缩调试段 (ELFCOMPRESS_ZSTD)。同时支持读取 ZSTD 压缩的输入段。</li>
+      <li><code>--no-undefined-version</code> — <strong>现已成为默认行为</strong>。version script 中指定但无匹配符号的符号将被报告。使用 <code>--undefined-version</code> 恢复旧行为。</li>
+      <li><code>DT_STATIC_TLS</code> — AArch64/PPC32/PPC64 的 initial-exec TLS 模型在生成共享库时设置此标记。</li>
+      <li><code>-V</code> 现在是 <code>-v</code> 的别名 (支持 <code>gcc -fuse-ld=lld -v</code>)。</li>
+      <li><code>ELFCOMPRESS_ZSTD</code> 压缩输入段现已支持。</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> LLD 新选项使用示例</div>
+      <div class="code-block"><span class="cmt"># 使用 zstd 压缩调试信息</span>
+$ clang -fuse-ld=lld -Wl,--compress-debug-sections=zstd -g -o myapp *.o
+
+<span class="cmt"># 抑制链接器警告</span>
+$ clang -fuse-ld=lld -Wl,-w -o myapp *.o
+
+<span class="cmt"># --no-undefined-version 已是默认, 无需显式指定</span>
+<span class="cmt"># 如需恢复旧行为 (允许未定义 version):</span>
+$ clang -fuse-ld=lld -Wl,--undefined-version -o myapp *.o
+
+<span class="cmt"># LLD 链接速度自动提升, 无需额外标志</span>
+$ clang -fuse-ld=lld -o myapp *.o</div>
+    </div>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">MinGW 改进</h3>
+    <ul style="padding-left:1.5rem; margin:0.3rem 0 0.8rem; color:#3a4a5a;">
+      <li><code>--guard-cf</code> / <code>--no-guard-cf</code> — Control Flow Guard (控制流保护) 开关。启用 <code>--guard-cf</code> 也会启用 <code>--guard-longjmp</code> (除非显式指定 <code>--no-guard-longjmp</code>)。默认关闭。</li>
+      <li><code>--guard-longjmp</code> / <code>--no-guard-longjmp</code> — longjmp 强化保护。依赖 <code>--guard-cf</code>, 不可单独使用。</li>
+      <li>使用 <code>-l&lt;name&gt;</code> 链接时正确识别 <code>&lt;name&gt;.lib</code> 文件 (即使指定了 <code>-static</code>), 与 GNU ld 行为一致。</li>
+      <li>修复了 i386 MinGW 上 Rust 代码的 unwinding 问题。</li>
+    </ul>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">COFF 改进</h3>
+    <ul style="padding-left:1.5rem; margin:0.3rem 0 0.8rem; color:#3a4a5a;">
+      <li>PDB 类型哈希从 SHA1 切换为 BLAKE3 (<code>-gcodeview-ghash</code>)。</li>
+      <li>DLL OrdinalBase 从 0 改为 1 (与 MS link.exe 和 GNU ld 一致)。</li>
+      <li>改进 PCH.OBJ 文件处理, 与 MSVC link.exe 行为一致。</li>
+    </ul>
+
+    <div class="alert alert-co-a">
+      <strong>&#x26A0; Breaking Change 提醒</strong>
+      <code>--no-undefined-version</code> 已成为默认。如果 version script 引用了不存在的符号,
+      链接将失败。使用 <code>--undefined-version</code> 恢复旧行为。
+    </div>
+
+    <div class="alert alert-co-g">
+      <strong>&#x2705; 性能受益</strong>
+      LLD 的并行化改进是透明优化, 无需任何代码或构建系统改动即可自动受益。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 15. AArch64 后端变更 -->
+  <!-- ================================================================== -->
+  <div class="section" id="aarch64-changes">
+    <div class="section-title">
+      <span class="icon">&#x1F9E0;</span> AArch64 后端: 新 CPU / FMV / 汇编扩展
+      <span class="badge badge-bg">正向变更</span>
+    </div>
+    <div class="section-subtitle">变更 #15 &middot; 后端 &middot; LLVM (AArch64)</div>
+
+    <h3 style="margin-top:0.8rem; color:#0a2647; font-size:1.05rem;">新支持的 CPU</h3>
+    <table class="info-table">
+      <thead>
+        <tr><th>CPU</th><th>-mcpu= 值</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>ARM Cortex-A715</td><td><code>cortex-a715</code></td><td>Armv9 中端核心</td></tr>
+        <tr><td>ARM Cortex-X3</td><td><code>cortex-x3</code></td><td>Armv9 高端性能核心</td></tr>
+        <tr><td>ARM Neoverse V2</td><td><code>neoverse-v2</code></td><td>Armv9 服务器/数据中心核心</td></tr>
+      </tbody>
+    </table>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">新特性</h3>
+    <ul style="padding-left:1.5rem; margin:0.3rem 0 0.8rem; color:#3a4a5a;">
+      <li><strong>Function Multi Versioning (FMV)</strong> — 根据 Arm C Language Extensions 规范实现了函数多版本化, 目前为 <strong>Beta</strong> 状态。允许根据 CPU 特性在运行时选择最优函数实现。</li>
+      <li><strong>RME MEC 汇编支持</strong> — 支持 Realm Management Extension (RME) 的 Memory Encryption Contexts (MEC) 汇编指令。</li>
+      <li><strong>Armv8.3 Complex Number 扩展</strong> — 代码生成支持 Armv8.3 复数运算指令。</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> 使用新 CPU 编译</div>
+      <div class="code-block"><span class="cmt"># 为 Cortex-A715 优化编译</span>
+$ clang --target=aarch64-linux-gnu -mcpu=cortex-a715 -O2 -c app.c
+
+<span class="cmt"># 为 Neoverse V2 服务器优化编译</span>
+$ clang --target=aarch64-linux-gnu -mcpu=neoverse-v2 -O2 -c server.c</div>
+    </div>
+
+    <div class="alert alert-co-g">
+      <strong>&#x2705; 应对措施</strong>
+      如果目标平台使用上述 CPU, 可通过 <code>-mcpu=</code> 标志启用对应的微架构优化。
+      FMV 功能处于 Beta 阶段, 可用于评估但不建议在生产中依赖。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 16. X86 后端变更 -->
+  <!-- ================================================================== -->
+  <div class="section" id="x86-changes">
+    <div class="section-title">
+      <span class="icon">&#x1F4BB;</span> X86 后端: 新 ISA / 新 CPU
+      <span class="badge badge-bg">正向变更</span>
+    </div>
+    <div class="section-subtitle">变更 #16 &middot; 后端 &middot; LLVM (X86)</div>
+
+    <h3 style="margin-top:0.8rem; color:#0a2647; font-size:1.05rem;">新支持的指令集 (ISA) 扩展</h3>
+    <table class="info-table">
+      <thead>
+        <tr><th>ISA 扩展</th><th>核心指令/内在函数</th><th>用途</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>AMX-FP16</strong></td>
+          <td><code>tdpfp16ps</code> / <code>_tile_dpfp16ps</code></td>
+          <td>矩阵 FP16 乘加运算</td>
+        </tr>
+        <tr>
+          <td><strong>CMPCCXADD</strong></td>
+          <td><code>_cmpccxadd_epi32/64</code></td>
+          <td>条件比较并原子加法</td>
+        </tr>
+        <tr>
+          <td><strong>AVX-IFMA</strong></td>
+          <td><code>_mm(256)_madd52hi/lo_avx_epu64</code></td>
+          <td>整数融合乘加 (52-bit)</td>
+        </tr>
+        <tr>
+          <td><strong>AVX-VNNI-INT8</strong></td>
+          <td><code>_mm(256)_dpbssd(s)/dpbsud(s)/dpbuud(s)_epi32</code></td>
+          <td>INT8 向量神经网络指令</td>
+        </tr>
+        <tr>
+          <td><strong>AVX-NE-CONVERT</strong></td>
+          <td><code>_mm(256)_bcstnebf16_ps</code> 等</td>
+          <td>BF16/FP16 窄精度转换</td>
+        </tr>
+        <tr>
+          <td><strong>PREFETCHI</strong></td>
+          <td>指令缓存预取</td>
+          <td>缓存优化</td>
+        </tr>
+        <tr>
+          <td><strong>RAO-INT</strong></td>
+          <td><code>_aadd/_aand/_aor/_axor_i32/64</code></td>
+          <td>原子整数运算</td>
+        </tr>
+        <tr>
+          <td><strong>WRMSRNS</strong> / <strong>RDMSRLIST/WRMSRLIST</strong></td>
+          <td>MSR 操作指令</td>
+          <td>系统编程</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">新支持的 CPU / 微架构</h3>
+    <table class="info-table">
+      <thead>
+        <tr><th>CPU</th><th>-march= / -mcpu= 值</th><th>厂商</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>AMD Zen 4</td><td><code>znver4</code></td><td>AMD</td></tr>
+        <tr><td>Raptor Lake</td><td><code>raptorlake</code></td><td>Intel</td></tr>
+        <tr><td>Meteor Lake</td><td><code>meteorlake</code></td><td>Intel</td></tr>
+        <tr><td>Emerald Rapids</td><td><code>emeraldrapids</code></td><td>Intel</td></tr>
+        <tr><td>Sierra Forest</td><td><code>sierraforest</code></td><td>Intel</td></tr>
+        <tr><td>Grand Ridge</td><td><code>grandridge</code></td><td>Intel</td></tr>
+        <tr><td>Granite Rapids</td><td><code>graniterapids</code></td><td>Intel</td></tr>
+      </tbody>
+    </table>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> 使用新 CPU 和 ISA 编译</div>
+      <div class="code-block"><span class="cmt"># 为 AMD Zen 4 优化编译</span>
+$ clang -march=znver4 -O2 -c app.c
+
+<span class="cmt"># 为 Intel Raptor Lake 优化编译</span>
+$ clang -march=raptorlake -O2 -c app.c
+
+<span class="cmt"># 显式启用 AMX-FP16 和 AVX-IFMA ISA 扩展</span>
+$ clang -march=znver4 -mamx-fp16 -mavx-ifma -O2 -c kernel.c
+
+<span class="cmt"># 使用 CMPCCXADD 内在函数</span>
+<span class="kw">#include</span> <span class="str">&lt;immintrin.h&gt;</span>
+<span class="kw">int</span> <span class="fn">atomic_add_if_less</span>(<span class="kw">int</span>* ptr, <span class="kw">int</span> val, <span class="kw">int</span> cmp) {
+    <span class="kw">return</span> <span class="fn">_cmpccxadd_epi32</span>(ptr, val, cmp, _CMPCCX_LT);
+}</div>
+    </div>
+
+    <div class="alert alert-co-g">
+      <strong>&#x2705; 应对措施</strong>
+      对于 AMD Zen 4 或新 Intel 平台 (Raptor Lake 及更新), 可通过 <code>-march=znver4</code> 或
+      <code>-march=raptorlake</code> 等标志启用对应的微架构调度和指令集优化。
+      AVX512-BF16 内在函数类型已从 <code>short</code> 切换为 <code>__bf16</code>, 使用 BF16 相关代码的需要注意。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 17. libc++ 废弃与移除 -->
+  <!-- ================================================================== -->
+  <div class="section" id="libcxx-changes">
+    <div class="section-title">
+      <span class="icon">&#x1F4DA;</span> libc++ 废弃与移除
+      <span class="badge badge-bm">中影响</span>
+    </div>
+    <div class="section-subtitle">变更 #17 &middot; 标准库 &middot; libc++</div>
+
+    <h3 style="margin-top:0.8rem; color:#0a2647; font-size:1.05rem;">已移除</h3>
+    <ul style="padding-left:1.5rem; margin:0.3rem 0 0.8rem; color:#3a4a5a;">
+      <li><strong>unary_function / binary_function</strong> — C++17 及更新标准模式中不再提供。
+        可通过 <code>_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION</code> 宏重新启用。</li>
+      <li><strong>std::function C++03 实现</strong> — <code>_LIBCPP_ENABLE_CXX03_FUNCTION</code> 宏已被移除。
+        需要使用 <code>std::function</code> 的用户应切换到 C++11 及以上标准。</li>
+      <li><strong>to_chars/from_chars 整数版本在 C++11/14 中的扩展</strong> — 这些函数从 C++17 开始才正式提供。
+        libc++ 此前在 C++11/14 中提供的非标准扩展已被移除。</li>
+      <li><strong>_LIBCPP_DEBUG 宏</strong> — 不再生效, 使用即报错。请迁移至 <code>_LIBCPP_ENABLE_DEBUG_MODE</code>。</li>
+      <li><strong>大量 C++23 模式下的 incidental transitive includes (传递包含) 被移除</strong> —
+        包括 <code>&lt;algorithm&gt;</code>, <code>&lt;array&gt;</code>, <code>&lt;atomic&gt;</code>,
+        <code>&lt;chrono&gt;</code>, <code>&lt;functional&gt;</code>, <code>&lt;memory&gt;</code>,
+        <code>&lt;string&gt;</code>, <code>&lt;vector&gt;</code> 等数十个头文件。
+        可通过 <code>_LIBCPP_REMOVE_TRANSITIVE_INCLUDES</code> 在所有语言版本中移除。</li>
+    </ul>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">已废弃 (即将移除)</h3>
+    <ul style="padding-left:1.5rem; margin:0.3rem 0 0.8rem; color:#3a4a5a;">
+      <li><strong>std::char_traits 基础模板 (base template)</strong> — 已标记为废弃, 将在 LLVM 18 中移除。
+        如果对 <code>char</code>, <code>wchar_t</code>, <code>char8_t</code>, <code>char16_t</code>,
+        <code>char32_t</code> 或自定义字符类型之外的类型使用 <code>std::char_traits</code>, 代码将停止工作。
+        标准不要求提供基础模板, 且此类模板对某些类型可能导致未检测到的错误行为。</li>
+      <li><strong>&lt;experimental/memory_resource&gt;</strong> — 已废弃, 请迁移至 <code>&lt;memory_resource&gt;</code>。
+        将在 LLVM 18 中移除。</li>
+      <li><strong>_LIBCPP_AVAILABILITY_CUSTOM_VERBOSE_ABORT_PROVIDED</strong> — 将在 LLVM 18 中不再生效。</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> 受影响代码 (C++17 模式下)</div>
+      <div class="code-block"><span class="cmt">// LLVM 15: 编译通过</span>
+<span class="cmt">// LLVM 16: C++17 模式下编译失败</span>
+<span class="kw">#include</span> <span class="str">&lt;functional&gt;</span>
+
+<span class="kw">struct</span> MyFunc : <span class="kw">std</span>::unary_function&lt;<span class="kw">int</span>, <span class="kw">bool</span>&gt; {  <span class="err">// error: no member 'unary_function'</span>
+    <span class="kw">bool</span> <span class="kw">operator</span>()(<span class="kw">int</span> x) <span class="kw">const</span> { <span class="kw">return</span> x &gt; <span class="num">0</span>; }
+};</div>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 A: 自行定义类型别名</div>
+      <div class="code-block"><span class="kw">struct</span> MyFunc {
+    <span class="kw">using</span> argument_type = <span class="kw">int</span>;    <span class="cmt">// 替代 unary_function&lt;int, bool&gt;::argument_type</span>
+    <span class="kw">using</span> result_type = <span class="kw">bool</span>;     <span class="cmt">// 替代 unary_function&lt;int, bool&gt;::result_type</span>
+    <span class="kw">bool</span> <span class="kw">operator</span>()(<span class="kw">int</span> x) <span class="kw">const</span> { <span class="kw">return</span> x &gt; <span class="num">0</span>; }
+};</div>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-after"></span> 修复方式 B: 使用宏重新启用 (C++17 模式)</div>
+      <div class="code-block"><span class="cmt">// 在包含任何头文件之前定义</span>
+<span class="kw">#define</span> _LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION
+<span class="kw">#include</span> <span class="str">&lt;functional&gt;</span>
+<span class="cmt">// unary_function / binary_function 重新可用</span></div>
+    </div>
+
+    <div class="alert alert-co-a">
+      <strong>&#x26A0; 应对措施</strong>
+      <strong>unary_function/binary_function:</strong> 迁移到 C++17 风格的 <code>using argument_type = ...</code> 类型别名定义。<br>
+      <strong>char_traits:</strong> 仅对标准字符类型使用 <code>std::char_traits</code>。<br>
+      <strong>transitive includes:</strong> 如果代码依赖隐式包含 (如通过 <code>&lt;string&gt;</code> 间接获得 <code>&lt;algorithm&gt;</code>),
+      需要显式添加对应的 <code>#include</code>。<br>
+      <strong>_LIBCPP_DEBUG:</strong> 将 <code>_LIBCPP_DEBUG</code> 替换为 <code>_LIBCPP_ENABLE_DEBUG_MODE</code>。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 18. C++ 其他潜在破坏性变更 -->
+  <!-- ================================================================== -->
+  <div class="section" id="cpp-other-breaking">
+    <div class="section-title">
+      <span class="icon">&#x26A0;</span> C++ 其他潜在破坏性变更
+      <span class="badge badge-bl">低影响</span>
+    </div>
+    <div class="section-subtitle">变更 #18 &middot; C++ 前端 &middot; Clang</div>
+
+    <h3 style="margin-top:0.8rem; color:#0a2647; font-size:1.05rem;">枚举 constexpr 范围检查 (enum constexpr conversion)</h3>
+    <p>见上方 <a href="#enum-constexpr">变更 #10</a>。</p>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">重载决议变更 (DR692/DR1395/DR1432)</h3>
+    <p>
+      作为实现 DR692/DR1395/DR1432 的副作用, 当一个候选函数模板具有 trailing parameter pack 时,
+      Clang 现在可能拒绝某些之前接受的重载函数模板调用 (判定为二义性)。
+    </p>
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> LLVM 16 中判定为二义性的代码</div>
+      <div class="code-block"><span class="kw">template</span> &lt;<span class="kw">typename</span> T&gt; <span class="kw">void</span> <span class="fn">g</span>(T, T = T());
+<span class="kw">template</span> &lt;<span class="kw">typename</span> T, <span class="kw">typename</span>... U&gt; <span class="kw">void</span> <span class="fn">g</span>(T, U...);
+<span class="kw">void</span> <span class="fn">h</span>() {
+    <span class="fn">g</span>(<span class="num">42</span>); <span class="cmt">// LLVM 16: error: ambiguous (pack vs default argument)</span>
+}</div>
+    </div>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">C++ 标准头单元定义限制</h3>
+    <p>
+      Clang 现在禁止 C++ 标准头单元 (header units) 中的非内联外部可见定义,
+      符合 [module.import/6]。在 Clang 15 中这些定义被允许 (但包含多次即构成 ODR 违规)。
+    </p>
+
+    <h3 style="margin-top:1rem; color:#0a2647; font-size:1.05rem;">数组元素大小与对齐检查</h3>
+    <p>
+      Clang 现在禁止将大小不是对齐倍数 (size not a multiple of alignment) 的类型用作数组元素类型。
+    </p>
+    <div class="example-box">
+      <div class="example-label"><span class="dot dot-before"></span> 受影响的代码</div>
+      <div class="code-block"><span class="kw">typedef</span> <span class="kw">char</span> int8_a16 <span class="kw">__attribute__</span>((aligned(<span class="num">16</span>)));
+int8_a16 array[<span class="num">4</span>];  <span class="cmt">// LLVM 16: error: 元素大小不是数组对齐的倍数</span></div>
+    </div>
+
+    <div class="alert alert-co-i">
+      <strong>&#x2139; 应对措施</strong>
+      这些变更影响面较窄, 大多数项目不会遇到。若受到重载决议变更影响, 可能需要显式消歧义或重构模板代码。
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 附录: 快速应对速查表 -->
   <!-- ================================================================== -->
   <div class="section" id="quickref">
     <div class="section-title">
@@ -889,7 +1368,7 @@ CXXFLAGS += -O2 -Wall</div>
           <td>-Wimplicit-function-declaration &rarr; Error</td>
           <td><span class="badge badge-bh">高</span></td>
           <td><code>-Wno-error=implicit-function-declaration</code></td>
-          <td>补全函数声明</td>
+          <td>补全函数声明或包含头文件</td>
         </tr>
         <tr>
           <td>3</td>
@@ -907,31 +1386,101 @@ CXXFLAGS += -O2 -Wall</div>
         </tr>
         <tr>
           <td>5</td>
-          <td>void* 解引用 (C++) &rarr; Error</td>
+          <td>void* 解引用 (C++) &rarr; 硬 Error</td>
           <td><span class="badge badge-bm">中</span></td>
-          <td>无绕过选项（硬 Error）</td>
+          <td>无绕过选项 (硬 Error)</td>
           <td>先 static_cast 再解引用</td>
         </tr>
         <tr>
           <td>6</td>
-          <td>Packed struct ABI 变化</td>
+          <td>资源目录路径变更 (仅主版本号)</td>
+          <td><span class="badge badge-bl">低</span></td>
+          <td>更新硬编码路径</td>
+          <td>使用 clang -print-resource-dir</td>
+        </tr>
+        <tr>
+          <td>7</td>
+          <td>__ppc64__ 移除 / -p 标志拒绝</td>
+          <td><span class="badge badge-bl">低</span></td>
+          <td>替换为 __powerpc64__ / -pg</td>
+          <td>更新平台特定代码</td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td>Packed struct ABI (非 POD 成员) 变更</td>
           <td><span class="badge badge-bm">中</span></td>
           <td><code>-fclang-abi-compat=15.0</code></td>
           <td>避免 packed struct 含非 POD</td>
         </tr>
         <tr>
-          <td>7</td>
-          <td>LLD 并行化</td>
-          <td><span class="badge badge-bg">受益</span></td>
-          <td>无需操作</td>
-          <td>自动受益</td>
+          <td>9</td>
+          <td>POD 判定规则 ABI 变更</td>
+          <td><span class="badge badge-bm">中</span></td>
+          <td><code>-fclang-abi-compat=15.0</code></td>
+          <td>确保跨模块编译版本一致</td>
         </tr>
         <tr>
-          <td>8</td>
+          <td>10</td>
+          <td>enum constexpr 范围检查</td>
+          <td><span class="badge badge-bm">中</span></td>
+          <td><code>-Wno-error=enum-constexpr-conversion</code></td>
+          <td>为 enum 添加固定底层类型</td>
+        </tr>
+        <tr>
+          <td>11</td>
+          <td>MSan param-retval 默认启用</td>
+          <td><span class="badge badge-bm">中</span></td>
+          <td><code>-fno-sanitize-memory-param-retval</code></td>
+          <td>修复未初始化变量</td>
+        </tr>
+        <tr>
+          <td>12</td>
+          <td>已废弃标志 (coroutines-ts, modules-ts, ...)</td>
+          <td><span class="badge badge-bl">低</span></td>
+          <td>更新为替代标志</td>
+          <td>按表格中的替代方案更新</td>
+        </tr>
+        <tr>
+          <td>13</td>
           <td>旧 PM 标志移除</td>
           <td><span class="badge badge-bl">低</span></td>
           <td>删除残留标志</td>
           <td>删除残留标志</td>
+        </tr>
+        <tr>
+          <td>14</td>
+          <td>LLD: 并行化 + 新功能 + --no-undefined-version 默认</td>
+          <td><span class="badge badge-bg">受益</span></td>
+          <td>自动受益; verificaton script 需检查</td>
+          <td>对 version script 无效符号进行修复</td>
+        </tr>
+        <tr>
+          <td>15</td>
+          <td>AArch64: 新 CPU (Cortex-A715/X3, Neoverse V2), FMV</td>
+          <td><span class="badge badge-bg">受益</span></td>
+          <td>无需操作</td>
+          <td>按需使用 -mcpu= 启用</td>
+        </tr>
+        <tr>
+          <td>16</td>
+          <td>X86: 新 ISA (AMX-FP16 等) / 新 CPU (znver4 等)</td>
+          <td><span class="badge badge-bg">受益</span></td>
+          <td>无需操作</td>
+          <td>按需使用 -march= 启用</td>
+        </tr>
+        <tr>
+          <td>17</td>
+          <td>libc++: unary_function 移除, transitive includes 移除等</td>
+          <td><span class="badge badge-bm">中</span></td>
+          <td>定义 _LIBCPP_ENABLE_CXX17_REMOVED_ 宏</td>
+          <td>迁移代码到 C++17 风格</td>
+        </tr>
+        <tr>
+          <td>18</td>
+          <td>C++ 其他: 重载决议, 头单元定义, 数组对齐检查</td>
+          <td><span class="badge badge-bl">低</span></td>
+          <td>取决于具体情况</td>
+          <td>审查受影响代码</td>
         </tr>
       </tbody>
     </table>
