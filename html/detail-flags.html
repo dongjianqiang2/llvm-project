@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>编译选项差异详解 — 毕昇编译器升级</title>
+<style>
+  :root {
+    --primary: #0a2647;
+    --primary-light: #1e4a7a;
+    --primary-extra: #eef4fb;
+    --accent: #d4a843;
+    --accent-light: #f5e6b8;
+    --bg: #f6f8fc;
+    --card: #fff;
+    --text: #111827;
+    --text2: #4b5563;
+    --border: #e5e7eb;
+    --red: #dc2626; --red-bg: #fef2f2;
+    --amber: #d97706; --amber-bg: #fffbeb;
+    --green: #059669; --green-bg: #ecfdf5;
+    --blue: #2563eb; --blue-bg: #eff6ff;
+    --radius: 12px;
+    --shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
+  }
+
+  /* Header */
+  .header{
+    background:linear-gradient(135deg,#071225 0%,#0a2647 45%,#1e4a7a 100%);
+    color:#fff;padding:48px 24px 36px;text-align:center;position:relative;overflow:hidden;
+  }
+  .header::after{
+    content:'';position:absolute;inset:0;
+    background:radial-gradient(ellipse 60% 40% at 30% 50%,rgba(212,168,67,.10) 0%,transparent 70%);
+    pointer-events:none;
+  }
+  .header .back{
+    display:inline-block;color:var(--accent);text-decoration:none;font-size:14px;
+    border:1px solid rgba(212,168,67,.4);padding:6px 18px;border-radius:6px;
+    transition:all .15s;margin-bottom:20px;position:relative;z-index:1;
+  }
+  .header .back:hover{background:rgba(212,168,67,.15);border-color:rgba(212,168,67,.6)}
+  .header h1{font-size:30px;font-weight:700;margin-bottom:8px;position:relative;z-index:1}
+  .header .sub{font-size:15px;opacity:.78;max-width:680px;margin:0 auto;position:relative;z-index:1}
+
+  /* Section cards */
+  .container{max-width:1100px;margin:0 auto;padding:0 20px}
+  .section{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin:24px auto;overflow:hidden}
+  .section-header{
+    padding:20px 28px 12px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:10px;
+  }
+  .section-header .num{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;border-radius:7px;
+    background:var(--primary);color:#fff;font-size:14px;font-weight:700;flex-shrink:0;
+  }
+  .section-header h2{font-size:19px;font-weight:700;color:var(--primary)}
+  .section-body{padding:20px 28px 28px}
+
+  /* Tables */
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0}
+  thead th{
+    background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;
+    padding:8px 12px;border-bottom:2px solid var(--border);font-size:12.5px;white-space:nowrap;
+  }
+  tbody td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#f8fafc}
+  table code,.inline-code{
+    background:#eef2f6;padding:1px 6px;border-radius:4px;
+    font-size:13px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+
+  /* Badges */
+  .bh{display:inline-block;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bm{display:inline-block;background:var(--amber-bg);color:var(--amber);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bl{display:inline-block;background:var(--blue-bg);color:var(--blue);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bg{display:inline-block;background:var(--green-bg);color:var(--green);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bflag{
+    display:inline-block;background:#f1f5f9;color:var(--primary-light);
+    font-size:12px;font-weight:500;padding:2px 10px;border-radius:4px;
+    font-family:"SF Mono",Menlo,monospace;
+  }
+
+  /* Callout */
+  .co{
+    padding:14px 18px;border-radius:7px;margin:12px 0;font-size:13.5px;
+    border-left:4px solid;line-height:1.75;
+  }
+  .co-r{background:var(--red-bg);border-color:var(--red);color:#7f1d1d}
+  .co-a{background:var(--amber-bg);border-color:var(--amber);color:#713f12}
+  .co-i{background:var(--blue-bg);border-color:var(--blue);color:#1e3a5f}
+  .co-g{background:var(--green-bg);border-color:var(--green);color:#064e3b}
+  .co strong{display:block;margin-bottom:3px}
+  .co code{background:rgba(0,0,0,.06);padding:1px 6px;border-radius:3px;font-size:13px}
+
+  /* Example box */
+  .example-box{
+    background:#fafbfc;border:1px solid var(--border);border-radius:8px;
+    padding:18px 22px;margin:14px 0;
+  }
+  .example-box .label{
+    font-size:12px;font-weight:700;color:var(--text2);
+    text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px;
+  }
+
+  /* Code block */
+  pre.cb{
+    background:#0a1a2e;color:#e2e8f0;padding:16px 20px;border-radius:8px;
+    overflow-x:auto;font-size:13px;line-height:1.6;
+    font-family:"SF Mono",Menlo,monospace;margin:8px 0;border:none;
+  }
+  pre.cb .c{color:#6b7280}
+  pre.cb .k{color:#93c5fd}
+  pre.cb .s{color:#a7f3d0}
+
+  /* Version tag */
+  .vt{
+    display:inline-block;background:var(--primary-extra);color:var(--primary-light);
+    font-size:11px;font-weight:600;padding:2px 10px;border-radius:4px;white-space:nowrap;
+  }
+
+  /* Scenario tabs */
+  .scenario-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;margin:14px 0}
+  .scenario-card{border:1px solid var(--border);border-radius:9px;overflow:hidden}
+  .scenario-card .sc-head{
+    padding:12px 18px;font-size:14.5px;font-weight:700;color:#fff;
+  }
+  .scenario-card .sc-body{padding:14px 18px 18px}
+  .sc-head.transition{background:linear-gradient(135deg,#0a2647,#1e4a7a)}
+  .sc-head.production{background:linear-gradient(135deg,#064e3b,#059669)}
+  .sc-head.citest{background:linear-gradient(135deg,#7c2d12,#d97706)}
+  .scenario-card code{
+    background:#eef2f6;padding:1px 6px;border-radius:4px;
+    font-size:13px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+  .scenario-card pre{
+    background:#f1f5f9;padding:12px 16px;border-radius:6px;
+    overflow-x:auto;font-size:13px;line-height:1.5;
+    font-family:"SF Mono",Menlo,monospace;margin:8px 0;border:1px solid #e2e8f0;
+    color:#1e293b;
+  }
+
+  /* Utility */
+  h4{margin:20px 0 8px;color:var(--primary);font-size:15px}
+  h4:first-child{margin-top:0}
+  .text-s{font-size:13px;color:var(--text2)}
+  .text-s code{font-size:12px}
+  .mt-10{margin-top:10px}
+  .mt-16{margin-top:16px}
+  .mb-12{margin-bottom:12px}
+  ul,ol{padding-left:20px;font-size:13.5px}
+  li{margin:4px 0}
+  hr{border:none;border-top:1px solid var(--border);margin:20px 0}
+
+  /* Footer */
+  .footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1100px;margin:32px auto 0}
+
+  @media(max-width:700px){
+    .header h1{font-size:23px}
+    .header{padding:32px 16px 28px}
+    .section-body{padding:14px 16px 20px}
+    .scenario-grid{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+
+<!-- ========== HEADER ========== -->
+<header class="header">
+  <a class="back" href="index.html">&#8592; 返回主页</a>
+  <h1>编译选项差异详解</h1>
+  <p class="sub">毕昇编译器升级 &mdash; LLVM 15.0.4 &#8594; 21.1.8 编译选项新增、废弃与迁移指南</p>
+</header>
+
+<div class="container">
+
+<!-- ========== OVERVIEW ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">&#9881;</span>
+    <h2>概述</h2>
+  </div>
+  <div class="section-body">
+    <p style="color:var(--text2);line-height:1.8">
+      从 LLVM 15.0.4 到 21.1.8，编译选项系统经历了大量变更：Options.td 累计
+      <strong style="color:var(--primary)">848 次提交</strong>。
+      本页面聚焦于<strong>与数通产品线构建系统最相关</strong>的编译选项变化，
+      包括新增选项的用途说明、废弃选项的替代方案，以及可直接用于代码仓库搜索的命令清单。
+    </p>
+    <div class="co co-i mt-10">
+      <strong>&#128203; 阅读建议</strong>
+      如果你正在处理 Makefile/CMake 构建脚本的兼容性适配，建议先看"新增选项"了解新功能，
+      再看"废弃/移除选项"和"搜索清单"逐个处理旧选项，最后参考"过渡期模板"制定完整的编译选项方案。
+    </div>
+  </div>
+</section>
+
+<!-- ========== NEW FLAGS ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">N</span>
+    <h2>新增的关键编译选项</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">
+      以下选项在 LLVM 15 &#8594; 21 升级路径中<strong>新增</strong>，与数通产品线的编译行为、安全性、调试体验密切相关。
+      版本号指该选项首次稳定可用的版本。
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width:22%">新增选项</th>
+          <th style="width:8%">版本</th>
+          <th style="width:28%">用途</th>
+          <th style="width:42%">适用场景与说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>-fwrapv-pointer</code></td>
+          <td><span class="vt">20</span></td>
+          <td>使指针溢出有明确定义（类似 <code>-fwrapv</code> 但作用于指针而非整数）</td>
+          <td>
+            <strong>强烈建议评估启用。</strong>LLVM 20 起编译器会将 <code>ptr+offset &lt; ptr</code> 这类越界检查优化为 <code>false</code>（因为指针溢出是 UB）。
+            如果你的代码中有环形缓冲区、边界检查等指针算术惯用法，启用此选项可避免行为被静默改变。对性能影响极小。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-fno-pointer-tbaa</code></td>
+          <td><span class="vt">20</span></td>
+          <td>禁用基于类型的别名分析（TBAA）标签</td>
+          <td>
+            LLVM 20 起 <strong>TBAA 默认启用</strong>，违反 C/C++ strict-aliasing 规则的代码可能被错误优化。
+            如果现有代码中通过不同类型指针访问同一内存（如 <code>char*</code> 与 <code>int*</code> 混用），
+            启用此选项作为<strong>过渡期保护</strong>，同时逐步修复 aliasing 违规。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-fstrict-flex-arrays=&lt;n&gt;</code></td>
+          <td><span class="vt">20</span></td>
+          <td>控制柔性数组成员（flexible array member）的严格程度</td>
+          <td>
+            <strong>n=0</strong>：最宽松（GCC 兼容模式）；<strong>n=1</strong>：仅 <code>[]</code>；<strong>n=2</strong>：仅 <code>[0]</code> 或 <code>[]</code>；
+            <strong>n=3</strong>：仅 C99 标准 FAM。
+            嵌入式网络设备中大量使用柔性数组的结构体（如协议头 + payload），严格模式可防止越界访问被优化掉。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-falign-loops=&lt;N&gt;</code></td>
+          <td><span class="vt">20</span></td>
+          <td>控制循环的字节对齐（如 <code>-falign-loops=16</code>）</td>
+          <td>
+            用于微调性能：较大的对齐值可能提升 i-cache 命中率（特别是热点循环），但会增加代码体积。
+            对 <code>-Oz</code> 场景通常不需要设置此选项；对性能敏感的数据面循环可以试验 <code>-falign-loops=32</code> 或 <code>64</code>。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-fmax-tokens=&lt;N&gt;</code></td>
+          <td><span class="vt">20</span></td>
+          <td>限制预处理阶段产生的 token 总数</td>
+          <td>
+            主要用于 IDE 和增量构建工具（如 clangd），用于限制单次分析的 token 量。
+            构建系统<strong>一般不需要</strong>设置；CI 中可用于检测意外引入大量模板展开的回归。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-fno-lifetime-dse</code></td>
+          <td><span class="vt">21</span></td>
+          <td>禁用 Lifetime Dead Store Elimination（死对象存储消除）优化</td>
+          <td>
+            LLVM 21 起编译器更积极地消除对象生命周期结束后的存储操作（如 <code>memset</code>、<code>memcpy</code>）。
+            如果你的代码依赖"对象析构后仍可通过内存读取之前写入的安全标记"（RAII 资源释放标记等），
+            启用此选项作为<strong>过渡期保护</strong>，同时修复代码中不符合 C++ 对象生命周期规则的用法。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-fexperimental-sanitize-metadata=&lt;type&gt;</code></td>
+          <td><span class="vt">20</span></td>
+          <td>实验性二进制分析元数据注入</td>
+          <td>
+            在生成的二进制中嵌入 sanitizer 元数据，供外部分析工具使用。
+            典型的 type 值包括 <code>atomics</code>、<code>covered</code>、<code>uar</code>。
+            CI/调试构建中可用于增强二进制分析能力，<strong>不建议在生产构建中启用</strong>。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-z gcs</code> / <code>-z gcs-report</code></td>
+          <td><span class="vt">19</span></td>
+          <td>链接器选项：启用 AArch64 Guarded Control Stack</td>
+          <td>
+            <strong>仅 AArch64 平台有效。</strong><code>-z gcs</code> 启用 GCS 保护（需硬件支持），
+            <code>-z gcs-report</code> 生成 GCS 兼容性报告。
+            对 ARM 嵌入式网络设备，这是<strong>控制流完整性（CFI）的重要补充</strong>，
+            与 BTI / PAC-RET 配合使用可大幅提升抗 ROP 攻击能力。
+          </td>
+        </tr>
+        <tr>
+          <td><code>-fsanitize-coverage-stack-depth-callback-min=&lt;N&gt;</code></td>
+          <td><span class="vt">20</span></td>
+          <td>覆盖率检测时仅当调用栈深度超过 N 时才触发回调</td>
+          <td>
+            用于 fuzzing 和覆盖率引导测试。在 CI 模糊测试中，设置合理的阈值（如 32）可减少浅层路径的噪音，
+            使报告更聚焦于深层调用路径的覆盖情况。<strong>生产构建不需要</strong>。
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="co co-a mt-16">
+      <strong>&#9888; 数通产品线需优先关注的前三项</strong>
+      <ol style="margin:6px 0 0 16px">
+        <li><code>-fwrapv-pointer</code> — 指针溢出 UB 优化直接影响网络协议解析中的边界检查逻辑</li>
+        <li><code>-fno-pointer-tbaa</code> — TBAA 默认启用可能静默改变底层内存操作的行为</li>
+        <li><code>-fno-lifetime-dse</code> — 死存储消除可能影响 RAII 资源管理模式的正确性</li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<!-- ========== DEPRECATED / REMOVED ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">D</span>
+    <h2>废弃/移除的选项</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">
+      以下选项在 LLVM 15 &#8594; 21 升级中<strong>已被废弃或移除</strong>。如果你的构建系统中仍在使用这些选项，
+      需要根据"替代方案"列进行替换。未及时替换的选项在新版本中可能导致编译警告、错误或静默失效。
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width:26%">已废弃/移除的选项</th>
+          <th style="width:12%">状态</th>
+          <th style="width:32%">替代方案</th>
+          <th style="width:30%">说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>-fexperimental-new-pass-manager</code></td>
+          <td><span class="bh">LLVM 16 移除</span></td>
+          <td><strong>无需替代</strong>（新版 Pass Manager 已强制启用）</td>
+          <td>LLVM 16 起新的 Pass Manager 是唯一选项，此 flag 被静默忽略。</td>
+        </tr>
+        <tr>
+          <td><code>-fno-legacy-pass-manager</code></td>
+          <td><span class="bh">LLVM 16 移除</span></td>
+          <td><strong>无需替代</strong>（旧版 Pass Manager 已不可用）</td>
+          <td>同上，旧版 PM 已从代码中彻底移除。</td>
+        </tr>
+        <tr>
+          <td><code>-fcoroutines-ts</code></td>
+          <td><span class="bm">LLVM 16 废弃</span> &#8594; <span class="bh">LLVM 17 移除</span></td>
+          <td>使用标准 C++20 协程（<code>#include &lt;coroutine&gt;</code>）</td>
+          <td>TS（技术规范）版协程语法被标准 C++20 协程取代。代码中 <code>#include &lt;experimental/coroutine&gt;</code> 需替换为 <code>&lt;coroutine&gt;</code>。</td>
+        </tr>
+        <tr>
+          <td><code>-fmodules-ts</code></td>
+          <td><span class="bm">LLVM 16 废弃</span> &#8594; <span class="bh">LLVM 17 移除</span></td>
+          <td>使用标准 C++20 modules</td>
+          <td>TS 版模块语法与标准 C++20 modules 不兼容。需将模块声明从 TS 语法迁移至标准语法。</td>
+        </tr>
+        <tr>
+          <td><code>-fconcepts-ts</code></td>
+          <td><span class="bh">LLVM 16 移除</span></td>
+          <td>使用标准 C++20 concepts</td>
+          <td>TS 版 concepts 关键字和语法与 C++20 标准版有差异，需逐处迁移。</td>
+        </tr>
+        <tr>
+          <td><code>-menable-unsafe-fp-math</code></td>
+          <td><span class="bh">LLVM 16 移除</span></td>
+          <td><code>-ffast-math</code> 或其子选项组合</td>
+          <td>此选项被 <code>-ffast-math</code> 取代。如果仅需部分 unsafe 优化，可用子选项组合（如 <code>-fno-signed-zeros -fno-trapping-math</code>）。</td>
+        </tr>
+        <tr>
+          <td><code>-Ofast</code></td>
+          <td><span class="bm">LLVM 18 废弃</span></td>
+          <td><code>-O3 -ffast-math</code></td>
+          <td>LLVM 18 起使用 <code>-Ofast</code> 会产生弃用警告。直接替换为 <code>-O3 -ffast-math</code> 语义完全等价。</td>
+        </tr>
+        <tr>
+          <td><code>GCC_INSTALL_PREFIX</code></td>
+          <td><span class="bm">LLVM 18 废弃</span> &#8594; <span class="bh">LLVM 19 移除</span></td>
+          <td><code>--gcc-install-dir=&lt;dir&gt;</code> / <code>--gcc-triple=&lt;triple&gt;</code></td>
+          <td>CMake 构建 Clang 时使用的配置变量。改为使用 <code>--gcc-install-dir=</code> 配置 GCC 安装目录。</td>
+        </tr>
+        <tr>
+          <td><code>clang-rename</code></td>
+          <td><span class="bh">LLVM 20 移除</span></td>
+          <td>clangd 内置重命名 / clang-refactor / IDE 重构功能</td>
+          <td>独立的 <code>clang-rename</code> 工具已从工具集中移除。clangd LSP 服务提供更完善的重命名支持。</td>
+        </tr>
+        <tr>
+          <td><code>le32</code> / <code>le64</code> targets</td>
+          <td><span class="bh">LLVM 20 移除</span></td>
+          <td>更新目标三元组配置</td>
+          <td>这些是 PNaCl 使用的虚拟目标，已不再维护。如果 CMake 中引用了 <code>le32-unknown-nacl</code> 或 <code>le64-unknown-nacl</code>，需更新为实际目标架构。</td>
+        </tr>
+        <tr>
+          <td><code>-enable-trivial-auto-var-init-zero-knowing-it-will-be-removed</code></td>
+          <td><span class="bh">LLVM 20 移除</span></td>
+          <td>使用 <code>-ftrivial-auto-var-init=zero</code></td>
+          <td>此超长命名的 flag 是过渡期占位符，已按计划移除。标准选项 <code>-ftrivial-auto-var-init=zero</code> 已足够。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="co co-g mt-16">
+      <strong>&#9989; 好消息：大部分废弃选项影响有限</strong>
+      对于以<strong>C 语言为主</strong>的数通产品线代码库，<code>-fcoroutines-ts</code>、<code>-fmodules-ts</code>、<code>-fconcepts-ts</code>
+      这几个 C++ TS 选项通常不会出现。需要重点检查的是 <code>-Ofast</code>、<code>-menable-unsafe-fp-math</code>、
+      <code>GCC_INSTALL_PREFIX</code> 以及 <code>le32/le64</code> 目标。
+    </div>
+  </div>
+</section>
+
+<!-- ========== MAKEFILE SEARCH CHECKLIST ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">&#128269;</span>
+    <h2>Makefile / CMake 搜索清单</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">
+      以下命令可直接复制粘贴到终端执行，用于在代码仓库中查找所有需要更新的废弃选项。
+      每个搜索命令都覆盖了常见的构建文件扩展名（<code>.cmake</code>、<code>.mk</code>、<code>.txt</code>、<code>.cpp</code>、<code>.h</code>、<code>.sh</code>）。
+    </p>
+
+    <div class="example-box">
+      <div class="label">&#128203; 搜索需要删除/更新的废弃 Pass Manager 选项</div>
+      <pre class="cb"><span class="c"># 这两个选项在 LLVM 16+ 中已无意义，应直接删除</span>
+grep -rn <span class="s">'fexperimental-new-pass-manager\|fno-legacy-pass-manager'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.txt'</span> --include=<span class="s">'*.mk'</span> .</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">&#128203; 搜索废弃的 C++ TS 选项</div>
+      <pre class="cb"><span class="c"># 这些 TS 选项在 LLVM 16/17 已移除，需更新为标准 C++20 用法</span>
+grep -rn <span class="s">'fcoroutines-ts\|fmodules-ts\|fconcepts-ts'</span> --include=<span class="s">'*.cpp'</span> --include=<span class="s">'*.h'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.mk'</span> .</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">&#128203; 搜索废弃的浮点优化选项</div>
+      <pre class="cb"><span class="c"># menable-unsafe-fp-math 在 LLVM 16 已移除，替换为 -ffast-math</span>
+grep -rn <span class="s">'menable-unsafe-fp-math'</span> --include=<span class="s">'*.mk'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.txt'</span> .</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">&#128203; 搜索废弃的 -Ofast</div>
+      <pre class="cb"><span class="c"># -Ofast 在 LLVM 18 起废弃, 替换为 -O3 -ffast-math</span>
+grep -rn <span class="s">'\-Ofast'</span> --include=<span class="s">'*.mk'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.txt'</span> .</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">&#128203; 搜索已移除的 le32/le64 目标</div>
+      <pre class="cb"><span class="c"># le32/le64 目标在 LLVM 20 已移除</span>
+grep -rn <span class="s">'le32\|le64'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.mk'</span> --include=<span class="s">'*.txt'</span> .</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">&#128203; 搜索废弃的 GCC_INSTALL_PREFIX 变量</div>
+      <pre class="cb"><span class="c"># GCC_INSTALL_PREFIX 在 LLVM 19 已移除，替换为 --gcc-install-dir=</span>
+grep -rn <span class="s">'GCC_INSTALL_PREFIX'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.txt'</span> .</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">&#128203; 搜索已移除的 clang-rename 工具引用</div>
+      <pre class="cb"><span class="c"># clang-rename 在 LLVM 20 已移除，替换为 clangd 或其他重构工具</span>
+grep -rn <span class="s">'clang-rename'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.sh'</span> --include=<span class="s">'*.py'</span> .</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">&#128203; 一键全量搜索（所有废弃选项一次性扫描）</div>
+      <pre class="cb"><span class="c">#!/bin/bash</span>
+<span class="c"># 在当前目录下扫描所有已知的废弃/移除选项</span>
+<span class="c"># 适用于: Makefile, CMake, C/C++ 源码, Shell 脚本, Python 脚本</span>
+<span class="k">echo</span> <span class="s">"========== 扫描废弃的 Pass Manager 选项 =========="</span>
+grep -rn <span class="s">'fexperimental-new-pass-manager\|fno-legacy-pass-manager'</span> \
+  --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.txt'</span> --include=<span class="s">'*.mk'</span> .
+
+<span class="k">echo</span> <span class="s">""</span>
+<span class="k">echo</span> <span class="s">"========== 扫描废弃的 C++ TS 选项 =========="</span>
+grep -rn <span class="s">'fcoroutines-ts\|fmodules-ts\|fconcepts-ts'</span> \
+  --include=<span class="s">'*.cpp'</span> --include=<span class="s">'*.h'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.mk'</span> .
+
+<span class="k">echo</span> <span class="s">""</span>
+<span class="k">echo</span> <span class="s">"========== 扫描废弃的 unsafe-fp-math / -Ofast =========="</span>
+grep -rn <span class="s">'menable-unsafe-fp-math\|-Ofast'</span> \
+  --include=<span class="s">'*.mk'</span> --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.txt'</span> .
+
+<span class="k">echo</span> <span class="s">""</span>
+<span class="k">echo</span> <span class="s">"========== 扫描 le32/le64 目标 =========="</span>
+grep -rn <span class="s">'le32\|le64'</span> \
+  --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.mk'</span> --include=<span class="s">'*.txt'</span> .
+
+<span class="k">echo</span> <span class="s">""</span>
+<span class="k">echo</span> <span class="s">"========== 扫描 GCC_INSTALL_PREFIX =========="</span>
+grep -rn <span class="s">'GCC_INSTALL_PREFIX'</span> \
+  --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.txt'</span> .
+
+<span class="k">echo</span> <span class="s">""</span>
+<span class="k">echo</span> <span class="s">"========== 扫描 clang-rename =========="</span>
+grep -rn <span class="s">'clang-rename'</span> \
+  --include=<span class="s">'*.cmake'</span> --include=<span class="s">'*.sh'</span> --include=<span class="s">'*.py'</span> .
+
+<span class="k">echo</span> <span class="s">""</span>
+<span class="k">echo</span> <span class="s">"========== 扫描完毕 =========="</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ========== FLAGS TEMPLATE ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">&#127987;</span>
+    <h2>过渡期推荐编译选项模板</h2>
+  </div>
+  <div class="section-body">
+    <p class="text-s mb-12">
+      以下模板按场景分类，提供可直接用于 Makefile / CMake 的编译选项组合。
+      过渡期模板中的部分选项应在<strong>完成代码修复后逐步移除</strong>；生产模板是长期推荐配置。
+    </p>
+
+    <!-- Scenario cards -->
+    <div class="scenario-grid">
+
+      <!-- Transition -->
+      <div class="scenario-card">
+        <div class="sc-head transition">&#128736; 过渡期兼容配置</div>
+        <div class="sc-body">
+          <p class="text-s" style="margin-bottom:10px">
+            适用于<strong>首次编译通过的过渡阶段</strong>。包含所有降级和兼容选项，确保旧代码能在新编译器下编译通过。
+            其中的选项应<strong>在修复代码后逐步移除</strong>。
+          </p>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">告警降级（P0 修复后移除）</div>
+            <pre># LLVM 16 默认 Error 的告警降级
+-Wno-error=implicit-function-declaration
+-Wno-error=implicit-int
+-Wno-error=incompatible-function-pointer-types
+-Wno-error=void-ptr-dereference
+
+# LLVM 20 新增的 Error 降级
+-Wno-error=extraneous-template-head
+-Wno-deprecated-literal-operator
+
+# LLVM 18+ 新告警抑制（视情况）
+-Wno-shorten-64-to-32
+-Wno-bitfield-constant-conversion</pre>
+          </div>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">语义兼容（审计代码后决定保留或移除）</div>
+            <pre># 指针溢出定义化（建议长期保留）
+-fwrapv-pointer
+
+# TBAA 禁用（修复 aliasing 违规后可移除）
+-fno-pointer-tbaa
+
+# Lifetime DSE 禁用（修复对象生命周期后可移除）
+-fno-lifetime-dse
+
+# ABI 兼容（保持旧 ABI，动态库过渡用）
+-fclang-abi-compat=15</pre>
+          </div>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">废弃选项替换</div>
+            <pre># -Ofast -> -O3 -ffast-math
+# -menable-unsafe-fp-math -> -ffast-math
+# GCC_INSTALL_PREFIX -> --gcc-install-dir=</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- Production -->
+      <div class="scenario-card">
+        <div class="sc-head production">&#9989; 生产环境推荐配置</div>
+        <div class="sc-body">
+          <p class="text-s" style="margin-bottom:10px">
+            适用于<strong>正式发布的生产构建</strong>。假设代码中已修复所有 P0 问题，仅保留必要的安全和语义选项。
+          </p>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">基础优化 + 安全</div>
+            <pre># 优化级别（按需选择）
+-O2                            # 或 -Os / -Oz
+
+# 指针溢出定义化
+-fwrapv-pointer
+
+# libc++ 快速加固（低开销）
+-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
+
+# 栈保护
+-fstack-protector-strong
+-D_FORTIFY_SOURCE=2</pre>
+          </div>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">AArch64 平台额外选项</div>
+            <pre># 控制流完整性保护
+-mbranch-protection=standard
+
+# Guarded Control Stack（硬件支持时）
+-Wl,-z,gcs
+
+# SVE 向量化（需要时显式指定）
+-march=armv9-a+sve2</pre>
+          </div>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">LTO 优化（需要时）</div>
+            <pre># ThinLTO
+-flto=thin -fsplit-lto-unit
+
+# 或 Full LTO
+-flto</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- CI Test -->
+      <div class="scenario-card">
+        <div class="sc-head citest">&#128300; CI 测试配置</div>
+        <div class="sc-body">
+          <p class="text-s" style="margin-bottom:10px">
+            适用于<strong>持续集成（CI）的调试和测试构建</strong>。启用全面的 Sanitizer 和检查，尽可能多地发现问题。
+          </p>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">全面 Sanitizer 检测</div>
+            <pre># Address + Undefined Behavior
+-fsanitize=address,undefined
+
+# 指针溢出专项检测
+-fsanitize=pointer-overflow
+
+# 内存错误检测
+-fsanitize=memory
+
+# 数值计算检测
+-fsanitize=numerical</pre>
+          </div>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">libc++ 扩展加固</div>
+            <pre># 扩展检查模式（CI 用）
+-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE
+
+# 调试模式额外检查
+-D_LIBCPP_DEBUG=1</pre>
+          </div>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">调试与覆盖率</div>
+            <pre># 调试信息
+-g -fno-omit-frame-pointer
+
+# 覆盖率检测（fuzzing / 测试）
+-fsanitize-coverage=trace-pc-guard
+-fsanitize-coverage-stack-depth-callback-min=32
+
+# 实验性元数据
+-fexperimental-sanitize-metadata=covered
+
+# 内联决策日志（调试用）
+-Rpass=inline -Rpass-missed=inline</pre>
+          </div>
+
+          <div class="example-box" style="margin:8px 0;padding:10px 14px">
+            <div class="label">严格告警（CI 用）</div>
+            <pre># 所有告警 + 告警即错误
+-Wall -Wextra -Wpedantic -Werror
+
+# 额外的类型安全告警
+-Wconversion -Wsign-conversion
+-Wshorten-64-to-32
+-Wimplicit-int-conversion</pre>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#128161; 使用建议</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li><strong>过渡期</strong>配置先在独立分支上验证编译通过，然后启动 P0 问题修复工作</li>
+        <li><strong>生产</strong>配置中 <code>-fwrapv-pointer</code> 建议长期保留（性能开销极低，安全性收益明显）</li>
+        <li><strong>CI</strong> 配置建议至少维护两套：一套"快速"（仅 ASan + UBSan）用于每个 PR，一套"全面"（所有 Sanitizer）用于 nightly</li>
+        <li><code>-fno-pointer-tbaa</code> 和 <code>-fno-lifetime-dse</code> 是临时保护措施，应在代码修复后移除</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ========== QUICK REFERENCE ========== -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">&#9889;</span>
+    <h2>关键选项速查对照表</h2>
+  </div>
+  <div class="section-body">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:30%">旧编译器 (LLVM 15) 的写法</th>
+          <th style="width:30%">新编译器 (LLVM 21) 的写法</th>
+          <th style="width:40%">备注</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>-Ofast</code></td>
+          <td><code>-O3 -ffast-math</code></td>
+          <td>语义完全等价，LLVM 18+ 废弃 <code>-Ofast</code></td>
+        </tr>
+        <tr>
+          <td><code>-menable-unsafe-fp-math</code></td>
+          <td><code>-ffast-math</code></td>
+          <td>LLVM 16 已移除</td>
+        </tr>
+        <tr>
+          <td><code>-fexperimental-new-pass-manager</code></td>
+          <td><strong>删除此行</strong></td>
+          <td>新 PM 已强制启用，无需显式指定</td>
+        </tr>
+        <tr>
+          <td><code>-fno-legacy-pass-manager</code></td>
+          <td><strong>删除此行</strong></td>
+          <td>旧 PM 已不存在</td>
+        </tr>
+        <tr>
+          <td><code>-fcoroutines-ts</code></td>
+          <td><strong>删除此行</strong>（改用标准 C++20 协程）</td>
+          <td>语法从 <code>&lt;experimental/coroutine&gt;</code> 迁移到 <code>&lt;coroutine&gt;</code></td>
+        </tr>
+        <tr>
+          <td><code>-fmodules-ts</code></td>
+          <td><strong>删除此行</strong>（改用标准 C++20 modules）</td>
+          <td>模块声明语法有差异，需逐处迁移</td>
+        </tr>
+        <tr>
+          <td><code>-fconcepts-ts</code></td>
+          <td><strong>删除此行</strong>（改用标准 C++20 concepts）</td>
+          <td>LLVM 16 已移除</td>
+        </tr>
+        <tr>
+          <td><code>GCC_INSTALL_PREFIX=/path</code></td>
+          <td><code>--gcc-install-dir=/path</code></td>
+          <td>CMake 配置变量名称变更</td>
+        </tr>
+        <tr>
+          <td><code>clang-rename</code></td>
+          <td>使用 clangd 或其他重构工具</td>
+          <td>LLVM 20 工具已移除</td>
+        </tr>
+        <tr>
+          <td><code>le32-unknown-nacl</code> / <code>le64-unknown-nacl</code></td>
+          <td>替换为实际目标三元组</td>
+          <td>LLVM 20 目标已移除</td>
+        </tr>
+        <tr>
+          <td><code>-enable-trivial-auto-var-init-zero-knowing-it-will-be-removed</code></td>
+          <td><code>-ftrivial-auto-var-init=zero</code></td>
+          <td>过渡期 flag 已按计划移除</td>
+        </tr>
+        <tr>
+          <td><code>-fwrapv</code>（仅此一个）</td>
+          <td><code>-fwrapv -fwrapv-pointer</code></td>
+          <td>LLVM 20 起 <code>-fwrapv</code> 不再覆盖指针溢出</td>
+        </tr>
+        <tr>
+          <td>无（新增选项）</td>
+          <td><code>-fstrict-flex-arrays=0</code></td>
+          <td>GCC 兼容模式，根据需要选择 strictness 级别</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</div><!-- /container -->
+
+<footer class="footer">
+  <p>专为数通产品线毕昇编译器升级工程编制 &middot; 仅供内部技术评估使用</p>
+  <p style="margin-top:4px;font-size:12px;opacity:.7">基于 LLVM 15.0.4 &#8594; 21.1.8 Release Notes 与 Options.td 差异分析 &middot; 2026-07-10</p>
+</footer>
+
+</body>
+</html>

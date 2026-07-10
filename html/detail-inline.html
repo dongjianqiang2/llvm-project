@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>内联差异详解 — 毕昇编译器升级</title>
+<style>
+  /* ===== 全局基础 ===== */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    background: #f4f6f9;
+    color: #2c3e50;
+    line-height: 1.75;
+    padding-bottom: 4rem;
+  }
+
+  /* ===== 页面头部 ===== */
+  .page-header {
+    background: linear-gradient(135deg, #0a2647 0%, #0d3b6e 40%, #0a2647 100%);
+    color: #fff;
+    padding: 2.5rem 2rem 2rem;
+    text-align: center;
+    border-bottom: 4px solid #d4a843;
+    position: relative;
+    overflow: hidden;
+  }
+  .page-header::after {
+    content: "";
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 4px;
+    background: linear-gradient(90deg, transparent, #d4a843, transparent);
+  }
+  .page-header h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    margin-bottom: 0.35rem;
+  }
+  .page-header .subtitle {
+    font-size: 1rem;
+    opacity: 0.8;
+    font-weight: 400;
+    color: #d4a843;
+  }
+
+  /* ===== 导航 ===== */
+  .nav-back {
+    background: #fff;
+    border-bottom: 1px solid #e0e4e8;
+    padding: 0.75rem 1.5rem;
+    text-align: center;
+  }
+  .nav-back a {
+    color: #0a2647;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.95rem;
+    transition: color 0.2s;
+  }
+  .nav-back a:hover { color: #d4a843; }
+
+  /* ===== 主内容区 ===== */
+  .main-container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+  }
+
+  /* ===== 章节卡片 ===== */
+  .section {
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(10,38,71,0.07);
+    margin-bottom: 2rem;
+    overflow: hidden;
+    border-left: 5px solid #d4a843;
+  }
+  .section-header {
+    background: #0a2647;
+    color: #fff;
+    padding: 1.2rem 1.5rem;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.8rem;
+  }
+  .section-header .section-number {
+    background: #d4a843;
+    color: #0a2647;
+    width: 2.2rem;
+    height: 2.2rem;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    font-size: 0.95rem;
+    flex-shrink: 0;
+    margin-top: 0.15rem;
+  }
+  .section-header h2 {
+    font-size: 1.25rem;
+    font-weight: 700;
+    line-height: 1.4;
+  }
+  .section-header .version-badge {
+    display: inline-block;
+    background: rgba(212,168,67,0.2);
+    color: #d4a843;
+    padding: 0.15rem 0.55rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  .section-body {
+    padding: 1.5rem;
+  }
+  .section-body p {
+    margin-bottom: 1rem;
+    color: #3a4a5c;
+    text-align: justify;
+  }
+  .section-body p:last-child { margin-bottom: 0; }
+
+  /* 小标签 */
+  .tag {
+    display: inline-block;
+    background: #e8f0fe;
+    color: #0a2647;
+    padding: 0.1rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+  .tag.impact-high {
+    background: #fde8e8;
+    color: #b91c1c;
+  }
+  .tag.impact-medium {
+    background: #fef3c7;
+    color: #92400e;
+  }
+  .tag.impact-low {
+    background: #d1fae5;
+    color: #065f46;
+  }
+
+  /* ===== 代码示例框 ===== */
+  .example-box {
+    background: #f8fafb;
+    border: 1px solid #dce3e8;
+    border-radius: 8px;
+    margin: 1.2rem 0;
+    overflow: hidden;
+  }
+  .example-box .example-title {
+    background: #eef2f5;
+    padding: 0.55rem 1rem;
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: #0a2647;
+    border-bottom: 1px solid #dce3e8;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .example-box .example-title::before {
+    content: "</>";
+    background: #0a2647;
+    color: #d4a843;
+    font-size: 0.7rem;
+    font-weight: 800;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+  }
+  .example-box pre {
+    margin: 0;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+    font-family: "Fira Code", "Cascadia Code", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.88rem;
+    line-height: 1.6;
+    background: #f8fafb;
+  }
+  .example-box .code-comment {
+    color: #6b8299;
+    font-style: italic;
+  }
+  .example-box .code-highlight {
+    color: #d4a843;
+    font-weight: 600;
+  }
+  .example-box .explanation {
+    background: #eef6ff;
+    border-top: 1px dashed #c0d4e8;
+    padding: 0.7rem 1.2rem;
+    font-size: 0.85rem;
+    color: #2c3e50;
+    line-height: 1.6;
+  }
+  .example-box .explanation strong {
+    color: #0a2647;
+  }
+
+  /* 代码内注释的简单着色（使用 span 包裹） */
+  .kw  { color: #9b2c8a; font-weight: 600; }
+  .fn  { color: #1a6fb5; }
+  .num { color: #b75d1e; }
+  .str { color: #3f7d3f; }
+  .cmt { color: #6b8299; font-style: italic; }
+  .att { color: #d4a843; font-weight: 600; }
+  .asm { color: #555; }
+
+  /* ===== 特别注意块 ===== */
+  .note-box {
+    background: #fff8e7;
+    border: 1px solid #f0d78c;
+    border-left: 4px solid #d4a843;
+    border-radius: 6px;
+    padding: 1rem 1.2rem;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+    color: #5c4a1e;
+    line-height: 1.6;
+  }
+  .note-box strong { color: #0a2647; }
+
+  .warning-box {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-left: 4px solid #ef4444;
+    border-radius: 6px;
+    padding: 1rem 1.2rem;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+    color: #7f1d1d;
+    line-height: 1.6;
+  }
+  .warning-box strong { color: #991b1b; }
+
+  /* ===== 汇总表格 ===== */
+  .summary-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  .summary-table thead th {
+    background: #0a2647;
+    color: #fff;
+    padding: 0.6rem 0.8rem;
+    text-align: left;
+    font-weight: 600;
+  }
+  .summary-table tbody td {
+    padding: 0.55rem 0.8rem;
+    border-bottom: 1px solid #e0e4e8;
+    vertical-align: top;
+  }
+  .summary-table tbody tr:nth-child(even) td {
+    background: #f8fafb;
+  }
+
+  /* ===== 页脚 ===== */
+  .page-footer {
+    text-align: center;
+    padding: 1.5rem;
+    color: #8899aa;
+    font-size: 0.82rem;
+    border-top: 1px solid #e0e4e8;
+    margin-top: 2rem;
+  }
+
+  /* ===== 响应式 ===== */
+  @media (max-width: 640px) {
+    .page-header h1 { font-size: 1.4rem; }
+    .section-header { flex-direction: column; gap: 0.5rem; }
+    .main-container { padding: 1rem 0.8rem; }
+    .section-body { padding: 1rem; }
+    .example-box pre { font-size: 0.78rem; padding: 0.8rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ========== 页面头部 ========== -->
+<header class="page-header">
+  <h1>内联差异详解 &mdash; 毕昇编译器升级</h1>
+  <p class="subtitle">LLVM 15 &rarr; 21 内联（Inlining）行为变化逐项剖析</p>
+</header>
+
+<!-- ========== 返回导航 ========== -->
+<nav class="nav-back">
+  <a href="index.html">&larr; 返回主页</a>
+</nav>
+
+<!-- ========== 主内容 ========== -->
+<div class="main-container">
+
+  <!-- ===== 概述 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">0</span>
+      <h2>概述：为什么内联行为会变化？</h2>
+    </div>
+    <div class="section-body">
+      <p>
+        内联（Inlining）是编译器最核心的优化之一。它决定了一个函数调用是保留为 <code>call</code> 指令
+        还是将函数体直接展开到调用点。正确的内联决策影响深远：过度内联导致代码膨胀、指令缓存压力增大；
+        内联不足则损失跨函数优化机会（常量传播、死代码消除、别名分析等）。
+      </p>
+      <p>
+        从 LLVM&nbsp;15 到 LLVM&nbsp;21，内联相关的提交超过 <strong>66&nbsp;次</strong>，
+        涵盖成本模型修正、启发式算法调整、机器学习模型引入、以及新语言特性的适配。
+        这些变化意味着同一份源码在升级后可能得到不同的内联结果，进而影响性能和二进制大小。
+      </p>
+      <p>
+        下表按影响力从高到低列出关键变化。
+      </p>
+      <table class="summary-table">
+        <thead>
+          <tr>
+            <th style="width:25%">变更</th>
+            <th style="width:15%">引入版本</th>
+            <th style="width:18%">影响范围</th>
+            <th>一句话说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>内联成本模型变化</strong></td>
+            <td>LLVM 15 &rarr; 21</td>
+            <td><span class="tag impact-high">高</span></td>
+            <td>66+ 次 InlineCost 修改，阈值与计算方式持续演进</td>
+          </tr>
+          <tr>
+            <td><strong>Switch 默认分支成本修正</strong></td>
+            <td>LLVM 18</td>
+            <td><span class="tag impact-medium">中</span></td>
+            <td>default 分支成本计算更准确，影响大 switch 的内联</td>
+          </tr>
+          <tr>
+            <td><strong>ML-inliner 稳定化</strong></td>
+            <td>LLVM 16</td>
+            <td><span class="tag impact-medium">中</span></td>
+            <td>机器学习模型可在 release 模式下使用</td>
+          </tr>
+          <tr>
+            <td><strong>内联汇编成本计入</strong></td>
+            <td>LLVM 21</td>
+            <td><span class="tag impact-medium">中</span></td>
+            <td>inline asm 的指令体积参与内联决策</td>
+          </tr>
+          <tr>
+            <td><strong>__memcpy_chk 折叠罚分移除</strong></td>
+            <td>LLVM 20</td>
+            <td><span class="tag impact-medium">中</span></td>
+            <td>安全检查内置函数不再被错误惩罚</td>
+          </tr>
+          <tr>
+            <td><strong>递归函数内联优化</strong></td>
+            <td>LLVM 20</td>
+            <td><span class="tag impact-low">低</span></td>
+            <td>尾递归可转换为迭代后被内联</td>
+          </tr>
+          <tr>
+            <td><strong>冷热路径分离</strong></td>
+            <td>持续演进</td>
+            <td><span class="tag impact-medium">中</span></td>
+            <td>冷路径更少被内联，缩小热代码体积</td>
+          </tr>
+          <tr>
+            <td><strong>store-to-load forwarding</strong></td>
+            <td>LLVM 21</td>
+            <td><span class="tag impact-low">低</span></td>
+            <td>内联后通过存储转发消除内存访问</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===== 1. 内联成本模型变化 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">1</span>
+      <h2>内联成本模型变化 <span class="version-badge">LLVM 15 &rarr; 21</span></h2>
+    </div>
+    <div class="section-body">
+      <p>
+        编译器的内联器（Inliner）对每个可内联的调用点计算一个"成本"和一个"收益"，
+        当收益大于成本时执行内联。<strong>InlineCost</strong> 是这一决策的核心模块。
+        LLVM&nbsp;15 到 LLVM&nbsp;21 之间，<code>InlineCost.cpp</code>
+        经历了 <strong>66&nbsp;次以上</strong>的修改，涵盖：
+      </p>
+      <ul style="margin: 0.5rem 0 0.5rem 1.5rem; line-height: 1.9;">
+        <li>指令成本权重的重新校准（如 <code>call</code>、<code>alloca</code>、<code>getelementptr</code> 的代价）</li>
+        <li>简化基本块（simplified BB）的成本估算改进</li>
+        <li>对 <code>select</code> / <code>phi</code> 节点处理的修正</li>
+        <li>函数属性（<code>norecurse</code>、<code>nosync</code> 等）对内联决策的影响</li>
+        <li>新指令类型的成本纳入（如 <code>llvm.experimental.*</code> 内建函数）</li>
+      </ul>
+
+      <div class="example-box">
+        <div class="example-title">示例 1：成本模型变化导致内联决策翻转</div>
+<pre><span class="cmt">// ========== 被调用方: util.cpp ==========</span>
+<span class="kw">int</span> <span class="fn">compute_offset</span>(<span class="kw">int</span> base, <span class="kw">int</span> stride) {
+    <span class="kw">int</span> tmp = base * stride;               <span class="cmt">// mul:  低成本指令</span>
+    <span class="kw">int</span> arr[4] = {tmp, tmp+1, tmp+2, tmp+3}; <span class="cmt">// alloca + 4 stores:  成本较高</span>
+    <span class="kw">int</span> result = arr[0];
+    <span class="kw">for</span> (<span class="kw">int</span> i = 1; i &lt; 4; i++)          <span class="cmt">// loop:  LLVM 15 可能简化后认为成本可接受</span>
+        result += arr[i];                  <span class="cmt">//         LLVM 21 的简化模型可能更精确</span>
+    <span class="kw">return</span> result;
+}
+
+<span class="cmt">// ========== 调用方: main.cpp ==========</span>
+<span class="kw">void</span> <span class="fn">process</span>() {
+    <span class="cmt">// LLVM 15: compute_offset 在 -O2 下可能被内联</span>
+    <span class="cmt">// LLVM 21: 成本模型中 alloca + loop 的权重变化,</span>
+    <span class="cmt">//          结果可能从"内联"变为"不内联"</span>
+    <span class="kw">int</span> off = compute_offset(100, 4);
+    do_something(off);
+}</pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>内联器就像一个会计，它给每条指令记账。
+          LLVM&nbsp;15 的"价目表"和 LLVM&nbsp;21 的"价目表"不同，
+          导致同一个函数在两个版本中可能获得不同的"报价"。
+          价格适中的就内联，太贵的就保留调用。
+        </div>
+      </div>
+
+      <div class="note-box">
+        <strong>注意：</strong><code>__attribute__((always_inline))</code> 标记的函数
+        <strong>不受成本模型影响</strong>，无论成本多高都会强制内联。
+        因此对性能极其敏感的小函数，建议显式加入此标记以确保行为稳定。
+      </div>
+
+      <div class="example-box">
+        <div class="example-title">示例 2：always_inline 不受影响</div>
+<pre><span class="cmt">// always_inline:  无论 LLVM 版本如何, 始终被内联</span>
+<span class="att">__attribute__((always_inline))</span>
+<span class="kw">inline int</span> <span class="fn">add</span>(<span class="kw">int</span> a, <span class="kw">int</span> b) {
+    <span class="kw">return</span> a + b;
+}
+
+<span class="cmt">// 普通 inline:  编译器自行决定, 受成本模型影响</span>
+<span class="kw">inline int</span> <span class="fn">multiply</span>(<span class="kw">int</span> a, <span class="kw">int</span> b) {
+    <span class="kw">return</span> a * b;
+}
+
+<span class="kw">int</span> <span class="fn">caller</span>(<span class="kw">int</span> x, <span class="kw">int</span> y) {
+    <span class="cmt">// add()     → 始终内联 (always_inline)</span>
+    <span class="cmt">// multiply() → 取决于 LLVM 版本的成本模型</span>
+    <span class="kw">return</span> add(x, y) + multiply(x, y);
+}</pre>
+      </div>
+
+      <div class="warning-box">
+        <strong>升级建议：</strong>如果你发现升级后性能下降，很可能是关键热函数不再被内联。
+        请使用 <code>-Rpass=inline</code> 和 <code>-Rpass-missed=inline</code> 对比两个版本的内联决策日志，
+        定位具体是哪个函数的内联行为发生了变化。
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 2. Switch 语句默认分支成本修正 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">2</span>
+      <h2>Switch 语句默认分支成本修正 <span class="version-badge">LLVM 18</span></h2>
+    </div>
+    <div class="section-body">
+      <p>
+        在 LLVM&nbsp;17 及更早版本中，<code>switch</code> 语句的 <code>default</code> 分支
+        在计算内联成本时被低估或忽略。这导致包含大量 <code>case</code> 的 switch 函数
+        ——例如协议分发器、状态机处理器——被不恰当地内联，造成代码膨胀。
+      </p>
+      <p>
+        LLVM&nbsp;18 修复了这一问题：<code>default</code> 分支的成本现在被准确计入，
+        使得内联器对这些函数做出更合理的决策。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">示例：协议分发函数中的大 switch</div>
+<pre><span class="cmt">// 协议处理函数 — 含大量 case 的 switch</span>
+<span class="kw">int</span> <span class="fn">handle_packet</span>(PacketType type) {
+    <span class="kw">switch</span> (type) {
+        <span class="kw">case</span> TYPE_CONNECT:    <span class="kw">return</span> process_connect();
+        <span class="kw">case</span> TYPE_DATA:       <span class="kw">return</span> process_data();
+        <span class="kw">case</span> TYPE_ACK:        <span class="kw">return</span> process_ack();
+        <span class="kw">case</span> TYPE_NACK:       <span class="kw">return</span> process_nack();
+        <span class="kw">case</span> TYPE_KEEPALIVE:  <span class="kw">return</span> process_keepalive();
+        <span class="kw">case</span> TYPE_HANDSHAKE:  <span class="kw">return</span> process_handshake();
+        <span class="kw">case</span> TYPE_AUTH:       <span class="kw">return</span> process_auth();
+        <span class="kw">case</span> TYPE_DISCONNECT: <span class="kw">return</span> process_disconnect();
+        <span class="kw">case</span> TYPE_ERROR:      <span class="kw">return</span> process_error();
+        <span class="kw">case</span> TYPE_TIMEOUT:    <span class="kw">return</span> process_timeout();
+        <span class="cmt">// ... 可能还有几十个 case</span>
+        <span class="kw">default</span>:
+            log_unknown(type);        <span class="cmt">// default 分支</span>
+            <span class="kw">return</span> -1;
+    }
+}
+
+<span class="kw">void</span> <span class="fn">dispatch</span>(PacketType type, Packet* pkt) {
+    <span class="cmt">// LLVM 17: default 分支代价被低估</span>
+    <span class="cmt">//          → handle_packet 可能被内联到 dispatch 中</span>
+    <span class="cmt">//          → 二进制膨胀明显（每个调用点一份完整 switch）</span>
+    <span class="cmt">//</span>
+    <span class="cmt">// LLVM 18: default 分支代价被正确计入</span>
+    <span class="cmt">//          → handle_packet 更倾向于保留为 call 指令</span>
+    <span class="cmt">//          → 缩小代码体积的同时, 减少指令缓存 miss</span>
+    <span class="kw">int</span> result = handle_packet(type);
+    <span class="kw">if</span> (result != 0) cleanup(pkt);
+}</pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>一个大 switch 就像一个有很多房间的走廊。
+          LLVM&nbsp;17 只计算了走廊的长度，忘了还有一个"其他门"（default）。
+          LLVM&nbsp;18 补上了这个计算，发现走廊太长就不把整个房子搬进客厅了。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 3. ML-inliner 稳定化 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">3</span>
+      <h2>ML-inliner 稳定化 <span class="version-badge">LLVM 16</span></h2>
+    </div>
+    <div class="section-body">
+      <p>
+        ML-inliner 是 LLVM 中基于机器学习模型的内联决策模块。它使用 TensorFlow 或 ONNX
+        模型替代传统手工调参的启发式算法。LLVM&nbsp;16 起，ML-inliner 在
+        <strong>release 构建模式下</strong>可作为稳定特性使用。
+      </p>
+      <p>
+        传统内联器使用固定的"成本-收益"公式；ML-inliner 则提取调用点和被调用函数的特征
+        （函数大小、调用深度、循环嵌套、参数常量性等），交给训练好的模型输出"内联/不内联"决策。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">示例：吞吐敏感函数可能被更积极内联</div>
+<pre><span class="cmt">// 场景：一个频繁调用的轻量包装函数</span>
+<span class="kw">static</span> <span class="kw">int</span> <span class="fn">scale_value</span>(<span class="kw">int</span> val, <span class="kw">int</span> factor) {
+    <span class="kw">return</span> (val * factor) &gt;&gt; 10;
+}
+
+<span class="kw">void</span> <span class="fn">process_stream</span>(<span class="kw">int</span>* data, <span class="kw">int</span> count) {
+    <span class="kw">for</span> (<span class="kw">int</span> i = 0; i &lt; count; i++) {
+        <span class="cmt">// 传统模型: 依据函数体大小和调用频率判断</span>
+        <span class="cmt">// ML 模型:  还会考虑以下特征:</span>
+        <span class="cmt">//   - 调用点在循环内 (用循环深度 +1 作为特征)</span>
+        <span class="cmt">//   - 被调用函数无副作用 (norecurse/nounwind)</span>
+        <span class="cmt">//   - 参数 'val' 来自内存加载, 内联后可能被 SROA 消除</span>
+        <span class="cmt">//</span>
+        <span class="cmt">// 结果: ML 模型倾向于内联此调用, 即使传统模型可能拒绝</span>
+        data[i] = scale_value(data[i], factor_lut[i]);
+    }
+}</pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>传统方法像是用计算器算账，ML 模型则像一个经验丰富的老师傅，
+          能看一眼就知道"这个函数该不该内联"。ML 模型学到的模式可能比手工规则更精准，
+          尤其对吞吐敏感的热循环函数。
+        </div>
+      </div>
+
+      <div class="note-box">
+        <strong>启用方式：</strong>ML-inliner 需要通过 <code>-mllvm -enable-ml-inliner=release</code>
+        在 Clang 中显式开启。默认情况下 LLVM 仍使用传统内联器。
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 4. 内联汇编指令影响内联成本 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">4</span>
+      <h2>内联汇编指令影响内联成本 <span class="version-badge">LLVM 21</span></h2>
+    </div>
+    <div class="section-body">
+      <p>
+        在 LLVM&nbsp;20 及之前，内联汇编（<code>__asm__ volatile</code>）指令
+        在内联成本计算中不被计入。这导致包含大量内联汇编的函数可能被过度内联，
+        实际展开后的代码体积远超预期。
+      </p>
+      <p>
+        LLVM&nbsp;21 修正了这一问题：内联汇编的指令条数现在参与成本计算，
+        使得内联决策更加合理。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">示例：嵌入式驱动中的寄存器写入</div>
+<pre><span class="cmt">// 嵌入式驱动中常见的内联汇编包装函数</span>
+<span class="kw">static inline void</span> <span class="fn">write_reg</span>(<span class="kw">uint32_t</span> addr, <span class="kw">uint32_t</span> val) {
+    <span class="kw">__asm__ volatile</span>(
+        <span class="str">"str %1, [%0]"</span>
+        :
+        : <span class="str">"r"</span>(addr), <span class="str">"r"</span>(val)
+        : <span class="str">"memory"</span>
+    );
+}
+
+<span class="kw">static inline void</span> <span class="fn">init_peripheral</span>() {
+    write_reg(REG_CLOCK,   0x01);   <span class="cmt">// 每条 write_reg 调用有一行汇编</span>
+    write_reg(REG_POWER,   0x03);   <span class="cmt">// LLVM 20: 内联汇编成本 = 0</span>
+    write_reg(REG_MODE,    0x10);   <span class="cmt">//          → 可能被无条件内联</span>
+    write_reg(REG_ENABLE,  0x01);   <span class="cmt">//</span>
+}                                   <span class="cmt">// LLVM 21: 内联汇编成本 = 实际指令数</span>
+                                    <span class="cmt">//          → 内联决策更合理</span></pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>过去编译器看到 <code>__asm__</code> 就当看不见，
+          以为它不占地方。LLVM&nbsp;21 终于开始"算账"了，内联汇编的行数被计入成本，
+          嵌入式驱动这类大量使用汇编包装函数的场景受益最大。
+        </div>
+      </div>
+
+      <div class="example-box">
+        <div class="example-title">示例：带 clobber 的复杂内联汇编</div>
+<pre><span class="cmt">// AArch64 上的原子操作包装</span>
+<span class="kw">static inline uint64_t</span> <span class="fn">atomic_fetch_add</span>(<span class="kw">uint64_t</span>* ptr, <span class="kw">uint64_t</span> val) {
+    <span class="kw">uint64_t</span> old, temp;
+    <span class="kw">__asm__ volatile</span>(
+        <span class="str">"1: ldxr %0, [%3]\n"</span>
+        <span class="str">"   add  %1, %0, %4\n"</span>
+        <span class="str">"   stxr %w2, %1, [%3]\n"</span>
+        <span class="str">"   cbnz %w2, 1b"</span>
+        : <span class="str">"=&r"</span>(old), <span class="str">"=&r"</span>(temp), <span class="str">"=&r"</span>(<span class="kw">int</span>){1}
+        : <span class="str">"r"</span>(ptr), <span class="str">"r"</span>(val)
+        : <span class="str">"memory", "cc"</span>
+    );
+    <span class="kw">return</span> old;
+}
+<span class="cmt">// 这个函数有 4 条 ARM 汇编指令</span>
+<span class="cmt">// LLVM 20: 内联成本 = C++ 部分 (几乎为 0)</span>
+<span class="cmt">// LLVM 21: 内联成本 = C++ 部分 + 4 条 asm 指令的估算代价</span>
+<span class="cmt">//          → 在深层调用链中更不容易被内联 → 减少总体代码体积</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 5. __memcpy_chk 等折叠不再增加罚分 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">5</span>
+      <h2>__memcpy_chk 等折叠不再增加罚分 <span class="version-badge">LLVM 20</span></h2>
+    </div>
+    <div class="section-body">
+      <p>
+        <code>__memcpy_chk</code>、<code>__memset_chk</code>、<code>__memmove_chk</code>
+        等是编译器在启用 <code>-D_FORTIFY_SOURCE</code> 时插入的安全检查包装函数。
+        它们在优化阶段通常被折叠（fold）为普通的 <code>llvm.memcpy</code> 等内部指令。
+      </p>
+      <p>
+        LLVM&nbsp;19 及之前，内联器在计算成本时无法识别这些将被折叠的调用，
+        从而错误地"惩罚"包含这些调用的函数，导致它们不被内联。
+        LLVM&nbsp;20 修复了这个问题：内联器识别这些调用会在后续优化中被消除，
+        不再将其计入成本。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">示例：FORTIFY_SOURCE 场景</div>
+<pre><span class="cmt">// 编译选项: -O2 -D_FORTIFY_SOURCE=2</span>
+<span class="cmt">// 源码中的 memcpy 被编译器替换为 __memcpy_chk</span>
+
+<span class="kw">void</span> <span class="fn">serialize_header</span>(<span class="kw">char</span>* buf, <span class="kw">const</span> Header* hdr) {
+    <span class="cmt">// 用户写的代码:</span>
+    memcpy(buf, hdr, <span class="kw">sizeof</span>(Header));
+
+    <span class="cmt">// 编译器实际生成的 IR (简化示意):</span>
+    <span class="cmt">//   call __memcpy_chk(buf, hdr, sizeof(Header), __builtin_object_size(buf, 0))</span>
+    <span class="cmt">//</span>
+    <span class="cmt">// LLVM 19: __memcpy_chk 调用被计入内联成本</span>
+    <span class="cmt">//          → serialize_header 可能被视为"太贵"而不内联</span>
+    <span class="cmt">//</span>
+    <span class="cmt">// LLVM 20: 内联器识别到 __memcpy_chk 将在后续优化中被折叠为</span>
+    <span class="cmt">//          llvm.memcpy → 不计入成本 → 内联决策更合理</span>
+
+    buf[<span class="kw">sizeof</span>(Header)] = <span class="str">'\0'</span>;
+}
+
+<span class="kw">void</span> <span class="fn">send_message</span>(<span class="kw">const</span> Header* hdr) {
+    <span class="kw">char</span> buffer[256];
+    <span class="cmt">// serialize_header 在 LLVM 20 中更可能被内联</span>
+    serialize_header(buffer, hdr);
+    send_to_socket(buffer);
+}</pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>编译器之前看到 <code>__memcpy_chk</code> 就以为这是个很重的函数调用，
+          不敢内联。实际上这些安全检查函数在优化阶段会被简化成普通的 <code>memcpy</code>。
+          LLVM&nbsp;20 认识到了这一点，不再"错怪"它们。
+        </div>
+      </div>
+
+      <div class="example-box">
+        <div class="example-title">示例：受影响的函数列表</div>
+<pre><span class="cmt">// 以下内置函数在 LLVM 20 中不再增加内联罚分：</span>
+
+<span class="kw">void</span> <span class="fn">example_all</span>(<span class="kw">void</span>* dst, <span class="kw">const void</span>* src, <span class="kw">size_t</span> n) {
+    __memcpy_chk(dst, src, n, __builtin_object_size(dst, 0));  <span class="cmt">// ✓ 不再罚分</span>
+    __memmove_chk(dst, src, n, __builtin_object_size(dst, 0)); <span class="cmt">// ✓</span>
+    __memset_chk(dst, 0, n, __builtin_object_size(dst, 0));    <span class="cmt">// ✓</span>
+    __strcpy_chk((<span class="kw">char</span>*)dst, (<span class="kw">const char</span>*)src,
+                 __builtin_object_size(dst, 1));               <span class="cmt">// ✓</span>
+    __stpcpy_chk((<span class="kw">char</span>*)dst, (<span class="kw">const char</span>*)src,
+                 __builtin_object_size(dst, 1));               <span class="cmt">// ✓</span>
+    <span class="cmt">// 等等 —— 所有 _chk 变体均受影响</span>
+}</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 6. 递归函数内联优化 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">6</span>
+      <h2>递归函数内联优化 <span class="version-badge">LLVM 20</span></h2>
+    </div>
+    <div class="section-body">
+      <p>
+        传统上，递归函数不能被内联——因为那会导致无限展开。LLVM&nbsp;20 增强了对
+        <strong>尾递归</strong>（tail recursion）模式的识别能力：
+        当检测到尾递归模式时，先将递归转换为等价的迭代循环，
+        然后对转换后的函数体执行常规内联分析。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">示例 1：尾递归被转换为迭代后内联</div>
+<pre><span class="cmt">// 尾递归形式的阶乘 (不是好的实践, 仅为演示)</span>
+<span class="kw">static int</span> <span class="fn">factorial_tail</span>(<span class="kw">int</span> n, <span class="kw">int</span> acc) {
+    <span class="kw">if</span> (n &lt;= 1) <span class="kw">return</span> acc;
+    <span class="kw">return</span> factorial_tail(n - 1, acc * n);  <span class="cmt">// 尾递归调用</span>
+}
+
+<span class="kw">int</span> <span class="fn">factorial</span>(<span class="kw">int</span> n) {
+    <span class="cmt">// LLVM 19:  尾递归识别后转为迭代, 但内联分析保守</span>
+    <span class="cmt">// LLVM 20:  转换为迭代后, 若循环体足够小, 可被内联</span>
+    <span class="cmt">//</span>
+    <span class="cmt">// 等价的迭代形式 (LLVM 自动生成):</span>
+    <span class="cmt">//   int acc = 1;</span>
+    <span class="cmt">//   while (n > 1) { acc *= n; n--; }</span>
+    <span class="cmt">//   return acc;</span>
+    <span class="kw">return</span> factorial_tail(n, 1);
+}
+
+<span class="kw">void</span> <span class="fn">compute</span>() {
+    <span class="cmt">// 在 LLVM 20 中, factorial(5) 的整个计算可能被</span>
+    <span class="cmt">// 内联 + 常量折叠为 return 120</span>
+    <span class="kw">int</span> result = factorial(5);
+    use_result(result);
+}</pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>递归就像俄罗斯套娃，一层套一层。编译器以前看到套娃就放弃了。
+          现在它学会了把套娃拆开重新排列成一个环（循环），然后判断这个环是否小到可以塞进调用者体内。
+        </div>
+      </div>
+
+      <div class="example-box">
+        <div class="example-title">示例 2：链表遍历中的尾递归</div>
+<pre><span class="kw">struct</span> Node { <span class="kw">int</span> value; Node* next; };
+
+<span class="cmt">// 尾递归形式的链表求和</span>
+<span class="kw">static int</span> <span class="fn">sum_list_tail</span>(Node* node, <span class="kw">int</span> acc) {
+    <span class="kw">if</span> (!node) <span class="kw">return</span> acc;
+    <span class="kw">return</span> sum_list_tail(node->next, acc + node->value);  <span class="cmt">// 尾递归</span>
+}
+
+<span class="kw">int</span> <span class="fn">total</span>(Node* head) {
+    <span class="cmt">// LLVM 20 先转换尾递归为循环, 然后根据循环复杂度决定是否内联</span>
+    <span class="kw">return</span> sum_list_tail(head, 0);
+}</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 7. 冷热路径分离 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">7</span>
+      <h2>冷热路径分离</h2>
+    </div>
+    <div class="section-body">
+      <p>
+        从 LLVM&nbsp;16 开始，内联器逐步增强对<strong>冷热路径</strong>的辨别能力。
+        标记为 <code>__attribute__((cold))</code> 的代码路径，以及由
+        Profile-Guided Optimization（PGO）识别为低频执行的路径，
+        在内联决策中会受到"压制"——即更倾向于保留为函数调用而非内联。
+      </p>
+      <p>
+        这么做的好处是显著<strong>减小热路径代码体积</strong>，提升指令缓存命中率。
+        错误处理、初始化失败路径、异常处理等冷代码不再膨胀热代码段。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">示例：冷路径更少被内联</div>
+<pre><span class="cmt">// 错误处理函数: 带 cold 属性</span>
+<span class="att">__attribute__((cold))</span>
+<span class="kw">static void</span> <span class="fn">handle_error</span>(<span class="kw">int</span> code) {
+    log_error(code);
+    cleanup_resources();
+    <span class="kw">if</span> (code == FATAL) abort();
+}
+
+<span class="cmt">// 正常处理函数: 不带 cold 属性</span>
+<span class="kw">static void</span> <span class="fn">do_work</span>(WorkItem* item) {
+    transform(item);
+    validate(item);
+}
+
+<span class="kw">void</span> <span class="fn">process</span>(WorkItem* item) {
+    <span class="cmt">// ===== 热路径 (hot) =====</span>
+    <span class="cmt">// do_work 不带 cold 属性</span>
+    <span class="cmt">// → 内联器倾向于内联（如果它足够小）</span>
+    do_work(item);
+
+    <span class="cmt">// ===== 冷路径 (cold) =====</span>
+    <span class="cmt">// handle_error 带 cold 属性</span>
+    <span class="cmt">// → 内联器倾向于保留为 call 指令</span>
+    <span class="cmt">// → 热代码路径体积减小, 指令缓存更高效</span>
+    <span class="kw">if</span> (__builtin_expect(item->error != 0, 0)) {
+        handle_error(item->error);
+    }
+}</pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>编译器像一个厨师，把常用的食材（热路径）放在案板上（内联到调用点），
+          不常用的食材（冷路径）留在冰箱里（保留为函数调用，需要时再取）。
+          案板整洁了，做菜（执行代码）就快了。
+        </div>
+      </div>
+
+      <div class="example-box">
+        <div class="example-title">示例：PGO 驱动冷热分离</div>
+<pre><span class="cmt">// 编译步骤:</span>
+<span class="cmt">//   1. clang -O2 -fprofile-generate -o prog prog.c</span>
+<span class="cmt">//   2. ./prog  (训练运行, 生成 .profraw)</span>
+<span class="cmt">//   3. llvm-profdata merge -o prog.profdata *.profraw</span>
+<span class="cmt">//   4. clang -O2 -fprofile-use=prog.profdata -o prog prog.c</span>
+
+<span class="kw">void</span> <span class="fn">parse_config</span>(<span class="kw">const char</span>* file) {
+    <span class="kw">int</span> fd = open(file, O_RDONLY);
+    <span class="kw">if</span> (fd &lt; 0) {
+        <span class="cmt">// 冷路径: 文件打开失败 (PGO 发现执行频率极低)</span>
+        <span class="cmt">// → 内联器降低此路径的内联倾向</span>
+        report_open_error(file);
+        <span class="kw">return</span>;
+    }
+    <span class="cmt">// 热路径: 正常解析 (PGO 发现执行频率极高)</span>
+    <span class="cmt">// → 内联器保持正常判断</span>
+    parse_and_apply(fd);
+    close(fd);
+}</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 8. store-to-load forwarding 优化 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">8</span>
+      <h2>store-to-load forwarding 优化 <span class="version-badge">LLVM 21</span></h2>
+    </div>
+    <div class="section-body">
+      <p>
+        当一个函数被内联后，调用点传给函数参数的值（通常通过寄存器传递）可能在函数体内
+        被写入栈（store），随后又从栈读取（load）。LLVM&nbsp;21 的内联器在计算"内联的收益"时，
+        更加精确地预估了内联后 <strong>store-to-load forwarding</strong>（存储到加载转发）
+        能消除的内存访问次数。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">示例：内联后消除冗余内存访问</div>
+<pre><span class="cmt">// 被调用函数: 参数以值传递</span>
+<span class="kw">static int</span> <span class="fn">apply_factor</span>(<span class="kw">int</span> value, <span class="kw">int</span> factor) {
+    <span class="cmt">// 未内联时:  value 存储在栈上 (%stack_value)</span>
+    <span class="cmt">//            factor 存储在栈上 (%stack_factor)</span>
+    <span class="cmt">//            每次使用都要 load</span>
+    <span class="kw">int</span> scaled  = value * factor;       <span class="cmt">// load value, load factor → mul</span>
+    <span class="kw">int</span> offset  = value + factor;       <span class="cmt">// load value, load factor → add</span>
+    <span class="kw">int</span> shifted = (value &lt;&lt; factor);    <span class="cmt">// load value, load factor → shl</span>
+    <span class="kw">return</span> scaled + offset + shifted;
+}
+
+<span class="kw">int</span> <span class="fn">caller</span>(<span class="kw">int</span> a) {
+    <span class="cmt">// 内联后:  a 的值在寄存器 %r0 中</span>
+    <span class="cmt">//          LLVM 21 预估到:</span>
+    <span class="cmt">//            无需 spill+reload a 到栈</span>
+    <span class="cmt">//            直接使用寄存器值进行计算</span>
+    <span class="cmt">//          → 消除 6 次 load, 显著节省指令</span>
+    <span class="kw">return</span> apply_factor(a, 3);
+}
+
+<span class="cmt">// 更直观的对比 (LLVM IR 层面):</span>
+<span class="cmt">//</span>
+<span class="cmt">// 未内联的 apply_factor (简化):</span>
+<span class="cmt">//   store %value, %stack_value       ← spill</span>
+<span class="cmt">//   store %factor, %stack_factor     ← spill</span>
+<span class="cmt">//   %v1 = load %stack_value          ← reload</span>
+<span class="cmt">//   %f1 = load %stack_factor         ← reload</span>
+<span class="cmt">//   %mul = mul %v1, %f1</span>
+<span class="cmt">//   %v2 = load %stack_value          ← reload</span>
+<span class="cmt">//   %f2 = load %stack_factor         ← reload</span>
+<span class="cmt">//   %add = add %v2, %f2</span>
+<span class="cmt">//   ... (更多 reload)</span>
+<span class="cmt">//</span>
+<span class="cmt">// 内联到 caller 后:</span>
+<span class="cmt">//   %mul = mul %a, 3                 ← 直接使用寄存器</span>
+<span class="cmt">//   %add = add %a, 3                 ← 直接使用寄存器</span>
+<span class="cmt">//   %shl = shl %a, 3                 ← 直接使用寄存器</span>
+<span class="cmt">//   ... (零次 spill/reload)</span></pre>
+        <div class="explanation">
+          <strong>通俗解释：</strong>没有内联时，参数传递像寄信——要封装（spill 到栈）再拆封（load 到寄存器）。
+          内联后参数直接在函数内部可见，LLVM&nbsp;21 能更好地评估这种"免邮费"带来的收益，
+          从而对这类函数做出更积极的内联决策。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 9. 内联决策查看方法 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">9</span>
+      <h2>内联决策查看方法</h2>
+    </div>
+    <div class="section-body">
+      <p>
+        要分析内联行为变化，最直接的方法是让编译器报告它的内联决策。
+        Clang 提供了 <code>-Rpass</code> 系列诊断选项。
+      </p>
+
+      <div class="example-box">
+        <div class="example-title">基础用法</div>
+<pre><span class="cmt"># 只查看成功内联的决策</span>
+clang -O2 -Rpass=inline file.cpp -c
+
+<span class="cmt"># 只查看内联失败 (未内联) 的决策</span>
+clang -O2 -Rpass-missed=inline file.cpp -c
+
+<span class="cmt"># 同时查看成功和失败的内联决策</span>
+clang -O2 -Rpass=inline -Rpass-missed=inline file.cpp -c</pre>
+      </div>
+
+      <div class="example-box">
+        <div class="example-title">输出示例与解读</div>
+<pre><span class="cmt"># 成功内联的典型输出:</span>
+<span class="cmt"># file.cpp:42:5: remark: 'compute_offset' inlined into 'process'</span>
+<span class="cmt">#   with (cost=15, threshold=35) [-Rpass=inline]</span>
+<span class="cmt">#</span>
+<span class="cmt"># 解读: compute_offset 的内联成本为 15,</span>
+<span class="cmt">#       低于阈值 35 → 被内联</span>
+
+<span class="cmt"># 内联失败的典型输出:</span>
+<span class="cmt"># file.cpp:58:10: remark: 'handle_packet' not inlined into 'dispatch'</span>
+<span class="cmt">#   because it should never be inlined</span>
+<span class="cmt">#   (cost=never): function too large [-Rpass-missed=inline]</span>
+<span class="cmt">#</span>
+<span class="cmt"># 解读: handle_packet 的函数体太大,</span>
+<span class="cmt">#       内联器判定成本不合算 → 不内联</span></pre>
+      </div>
+
+      <div class="example-box">
+        <div class="example-title">对比 LLVM 15 和 LLVM 21 的内联决策差异</div>
+<pre><span class="cmt"># 用两个编译器分别编译相同的优化后的源码，对比差异：</span>
+
+<span class="cmt"># 使用 LLVM 15 工具链</span>
+clang-15 -O2 -Rpass=inline -Rpass-missed=inline file.cpp -c 2&gt;inline_llvm15.log
+
+<span class="cmt"># 使用 LLVM 21 工具链</span>
+clang-21 -O2 -Rpass=inline -Rpass-missed=inline file.cpp -c 2&gt;inline_llvm21.log
+
+<span class="cmt"># 对比两者差异 (简化 shell 脚本示意)</span>
+<span class="cmt"># 提取函数名, 排序后对比</span>
+grep -oP <span class="str">"'[^']+' (inlined|not inlined)"</span> inline_llvm15.log | sort &gt; /tmp/15.txt
+grep -oP <span class="str">"'[^']+' (inlined|not inlined)"</span> inline_llvm21.log | sort &gt; /tmp/21.txt
+diff /tmp/15.txt /tmp/21.txt</pre>
+        <div class="explanation">
+          <strong>提示：</strong>如果有大量文件需要对比，建议写一个自动化脚本，
+          对每个编译单元收集内联日志并汇总统计。重点关注热函数（通过 perf/flamegraph 识别）
+          的内联状态变化。
+        </div>
+      </div>
+
+      <div class="note-box">
+        <strong>进阶技巧：</strong>
+        <ul style="margin: 0.5rem 0 0 1.2rem; line-height: 1.8;">
+          <li>使用 <code>-Rpass-analysis=inline</code> 获取更详细的内联分析（包括成本分解）</li>
+          <li>使用 <code>-mllvm -print-after=inline</code> 查看内联 pass 执行后的 IR 变化</li>
+          <li>使用 <code>-fdiagnostics-show-hotness</code> 让 PGO 热信息出现在 remark 中</li>
+          <li>使用 <code>llvm-remark-size-diff</code> 工具对比两个编译的内联差别</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 总结 ===== -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-number">&infin;</span>
+      <h2>总结</h2>
+    </div>
+    <div class="section-body">
+      <p>
+        LLVM&nbsp;15 到 LLVM&nbsp;21 之间，内联子系统经历了多维度、持续性的改进。
+        这些变化的总趋势是使内联决策<strong>更加精确</strong>——更少地过度内联（减少代码膨胀），
+        同时不遗漏关键热函数的内联机会（保证运行时性能）。
+      </p>
+      <p>
+        在毕昇编译器升级过程中，建议：
+      </p>
+      <ol style="margin: 0.5rem 0 0.5rem 1.5rem; line-height: 1.9;">
+        <li><strong>对比内联日志</strong> —— 使用 <code>-Rpass=inline</code> 逐文件对比两个版本</li>
+        <li><strong>关注热函数</strong> —— 优先排查 perf 报告中 top 函数的内联状态变化</li>
+        <li><strong>评估二进制大小</strong> —— 如果大小显著变化，通常是内联行为差异导致</li>
+        <li><strong>善用 always_inline</strong> —— 对性能绝对关键的小函数显式标记</li>
+        <li><strong>持续监控</strong> —— 每次 LLVM 主版本升级都建议做内联决策对比</li>
+      </ol>
+    </div>
+  </div>
+
+</div>
+
+<!-- ========== 页脚 ========== -->
+<footer class="page-footer">
+  <p>毕昇编译器升级 — 内联差异详解 &middot; LLVM 15 &rarr; 21</p>
+  <p style="margin-top:0.3rem;">基于 LLVM 上游变更记录整理</p>
+</footer>
+
+</body>
+</html>

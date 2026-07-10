@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLVM 19 差异详解 — 毕昇编译器升级</title>
+<style>
+  :root {
+    --primary: #0a2647; --primary-light: #1e4a7a; --accent: #d4a843;
+    --bg: #f6f8fc; --card: #fff; --text: #111827; --text2: #4b5563; --border: #e5e7eb;
+    --red: #dc2626; --red-bg: #fef2f2; --amber: #d97706; --amber-bg: #fffbeb;
+    --green: #059669; --green-bg: #ecfdf5; --blue: #2563eb; --blue-bg: #eff6ff;
+    --radius: 10px; --shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
+  }
+
+  /* Header */
+  .header{
+    background:linear-gradient(135deg,#071225 0%,#0a2647 45%,#1e4a7a 100%);
+    color:#fff;padding:40px 24px 32px;text-align:center;position:relative;overflow:hidden;
+  }
+  .header::after{
+    content:'';position:absolute;inset:0;
+    background:radial-gradient(ellipse 60% 40% at 30% 50%,rgba(212,168,67,.10) 0%,transparent 70%);
+    pointer-events:none;
+  }
+  .header h1{font-size:28px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
+  .header .sub{font-size:14px;opacity:.78;position:relative;z-index:1}
+  .header .back{
+    display:inline-block;margin-bottom:16px;color:var(--accent);text-decoration:none;font-size:13px;
+    border:1px solid rgba(212,168,67,.35);padding:5px 18px;border-radius:6px;transition:all .15s;
+    position:relative;z-index:1;
+  }
+  .header .back:hover{background:rgba(212,168,67,.15);border-color:rgba(212,168,67,.55)}
+
+  .container{max-width:960px;margin:0 auto;padding:20px}
+
+  /* Card */
+  .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:20px;overflow:hidden}
+  .card-title{
+    padding:18px 24px 14px;border-bottom:1px solid var(--border);
+    font-size:18px;font-weight:700;color:var(--primary);
+    display:flex;align-items:center;gap:8px;
+  }
+  .card-body{padding:18px 24px 24px}
+
+  h4{margin:20px 0 10px;color:var(--primary);font-size:15px;font-weight:700}
+  h4:first-child{margin-top:0}
+  p{margin:8px 0;font-size:14px;color:var(--text2);line-height:1.75}
+
+  /* Code inline */
+  code{
+    background:#eef2f6;padding:1px 7px;border-radius:4px;
+    font-size:13px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+
+  /* Code block */
+  pre.cb{
+    background:#0a1a2e;color:#e2e8f0;padding:16px 20px;border-radius:8px;
+    overflow-x:auto;font-size:13px;line-height:1.6;font-family:"SF Mono",Menlo,monospace;margin:12px 0;border:none;
+  }
+  pre.cb .c{color:#6b7280}
+  pre.cb .k{color:#93c5fd}
+  pre.cb .s{color:#a7f3d0}
+  pre.cb .r{color:#fca5a5}
+
+  /* Callout */
+  .co{padding:14px 18px;border-radius:7px;margin:14px 0;font-size:13.5px;border-left:4px solid;line-height:1.65}
+  .co-r{background:var(--red-bg);border-color:var(--red);color:#7f1d1d}
+  .co-a{background:var(--amber-bg);border-color:var(--amber);color:#713f12}
+  .co-i{background:var(--blue-bg);border-color:var(--blue);color:#1e3a5f}
+  .co-g{background:var(--green-bg);border-color:var(--green);color:#064e3b}
+  .co strong{display:block;margin-bottom:3px}
+  .co code{background:rgba(0,0,0,.06);padding:1px 6px;border-radius:3px}
+
+  /* Badges */
+  .bh{display:inline-block;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px}
+  .bm{display:inline-block;background:var(--amber-bg);color:var(--amber);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px}
+  .bl{display:inline-block;background:var(--blue-bg);color:var(--blue);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px}
+  .bg{display:inline-block;background:var(--green-bg);color:var(--green);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px}
+
+  .tag{display:inline-block;background:#eef2f6;color:var(--primary-light);font-size:11.5px;padding:2px 10px;border-radius:4px;margin:2px 2px 2px 0}
+
+  /* Example box */
+  .example-box{
+    background:#fafbfc;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:7px;
+    padding:16px 20px;margin:14px 0;
+  }
+  .example-box .label{font-size:11.5px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+
+  /* Comparison */
+  .compare{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0}
+  @media(max-width:700px){.compare{grid-template-columns:1fr}}
+  .compare-col{
+    border:1px solid var(--border);border-radius:7px;overflow:hidden;
+  }
+  .compare-col .col-head{padding:6px 14px;font-size:12px;font-weight:700;text-align:center}
+  .compare-col .col-head.old{background:var(--red-bg);color:var(--red)}
+  .compare-col .col-head.new{background:var(--green-bg);color:var(--green)}
+  .compare-col .col-body{padding:10px 14px;font-size:13px}
+
+  ul,ol{padding-left:20px;font-size:13.5px;color:var(--text2);line-height:1.8}
+  li{margin:3px 0}
+  ul li strong, ol li strong{color:var(--text)}
+
+  .section-summary{
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;margin:16px 0;
+  }
+  .summary-item{
+    border:1px solid var(--border);border-radius:8px;padding:16px 18px;background:#fafbfc;
+  }
+  .summary-item .si-tag{font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
+  .summary-item .si-name{font-size:15px;font-weight:700;color:var(--primary);margin-bottom:4px}
+  .summary-item .si-desc{font-size:13px;color:var(--text2);line-height:1.55}
+
+  hr{border:none;border-top:1px solid var(--border);margin:16px 0}
+
+  .footer{text-align:center;padding:28px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:960px;margin:20px auto 0}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <a class="back" href="index.html">&larr; 返回主页</a>
+  <h1>LLVM 19 差异详解</h1>
+  <p class="sub">毕昇编译器升级 &mdash; 聚焦 SVE/PAuth/GCS/调试基础设施等关键变更</p>
+</header>
+
+<div class="container">
+
+  <!-- OVERVIEW -->
+  <div class="card">
+    <div class="card-title">LLVM 19 变更概览</div>
+    <div class="card-body">
+      <p>LLVM 19 是 LLVM 15&rarr;21 升级路径中的第四个主要版本，于 2024 年 9 月发布。本页聚焦与<strong>数通产品线（AArch64 嵌入式网络设备）</strong>最相关的七项关键变更，提供详细说明、代码示例和迁移指引。</p>
+      <div class="section-summary">
+        <div class="summary-item">
+          <div class="si-tag">AArch64 关键变更</div>
+          <div class="si-name">SVE/SVE2 变为可选</div>
+          <div class="si-desc"><code>-march=armv9-a</code> 不再隐含 +sve/+sve2，需显式指定</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">安全特性</div>
+          <div class="si-name">PAuth 完全支持</div>
+          <div class="si-desc">ELF PAuth relocations + <code>GNU_PROPERTY_AARCH64_FEATURE_PAUTH</code></div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">C++ 语言变更</div>
+          <div class="si-name">模板参数自阴影诊断</div>
+          <div class="si-desc">函数/变量模板不能与模板参数同名</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">C++ 默认行为</div>
+          <div class="si-name">模板松弛匹配默认启用</div>
+          <div class="si-desc"><code>-frelaxed-template-template-args</code> 默认开启</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">ISA 移除</div>
+          <div class="si-name">3DNow! / KNL/KNM 移除</div>
+          <div class="si-desc">所有 3DNow! intrinsics 和 codegen 支持已删除</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">安全特性</div>
+          <div class="si-name">GCS 链接器支持</div>
+          <div class="si-desc"><code>-z gcs</code> / <code>-z gcs-report</code> 选项</div>
+        </div>
+        <div class="summary-item">
+          <div class="si-tag">基础设施</div>
+          <div class="si-name">Debug records 切换</div>
+          <div class="si-desc">Debug intrinsics &rarr; debug records 新基础设施</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== SVE/SVE2 ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bh">对 AArch64 影响最大</span>
+      SVE/SVE2 ARMv9.0 变为可选特性
+    </div>
+    <div class="card-body">
+
+      <div class="co co-r">
+        <strong>破坏性变更</strong>
+        在 LLVM 19 之前，<code>-march=armv9-a</code>（以及 <code>-march=armv9.1-a</code>、<code>-march=armv9.2-a</code> 等）会<strong>隐式</strong>启用的 SVE 和 SVE2 扩展。LLVM 19 起，这些扩展从默认扩展列表中移除，变为可选特性。这与 ARM 架构手册的规范保持一致——SVE 和 SVE2 在 ARMv9.0 中确实是<strong>可选</strong>扩展。
+      </div>
+
+      <h4>变更动机</h4>
+      <p>在 ARM 架构规范中，ARMv9.0-A 基线要求 SVE（Scalable Vector Extension），但 SVE2 仅为 ARMv9.0-A 的<strong>可选扩展</strong>。然而，在 ARMv8.9-A 和 ARMv9.3-A 之前，SVE2 不被认为是基线特性。之前 Clang 在所有 ARMv9.x 目标中默认启用 SVE/SVE2 的行为过于激进，与实际硬件能力不匹配——许多 ARMv9.0/9.1/9.2 实现并不支持 SVE。</p>
+
+      <div class="co co-a">
+        <strong>核心影响</strong>
+        依赖 SVE 自动向量化的代码可能<strong>降级为 NEON</strong>，导致性能回退。如果 CPU 实际上支持 SVE，但编译时未显式指定 +sve/+sve2，编译器将不再生成 SVE 指令。
+      </div>
+
+      <h4>示例 1：-march=armv9-a 不再隐含 +sve/+sve2</h4>
+      <div class="compare">
+        <div class="compare-col">
+          <div class="col-head old">LLVM 18 及之前（SVE 默认启用）</div>
+          <div class="col-body">
+            <pre class="cb"><span class="c"># armv9-a 自动包含 SVE/SVE2</span>
+<span class="c"># 编译器生成 SVE 向量化代码</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-march=</span>armv9-a \
+      <span class="k">-O2</span> <span class="k">-c</span> example.c
+
+<span class="c"># 等价于自动添加了 +sve+sve2</span></pre>
+          </div>
+        </div>
+        <div class="compare-col">
+          <div class="col-head new">LLVM 19+ （SVE 需显式指定）</div>
+          <div class="col-body">
+            <pre class="cb"><span class="c"># armv9-a 不再自动包含 SVE/SVE2</span>
+<span class="c"># 必须显式添加 +sve 和/或 +sve2</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-march=</span>armv9-a+sve+sve2 \
+      <span class="k">-O2</span> <span class="k">-c</span> example.c
+
+<span class="c"># 或仅启用 SVE</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-march=</span>armv9-a+sve \
+      <span class="k">-O2</span> <span class="k">-c</span> example.c</pre>
+          </div>
+        </div>
+      </div>
+
+      <h4>示例 2：检查现有 -march/-mcpu 配置</h4>
+      <div class="example-box">
+        <div class="label">检查脚本 &mdash; 扫描构建系统中的 -march 配置</div>
+        <pre class="cb"><span class="c">#!/bin/bash</span>
+<span class="c"># 检查项目中所有使用 armv9-a 但不包含 +sve 的编译配置</span>
+<span class="k">grep</span> <span class="s">-rn</span> <span class="s">"armv9"</span> Makefile CMakeLists.txt *.cmake *.mk \
+  | <span class="k">grep</span> <span class="s">-v</span> <span class="s">"+sve"</span>
+
+<span class="c"># 输出示例（需要修复的条目）：</span>
+<span class="c"># Makefile:42: CFLAGS += -march=armv9-a</span>
+<span class="c"># CMakeLists.txt:15: set(CMAKE_C_FLAGS "-march=armv9-a")</span>
+<span class="c">#</span>
+<span class="c"># 修复方式：</span>
+<span class="c"># Makefile:42: CFLAGS += -march=armv9-a+sve+sve2</span>
+<span class="c"># CMakeLists.txt:15: set(CMAKE_C_FLAGS "-march=armv9-a+sve+sve2")</span></pre>
+      </div>
+
+      <div class="example-box">
+        <div class="label">使用 -mcpu 时的注意事项</div>
+        <pre class="cb"><span class="c"># -mcpu 指定的 CPU 实现如果实际支持 SVE，</span>
+<span class="c"># -mcpu 会自动启用对应的 SVE 扩展</span>
+<span class="c"># 例如 Neoverse V2 支持 SVE2，无需额外 +sve2</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-mcpu=</span>neoverse-v2 \
+      <span class="k">-O2</span> <span class="k">-c</span> example.c
+
+<span class="c"># 但使用通用 -march 时不再自动获取 SVE</span>
+<span class="c"># 推荐做法：优先使用 -mcpu 指定具体目标 CPU</span>
+<span class="c"># 或在 -march= 中明确列出所有需要的扩展</span></pre>
+      </div>
+
+      <h4>迁移建议</h4>
+      <ul>
+        <li><strong>如果 CPU 支持 SVE</strong>：在 <code>-march=armv9-a</code> 中<strong>显式添加</strong> <code>+sve</code> 和 <code>+sve2</code></li>
+        <li><strong>如果 CPU 不支持 SVE</strong>：无需操作，行为与之前使用 NEON 一致</li>
+        <li><strong>推荐用法</strong>：使用 <code>-mcpu=&lt;具体CPU型号&gt;</code> 替代泛型 <code>-march=armv9-a</code>，编译器会根据 CPU 特性自动启用正确的扩展</li>
+        <li><strong>性能验证</strong>：升级后务必对比关键模块的向量化情况，确认是否意外降级为 NEON（可通过 <code>-Rpass=vectorize</code> 检查）</li>
+        <li><strong>SVE 版本说明</strong>：
+          <ul>
+            <li><code>+sve</code>：SVE（ARMv8.2-A 起可选，ARMv8.6-A 起部分实现）</li>
+            <li><code>+sve2</code>：SVE2（ARMv9.0-A 可选，ARMv8.9-A / ARMv9.3-A 起基线要求）</li>
+            <li><code>+sve2-bitperm</code>：SVE2 位排列扩展（ARMv8.9-A / ARMv9.3-A 起基线要求）</li>
+          </ul>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ====== PAuth ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bg">重要安全特性</span>
+      Pointer Authentication (PAuth) 完全支持
+    </div>
+    <div class="card-body">
+
+      <div class="co co-g">
+        <strong>重要安全增强</strong>
+        LLVM 19 完成了对 AArch64 Pointer Authentication 的 ELF 重定位类型支持，包括新增的 <code>R_AARCH64_AUTH_ABS64</code> 和 <code>R_AARCH64_AUTH_RELATIVE</code> 静态重定位类型。同时链接器支持 <code>GNU_PROPERTY_AARCH64_FEATURE_PAUTH</code> 属性 note，标志着 PAuth 在 ELF/Linux 平台进入了生产可用阶段。
+      </div>
+
+      <h4>Pointer Authentication 是什么</h4>
+      <p>Pointer Authentication（PAC）是 ARMv8.3-A 引入的硬件安全特性。它利用 64 位指针中未使用的高位来存储基于密钥的"指针认证码"（Pointer Authentication Code, PAC）。在指针被使用前（如函数返回、间接跳转），硬件验证 PAC 的正确性。如果攻击者试图篡改指针，PAC 将不匹配，触发异常。</p>
+      <p>主要防护场景：</p>
+      <ul>
+        <li><strong>返回导向编程（ROP）</strong>：通过 PAC-RET 保护函数返回地址</li>
+        <li><strong>跳转导向编程（JOP）</strong>：通过 PAC/BTI 组合保护间接跳转</li>
+        <li><strong>数据指针篡改</strong>：通过 PAC 保护关键数据指针</li>
+      </ul>
+
+      <h4>示例 1：静态 PAuth 重定位类型</h4>
+      <div class="example-box">
+        <div class="label">新支持的 ELF 重定位类型</div>
+        <pre class="cb"><span class="c">// PAuth 签名指针的重定位</span>
+<span class="c">// R_AARCH64_AUTH_ABS64: 用于静态初始化中已签名的绝对指针</span>
+<span class="c">// R_AARCH64_AUTH_RELATIVE: 用于静态初始化中已签名的相对指针</span>
+
+<span class="c">// C 源码示例：需要 PAuth 保护的关键函数指针表</span>
+<span class="k">__attribute__</span>((<span class="k">used</span>))
+<span class="k">static void</span> (*<span class="k">const</span> critical_handlers[])(<span class="k">void</span>) = {
+    handle_packet_ingress,
+    handle_packet_egress,
+    handle_security_event,
+    <span class="k">NULL</span>
+};
+<span class="c">// 链接时这些函数指针可被 PAC 签名，</span>
+<span class="c">// R_AARCH64_AUTH_ABS64 用于重定位签名后的指针</span></pre>
+      </div>
+
+      <h4>示例 2：-mbranch-protection=standard 启用 PAuth-LR</h4>
+      <div class="example-box">
+        <div class="label">编译选项 — ARMv9.3-A+ 使用 FEAT_PAuth_LR</div>
+        <pre class="cb"><span class="c"># -mbranch-protection=standard 在兼容目标上自动启用 PAuth-LR</span>
+<span class="c"># PAuth-LR（FEAT_PAuth_LR）是 ARMv9.3-A 的简化版 PAC，</span>
+<span class="c"># 专为低开销场景设计，适合嵌入式网络设备</span>
+
+<span class="c"># 针对支持 FEAT_PAuth_LR 的目标（如 ARMv9.3-A+）</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-march=</span>armv9.3-a \
+      <span class="k">-mbranch-protection=</span>standard \
+      <span class="k">-O2</span> <span class="k">-c</span> example.c
+
+<span class="c"># standard 等价于 bti+pac-ret+leaf（含 PAuth-LR）</span>
+<span class="c"># bti: Branch Target Identification（防护 JOP）</span>
+<span class="c"># pac-ret: PAC 保护返回地址（防护 ROP）</span>
+<span class="c"># leaf: 同时保护叶子函数</span>
+<span class="c"># PAuth-LR: 使用 LR 寄存器存储 PAC（减少指令开销）</span></pre>
+      </div>
+
+      <div class="example-box">
+        <div class="label">精细控制 PAuth 选项</div>
+        <pre class="cb"><span class="c"># 完整 PAuth 保护（ARMv8.3-A+）</span>
+clang <span class="k">-mbranch-protection=</span>bti+pac-ret+leaf
+
+<span class="c"># 仅 BTI（最低要求 ARMv8.5-A）</span>
+clang <span class="k">-mbranch-protection=</span>bti
+
+<span class="c"># 仅 PAC 返回地址保护</span>
+clang <span class="k">-mbranch-protection=</span>pac-ret
+
+<span class="c"># 标准模式（LLVM 19 推荐）</span>
+clang <span class="k">-mbranch-protection=</span>standard</pre>
+      </div>
+
+      <h4>示例 3：GNU_PROPERTY_AARCH64_FEATURE_PAUTH</h4>
+      <div class="example-box">
+        <div class="label">链接器 — GNU property note 支持</div>
+        <pre class="cb"><span class="c"># 链接时，lld 和 ld.lld 支持 GNUT_PROPERTY_AARCH64_FEATURE_PAUTH</span>
+<span class="c"># 该 note 标记 ELF 文件启用了 PAuth 特性</span>
+<span class="c"># 动态链接器（ld.so）可在加载时检查此标记</span>
+
+<span class="c"># 编译带 PAuth 的目标文件</span>
+clang <span class="k">-mbranch-protection=</span>standard <span class="k">-c</span> module.c
+
+<span class="c"># 链接（自动处理 PAuth property）</span>
+ld.lld <span class="k">-o</span> libmodule.so module.o
+
+<span class="c"># 检查生成的 ELF 中的 PAuth 属性</span>
+readelf <span class="k">-n</span> libmodule.so | <span class="k">grep</span> <span class="s">PAUTH</span>
+<span class="c"># 输出示例：</span>
+<span class="c">#   Properties: AArch64 feature: PAUTH</span></pre>
+      </div>
+
+      <h4>对数通设备的价值</h4>
+      <ul>
+        <li><strong>控制流完整性（CFI）</strong>：BTI + PAC-RET + PAuth-LR 组合提供硬件级别的 ROP/JOP 防护，对网络数据面代码的保护尤为重要</li>
+        <li><strong>低开销</strong>：PAuth-LR（FEAT_PAuth_LR）在 ARMv9.3-A+ 上以极低性能开销（通常 &lt;1%）提供返回地址保护</li>
+        <li><strong>固件安全</strong>：嵌入式网络设备固件中，PAuth 可防止缓冲区溢出利用篡改控制流</li>
+        <li><strong>与上游对齐</strong>：Linux 内核、Android、各大发行版已逐步启用 PAC/BTI 保护</li>
+      </ul>
+
+      <div class="co co-i">
+        <strong>迁移建议</strong>
+        对于运行在 ARMv8.3-A+ 或 ARMv9.x-A 平台的数通设备，强烈建议在编译器标志中添加 <code>-mbranch-protection=standard</code>，以获得硬件级别的控制流完整性保护。需要在<strong>所有编译单元和链接阶段</strong>一致使用此选项。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== Template Parameter Self-Shadowing ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bh">诊断变更</span>
+      模板参数自阴影诊断
+    </div>
+    <div class="card-body">
+
+      <div class="co co-r">
+        <strong>行为变更</strong>
+        在 LLVM 19 之前，函数模板或变量模板如果与自身的模板参数同名，编译器不会报错（或仅产生警告）。LLVM 19 起，这种情况被视为<strong>编译错误（error）</strong>，因为模板名会遮蔽模板参数名，导致代码含义不明确。
+      </div>
+
+      <h4>问题说明</h4>
+      <p>C++ 标准规定，模板声明中的模板参数名在其作用域内是有效的实体名。如果函数模板或变量模板的名字与其中某个模板参数同名，则模板名字会在其定义内部<strong>遮蔽</strong>（shadow）同名的模板参数，造成混淆和潜在的错误。</p>
+
+      <div class="example-box">
+        <div class="label">示例 &mdash; 现在报 error 的代码</div>
+        <pre class="cb"><span class="c">// LLVM 19 起：这些都是编译错误</span>
+
+<span class="c">// 错误 1：函数模板与类型参数同名</span>
+<span class="k">template</span>&lt;<span class="k">class</span> T&gt;
+<span class="k">void</span> <span class="r">T</span>() {}  <span class="c">// ERROR: 函数模板 'T' 与其模板参数同名</span>
+
+<span class="c">// 错误 2：变量模板与类型参数同名</span>
+<span class="k">template</span>&lt;<span class="k">class</span> V&gt;
+<span class="k">int</span> <span class="r">V</span> = 42;  <span class="c">// ERROR: 变量模板 'V' 与其模板参数同名</span>
+
+<span class="c">// 错误 3：类模板外的函数定义与模板参数同名</span>
+<span class="k">template</span>&lt;<span class="k">typename</span> U&gt;
+<span class="k">struct</span> Wrapper {
+    <span class="k">template</span>&lt;<span class="k">typename</span> U&gt;  <span class="c">// 合法：类作用域内的重声明</span>
+    <span class="k">void</span> <span class="r">U</span>() {}  <span class="c">// ERROR: 成员函数模板 'U' 与模板参数同名</span>
+};
+</pre>
+      </div>
+
+      <div class="example-box">
+        <div class="label">正确写法 &mdash; 避免同名</div>
+        <pre class="cb"><span class="c">// 修正：使用不同的名称</span>
+<span class="k">template</span>&lt;<span class="k">class</span> T&gt;
+<span class="k">void</span> <span class="k">func_t</span>() {}  <span class="c">// OK: 函数名与模板参数不同</span>
+
+<span class="k">template</span>&lt;<span class="k">class</span> V&gt;
+<span class="k">int</span> <span class="k">value_v</span> = 42;  <span class="c">// OK: 变量名与模板参数不同</span>
+
+<span class="c">// 或者使用描述性名称</span>
+<span class="k">template</span>&lt;<span class="k">class</span> ValueType&gt;
+<span class="k">void</span> <span class="k">processValue</span>(ValueType val) {}  <span class="c">// OK</span>
+</pre>
+      </div>
+
+      <div class="co co-a">
+        <strong>影响范围</strong>
+        此诊断主要影响使用了短模板参数名（如 <code>T</code>、<code>V</code>、<code>U</code>）的通用代码。如果代码库中有函数模板或变量模板恰好与模板参数同名（虽然罕见但可能存在于历史代码中），升级到 LLVM 19 后将导致编译失败。修复方式很简单：将函数/变量名改为与模板参数不同的名称。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== -frelaxed-template-template-args ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bm">默认行为变更</span>
+      -frelaxed-template-template-args 默认启用
+    </div>
+    <div class="card-body">
+
+      <div class="co co-i">
+        <strong>模板匹配规则放宽</strong>
+        LLVM 19 起，<code>-frelaxed-template-template-args</code> 编译器标志<strong>默认启用</strong>。该标志使模板模板参数（template template parameter）的匹配规则更加灵活，允许接受参数不精确匹配的模板作为模板参数。
+      </div>
+
+      <h4>问题背景</h4>
+      <p>C++17 标准（P0522R0）放宽了模板模板参数的匹配规则：一个模板模板参数可以匹配一个实参模板，即使实参模板的参数列表与形参不完全匹配，只要实参模板可以接受形参所使用的参数即可。但在 C++17 标准化过程中，此变更被视为缺陷报告，理论上应追溯适用于 C++14 及更早标准。</p>
+      <p>此前，Clang 将此作为可选特性通过 <code>-frelaxed-template-template-args</code> 提供。LLVM 19 起，该行为默认启用，与 GCC 行为对齐。</p>
+
+      <div class="example-box">
+        <div class="label">示例 &mdash; 松弛匹配的具体表现</div>
+        <pre class="cb"><span class="c">// 一个接受默认参数的模板</span>
+<span class="k">template</span>&lt;<span class="k">typename</span> T, <span class="k">typename</span> Alloc = std::allocator&lt;T&gt;&gt;
+<span class="k">class</span> MyContainer { <span class="c">/* ... */</span> };
+
+<span class="c">// 模板模板参数：期望一个接受单个参数的模板</span>
+<span class="k">template</span>&lt;<span class="k">template</span>&lt;<span class="k">typename</span>&gt; <span class="k">class</span> Container&gt;
+<span class="k">struct</span> Processor {
+    Container&lt;<span class="k">int</span>&gt; data;
+};
+
+<span class="c">// LLVM 18 及之前（-frelaxed-template-template-args 未启用）：</span>
+<span class="c">//   ❌ 错误：MyContainer 接受 2 个模板参数，</span>
+<span class="c">//          但 Container 模板模板参数期望 1 个</span>
+<span class="c">//</span>
+<span class="c">// LLVM 19（默认启用松弛匹配）：</span>
+<span class="c">//   ✅ OK：MyContainer&lt;int&gt; 等价于 MyContainer&lt;int, allocator&lt;int&gt;&gt;</span>
+<span class="c">//          默认参数使其可以接受 1 个实参</span>
+Processor&lt;MyContainer&gt; proc;  <span class="c">// LLVM 19 起合法</span>
+</pre>
+      </div>
+
+      <h4>兼容性与控制</h4>
+      <div class="example-box">
+        <div class="label">恢复旧行为的选项（已废弃）</div>
+        <pre class="cb"><span class="c"># -frelaxed-template-template-args 标志已废弃</span>
+<span class="c"># LLVM 19 中仍可识别但无效果（始终启用）</span>
+<span class="c"># 负拼写（negative spelling）可用于兼容旧版本</span>
+
+<span class="c"># 在 LLVM 18 中禁用松弛匹配</span>
+clang++ <span class="k">-fno-relaxed-template-template-args</span> example.cpp
+
+<span class="c"># LLVM 19 中该标志被忽略（松弛匹配始终启用）</span>
+<span class="c"># 如需在 LLVM 18 上保持旧行为，可：</span>
+clang++ <span class="k">-fno-relaxed-template-template-args</span> example.cpp  <span class="c"># 仅 LLVM 18 有效</span>
+</pre>
+      </div>
+
+      <div class="co co-a">
+        <strong>潜在影响</strong>
+        此变更通常<strong>不会</strong>导致现有代码编译失败（只是让更多代码通过编译）。唯一需要注意的是：如果代码依赖"模板模板参数匹配失败"来触发 SFINAE 选择其他重载或特化，则行为可能改变——松弛匹配下，某个原本不匹配的候选现在可能匹配，改变了重载决议的结果。这种情况较为罕见，但仍建议在升级后进行全量编译验证。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== 3DNow! and KNL/KNM ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bh">ISA 移除</span>
+      3DNow! 完全移除 / Intel KNL/KNM 移除
+    </div>
+    <div class="card-body">
+
+      <div class="co co-r">
+        <strong>不可逆的移除</strong>
+        LLVM 19 从代码库中<strong>完全删除</strong>了以下 ISA 支持：AMD 3DNow! 指令集的所有 intrinsics 和 code generation 支持，以及 Intel Xeon Phi Knights Landing（KNL）和 Knights Mill（KNM）微架构支持。
+      </div>
+
+      <h4>3DNow! 移除详情</h4>
+      <p>3DNow! 是 AMD 于 1998 年在 K6-2 处理器上引入的 SIMD 指令集扩展，用于加速 3D 图形和浮点运算。该指令集已被 AMD 废弃多年：</p>
+      <ul>
+        <li>2010 年：AMD 在 Bulldozer 架构中停止支持 3DNow!（除 <code>PREFETCH/PREFETCHW</code> 指令外）</li>
+        <li>2011 年：GCC 4.7 移除 3DNow! intrinsics 支持</li>
+        <li>2019 年：GCC 9 完全移除后端支持</li>
+        <li>2024 年：LLVM 19 完全移除所有 3DNow! 支持</li>
+      </ul>
+
+      <div class="example-box">
+        <div class="label">受影响的 intrinsics（部分列表）</div>
+        <pre class="cb"><span class="c">// 以下 intrinsics 已从 &lt;mm3dnow.h&gt; 和 &lt;x86intrin.h&gt; 中移除：</span>
+
+<span class="c">// 浮点 SIMD 操作</span>
+__m64 <span class="r">_m_pfadd</span>(__m64, __m64);     <span class="c">// 已移除</span>
+__m64 <span class="r">_m_pfsub</span>(__m64, __m64);     <span class="c">// 已移除</span>
+__m64 <span class="r">_m_pfmul</span>(__m64, __m64);     <span class="c">// 已移除</span>
+<span class="k">void</span> <span class="r">_m_prefetch</span>(<span class="k">void</span>*);       <span class="c">// 已移除（改用 _mm_prefetch）</span>
+
+<span class="c">// 整数 SIMD 操作（3DNow! 扩展）</span>
+__m64 <span class="r">_m_pavgusb</span>(__m64, __m64);    <span class="c">// 已移除</span>
+<span class="k">void</span> <span class="r">_m_femms</span>(<span class="k">void</span>);            <span class="c">// 已移除（改用 _mm_empty）</span>
+
+<span class="c">// 三角函数近似</span>
+__m64 <span class="r">_m_pf2iw</span>(__m64);            <span class="c">// 已移除</span>
+__m64 <span class="r">_m_pi2fw</span>(__m64);            <span class="c">// 已移除</span>
+</pre>
+      </div>
+
+      <h4>Intel KNL/KNM 移除详情</h4>
+      <p>Intel Xeon Phi Knights Landing（KNL，<code>knl</code>）和 Knights Mill（KNM，<code>knm</code>）是 Intel 的众核架构产品线，已于 2018-2020 年间停产。LLVM 19 移除了对这两个目标的专门支持和调优。</p>
+
+      <div class="example-box">
+        <div class="label">受影响的编译选项</div>
+        <pre class="cb"><span class="c"># 以下 -march/-mtune 目标不再可用：</span>
+clang <span class="k">-march=</span><span class="r">knl</span> example.c    <span class="c"># ERROR: unknown target CPU 'knl'</span>
+clang <span class="k">-march=</span><span class="r">knm</span> example.c    <span class="c"># ERROR: unknown target CPU 'knm'</span>
+clang <span class="k">-mtune=</span><span class="r">knl</span> example.c    <span class="c"># ERROR: unknown target CPU 'knl'</span>
+clang <span class="k">-mtune=</span><span class="r">knm</span> example.c    <span class="c"># ERROR: unknown target CPU 'knm'</span>
+</pre>
+      </div>
+
+      <div class="co co-a">
+        <strong>对数通设备的影响</strong>
+        数通产品线主要面向 AArch64 平台，3DNow! 和 KNL/KNM 移除<strong>基本无影响</strong>。但如果构建系统中有 x86 回退路径、仿真测试环境或交叉编译脚本引用了 <code>-march=knl</code>/<code>-march=knm</code> 或 3DNow! intrinsics，需要清理或更新这些引用。使用 3DNow! 指令的遗留 x86 代码需要迁移到 SSE/AVX 指令集。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== GCS ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bg">安全特性</span>
+      Guarded Control Stack (GCS) 链接器支持
+    </div>
+    <div class="card-body">
+
+      <div class="co co-g">
+        <strong>AArch64 硬件安全栈</strong>
+        LLVM 19 为 LLD 链接器添加了 AArch64 Guarded Control Stack（GCS）支持，通过 <code>-z gcs</code> 和 <code>-z gcs-report</code> 选项控制。GCS 是 ARMv9.4-A 引入的硬件特性（FEAT_GCS），提供硬件级别的返回地址完整性保护。
+      </div>
+
+      <h4>GCS 工作原理</h4>
+      <p>Guarded Control Stack 在硬件层面维护一个独立的、仅可被特定指令写入的"影子栈"。函数调用时，返回地址被同时压入常规栈和 GCS 影子栈。函数返回时，硬件自动比对两个栈上的返回地址——如果不匹配，说明返回地址被篡改，触发异常。</p>
+      <p>GCS 与 PAC-RET 互补：</p>
+      <ul>
+        <li><strong>PAC-RET</strong>：签名/验证返回地址，防止伪造（但无法防止重放攻击）</li>
+        <li><strong>GCS</strong>：维护完整的返回地址链，防止任何形式的篡改（包括重放）</li>
+      </ul>
+
+      <h4>链接器选项</h4>
+      <div class="example-box">
+        <div class="label">-z gcs — 启用 GCS 支持</div>
+        <pre class="cb"><span class="c"># 编译目标文件（编译器端标记 GCS 特性）</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-march=</span>armv9.4-a \
+      <span class="k">-mbranch-protection=</span>gcs \
+      <span class="k">-c</span> example.c
+
+<span class="c"># 链接时启用 GCS（lld / ld.lld）</span>
+ld.lld <span class="k">-z</span> gcs <span class="k">-o</span> output example.o
+
+<span class="c"># 完整示例：GCS + BTI + PAC-RET 组合保护</span>
+clang <span class="k">-target</span> aarch64-linux-gnu \
+      <span class="k">-march=</span>armv9.4-a \
+      <span class="k">-mbranch-protection=</span>bti+pac-ret+gcs \
+      <span class="k">-O2</span> <span class="k">-c</span> example.c
+
+ld.lld <span class="k">-z</span> gcs <span class="k">-o</span> example example.o</pre>
+      </div>
+
+      <div class="example-box">
+        <div class="label">-z gcs-report — 报告 GCS 兼容性</div>
+        <pre class="cb"><span class="c"># 仅报告哪些目标文件支持/不支持 GCS，不实际启用</span>
+ld.lld <span class="k">-z</span> gcs-report <span class="k">-o</span> output *.o
+
+<span class="c"># 典型输出：</span>
+<span class="c">#   module_a.o: GCS compatible</span>
+<span class="c">#   module_b.o: GCS compatible</span>
+<span class="c">#   legacy.o:   NOT GCS compatible (missing .note.gnu.property)</span>
+<span class="c"># （静态链接场景需所有目标文件都标记 GCS 兼容）</span>
+</pre>
+      </div>
+
+      <h4>对嵌入式网络设备的意义</h4>
+      <ul>
+        <li><strong>纵深防御</strong>：GCS + PAC-RET + BTI 构成完整的控制流完整性三层防护（间接跳转保护 + 返回地址签名 + 硬件影子栈）</li>
+        <li><strong>硬件强制</strong>：GCS 由硬件直接执行检查，旁路难度远高于软件 shadow stack</li>
+        <li><strong>零运行时开销</strong>：GCS 的检查由硬件在返回指令执行时自动完成，基本无性能开销</li>
+        <li><strong>固件级保护</strong>：嵌入式设备固件往往缺乏地址空间随机化，GCS 硬件保护尤为关键</li>
+      </ul>
+
+      <div class="co co-i">
+        <strong>迁移注意事项</strong>
+        GCS 需要 ARMv9.4-A（FEAT_GCS）硬件支持。对于运行在较旧 ARM 平台上的设备，此功能不可用但也不会造成问题。<code>-z gcs</code> 和 <code>-z gcs-report</code> 是 LLD 特有的选项；如果使用 GNU ld 或 gold，需参考各自对应的选项。GCS 与 PAuth-LR 可以同时使用，提供互补的保护。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== Debug records ====== -->
+  <div class="card">
+    <div class="card-title">
+      <span class="bm">基础设施变更</span>
+      Debug intrinsics &rarr; Debug records
+    </div>
+    <div class="card-body">
+
+      <div class="co co-a">
+        <strong>IR 表示层重大重构</strong>
+        LLVM 19 将 LLVM IR 中的调试信息基础设施从"debug intrinsics"（<code>llvm.dbg.value</code>、<code>llvm.dbg.declare</code> 等）切换为"debug records"——一种不嵌入指令流的独立调试数据表示。这是 LLVM 调试信息子系统自 2010 年以来最大的一次架构变更。
+      </div>
+
+      <h4>变更动机</h4>
+      <p>传统的 debug intrinsics 作为 IR 指令嵌入在基本块中，与普通指令混合。这种设计存在几个问题：</p>
+      <ul>
+        <li>优化 pass 需要<strong>专门处理</strong> debug intrinsics（跳过、保留、更新），增加了每个 pass 的复杂度</li>
+        <li>debug intrinsics 的存在可能<strong>干扰优化决策</strong>（如指令合并、重排序等）</li>
+        <li>维护 debug info 正确性在大量 pass 的流转中极其困难</li>
+      </ul>
+      <p>Debug records 将这些调试信息从指令流中分离，存储为指令的"附加标记"，使优化 pass 可以在<strong>不感知调试信息</strong>的情况下正常工作。</p>
+
+      <h4>技术细节</h4>
+      <div class="example-box">
+        <div class="label">IR 表示对比（概念层面）</div>
+        <div class="compare">
+          <div class="compare-col">
+            <div class="col-head old">旧：Debug Intrinsics（LLVM 18 及之前）</div>
+            <div class="col-body">
+              <pre class="cb"><span class="c">; Debug info 作为 IR 指令嵌入指令流</span>
+  %x = add i32 %a, %b
+  <span class="r">call void @llvm.dbg.value</span>(metadata i32 %x, ...)
+  %y = mul i32 %x, %c
+  <span class="r">call void @llvm.dbg.value</span>(metadata i32 %y, ...)
+  store i32 %y, ptr %p
+
+<span class="c">; 所有优化 pass 必须处理这些 dbg 调用</span></pre>
+            </div>
+          </div>
+          <div class="compare-col">
+            <div class="col-head new">新：Debug Records（LLVM 19+）</div>
+            <div class="col-body">
+              <pre class="cb"><span class="c">; Debug info 作为指令的附属数据</span>
+  %x = add i32 %a, %b    <span class="c">#+dbg(value: %x)</span>
+  %y = mul i32 %x, %c    <span class="c">#+dbg(value: %y)</span>
+  store i32 %y, ptr %p
+
+<span class="c">; 优化 pass 无需感知 debug records</span>
+<span class="c">; 指令移动/删除时 debug info 自动跟随</span></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <h4>影响与注意事项</h4>
+      <div class="co co-a">
+        <strong>对大多数用户透明，但对以下场景有影响</strong>
+      </div>
+
+      <ul>
+        <li><strong>手写 LLVM IR 的工具</strong>：如果代码生成工具直接构造 <code>llvm.dbg.value</code> / <code>llvm.dbg.declare</code> intrinsics，需要更新为使用新的 debug records API（或者通过自动转换层兼容）</li>
+        <li><strong>LLVM IR 解析器</strong>：LLVM 19 仍能读取包含旧式 debug intrinsics 的 <code>.ll</code> 文件，并在内部自动转换为 debug records</li>
+        <li><strong>LLVM Pass 开发者</strong>：自定义 pass 中手动处理 debug intrinsics 的代码可以大幅简化——不再需要显式跳过或保留 debug 指令</li>
+        <li><strong>IR 输出</strong>：<code>llvm-dis</code> 等工具输出的 IR 文本默认为新格式。可使用 <code>--write-if-empty</code> 等选项控制输出行为</li>
+        <li><strong>LTO 调试信息体积</strong>：Debug records 的设计减少了调试信息的冗余，LTO 场景下的调试信息体积可能有所改善</li>
+      </ul>
+
+      <div class="example-box">
+        <div class="label">兼容性说明</div>
+        <pre class="cb"><span class="c"># 1. 旧的 .ll 文件仍可被解析</span>
+<span class="c"># LLVM 19 的 IR parser 会自动将旧的 dbg intrinsics</span>
+<span class="c"># 转换为 debug records，无需手动修改已有 IR</span>
+
+<span class="c"># 2. 新的 IR pass 无需处理 debug info</span>
+<span class="c"># 旧写法（LLVM 18 pass）：</span>
+<span class="k">for</span> (Instruction &amp;I : BB) {
+    <span class="k">if</span> (isa&lt;DbgInfoIntrinsic&gt;(&amp;I))
+        <span class="k">continue</span>;  <span class="c">// 手动跳过 debug 指令</span>
+    <span class="c">// ... 处理 I</span>
+}
+
+<span class="c"># 新写法（LLVM 19 pass）：</span>
+<span class="k">for</span> (Instruction &amp;I : BB) {
+    <span class="c">// 直接处理所有指令，无需过滤</span>
+    <span class="c">// debug records 会自动跟随 I 移动/删除</span>
+}
+
+<span class="c"># 3. 如需手动处理 debug records（少数场景）</span>
+<span class="k">for</span> (DbgRecord &amp;DR : I.getDbgRecordRange()) {
+    <span class="c">// DR 是与指令 I 关联的 debug record</span>
+}
+</pre>
+      </div>
+
+      <div class="co co-i">
+        <strong>对数通产品线的影响</strong>
+        对数通设备开发者而言，此项变更<strong>基本透明</strong>。主要影响在 LLVM 工具链开发者层面：如果数通团队维护了自定义的 LLVM pass（针对特定硬件优化的 pass），需要将 pass 中手动处理 debug intrinsics 的代码适配为 debug records 模式。对于纯前端使用者，调试信息质量（DWARF 输出）不受影响，甚至可能因不再干扰优化 pass 而获得更好的优化后调试体验。
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== SUMMARY TABLE ====== -->
+  <div class="card">
+    <div class="card-title">LLVM 19 变更影响矩阵</div>
+    <div class="card-body">
+      <table style="width:100%;border-collapse:collapse;font-size:13.5px;">
+        <thead>
+          <tr>
+            <th style="background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:7px 11px;border-bottom:2px solid var(--border);font-size:12.5px">变更项</th>
+            <th style="background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:7px 11px;border-bottom:2px solid var(--border);font-size:12.5px">类别</th>
+            <th style="background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:7px 11px;border-bottom:2px solid var(--border);font-size:12.5px">对数通设备影响</th>
+            <th style="background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:7px 11px;border-bottom:2px solid var(--border);font-size:12.5px">处理优先级</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">SVE/SVE2 变可选</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">AArch64</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">性能可能回退（降级 NEON）</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bh">P0 必须处理</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">PAuth 完全支持</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">安全</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">正面 — 硬件 CFI 保护</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bg">P2 推荐启用</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">模板参数自阴影诊断</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">C++</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">可能导致编译失败</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bh">P0 编译修复</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">模板松弛匹配默认启用</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">C++</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">SFINAE 行为可能改变</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 需验证</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">3DNow!/KNL/KNM 移除</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">x86 ISA</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">基本无影响</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bl">P2 清理引用</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">GCS 链接器支持</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">安全</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">正面 — 硬件影子栈</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bg">P2 建议评估</span></td>
+          </tr>
+          <tr>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)">Debug records 切换</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="tag">基础设施</span></td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border);color:var(--text2)">对大部分用户透明</td>
+            <td style="padding:7px 11px;border-bottom:1px solid var(--border)"><span class="bm">P1 验证LTO</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<footer class="footer">
+  <p>LLVM 19 差异详解 &nbsp;&middot;&nbsp; 分析日期：2026-07-10 &nbsp;&middot;&nbsp; 毕昇编译器升级工程</p>
+  <p style="margin-top:4px;font-size:12px">专为数通产品线编制 &middot; 仅供内部技术评估使用</p>
+</footer>
+
+</body>
+</html>

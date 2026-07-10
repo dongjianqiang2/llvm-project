@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLVM 20 差异详解 — 毕昇编译器升级</title>
+<style>
+  :root {
+    --primary: #0a2647;
+    --primary-light: #1e4a7a;
+    --primary-extra: #eef4fb;
+    --accent: #d4a843;
+    --accent-light: #f5e6b8;
+    --bg: #f6f8fc;
+    --card: #fff;
+    --text: #111827;
+    --text2: #4b5563;
+    --border: #e5e7eb;
+    --red: #dc2626; --red-bg: #fef2f2;
+    --amber: #d97706; --amber-bg: #fffbeb;
+    --green: #059669; --green-bg: #ecfdf5;
+    --blue: #2563eb; --blue-bg: #eff6ff;
+    --radius: 12px;
+    --shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
+  }
+
+  /* ── Header ── */
+  .header{
+    background:linear-gradient(135deg, var(--primary) 0%, #0d3360 100%);
+    color:#fff;padding:40px 24px 36px;text-align:center;
+    border-bottom:4px solid var(--accent);
+  }
+  .header h1{font-size:28px;font-weight:800;margin-bottom:10px;letter-spacing:1px}
+  .header .subtitle{font-size:15px;color:#c5d5e8}
+  .header .back-link{
+    display:inline-block;margin-bottom:16px;color:var(--accent);
+    text-decoration:none;font-size:14px;font-weight:600;
+    transition:color .2s;
+  }
+  .header .back-link:hover{color:#f5e6b8}
+
+  /* ── Badge ── */
+  .badge{
+    display:inline-block;padding:2px 10px;border-radius:20px;
+    font-size:12px;font-weight:700;letter-spacing:0.5px;
+  }
+  .badge-danger{background:var(--red);color:#fff}
+  .badge-warn{background:var(--amber);color:#fff}
+  .badge-info{background:var(--blue);color:#fff}
+
+  /* ── Layout ── */
+  .container{max-width:960px;margin:0 auto;padding:32px 20px 64px}
+
+  /* ── Section ── */
+  .section{
+    background:var(--card);border-radius:var(--radius);
+    box-shadow:var(--shadow);border:1px solid var(--border);
+    padding:28px 32px;margin-bottom:28px;
+  }
+  .section h2{
+    font-size:21px;color:var(--primary);margin-bottom:6px;
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  }
+  .section h2 .anchor{font-size:18px;opacity:.5}
+  .section .desc{
+    color:var(--text2);margin:8px 0 16px;font-size:14.5px;
+  }
+
+  /* ── Tags row ── */
+  .tag-row{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+  .tag{
+    display:inline-block;padding:3px 12px;border-radius:14px;
+    font-size:12px;font-weight:600;
+  }
+  .tag-risk{background:var(--red-bg);color:var(--red)}
+  .tag-fix{background:var(--green-bg);color:var(--green)}
+  .tag-note{background:var(--blue-bg);color:var(--blue)}
+  .tag-warn{background:var(--amber-bg);color:var(--amber)}
+
+  /* ── Example Box ── */
+  .example-box{
+    background:#f8f9fb;border:1px solid #e2e6ed;border-left:4px solid var(--accent);
+    border-radius:8px;padding:20px 24px;margin:18px 0;
+  }
+  .example-box h4{
+    font-size:14px;color:var(--accent);margin-bottom:8px;
+    text-transform:uppercase;letter-spacing:1px;font-weight:700;
+  }
+  .example-box .example-title{
+    font-size:13px;font-weight:700;color:var(--text2);
+    margin:14px 0 4px;text-transform:uppercase;letter-spacing:0.8px;
+  }
+  .example-box .example-title:first-of-type{margin-top:0}
+  .example-box pre{
+    background:#1e293b;color:#e2e8f0;padding:16px 20px;
+    border-radius:6px;overflow-x:auto;font-size:13px;
+    line-height:1.55;font-family:"SF Mono","Fira Code","Cascadia Code","Consolas",monospace;
+    margin:6px 0 2px;
+  }
+  .example-box .code-label{
+    display:inline-block;font-size:11px;font-weight:700;padding:2px 10px;
+    border-radius:4px;margin-bottom:4px;
+  }
+  .label-before{background:#fecaca;color:#991b1b}
+  .label-after{background:#bbf7d0;color:#14532d}
+  .label-fix{background:#bfdbfe;color:#1e3a5f}
+
+  /* ── Advice Box ── */
+  .advice-box{
+    background:var(--amber-bg);border:1px solid #fde68a;
+    border-radius:8px;padding:16px 20px;margin-top:20px;
+  }
+  .advice-box strong{color:var(--amber)}
+  .advice-box p{margin:4px 0}
+
+  /* ── Footer ── */
+  .footer{
+    text-align:center;padding:32px 20px;color:var(--text2);
+    font-size:13px;border-top:1px solid var(--border);
+  }
+  .footer a{color:var(--accent);text-decoration:none;font-weight:600}
+
+  /* ── TOC ── */
+  .toc{
+    background:var(--card);border-radius:var(--radius);
+    box-shadow:var(--shadow);border:1px solid var(--border);
+    padding:24px 28px;margin-bottom:28px;
+  }
+  .toc h3{font-size:16px;color:var(--primary);margin-bottom:12px}
+  .toc ol{padding-left:22px;font-size:14px;line-height:2.1}
+  .toc a{color:var(--blue);text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+
+  /* ── Responsive ── */
+  @media(max-width:700px){
+    .section{padding:20px 18px}
+    .header h1{font-size:22px}
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══════════ HEADER ═══════════ -->
+<header class="header">
+  <a class="back-link" href="index.html">&larr; 返回主页</a>
+  <h1>LLVM 20 差异详解</h1>
+  <p class="subtitle">毕昇编译器升级 &mdash; 数通产品线迁移指南</p>
+</header>
+
+<!-- ═══════════ TOC ═══════════ -->
+<div class="container">
+  <div class="toc">
+    <h3>&#128218; 目录</h3>
+    <ol>
+      <li><a href="#tbaa">TBAA 默认启用 <span class="badge badge-danger">最高风险</span></a></li>
+      <li><a href="#ptr-ub">指针溢出 UB 积极优化 <span class="badge badge-danger">最高风险</span></a></li>
+      <li><a href="#fwrapv-ptr">-fwrapv-pointer 新标志 <span class="badge badge-warn">行为变更</span></a></li>
+      <li><a href="#enum-constexpr">enum constexpr 转换不可压制 <span class="badge badge-warn">编译报错</span></a></li>
+      <li><a href="#le32-le64">le32 / le64 目标移除</a></li>
+      <li><a href="#extra-template">多余 template header 默认报错</a></li>
+      <li><a href="#itanium-vtable">Itanium 构造 vtable 名称修正</a></li>
+      <li><a href="#machine-block">Size-aware Machine Block Placement</a></li>
+    </ol>
+  </div>
+
+<!-- ═══════════ 1. TBAA ═══════════ -->
+<section class="section" id="tbaa">
+  <h2><span class="anchor">&#128737;</span> 1. TBAA 默认启用 <span class="badge badge-danger">最高风险</span></h2>
+  <div class="desc">
+    Clang 20 起对不兼容指针生成不同的 <strong>Type-Based Alias Analysis (TBAA)</strong> 标签。
+    编译器据此假定不同类型的指针永不别名（即永不指向同一内存），从而启用更强力的别名分析优化。
+    这一变更可能导致过去靠"侥幸"运行的 strict aliasing 违规代码在 LLVM 20 下产生错误结果。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-risk">&#9888; 最高风险</span>
+    <span class="tag tag-fix">&#128295; 需代码修复</span>
+    <span class="tag tag-note">&#128161; 可临时禁用</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例 1：Strict Aliasing 违规（错误代码）</h4>
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
+    <pre>int foo(float *f, int *i) {
+  *i = 1;      // 向 int 写入
+  *f = 2.0f;   // 向 float 写入（通过不同指针类型）
+  return *i;   // 老编译器返回 1
+}
+// 编译器未积极利用 TBAA，两个 store、一个 load 顺序执行</pre>
+    <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
+    <pre>int foo(float *f, int *i) {
+  *i = 1;      // TBAA 标签: int
+  *f = 2.0f;   // TBAA 标签: float — 与 int 不别名
+  return *i;   // 编译器可能直接返回 1（常量折叠）
+               // 或更糟：重排顺序后返回 2
+}
+// TBAA 认为 float* 写不改变 *i，因此可以重排甚至消除 load</pre>
+    <p style="font-size:13px;color:var(--red);margin-top:10px;"><strong>&#9888;</strong> 注意：此代码违反 C 标准 strict aliasing 规则，旧版本碰巧"能跑"，LLVM 20 将积极利用该规则进行优化。</p>
+  </div>
+
+  <div class="example-box">
+    <h4>&#9989; 示例 2：正确的 Union-based Aliasing</h4>
+    <p class="example-title"><span class="code-label label-fix">修复方案</span></p>
+    <pre>union Buffer {
+  int   as_int;
+  float as_float;
+};
+
+int foo_correct(float *f, int *i) {
+  union Buffer u;
+  u.as_int = 1;      // 通过 union 写入 int
+  u.as_float = 2.0f; // 通过 union 写入 float — 合法
+  return u.as_int;   // 行为明确
+}</pre>
+    <p style="font-size:13px;color:var(--green);margin-top:6px;">&#10004; 通过 <code>union</code> 访问不同类型是标准允许的 aliasing 方式。</p>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 应对措施</strong>
+    <p>1. <strong>临时迁回</strong>：添加编译选项 <code>-fno-pointer-tbaa</code> 禁用基于指针类型的 TBAA，使行为与老版本一致。</p>
+    <p>2. <strong>根本修复</strong>：排查代码中的 strict aliasing 违规，改用 <code>union</code> 或 <code>memcpy</code> 进行跨类型访问。</p>
+    <p>3. <strong>检测工具</strong>：启用 <code>-Wstrict-aliasing</code> 和 <code>-fstrict-aliasing</code> 配合静态分析工具扫描潜在违规。</p>
+    <p><strong>建议</strong>：先用 <code>-fno-pointer-tbaa</code> 稳定迁移，确认功能正确后，再逐步修复代码中的 strict aliasing 违规并移除该标志。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 2. 指针溢出 UB ═══════════ -->
+<section class="section" id="ptr-ub">
+  <h2><span class="anchor">&#128737;</span> 2. 指针溢出 UB 积极优化 <span class="badge badge-danger">最高风险</span></h2>
+  <div class="desc">
+    在 C/C++ 标准中，构造超出对象边界一个元素以上的指针是<strong>未定义行为 (UB)</strong>。
+    LLVM 20 开始更积极地利用这一事实进行优化：<code>ptr + unsigned_offset &lt; ptr</code>
+    这类传统上用于边界检查的模式，现在会被优化为 <code>false</code>（因为如果指针加法溢出了，程序就已经是 UB）。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-risk">&#9888; 最高风险</span>
+    <span class="tag tag-fix">&#128295; 需代码修复</span>
+    <span class="tag tag-warn">&#9888; -fwrapv 不再覆盖指针</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例：典型的边界检查代码</h4>
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
+    <pre>// 一种常见的溢出检查模式
+void process_buffer(char *buf, size_t len) {
+  char *end = buf + len;
+  if (end &lt; buf) {  // 检查指针加法是否回绕
+    handle_overflow();
+    return;
+  }
+  // ... 正常处理 ...
+}
+// 旧编译器不会优化掉这个比较</pre>
+    <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
+    <pre>// 同样的代码，LLVM 20 的优化：
+void process_buffer(char *buf, size_t len) {
+  char *end = buf + len;
+  if (end &lt; buf) {  // 优化为 false！
+    handle_overflow();   // 此分支被消除，不会生成代码
+    return;
+  }
+  // 编译器推理：如果 buf+len 真的溢出了，程序就是 UB
+  // 因此编译器假定这永远不会发生，直接删除溢出检查
+}</pre>
+    <p style="font-size:13px;color:var(--red);margin-top:10px;"><strong>&#9888;</strong> 这是一个非常危险的变更：运行了数十年的边界检查代码可能在静默中被优化消除，导致缓冲区溢出漏洞。</p>
+  </div>
+
+  <div class="example-box">
+    <h4>&#9989; 修复方案 1：使用整数运算</h4>
+    <p class="example-title"><span class="code-label label-fix">推荐修复</span></p>
+    <pre>#include &lt;stdint.h&gt;
+
+void process_buffer(char *buf, size_t len) {
+  // 将指针转为整数后再做溢出检查 — 整数溢出行为是明确的
+  uintptr_t buf_addr = (uintptr_t)buf;
+  if (buf_addr + len &lt; buf_addr) {  // 整数运算，行为确定
+    handle_overflow();
+    return;
+  }
+  // ... 安全处理 ...
+}</pre>
+  </div>
+
+  <div class="example-box">
+    <h4>&#9989; 修复方案 2：使用编译选项</h4>
+    <p class="example-title"><span class="code-label label-fix">编译标志修复</span></p>
+    <pre># 注意：-fwrapv 在 LLVM 20 不再影响指针溢出！
+# 需要单独使用新标志
+clang -fwrapv-pointer ...</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 关键提醒</strong>
+    <p>1. <strong><code>-fwrapv</code> 不再有效</strong>：LLVM 20 中该标志只控制有符号整数溢出，不控制指针溢出。必须单独使用 <code>-fwrapv-pointer</code>。</p>
+    <p>2. <strong>排查范围</strong>：搜索代码库中 <code>ptr + N &lt; ptr</code>、<code>ptr + N &gt;= ptr</code> 等涉及指针溢出的比较模式。</p>
+    <p>3. <strong>推荐方案</strong>：将指针比较改为 <code>uintptr_t</code> 整数比较，这是最可移植且不依赖编译器标志的修复方式。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 3. -fwrapv-pointer ═══════════ -->
+<section class="section" id="fwrapv-ptr">
+  <h2><span class="anchor">&#9888;</span> 3. -fwrapv-pointer 新标志 <span class="badge badge-warn">行为变更</span></h2>
+  <div class="desc">
+    LLVM 20 新增 <code>-fwrapv-pointer</code> 编译标志，用于<strong>独立控制</strong>指针溢出行为。
+    在此之前，一些项目依赖 <code>-fwrapv</code> 同时覆盖整数和指针溢出 —— 这一假设在 LLVM 20 中不再成立。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; 行为变更</span>
+    <span class="tag tag-note">&#128161; 需评估</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例：-fwrapv 不再覆盖指针</h4>
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
+    <pre># 旧命令：-fwrapv 被认为同时覆盖整数和指针溢出
+clang -fwrapv -O2 foo.c
+# 结果：有符号整数溢出为 wrapping，指针加法溢出也类似</pre>
+    <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
+    <pre># -fwrapv 只控制有符号整数溢出
+clang -fwrapv -O2 foo.c
+# 结果：
+#   有符号整数溢出 → wrapping（正常）
+#   指针加法溢出   → UB（不会被 -fwrapv 覆盖！）
+
+# 正确做法：同时添加两个标志
+clang -fwrapv -fwrapv-pointer -O2 foo.c
+#   有符号整数溢出 → wrapping
+#   指针加法溢出   → wrapping </pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>1. <strong>检查构建系统</strong>：查找所有使用 <code>-fwrapv</code> 的构建配置，评估是否需要添加 <code>-fwrapv-pointer</code>。</p>
+    <p>2. <strong>生产环境推荐</strong>：如果项目历史上有指针溢出相关 bug 或依赖指针回绕行为，建议启用 <code>-fwrapv-pointer</code> 作为安全过渡措施。</p>
+    <p>3. <strong>长期方向</strong>：逐步将指针溢出检查改为 <code>uintptr_t</code> 方案，消除对编译器标志的依赖。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 4. enum constexpr ═══════════ -->
+<section class="section" id="enum-constexpr">
+  <h2><span class="anchor">&#128218;</span> 4. enum constexpr 转换不可压制 <span class="badge badge-warn">编译报错</span></h2>
+  <div class="desc">
+    C++ 标准要求 <code>constexpr</code> 上下文中枚举值必须在声明的枚举器范围内。
+    LLVM 20 开始严格执行这一规则：将超出范围的整数值显式转换为枚举类型不再被允许为常量表达式，
+    且此错误<strong>无法通过 <code>-Wno-*</code> 等警告标志压制</strong>。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-risk">&#10060; 硬错误</span>
+    <span class="tag tag-fix">&#128295; 需代码修复</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例：超出范围的 enum constexpr</h4>
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
+    <pre>enum E { Zero, One, Two };
+
+// 旧版本：警告（可用 -Wno-enum-constexpr-conversion 压制）
+constexpr E v = (E)8;   // 8 超出 {0,1,2} 范围
+// 仍可编译通过，v 值为 8（未定义行为但编译器放行）</pre>
+    <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
+    <pre>enum E { Zero, One, Two };
+
+constexpr E v = (E)8;   // error: 常量表达式中枚举值超出范围
+// 无法用 -Wno-* 压制，必须修复源代码
+</pre>
+  </div>
+
+  <div class="example-box">
+    <h4>&#9989; 修复方案</h4>
+    <p class="example-title"><span class="code-label label-fix">做法 1：去掉 constexpr</span></p>
+    <pre>enum E { Zero, One, Two };
+
+E v = (E)8;  // 去掉 constexpr，不再是常量表达式上下文</pre>
+    <p class="example-title"><span class="code-label label-fix">做法 2：使用底层类型 (C++11 scoped enum)</span></p>
+    <pre>enum class E : int { Zero, One, Two };
+
+constexpr E v = static_cast&lt;E&gt;(8);  // scoped enum 允许任意底层类型值
+// 注意：这是未指定枚举器值，但语法上合法</pre>
+    <p class="example-title"><span class="code-label label-fix">做法 3：定义所需枚举器</span></p>
+    <pre>enum E { Zero, One, Two, Eight = 8 };  // 添加所需值到枚举定义
+constexpr E v = Eight;</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 用 <code>grep -r "constexpr.*(E)"</code> 搜索代码中涉及的 constexpr 枚举转换。</p>
+    <p>&#8226; 优先采用方案 1（去掉 constexpr）或方案 3（扩展枚举定义），避免未定义行为。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 5. le32/le64 ═══════════ -->
+<section class="section" id="le32-le64">
+  <h2><span class="anchor">&#128260;</span> 5. le32 / le64 目标移除</h2>
+  <div class="desc">
+    LLVM 20 已移除对小端 32 位 (<code>le32</code>) 和小端 64 位 (<code>le64</code>) 目标平台的支持。
+    这些目标主要用于 PNaCl（Portable Native Client），该技术已不再活跃维护。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; 目标移除</span>
+    <span class="tag tag-note">&#128161; 需检查构建配置</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 影响</h4>
+    <pre># 以下目标三元组不再有效
+-target le32-unknown-nacl
+-target le64-unknown-nacl
+
+# 编译报错示例
+$ clang -target le32-unknown-nacl hello.c
+error: unknown target triple 'le32-unknown-nacl'</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 应对措施</strong>
+    <p>&#8226; <strong>一般项目不受影响</strong>：le32/le64 仅在 PNaCl 生态中使用，主流 Linux/x86-64/ARM 项目无需关注。</p>
+    <p>&#8226; <strong>检查构建脚本</strong>：搜索构建配置中是否包含 <code>le32</code> 或 <code>le64</code> 字符串，若有则需移除或替换为实际目标平台。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 6. 多余 template header ═══════════ -->
+<section class="section" id="extra-template">
+  <h2><span class="anchor">&#128218;</span> 6. 多余 template header 默认报错</h2>
+  <div class="desc">
+    C++ 标准要求显式特化声明前不应有多余的 <code>template&lt;&gt;</code> 头。
+    例如嵌套的 <code>template&lt;&gt; template &lt;typename T&gt;</code> 在规范上非法，
+    LLVM 20 将此从警告升级为<strong>默认报错</strong>。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-risk">&#10060; 硬错误</span>
+    <span class="tag tag-fix">&#128295; 需代码修复</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 示例：错误的多余 template head</h4>
+    <p class="example-title"><span class="code-label label-before">旧行为 (LLVM &lt; 20)</span></p>
+    <pre>template &lt;&gt;              // 多余的 template&lt;&gt; 头
+template &lt;typename T&gt;    // C++ 标准要求此处不应有 template&lt;&gt;
+void f();                // 旧编译器：警告（可能被忽略）</pre>
+    <p class="example-title"><span class="code-label label-after">新行为 (LLVM 20+)</span></p>
+    <pre>template &lt;&gt;              // error: extraneous template head
+template &lt;typename T&gt;
+void f();
+// LLVM 20 默认报错，编译失败</pre>
+  </div>
+
+  <div class="example-box">
+    <h4>&#9989; 修复方案</h4>
+    <p class="example-title"><span class="code-label label-fix">删除多余的 template&lt;&gt;</span></p>
+    <pre>// 正确的写法：去掉多余的 template&lt;&gt;
+template &lt;typename T&gt;
+void f();</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; 搜索代码中 <code>template &lt;&gt;</code> 后紧跟 <code>template &lt;</code> 的模式，删除多余的 template head。</p>
+    <p>&#8226; 此修复简单直接，通常只需删除一行。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 7. Itanium vtable ═══════════ -->
+<section class="section" id="itanium-vtable">
+  <h2><span class="anchor">&#128179;</span> 7. Itanium 构造 vtable 名称修正</h2>
+  <div class="desc">
+    LLVM 20 修正了 Itanium C++ ABI 下<strong>构造 vtable (construction vtable)</strong> 的名称生成错误。
+    构造 vtable 用于虚基类子对象的构造/析构期间，名称修正可能导致<strong>ABI 不兼容</strong>，
+    新旧编译器生成的符号名称可能不同，影响链接兼容性。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-warn">&#9888; ABI 变更</span>
+    <span class="tag tag-note">&#128161; 可恢复旧行为</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 影响场景</h4>
+    <pre>// 涉及虚基类的继承层次结构
+struct Base { virtual ~Base(); };
+struct Derived : virtual Base { virtual ~Derived(); };
+
+// LLVM 20 修正后，构造 vtable 的符号名称可能改变
+// 导致与旧版本编译的库链接时出现未定义符号错误</pre>
+  </div>
+
+  <div class="example-box">
+    <h4>&#9989; 修复方案</h4>
+    <p class="example-title"><span class="code-label label-fix">临时恢复旧行为</span></p>
+    <pre># 使用 ABI 兼容标志回到 LLVM 19 的命名方式
+clang -fclang-abi-compat=19 ...</pre>
+    <p class="example-title"><span class="code-label label-fix">根本修复</span></p>
+    <pre># 确保所有依赖库使用相同的 LLVM 版本重新编译
+# 消除跨版本 ABI 混用</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; <strong>全量重编</strong>：升级编译器后对所有 C++ 代码进行全量重编译，避免新旧 ABI 混用。</p>
+    <p>&#8226; <strong>过渡期</strong>：如有无法立即重编的预编译库，使用 <code>-fclang-abi-compat=19</code> 保持兼容。</p>
+    <p>&#8226; <strong>影响面</strong>：仅涉及带虚基类的复杂继承体系，大多数项目不受影响。</p>
+  </div>
+</section>
+
+<!-- ═══════════ 8. Machine Block Placement ═══════════ -->
+<section class="section" id="machine-block">
+  <h2><span class="anchor">&#128269;</span> 8. Size-aware Machine Block Placement</h2>
+  <div class="desc">
+    LLVM 20 引入了<strong>代码大小感知的基本块布局优化</strong>（Size-aware Machine Block Placement）。
+    该优化在 <code>-Oz</code>（最小体积）和 <code>-Os</code>（优化体积）场景下尤为有效，
+    通过更智能的代码布局减少跳转指令开销和指令缓存未命中。
+  </div>
+  <div class="tag-row">
+    <span class="tag tag-note">&#128161; 性能优化</span>
+    <span class="tag tag-fix">&#128200; 体积改善</span>
+  </div>
+
+  <div class="example-box">
+    <h4>&#128030; 典型影响</h4>
+    <pre>// 编译选项
+clang -Oz -o output input.c    // 目标：最小体积
+clang -Os -o output input.c    // 目标：平衡体积与性能
+
+// 新优化在 LLVM IR → Machine IR 阶段改进基本块布局
+// 效果：
+//   1. 减少无条件跳转指令数量
+//   2. 改善热路径指令缓存局部性
+//   3. 更紧凑的代码生成</pre>
+  </div>
+
+  <div class="advice-box">
+    <strong>&#128161; 建议</strong>
+    <p>&#8226; <strong>正面影响</strong>：对 <code>-Oz</code> / <code>-Os</code> 构建场景，代码体积有望改善。</p>
+    <p>&#8226; <strong>验证方法</strong>：对比 LLVM 19 和 LLVM 20 的 <code>-Oz</code> 构建产物，使用 <code>size</code> 或 <code>bloaty</code> 工具测量体积变化。</p>
+    <p>&#8226; <strong>性能验证</strong>：虽然目标是小体积，也建议在目标设备上运行性能回归测试，确保布局变更未引入性能退化。</p>
+    <p>&#8226; <strong>风险低</strong>：此优化在 LLVM 后端层面运作，不影响前端语义，兼容性风险极低。</p>
+  </div>
+</section>
+
+<!-- ═══════════ FOOTER ═══════════ -->
+<footer class="footer">
+  <p>LLVM 20 差异详解 &mdash; 毕昇编译器升级迁移指南</p>
+  <p style="margin-top:4px;"><a href="index.html">&larr; 返回主页</a></p>
+</footer>
+
+</div><!-- .container -->
+</body>
+</html>

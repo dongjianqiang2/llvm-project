@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLVM 18 差异详解 — 毕昇编译器升级</title>
+<style>
+  :root {
+    --primary: #0a2647;
+    --primary-light: #1e4a7a;
+    --primary-extra: #eef4fb;
+    --accent: #d4a843;
+    --accent-light: #f5e6b8;
+    --bg: #f6f8fc;
+    --card: #fff;
+    --text: #111827;
+    --text2: #4b5563;
+    --border: #e5e7eb;
+    --red: #dc2626; --red-bg: #fef2f2;
+    --amber: #d97706; --amber-bg: #fffbeb;
+    --green: #059669; --green-bg: #ecfdf5;
+    --blue: #2563eb; --blue-bg: #eff6ff;
+    --radius: 12px;
+    --shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
+  }
+
+  /* Header */
+  .header{
+    background:linear-gradient(135deg,#071225 0%,#0a2647 45%,#1e4a7a 100%);
+    color:#fff;padding:48px 24px 40px;text-align:center;position:relative;overflow:hidden;
+  }
+  .header::after{
+    content:'';position:absolute;inset:0;
+    background:radial-gradient(ellipse 60% 40% at 30% 50%,rgba(212,168,67,.10) 0%,transparent 70%);
+    pointer-events:none;
+  }
+  .header-badge{
+    display:inline-block;background:rgba(212,168,67,.18);border:1px solid rgba(212,168,67,.30);
+    color:var(--accent-light);font-size:12px;padding:4px 18px;border-radius:20px;
+    letter-spacing:1px;margin-bottom:14px;position:relative;z-index:1;
+  }
+  .header h1{font-size:30px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
+  .header .subtitle{font-size:15px;opacity:.78;max-width:680px;margin:0 auto 20px;position:relative;z-index:1}
+  .header .back{
+    display:inline-block;color:var(--accent);text-decoration:none;font-size:14px;
+    border:1px solid rgba(212,168,67,.4);padding:5px 18px;border-radius:6px;transition:background .12s;
+    position:relative;z-index:1;
+  }
+  .header .back:hover{background:rgba(212,168,67,.15)}
+
+  /* Container */
+  .container{max-width:1000px;margin:0 auto;padding:20px 20px 0}
+
+  /* Section / Card */
+  .section{
+    background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);
+    margin-bottom:24px;overflow:hidden;
+  }
+  .section-header{
+    padding:18px 26px 12px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  }
+  .section-header .num{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;border-radius:7px;
+    background:var(--primary);color:#fff;font-size:14px;font-weight:700;flex-shrink:0;
+  }
+  .section-header h2{font-size:18px;font-weight:700;color:var(--primary)}
+  .section-header .tag{
+    font-size:11px;font-weight:600;background:var(--primary-extra);color:var(--primary-light);
+    padding:2px 10px;border-radius:4px;white-space:nowrap;
+  }
+  .section-body{padding:18px 26px 26px}
+
+  /* Content styles */
+  p{margin:8px 0;font-size:14.5px;color:var(--text2)}
+  p strong{color:var(--text)}
+  h4{margin:18px 0 8px;color:var(--primary);font-size:15px}
+  h4:first-child{margin-top:4px}
+  h5{margin:14px 0 6px;color:var(--primary-light);font-size:14px;font-weight:600}
+
+  /* Tables */
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0}
+  thead th{background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:8px 12px;border-bottom:2px solid var(--border);font-size:12.5px}
+  tbody td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#f8fafc}
+  code,.inline-code{
+    background:#eef2f6;padding:1px 6px;border-radius:4px;
+    font-size:13px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+
+  /* Badges */
+  .bh{display:inline-block;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bm{display:inline-block;background:var(--amber-bg);color:var(--amber);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bl{display:inline-block;background:var(--blue-bg);color:var(--blue);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bg{display:inline-block;background:var(--green-bg);color:var(--green);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+
+  /* Example box */
+  .example-box{
+    background:#fafbfc;border:1px solid var(--border);border-left:4px solid var(--primary-light);
+    border-radius:7px;padding:16px 18px;margin:12px 0;
+  }
+  .example-box .label{
+    font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;
+  }
+
+  /* Callout */
+  .co{padding:14px 18px;border-radius:7px;margin:12px 0;font-size:13.5px;border-left:4px solid}
+  .co-r{background:var(--red-bg);border-color:var(--red);color:#7f1d1d}
+  .co-a{background:var(--amber-bg);border-color:var(--amber);color:#713f12}
+  .co-i{background:var(--blue-bg);border-color:var(--blue);color:#1e3a5f}
+  .co-g{background:var(--green-bg);border-color:var(--green);color:#064e3b}
+  .co strong{display:block;margin-bottom:3px}
+  .co code{background:rgba(0,0,0,.06);padding:1px 6px;border-radius:3px;font-size:13px}
+
+  /* Code block */
+  pre.cb{
+    background:#0a1a2e;color:#e2e8f0;padding:16px 20px;border-radius:8px;
+    overflow-x:auto;font-size:13px;line-height:1.6;font-family:"SF Mono",Menlo,monospace;margin:10px 0;
+  }
+  pre.cb .c{color:#6b7280}
+  pre.cb .k{color:#93c5fd}
+  pre.cb .s{color:#a7f3d0}
+  pre.cb .r{color:#fca5a5}
+  pre.cb .f{color:#c4b5fd}
+
+  /* ABI break highlight */
+  .abi-highlight{
+    background:linear-gradient(135deg, #fef2f2 0%, #fff5f5 100%);
+    border:2px solid var(--red);border-radius:8px;padding:18px 22px;margin:16px 0;
+  }
+  .abi-highlight .abi-title{
+    font-size:15px;font-weight:700;color:var(--red);margin-bottom:6px;
+  }
+
+  /* Lists */
+  ul,ol{padding-left:20px;font-size:14px;color:var(--text2)}
+  li{margin:5px 0}
+  li strong{color:var(--text)}
+  ul.arrow-list{list-style:none;padding-left:0}
+  ul.arrow-list li{padding-left:22px;position:relative}
+  ul.arrow-list li::before{content:'\2192';position:absolute;left:0;color:var(--accent);font-weight:700}
+
+  /* Flex utilities */
+  .flex{display:flex}.flex-wrap{flex-wrap:wrap}.gap-2{gap:6px}.gap-3{gap:12px}
+  .mt-4{margin-top:4px}.mt-6{margin-top:6px}.mt-10{margin-top:10px}.mt-14{margin-top:14px}.mt-18{margin-top:18px}
+  .mb-4{margin-bottom:4px}.mb-6{margin-bottom:6px}.mb-10{margin-bottom:10px}
+  hr{border:none;border-top:1px solid var(--border);margin:18px 0}
+
+  /* Footer */
+  .footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1000px;margin:0 auto}
+
+  @media(max-width:700px){
+    .header h1{font-size:22px}
+    .container{padding:12px}
+    .section-body{padding:14px 16px 18px}
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <div class="header-badge">LLVM 18.1 · 2024年3月发布</div>
+  <h1>LLVM 18 差异详解</h1>
+  <p class="subtitle">毕昇编译器升级 — 函数模板 Name Mangling、__int128 ABI、PCH、常量表达式、FatLTO 等关键变更详细说明</p>
+  <a class="back" href="index.html">&larr; 返回主页</a>
+</header>
+
+<div class="container">
+
+<!-- ══════════════════════════════════════════════════════
+     OVERVIEW
+     ══════════════════════════════════════════════════════ -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">&#9733;</span>
+    <h2>版本概览</h2>
+    <span class="tag">LLVM 18.1.0</span>
+  </div>
+  <div class="section-body">
+    <p>LLVM 18 是 2024 年 3 月发布的稳定版本，在 Clang 前端、LLVM 核心、链接器等组件中引入了多个重要的行为变更。其中<strong>函数模板名称重整（Name Mangling）</strong>是最关键的 ABI Break，直接影响所有依赖动态库和插件系统的 C++ 代码。</p>
+    <p>本章节详细覆盖以下七个关键变更，每个变更都包含问题说明、代码示例、影响评估及应对方案。</p>
+
+    <div class="flex flex-wrap gap-3 mt-14">
+      <span class="bh">ABI Break</span> 函数模板名称重整
+      <span class="bm">ABI 变更</span> __int128 x86-64 SystemV
+      <span class="bm">语言行为</span> 模板化 operator== 反转
+      <span class="bm">构建系统</span> PCH 扩展名变更
+      <span class="bh">LLVM 19 Error</span> -Wenum-constexpr-conversion
+      <span class="bm">IR 变更</span> 常量表达式变体移除
+      <span class="bg">新特性</span> FatLTO 支持
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     1. FUNCTION TEMPLATE NAME MANGLING
+     ══════════════════════════════════════════════════════ -->
+<section id="name-mangling" class="section">
+  <div class="section-header">
+    <span class="num">1</span>
+    <h2>函数模板名称重整（Name Mangling）</h2>
+    <span class="bh">最关键的 ABI Break</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-r">
+      <strong>&#128308; 这是 LLVM 18 中最关键、影响最广的 ABI 变更</strong>
+      所有满足特定条件的 C++ 函数模板的 mangled name 都会发生变化，导致符号不匹配、动态加载失败等严重问题。
+    </div>
+
+    <h4>变更说明</h4>
+    <p>LLVM 18 修复了 Clang 在 Itanium C++ ABI 下对函数模板的名称重整（Name Mangling）实现。此前，某些函数模板的 mangled name 未能正确反映模板参数之间的依赖关系、C++20 约束（concepts/requires）、以及 <code>auto</code> 推导类型等信息。LLVM 18 将这些因素纳入 mangling 计算，使得生成的符号名与 GCC 的行为保持一致，<strong>但因此改变了这些函数模板的 ABI</strong>。</p>
+    <p>通俗地说：两个同名模板函数，在旧编译器中可能产生相同的 mangled name（误判为同一符号），在新编译器中则会正确地区分出不同的 mangled name。反过来，原来匹配的符号也可能不再匹配。</p>
+
+    <div class="abi-highlight mt-14">
+      <div class="abi-title">&ldquo;模板参数的依赖关系和约束条件现在会影响符号名&rdquo;</div>
+      <p style="margin-bottom:0;color:#7f1d1d;font-size:13.5px">
+        Itanium ABI 规范要求：当模板参数的依赖关系、约束条件、或推导类型不同时，函数模板的 mangled name 必须不同。
+        旧版本的 Clang 在某些情况下未严格遵守此规范，LLVM 18 修复了这一问题。
+      </p>
+    </div>
+
+    <h4>场景一：模板参数依赖前一个参数</h4>
+    <div class="example-box">
+      <div class="label">示例 1 &mdash; 参数依赖</div>
+      <pre class="cb"><span class="c">// template 的第二个参数 V 的类型 依赖于 第一个参数 T</span>
+<span class="c">// 旧编译器可能对所有实例化生成相同的 mangled name</span>
+<span class="c">// 新编译器会根据 T 的实际类型生成不同的符号</span>
+
+<span class="k">template</span>&lt;<span class="k">typename</span> T, T V&gt;
+<span class="k">void</span> <span class="f">f</span>() {}
+
+<span class="k">void</span> <span class="f">example1</span>() {
+    f&lt;<span class="k">int</span>, 42&gt;();      <span class="c">// mangled name 变化：T=int, V=42(int)</span>
+    f&lt;<span class="k">char</span>, <span class="s">'x'</span>&gt;();    <span class="c">// mangled name 变化：T=char, V='x'(char)</span>
+    f&lt;<span class="k">long</span>, 99L&gt;();     <span class="c">// 每个实例化现在有唯一确定的符号名</span>
+}</pre>
+    </div>
+
+    <h4>场景二：带 C++20 约束（constraints/requires）的模板</h4>
+    <div class="example-box">
+      <div class="label">示例 2 &mdash; C++20 约束</div>
+      <pre class="cb"><span class="c">// C++20 requires 子句 —— 约束条件现在参与 name mangling</span>
+<span class="c">// 旧：约束被忽略，所有未约束版本和约束版本可能产生相同符号</span>
+<span class="c">// 新：约束条件不同 = 不同的 mangled name</span>
+
+<span class="cp">#include &lt;concepts&gt;</span>
+
+<span class="k">template</span>&lt;<span class="k">typename</span> T&gt;
+<span class="k">requires</span> std::integral&lt;T&gt;
+<span class="k">void</span> <span class="f">f</span>(T x) {}
+
+<span class="k">template</span>&lt;<span class="k">typename</span> T&gt;
+<span class="k">requires</span> std::floating_point&lt;T&gt;
+<span class="k">void</span> <span class="f">f</span>(T x) {} <span class="c">// 与上面的 mangled name 不同</span>
+
+<span class="k">void</span> <span class="f">example2</span>() {
+    f(42);       <span class="c">// 调用 integral 重载</span>
+    f(3.14);     <span class="c">// 调用 floating_point 重载</span>
+                 <span class="c">// 两个重载现在有正确区分的 mangled name</span>
+}</pre>
+    </div>
+
+    <h4>场景三：auto 推导类型参数</h4>
+    <div class="example-box">
+      <div class="label">示例 3 &mdash; auto 推导类型</div>
+      <pre class="cb"><span class="c">// auto 非类型模板参数 —— C++17 特性</span>
+<span class="c">// 旧：auto 推导的实际类型不影响 mangling</span>
+<span class="c">// 新：推导出的具体类型参与 mangling 计算</span>
+
+<span class="k">template</span>&lt;<span class="k">auto</span> V&gt;
+<span class="k">void</span> <span class="f">f</span>() {}
+
+<span class="k">void</span> <span class="f">example3</span>() {
+    f&lt;42&gt;();        <span class="c">// V 推导为 int，mangled name 含 int 信息</span>
+    f&lt;<span class="s">'x'</span>&gt;();       <span class="c">// V 推导为 char，mangled name 含 char 信息</span>
+    f&lt;3.14&gt;();      <span class="c">// V 推导为 double（C++20），mangled name 变化</span>
+}</pre>
+    </div>
+
+    <h4>影响评估</h4>
+    <table>
+      <thead><tr><th style="width:20%">影响维度</th><th style="width:40%">具体表现</th><th style="width:40%">受影响场景</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="bh">动态库 ABI</span></td>
+          <td>使用新/旧编译器分别编译的 .so 之间，上述模板函数的符号名不匹配，<strong>链接时找不到符号</strong></td>
+          <td>动态库升级场景；插件加载系统（dlopen/dlsym）；跨编译器版本的库分发</td>
+        </tr>
+        <tr>
+          <td><span class="bh">静态库链接</span></td>
+          <td>新旧目标文件中的符号不一致，链接器可能报告<strong>未定义引用</strong>或<strong>重复定义</strong></td>
+          <td>增量构建；预编译静态库分发</td>
+        </tr>
+        <tr>
+          <td><span class="bm">二进制兼容</span></td>
+          <td>已部署的二进制文件调用新编译的库时，因符号名变化导致<strong>运行时符号解析失败</strong></td>
+          <td>热更新/热补丁系统；插件架构</td>
+        </tr>
+        <tr>
+          <td><span class="bl">编译隔离</span></td>
+          <td>全量从源码重新编译（不涉及预编译库）时通常不受影响，因为编译+链接使用同一编译器</td>
+          <td>纯源码构建的项目</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>诊断方法</h4>
+    <div class="example-box">
+      <div class="label">使用 nm 检查符号变化</div>
+      <pre class="cb"><span class="c"># 用旧编译器 (LLVM 17) 编译</span>
+clang++-17 -c example.cpp -o example_old.o
+nm -C example_old.o | grep <span class="s">"f&lt;"</span>
+
+<span class="c"># 用新编译器 (LLVM 18) 编译</span>
+clang++-18 -c example.cpp -o example_new.o
+nm -C example_new.o | grep <span class="s">"f&lt;"</span>
+
+<span class="c"># 对比两个输出，检查符号名是否有差异</span>
+diff &lt;(nm -C example_old.o | sort) &lt;(nm -C example_new.o | sort)
+
+<span class="c"># 也可以直接查看未 demangle 的原始符号名</span>
+nm example_old.o | c++filt
+nm example_new.o | c++filt</pre>
+    </div>
+
+    <h4>恢复兼容性</h4>
+    <div class="co co-a">
+      <strong>&#128993; 过渡期兼容方案</strong>
+      如果暂时无法全量重新编译所有依赖库，可以通过 <code>-fclang-abi-compat=17</code> 编译选项让 LLVM 18 使用与 LLVM 17 兼容的 ABI（包括旧的 name mangling 行为）。<br>
+      <strong>注意：</strong>这是一个<strong>过渡期</strong>方案。长期应升级所有依赖库到新的 ABI，并在全量重新编译后移除此标志。
+    </div>
+
+    <h4>建议的应对策略</h4>
+    <ul class="arrow-list">
+      <li><strong>全量重新编译</strong>：如果项目所有代码和依赖都是源码构建，统一用 LLVM 18 重新编译即可，不需要额外处理</li>
+      <li><strong>检查动态库接口</strong>：对导出 API 使用 <code>nm -C</code> 检查是否有上述模板模式，评估对外部调用者的影响</li>
+      <li><strong>插件系统</strong>：如果通过 dlopen/dlsym 按 mangled name 加载符号，需要更新符号名（或改用 extern "C" 包装）</li>
+      <li><strong>过渡期</strong>：使用 <code>-fclang-abi-compat=17</code> 保持兼容，逐步迁移</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     2. __int128 x86-64 SystemV ABI
+     ══════════════════════════════════════════════════════ -->
+<section id="int128-abi" class="section">
+  <div class="section-header">
+    <span class="num">2</span>
+    <h2>__int128 x86-64 SystemV ABI 变更</h2>
+    <span class="bm">ABI 变更</span>
+    <span class="tag">x86-64 Linux</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-a">
+      <strong>&#128993; x86-64 Linux 平台的调用约定变更</strong>
+      涉及 <code>__int128</code> 类型参数的函数，在 LLVM 18 中其参数传递方式发生了变化，与旧版本编译的代码二进制不兼容。
+    </div>
+
+    <h4>变更说明</h4>
+    <p>在 x86-64 SystemV ABI 下，<code>__int128</code>（128 位整数）类型的函数参数，旧版本的 Clang 采用<strong>"拆分传递"</strong>方案：将 128 位数据拆分为两部分，一部分通过寄存器传递，剩余部分通过栈传递。LLVM 18 修正了这一行为，现在 <code>__int128</code> 参数<strong>完全通过寄存器对（register pair）传递</strong>，不再涉及栈操作。</p>
+    <p>这个修正使 Clang 的行为与 GCC 保持一致，<strong>但改变了函数调用约定</strong>。使用不同版本编译器编译的调用方和被调用方之间会出现 ABI 不兼容。</p>
+
+    <h4>代码示例</h4>
+    <div class="example-box">
+      <div class="label">示例 — __int128 参数传递</div>
+      <pre class="cb"><span class="c">// 一个接受 __int128 参数的函数</span>
+<span class="c">// 旧 ABI：val 被拆分为寄存器 + 栈</span>
+<span class="c">// 新 ABI：val 完全通过寄存器对 (rdx:rax 或类似) 传递</span>
+
+<span class="k">__int128</span> <span class="f">add128</span>(<span class="k">__int128</span> a, <span class="k">__int128</span> b) {
+    <span class="k">return</span> a + b;
+}
+
+<span class="k">void</span> <span class="f">caller</span>() {
+    <span class="k">__int128</span> x = (<span class="k">__int128</span>)1 &lt;&lt; 100;
+    <span class="k">__int128</span> y = (<span class="k">__int128</span>)1 &lt;&lt; 64;
+    <span class="k">__int128</span> result = add128(x, y);
+    <span class="c">// 调用方和被调用方必须使用同一 ABI 约定</span>
+}</pre>
+    </div>
+
+    <h4>影响评估</h4>
+    <table>
+      <thead><tr><th style="width:22%">维度</th><th style="width:78%">详情</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="bm">影响平台</span></td>
+          <td><strong>仅限 x86-64 Linux</strong>（SystemV AMD64 ABI）。ARM64 (AArch64)、Windows、macOS 等其他平台不受影响</td>
+        </tr>
+        <tr>
+          <td><span class="bm">触发条件</span></td>
+          <td>函数参数或返回值类型包含 <code>__int128</code>（包括 signed/unsigned 变体）</td>
+        </tr>
+        <tr>
+          <td><span class="bh">风险</span></td>
+          <td>新旧编译器混编的 .o/.so 之间调用此类函数时，参数传递不匹配，可能导致数据损坏或崩溃</td>
+        </tr>
+        <tr>
+          <td><span class="bl">发生概率</span></td>
+          <td>相对较低 — <code>__int128</code> 在大多数业务代码中使用并不频繁，主要出现在加密算法、大数运算、哈希函数等场景</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>应对建议</h4>
+    <ul class="arrow-list">
+      <li><strong>排查 __int128 使用</strong>：在代码库中搜索 <code>__int128</code>、<code>unsigned __int128</code>，确认使用范围</li>
+      <li><strong>全量重编译</strong>：涉及 __int128 的模块，调用方和被调用方必须使用同一版本编译器编译</li>
+      <li><strong>优先关注</strong>：加解密库、哈希库、大整数运算库（如自定义的 BigInt 实现）</li>
+      <li><strong>过渡方案</strong>：使用 <code>-fclang-abi-compat=17</code> 保持旧 ABI 行为</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     3. TEMPLATE OPERATOR== REVERSAL FIX
+     ══════════════════════════════════════════════════════ -->
+<section id="operator-reversal" class="section">
+  <div class="section-header">
+    <span class="num">3</span>
+    <h2>模板化 operator== 反转修复</h2>
+    <span class="bm">C++20 语言行为变更</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-a">
+      <strong>&#128993; C++20 operator== 重写规则的边界情况修正</strong>
+      LLVM 18 修复了模板化 <code>operator==</code> 在 C++20 反转重写规则下的处理，之前被接受的某些代码现在可能变为歧义。
+    </div>
+
+    <h4>变更说明</h4>
+    <p>C++20 引入了 <code>operator==</code> 的<strong>反转重写规则</strong>（reversed rewriting）：如果 <code>a == b</code> 找不到匹配的 <code>operator==(a, b)</code>，编译器会尝试反转参数顺序，查找 <code>operator==(b, a)</code>。</p>
+    <p>LLVM 18 修复了此规则应用于<strong>模板化 operator==</strong> 时的一个问题。对于某些同时定义了正向和反向匹配的模板 operator== 场景，之前 Clang 会接受（选出一个候选），现在正确报告为<strong>歧义</strong>（ambiguous）。这可能导致之前可编译通过的代码在 LLVM 18 下编译失败。</p>
+
+    <h4>代码示例</h4>
+    <div class="example-box">
+      <div class="label">示例 — 变为歧义的 operator== 调用</div>
+      <pre class="cb"><span class="c">// C++20 模式</span>
+<span class="c">// LLVM 17：接受此代码（选择非模板或其中一个模板）</span>
+<span class="c">// LLVM 18：报告歧义错误（两个候选 operator== 同等匹配）</span>
+
+<span class="k">struct</span> <span class="f">P</span> {};
+
+<span class="c">// 候选1：正向 operator==</span>
+<span class="k">template</span>&lt;<span class="k">class</span> S&gt;
+<span class="k">bool</span> <span class="k">operator</span>==(<span class="k">const</span> P&amp;, <span class="k">const</span> S&amp;);
+
+<span class="c">// 候选2：另一个模板 operator==，反转后也能匹配</span>
+<span class="k">template</span>&lt;<span class="k">class</span> T&gt;
+<span class="k">bool</span> <span class="k">operator</span>==(<span class="k">const</span> T&amp;, <span class="k">const</span> P&amp;);
+
+<span class="k">void</span> <span class="f">test</span>() {
+    P p1, p2;
+    <span class="k">if</span> (p1 == p2) {  <span class="c">// 歧义：候选1 正向匹配 (P, P)</span>
+                        <span class="c">//       候选2 反转匹配  P==P → P==P 反转</span>
+                        <span class="c">// LLVM 18 报告：call to 'operator==' is ambiguous</span>
+    }
+}</pre>
+    </div>
+
+    <h4>诊断与处理</h4>
+    <div class="co co-i">
+      <strong>&#128309; 使用 -Wambiguous-reversed-operator 提前检测</strong>
+      该告警选项可以帮助在旧编译器（LLVM 17）上提前发现可能存在歧义的 operator== 使用。<br>
+      升级到 LLVM 18 之前，建议先启用此告警进行一轮代码筛查和修复。
+    </div>
+
+    <h4>应对建议</h4>
+    <ul class="arrow-list">
+      <li>启用 <code>-Wambiguous-reversed-operator</code> 在升级前检测潜在歧义</li>
+      <li>对于确实歧义的 operator== 调用，显式指定候选（例如添加更特化的重载）</li>
+      <li>检查代码中自定义的模板化 operator==，特别是涉及对称比较运算符的场景</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     4. PCH EXTENSION CHANGE
+     ══════════════════════════════════════════════════════ -->
+<section id="pch-extension" class="section">
+  <div class="section-header">
+    <span class="num">4</span>
+    <h2>PCH 扩展名改为 .pch</h2>
+    <span class="bm">构建系统适配</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-a">
+      <strong>&#128993; 预编译头部（PCH）文件扩展名变更</strong>
+      LLVM 18 将预编译头部的默认扩展名从 <code>.gch</code> 改为 <code>.pch</code>，且 <code>-include</code> 不再自动识别 <code>.gch</code> 文件。
+    </div>
+
+    <h4>变更说明</h4>
+    <p>预编译头部（Precompiled Header）是加速 C/C++ 编译的重要机制。LLVM 18 对 PCH 文件的处理做了两项关键变更：</p>
+    <ol>
+      <li><strong>默认扩展名改为 <code>.pch</code></strong>：使用 <code>clang -x c++-header</code> 编译头部生成的预编译文件，旧版本使用 <code>.h.gch</code> 作为扩展名，LLVM 18 改为 <code>.h.pch</code></li>
+      <li><strong><code>-include</code> 不再查找 <code>.gch</code></strong>：<code>-include a.h</code> 在旧版本中会自动查找 <code>a.h.gch</code> 作为 PCH 文件。LLVM 18 起只查找 <code>a.h.pch</code>（如果存在），不再回退到 <code>.gch</code></li>
+    </ol>
+
+    <h4>影响示例</h4>
+    <div class="example-box">
+      <div class="label">示例 — PCH 生成和使用</div>
+      <pre class="cb"><span class="c"># 旧行为 (LLVM 17 及之前)：</span>
+clang++-17 -x c++-header common.h -o common.h.gch        <span class="c"># 生成 .gch</span>
+clang++-17 -include common.h main.cpp                    <span class="c"># 自动查找 common.h.gch ✓</span>
+
+<span class="c"># 新行为 (LLVM 18)：</span>
+clang++-18 -x c++-header common.h -o common.h.pch        <span class="c"># 生成 .pch</span>
+clang++-18 -include common.h main.cpp                    <span class="c"># 自动查找 common.h.pch ✓</span>
+                                                         <span class="c"># 不再查找 common.h.gch ✗</span></pre>
+    </div>
+
+    <h4>影响评估</h4>
+    <table>
+      <thead><tr><th style="width:22%">场景</th><th style="width:78%">影响</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="bh">Makefile/CMake</span></td>
+          <td>构建脚本中硬编码 <code>.gch</code> 扩展名的地方需要更新为 <code>.pch</code>，否则 PCH 不会被自动发现</td>
+        </tr>
+        <tr>
+          <td><span class="bh">外部工具</span></td>
+          <td>任何依赖 <code>-include</code> + PCH 自动查找机制的工具链（如 distcc、ccache 的 PCH 模式）可能需要更新</td>
+        </tr>
+        <tr>
+          <td><span class="bm">显式指定</span></td>
+          <td>如果构建脚本显式指定 PCH 文件路径（通过 <code>-include-pch</code> 或直接作为输入文件），则不受此变更影响</td>
+        </tr>
+        <tr>
+          <td><span class="bm">存量 .gch 文件</span></td>
+          <td>已有的 <code>.gch</code> 文件不会被自动识别。可以通过 <code>-include-pch common.h.gch</code> 显式指定来继续使用</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>完整示例：更新构建脚本</h4>
+    <div class="example-box">
+      <div class="label">示例 — Makefile 适配</div>
+      <pre class="cb"><span class="c"># 旧 Makefile (LLVM &lt;18)</span>
+PCH_FILE = common.h.gch
+<span class="k">$(PCH_FILE)</span>: common.h
+	clang++ -x c++-header $&lt; -o $@
+
+main.o: main.cpp <span class="k">$(PCH_FILE)</span>
+	clang++ -include common.h -c main.cpp
+
+<span class="c"># --- 改为 ---</span>
+
+<span class="c"># 新 Makefile (LLVM 18+)</span>
+PCH_FILE = common.h.pch                               <span class="c"># 改扩展名</span>
+<span class="k">$(PCH_FILE)</span>: common.h
+	clang++ -x c++-header $&lt; -o $@
+
+main.o: main.cpp <span class="k">$(PCH_FILE)</span>
+	clang++ -include common.h -c main.cpp             <span class="c"># -include 不变，自动找 .pch</span></pre>
+    </div>
+
+    <h4>应对建议</h4>
+    <ul class="arrow-list">
+      <li>在 Makefile / CMakeLists.txt 中搜索 <code>.gch</code> 引用，替换为 <code>.pch</code></li>
+      <li>清理构建目录中的旧 <code>.gch</code> 文件，防止混淆</li>
+      <li>检查 CI/CD 构建脚本中的 PCH 路径</li>
+      <li>如果使用 ccache，确认其 PCH 模式与新扩展名兼容</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     5. -Wenum-constexpr-conversion
+     ══════════════════════════════════════════════════════ -->
+<section id="enum-constexpr" class="section">
+  <div class="section-header">
+    <span class="num">5</span>
+    <h2>-Wenum-constexpr-conversion 默认启用</h2>
+    <span class="bh">LLVM 19 升级为硬 Error</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-r">
+      <strong>&#128308; LLVM 18 在系统头文件中默认启用；LLVM 19/20 起升级为不可压制的硬 Error</strong>
+      这是一个<strong>分期收紧</strong>的变更：LLVM 18 只是默认启用告警，LLVM 19/20 将升级为强制错误。在 LLVM 18 阶段必须完成相关代码的修复。
+    </div>
+
+    <h4>变更说明</h4>
+    <p><code>-Wenum-constexpr-conversion</code> 检测<strong>编译期</strong>将超出枚举范围的整数值转换为枚举类型的操作。C++ 标准规定，枚举类型的值必须在其底层类型能表示的范围内且与某个枚举器对应（或有足够的位宽表示所有枚举器的组合）。</p>
+    <p>LLVM 18 之前，此告警在<strong>系统头文件</strong>（如标准库头文件）中被默认静默。LLVM 18 起，该告警在系统头文件中<strong>默认启用</strong>。LLVM 19/20 将其升级为<strong>硬 Error</strong>，不可通过编译选项降级。</p>
+
+    <h4>代码示例</h4>
+    <div class="example-box">
+      <div class="label">示例 — enum 超范围值</div>
+      <pre class="cb"><span class="c">// 定义一个只有两个有效值的枚举</span>
+<span class="k">enum</span> <span class="f">E</span> { A, B };  <span class="c">// A=0, B=1, 底层类型为 int</span>
+
+<span class="c">// LLVM 18：触发 -Wenum-constexpr-conversion 告警</span>
+<span class="c">// LLVM 19/20：编译错误</span>
+<span class="k">constexpr</span> <span class="f">E</span> v1 = (<span class="f">E</span>)10;     <span class="c">// 10 超出 [0,1] 范围，错误！</span>
+
+<span class="c">// 标准库中也可能触发，例如：</span>
+<span class="c">// 某些实现中 std::byte 相关的转换可能涉及枚举类型</span>
+<span class="c">// LLVM 18 起在系统头文件中也会报告</span>
+
+<span class="c">// 正确做法：确保值在有效范围内</span>
+<span class="k">constexpr</span> <span class="f">E</span> v2 = (<span class="f">E</span>)1;      <span class="c">// OK，1 = B</span></pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">示例 — 带底层类型指定（fixed underlying type）</div>
+      <pre class="cb"><span class="c">// 指定底层类型的枚举</span>
+<span class="k">enum</span> <span class="k">class</span> <span class="f">Flags</span> : <span class="k">unsigned</span> <span class="k">int</span> {
+    None  = 0,
+    Read  = 1 &lt;&lt; 0,
+    Write = 1 &lt;&lt; 1,
+    Exec  = 1 &lt;&lt; 2
+};
+
+<span class="c">// 组合标志 —— 看似合理，但 7 不是任何枚举器</span>
+<span class="k">constexpr</span> <span class="f">Flags</span> all = (<span class="f">Flags</span>)7;  <span class="c">// LLVM 19+ 报错！</span>
+
+<span class="c">// 规避方案1：使用底层类型而非枚举类型</span>
+<span class="k">constexpr</span> <span class="k">unsigned</span> <span class="k">int</span> all_flags = 7;
+
+<span class="c">// 规避方案2（C++23）：使用 std::to_underlying + 显式转换</span>
+<span class="c">// 或考虑使用位域 / 整数类型组合标志</span></pre>
+    </div>
+
+    <h4>影响评估</h4>
+    <table>
+      <thead><tr><th style="width:18%">版本阶段</th><th style="width:42%">行为</th><th style="width:40%">应对</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>LLVM 17 及之前</strong></td>
+          <td>系统头文件内不告警</td>
+          <td>无影响</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 18</strong></td>
+          <td>系统头文件中默认启用告警（warning）</td>
+          <td>可暂时用 <code>-Wno-enum-constexpr-conversion</code> 降级</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 19+</strong></td>
+          <td><span class="bh">升级为硬 Error，不可降级</span></td>
+          <td><strong>必须在升级到 LLVM 19 之前修复所有违规代码</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>应对建议</h4>
+    <ul class="arrow-list">
+      <li><strong>在 LLVM 18 阶段完成修复</strong>：利用 <code>-Wenum-constexpr-conversion</code> 告警定位所有违规点</li>
+      <li><strong>枚举标志组合</strong>：对于位掩码用途的枚举，改用底层整数类型存储组合值，而非强制转换为枚举类型</li>
+      <li><strong>枚举值校验</strong>：检查所有 <code>constexpr</code> 上下文中对枚举的显式转换，确保值在合法范围内</li>
+      <li><strong>标准库头文件</strong>：注意系统头文件（如 <code>&lt;filesystem&gt;</code>、<code>&lt;chrono&gt;</code> 等）也可能触发，这些需要等待标准库修复</li>
+    </ul>
+
+    <div class="co co-r mt-14">
+      <strong>&#128308; 特别提示</strong>
+      如果项目计划跳过 LLVM 18 直接从 17 升级到 19/20，请务必先用 LLVM 18 的 <code>-Wenum-constexpr-conversion</code> 完成一轮代码筛查，因为 LLVM 19 起此错误<strong>不可压制</strong>。
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     6. CONSTANT EXPRESSION VARIANTS REMOVED
+     ══════════════════════════════════════════════════════ -->
+<section id="constantexpr-removal" class="section">
+  <div class="section-header">
+    <span class="num">6</span>
+    <h2>大量常量表达式变体移除</h2>
+    <span class="bm">LLVM IR 变更</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-a">
+      <strong>&#128993; LLVM IR 中的多种 ConstantExpr 子类被移除</strong>
+      直接影响手写 LLVM IR 或使用 LLVM C++ API 构建 IR 的工具。纯 C/C++ 源码编译的用户不受直接影响。
+    </div>
+
+    <h4>变更说明</h4>
+    <p>LLVM IR 中的 <code>ConstantExpr</code> 表示编译期可计算的常量表达式。历史上，LLVM 为每种二元运算都定义了对应的常量表达式子类。随着 LLVM 向 opaque pointers 和其他 IR 现代化方向的演进，许多常量表达式变体变得冗余，LLVM 18 移除了一批不再需要的变体。</p>
+    <p>移除后，这些操作在编译期仍可正常计算，只是不再以独立的 ConstantExpr 子类表示，而是统一使用 <code>ConstantFold</code> 机制处理。</p>
+
+    <h4>移除的常量表达式变体</h4>
+    <table>
+      <thead><tr><th>类别</th><th>移除的 ConstantExpr 变体</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>位运算</strong></td>
+          <td><code>And</code>、<code>Or</code>、<code>LShr</code>、<code>AShr</code></td>
+          <td>按位与、或、逻辑右移、算术右移</td>
+        </tr>
+        <tr>
+          <td><strong>整数扩展/截断</strong></td>
+          <td><code>ZExt</code>、<code>SExt</code>、<code>Trunc</code></td>
+          <td>零扩展、符号扩展、整数截断</td>
+        </tr>
+        <tr>
+          <td><strong>浮点转换</strong></td>
+          <td><code>FPTrunc</code>、<code>FPExt</code>、<code>FPToUI</code>、<code>FPToSI</code>、<code>UIToFP</code>、<code>SIToFP</code></td>
+          <td>浮点截断、浮点扩展、浮点转整数（有/无符号）、整数转浮点（无/有符号）</td>
+        </tr>
+        <tr>
+          <td><strong>指针操作</strong></td>
+          <td><code>PtrToInt</code>、<code>IntToPtr</code>、<code>BitCast</code>、<code>AddrSpaceCast</code></td>
+          <td>指针与整数互转、bitcast、地址空间转换</td>
+        </tr>
+        <tr>
+          <td><strong>聚合操作</strong></td>
+          <td><code>ExtractElement</code>、<code>InsertElement</code>、<code>ShuffleVector</code></td>
+          <td>向量元素提取/插入/重排</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>代码示例</h4>
+    <div class="example-box">
+      <div class="label">示例 — LLVM C++ API 中已不可用的类型</div>
+      <pre class="cb"><span class="c">// 旧代码（LLVM 17 及之前可用）：</span>
+<span class="c">// 使用 ConstantExpr::getZExt() 创建常量零扩展表达式</span>
+Constant *C = ConstantExpr::getZExt(Value, Int64Ty);
+
+<span class="c">// 新代码（LLVM 18+）：</span>
+<span class="c">// 直接使用 ConstantFold 或 IR Builder</span>
+Constant *C = ConstantFoldCastOperand(Instruction::ZExt, Value, Int64Ty, DL);
+<span class="c">// 或者通过 IRBuilder:</span>
+<span class="c">// IRBuilder&lt;&gt; Builder(...);</span>
+<span class="c">// Value *C = Builder.CreateZExt(Value, Int64Ty);</span></pre>
+    </div>
+
+    <div class="example-box">
+      <div class="label">示例 — 手写 LLVM IR 中的变化</div>
+      <pre class="cb"><span class="c">; 旧 IR（LLVM 17 及之前，常量表达式语法可用）：</span>
+<span class="k">@g</span> = <span class="k">global</span> i64 zext (i32 <span class="k">ptrtoint</span> (ptr <span class="k">@foo</span> <span class="k">to</span> i32) <span class="k">to</span> i64)
+
+<span class="c">; 新 IR（LLVM 18+，不能嵌套这些常量表达式）：</span>
+<span class="c">; 需要改为使用指令序列或在编译期预先计算：</span>
+<span class="k">@ptr_val</span> = <span class="k">global</span> i32 <span class="k">ptrtoint</span> (ptr <span class="k">@foo</span> <span class="k">to</span> i32)
+<span class="k">@g</span> = <span class="k">global</span> i64 0  <span class="c">; 改为运行时初始化或使用 ConstantFold</span></pre>
+    </div>
+
+    <h4>影响评估</h4>
+    <table>
+      <thead><tr><th style="width:22%">用户类别</th><th style="width:78%">影响</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="bg">普通 C/C++ 源码编译</span></td>
+          <td><strong>不受影响</strong> — Clang 前端已适配，自动生成新的 IR 格式</td>
+        </tr>
+        <tr>
+          <td><span class="bm">使用 LLVM C++ API 的工具</span></td>
+          <td><strong>需要更新代码</strong> — 不能再调用已移除的 <code>ConstantExpr::get*()</code> 静态方法，改用 <code>ConstantFoldCastOperand</code> 或 <code>IRBuilder</code></td>
+        </tr>
+        <tr>
+          <td><span class="bm">手写/生成 LLVM IR 的工具</span></td>
+          <td><strong>需要更新 IR 生成逻辑</strong> — 不能再在常量表达式中使用已移除的操作类型</td>
+        </tr>
+        <tr>
+          <td><span class="bh">LLVM Pass 插件</span></td>
+          <td><strong>需要更新</strong> — 如果 Pass 中模式匹配了这些 ConstantExpr 子类，需要修改匹配逻辑</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>应对建议</h4>
+    <ul class="arrow-list">
+      <li><strong>纯 C/C++ 项目</strong>：通常无需关注</li>
+      <li><strong>有自定义 LLVM Pass</strong>：检查 Pass 代码中是否使用了已移除的 ConstantExpr API，替换为新的常量折叠接口</li>
+      <li><strong>生成 IR 的工具</strong>：检查生成的 IR 中是否包含已移除的常量表达式语法，改用指令序列</li>
+      <li><strong>汇编级别的 IR 测试</strong>：更新 <code>.ll</code> 测试文件，移除已废弃的常量表达式用法</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     7. FatLTO SUPPORT (LLD)
+     ══════════════════════════════════════════════════════ -->
+<section id="fatlto" class="section">
+  <div class="section-header">
+    <span class="num">7</span>
+    <h2>FatLTO 支持 (LLD)</h2>
+    <span class="bg">新特性</span>
+  </div>
+  <div class="section-body">
+
+    <div class="co co-g">
+      <strong>&#128994; LLVM 18 新增 FatLTO 链接器支持</strong>
+      LLD 新增 <code>--fat-lto-objects</code> 选项，目标文件中同时包含机器码和 LLVM IR，避免 ThinLTO/Full LTO 与无 LTO 构建之间的不兼容。
+    </div>
+
+    <h4>变更说明</h4>
+    <p><strong>FatLTO</strong>（Fat Link-Time Optimization）是 LLVM 18 引入的一种新的 LTO 目标文件格式。传统 LTO 模式下，目标文件要么包含机器码（无 LTO），要么包含 LLVM IR bitcode（LTO 模式），二者不能混用。FatLTO 的目标文件<strong>同时包含机器码和 LLVM IR</strong>，使同一份目标文件既可以用于 LTO 链接，也可以用于非 LTO 链接。</p>
+    <p>LLD 在 LLVM 18 中新增 <code>--fat-lto-objects</code> 链接器选项，用于支持这种格式的目标文件。</p>
+
+    <h4>工作流程</h4>
+    <div class="example-box">
+      <div class="label">示例 — FatLTO 编译和链接流程</div>
+      <pre class="cb"><span class="c"># 生成 FatLTO 目标文件：同时包含机器码和 LLVM IR</span>
+clang++-18 -c -ffat-lto-objects foo.cpp -o foo.o
+clang++-18 -c -ffat-lto-objects bar.cpp -o bar.o
+
+<span class="c"># 非 LTO 链接（使用机器码部分，忽略 IR）：</span>
+clang++-18 foo.o bar.o -o app_no_lto
+
+<span class="c"># LTO 链接（使用 IR 部分进行跨模块优化）：</span>
+clang++-18 -flto foo.o bar.o -o app_lto
+
+<span class="c"># 或直接用 LLD + --fat-lto-objects：</span>
+ld.lld --fat-lto-objects foo.o bar.o -o app
+<span class="c"># LLD 自动识别 FatLTO 格式，根据需要选择机器码或 IR</span></pre>
+    </div>
+
+    <h4>为什么需要 FatLTO</h4>
+    <table>
+      <thead><tr><th style="width:22%">问题</th><th style="width:40%">传统方案</th><th style="width:38%">FatLTO 方案</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>构建变体管理</strong></td>
+          <td>LTO 和非 LTO 构建需要分别生成目标文件，两套编译产物</td>
+          <td><span class="bg">同一份目标文件</span>，链接时灵活选择</td>
+        </tr>
+        <tr>
+          <td><strong>增量构建</strong></td>
+          <td>切换 LTO 模式需要全量重新编译</td>
+          <td><span class="bg">无需重新编译</span>，仅重新链接即可</td>
+        </tr>
+        <tr>
+          <td><strong>库分发</strong></td>
+          <td>分发 LTO 版本的库需要单独构建或同时分发两套</td>
+          <td><span class="bg">单一构建产物</span>同时满足 LTO 和非 LTO 用户</td>
+        </tr>
+        <tr>
+          <td><strong>文件大小</strong></td>
+          <td>单套文件较小</td>
+          <td><span class="bm">文件稍大</span>（包含两份数据），但省去双份构建的存储开销</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>影响评估</h4>
+    <div class="co co-i">
+      <strong>&#128309; 这是一个<em>新增功能</em>，而非默认行为变更</strong>
+      FatLTO 是可选功能。不使用 <code>-ffat-lto-objects</code> 编译选项或 <code>--fat-lto-objects</code> 链接选项时，行为与旧版本完全一致。对现有构建流程<strong>零影响</strong>。
+    </div>
+
+    <h4>适用场景与建议</h4>
+    <ul class="arrow-list">
+      <li><strong>大型项目</strong>：希望同一份编译产物同时支持 LTO 和快速非 LTO 调试构建</li>
+      <li><strong>SDK/库分发</strong>：分发的预编译库同时支持 LTO 和非 LTO 用户</li>
+      <li><strong>CI/CD 优化</strong>：减少构建变体的编译次数，一份编译 + 多种链接配置</li>
+      <li><strong>暂不需要</strong>：如果项目统一使用或无 LTO 或统一使用 LTO，且没有库分发需求，FatLTO 带来的收益有限</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     SUMMARY: UPGRADE RECOMMENDATIONS
+     ══════════════════════════════════════════════════════ -->
+<section id="summary" class="section">
+  <div class="section-header">
+    <span class="num">&#10003;</span>
+    <h2>升级建议汇总</h2>
+    <span class="tag">LLVM 18 关键点</span>
+  </div>
+  <div class="section-body">
+
+    <p>以下是针对数通产品线从 LLVM 17 升级到 LLVM 18 的优先级建议：</p>
+
+    <table>
+      <thead><tr><th style="width:8%">优先级</th><th style="width:24%">变更项</th><th style="width:28%">类型</th><th style="width:40%">核心行动</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="bh">P0</span></td>
+          <td>函数模板名称重整</td>
+          <td>ABI Break</td>
+          <td>检查动态库接口/插件系统中的模板符号；评估是否需要 <code>-fclang-abi-compat=17</code> 过渡</td>
+        </tr>
+        <tr>
+          <td><span class="bh">P0</span></td>
+          <td>-Wenum-constexpr-conversion</td>
+          <td>默认启用 → LLVM 19 Error</td>
+          <td>在 LLVM 18 阶段修复所有 enum constexpr 超范围值</td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td>PCH 扩展名变更</td>
+          <td>构建系统</td>
+          <td>更新 Makefile/CMake 中的 .gch 为 .pch</td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td>__int128 x86-64 SystemV ABI</td>
+          <td>ABI 变更</td>
+          <td>排查 __int128 使用场景，确保调用方和被调用方统一编译</td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td>模板化 operator== 反转修复</td>
+          <td>C++20 行为变更</td>
+          <td>启用 <code>-Wambiguous-reversed-operator</code> 提前检测</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td>常量表达式变体移除</td>
+          <td>LLVM IR 变更</td>
+          <td>仅影响自定义 LLVM Pass 或 IR 生成工具</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td>FatLTO 支持</td>
+          <td>新特性（可选）</td>
+          <td>评估是否在构建流程中引入 FatLTO 以简化 LTO/非LTO 构建管理</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="co co-i mt-14">
+      <strong>&#128309; 关键结论</strong>
+      对于数通产品线，<strong>函数模板名称重整</strong>是 LLVM 18 影响最大、最需要优先关注的变更。如果产品使用了动态加载插件或预编译动态库，必须在升级前完成符号兼容性评估。<br><br>
+      <strong>-Wenum-constexpr-conversion</strong> 虽然在 LLVM 18 中只是告警，但因为 LLVM 19 起将升级为不可压制的错误，<strong>必须在 LLVM 18 阶段完成所有修复</strong>，为后续升级铺平道路。
+    </div>
+  </div>
+</section>
+
+</div><!-- /container -->
+
+<footer class="footer">
+  <p>LLVM 18 差异详解 &nbsp;·&nbsp; 毕昇编译器升级工程 &nbsp;·&nbsp; 分析日期：2026-07-10</p>
+  <p style="margin-top:4px;font-size:12px">专为数通产品线编制 &nbsp;·&nbsp; 仅供内部技术评估使用</p>
+</footer>
+
+</body>
+</html>

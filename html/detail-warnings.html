@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>告警 (Warnings) 差异详解 — 毕昇编译器升级</title>
+<style>
+  :root {
+    --primary: #0a2647;
+    --primary-light: #1e4a7a;
+    --primary-extra: #eef4fb;
+    --accent: #d4a843;
+    --accent-light: #f5e6b8;
+    --bg: #f6f8fc;
+    --card: #fff;
+    --text: #111827;
+    --text2: #4b5563;
+    --border: #e5e7eb;
+    --red: #dc2626; --red-bg: #fef2f2;
+    --amber: #d97706; --amber-bg: #fffbeb;
+    --green: #059669; --green-bg: #ecfdf5;
+    --blue: #2563eb; --blue-bg: #eff6ff;
+    --radius: 12px;
+    --shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
+  }
+
+  /* Header */
+  .header{
+    background:linear-gradient(135deg,#071225 0%,#0a2647 45%,#1e4a7a 100%);
+    color:#fff;padding:48px 24px 40px;text-align:center;position:relative;overflow:hidden;
+  }
+  .header::after{
+    content:'';position:absolute;inset:0;
+    background:radial-gradient(ellipse 60% 40% at 30% 50%,rgba(212,168,67,.10) 0%,transparent 70%);
+    pointer-events:none;
+  }
+  .header .back{
+    display:inline-block;color:var(--accent);text-decoration:none;font-size:14px;
+    border:1px solid rgba(212,168,67,.4);padding:5px 18px;border-radius:6px;
+    transition:all .15s;margin-bottom:18px;position:relative;z-index:1;
+  }
+  .header .back:hover{background:rgba(212,168,67,.15);color:var(--accent-light)}
+  .header h1{font-size:30px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
+  .header .subtitle{font-size:15px;opacity:.75;max-width:680px;margin:0 auto;position:relative;z-index:1}
+
+  /* TOC bar */
+  .toc-bar{
+    position:sticky;top:0;z-index:100;
+    background:rgba(255,255,255,.93);backdrop-filter:blur(14px);
+    border-bottom:1px solid var(--border);padding:0 20px;
+  }
+  .toc-bar-inner{
+    max-width:1100px;margin:0 auto;display:flex;align-items:center;gap:6px;
+    overflow-x:auto;padding:8px 0;scrollbar-width:none;white-space:nowrap;
+  }
+  .toc-bar-inner::-webkit-scrollbar{display:none}
+  .toc-bar-inner a{
+    font-size:13px;color:var(--text2);text-decoration:none;
+    padding:4px 10px;border-radius:5px;transition:all .12s;flex-shrink:0;
+  }
+  .toc-bar-inner a:hover{color:var(--primary);background:var(--primary-extra)}
+  .toc-div{color:#d1d5db;font-size:11px;flex-shrink:0}
+
+  /* Main container */
+  .container{max-width:1100px;margin:0 auto;padding:0 20px}
+
+  /* Section */
+  .section{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin:24px auto;overflow:hidden}
+  .section-header{
+    padding:18px 26px 12px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:10px;
+  }
+  .section-header .num{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;border-radius:7px;
+    background:var(--primary);color:#fff;font-size:14px;font-weight:700;flex-shrink:0;
+  }
+  .section-header h2{font-size:18px;font-weight:700;color:var(--primary)}
+  .section-header .h2-tag{
+    font-size:11px;font-weight:600;background:var(--primary-extra);color:var(--primary-light);
+    padding:2px 10px;border-radius:4px;margin-left:6px;white-space:nowrap;
+  }
+  .section-body{padding:18px 26px 26px}
+
+  /* Example box */
+  .example-box{
+    background:#fafbfc;border:1px solid var(--border);border-radius:8px;
+    padding:18px 20px;margin:14px 0;
+  }
+  .example-box .example-label{
+    font-size:11px;font-weight:700;color:var(--text2);
+    text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;
+  }
+  .example-box .example-desc{
+    font-size:13.5px;color:var(--text2);margin-bottom:10px;line-height:1.6;
+  }
+
+  /* Fix box */
+  .fix-box{
+    background:var(--green-bg);border:1px solid #a7f3d0;border-radius:7px;
+    padding:12px 16px;margin-top:10px;
+  }
+  .fix-box .fix-label{
+    font-size:11px;font-weight:700;color:var(--green);
+    text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;
+  }
+
+  /* Code block */
+  pre.cb{
+    background:#0a1a2e;color:#e2e8f0;padding:14px 18px;border-radius:7px;
+    overflow-x:auto;font-size:13px;line-height:1.55;font-family:"SF Mono",Menlo,monospace;margin:8px 0;
+  }
+  pre.cb .c{color:#6b7280}
+  pre.cb .k{color:#93c5fd}
+  pre.cb .s{color:#a7f3d0}
+  pre.cb .r{color:#fca5a5}
+
+  /* Inline code */
+  code,.inline-code{
+    background:#eef2f6;padding:1px 6px;border-radius:4px;
+    font-size:13px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+
+  /* Tables */
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0}
+  thead th{background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:8px 12px;border-bottom:2px solid var(--border);font-size:12.5px}
+  tbody td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#f8fafc}
+  table code{font-size:12.5px}
+
+  /* Badges */
+  .bh{display:inline-block;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bm{display:inline-block;background:var(--amber-bg);color:var(--amber);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bl{display:inline-block;background:var(--blue-bg);color:var(--blue);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bg{display:inline-block;background:var(--green-bg);color:var(--green);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bflag{
+    display:inline-block;background:#f1f5f9;color:var(--primary-light);
+    font-size:12px;font-weight:500;padding:2px 10px;border-radius:4px;
+    font-family:"SF Mono",Menlo,monospace;
+  }
+
+  /* Callout */
+  .co{padding:14px 18px;border-radius:7px;margin:12px 0;font-size:13.5px;border-left:4px solid}
+  .co-r{background:var(--red-bg);border-color:var(--red);color:#7f1d1d}
+  .co-a{background:var(--amber-bg);border-color:var(--amber);color:#713f12}
+  .co-i{background:var(--blue-bg);border-color:var(--blue);color:#1e3a5f}
+  .co-g{background:var(--green-bg);border-color:var(--green);color:#064e3b}
+  .co strong{display:block;margin-bottom:3px}
+  .co code{background:rgba(0,0,0,.06);padding:1px 6px;border-radius:3px;font-size:13px}
+
+  /* Info cards */
+  .cg{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;margin:12px 0}
+  .ic{border:1px solid var(--border);border-radius:7px;padding:14px 16px}
+  .ic .il{font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
+  .ic .iv{font-size:14px;font-weight:600;color:var(--primary)}
+
+  /* Severity badge */
+  .severity{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;margin-bottom:6px}
+  .severity-high{color:var(--red)}
+  .severity-medium{color:var(--amber)}
+  .severity-low{color:var(--blue)}
+
+  .mb-6{margin-bottom:6px}
+  .mt-10{margin-top:10px}
+  .mt-16{margin-top:16px}
+  .flex{display:flex}.flex-wrap{flex-wrap:wrap}.gap-2{gap:6px}
+  .text-s{font-size:13px;color:var(--text2)}
+
+  /* Footer */
+  .footer{text-align:center;padding:36px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1100px;margin:36px auto 0}
+
+  @media(max-width:700px){
+    .header h1{font-size:23px}
+    .container{padding:0 10px}
+    .section-body{padding:14px 16px 18px}
+    .section-header{padding:14px 16px 10px}
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <a class="back" href="index.html">&#8592; 返回主页</a>
+  <h1>告警 (Warnings) 差异详解</h1>
+  <p class="subtitle">毕昇编译器升级 &mdash; LLVM 15.0.4 &#8594; 21.1.8 告警变更完整说明，含代码示例与修复方案</p>
+</header>
+
+<!-- TOC -->
+<nav class="toc-bar">
+  <div class="toc-bar-inner">
+    <a href="#overview">概览</a><span class="toc-div">|</span>
+    <a href="#table">总览表</a><span class="toc-div">|</span>
+    <a href="#implicit-function">隐式函数声明</a><span class="toc-div">|</span>
+    <a href="#implicit-int">隐式 int</a><span class="toc-div">|</span>
+    <a href="#func-ptr">函数指针类型</a><span class="toc-div">|</span>
+    <a href="#void-deref">void* 解引用</a><span class="toc-div">|</span>
+    <a href="#shorten">64→32 缩窄</a><span class="toc-div">|</span>
+    <a href="#negation">取反隐式转换</a><span class="toc-div">|</span>
+    <a href="#enum-constexpr">enum constexpr</a><span class="toc-div">|</span>
+    <a href="#deprecated-literal">字面量操作符</a><span class="toc-div">|</span>
+    <a href="#global-ctors">全局构造</a><span class="toc-div">|</span>
+    <a href="#void-ptr-cast">void* 隐式转换</a><span class="toc-div">|</span>
+    <a href="#strategy">修复策略</a>
+  </div>
+</nav>
+
+<div class="container">
+
+<!-- ═══════════════════════════════════════
+     OVERVIEW
+     ═══════════════════════════════════════ -->
+<section id="overview" class="section">
+  <div class="section-header">
+    <span class="num">!</span>
+    <h2>告警变更概览</h2>
+    <span class="h2-tag">Why This Matters</span>
+  </div>
+  <div class="section-body">
+    <p style="margin-bottom:12px;color:var(--text2)">
+      在 LLVM 15 到 21 的升级过程中，多个原本仅仅是"警告"的诊断被升级为<b>默认错误（Default Error）</b>，
+      这意味着旧代码在新编译器下将<b>直接编译失败</b>。此外，还引入了若干新的警告组，用于检测此前被忽略的潜在问题。
+    </p>
+
+    <div class="co co-r">
+      <strong>&#128680; 影响最大的变更</strong>
+      对 C 代码（驱动、协议栈、底层库）影响最大的三个变更是：
+      <code>-Wimplicit-function-declaration</code>、
+      <code>-Wimplicit-int</code> 和
+      <code>-Wincompatible-function-pointer-types</code> 升级为 Error（LLVM 16）。
+      如果代码库中有旧风格 C 代码，升级时会遇到大量编译失败。
+    </div>
+
+    <div class="co co-i mt-10">
+      <strong>&#128161; 两种应对思路</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li><strong>短期（过渡）</strong>：使用 <code>-Wno-error=&lt;warning-name&gt;</code> 将特定告警降级回 Warning，保证编译通过</li>
+        <li><strong>长期（推荐）</strong>：修复代码中的问题，逐步移除降级选项</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     MASTER TABLE
+     ═══════════════════════════════════════ -->
+<section id="table" class="section">
+  <div class="section-header">
+    <span class="num">&#9776;</span>
+    <h2>告警变更总览表</h2>
+    <span class="h2-tag">All Warnings at a Glance</span>
+  </div>
+  <div class="section-body">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:10%">版本</th>
+          <th style="width:32%">告警名称</th>
+          <th style="width:12%">变更类型</th>
+          <th style="width:16%">影响场景</th>
+          <th style="width:30%">降级 / 控制选项</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>LLVM 16</strong></td>
+          <td><code>-Wimplicit-function-declaration</code></td>
+          <td><span class="bh">升级为 Error</span></td>
+          <td>C 代码调用未声明函数</td>
+          <td><code>-Wno-error=implicit-function-declaration</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 16</strong></td>
+          <td><code>-Wimplicit-int</code></td>
+          <td><span class="bh">升级为 Error</span></td>
+          <td>C 代码省略类型说明（K&R 风格）</td>
+          <td><code>-Wno-error=implicit-int</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 16</strong></td>
+          <td><code>-Wincompatible-function-pointer-types</code></td>
+          <td><span class="bh">升级为 Error</span></td>
+          <td>函数指针类型不匹配</td>
+          <td><code>-Wno-error=incompatible-function-pointer-types</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 16</strong></td>
+          <td><code>-Wvoid-ptr-dereference</code></td>
+          <td><span class="bh">升级为 Error</span></td>
+          <td>C++ 中 void* 解引用</td>
+          <td><code>-Wno-error=void-ptr-dereference</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 17</strong></td>
+          <td><code>-Wvoid-ptr-dereference</code></td>
+          <td><span class="bh">硬 Error</span></td>
+          <td>同上，不可降级为 Warning</td>
+          <td>必须修复代码</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 18</strong></td>
+          <td><code>-Wshorten-64-to-32</code></td>
+          <td><span class="bl">新增 Warning</span></td>
+          <td>64 位到 32 位隐式缩窄</td>
+          <td><code>-Wno-shorten-64-to-32</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 18</strong></td>
+          <td><code>-Wimplicit-int-conversion-on-negation</code></td>
+          <td><span class="bl">新增 Warning</span></td>
+          <td>取反操作中的隐式转换</td>
+          <td><code>-Wno-implicit-int-conversion-on-negation</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 18</strong></td>
+          <td><code>-Wenum-constexpr-conversion</code></td>
+          <td><span class="bm">默认 Warning</span></td>
+          <td>enum 值超出范围</td>
+          <td><code>-Wno-enum-constexpr-conversion</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 19</strong></td>
+          <td><code>-Wenum-constexpr-conversion</code></td>
+          <td><span class="bm">系统头文件默认启用</span></td>
+          <td>系统头文件中 enum 转换也会告警</td>
+          <td><code>-Wno-enum-constexpr-conversion</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 19</strong></td>
+          <td><code>-Wimplicit-void-ptr-cast</code></td>
+          <td><span class="bl">新增 Warning</span></td>
+          <td>C++ 中 void* 到其他指针隐式转换</td>
+          <td><code>-Wno-implicit-void-ptr-cast</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 20</strong></td>
+          <td><code>-Wenum-constexpr-conversion</code></td>
+          <td><span class="bh">不可压制 Error</span></td>
+          <td>必须修复 enum 值</td>
+          <td>不可降级</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 20</strong></td>
+          <td><code>-Wdeprecated-literal-operator</code></td>
+          <td><span class="bm">默认启用 Warning</span></td>
+          <td>废弃的字面量操作符语法</td>
+          <td><code>-Wno-deprecated-literal-operator</code></td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 21</strong></td>
+          <td><code>-Wglobal-constructors</code> 扩展</td>
+          <td><span class="bm">覆盖范围扩大</span></td>
+          <td><code>__attribute__((constructor))</code> 也触发</td>
+          <td><code>-Wno-global-constructors</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     IMPLICIT FUNCTION DECLARATION
+     ═══════════════════════════════════════ -->
+<section id="implicit-function" class="section">
+  <div class="section-header">
+    <span class="num">1</span>
+    <h2>-Wimplicit-function-declaration 升级为 Error</h2>
+    <span class="h2-tag">LLVM 16</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-high">&#9632; 严重程度：高 &mdash; 直接导致编译失败</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      在 C99 之前的 C 标准中，调用未声明的函数时，编译器会<strong>隐式假设</strong>该函数返回 <code>int</code>，并接受任意参数。
+      C99 标准废弃了这一行为，但 Clang 长期以来仅给出警告。LLVM 16 起，该警告升级为<strong>默认 Error</strong>（不可通过 <code>-w</code> 关闭），
+      所有隐式函数声明将直接导致编译失败。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#10060; 问题代码</div>
+      <div class="example-desc">
+        下面的 C 代码在 LLVM 15 下仅产生警告，在 LLVM 16+ 下直接报错。
+      </div>
+      <pre class="cb"><span class="c">/* example.c — LLVM 16 下编译失败 */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> result = <span class="r">foo</span>(<span class="s">"hello"</span>, 42);  <span class="c">// 编译器不知道 foo 是什么！</span>
+    printf(<span class="s">"result = %d\n"</span>, result);  <span class="c">// 以前给个警告，现在直接报错</span>
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案 1：添加 #include 头文件</div>
+      <pre class="cb"><span class="c">/* example_fixed.c */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+<span class="k">#include</span> <span class="s">"foo.h"</span>       <span class="c">// 包含 foo 的声明</span>
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> result = <span class="r">foo</span>(<span class="s">"hello"</span>, 42);  <span class="c">// OK，编译器知道 foo 的签名</span>
+    printf(<span class="s">"result = %d\n"</span>, result);
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box" style="margin-top:8px">
+      <div class="fix-label">&#10004; 修复方案 2：添加前置声明（不需要头文件时）</div>
+      <pre class="cb"><span class="c">/* example_fixed2.c */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+
+<span class="k">int</span> <span class="r">foo</span>(<span class="k">const char</span> *msg, <span class="k">int</span> val);  <span class="c">// 前置声明，编译器现在知道了</span>
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> result = <span class="r">foo</span>(<span class="s">"hello"</span>, 42);  <span class="c">// OK</span>
+    printf(<span class="s">"result = %d\n"</span>, result);
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 临时降级方案（不推荐）</strong>
+      仅用于紧急修复阻塞，长期必须修复代码：
+      <br><code>-Wno-error=implicit-function-declaration</code>
+      <br>注意：即使降级，LLVM 16+ 仍然会<b>发出警告</b>（只是不会阻止编译），且该警告<b>不能被 <code>-w</code></b> 关闭。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     IMPLICIT INT
+     ═══════════════════════════════════════ -->
+<section id="implicit-int" class="section">
+  <div class="section-header">
+    <span class="num">2</span>
+    <h2>-Wimplicit-int 升级为 Error</h2>
+    <span class="h2-tag">LLVM 16</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-high">&#9632; 严重程度：高 &mdash; 直接导致编译失败</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      在 C89 及更早的 K&amp;R 风格中，可以省略变量和函数的返回类型，编译器隐式假定为 <code>int</code>。
+      C99 标准移除了这一特性。LLVM 16 起，省略类型声明将导致<strong>编译错误</strong>。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#10060; 问题代码</div>
+      <div class="example-desc">
+        下面的旧风格 C 代码在 LLVM 15 下可以编译，在 LLVM 16+ 下报错。
+      </div>
+      <pre class="cb"><span class="c">/* old_style.c — K&amp;R 风格，LLVM 16 下编译失败 */</span>
+<span class="k">static</span> flag = 1;                   <span class="c">// 缺少类型！编译器假设是 int</span>
+<span class="k">static const</span> MAX_BUF = 4096;      <span class="c">// 同样省略了 int</span>
+
+<span class="r">do_stuff</span>(n)                        <span class="c">// 函数返回类型也省略了</span>
+    <span class="k">int</span> n;                          <span class="c">// K&amp;R 风格参数声明</span>
+{
+    <span class="k">return</span> n * 2;
+}
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> x = <span class="r">do_stuff</span>(flag);
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案：显式添加类型</div>
+      <pre class="cb"><span class="c">/* old_style_fixed.c */</span>
+<span class="k">static</span> <span class="k">int</span> flag = 1;                    <span class="c">// 显式 int</span>
+<span class="k">static</span> <span class="k">const</span> <span class="k">int</span> MAX_BUF = 4096;       <span class="c">// 显式 const int</span>
+
+<span class="k">int</span> <span class="r">do_stuff</span>(<span class="k">int</span> n)                     <span class="c">// 现代风格：返回类型和参数类型在同一行</span>
+{
+    <span class="k">return</span> n * 2;
+}
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> x = <span class="r">do_stuff</span>(flag);
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 临时降级方案（不推荐）</strong>
+      <code>-Wno-error=implicit-int</code>
+      <br>此方案仅用于紧急情况。K&amp;R 风格在现代 C 标准中已被移除，建议尽快修复。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     INCOMPATIBLE FUNCTION POINTER TYPES
+     ═══════════════════════════════════════ -->
+<section id="func-ptr" class="section">
+  <div class="section-header">
+    <span class="num">3</span>
+    <h2>-Wincompatible-function-pointer-types 升级为 Error</h2>
+    <span class="h2-tag">LLVM 16</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-high">&#9632; 严重程度：高 &mdash; 直接导致编译失败</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      将一种签名的函数指针赋值给另一种不兼容签名的函数指针变量，是典型的类型安全问题。
+      这种行为可能导致运行时崩溃或未定义行为。LLVM 16 起，此类转换直接<strong>编译报错</strong>。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#10060; 问题代码</div>
+      <div class="example-desc">
+        函数指针类型不兼容 &mdash; LLVM 16+ 下编译失败。
+      </div>
+      <pre class="cb"><span class="c">/* funcptr_bad.c — LLVM 16 下编译失败 */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+
+<span class="k">int</span> <span class="r">add</span>(<span class="k">int</span> a, <span class="k">int</span> b) { <span class="k">return</span> a + b; }
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">void</span> *(*<span class="r">fp</span>)();                   <span class="c">// fp 指向: 返回 void* 的函数</span>
+    fp = (<span class="k">void</span> *(*)())add;           <span class="c">// 错误！add 返回 int 而非 void*</span>
+                                         <span class="c">// 函数指针类型不匹配</span>
+    fp();                                <span class="c">// LLVM 16 报错</span>
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案 1：使用兼容的函数指针类型</div>
+      <pre class="cb"><span class="c">/* funcptr_fixed1.c */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+
+<span class="k">int</span> <span class="r">add</span>(<span class="k">int</span> a, <span class="k">int</span> b) { <span class="k">return</span> a + b; }
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> (*<span class="r">fp</span>)(<span class="k">int</span>, <span class="k">int</span>);            <span class="c">// fp 指向: 返回 int, 接受两个 int 的函数</span>
+    fp = add;                           <span class="c">// OK，类型完全匹配</span>
+    <span class="k">int</span> result = fp(3, 4);
+    printf(<span class="s">"result = %d\n"</span>, result);
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box" style="margin-top:8px">
+      <div class="fix-label">&#10004; 修复方案 2：确实需要转换时使用显式 typedef</div>
+      <pre class="cb"><span class="c">/* funcptr_fixed2.c — 如果确实需要万能指针 */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+
+<span class="k">typedef</span> <span class="k">void</span> *(*<span class="r">generic_fn</span>)(...);  <span class="c">// 明确定义万能函数指针类型</span>
+
+<span class="k">int</span> <span class="r">add</span>(<span class="k">int</span> a, <span class="k">int</span> b) { <span class="k">return</span> a + b; }
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="r">generic_fn</span> fp;
+    fp = (<span class="r">generic_fn</span>)add;            <span class="c">// 显式转换，意图明确</span>
+    <span class="c">// 但调用时仍需正确匹配参数类型</span>
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="co co-r mt-10">
+      <strong>&#128680; 安全提示</strong>
+      函数指针类型不匹配是严重的类型安全问题，可能直接导致栈损坏、参数传递错误、返回值被错误解释等严重后果。
+      <strong>强烈不建议使用降级选项绕过此检查</strong>，必须修复代码。
+    </div>
+
+    <div class="co co-a">
+      <strong>&#9888; 临时降级方案（极不推荐）</strong>
+      <code>-Wno-error=incompatible-function-pointer-types</code>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     VOID* DEREFERENCE
+     ═══════════════════════════════════════ -->
+<section id="void-deref" class="section">
+  <div class="section-header">
+    <span class="num">4</span>
+    <h2>void* 解引用在 C++ 中为 Error</h2>
+    <span class="h2-tag">LLVM 16 &#8594; 17</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-high">&#9632; 严重程度：高 &mdash; LLVM 16 起为 Error，LLVM 17 起为硬 Error</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      在 C++ 中，<code>void*</code> 指向的内存没有类型信息，编译器不知道应该读取多大、如何解释。
+      C 语言允许 <code>void*</code> 的某些操作（作为 GCC 扩展），但 C++ 标准严格禁止。
+      LLVM 16 将此警告升级为 Error，LLVM 17 进一步收紧为<strong>不可降级的硬 Error</strong>。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#10060; 问题代码（C++）</div>
+      <div class="example-desc">
+        对 void* 解引用在 C++ 中是不合法的 &mdash; LLVM 16+ 直接报错。
+      </div>
+      <pre class="cb"><span class="c">// void_deref_bad.cpp — C++ 中 void* 不能解引用</span>
+<span class="k">#include</span> <span class="s">&lt;cstdio&gt;</span>
+
+<span class="k">void</span> <span class="r">func</span>(<span class="k">void</span> *p) {
+    *p;                           <span class="c">// 错误！void* 不能解引用，编译器不知道 *p 的类型</span>
+                                  <span class="c">// LLVM 16: Error</span>
+                                  <span class="c">// LLVM 17: 硬 Error，不可降级</span>
+}
+
+<span class="k">int</span> <span class="r">main</span>() {
+    <span class="k">int</span> x = 42;
+    <span class="r">func</span>(&amp;x);
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label">&#10060; 另一个常见场景</div>
+      <pre class="cb"><span class="c">// void_ptr_arithmetic.cpp — void* 算术运算同样非法</span>
+<span class="k">void</span> <span class="r">process</span>(<span class="k">void</span> *buf, <span class="k">size_t</span> count) {
+    <span class="k">for</span> (<span class="k">size_t</span> i = 0; i &lt; count; i++) {
+        <span class="c">// buf[i] 错误：void* 不能下标访问</span>
+        <span class="c">// buf++   错误：void* 不能算术运算</span>
+    }
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案：先转换为具体类型指针</div>
+      <pre class="cb"><span class="c">// void_deref_fixed.cpp</span>
+<span class="k">#include</span> <span class="s">&lt;cstdio&gt;</span>
+
+<span class="k">void</span> <span class="r">func</span>(<span class="k">void</span> *p) {
+    <span class="k">int</span> *ip = <span class="k">static_cast</span>&lt;<span class="k">int</span>*&gt;(p);   <span class="c">// 先转换为具体类型的指针</span>
+    *ip;                              <span class="c">// OK，编译器知道 *ip 是 int</span>
+}
+
+<span class="k">void</span> <span class="r">process</span>(<span class="k">void</span> *buf, <span class="k">size_t</span> count) {
+    <span class="k">char</span> *cbuf = <span class="k">static_cast</span>&lt;<span class="k">char</span>*&gt;(buf);  <span class="c">// 转换为 char* 进行字节级访问</span>
+    <span class="k">for</span> (<span class="k">size_t</span> i = 0; i &lt; count; i++) {
+        cbuf[i] = 0;                      <span class="c">// OK</span>
+    }
+}</pre>
+    </div>
+
+    <div class="co co-r mt-10">
+      <strong>&#128680; 注意</strong>
+      LLVM 17 起此错误<strong>不可降级</strong>，使用 <code>-Wno-error=void-ptr-dereference</code> 无效。
+      必须修复所有 void* 解引用代码。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     SHORTEN 64 TO 32
+     ═══════════════════════════════════════ -->
+<section id="shorten" class="section">
+  <div class="section-header">
+    <span class="num">5</span>
+    <h2>-Wshorten-64-to-32</h2>
+    <span class="h2-tag">LLVM 18 新增</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-medium">&#9632; 严重程度：中 &mdash; 新增 Warning，不影响编译但反映潜在数据丢失</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      该警告检测 64 位整数到 32 位整数的<strong>隐式缩窄转换</strong>。在 64 位平台上，
+      <code>size_t</code>、指针差值等类型为 64 位，赋值给 <code>int</code> 时可能丢失高 32 位数据。
+      对于嵌入式 / 数通设备，由于内存大小通常不超过 4GB，该警告大多是误报，但<strong>指针和 size_t 相关的缩窄</strong>在数据包处理场景中值得关注。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#9888; 触发警告的代码</div>
+      <div class="example-desc">
+        LLVM 18 会对以下隐式缩窄发出 <code>-Wshorten-64-to-32</code> 警告。
+      </div>
+      <pre class="cb"><span class="c">/* shorten_bad.c — LLVM 18 下产生警告 */</span>
+<span class="k">#include</span> <span class="s">&lt;stddef.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;string.h&gt;</span>
+
+<span class="k">void</span> <span class="r">process</span>(<span class="k">const char</span> *buf, <span class="k">size_t</span> size) {
+    <span class="k">int</span> len = size;                     <span class="c">// 64位 → 32位，数据包大于 2GB 时丢失！</span>
+    <span class="k">int</span> slen = <span class="r">strlen</span>(buf);             <span class="c">// strlen 返回 size_t (64位) → int (32位)</span>
+    <span class="k">unsigned</span> <span class="k">int</span> ulen = size;          <span class="c">// 同样缩窄</span>
+    <span class="k">int</span> diff = buf + 10 - buf;          <span class="c">// 指针差值 ptrdiff_t (64位) → int (32位)</span>
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案 1：使用匹配的类型</div>
+      <pre class="cb"><span class="c">/* shorten_fixed1.c */</span>
+<span class="k">#include</span> <span class="s">&lt;stddef.h&gt;</span>
+<span class="k">#include</span> <span class="s">&lt;string.h&gt;</span>
+
+<span class="k">void</span> <span class="r">process</span>(<span class="k">const char</span> *buf, <span class="k">size_t</span> size) {
+    <span class="k">size_t</span> len = size;                  <span class="c">// 使用 size_t 匹配</span>
+    <span class="k">size_t</span> slen = <span class="r">strlen</span>(buf);          <span class="c">// 直接用 size_t</span>
+    <span class="k">size_t</span> ulen = size;                 <span class="c">// 统一使用 size_t</span>
+    <span class="k">ptrdiff_t</span> diff = buf + 10 - buf;    <span class="c">// 使用 ptrdiff_t</span>
+}</pre>
+    </div>
+
+    <div class="fix-box" style="margin-top:8px">
+      <div class="fix-label">&#10004; 修复方案 2：确保安全时使用显式转换</div>
+      <pre class="cb"><span class="c">/* shorten_fixed2.c — 当确定值不会超过 32 位范围时 */</span>
+<span class="k">#include</span> <span class="s">&lt;stddef.h&gt;</span>
+
+<span class="k">void</span> <span class="r">process</span>(<span class="k">const char</span> *buf, <span class="k">size_t</span> size) {
+    <span class="c">// 显式 cast 告诉编译器：我知道在缩窄，且确认安全</span>
+    <span class="k">int</span> len = (<span class="k">int</span>)size;               <span class="c">// C 风格显式转换</span>
+    <span class="c">// 或使用 static_cast（C++）</span>
+    <span class="c">// int len = static_cast&lt;int&gt;(size);</span>
+}</pre>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 嵌入式场景特别关注</strong>
+      数通设备上通常内存不超过 4GB，size_t 的高 32 位始终为 0，缩窄在实际上不会丢数据。
+      但该警告可以帮助发现<b>代码移植性问题</b>——同样的代码在 64 位服务器上可能行为不同。
+      <br><br>关闭此警告：<code>-Wno-shorten-64-to-32</code>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     NEGATION IMPLICIT CONVERSION
+     ═══════════════════════════════════════ -->
+<section id="negation" class="section">
+  <div class="section-header">
+    <span class="num">6</span>
+    <h2>-Wimplicit-int-conversion-on-negation</h2>
+    <span class="h2-tag">LLVM 18 新增</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-medium">&#9632; 严重程度：中 &mdash; 新增 Warning，检测取反时的意外类型转换</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      当对 <code>unsigned</code> 类型取反并赋值给 <code>signed</code> 类型时，会发生隐式类型转换。
+      取反操作先将值提升，然后再转换为目标类型，这一过程可能产生意外结果。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#9888; 触发警告的代码</div>
+      <div class="example-desc">
+        以下代码在 LLVM 18 下会触发 <code>-Wimplicit-int-conversion-on-negation</code>。
+      </div>
+      <pre class="cb"><span class="c">/* negation_bad.c — LLVM 18 下触发警告 */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">unsigned</span> <span class="k">int</span> x = 5;
+    <span class="k">int</span> y = -x;                    <span class="c">// 对 unsigned int 取反，再赋值给 int</span>
+                                   <span class="c">// -x 的类型是 unsigned int (值很大)</span>
+                                   <span class="c">// 然后隐式转换为 int</span>
+    printf(<span class="s">"y = %d\n"</span>, y);        <span class="c">// 输出 y = -5？不，可能是很大的正数！</span>
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="example-box">
+      <div class="example-label">&#9888; 更多触发场景</div>
+      <pre class="cb"><span class="c">/* negation_more.c */</span>
+<span class="k">void</span> <span class="r">examples</span>() {
+    <span class="k">unsigned</span> <span class="k">short</span> a = 10;
+    <span class="k">int</span> b = -a;                    <span class="c">// unsigned short 先提升为 int，再取反</span>
+                                   <span class="c">// 但如果 a 是 unsigned int，行为完全不同</span>
+
+    <span class="k">unsigned</span> <span class="k">long</span> c = 100;
+    <span class="k">long</span> d = -c;                   <span class="c">// 类似问题</span>
+
+    <span class="k">unsigned</span> <span class="k">char</span> e = 1;
+    <span class="k">int</span> f = -e;                    <span class="c">// 同样触发警告</span>
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案：显式处理类型转换</div>
+      <pre class="cb"><span class="c">/* negation_fixed.c */</span>
+<span class="k">#include</span> <span class="s">&lt;stdio.h&gt;</span>
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">unsigned</span> <span class="k">int</span> x = 5;
+
+    <span class="c">// 方案 A：先转换为 signed 再取反</span>
+    <span class="k">int</span> y1 = -((<span class="k">int</span>)x);          <span class="c">// 显式转换为 int，然后取反 → y1 = -5</span>
+
+    <span class="c">// 方案 B：如果只是想得到负值</span>
+    <span class="k">int</span> y2 = 0 - (<span class="k">int</span>)x;          <span class="c">// 用 0 减去，语义更明确</span>
+
+    <span class="c">// 方案 C：使用 signed 类型存储</span>
+    <span class="k">int</span> sx = 5;
+    <span class="k">int</span> y3 = -sx;                  <span class="c">// 直接取反，无警告</span>
+
+    printf(<span class="s">"y1 = %d\n"</span>, y1);
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 关闭此警告</strong>
+      <code>-Wno-implicit-int-conversion-on-negation</code>
+      <br>注意：这不只是风格问题——取反操作作用于 unsigned 类型时，结果可能远非预期。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     ENUM CONSTEXPR CONVERSION
+     ═══════════════════════════════════════ -->
+<section id="enum-constexpr" class="section">
+  <div class="section-header">
+    <span class="num">7</span>
+    <h2>-Wenum-constexpr-conversion 逐步严格化</h2>
+    <span class="h2-tag">LLVM 18 &#8594; 19 &#8594; 20</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-high">&#9632; 严重程度：逐步升级 &mdash; LLVM 20 起不可压制，必须修复</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      在 C++ 中，将超出枚举定义范围的整数值强制转换为枚举类型，并用于 <code>constexpr</code> 上下文，
+      是未定义行为。此检查在 LLVM 18、19、20 中逐步收紧：
+    </p>
+
+    <ul style="margin:8px 0 12px 18px;font-size:13.5px;color:var(--text2)">
+      <li><strong>LLVM 18</strong>：新增 Warning，可通过 <code>-Wno-enum-constexpr-conversion</code> 关闭</li>
+      <li><strong>LLVM 19</strong>：在<strong>系统头文件中也默认启用</strong>此 Warning</li>
+      <li><strong>LLVM 20</strong>：<strong>不可压制</strong>，必须修复代码</li>
+    </ul>
+
+    <div class="example-box">
+      <div class="example-label">&#10060; 问题代码</div>
+      <div class="example-desc">
+        将超出范围的整数值转换为 enum，并用于 constexpr &mdash; LLVM 18 警告，LLVM 20 报错。
+      </div>
+      <pre class="cb"><span class="c">// enum_bad.cpp — 在 constexpr 中使用超出范围的 enum 值</span>
+<span class="k">enum</span> <span class="k">Color</span> { Red, Green, Blue };      <span class="c">// 有效值: 0, 1, 2</span>
+
+<span class="k">constexpr</span> <span class="k">Color</span> c1 = (<span class="k">Color</span>)100;       <span class="c">// 100 超出范围！</span>
+                                           <span class="c">// LLVM 18: warning</span>
+                                           <span class="c">// LLVM 19: warning (含系统头文件)</span>
+                                           <span class="c">// LLVM 20: 硬 error，不可压制</span>
+
+<span class="k">constexpr</span> <span class="k">Color</span> c2 = <span class="k">static_cast</span>&lt;<span class="k">Color</span>&gt;(999);  <span class="c">// 同样的问题</span>
+
+<span class="c">// 典型场景：从整数/协议字段转换为 enum</span>
+<span class="k">enum</span> <span class="k">class</span> <span class="k">PacketType</span> { TCP = 1, UDP = 2, ICMP = 3 };
+
+<span class="k">constexpr</span> <span class="k">PacketType</span> <span class="r">parse_packet</span>(<span class="k">int</span> raw) {
+    <span class="k">return</span> <span class="k">static_cast</span>&lt;<span class="k">PacketType</span>&gt;(raw);  <span class="c">// raw 可能是任意值！</span>
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案 1：不使用 constexpr</div>
+      <pre class="cb"><span class="c">// enum_fixed1.cpp — 非 constexpr 上下文仍然允许</span>
+<span class="k">enum</span> <span class="k">Color</span> { Red, Green, Blue };
+
+<span class="k">Color</span> c = <span class="k">static_cast</span>&lt;<span class="k">Color</span>&gt;(100);    <span class="c">// 非 constexpr，仍然 OK（但有风险）</span></pre>
+    </div>
+
+    <div class="fix-box" style="margin-top:8px">
+      <div class="fix-label">&#10004; 修复方案 2：使用 scoped enum 并定义底层类型</div>
+      <pre class="cb"><span class="c">// enum_fixed2.cpp — 使用有固定底层类型的 enum</span>
+<span class="k">enum</span> <span class="k">class</span> <span class="k">PacketType</span> : <span class="k">int</span> {           <span class="c">// 底层类型为 int，可以容纳更多值</span>
+    TCP = 1, UDP = 2, ICMP = 3,
+    UNKNOWN = 255                       <span class="c">// 定义合法范围</span>
+};
+
+<span class="k">PacketType</span> <span class="r">parse_packet</span>(<span class="k">int</span> raw) {
+    <span class="c">// 运行时转换，先检查范围</span>
+    <span class="k">switch</span> (raw) {
+        <span class="k">case</span> 1: <span class="k">return</span> <span class="k">PacketType</span>::TCP;
+        <span class="k">case</span> 2: <span class="k">return</span> <span class="k">PacketType</span>::UDP;
+        <span class="k">case</span> 3: <span class="k">return</span> <span class="k">PacketType</span>::ICMP;
+        <span class="k">default</span>: <span class="k">return</span> <span class="k">PacketType</span>::UNKNOWN;
+    }
+}</pre>
+    </div>
+
+    <div class="co co-r mt-10">
+      <strong>&#128680; LLVM 20 不可降级</strong>
+      在 LLVM 20 中，此检查变为<strong>硬 Error，不可通过任何编译选项降级</strong>。
+      如果代码中有此类问题，必须修复代码后才能升级到 LLVM 20+。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     DEPRECATED LITERAL OPERATOR
+     ═══════════════════════════════════════ -->
+<section id="deprecated-literal" class="section">
+  <div class="section-header">
+    <span class="num">8</span>
+    <h2>-Wdeprecated-literal-operator</h2>
+    <span class="h2-tag">LLVM 20 默认启用</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-low">&#9632; 严重程度：低 &mdash; LLVM 20 起默认启用 Warning</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      C++11 引入了用户定义字面量（User-Defined Literals）。在早期实现中，允许在字面量操作符的
+      标识符和 <code>operator""</code> 之间添加空格（如 <code>operator "" _X</code>）。
+      C++20 标准废弃了这种写法。LLVM 20 起，此警告<strong>默认启用</strong>。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#9888; 触发警告的代码</div>
+      <div class="example-desc">
+        <code>operator""</code> 和标识符之间有空格 &mdash; LLVM 20 默认警告。
+      </div>
+      <pre class="cb"><span class="c">// literal_operator_bad.cpp — 废弃的字面量操作符声明方式</span>
+<span class="k">#include</span> <span class="s">&lt;cstddef&gt;</span>
+
+<span class="c">// 旧写法：operator"" 和 _X 之间有空格</span>
+<span class="k">int</span> <span class="k">operator</span>"" _X(<span class="k">const char</span> *);          <span class="c">// 废弃用法！LLVM 20 默认警告</span>
+<span class="k">long double</span> <span class="k">operator</span>"" _Y(<span class="k">long double</span>);   <span class="c">// 同样废弃</span>
+
+<span class="c">// 使用</span>
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> val = 123_X;     <span class="c">// 调用上面定义的字面量操作符</span>
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案：去掉空格</div>
+      <pre class="cb"><span class="c">// literal_operator_fixed.cpp — 标准写法</span>
+<span class="k">#include</span> <span class="s">&lt;cstddef&gt;</span>
+
+<span class="c">// 正确写法：operator"" 和标识符之间不能有空格</span>
+<span class="k">int</span> <span class="k">operator</span>""_X(<span class="k">const char</span> *);           <span class="c">// 标准写法，无空格</span>
+<span class="k">long double</span> <span class="k">operator</span>""_Y(<span class="k">long double</span>);    <span class="c">// 标准写法</span>
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> val = 123_X;     <span class="c">// OK</span>
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 关闭此警告</strong>
+      <code>-Wno-deprecated-literal-operator</code>
+      <br>如果代码库中大量使用旧写法且暂时无法全部修改，可以临时关闭。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     GLOBAL CONSTRUCTORS
+     ═══════════════════════════════════════ -->
+<section id="global-ctors" class="section">
+  <div class="section-header">
+    <span class="num">9</span>
+    <h2>-Wglobal-constructors 扩展</h2>
+    <span class="h2-tag">LLVM 21</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-medium">&#9632; 严重程度：中 &mdash; 覆盖范围扩大，更多代码触发警告</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      <code>-Wglobal-constructors</code> 用于检测需要运行时初始化的全局/静态对象。在嵌入式系统中，
+      全局构造器会增加启动时间并可能导致初始化顺序问题。LLVM 21 将此警告的范围扩展至
+      <code>__attribute__((constructor))</code> 修饰的函数。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#9888; LLVM 21 新增触发场景</div>
+      <div class="example-desc">
+        使用 <code>__attribute__((constructor))</code> 的函数在 LLVM 21 下触发 <code>-Wglobal-constructors</code>。
+      </div>
+      <pre class="cb"><span class="c">// global_ctor.cpp — LLVM 21 下触发 -Wglobal-constructors</span>
+<span class="k">#include</span> <span class="s">&lt;cstdio&gt;</span>
+
+<span class="c">// 场景 1：C++ 静态对象（一直触发）</span>
+<span class="k">static</span> <span class="k">int</span> x = 42;                       <span class="c">// 简单初始化，无警告</span>
+<span class="k">static</span> std::string name = <span class="s">"hello"</span>;       <span class="c">// 需要运行时构造 → 警告</span>
+
+<span class="c">// 场景 2：__attribute__((constructor)) — LLVM 21 新增</span>
+<span class="k">__attribute__</span>((<span class="r">constructor</span>))
+<span class="k">void</span> <span class="r">my_init</span>() {                          <span class="c">// LLVM 21 也触发警告！</span>
+    printf(<span class="s">"initializing...\n"</span>);
+}
+
+<span class="c">// 场景 3：C 中同样影响</span>
+<span class="c">// void __attribute__((constructor)) early_setup(void) { ... }</span></pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案 1：评估是否真的需要 constructor 属性</div>
+      <pre class="cb"><span class="c">// global_ctor_fixed1.cpp</span>
+<span class="k">#include</span> <span class="s">&lt;cstdio&gt;</span>
+
+<span class="c">// 方案 A：改为首次使用时懒初始化</span>
+<span class="k">static</span> <span class="k">bool</span> <span class="r">is_initialized</span>() {
+    <span class="k">static</span> <span class="k">bool</span> initialized = <span class="k">false</span>;
+    <span class="k">if</span> (!initialized) {
+        <span class="r">do_setup</span>();
+        initialized = <span class="k">true</span>;
+    }
+    <span class="k">return</span> initialized;
+}</pre>
+    </div>
+
+    <div class="fix-box" style="margin-top:8px">
+      <div class="fix-label">&#10004; 修复方案 2：使用 pragma 抑制特定实例的警告</div>
+      <pre class="cb"><span class="c">// global_ctor_fixed2.cpp</span>
+<span class="k">#include</span> <span class="s">&lt;cstdio&gt;</span>
+
+<span class="c">// 如果确实需要 constructor，用 pragma 局部禁用警告</span>
+<span class="k">#pragma</span> clang diagnostic push
+<span class="k">#pragma</span> clang diagnostic ignored <span class="s">"-Wglobal-constructors"</span>
+
+<span class="k">__attribute__</span>((constructor))
+<span class="k">void</span> <span class="r">my_init</span>() {
+    printf(<span class="s">"initializing...\n"</span>);
+}
+
+<span class="k">#pragma</span> clang diagnostic pop</pre>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 关闭此警告</strong>
+      <code>-Wno-global-constructors</code>
+      <br>对于嵌入式系统，全局构造器的初始化顺序问题尤为敏感。建议审核所有 constructor 函数的使用。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     IMPLICIT VOID PTR CAST
+     ═══════════════════════════════════════ -->
+<section id="void-ptr-cast" class="section">
+  <div class="section-header">
+    <span class="num">10</span>
+    <h2>-Wimplicit-void-ptr-cast</h2>
+    <span class="h2-tag">LLVM 19 新增</span>
+  </div>
+  <div class="section-body">
+    <div class="severity severity-medium">&#9632; 严重程度：中 &mdash; 新增 Warning，C++ 代码中常见</div>
+
+    <p style="margin:8px 0;color:var(--text2)">
+      在 C 语言中，<code>void*</code> 可以隐式转换为任何指针类型。但在 <strong>C++</strong> 中，
+      这种隐式转换是不允许的——需要显式类型转换（cast）。许多 C/C++ 混合项目中，从 <code>malloc</code>
+      返回的 <code>void*</code> 赋值给具体类型指针常触发此警告。
+    </p>
+
+    <div class="example-box">
+      <div class="example-label">&#9888; 触发警告的代码</div>
+      <div class="example-desc">
+        C++ 中 void* 到具体指针类型的隐式转换 &mdash; LLVM 19 新增警告。
+      </div>
+      <pre class="cb"><span class="c">// voidptr_cast_bad.cpp — C++ 中 void* 不能隐式转换</span>
+<span class="k">#include</span> <span class="s">&lt;cstdlib&gt;</span>
+
+<span class="k">struct</span> <span class="k">Data</span> {
+    <span class="k">int</span> id;
+    <span class="k">char</span> name[32];
+};
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">void</span> *p = <span class="r">malloc</span>(100);              <span class="c">// malloc 返回 void*</span>
+
+    <span class="k">int</span> *ip = p;                        <span class="c">// C++ 中 void*→int* 需要显式 cast！</span>
+                                        <span class="c">// LLVM 19: -Wimplicit-void-ptr-cast</span>
+
+    <span class="k">char</span> *cp = p;                       <span class="c">// 同样触发</span>
+
+    <span class="k">Data</span> *dp = p;                       <span class="c">// 同样触发</span>
+
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">&#10004; 修复方案 1：使用 static_cast（C++ 推荐）</div>
+      <pre class="cb"><span class="c">// voidptr_cast_fixed1.cpp — C++ 风格</span>
+<span class="k">#include</span> <span class="s">&lt;cstdlib&gt;</span>
+
+<span class="k">struct</span> <span class="k">Data</span> { <span class="k">int</span> id; <span class="k">char</span> name[32]; };
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">void</span> *p = <span class="r">malloc</span>(100);
+
+    <span class="k">int</span> *ip = <span class="k">static_cast</span>&lt;<span class="k">int</span>*&gt;(p);         <span class="c">// 显式转换，意图明确</span>
+    <span class="k">char</span> *cp = <span class="k">static_cast</span>&lt;<span class="k">char</span>*&gt;(p);        <span class="c">// 同样</span>
+    <span class="k">Data</span> *dp = <span class="k">static_cast</span>&lt;<span class="k">Data</span>*&gt;(p);         <span class="c">// 同样</span>
+
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="fix-box" style="margin-top:8px">
+      <div class="fix-label">&#10004; 修复方案 2：C 风格转换（混合 C/C++ 项目）</div>
+      <pre class="cb"><span class="c">// voidptr_cast_fixed2.cpp</span>
+<span class="k">#include</span> <span class="s">&lt;cstdlib&gt;</span>
+
+<span class="k">int</span> <span class="k">main</span>() {
+    <span class="k">int</span> *ip = (<span class="k">int</span>*)<span class="r">malloc</span>(100);       <span class="c">// C 风格转换，也消除警告</span>
+    <span class="k">char</span> *cp = (<span class="k">char</span>*)<span class="r">malloc</span>(200);       <span class="c">// 在 C 中本就必需，在 C++ 中消除警告</span>
+    <span class="k">return</span> 0;
+}</pre>
+    </div>
+
+    <div class="co co-g mt-10">
+      <strong>&#9989; 好习惯</strong>
+      即使在 C++ 代码中使用 C 标准的 <code>malloc</code>，也养成显式转换的习惯。
+      这样代码在 C 和 C++ 编译器下行为一致，更易于维护。
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>&#9888; 关闭此警告</strong>
+      <code>-Wno-implicit-void-ptr-cast</code>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════
+     REPAIR STRATEGY
+     ═══════════════════════════════════════ -->
+<section id="strategy" class="section">
+  <div class="section-header">
+    <span class="num">&#9733;</span>
+    <h2>修复策略与建议</h2>
+  </div>
+  <div class="section-body">
+
+    <h4 style="color:var(--primary);margin-bottom:8px">分阶段修复优先级</h4>
+    <table>
+      <thead>
+        <tr><th style="width:8%">阶段</th><th style="width:24%">告警</th><th style="width:18%">版本</th><th style="width:50%">行动</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="bh">P0</span></td>
+          <td><code>-Wimplicit-function-declaration</code><br><code>-Wimplicit-int</code><br><code>-Wincompatible-function-pointer-types</code></td>
+          <td>LLVM 16</td>
+          <td>立即修复。这三个直接导致编译失败，影响面最广。先用降级选项保证编译通过，再逐步修复代码。</td>
+        </tr>
+        <tr>
+          <td><span class="bh">P0</span></td>
+          <td><code>-Wvoid-ptr-dereference</code></td>
+          <td>LLVM 16/17</td>
+          <td>LLVM 17 起不可降级，必须修复所有 void* 解引用。</td>
+        </tr>
+        <tr>
+          <td><span class="bh">P0</span></td>
+          <td><code>-Wenum-constexpr-conversion</code></td>
+          <td>LLVM 20</td>
+          <td>LLVM 20 起不可压制，升级前必须修复所有 constexpr enum 转换。</td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td><code>-Wshorten-64-to-32</code></td>
+          <td>LLVM 18</td>
+          <td>评估并修复有实际风险的缩窄转换。嵌入式场景可考虑关闭此警告。</td>
+        </tr>
+        <tr>
+          <td><span class="bm">P1</span></td>
+          <td><code>-Wimplicit-void-ptr-cast</code><br><code>-Wimplicit-int-conversion-on-negation</code></td>
+          <td>LLVM 18/19</td>
+          <td>新增警告，逐一修复或评估后关闭。</td>
+        </tr>
+        <tr>
+          <td><span class="bl">P2</span></td>
+          <td><code>-Wdeprecated-literal-operator</code><br><code>-Wglobal-constructors</code></td>
+          <td>LLVM 20/21</td>
+          <td>影响范围较小，可在升级后逐步修复。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="co co-i mt-16">
+      <strong>&#128161; 推荐升级路径</strong>
+      <ol style="margin:6px 0 0 16px">
+        <li><strong>审计阶段</strong>：用新版本编译器 + 全部降级选项先编译一轮，收集所有警告</li>
+        <li><strong>P0 修复</strong>：修复所有会导致编译失败的 Error 级问题</li>
+        <li><strong>P1 评估</strong>：对新警告逐一评估，决定修复还是关闭</li>
+        <li><strong>移除降级</strong>：逐步移除过渡期降级选项，确保代码在新编译器下零警告编译</li>
+        <li><strong>CI 固化</strong>：将 <code>-Wall -Wextra -Werror</code> 加入 CI，防止回退</li>
+      </ol>
+    </div>
+
+    <h4 style="color:var(--primary);margin-top:20px">完整的降级选项汇总</h4>
+    <table>
+      <thead>
+        <tr><th>降级选项</th><th>目标告警</th><th>生效版本</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>-Wno-error=implicit-function-declaration</code></td><td>隐式函数声明（E&#8594;W）</td><td>LLVM 16+</td></tr>
+        <tr><td><code>-Wno-error=implicit-int</code></td><td>隐式 int（E&#8594;W）</td><td>LLVM 16+</td></tr>
+        <tr><td><code>-Wno-error=incompatible-function-pointer-types</code></td><td>函数指针不兼容（E&#8594;W）</td><td>LLVM 16+</td></tr>
+        <tr><td><code>-Wno-error=void-ptr-dereference</code></td><td>void* 解引用（仅 LLVM 16 有效）</td><td>LLVM 16</td></tr>
+        <tr><td><code>-Wno-shorten-64-to-32</code></td><td>64&#8594;32 缩窄（关闭）</td><td>LLVM 18+</td></tr>
+        <tr><td><code>-Wno-implicit-int-conversion-on-negation</code></td><td>取反隐式转换（关闭）</td><td>LLVM 18+</td></tr>
+        <tr><td><code>-Wno-enum-constexpr-conversion</code></td><td>enum constexpr（LLVM 20 无效）</td><td>LLVM 18/19</td></tr>
+        <tr><td><code>-Wno-deprecated-literal-operator</code></td><td>废弃字面量操作符（关闭）</td><td>LLVM 20+</td></tr>
+        <tr><td><code>-Wno-global-constructors</code></td><td>全局构造器（关闭）</td><td>LLVM 21+</td></tr>
+        <tr><td><code>-Wno-implicit-void-ptr-cast</code></td><td>void* 隐式转换（关闭）</td><td>LLVM 19+</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</div><!-- /container -->
+
+<footer class="footer">
+  <p>分析日期：2026-07-10 &nbsp;&middot;&nbsp; 基于 LLVM 15.0.4 &#8594; 21.1.8 官方 Release Notes &amp; 源代码差异分析</p>
+  <p style="margin-top:4px;font-size:12px">专为数通产品线毕昇编译器升级工程编制 &middot; 仅供内部技术评估使用</p>
+</footer>
+
+</body>
+</html>

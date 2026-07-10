@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C++ 标准库差异详解 — 毕昇编译器升级</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f0f2f5; color: #333; line-height: 1.8;
+  }
+  .header {
+    background: linear-gradient(135deg, #0a2647 0%, #0d3b6e 50%, #0a2647 100%);
+    color: #fff; padding: 48px 24px 36px; text-align: center;
+    border-bottom: 3px solid #d4a843;
+  }
+  .header .back-link {
+    display: inline-block; color: #d4a843; text-decoration: none;
+    font-size: 14px; margin-bottom: 16px; transition: opacity 0.2s;
+  }
+  .header .back-link:hover { opacity: 0.8; }
+  .header h1 { font-size: 28px; font-weight: 700; letter-spacing: 1px; }
+  .header .subtitle {
+    margin-top: 8px; font-size: 14px; color: rgba(255,255,255,0.65);
+  }
+  .container { max-width: 980px; margin: 0 auto; padding: 32px 24px 64px; }
+  .toc {
+    background: #fff; border-radius: 8px; padding: 24px 32px; margin-bottom: 36px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06); border-left: 4px solid #d4a843;
+  }
+  .toc h2 { font-size: 18px; color: #0a2647; margin-bottom: 12px; }
+  .toc ol { padding-left: 20px; }
+  .toc li { margin-bottom: 4px; }
+  .toc a { color: #0a2647; text-decoration: none; }
+  .toc a:hover { color: #d4a843; text-decoration: underline; }
+  section {
+    background: #fff; border-radius: 8px; padding: 32px; margin-bottom: 28px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+  section h2 {
+    font-size: 22px; color: #0a2647; margin-bottom: 16px;
+    padding-bottom: 10px; border-bottom: 2px solid #d4a843;
+  }
+  section h3 { font-size: 18px; color: #0a2647; margin: 24px 0 10px; }
+  section h4 { font-size: 16px; color: #555; margin: 16px 0 8px; }
+  section p { margin-bottom: 12px; }
+  section ul, section ol { padding-left: 24px; margin-bottom: 12px; }
+  section li { margin-bottom: 6px; }
+  code.inline {
+    background: #eef1f5; color: #0a2647; padding: 1px 6px;
+    border-radius: 3px; font-family: "Source Code Pro", "Fira Code", "Consolas", monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: #0a2647; color: #e0e0e0; padding: 20px 24px;
+    border-radius: 6px; overflow-x: auto; font-size: 13px;
+    line-height: 1.7; margin-bottom: 16px;
+    font-family: "Source Code Pro", "Fira Code", "Consolas", monospace;
+  }
+  pre .kw { color: #d4a843; }
+  pre .str { color: #a5d6a5; }
+  pre .cmt { color: #6a8aaf; }
+  .example-box {
+    background: #f7f9fb; border-left: 4px solid #d4a843;
+    padding: 16px 20px; margin: 16px 0; border-radius: 0 6px 6px 0;
+  }
+  .example-box .label {
+    font-size: 12px; font-weight: 700; color: #d4a843; text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 6px;
+  }
+  .abi-table {
+    width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px;
+  }
+  .abi-table th {
+    background: #0a2647; color: #d4a843; padding: 10px 14px;
+    text-align: left; font-weight: 600;
+  }
+  .abi-table td {
+    padding: 10px 14px; border-bottom: 1px solid #e0e0e0;
+  }
+  .abi-table tr:nth-child(even) td { background: #f7f9fb; }
+  .abi-table code.inline { font-size: 0.85em; }
+  .note {
+    background: #fffdf2; border: 1px solid #d4a843; border-radius: 6px;
+    padding: 14px 20px; margin: 16px 0; font-size: 14px;
+  }
+  .note strong { color: #0a2647; }
+  .mode-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px; margin: 16px 0;
+  }
+  .mode-card {
+    background: #f7f9fb; border-radius: 6px; padding: 18px;
+    border-left: 4px solid #0a2647;
+  }
+  .mode-card .mode-name { font-weight: 700; color: #0a2647; margin-bottom: 6px; }
+  .mode-card .mode-desc { font-size: 14px; color: #555; }
+  .mode-card.recommended { border-left-color: #d4a843; background: #fffdf2; }
+  .version-timeline {
+    position: relative; padding-left: 28px;
+  }
+  .version-timeline::before {
+    content: ''; position: absolute; left: 8px; top: 0; bottom: 0;
+    width: 2px; background: #d4a843;
+  }
+  .version-item {
+    position: relative; margin-bottom: 28px;
+  }
+  .version-item::before {
+    content: ''; position: absolute; left: -24px; top: 6px;
+    width: 12px; height: 12px; background: #d4a843; border-radius: 50%;
+    border: 2px solid #fff; box-shadow: 0 0 0 2px #d4a843;
+  }
+  .version-item .ver-tag {
+    display: inline-block; background: #0a2647; color: #d4a843;
+    padding: 2px 12px; border-radius: 12px; font-weight: 700; font-size: 13px;
+    margin-bottom: 8px;
+  }
+  .version-item h4 { color: #0a2647; margin-top: 4px; }
+  .footer {
+    text-align: center; padding: 24px; color: #999; font-size: 13px;
+    border-top: 1px solid #e0e0e0; margin-top: 40px;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <a class="back-link" href="index.html">&#8592; 返回主页</a>
+  <h1>C++ 标准库差异详解</h1>
+  <div class="subtitle">毕昇编译器升级 &mdash; libc++ ABI / Hardening / 版本变更</div>
+</div>
+
+<div class="container">
+
+  <!-- 目录 -->
+  <div class="toc">
+    <h2>目录</h2>
+    <ol>
+      <li><a href="#abi-mechanism">libc++ ABI 版本机制</a></li>
+      <li><a href="#perf-switches">性能关键 ABI 开关</a></li>
+      <li><a href="#hardening">Hardening 模式（LLVM 18+）</a></li>
+      <li><a href="#per-version">分版本 ABI 变更（16 &rarr; 21）</a></li>
+    </ol>
+  </div>
+
+  <!-- 1. libc++ ABI 版本机制 -->
+  <section id="abi-mechanism">
+    <h2>libc++ ABI 版本机制</h2>
+    <p>
+      libc++ 通过 ABI 版本号将一组向后不兼容的变更聚合在一起。
+      当前支持两个 ABI 版本：
+    </p>
+    <ul>
+      <li><strong>ABI v1</strong> — 稳定默认版本，保证长期二进制兼容性，适合系统级或广泛分发的库。</li>
+      <li><strong>ABI v2</strong> — 实验性版本，包含多项结构优化（如 <code class="inline">string</code>、<code class="inline">unique_ptr</code> 的布局调整），性能更好但打破 ABI。</li>
+    </ul>
+
+    <h3>CMake 配置</h3>
+    <pre>-DLIBCXX_ABI_VERSION=<span class="str">1</span>   <span class="cmt"># 默认稳定 ABI</span></pre>
+
+    <p>
+      每个具体的 ABI 变更由独立的宏控制，遵循 <code class="inline">_LIBCPP_ABI_XXX</code> 命名约定。
+      这意味着编译者可以<strong>微调</strong>：即使基于 ABI v1，也可以单独打开某些性能优化开关
+      （前提是确认静态链接或不依赖稳定 ABI）。
+    </p>
+    <p>
+      常见宏列表（<code class="inline">&lt;__config_site&gt;</code> 或编译时通过 <code class="inline">-D</code> 注入）：
+    </p>
+
+    <table class="abi-table">
+      <tr><th>宏</th><th>默认（v1）</th><th>v2 行为</th><th>影响</th></tr>
+      <tr>
+        <td><code class="inline">_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT</code></td>
+        <td>OFF</td><td>ON</td>
+        <td>string 内部缓冲区移至对象头部，8 字节对齐</td>
+      </tr>
+      <tr>
+        <td><code class="inline">_LIBCPP_ABI_OPTIMIZED_FUNCTION</code></td>
+        <td>OFF</td><td>ON</td>
+        <td>std::function 布局优化，减小体积</td>
+      </tr>
+      <tr>
+        <td><code class="inline">_LIBCPP_ABI_VARIANT_INDEX_TYPE_OPTIMIZATION</code></td>
+        <td>OFF</td><td>ON</td>
+        <td>variant 用最小整数类型存 index</td>
+      </tr>
+      <tr>
+        <td><code class="inline">_LIBCPP_ABI_NO_COMPRESSED_PAIR_PADDING</code></td>
+        <td>OFF</td><td>ON</td>
+        <td>利用 <code>[[no_unique_address]]</code> 减少 pair 填充</td>
+      </tr>
+      <tr>
+        <td><code class="inline">_LIBCPP_ABI_ENABLE_UNIQUE_PTR_TRIVIAL_ABI</code></td>
+        <td>OFF</td><td>ON</td>
+        <td>unique_ptr 在寄存器中传递</td>
+      </tr>
+      <tr>
+        <td><code class="inline">_LIBCPP_ABI_STRING_OPTIMIZED_EXTERNAL_INSTANTIATION</code></td>
+        <td>OFF</td><td>ON</td>
+        <td>string 快路径内联优化</td>
+      </tr>
+    </table>
+  </section>
+
+  <!-- 2. 性能关键 ABI 开关 -->
+  <section id="perf-switches">
+    <h2>性能关键 ABI 开关</h2>
+
+    <h3><code class="inline">_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT</code></h3>
+    <p>
+      将 <code class="inline">std::string</code> 的内部缓冲区（SSO buffer）从对象尾部移至头部，
+      配合 8 字节对齐，使 <code class="inline">string</code> 对象的起始地址直接指向字符数据。
+      这消除了访问字符串内容时的偏移计算，提升缓存局部性和访问速度。
+    </p>
+    <div class="example-box">
+      <div class="label">示例 &mdash; 布局差异</div>
+      <pre><span class="cmt">// 传统布局（v1）：size/capacity 在前，data 在尾</span>
+<span class="kw">struct</span> string_v1 { size_t size, capacity; <span class="kw">char</span>* ptr; <span class="kw">char</span> buf[16]; };
+<span class="cmt">// sizeof = 48 (含填充)</span>
+
+<span class="cmt">// Alternate 布局（v2）：buf 对齐到 8 字节，放在最前</span>
+<span class="kw">struct</span> string_v2 { <span class="kw">char</span> buf[16]; size_t size, capacity; <span class="kw">char</span>* ptr; };
+<span class="cmt">// sizeof = 40；buf 地址 == this 地址（零偏移访问）</span></pre>
+    </div>
+
+    <h3><code class="inline">_LIBCPP_ABI_OPTIMIZED_FUNCTION</code></h3>
+    <p>
+      优化 <code class="inline">std::function</code> 的内部存储结构，减少动态内存分配，
+      使小可调用对象（如捕获单个指针的 lambda）完全驻留在对象内部。
+    </p>
+    <div class="example-box">
+      <div class="label">示例 &mdash; std::function 效率</div>
+      <pre><span class="cmt">// 默认：小函数可能仍需堆分配</span>
+std::function&lt;<span class="kw">void</span>()&gt; f1 = [ptr]{ do_work(ptr); };
+<span class="cmt">// 优化后：单指针捕获的 lambda 零堆分配存储</span></pre>
+    </div>
+
+    <h3><code class="inline">_LIBCPP_ABI_VARIANT_INDEX_TYPE_OPTIMIZATION</code></h3>
+    <p>
+      将 <code class="inline">std::variant</code> 内部的类型索引字段改用最小必要宽度的整数类型
+      （例如 2-3 个备选类型用 <code class="inline">uint8_t</code>），减少对象总体积。
+    </p>
+    <div class="example-box">
+      <div class="label">示例 &mdash; variant 体积</div>
+      <pre><span class="kw">using</span> V = std::variant&lt;<span class="kw">int</span>, <span class="kw">double</span>, std::string&gt;;
+<span class="cmt">// 默认：index 字段用 size_t (8 字节)</span>
+<span class="cmt">// 优化：index 用 uint8_t (1 字节)，对象缩小 ~7 字节</span></pre>
+    </div>
+
+    <h3><code class="inline">_LIBCPP_ABI_NO_COMPRESSED_PAIR_PADDING</code></h3>
+    <p>
+      利用 C++20 <code class="inline">[[no_unique_address]]</code> 属性，
+      让 <code class="inline">std::pair</code> 中的空类型成员不占独立地址空间，
+      与相邻成员共享存储，消除填充字节。
+    </p>
+    <div class="example-box">
+      <div class="label">示例 &mdash; pair 填充消除</div>
+      <pre><span class="kw">struct</span> Empty {};
+std::pair&lt;Empty, <span class="kw">int</span>&gt; p;
+<span class="cmt">// 默认：Empty 占 1 字节 + 对齐填充 = 8 字节（64 位）</span>
+<span class="cmt">// 优化：Empty 与 int 共享地址空间 = 共 4 字节</span></pre>
+    </div>
+
+    <h3><code class="inline">_LIBCPP_ABI_ENABLE_UNIQUE_PTR_TRIVIAL_ABI</code></h3>
+    <p>
+      将 <code class="inline">std::unique_ptr</code> 标记为具有平凡 ABI 的类型，
+      使其能够在寄存器中按值传递（而非总是在栈上通过指针传递），
+      消除按值传递时的内存读写开销。
+    </p>
+    <div class="note">
+      <strong>建议：</strong>
+      静态链接场景强烈推荐启用此开关。动态库场景需确保所有编译单元使用一致设置，
+      否则将导致 ABI 不兼容（调用约定不一致）。
+    </div>
+    <div class="example-box">
+      <div class="label">示例 &mdash; 寄存器传递 vs 栈传递</div>
+      <pre><span class="cmt">// 未启用：unique_ptr 按值传递 → 通过栈 (内存) 传参</span>
+<span class="kw">void</span> consume(std::unique_ptr&lt;Foo&gt; ptr);   <span class="cmt">// 慢路径</span>
+
+<span class="cmt">// 启用后：unique_ptr 在寄存器中传递 (与原始指针一致)</span>
+<span class="kw">void</span> consume(std::unique_ptr&lt;Foo&gt; ptr);   <span class="cmt">// 快路径</span></pre>
+    </div>
+
+    <h3><code class="inline">_LIBCPP_ABI_STRING_OPTIMIZED_EXTERNAL_INSTANTIATION</code></h3>
+    <p>
+      将 <code class="inline">std::string</code> 的热路径（如 SSO 判定、
+      短字符串拷贝等）标记为可内联，同时保持大操作的外部模板实例化。
+      这种策略既避免了代码膨胀，又保证了快速路径的零开销。
+    </p>
+    <div class="example-box">
+      <div class="label">示例 &mdash; 内联快路径</div>
+      <pre><span class="cmt">// 以下操作在启用优化后全部内联到调用方：</span>
+<span class="kw">if</span> (str.size() &lt;= <span class="str">SSO_CAPACITY</span>) {
+    <span class="cmt">// 短字符串：直接 memcpy 到内部缓冲区，无函数调用开销</span>
+    __builtin_memcpy(buf, src, size);
+}
+<span class="cmt">// 长字符串：调用外部实例化的分配/拷贝（避免代码膨胀）</span></pre>
+    </div>
+  </section>
+
+  <!-- 3. Hardening 模式 -->
+  <section id="hardening">
+    <h2>Hardening 模式（LLVM 18+）</h2>
+    <p>
+      LLVM 18 引入了统一的 libc++ Hardening 模式，替代了此前碎片化的
+      <code class="inline">_LIBCPP_DEBUG</code> / <code class="inline">_LIBCPP_ENABLE_ASSERTIONS</code>
+      等配置方式。通过单个编译宏即可选择安全级别。
+    </p>
+
+    <h3>四种模式</h3>
+    <div class="mode-grid">
+      <div class="mode-card">
+        <div class="mode-name">None</div>
+        <div class="mode-desc">无检查。零运行时开销，适合性能极敏感的发布构建。</div>
+      </div>
+      <div class="mode-card recommended">
+        <div class="mode-name">Fast</div>
+        <div class="mode-desc">低开销检查集。涵盖最常见的未定义行为（越界访问、空指针解引用等），
+          开销通常 &lt;2%。<strong>推荐用于生产环境。</strong></div>
+      </div>
+      <div class="mode-card">
+        <div class="mode-name">Extensive</div>
+        <div class="mode-desc">广泛检查。包含更全面的断言，开销中等（约 5-15%）。
+          适合 CI/测试流水线。</div>
+      </div>
+      <div class="mode-card">
+        <div class="mode-name">Debug</div>
+        <div class="mode-desc">完整调试检查。包含迭代器有效性、容器边界等所有断言。
+          开销较高，仅用于开发调试。</div>
+      </div>
+    </div>
+
+    <h3>用法</h3>
+    <pre><span class="cmt">// CMakeLists.txt 或编译选项</span>
+add_compile_definitions(
+    _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
+)</pre>
+
+    <div class="note">
+      <strong>重要：</strong>Hardening 模式对 ABI <strong>无影响</strong>。
+      启用 Fast 模式不会改变任何类型的布局、大小或调用约定，
+      因此可以在部分编译单元中分别使用不同模式（但建议统一使用 Fast）。
+    </div>
+
+    <h3>检查覆盖示例</h3>
+    <table class="abi-table">
+      <tr><th>检查类别</th><th>None</th><th>Fast</th><th>Extensive</th><th>Debug</th></tr>
+      <tr><td><code class="inline">vector::operator[]</code> 越界</td><td>&#x2717;</td><td>&#x2713;</td><td>&#x2713;</td><td>&#x2713;</td></tr>
+      <tr><td><code class="inline">span</code> 越界</td><td>&#x2717;</td><td>&#x2713;</td><td>&#x2713;</td><td>&#x2713;</td></tr>
+      <tr><td><code class="inline">optional::value()</code> 空值</td><td>&#x2717;</td><td>&#x2713;</td><td>&#x2713;</td><td>&#x2713;</td></tr>
+      <tr><td><code class="inline">string_view</code> 非空终止</td><td>&#x2717;</td><td>&#x2717;</td><td>&#x2713;</td><td>&#x2713;</td></tr>
+      <tr><td>迭代器有效性</td><td>&#x2717;</td><td>&#x2717;</td><td>&#x2717;</td><td>&#x2713;</td></tr>
+      <tr><td>容器边界全量</td><td>&#x2717;</td><td>&#x2717;</td><td>&#x2717;</td><td>&#x2713;</td></tr>
+    </table>
+  </section>
+
+  <!-- 4. 分版本 ABI 变更 -->
+  <section id="per-version">
+    <h2>分版本 ABI 变更</h2>
+    <p>
+      以下按 LLVM 版本列出主要的 ABI 相关变更。
+      升级跨多个大版本时，需综合考虑所有中间版本的累积影响。
+    </p>
+
+    <div class="version-timeline">
+
+      <div class="version-item">
+        <span class="ver-tag">LLVM 16</span>
+        <h4>移除 Debug 符号 + 新增 PMR</h4>
+        <ul>
+          <li><strong>移除：</strong>此前版本遗留的调试模式符号（与新版 Hardening 不兼容）
+            从 libc++.so 中删除。</li>
+          <li><strong>新增：</strong>Polymorphic Memory Resource（PMR）组件，
+            新增 <strong>50+ 符号</strong>，包括 <code class="inline">std::pmr::monotonic_buffer_resource</code>、
+            <code class="inline">std::pmr::unsynchronized_pool_resource</code> 等。</li>
+          <li>此项变更对静态链接无影响；动态链接需确保 libc++.so 版本匹配。</li>
+        </ul>
+        <div class="example-box">
+          <div class="label">示例 &mdash; PMR 用法</div>
+          <pre><span class="cmt">// LLVM 16+ 直接可用，无额外编译选项</span>
+<span class="kw">#include</span> <span class="str">&lt;memory_resource&gt;</span>
+<span class="kw">char</span> buffer[1024];
+std::pmr::monotonic_buffer_resource pool{buffer, <span class="kw">sizeof</span>(buffer)};
+std::pmr::vector&lt;<span class="kw">int</span>&gt; vec{&amp;pool};  <span class="cmt">// 使用栈上内存的 vector</span></pre>
+        </div>
+      </div>
+
+      <div class="version-item">
+        <span class="ver-tag">LLVM 17</span>
+        <h4>移除 allocator_arg 等符号；移除排序算法显式实例化</h4>
+        <ul>
+          <li><strong>移除符号：</strong><code class="inline">std::allocator_arg</code>、
+            <code class="inline">std::piecewise_construct</code> 等空结构体从
+            libc++.so 导出表中移除。这些对象原本为零大小占位符，
+            移除可减少 .dynsym 表大小。</li>
+          <li><strong>移除排序算法显式实例化：</strong>
+            <code class="inline">std::sort</code>、
+            <code class="inline">std::stable_sort</code> 等不再从动态库中导出预实例化版本。
+            静态链接时编译器可直接内联；动态链接场景需自行实例化。</li>
+          <li>此变更为纯清理操作，无性能回退。</li>
+        </ul>
+      </div>
+
+      <div class="version-item">
+        <span class="ver-tag">LLVM 18</span>
+        <h4>__cxa_init_primary_exception 使 make_exception_ptr 快 30 倍</h4>
+        <ul>
+          <li>引入 <code class="inline">__cxa_init_primary_exception</code> 作为
+            Itanium C++ ABI 的扩展入口点。</li>
+          <li><code class="inline">std::make_exception_ptr</code> 从原先的
+            throw + catch 往返（极其昂贵）改为直接分配+构造异常对象。</li>
+          <li><strong>性能提升：</strong>~30 倍加速（micro-benchmark 级别）。</li>
+        </ul>
+        <div class="example-box">
+          <div class="label">示例 &mdash; make_exception_ptr 加速</div>
+          <pre><span class="cmt">// LLVM 17 及之前：throw + catch 往返（极慢）</span>
+<span class="kw">auto</span> ep = std::make_exception_ptr(std::runtime_error(<span class="str">"err"</span>));
+<span class="cmt">// LLVM 18+：直接构造异常对象（~30x 加速）</span></pre>
+        </div>
+      </div>
+
+      <div class="version-item">
+        <span class="ver-tag">LLVM 19</span>
+        <h4>重新导出 __cxa_* 符号</h4>
+        <ul>
+          <li>将此前由 libc++abi 独占导出的 <code class="inline">__cxa_*</code>
+            系列符号（如 <code class="inline">__cxa_throw</code>、
+            <code class="inline">__cxa_allocate_exception</code> 等）
+            重新在 libc++.so 中导出。</li>
+          <li>这样做的目的是：允许仅链接 libc++.so 而不显式链接 libc++abi.so
+            的应用程序正常工作。</li>
+          <li>不影响 ABI 兼容性，仅改变符号的可见性。</li>
+        </ul>
+      </div>
+
+      <div class="version-item">
+        <span class="ver-tag">LLVM 20 / 21</span>
+        <h4>多个 UB 修复无条件启用</h4>
+        <ul>
+          <li>LLVM 20 和 21 包含多项未定义行为（UB）修正，这些修正
+            <strong>无条件启用</strong>（不依赖 ABI 版本开关），
+            因为原行为违反 C++ 标准。</li>
+          <li>受影响组件：<code class="inline">std::vector</code> 的
+            <code class="inline">insert</code>/<code class="inline">emplace</code>
+            操作、<code class="inline">std::deque</code> 迭代器边界、
+            <code class="inline">std::string</code> 异常安全路径等。</li>
+          <li>对于之前依赖于旧 UB 行为的代码（通常是无意依赖），
+            升级后可能导致行为变化，需要验证。</li>
+        </ul>
+        <div class="note">
+          <strong>迁移建议：</strong>
+          使用 UBSan（<code class="inline">-fsanitize=undefined</code>）对现有代码进行扫描，
+          提前发现并修复 UB 依赖，确保平滑升级。
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+</div>
+
+<div class="footer">
+  <p>毕昇编译器升级 &mdash; C++ 标准库差异详解</p>
+</div>
+
+</body>
+</html>

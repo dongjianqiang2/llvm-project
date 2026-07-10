@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLVM 15→21 毕昇编译器升级分析 — 数通产品线</title>
+<style>
+  :root {
+    --primary: #0a2647;
+    --primary-light: #1e4a7a;
+    --primary-extra: #eef4fb;
+    --accent: #d4a843;
+    --accent-light: #f5e6b8;
+    --bg: #f6f8fc;
+    --card: #fff;
+    --text: #111827;
+    --text2: #4b5563;
+    --border: #e5e7eb;
+    --red: #dc2626; --red-bg: #fef2f2;
+    --amber: #d97706; --amber-bg: #fffbeb;
+    --green: #059669; --green-bg: #ecfdf5;
+    --blue: #2563eb; --blue-bg: #eff6ff;
+    --radius: 12px;
+    --shadow: 0 1px 4px rgba(0,0,0,.05);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.7;font-size:15px;
+  }
+
+  /* Hero */
+  .hero{
+    background:linear-gradient(135deg,#071225 0%,#0a2647 45%,#1e4a7a 100%);
+    color:#fff;padding:60px 24px 48px;text-align:center;position:relative;overflow:hidden;
+  }
+  .hero::after{
+    content:'';position:absolute;inset:0;
+    background:radial-gradient(ellipse 60% 40% at 30% 50%,rgba(212,168,67,.10) 0%,transparent 70%);
+    pointer-events:none;
+  }
+  .hero-badge{
+    display:inline-block;background:rgba(212,168,67,.18);border:1px solid rgba(212,168,67,.30);
+    color:var(--accent-light);font-size:12px;padding:4px 18px;border-radius:20px;
+    letter-spacing:1px;margin-bottom:18px;position:relative;z-index:1;
+  }
+  .hero h1{font-size:34px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
+  .hero .subtitle{font-size:16px;opacity:.78;max-width:680px;margin:0 auto 24px;position:relative;z-index:1}
+  .hero-stats{display:flex;justify-content:center;gap:36px;flex-wrap:wrap;position:relative;z-index:1}
+  .hero-stat{text-align:center}
+  .hero-stat-value{font-size:26px;font-weight:700;color:var(--accent)}
+  .hero-stat-label{font-size:12px;opacity:.6;margin-top:2px}
+
+  /* Focus banner */
+  .focus-banner{
+    background:linear-gradient(90deg, #0a2647 0%, #14365e 100%);
+    padding:20px 24px;margin:0;position:relative;z-index:1;
+  }
+  .focus-banner-inner{max-width:1200px;margin:0 auto;display:flex;gap:12px 28px;flex-wrap:wrap;justify-content:center}
+  .focus-tag{
+    display:inline-flex;align-items:center;gap:6px;
+    color:var(--accent-light);font-size:13px;font-weight:500;
+  }
+  .focus-tag .icon{font-size:16px}
+
+  /* Nav */
+  .toc-bar{
+    position:sticky;top:0;z-index:100;
+    background:rgba(255,255,255,.93);backdrop-filter:blur(14px);
+    border-bottom:1px solid var(--border);padding:0 20px;
+  }
+  .toc-bar-inner{
+    max-width:1200px;margin:0 auto;display:flex;align-items:center;gap:6px;
+    overflow-x:auto;padding:8px 0;scrollbar-width:none;white-space:nowrap;
+  }
+  .toc-bar-inner::-webkit-scrollbar{display:none}
+  .toc-bar-inner a{
+    font-size:13px;color:var(--text2);text-decoration:none;
+    padding:4px 10px;border-radius:5px;transition:all .12s;flex-shrink:0;
+  }
+  .toc-bar-inner a:hover{color:var(--primary);background:var(--primary-extra)}
+  .toc-div{color:#d1d5db;font-size:11px;flex-shrink:0}
+
+  /* Section */
+  .section{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin:24px auto;max-width:1200px;overflow:hidden}
+  .section-header{
+    padding:20px 28px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;
+  }
+  .section-header .num{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;border-radius:7px;
+    background:var(--primary);color:#fff;font-size:14px;font-weight:700;flex-shrink:0;
+  }
+  .section-header h2{font-size:19px;font-weight:700;color:var(--primary)}
+  .section-header .h2-tag{
+    font-size:11px;font-weight:600;background:var(--primary-extra);color:var(--primary-light);
+    padding:2px 10px;border-radius:4px;margin-left:6px;white-space:nowrap;
+  }
+  .section-body{padding:20px 28px 28px}
+
+  /* Version block */
+  .vblock{border:1px solid var(--border);border-radius:10px;margin-bottom:18px;overflow:hidden}
+  .vhead{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:12px 18px;background:#f1f5f9;flex-wrap:wrap;gap:6px;cursor:default;
+  }
+  .vhead h3{font-size:15px;font-weight:700;color:var(--primary)}
+  .vmeta{display:flex;gap:12px;font-size:12px;color:var(--text2);flex-wrap:wrap}
+  .vbody{padding:14px 18px 18px}
+
+  .vbody h4{margin:14px 0 6px;color:var(--primary);font-size:14px}
+  .vbody h4:first-child{margin-top:0}
+
+  /* Tables */
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0}
+  thead th{background:#f1f5f9;color:var(--primary);font-weight:600;text-align:left;padding:8px 12px;border-bottom:2px solid var(--border);font-size:12.5px}
+  tbody td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#f8fafc}
+  table code,.inline-code{
+    background:#eef2f6;padding:1px 6px;border-radius:4px;
+    font-size:13px;font-family:"SF Mono",Menlo,monospace;border:1px solid #e2e8f0;color:#1e293b;
+  }
+
+  /* Badges */
+  .bh{display:inline-block;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bm{display:inline-block;background:var(--amber-bg);color:var(--amber);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bl{display:inline-block;background:var(--blue-bg);color:var(--blue);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bg{display:inline-block;background:var(--green-bg);color:var(--green);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;white-space:nowrap}
+  .bflag{
+    display:inline-block;background:#f1f5f9;color:var(--primary-light);
+    font-size:12px;font-weight:500;padding:2px 10px;border-radius:4px;font-family:"SF Mono",Menlo,monospace;
+  }
+
+  /* Summary Cards */
+  .sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;margin:14px 0}
+  .sc{border:1px solid var(--border);border-radius:9px;padding:18px 20px;position:relative;overflow:hidden}
+  .sc::before{content:'';position:absolute;top:0;left:0;width:4px;height:100%;border-radius:0 2px 2px 0}
+  .sc.sc-r::before{background:var(--red)}
+  .sc.sc-a::before{background:var(--amber)}
+  .sc.sc-g::before{background:var(--green)}
+  .sc-b{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px}
+  .sc-r .sc-b{color:var(--red)}
+  .sc-a .sc-b{color:var(--amber)}
+  .sc-g .sc-b{color:var(--green)}
+  .sc-t{font-size:15px;font-weight:700;margin-bottom:3px}
+  .sc-d{font-size:13.5px;color:var(--text2);line-height:1.6}
+  .sc-v{display:inline-block;background:#eef2f6;color:var(--primary-light);font-size:11px;padding:2px 8px;border-radius:4px;margin-top:6px}
+
+  /* Checklists */
+  .cl{list-style:none;padding:0;columns:2;column-gap:28px}
+  @media(max-width:700px){.cl{columns:1}}
+  .cl li{padding:6px 0 6px 26px;position:relative;font-size:13.5px;break-inside:avoid}
+  .cl li::before{content:'';position:absolute;left:0;top:10px;width:16px;height:16px;border:2px solid #94a3b8;border-radius:3px}
+  .cl li .cv{display:inline-block;background:#eef2f6;color:var(--primary-light);font-size:10.5px;font-weight:600;padding:1px 7px;border-radius:3px;margin-left:4px}
+
+  /* Callout */
+  .co{padding:14px 18px;border-radius:7px;margin:12px 0;font-size:13.5px;border-left:4px solid}
+  .co-r{background:var(--red-bg);border-color:var(--red);color:#7f1d1d}
+  .co-a{background:var(--amber-bg);border-color:var(--amber);color:#713f12}
+  .co-i{background:var(--blue-bg);border-color:var(--blue);color:#1e3a5f}
+  .co-g{background:var(--green-bg);border-color:var(--green);color:#064e3b}
+  .co strong{display:block;margin-bottom:3px}
+  .co code{background:rgba(0,0,0,.06);padding:1px 6px;border-radius:3px;font-size:13px}
+
+  /* Code block */
+  pre.cb{
+    background:#0a1a2e;color:#e2e8f0;padding:16px 20px;border-radius:8px;
+    overflow-x:auto;font-size:13px;line-height:1.6;font-family:"SF Mono",Menlo,monospace;margin:12px 0;
+  }
+  pre.cb .c{color:#6b7280}
+  pre.cb .k{color:#93c5fd}
+  pre.cb .s{color:#a7f3d0}
+
+  /* Phase steps */
+  .ps{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+  .ps-item{flex:1;min-width:130px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;text-align:center;background:#fafbfc}
+  .ps-item .pn{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;font-size:12px;font-weight:700;margin-bottom:4px}
+  .ps-item .pt{font-weight:600;font-size:13.5px;display:block}
+  .ps-item .pd{font-size:12px;color:var(--text2);margin-top:1px}
+
+  /* Cards mini */
+  .cg{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;margin:12px 0}
+  .ic{border:1px solid var(--border);border-radius:7px;padding:14px 16px}
+  .ic .il{font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
+  .ic .iv{font-size:14px;font-weight:600;color:var(--primary)}
+
+  /* Arrow list */
+  .al{list-style:none;padding:0}
+  .al li{padding:5px 0 5px 22px;position:relative;font-size:13.5px;color:var(--text2)}
+  .al li::before{content:'→';position:absolute;left:0;color:var(--accent);font-weight:700}
+  .al li strong{color:var(--text)}
+
+  .mb-6{margin-bottom:6px}
+  .mt-10{margin-top:10px}
+  .flex{display:flex}.flex-wrap{flex-wrap:wrap}.gap-2{gap:6px}
+  .text-s{font-size:13px;color:var(--text2)}
+  hr{border:none;border-top:1px solid var(--border);margin:18px 0}
+
+  /* Footer */
+  .footer{text-align:center;padding:36px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1200px;margin:36px auto 0}
+</style>
+</head>
+<body>
+
+<!-- HERO -->
+<header class="hero">
+  <div class="hero-badge">🛠 数通产品线 · 毕昇编译器升级专项</div>
+  <h1>LLVM 15.0.4 → 21.1.8</h1>
+  <p class="subtitle">差异分析与质量加固建议 — 聚焦性能、小型化、告警、未定义行为、内联、编译选项、C++ 标准库</p>
+  <div class="hero-stats">
+    <div class="hero-stat"><div class="hero-stat-value">3.5 年</div><div class="hero-stat-label">版本跨度 2022→2026</div></div>
+    <div class="hero-stat"><div class="hero-stat-value">~114k</div><div class="hero-stat-label">提交数</div></div>
+    <div class="hero-stat"><div class="hero-stat-value">6</div><div class="hero-stat-label">大版本</div></div>
+    <div class="hero-stat"><div class="hero-stat-value">~8,400</div><div class="hero-stat-label">变更文件</div></div>
+    <div class="hero-stat"><div class="hero-stat-value">+1.8M</div><div class="hero-stat-label">新增代码</div></div>
+  </div>
+</header>
+
+<!-- FOCUS BANNER -->
+<div class="focus-banner">
+  <div class="focus-banner-inner">
+    <span class="focus-tag"><span class="icon">⚡</span> 性能</span>
+    <span class="focus-tag"><span class="icon">📏</span> 小型化</span>
+    <span class="focus-tag"><span class="icon">⚠️</span> 告警</span>
+    <span class="focus-tag"><span class="icon">🚫</span> 未定义行为</span>
+    <span class="focus-tag"><span class="icon">🔗</span> 内联差异</span>
+    <span class="focus-tag"><span class="icon">⚙️</span> 编译选项</span>
+    <span class="focus-tag"><span class="icon">📚</span> C++ 标准库</span>
+  </div>
+</div>
+
+<!-- TOC -->
+<nav class="toc-bar">
+  <div class="toc-bar-inner">
+    <a href="#summary">核心结论</a><span class="toc-div">｜</span>
+    <a href="#perf-size">⚡性能与小型化</a><span class="toc-div">｜</span>
+    <a href="#warnings">⚠️告警</a><span class="toc-div">｜</span>
+    <a href="#ub">🚫未定义行为</a><span class="toc-div">｜</span>
+    <a href="#inline">🔗内联</a><span class="toc-div">｜</span>
+    <a href="#flags">⚙️编译选项</a><span class="toc-div">｜</span>
+    <a href="#libcxx">📚C++标准库</a><span class="toc-div">｜</span>
+    <a href="#breaking">Breaking Changes</a><span class="toc-div">｜</span>
+    <a href="#checklist">检查清单</a>
+  </div>
+</nav>
+
+<div class="container" style="max-width:1200px;margin:0 auto;padding:0 20px">
+
+<!-- ══════════════════════════════════════════════════════
+     CORE SUMMARY
+     ══════════════════════════════════════════════════════ -->
+<section id="summary" class="section">
+  <div class="section-header">
+    <span class="num">✦</span>
+    <h2>核心结论</h2>
+  </div>
+  <div class="section-body">
+    <p style="margin-bottom:16px;color:var(--text2)">本报告针对数通产品线关注维度，系统梳理 LLVM 15.0.4 → 21.1.8 六大版本的所有关键差异，并提供分阶段迁移建议。</p>
+
+    <div class="sg">
+      <div class="sc sc-r">
+        <div class="sc-b">🔴 最高优先级 · 行为变化</div>
+        <div class="sc-t">TBAA 默认启用 + 指针溢出 UB</div>
+        <div class="sc-d"><code>strict-aliasing</code> 违例代码被静默错误优化；依赖指针包装语义的边界检查失效。两项皆为 <strong>LLVM 20</strong> 引入，升级后必须第一时间验证。 <a href="detail-llvm-20.html" style="color:var(--red);text-decoration:underline">详情→</a></div>
+        <div class="sc-v">LLVM 20.1 · <code>-fno-pointer-tbaa</code> / <code>-fwrapv-pointer</code></div>
+      </div>
+      <div class="sc sc-r">
+        <div class="sc-b">🔴 最高优先级 · ABI Break</div>
+        <div class="sc-t">C++ 函数模板名称重整</div>
+        <div class="sc-d">受约束模板、<code>auto</code> 返回类型、依赖参数的模板的 <strong>mangled name</strong> 改变，造成二进制不兼容。是 LLVM 18 最关键的 ABI 变更。 <a href="detail-llvm-18.html" style="color:var(--red);text-decoration:underline">详情→</a></div>
+        <div class="sc-v">LLVM 18.1 · <code>-fclang-abi-compat=17</code></div>
+      </div>
+      <div class="sc sc-r">
+        <div class="sc-b">🔴 最高优先级 · 优化语义</div>
+        <div class="sc-t">Lifetime DSE 死对象存储消除</div>
+        <div class="sc-d">对象死亡后的存储操作被更积极消除，依赖此行为的代码（如 RAII 资源释放标记）可能失效。 <a href="detail-llvm-21.html" style="color:var(--red);text-decoration:underline">详情→</a></div>
+        <div class="sc-v">LLVM 21.1 · <code>-fno-lifetime-dse</code></div>
+      </div>
+      <div class="sc sc-r">
+        <div class="sc-b">🔴 最高优先级 · 小型化</div>
+        <div class="sc-t">SVE/SVE2 ARMv9.0 变为可选</div>
+        <div class="sc-d"><code>-march=armv9-a</code> 不再隐含 <code>+sve</code>/<code>+sve2</code>。依赖 SVE 自动向量化的场景需显式指定，否则可能降级为 NEON。 <a href="detail-llvm-19.html" style="color:var(--red);text-decoration:underline">详情→</a></div>
+        <div class="sc-v">LLVM 19.1</div>
+      </div>
+      <div class="sc sc-a">
+        <div class="sc-b">🟡 重要 · 编译配置</div>
+        <div class="sc-t">C++17 默认标准（原 C++14）</div>
+        <div class="sc-d">LLVM 16 起默认 <code>gnu++17</code>。C++17 的 <code>if constexpr</code>、折叠表达式、结构化绑定等新规则可能导致旧的 C++14 代码编译失败或语义变化。</div>
+        <div class="sc-v">LLVM 16.0 · <code>-std=gnu++14</code> 恢复</div>
+      </div>
+      <div class="sc sc-g">
+        <div class="sc-b">🟢 推荐 · 安全与质量</div>
+        <div class="sc-t">libc++ Hardening + 新 Sanitizers</div>
+        <div class="sc-d">LLVM 18+ 引入 <code>_LIBCPP_HARDENING_MODE</code> 生产级加固；LLVM 18+ 新增 Numerical Sanitizer；LLVM 19+ 新增 Realtime Sanitizer。 <a href="detail-libcxx.html" style="color:var(--green);text-decoration:underline">详情→</a></div>
+        <div class="sc-v"><code>-D_LIBCPP_HARDENING_MODE=FAST</code></div>
+      </div>
+      <div class="sc sc-g">
+        <div class="sc-b">🟢 推荐 · AArch64 防护</div>
+        <div class="sc-t">Pointer Authentication (PAuth)</div>
+        <div class="sc-d">BTI + PAC-RET + PAuth-LR 组合保护，LLVM 19 起完全支持。对嵌入式网络设备的控制流完整性有重要价值。 <a href="detail-llvm-19.html" style="color:var(--green);text-decoration:underline">详情→</a></div>
+        <div class="sc-v"><code>-mbranch-protection=standard</code></div>
+      </div>
+      <div class="sc sc-a">
+        <div class="sc-b">🟡 重要 · 链接阶段</div>
+        <div class="sc-t">LLD 性能大幅提升 + 默认行为变更</div>
+        <div class="sc-d">LLVM 16 起重定位扫描并行化；LLVM 18 起 <code>cdsort</code> 算法排序。同时 <code>--no-undefined-version</code> 默认启用，<code>--build-id</code> 默认改为 SHA1。</div>
+        <div class="sc-v">需确认链接脚本与 version script</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     PERFORMANCE & CODE SIZE
+     ══════════════════════════════════════════════════════ -->
+<section id="perf-size" class="section">
+  <div class="section-header">
+    <span class="num">⚡</span>
+    <h2>性能与小型化</h2>
+    <span class="h2-tag">Performance &amp; Code Size</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 数通产品线关注点</strong>
+      嵌入式 / 数通设备对代码体积（<code>-Oz</code> / <code>-Os</code>）和执行性能敏感。
+      编译器升级可能带来免费的性能提升，也可能引入意外的代码膨胀或性能倒退。
+    </div>
+
+    <div style="text-align:right;margin-bottom:8px">
+      <a href="detail-perf-size.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看详情 →</a>
+    </div>
+    <h4 style="color:var(--primary);font-size:15px;margin-top:16px">📈 代码体积优化进展</h4>
+    <table>
+      <thead><tr><th>版本</th><th>变更</th><th>对代码体积的影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>LLVM 16</strong></td><td>GlobalOpt 改进；死代码消除增强</td><td class="text-s">小幅改善</td></tr>
+        <tr><td><strong>LLVM 17</strong></td><td>Opaque pointers 强制推行（消除 pointer bitcast 冗余）</td><td><span class="bg">中等改善</span> — 间接减少了大量 GEP/bitcast 链</td></tr>
+        <tr><td><strong>LLVM 18</strong></td><td>FatLTO 支持；<code>cdsort</code> 代码段布局排序算法</td><td><span class="bg">正面影响</span> — 按调用图优化布局，减少 i-cache miss</td></tr>
+        <tr><td><strong>LLVM 19</strong></td><td><code>nusw</code>/<code>nuw</code> GEP flags（更好的分析）；Debug records 基础设施</td><td class="text-s">间接正面</td></tr>
+        <tr><td><strong>LLVM 20</strong></td><td><strong>Size-aware Machine Block Placement</strong> (<span class="inline-code">#109711</span>)</td><td><span class="bg">显著改善</span> — 对 <code>-Oz</code>/<code>-Os</code> 场景的机器块布局进行了大小感知优化</td></tr>
+        <tr><td><strong>LLVM 20</strong></td><td><code>-fno-pointer-tbaa</code> 可用（但 TBAA 默认启用）</td><td><span class="bm">⚠ TBAA 可能因更积极优化而减小体积，但也可能导致错误</span></td></tr>
+        <tr><td><strong>LLVM 21</strong></td><td><code>nooutline</code> 属性语法变更；Lifetime DSE</td><td><span class="bm">⚠ Lifetime DSE 可能减小代码但改变语义</span></td></tr>
+      </tbody>
+    </table>
+
+    <div class="co co-a mt-10">
+      <strong>⚡ 关键性能优化改进</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li><strong>LLVM 16–17</strong>：ML-inliner 稳定化 + 内联决策中冷热分离更精确</li>
+        <li><strong>LLVM 17</strong>：<code>nofpclass</code> 浮点属性 → 更激进的浮点比较优化（可提升数值密集代码性能）</li>
+        <li><strong>LLVM 18</strong>：<code>cdsort</code> 排序算法替代 <code>hfsort</code>（调用面剖面条目排序更优）；FatLTO 支持</li>
+        <li><strong>LLVM 19</strong>：<code>nusw</code>/<code>nuw</code> GEP flags → 更精确的越界分析；MMRAs 内存模型松弛标注</li>
+        <li><strong>LLVM 20</strong>：<strong>TBAA 默认启用</strong> → 更激进的别名分析（性能收益 vs. 安全风险的权衡）</li>
+        <li><strong>LLVM 20</strong>：<strong>Size-aware Machine Block Placement</strong> → 对 <code>-Oz</code> 场景代码体积优化</li>
+        <li><strong>LLVM 21</strong>：<strong>Lifetime DSE</strong> → 更积极消除死存储（可能提升性能，但需验证语义）</li>
+      </ul>
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin-top:16px">⚠️ 可能的性能 / 体积回归风险</h4>
+    <table>
+      <thead><tr><th>风险点</th><th>版本</th><th>说明</th><th>影响目标</th></tr></thead>
+      <tbody>
+        <tr><td>TBAA 默认启用</td><td>20</td><td>违反 strict aliasing 的代码被错误优化 → 逻辑错误或 crash</td><td>通用</td></tr>
+        <tr><td>指针溢出 UB 优化</td><td>20</td><td>依赖指针包装语义的边界检查被优化掉 → 安全边界失效</td><td>通用</td></tr>
+        <tr><td>Lifetime DSE</td><td>21</td><td>死对象存储消除 → 资源释放标记/调试断言失效</td><td>通用</td></tr>
+        <tr><td>SVE 自动向量化降级</td><td>19</td><td><code>-march=armv9-a</code> 不再默认 SVE → 性能回退到 NEON</td><td>AArch64</td></tr>
+        <tr><td>向量化 Cost Model 变化</td><td>16–21</td><td>跨版本累积的 cost model 改变导致部分循环不再向量化</td><td>通用</td></tr>
+        <tr><td>Debug INFO 基础设施重写</td><td>19</td><td>Debug intrinsics → Debug records，可能影响 LTO 调试信息体积</td><td>调试构建</td></tr>
+        <tr><td>ConstantExpr 移除累积</td><td>16–21</td><td>逐步移除常量表达式变体，IR 构建方式变化</td><td>IR 生成工具</td></tr>
+      </tbody>
+    </table>
+
+    <div class="cg mt-10">
+      <div class="ic"><div class="il">建议验证1</div><div class="iv">二进制体积对比</div>使用 <code>size(1)</code>/<code>bloaty</code> 对关键模块进行新旧编译器对比</div>
+      <div class="ic"><div class="il">建议验证2</div><div class="iv">性能基准测试</div>CoreMark / Dhrystone / 协议栈吞吐量等关键指标对比</div>
+      <div class="ic"><div class="il">建议验证3</div><div class="iv">-Oz 构建验证</div>确认 <code>-Oz</code> 路径的代码体积无异常膨胀</div>
+      <div class="ic"><div class="il">建议验证4</div><div class="iv">LTO 测试</div>ThinLTO / Full LTO 行为对比，注意分布式 LTO 新特性</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     WARNINGS
+     ══════════════════════════════════════════════════════ -->
+<section id="warnings" class="section">
+  <div class="section-header">
+    <span class="num">⚠️</span>
+    <h2>告警变化</h2>
+    <span class="h2-tag">New Warnings · Default-Error</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 数通产品线关注点</strong>
+      告警从 warning 升级为 error 会直接导致编译失败。需提前识别并修复这些告警，或通过编译选项降级。
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:16px 0 8px">默认升级为 Error 的告警</h4>
+    <table>
+      <thead><tr><th>版本</th><th>告警</th><th>降级选项</th><th>影响场景</th></tr></thead>
+      <tbody>
+        <tr><td><strong>16</strong></td><td><code>-Wimplicit-function-declaration</code> → <span class="bh">Error</span></td><td><code>-Wno-error=implicit-function-declaration</code></td><td>C 代码中隐式声明函数</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-Wimplicit-int</code> → <span class="bh">Error</span></td><td><code>-Wno-error=implicit-int</code></td><td>C 代码省略类型说明</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-Wincompatible-function-pointer-types</code> → <span class="bh">Error</span></td><td><code>-Wno-error=incompatible-function-pointer-types</code></td><td>函数指针类型不兼容</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-Wvoid-ptr-dereference</code> → <span class="bh">Error</span> (C++)</td><td><code>-Wno-error=void-ptr-dereference</code></td><td>C++ 中 void* 解引用</td></tr>
+        <tr><td><strong>17</strong></td><td>void* 解引用 (C++) 从 warning-as-error → <span class="bh">硬 Error</span></td><td><code>-Wno-error=void-ptr-dereference</code></td><td>同上，规则收紧</td></tr>
+        <tr><td><strong>18</strong></td><td><code>-Wenum-constexpr-conversion</code> 在系统头文件中 <span class="bm">默认启用</span></td><td><code>-Wno-enum-constexpr-conversion</code></td><td>enum 值超出范围（19 起不可压制）</td></tr>
+        <tr><td><strong>20</strong></td><td>enum constexpr 转换 <span class="bh">完全不可压制</span></td><td>不可降级</td><td>必须修复代码</td></tr>
+        <tr><td><strong>20</strong></td><td>多余的 template header → <span class="bh">默认 Error</span></td><td><code>-Wno-error=extraneous-template-head</code></td><td>C++ 模板代码</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-Wdeprecated-literal-operator</code> <span class="bm">默认启用</span></td><td><code>-Wno-deprecated-literal-operator</code></td><td>废弃的字面量操作符</td></tr>
+        <tr><td><strong>21</strong></td><td><code>-Wglobal-constructors</code> 覆盖 <code>gnu::constructor</code></td><td>—</td><td>使用 <code>__attribute__((constructor))</code> 的场景</td></tr>
+      </tbody>
+    </table>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:20px 0 8px">新增的重要告警组</h4>
+    <table>
+      <thead><tr><th>版本</th><th>新告警组</th><th>检测场景</th><th>数通设备关注</th></tr></thead>
+      <tbody>
+        <tr><td><strong>16</strong></td><td><code>-Wgnu-empty-initializer</code></td><td>GNU 空初始化器</td><td><span class="bl">低</span></td></tr>
+        <tr><td><strong>17</strong></td><td><code>-Wbitfield-constant-conversion</code></td><td>位域常量转换（符号扩展问题）</td><td><span class="bm">中 — 嵌入式位域操作常见</span></td></tr>
+        <tr><td><strong>18</strong></td><td><code>-Wshorten-64-to-32</code></td><td>64→32 位隐式缩窄转换</td><td><span class="bh">高 — 数通设备指针/大小运算常见</span></td></tr>
+        <tr><td><strong>18</strong></td><td><code>-Wimplicit-int-conversion-on-negation</code></td><td>取反操作中的隐式整数转换</td><td><span class="bm">中</span></td></tr>
+        <tr><td><strong>18</strong></td><td><code>-Wdeprecated-ofast</code></td><td>检测 <code>-Ofast</code> 使用</td><td><span class="bl">低 — 建议改为 <code>-O3 -ffast-math</code></span></td></tr>
+        <tr><td><strong>18</strong></td><td><code>-Wimplicit-enum-enum-cast</code></td><td>enum 之间隐式转换</td><td><span class="bm">中</span></td></tr>
+        <tr><td><strong>18</strong></td><td><code>-Wcharacter-conversion</code></td><td>字符类型隐式转换</td><td><span class="bm">中</span></td></tr>
+        <tr><td><strong>19</strong></td><td><code>-Wimplicit-void-ptr-cast</code></td><td>void* 隐式转换（C++）</td><td><span class="bm">中</span></td></tr>
+        <tr><td><strong>20</strong></td><td><code>-Wdeprecated-literal-operator</code>（默认启用）</td><td>废弃的字面量操作符</td><td><span class="bl">低</span></td></tr>
+        <tr><td><strong>20</strong></td><td><code>-Wdefault-const-init-unsafe</code> 系列</td><td>const 初始化不安全的场景</td><td><span class="bl">低</span></td></tr>
+        <tr><td><strong>21</strong></td><td><code>-Wdeprecated-redundant-constexpr-static-def</code></td><td>冗余的 constexpr static 定义</td><td><span class="bl">低</span></td></tr>
+        <tr><td><strong>21</strong></td><td><code>-Wdeprecated-missing-comma-variadic-parameter</code></td><td>变参宏中遗漏逗号</td><td><span class="bm">中 — 宏定义常见</span></td></tr>
+      </tbody>
+    </table>
+
+    <div class="co co-r mt-10">
+      <strong>🔴 对数通设备 C 代码影响最大的告警</strong>
+      C 代码（驱动/协议栈/底层库）中<code>-Wimplicit-function-declaration</code> 和 <code>-Wimplicit-int</code> 升级为 error 影响最广。
+      建议在迁移初期使用降级选项，逐步修复后移除。
+    </div>
+    <div style="text-align:right;margin-top:14px">
+      <a href="detail-warnings.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看全部告警详解 →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     UNDEFINED BEHAVIOR
+     ══════════════════════════════════════════════════════ -->
+<section id="ub" class="section">
+  <div class="section-header">
+    <span class="num">🚫</span>
+    <h2>未定义行为</h2>
+    <span class="h2-tag">UB &amp; Sanitizers</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-r">
+      <strong>🔴 核心变更：LLVM 20 起编译器更积极利用 UB 进行优化</strong>
+      这是 LLVM 15→21 <strong>最重大的语义变化</strong>。之前"恰好工作"但实际属于 UB 的代码，在新版本中可能被优化掉或行为改变。
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:16px 0 8px">UB 相关关键变更</h4>
+    <table>
+      <thead><tr><th>版本</th><th>变更</th><th>UB 表现</th><th>修复/兼容方案</th></tr></thead>
+      <tbody>
+        <tr><td><strong>20</strong></td><td>指针加法溢出 UB 更积极优化</td><td><code>ptr + offset &lt; ptr</code> → 优化为 <code>false</code></td><td><code>-fwrapv-pointer</code> / 改用整数运算</td></tr>
+        <tr><td><strong>20</strong></td><td>TBAA 标签默认启用</td><td>违反 strict-aliasing 的指针访问被错误优化</td><td><code>-fno-pointer-tbaa</code> / 修复 aliasing 违规</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fwrapv</code> 不再影响指针溢出</td><td>需用 <code>-fwrapv-pointer</code> 单独控制</td><td>同时设置 <code>-fwrapv -fwrapv-pointer</code></td></tr>
+        <tr><td><strong>21</strong></td><td>Lifetime DSE 更积极</td><td>对象死亡后的存储被消除（<code>memset</code>/<code>memcpy</code> 等）</td><td><code>-fno-lifetime-dse</code></td></tr>
+        <tr><td><strong>16</strong></td><td><code>-fsanitize-memory-param-retval</code> 默认启用</td><td>MSan 下未初始化参数传递被检测</td><td><code>-fno-sanitize-memory-param-retval</code></td></tr>
+        <tr><td><strong>18</strong></td><td>enum constexpr 范围检查</td><td>超出范围的 enum 值作为常量表达式被拒绝</td><td>修复 enum 值（LLVM 20 起不可压制）</td></tr>
+        <tr><td><strong>20</strong></td><td>libc++ 内部 UB 修复无条件启用</td><td>list/tree/hash_table/forward_list 节点指针 UB 固定</td><td>不可禁用（旧 flag 已无条件启用）</td></tr>
+        <tr><td><strong>21</strong></td><td>null 指针算术优化</td><td>旧式 <code>offsetof</code> 惯用法可能被优化破坏</td><td><code>-fwrapv-pointer</code> / <code>-fno-delete-null-pointer-checks</code></td></tr>
+      </tbody>
+    </table>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:20px 0 8px">Sanitizers 增强（UB 检测利器）</h4>
+    <table>
+      <thead><tr><th>版本</th><th>Sanitizer 变化</th><th>对数通设备的推荐</th></tr></thead>
+      <tbody>
+        <tr><td><strong>16</strong></td><td>MSan param-retval 默认启用</td><td>CI 中启用 <code>-fsanitize=memory</code></td></tr>
+        <tr><td><strong>17+</strong></td><td>ASan stack-use-after-return 改进</td><td>CI 测试用 <code>-fsanitize=address</code></td></tr>
+        <tr><td><strong>18+</strong></td><td><strong>Numerical Sanitizer 新增</strong> (<span class="inline-code">#94322</span>)</td><td>检测数值计算异常（除零/溢出）</td></tr>
+        <tr><td><strong>19+</strong></td><td><strong>Realtime Sanitizer 新增</strong> (<span class="inline-code">#92460</span>)</td><td>实时系统（RTOS/嵌入式）内存安全检查</td></tr>
+        <tr><td><strong>20+</strong></td><td>UBSan 新增 null/alignment checks for aggregates</td><td><code>-fsanitize=undefined</code> 覆盖更深</td></tr>
+        <tr><td><strong>20+</strong></td><td>Metadata Sanitizer（实验性）</td><td>二进制分析元数据注入</td></tr>
+      </tbody>
+    </table>
+
+    <div class="co co-a mt-10">
+      <strong>🟡 数通产品线 UB 治理建议</strong>
+      <ol style="margin:6px 0 0 16px">
+        <li><strong>立即行动</strong>：用新编译器（20/21）+ <code>-fwrapv-pointer</code> 构建，先用 <code>-fsanitize=undefined,pointer-overflow</code> 做一轮全量测试，发现潜在 UB</li>
+        <li><strong>修复优先级</strong>：先修复 pointer-overflow 和 strict-aliasing 违规（这两项在 LLVM 20 会静默改变行为）</li>
+        <li><strong>长期</strong>：在 CI 中持续启用 UBSan + ASan，防止新的 UB 引入</li>
+        <li><strong>生产构建</strong>：评估是否启用 <code>-fwrapv-pointer</code> 使指针溢出有明确定义</li>
+      </ol>
+    </div>
+    <div style="text-align:right;margin-top:14px">
+      <a href="detail-ub.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看全部 UB 详解 →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     INLINING
+     ══════════════════════════════════════════════════════ -->
+<section id="inline" class="section">
+  <div class="section-header">
+    <span class="num">🔗</span>
+    <h2>内联差异</h2>
+    <span class="h2-tag">Inliner · Inline Cost</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 数通产品线关注点</strong>
+      内联决策直接影响代码体积和执行速度。数通设备通常使用 <code>-Oz</code> 或 <code>-Os</code> 控制体积，
+      内联成本模型的变化可能导致关键函数被不同地内联。
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:16px 0 8px">Inliner 关键变更（15→21 共 20+ 次 Inliner.cpp 修改、66+ 次 InlineCost.cpp 修改）</h4>
+    <table>
+      <thead><tr><th>版本</th><th>变更</th><th>对数通设备的影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>16</strong></td><td>ML-inliner 稳定（release 模式可用）</td><td>默认使用 ML 模型做内联决策，对吞吐敏感的转发面代码可能更积极内联</td></tr>
+        <tr><td><strong>17</strong></td><td>Always inliner 路径清理</td><td><code>__attribute__((always_inline))</code> 路径更可靠</td></tr>
+        <tr><td><strong>18</strong></td><td><code>InlineCost</code>：Switch 语句默认分支成本修正（<span class="inline-code">#85160</span>）</td><td>含大 switch 的协议分发函数内联决策更准确</td></tr>
+        <tr><td><strong>19</strong></td><td>冷热 callsite 处理改进；BFI（块频率信息）更广泛应用</td><td>冷路径（错误处理/初始化）更少被内联 → 代码体积改善</td></tr>
+        <tr><td><strong>19</strong></td><td><code>getelementptr</code> 添加 <code>nusw</code>/<code>nuw</code> flags</td><td>指针分析更精确 → 内联后的优化更高效</td></tr>
+        <tr><td><strong>20</strong></td><td>TBAA 默认启用</td><td>内联后的别名分析更激进的，可能推动更多后续优化</td></tr>
+        <tr><td><strong>20</strong></td><td>Size-aware Machine Block Placement</td><td>对 <code>-Oz</code> 构建的内联后代码布局优化</td></tr>
+        <tr><td><strong>20</strong></td><td><code>__memcpy_chk</code> 等折叠内联不再增加罚分（<span class="inline-code">#117876</span>）</td><td>涉及内存拷贝的安全函数不再被错误地惩罚 → 更合理的内联决策</td></tr>
+        <tr><td><strong>20</strong></td><td>递归函数内联优化（<span class="inline-code">#139982</span>）</td><td>特定模式的递归可被优化为迭代，减少栈压力</td></tr>
+        <tr><td><strong>21</strong></td><td><code>__builtin_structured_binding_size</code> 新内建函数</td><td>结构化绑定场景的编译期计算</td></tr>
+        <tr><td><strong>21</strong></td><td>内联汇编指令在内联成本中的计算（<span class="inline-code">#146628</span>）</td><td>含有内联汇编的函数内联决策更合理（数通设备驱动/PLD 代码常见）</td></tr>
+        <tr><td><strong>21</strong></td><td>store-to-load forwarding 解析调用参数（<span class="inline-code">#190607</span>）</td><td>内联后存储转发分析 → 减少不必要的内存访问</td></tr>
+      </tbody>
+    </table>
+
+    <div class="co co-a mt-10">
+      <strong>🟡 内联差异验证建议</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li>对关键模块进行 <code>-Oz</code> / <code>-Os</code> 两种构建的 <code>.text</code> 段对比</li>
+        <li>使用 <code>-Rpass=inline</code> / <code>-Rpass-missed=inline</code> 输出内联决策日志，与旧编译器对比</li>
+        <li>关注内联汇编密集的驱动代码的内联决策变化（LLVM 21 起影响）</li>
+        <li>LTO 场景下内联策略变化更大，需单独验证</li>
+      </ul>
+    </div>
+    <div style="text-align:right;margin-top:14px">
+      <a href="detail-inline.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看内联差异详解 →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     COMPILER FLAGS
+     ══════════════════════════════════════════════════════ -->
+<section id="flags" class="section">
+  <div class="section-header">
+    <span class="num">⚙️</span>
+    <h2>编译选项差异</h2>
+    <span class="h2-tag">New · Deprecated · Removed</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 变化概览</strong>
+      LLVM 15→21 间 Options.td 有 <strong>848 次提交</strong>变更。以下列出与数通产品线最相关的编译选项变化。
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:16px 0 8px">新增的重要编译选项</h4>
+    <table>
+      <thead><tr><th>版本</th><th>新增选项</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><strong>16</strong></td><td><code>-fno-legacy-pass-manager</code> 已移除（被忽略）</td><td>新 PM 已强制使用</td></tr>
+        <tr><td><strong>18+</strong></td><td><code>-D_LIBCPP_HARDENING_MODE=</code></td><td>libc++ 加固模式选择</td></tr>
+        <tr><td><strong>19</strong></td><td><code>-z gcs</code> / <code>-z gcs-report</code></td><td>AArch64 Guarded Control Stack</td></tr>
+        <tr><td><strong>19</strong></td><td><code>-frelaxed-template-template-args</code>（默认启用）</td><td>模板模板参数松弛匹配</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fwrapv-pointer</code></td><td>使指针溢出有明确定义</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fno-pointer-tbaa</code></td><td>禁用 TBAA 标签</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fstrict-flex-arrays=</code></td><td>柔性数组成员严格程度</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-falign-loops=</code></td><td>循环对齐控制</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fmax-tokens=</code></td><td>预处理 token 数量限制</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fsanitize-coverage-stack-depth-callback-min=</code></td><td>覆盖率检测栈深度回调</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fexperimental-sanitize-metadata=</code></td><td>实验性二进制分析元数据</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fgpu-sanitize</code></td><td>卸载设备 sanitizer</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fcomplex-arithmetic=</code> / <code>-complex-range=</code></td><td>复数运算模式控制</td></tr>
+        <tr><td><strong>21</strong></td><td><code>-fno-lifetime-dse</code></td><td>禁用 Lifetime DSE 优化</td></tr>
+        <tr><td><strong>21</strong></td><td><code>-foffload-new-driver</code></td><td>新 offload driver</td></tr>
+      </tbody>
+    </table>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:20px 0 8px">废弃/移除的选项</h4>
+    <table>
+      <thead><tr><th>版本</th><th>选项</th><th>替代方案</th></tr></thead>
+      <tbody>
+        <tr><td><strong>16</strong></td><td><code>-fexperimental-new-pass-manager</code></td><td>已强制使用新 PM，无需指定</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-fno-legacy-pass-manager</code></td><td>同上</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-fcoroutines-ts</code> 废弃 <span class="bm">→ 17 移除</span></td><td>使用标准 C++20 协程</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-fmodules-ts</code> 废弃 <span class="bm">→ 17 移除</span></td><td>使用标准 C++20 modules</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-fconcepts-ts</code> 移除</td><td>使用标准 C++20 concepts</td></tr>
+        <tr><td><strong>16</strong></td><td><code>-menable-unsafe-fp-math</code> 移除</td><td>使用 <code>-ffast-math</code></td></tr>
+        <tr><td><strong>18</strong></td><td><code>GCC_INSTALL_PREFIX</code> 废弃 <span class="bm">→ 19 移除</span></td><td><code>--gcc-install-dir=</code> / <code>--gcc-triple=</code></td></tr>
+        <tr><td><strong>19</strong></td><td><code>-Ofast</code> <span class="bm">废弃</span></td><td><code>-O3 -ffast-math</code></td></tr>
+        <tr><td><strong>20</strong></td><td><code>clang-rename</code> 工具移除</td><td>其他重构工具</td></tr>
+        <tr><td><strong>20</strong></td><td><code>le32</code> / <code>le64</code> 目标移除</td><td>更新目标配置</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-fdelayed-template-parsing</code> C++20 MSVC 不再默认</td><td>匹配 MSVC 行为</td></tr>
+        <tr><td><strong>20</strong></td><td><code>-enable-trivial-auto-var-init-zero-knowing-it-will-be-removed</code> 移除</td><td>已到期移除</td></tr>
+        <tr><td><strong>20</strong></td><td><code>RenderScript</code> 支持移除</td><td>迁移至 Vulkan</td></tr>
+      </tbody>
+    </table>
+
+    <div class="co co-a mt-10">
+      <strong>🟡 数通产品线 Makefile/CMake 检查要点</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li>搜索 Makefile/CMakeLists 中的 <code>-fexperimental-new-pass-manager</code> / <code>-fno-legacy-pass-manager</code> → 删除</li>
+        <li>搜索 <code>-fcoroutines-ts</code> / <code>-fmodules-ts</code> → 更新为标准选项</li>
+        <li>搜索 <code>le32</code> / <code>le64</code> 目标 → 替换</li>
+        <li>搜索 <code>-Ofast</code> → 替换为 <code>-O3 -ffast-math</code></li>
+        <li>搜索 <code>GCC_INSTALL_PREFIX</code> → 替换为 <code>--gcc-install-dir=</code></li>
+        <li>搜索 <code>-menable-unsafe-fp-math</code> → 替换为 <code>-ffast-math</code></li>
+        <li>搜索 <code>-fwrapv</code> 使用 → 评估是否需要添加 <code>-fwrapv-pointer</code></li>
+      </ul>
+    </div>
+    <div style="text-align:right;margin-top:14px">
+      <a href="detail-flags.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">⚙️ 查看全部编译选项差异 →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     LIBC++
+     ══════════════════════════════════════════════════════ -->
+<section id="libcxx" class="section">
+  <div class="section-header">
+    <span class="num">📚</span>
+    <h2>C++ 标准库差异</h2>
+    <span class="h2-tag">libc++ · ABI · Performance</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 数通产品线关注点</strong>
+      C++ 标准库的 ABI 稳定性和性能对嵌入式设备至关重要。libc++ 在 LLVM 15→21 间新增了大量 ABI 选项、加固能力和性能优化。
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:16px 0 8px">分版本 ABI / 性能关键变更</h4>
+    <table>
+      <thead><tr><th>版本</th><th>变更</th><th>性能/体积影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>15→16</strong></td><td>移除 ~30 个 debug 模式废弃符号；新增 <code>__libcpp_verbose_abort</code></td><td class="text-s">调试构建体积优化</td></tr>
+        <tr><td><strong>16→17</strong></td><td>新增 <code>&lt;memory_resource&gt;</code> (PMR) — <code>monotonic_buffer_resource</code>、pool 资源</td><td><span class="bm">约 50 个新符号</span>；PMR 对嵌入式内存池分配有价值</td></tr>
+        <tr><td><strong>17→18</strong></td><td>移除 <code>allocator_arg</code>/<code>defer_lock</code>/<code>try_to_lock</code>/<code>adopt_lock</code>/<code>piecewise_construct</code> 符号；移除 <code>__insertion_sort_incomplete</code>/<code>__sort5</code> 显式实例化</td><td><span class="bg">动态库体积减少</span></td></tr>
+        <tr><td><strong>18→19</strong></td><td><span class="bh">新增 <code>__cxa_init_primary_exception</code></span> — <strong>30x 更快 <code>make_exception_ptr</code></strong></td><td><span class="bg">显著提升异常路径性能</span></td></tr>
+        <tr><td><strong>18→19</strong></td><td>新增 <code>__is_posix_terminal</code></td><td class="text-s">新增符号</td></tr>
+        <tr><td><strong>19→20</strong></td><td>重新导出 ~40 个 <code>__cxa_*</code> 符号（来自 libc++abi）</td><td class="text-s">改善异常处理符号可见性</td></tr>
+        <tr><td><strong>20→21</strong></td><td>多个 UB 修复 flag <strong>无条件开启</strong>：<code>_LIBCPP_ABI_LIST_REMOVE_NODE_POINTER_UB</code> 等</td><td><span class="bg">避免 UB 带来的安全风险</span></td></tr>
+      </tbody>
+    </table>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:20px 0 8px">ABI 编译选项（影响性能的关键开关）</h4>
+    <table>
+      <thead><tr><th>ABI Flag</th><th>性能影响</th><th>适用场景</th></tr></thead>
+      <tbody>
+        <tr><td><code>_LIBCPP_ABI_ALTERNATE_STRING_LAYOUT</code></td><td><span class="bg">显著提升 string 操作性能</span></td><td>内部缓冲区前置 + 8 字节对齐</td></tr>
+        <tr><td><code>_LIBCPP_ABI_OPTIMIZED_FUNCTION</code></td><td><span class="bg">优化 <code>std::function</code> 结构</span></td><td>延迟/回调节点密集场景（仍为 unstable）</td></tr>
+        <tr><td><code>_LIBCPP_ABI_VARIANT_INDEX_TYPE_OPTIMIZATION</code></td><td><span class="bg">缩小 <code>std::variant</code> 体积</span></td><td>使用最小整数类型存储 variant index</td></tr>
+        <tr><td><code>_LIBCPP_ABI_NO_COMPRESSED_PAIR_PADDING</code></td><td><span class="bg">减少 pair 填充字节</span></td><td>嵌入式场景的容器元素体积优化</td></tr>
+        <tr><td><code>_LIBCPP_ABI_ENABLE_UNIQUE_PTR_TRIVIAL_ABI</code></td><td><span class="bh">消除按值传递 <code>unique_ptr</code> 的开销</span></td><td>函数参数频繁传递 unique_ptr 的场景</td></tr>
+        <tr><td><code>_LIBCPP_ABI_ENABLE_SHARED_PTR_TRIVIAL_ABI</code></td><td>改善 shared_ptr 调用约定</td><td>类似 unique_ptr 的传值优化</td></tr>
+        <tr><td><code>_LIBCPP_ABI_STRING_OPTIMIZED_EXTERNAL_INSTANTIATION</code></td><td><span class="bg">改善 string 快路径内联</span></td><td>将慢路径移至 dylib，提升快路径内联率</td></tr>
+      </tbody>
+    </table>
+
+    <div class="cg mt-10">
+      <div class="ic"><div class="il">ABI 版本</div><div class="iv">v1（稳定默认） / v2（实验性）</div></div>
+      <div class="ic"><div class="il">CMake 配置</div><div class="iv"><code>LIBCXX_ABI_VERSION=1</code></div></div>
+      <div class="ic"><div class="il">加固模式</div><div class="iv"><code>LIBCXX_HARDENING_MODE=none</code>（默认）</div></div>
+    </div>
+
+    <div class="co co-a mt-10">
+      <strong>🟡 数通产品线 libc++ 建议</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li>评估启用 <code>_LIBCPP_ABI_ENABLE_UNIQUE_PTR_TRIVIAL_ABI</code> → 消除 unique_ptr 传值开销（与动态库 ABI 不兼容，仅限静态链接）</li>
+        <li>评估启用 <code>_LIBCPP_ABI_STRING_OPTIMIZED_EXTERNAL_INSTANTIATION</code></li>
+        <li>生产环境强烈建议启用 Fast hardening 模式：<code>-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST</code></li>
+        <li>CI 测试启用 Extensive hardening + ASan</li>
+      </ul>
+    </div>
+    <div style="text-align:right;margin-top:14px">
+      <a href="detail-libcxx.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">📚 查看 libc++ 详解 →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     BREAKING CHANGES SUMMARY
+     ══════════════════════════════════════════════════════ -->
+<section id="breaking" class="section">
+  <div class="section-header">
+    <span class="num">B</span>
+    <h2>Breaking Changes 速览表</h2>
+    <span class="h2-tag">全版本概括</span>
+  </div>
+  <div class="section-body">
+    <table>
+      <thead>
+        <tr><th style="width:12%">版本</th><th style="width:44%">C/C++ 语言层</th><th style="width:22%">ABI 变化</th><th style="width:22%">工具链/平台</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>LLVM 16</strong></td>
+          <td>◈ C++17 默认<br>◈ implicit-func/int → Error<br>◈ func-ptr-types → Error<br>◈ void* deref → Error(C++)<br>◈ 元素类型对齐检查</td>
+          <td>◈ packed struct POD 成员<br>◈ POD 分类匹配 GCC<br>⚠ <code>-fclang-abi-compat=15</code></td>
+          <td>◈ 旧 PM flags 移除<br>◈ ARMv2/v3 移除<br>◈ Resource dir 改 major 版本</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 17</strong></td>
+          <td>◈ asm goto 间接边拆分<br>◈ experimental 协程 traits 不再搜索<br>◈ <code>static_assert(false)</code> CWG2518</td>
+          <td>◈ trivial copyable 判定修复</td>
+          <td>◈ Opaque ptr 强制<br>◈ <code>-fcoroutines-ts</code> 移除</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 18</strong></td>
+          <td>◈ template operator== 反转修复<br>◈ PCH .gch → .pch<br>◈ <code>__has_cpp_attribute</code> 返回值修复</td>
+          <td>◈ <span class="bh">函数模板名称重整</span><br>◈ <code>__int128</code> x86-64 SystemV<br>⚠ <code>-fclang-abi-compat=17</code></td>
+          <td>◈ PCH 扩展名更改<br>◈ <code>GCC_INSTALL_PREFIX</code> 废弃</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 19</strong></td>
+          <td>◈ 模板参数自阴影诊断<br>◈ <code>-frelaxed-template-template-args</code> 默认</td>
+          <td>◈ MSVC name mangling 修复 (auto/static init)<br>◈ MSVC 调用约定修复<br>◈ AArch64 FMV alias 移除</td>
+          <td>◈ <span class="bh">SVE/SVE2 ARMv9.0 可选</span><br>◈ PAuth 完全支持<br>◈ 3DNow!/KNL 移除</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 20</strong></td>
+          <td>◈ <span class="bh">TBAA 默认启用</span><br>◈ <span class="bh">指针溢出 UB 优化</span><br>◈ <code>-fwrapv</code> 不再影响指针<br>◈ enum constexpr 不可压制</td>
+          <td>◈ Itanium 构造 vtable 修复<br>◈ 友元函数模板 mangling<br>⚠ <code>-fclang-abi-compat=19</code></td>
+          <td>◈ le32/le64 移除<br>◈ RenderScript 移除<br>◈ <code>clang-rename</code> 移除</td>
+        </tr>
+        <tr>
+          <td><strong>LLVM 21</strong></td>
+          <td>◈ <span class="bh">Lifetime DSE</span><br>◈ break/continue 严格化<br>◈ <code>__has_feature(modules)</code> 语义变更</td>
+          <td>◈ <code>_BitInt</code> 位域 ABI<br>◈ <code>__regcall</code> struct 传递<br>◈ Coroutine C calling conv</td>
+          <td>◈ <code>__is_referenceable</code> 移除<br>◈ 浮点字面量表示法变更</td>
+        </tr>
+      </tbody>
+    </table>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px;justify-content:center">
+      <a href="detail-llvm-16.html" style="display:inline-block;border:1px solid var(--border);color:var(--primary);text-decoration:none;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;background:#f1f5f9;transition:.12s">LLVM 16 详解 →</a>
+      <a href="detail-llvm-17.html" style="display:inline-block;border:1px solid var(--border);color:var(--primary);text-decoration:none;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;background:#f1f5f9;transition:.12s">LLVM 17 详解 →</a>
+      <a href="detail-llvm-18.html" style="display:inline-block;border:1px solid var(--border);color:var(--primary);text-decoration:none;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;background:#f1f5f9;transition:.12s">LLVM 18 详解 →</a>
+      <a href="detail-llvm-19.html" style="display:inline-block;border:1px solid var(--border);color:var(--primary);text-decoration:none;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;background:#f1f5f9;transition:.12s">LLVM 19 详解 →</a>
+      <a href="detail-llvm-20.html" style="display:inline-block;border:1px solid var(--border);color:var(--primary);text-decoration:none;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;background:#f1f5f9;transition:.12s">LLVM 20 详解 →</a>
+      <a href="detail-llvm-21.html" style="display:inline-block;border:1px solid var(--border);color:var(--primary);text-decoration:none;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;background:#f1f5f9;transition:.12s">LLVM 21 详解 →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     CHECKLIST
+     ══════════════════════════════════════════════════════ -->
+<section id="checklist" class="section">
+  <div class="section-header">
+    <span class="num">✓</span>
+    <h2>升级迁移检查清单</h2>
+    <span class="h2-tag">按数通设备关注点排序</span>
+  </div>
+  <div class="section-body">
+
+    <h4 style="color:var(--primary);margin-bottom:6px">🔴 P0 · 必须解决（会改变行为或导致编译失败）</h4>
+    <ul class="cl">
+      <li>确认无 strict-aliasing 违规<span class="cv">20</span></li>
+      <li>确认无指针包装语义依赖<span class="cv">20</span></li>
+      <li>确认无死对象存储依赖<span class="cv">21</span></li>
+      <li>修复所有 implicit-function-declaration<span class="cv">16</span></li>
+      <li>修复所有 implicit-int<span class="cv">16</span></li>
+      <li>修复函数指针类型不兼容<span class="cv">16</span></li>
+      <li>修复 void* 解引用（C++）<span class="cv">16/17</span></li>
+      <li>修复 enum constexpr 超范围值<span class="cv">20</span></li>
+      <li>修复多余 template header<span class="cv">20</span></li>
+      <li>检查 <code>_BitInt</code>/SVE 等新类型使用<span class="cv">21</span></li>
+      <li>检查 C++ 模块名称重整影响<span class="cv">18</span></li>
+      <li>检查 coroutine ABI 兼容性 (i686/MIPS/PPC64)<span class="cv">21</span></li>
+    </ul>
+
+    <h4 style="color:var(--primary);margin:18px 0 6px">🟡 P1 · 重要（需验证和适配）</h4>
+    <ul class="cl">
+      <li>C++17 标准适配检查（默认变更）<span class="cv">16</span></li>
+      <li>SVE 自动向量化降级检查<span class="cv">19</span></li>
+      <li>动态库/插件 ABI 兼容性测试<span class="cv">18</span></li>
+      <li>二进制体积对比（-Oz / -Os）</li>
+      <li>性能基准测试对比</li>
+      <li>内联决策差异分析（关键函数）</li>
+      <li>确认 <code>-fclang-abi-compat</code> 策略</li>
+      <li>Makefile/CMake 废弃选项清理</li>
+      <li>检查 <code>__has_feature(modules)</code> 使用<span class="cv">21</span></li>
+      <li>检查 <code>__is_referenceable</code> 使用<span class="cv">21</span></li>
+      <li>检查 PCH 扩展名变更（.gch → .pch）<span class="cv">18</span></li>
+      <li>检查 debug info 基础设施变更影响<span class="cv">19</span></li>
+    </ul>
+
+    <h4 style="color:var(--primary);margin:18px 0 6px">🟢 P2 · 建议（质量加固）</h4>
+    <ul class="cl">
+      <li>启用 libc++ Fast hardening 模式</li>
+      <li>CI 加入 <code>-fsanitize=pointer-overflow</code></li>
+      <li>CI 加入 <code>-fsanitize=undefined,address</code></li>
+      <li>AArch64 启用 <code>-mbranch-protection=standard</code></li>
+      <li>评估 <code>-fwrapv-pointer</code> 是否默认启用</li>
+      <li>评估 <code>unique_ptr trivial_abi</code> 启用</li>
+      <li>评估 LLD <code>--build-id</code> 策略变更</li>
+      <li>更新 clang-tidy 配置</li>
+      <li>更新 CMake 最低版本（3.20+）</li>
+      <li>更新 Python 最低版本（3.8+）</li>
+      <li>LLVM 16 resource dir 路径检查</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     FLAGS TEMPLATE
+     ══════════════════════════════════════════════════════ -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">⛳</span>
+    <h2>推荐编译器标志模板</h2>
+  </div>
+  <div class="section-body">
+
+    <h4 style="color:var(--primary);font-size:14px;margin-bottom:8px">过渡期兼容标志（用于逐步迁移）</h4>
+    <pre class="cb"><span class="c"># 过渡期兼容选项 — 在逐步修复代码后移除</span>
+-Wno-error=implicit-function-declaration              <span class="c"># LLVM 16 新默认 （P0 需修复）</span>
+-Wno-error=implicit-int                               <span class="c"># LLVM 16 新默认 （P0 需修复）</span>
+-Wno-error=incompatible-function-pointer-types         <span class="c"># LLVM 16 新默认 （P0 需修复）</span>
+-Wno-error=void-ptr-dereference                       <span class="c"># LLVM 16/17 C++ （P0 需修复）</span>
+-Wno-error=extraneous-template-head                   <span class="c"># LLVM 20 （P0 需修复）</span></pre>
+
+    <h4 style="color:var(--primary);font-size:14px;margin:16px 0 8px">语义兼容标志（必要）</h4>
+    <pre class="cb"><span class="c"># 语义兼容 — 根据代码审计结果决定是否使用</span>
+-fwrapv-pointer                                       <span class="c"># 使指针溢出明确定义（LLVM 20+ 推荐）</span>
+-fno-pointer-tbaa                                      <span class="c"># 禁用 TBAA（LLVM 20+ 有 strict aliasing 违规时使用）</span>
+-fno-lifetime-dse                                      <span class="c"># 禁用 Lifetime DSE（LLVM 21+ 有依赖时使用）</span>
+-fclang-abi-compat=15                                  <span class="c"># 保持旧 ABI（影响动态库兼容性）</span></pre>
+
+    <h4 style="color:var(--primary);font-size:14px;margin:16px 0 8px">安全加固标志（推荐）</h4>
+    <pre class="cb"><span class="c"># 生产环境安全加固</span>
+-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST   <span class="c"># libc++ 快检（低开销）</span>
+-fsanitize=pointer-overflow                             <span class="c"># 检测指针溢出</span>
+
+<span class="c"># AArch64 平台</span>
+-mbranch-protection=standard                            <span class="c"># BTI+PAC-RET+PAuth-LR</span></pre>
+
+    <h4 style="color:var(--primary);font-size:14px;margin:16px 0 8px">CI 测试标志</h4>
+    <pre class="cb"><span class="c"># CI / 测试构建</span>
+-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE <span class="c"># libc++ 扩展检查</span>
+-fsanitize=address,undefined                              <span class="c"># ASan + UBSan</span>
+-fsanitize=pointer-overflow                               <span class="c"># 指针溢出检测</span></pre>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     PHASED STRATEGY
+     ══════════════════════════════════════════════════════ -->
+<section class="section">
+  <div class="section-header">
+    <span class="num">★</span>
+    <h2>分阶段升级策略</h2>
+  </div>
+  <div class="section-body">
+    <div class="ps">
+      <div class="ps-item"><div class="pn">1</div><span class="pt">编译自检</span><span class="pd">新编译器构建旧代码，发现 warnings/errors</span></div>
+      <div class="ps-item"><div class="pn">2</div><span class="pt">修复 P0</span><span class="pd">TBAA、指针UB、Lifetime DSE、告警升级</span></div>
+      <div class="ps-item"><div class="pn">3</div><span class="pt">功能验证</span><span class="pd">单元 + 集成 + UB Sanitizer 测试</span></div>
+      <div class="ps-item"><div class="pn">4</div><span class="pt">性能对比</span><span class="pd">核心指标基准 + 代码体积对比</span></div>
+      <div class="ps-item"><div class="pn">5</div><span class="pt">安全加固</span><span class="pd">Hardening / PAuth / Sanitizers</span></div>
+      <div class="ps-item"><div class="pn">6</div><span class="pt">灰度生产</span><span class="pd">逐步上线 + 监控回归</span></div>
+    </div>
+
+    <div class="co co-i mt-10">
+      <strong>📌 建议</strong>
+      建议在独立分支上完成阶段 1-5 后再合入主线。
+      阶段 1（编译自检）可与阶段 2（P0 修复）并行进行。
+    </div>
+  </div>
+</section>
+
+</div><!-- /container -->
+
+<footer class="footer">
+  <p>分析日期：2026-07-10 &nbsp;·&nbsp; 基于 LLVM 15.0.4 → 21.1.8 官方 Release Notes &amp; 源代码差异分析</p>
+  <p style="margin-top:4px;font-size:12px">专为数通产品线毕昇编译器升级工程编制 · 仅供内部技术评估使用</p>
+</footer>
+
+</body>
+</html>
