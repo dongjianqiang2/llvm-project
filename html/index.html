@@ -228,6 +228,7 @@
     <span class="focus-tag"><span class="icon">🔗</span> 内联差异</span>
     <span class="focus-tag"><span class="icon">⚙️</span> 编译选项</span>
     <span class="focus-tag"><span class="icon">📚</span> C++ 标准库</span>
+    <span class="focus-tag"><span class="icon">🔧</span> 热补丁</span>
   </div>
 </div>
 
@@ -240,6 +241,7 @@
     <a href="#warnings">⚠️告警</a><span class="toc-div">｜</span>
     <a href="#ub">🚫未定义行为</a><span class="toc-div">｜</span>
     <a href="#sanitizers">🛡️Sanitizers</a><span class="toc-div">｜</span>
+    <a href="#hotpatch">🔧热补丁</a><span class="toc-div">｜</span>
     <a href="#inline">🔗内联</a><span class="toc-div">｜</span>
     <a href="#flags">⚙️编译选项</a><span class="toc-div">｜</span>
     <a href="#libcxx">📚C++标准库</a><span class="toc-div">｜</span>
@@ -566,6 +568,48 @@
       </ul>
     </div>
     <div class="detail-link-wrap"><a href="detail-sanitizers.html" class="detail-btn">🛡️ 查看 Sanitizers 详解 →</a></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     HOTPATCH
+     ══════════════════════════════════════════════════════ -->
+<section id="hotpatch" class="section">
+  <div class="section-header">
+    <span class="num">🔧</span>
+    <h2>热补丁影响</h2>
+    <span class="h2-tag">Hot Patching</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 数通产品线关注点</strong>
+      数通设备需要在现网不中断服务的情况下进行热补丁修复。编译器升级可能影响 NOP 填充、函数对齐、函数外提等行为，导致热补丁机制失效。
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px;margin:16px 0 8px">关键变化</h4>
+    <table>
+      <thead><tr><th>版本</th><th>变更</th><th>对热补丁的影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>LLVM 20</strong></td><td><code>.balign N, 0</code> 填充 0x00 而非 NOP</td><td><span class="bh">高</span> — NOP sled 可能被替换为零字节</td></tr>
+        <tr><td><strong>LLVM 21</strong></td><td><code>nooutline</code> 属性语法变更</td><td><span class="bm">中</span> — 需验证关键函数未被外提</td></tr>
+        <tr><td><strong>LLVM 21</strong></td><td><code>noipa</code> 属性新增</td><td><span class="bg">正面</span> — 阻止 IPA 破坏热补丁函数边界</td></tr>
+        <tr><td><strong>LLVM 16-21</strong></td><td>Machine Outliner 持续增强</td><td><span class="bm">中</span> — 外提函数增加热补丁复杂度</td></tr>
+        <tr><td><strong>LLVM 20</strong></td><td><code>-falign-loops=</code> 新选项</td><td><span class="bl">低</span> — 循环对齐控制</td></tr>
+        <tr><td><strong>LLVM 19+</strong></td><td>BTI landing pad 要求</td><td><span class="bm">中</span> — 热补丁入口需有效 BTI 指令</td></tr>
+      </tbody>
+    </table>
+
+    <div class="co co-a mt-10">
+      <strong>🔧 热补丁验证建议</strong>
+      <ul style="margin:6px 0 0 16px">
+        <li>检查关键函数的 <code>-fpatchable-function-entry</code> NOP 序列是否完整</li>
+        <li>验证 <code>nooutline</code> / <code>noipa</code> 属性在关键函数上的效果</li>
+        <li>确认 AArch64 热补丁入口处有有效 BTI 指令</li>
+        <li>用升级后的编译器构建，验证热补丁注入流程</li>
+      </ul>
+    </div>
+
+    <div class="detail-link-wrap"><a href="detail-hotpatch.html" class="detail-btn">🔧 查看热补丁详解 →</a></div>
   </div>
 </section>
 

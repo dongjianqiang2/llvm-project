@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>热补丁影响 — 毕昇编译器升级</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family:-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    background: #f0f2f5;
+    color: #1a1a2e;
+    line-height: 1.7;
+  }
+  header {
+    background: linear-gradient(135deg, #0a2647 0%, #0d3b6e 40%, #0a2647 100%);
+    color: #fff;
+    padding: 40px 24px 32px;
+    text-align: center;
+    border-bottom: 4px solid #d4a843;
+  }
+  header h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #d4a843;
+    margin-bottom: 8px;
+  }
+  header .subtitle {
+    font-size: 1rem;
+    color: rgba(255,255,255,0.75);
+    font-weight: 400;
+  }
+  .top-nav {
+    padding: 12px 24px;
+    background: #081d36;
+  }
+  .top-nav a {
+    color: #d4a843;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .top-nav a:hover { color: #e8c265; text-decoration: underline; }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+  }
+  section {
+    background: #fff;
+    border-radius: 10px;
+    padding: 28px 32px;
+    margin-bottom: 28px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    border-left: 5px solid #0a2647;
+  }
+  section h2 {
+    color: #0a2647;
+    font-size: 1.35rem;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #d4a843;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  section h2 .badge {
+    display: inline-block;
+    background: #d4a843;
+    color: #0a2647;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 12px;
+    white-space: nowrap;
+  }
+  section h3 {
+    color: #0a2647;
+    font-size: 1.1rem;
+    margin: 18px 0 8px;
+  }
+  section p {
+    margin-bottom: 10px;
+    color: #333;
+  }
+  section ul, section ol {
+    margin: 8px 0 14px 20px;
+  }
+  section li {
+    margin-bottom: 6px;
+    color: #333;
+  }
+  .example-box {
+    background: #f5f0e6;
+    border: 1px solid #d4a843;
+    border-radius: 8px;
+    margin: 14px 0;
+    overflow: hidden;
+  }
+  .example-box .label {
+    background: #d4a843;
+    color: #0a2647;
+    font-size: 0.8rem;
+    font-weight: 700;
+    padding: 5px 14px;
+    display: inline-block;
+    border-radius: 0 0 8px 0;
+  }
+  .example-box pre {
+    padding: 14px 18px;
+    margin: 0;
+    overflow-x: auto;
+    font-family: "Fira Code", "Cascadia Code", "JetBrains Mono", "SF Mono", Consolas, monospace;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    color: #1a1a2e;
+  }
+  .example-box code {
+    font-family: inherit;
+  }
+  .warning-box {
+    background: #fff8e6;
+    border: 1px solid #d4a843;
+    border-left: 5px solid #d4a843;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .warning-box strong {
+    color: #0a2647;
+  }
+  .risk-box {
+    background: #fff0f0;
+    border: 1px solid #c0392b;
+    border-left: 5px solid #c0392b;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .risk-box strong {
+    color: #a71d2a;
+  }
+  .tip-box {
+    background: #eaf4f0;
+    border: 1px solid #2e7d55;
+    border-left: 5px solid #2e7d55;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .tip-box strong {
+    color: #1e5f3e;
+  }
+  code.inline {
+    background: #edf2f7;
+    color: #0a2647;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "Fira Code", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    font-size: 0.88em;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 0.95rem;
+  }
+  table th {
+    background: #0a2647;
+    color: #d4a843;
+    padding: 10px 14px;
+    text-align: left;
+    font-weight: 700;
+  }
+  table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid #e0ddd5;
+  }
+  table tr:nth-child(even) td {
+    background: #fafaf7;
+  }
+  footer {
+    text-align: center;
+    padding: 24px;
+    color: #888;
+    font-size: 0.85rem;
+    background: #081d36;
+  }
+  footer p { color: rgba(255,255,255,0.5); }
+  @media (max-width: 640px) {
+    header h1 { font-size: 1.5rem; }
+    section { padding: 18px 16px; }
+    main { padding: 20px 12px 40px; }
+  }
+  .back-link {
+    display: inline-block; color: #d4a843; text-decoration: none;
+    border: 1px solid rgba(212,168,67,0.4); padding: 6px 18px;
+    border-radius: 6px; font-size: 14px; margin-top: 0; margin-bottom: 8px;
+    transition: background 0.15s;
+  }
+  .back-link:hover { background: rgba(212,168,67,0.12); }
+
+</style>
+</head>
+<body>
+
+<header>
+  <h1>热补丁影响</h1>
+  <div class="subtitle">毕昇编译器升级 &mdash; LLVM 15 到 21 的热补丁兼容性分析</div>
+</header>
+
+<div class="top-nav">
+  <a href="index.html" class="back-link">&larr; 返回主页</a>
+</div>
+
+<main>
+
+<!-- ================================================================== -->
+<section>
+  <h2>概述</h2>
+
+  <p>
+    对于电信 / 数据通信产品，<strong>现场热补丁（Field Hot Patching）</strong>是关键的运维能力——在不重启系统的情况下修复漏洞或更新功能。编译器升级（LLVM 15 到 21）涉及多项与热补丁机制相关的底层变更，包括函数入口 NOP 序列、outlining 行为、代码对齐填充、BTI 着陆垫等。如果未评估这些变更，可能导致线上热补丁注入失败或产生未定义行为。
+  </p>
+
+  <p>
+    以下章节逐项分析各关键变更点、对热补丁机制的影响，以及推荐的验证与迁移策略。
+  </p>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">跨版本</span> -fpatchable-function-entry 行为变化</h2>
+
+  <p>
+    <code class="inline">-fpatchable-function-entry=N</code> 选项指示编译器在函数入口处插入 N 条 NOP 指令，为运行时热补丁工具（如 Linux ftrace）预留跳转空间。LLVM 15 到 21 之间，NOP 条数的计算、与内联/outline 标志的交互、以及补丁记录段的生成方式都发生了变化。
+  </p>
+
+  <h3>各版本关键变更</h3>
+  <ul>
+    <li><strong>LLVM 16：</strong> 修复了 <code class="inline">__builtin_assume_aligned</code> 与 patchable function 交互时的崩溃问题。</li>
+    <li><strong>LLVM 17/18：</strong> 修复多个架构（LoongArch、PowerPC）的支持，并在 X86 上修复了 patchable-function pass 的崩溃。</li>
+    <li><strong>LLVM 19：</strong> 新增 <code class="inline">hybrid_patchable</code> 属性，支持 ARM64EC 混合二进制场景。</li>
+    <li><strong>LLVM 20：</strong> PatchableFunction pass 移植到 New Pass Manager（NPM），执行时机可能变化。</li>
+    <li><strong>LLVM 21：</strong> 新增 <code class="inline">-fpatchable-function-entry=N,M,S</code> 的第三个参数：允许指定补丁记录段名称（如将 <code class="inline">__patchable_function_entries</code> 放入自定义段）。</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">-fpatchable-function-entry 用法</span>
+<pre><code>// 两个 NOP 在函数入口，补丁记录偏移 0
+// clang -fpatchable-function-entry=2,0
+
+// 带自定义段名（LLVM 21 新增）
+// clang -fpatchable-function-entry=2,0,.my_patch_entries
+
+// __attribute__ 精确控制
+__attribute__((patchable_function_entry(5, 3)))
+void critical_handler(void) {
+    // 入口：5 条 NOP，实际可 patch 的代码起始于偏移 3
+    handle_event();
+}</code></pre>
+  </div>
+
+  <div class="warning-box">
+    <strong>升级影响：</strong> NOP 序列的长度和位置可能随编译器版本变化。如果热补丁工具依赖固定的 NOP 长度（如 hard-coded 5 字节），升级后 NOP 序列可能变短或变长，导致补丁代码覆盖超出预期范围。升级后务必重新验证目标函数入口处的 NOP 序列。
+  </div>
+
+  <h3>NOP 计数交互</h3>
+  <p>
+    <code class="inline">-fpatchable-function-entry</code> 与以下编译器特性存在交互：
+  </p>
+  <ul>
+    <li><strong>内联：</strong> 被内联的函数不再有独立入口，其 NOP 序列消失。若热补丁期望在某函数上 hook，需确保该函数不被内联（使用 <code class="inline">__attribute__((noinline))</code>）。</li>
+    <li><strong>Outlining：</strong> Machine Outliner 可能将函数体的一部分提取为独立函数，被提取部分的 NOP 序列行为不确定。</li>
+    <li><strong>KCFI / 控制流完整性：</strong> LLVM 21 允许将补丁记录放入自定义段，以解决 <code class="inline">-fsanitize=kcfi</code> 与 <code class="inline">-fpatchable-function-entry</code> 的兼容性问题——KCFI 在函数入口插入类型哈希前缀，需与 NOP 序列共存。</li>
+  </ul>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 21</span> nooutline 属性语法变更</h2>
+
+  <p>
+    <code class="inline">nooutline</code> 属性最初在 LLVM 15 后期（D140438）作为字符串属性引入，用于阻止 Machine Outliner 和 IR Outliner 从该函数中提取代码。在 LLVM 21 中（commit <code class="inline">0d08cb0e7037</code>），<code class="inline">nooutline</code> 从字符串属性转换为<strong>枚举属性</strong>（Enum Attribute），带来了 IR 序列化格式的变化。
+  </p>
+
+  <h3>行为对比</h3>
+  <table>
+    <thead>
+      <tr><th>版本</th><th>IR 表示</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LLVM 15 ~ 20</td>
+        <td><code class="inline">"nooutline"</code> (字符串属性)</td>
+        <td>通过 <code class="inline">Attribute::get(Context, "nooutline")</code> 查询</td>
+      </tr>
+      <tr>
+        <td>LLVM 21</td>
+        <td><code class="inline">nooutline</code> (枚举属性)</td>
+        <td>通过 <code class="inline">Attribute::NoOutline</code> 查询，bitcode 自动升级</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="example-box">
+    <span class="label">C 源码中使用 nooutline</span>
+<pre><code>// 关键函数：不允许被 outliner 提取
+__attribute__((nooutline))
+void critical_timer_callback(void) {
+    // 此函数体不会被 Machine Outliner 拆分
+    update_watchdog();
+    process_timed_events();
+}
+
+// 组合用法：禁止内联 + 禁止 outlining
+__attribute__((noinline, nooutline))
+void hot_patchable_handler(int event) {
+    // 保留独立入口用于热补丁，同时防止被拆分
+    dispatch_event(event);
+}</code></pre>
+  </div>
+
+  <div class="example-box">
+    <span class="label">LLVM IR 变化（16 -> 21）</span>
+<pre><code>; LLVM 15-20 IR（字符串属性）
+define void @critical_func() #0 {
+  ret void
+}
+attributes #0 = { "nooutline" ... }
+
+; LLVM 21 IR（枚举属性）
+define void @critical_func() #0 {
+  ret void
+}
+attributes #0 = { nooutline ... }
+
+; bitcode reader 自动将旧格式升级为新格式</code></pre>
+  </div>
+
+  <div class="tip-box">
+    <strong>兼容性说明：</strong> LLVM 21 的 bitcode reader 包含自动升级逻辑，旧格式的 <code class="inline">"nooutline"</code> 字符串属性会被自动转换为 <code class="inline">nooutline</code> 枚举属性。但如果代码中有 <strong>hard-coded 字符串匹配</strong>（如自定义 pass 检查属性名），需要更新为使用 <code class="inline">Attribute::NoOutline</code>。
+  </div>
+
+  <div class="warning-box">
+    <strong>升级影响：</strong> 如果升级后不显式使用 <code class="inline">nooutline</code>，Machine Outliner 可能在 <code class="inline">-Oz</code> 或特定目标上默认将关键函数的部分代码提取出去。被 outlining 的函数体被拆分后，热补丁替换的函数入口代码可能无法覆盖被提取到外部的部分逻辑，导致补丁不完整。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 20</span> .balign / NOP 填充变化</h2>
+
+  <p>
+    在 LLVM 15 ~ 19 中，<code class="inline">.balign N, 0</code> 在非 x86 目标的 <code class="inline">.text</code> 段中实际上未按填充值 0 来填充——汇编器将其视为"使用 NOP 指令对齐"（因为大多数非 x86 目标的 <code class="inline">TextAlignFillValue</code> 默认值为 0，汇编器在 code section 中不会使用字节 0x00 填充）。LLVM 20（commit <code class="inline">ea222be0d926</code>）修复了此行为，使得 <code class="inline">.balign N, 0</code> 真正使用 <code class="inline">0x00</code> 字节填充。
+  </p>
+
+  <h3>影响范围</h3>
+  <ul>
+    <li><strong>AArch64：</strong> NOP 指令为 <code class="inline">0xd503201f</code>（4 字节）。若对齐填充使用 0x00，CPU 可能将其解码为 <code class="inline">0x00000000</code>（UDEF 或非法指令），导致热补丁跳转后 crash。</li>
+    <li><strong>ARM：</strong> NOP 为 <code class="inline">0xe320f000</code> 或 <code class="inline">0x46c0</code>（Thumb）。0x00 填充同样可能是非法指令。</li>
+    <li><strong>RISC-V：</strong> NOP 为 <code class="inline">0x00000013</code>（addi x0, x0, 0），而非全零字节。</li>
+    <li><strong>LoongArch：</strong> NOP 为 <code class="inline">0x03400000</code>，全零字节为非法指令。</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">汇编指令对齐差异</span>
+<pre><code>/* 内联汇编中常见的对齐写法（危险！） */
+__asm__ volatile(
+    ".balign 16, 0\n"     // LLVM 15-19: 使用 NOP 填充（正确）
+                          // LLVM 20+:   使用 0x00 填充（可能非法指令！）
+    "my_label: \n"
+    "str x0, [x1]\n"
+);
+
+/* 正确写法 */
+__asm__ volatile(
+    ".balign 16\n"        // 不指定 fill value，汇编器使用目标 NOP
+    "my_label: \n"
+    "str x0, [x1]\n"
+);</code></pre>
+  </div>
+
+  <div class="risk-box">
+    <strong>高风险：</strong> 如果产品代码的内联汇编或链接脚本中使用了 <code class="inline">.balign N, 0</code> 来对齐代码段，升级到 LLVM 20 后，生成的对齐填充将从 NOP 指令变为 0x00 字节。在 AArch64 上，CPU 遇到全零指令时将触发非法指令异常。请务必在升级前扫描所有汇编文件。
+  </div>
+
+  <div class="tip-box">
+    <strong>排查方法：</strong> 使用 <code class="inline">objdump -d</code> 反汇编二进制，搜索连续的 <code class="inline">0x00000000</code> 出现在 <code class="inline">.text</code> 段中。也可用 <code class="inline">grep -rn "\.balign.*, *0"</code> 扫描汇编源码。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">跨版本</span> Machine Outliner 对热补丁的影响</h2>
+
+  <p>
+    Machine Outliner 在 <code class="inline">-Oz</code> 优化级别默认启用（部分目标在 <code class="inline">-Os</code> 也启用），它将多个函数中重复的指令序列提取为独立的"outlined function"。LLVM 15 到 21 之间，Machine Outliner 持续演进，可能提取更多的指令序列。
+  </p>
+
+  <h3>版本演进</h3>
+  <ul>
+    <li><strong>LLVM 16：</strong> 加入了 <code class="inline">nooutline</code> 属性的完整支持（D140438），允许函数级别禁用 outlining。</li>
+    <li><strong>LLVM 17~19：</strong> 持续改进指令序列匹配算法，保留了 instruction bundles、修复了 outlined candidates 中 LOH（Linker Optimization Hints）的处理。</li>
+    <li><strong>LLVM 20：</strong> 引入 <strong>Global Outlining</strong>（commit <code class="inline">0f5254528967</code>），利用跨模块的 codegen data 识别跨 TU 的可 outlining 序列，outlining 范围从单个模块扩展到全程序。</li>
+    <li><strong>LLVM 21：</strong> 修复 outlined candidates 中 LOH 的遗留问题，同时 <code class="inline">nooutline</code> 转为枚举属性。</li>
+  </ul>
+
+  <h3>对热补丁的影响</h3>
+  <p>
+    当 Machine Outliner 从函数 A 中提取指令序列并创建 outlined function <code class="inline">OUTLINED_FUNCTION_x</code> 后：
+  </p>
+  <ol>
+    <li>函数 A 的函数体中对原指令序列的引用被替换为对 <code class="inline">OUTLINED_FUNCTION_x</code> 的调用</li>
+    <li>热补丁替换函数 A 的入口代码时，只能覆盖留在函数 A 中的逻辑，无法覆盖被提取到 <code class="inline">OUTLINED_FUNCTION_x</code> 中的部分</li>
+    <li>如果补丁需要同时修改被提取的代码路径，需要额外对 outlined function 进行补丁——但 outlined function 可能被多个函数共享</li>
+  </ol>
+
+  <div class="example-box">
+    <span class="label">Machine Outliner 影响示意</span>
+<pre><code>// 原始代码（hot_patchable 函数）
+void hot_patchable_func(void) {
+    init_device();        // 公共序列 A
+    configure_io();       // 公共序列 A
+    // ... 函数特定逻辑 ...
+    cleanup_device();     // 公共序列 B
+    disable_irq();        // 公共序列 B
+}
+
+// Machine Outliner 后:
+// OUTLINED_FUNCTION_0:
+//   init_device(); configure_io(); ret
+//
+// OUTLINED_FUNCTION_1:
+//   cleanup_device(); disable_irq(); ret
+//
+// hot_patchable_func:
+//   bl OUTLINED_FUNCTION_0
+//   ... 函数特定逻辑 ...
+//   bl OUTLINED_FUNCTION_1
+//
+// 如果热补丁替换 init_device 的行为，
+// 需要同时 patch hot_patchable_func 和 OUTLINED_FUNCTION_0</code></pre>
+  </div>
+
+  <h3>缓解策略</h3>
+  <div class="example-box">
+    <span class="label">禁用 Outlining</span>
+<pre><code>// 方案1: 函数级别禁用（推荐用于关键热补丁函数）
+__attribute__((nooutline))
+void hot_patchable_func(void) {
+    // ...
+}
+
+// 方案2: 编译单元级别禁用
+// clang -mno-outline ...
+
+// 方案3: 链接时禁用（如果使用 LTO）
+// clang -mllvm -enable-machine-outliner=never ...
+
+// 方案4: Makefile / CMake 配置
+// CFLAGS += -mno-outline  # 仅用于需要热补丁的编译单元</code></pre>
+  </div>
+
+  <div class="warning-box">
+    <strong>Global Outlining 特别注意：</strong> LLVM 20 引入的 Global Outlining 可能跨模块提取代码。即使在单个编译单元禁用了 outlining，链接时的全局 outlining pass 仍可能提取代码。确保在启用 <code class="inline">-mno-outline</code> 的同时，不在链接阶段使用 <code class="inline">-codegen-data-generate</code> 或 <code class="inline">-codegen-data-use</code>（这些选项触发跨模块 outlining）。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 21</span> noipa 属性（新增）</h2>
+
+  <p>
+    LLVM 21 引入了 <code class="inline">noipa</code> 函数属性（commit <code class="inline">c07bc2962c5f</code>），禁用所有检查函数定义的<strong>过程间分析（Interprocedural Analysis, IPA）</strong>。设置此属性等价于将该函数定义移动到一个独立的、优化器不透明的模块中。
+  </p>
+
+  <h3>noipa 与 noinline / nooutline 的关系</h3>
+  <table>
+    <thead>
+      <tr><th>属性</th><th>阻止内联</th><th>阻止 Outlining</th><th>阻止 IPA</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code class="inline">noinline</code></td><td>是</td><td>否</td><td>否</td></tr>
+      <tr><td><code class="inline">nooutline</code></td><td>否</td><td>是</td><td>否</td></tr>
+      <tr><td><code class="inline">noipa</code></td><td><strong>否</strong></td><td><strong>否</strong></td><td>是</td></tr>
+      <tr><td><code class="inline">noipa + noinline + nooutline</code></td><td>是</td><td>是</td><td>是</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code class="inline">noipa</code> 的关键特点：<strong>它不阻止内联和 outlining</strong>。如果希望函数入口保持完整且不受 IPA 干扰，需要同时组合使用三个属性。
+  </p>
+
+  <div class="example-box">
+    <span class="label">noipa 使用示例</span>
+<pre><code>// LLVM 21 新增: 阻止 IPA 优化破坏函数边界
+__attribute__((noipa))
+int compute_checksum(const uint8_t *buf, size_t len) {
+    // 优化器不会跨此函数边界进行过程间分析
+    // IP-CP, IP-SCCP, 死参数消除等不会影响此函数
+    int sum = 0;
+    for (size_t i = 0; i < len; i++)
+        sum += buf[i];
+    return sum;
+}
+
+// 完整的热补丁安全组合（LLVM 21 推荐）
+__attribute__((noipa, noinline, nooutline))
+__attribute__((patchable_function_entry(5, 3)))
+void hot_patchable_handler(int event_id, void *data) {
+    switch (event_id) {
+    case EVENT_INIT:
+        init_subsystem(data);
+        break;
+    case EVENT_SHUTDOWN:
+        shutdown_subsystem();
+        break;
+    }
+    // 这三个属性共同保证:
+    // - noinline:   保留独立入口，不被内联到调用者
+    // - nooutline:  函数体不会被 Machine Outliner 拆分
+    // - noipa:      过程间分析不会修改函数签名或边界行为
+    // + patchable_function_entry: 入口处有足够的 NOP 空间
+}</code></pre>
+  </div>
+
+  <div class="tip-box">
+    <strong>使用建议：</strong> <code class="inline">noipa</code> 主要用于防止过程间分析破坏热补丁函数的外部可观测行为——例如 IP-CP（Interprocedural Constant Propagation）将常量传播跨函数边界，死参数消除移除补丁代码依赖的参数等。对于需要保持 ABI 稳定、可被外部热补丁替换的函数，推荐使用 <code class="inline">__attribute__((noipa, noinline, nooutline))</code> 组合。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 19+</span> BTI（Branch Target Identification）对热补丁跳转的影响</h2>
+
+  <p>
+    <strong>BTI（Branch Target Identification）</strong>是 ARMv8.5-A 引入的安全特性，要求间接跳转的目标地址必须是一条合法的 BTI 着陆指令（<code class="inline">bti c</code>、<code class="inline">bti j</code> 等）。如果热补丁跳转到未标记 BTI 的地址，CPU 将在启用了 BTI 的系统上触发 Branch Target Exception。
+  </p>
+
+  <h3>版本变更</h3>
+  <ul>
+    <li><strong>LLVM 19：</strong> 大幅改进 BTI 生成策略——无地址被取（non-addr-taken）的静态函数不再生成 BTI 着陆垫（ELF 目标），减少了不需要间接调用的函数的代码膨胀。但如果热补丁工具通过 <strong>地址</strong>（而非符号名）跳转到这些函数，将缺少 BTI 指令。</li>
+    <li><strong>LLVM 20：</strong> 进一步优化，增加更多场景下的 BTI 省略。</li>
+    <li><strong>LLVM 21：</strong> 为异常处理入口添加 BTI 指令；同时修改了 <code class="inline">asm goto</code> 的行为——<strong>不再在 asm goto 的 label 目标处自动生成 BTI 指令</strong>（commit <code class="inline">56acb06bc6a1</code>）。如果热补丁通过 asm goto 机制将控制流转移到 label，且 label 处需要 BTI，需要手动插入。</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">BTI 对热补丁的影响示意</span>
+<pre><code>// AArch64, -mbranch-protection=bti
+
+// LLVM 15-18: 所有外部可见函数自动生成 BTI
+__attribute__((patchable_function_entry(4, 2)))
+void critical_func(void) {
+    // 反汇编 (LLVM 18):
+    // critical_func:
+    //   nop              ; patchable NOP
+    //   nop              ; patchable NOP
+    //   bti c            ; BTI landing pad
+    //   stp x29, x30, [sp, #-16]!
+    //   ...
+}
+
+// LLVM 19-21: 若函数地址未被显式取用，可能不生成 BTI
+// 热补丁跳转到此函数入口时：
+// - 如果 BTI 被省略 & 系统启用了 BTI → Branch Target Exception
+// - 如果 BTI 存在 → 正常执行
+
+// LLVM 21: asm goto 不再自动生成 BTI
+__asm__ goto(
+    "cmp %0, #0\n"
+    "b.eq %l[done]\n"
+    : : "r"(val) : : done);
+done:
+    // LLVM 15-20: 此 label 处自动生成 bti j
+    // LLVM 21:    不再自动生成，需手动添加
+    return;</code></pre>
+  </div>
+
+  <div class="risk-box">
+    <strong>风险场景：</strong> 对于在 AArch64 上使用 <code class="inline">-mbranch-protection=bti</code> 编译的产品，如果热补丁机制需要在运行时跳转到函数入口，需要确认目标函数仍然生成了 BTI 着陆指令。LLVM 19 后省略 BTI 的函数是补丁安全的<strong>前提是</strong>：运行时跳转不经过间接调用路径（而是通过符号解析+绝对跳转），并且 CPU 处于允许非 BTI 目标的上下文。
+  </div>
+
+  <div class="tip-box">
+    <strong>验证方法：</strong> 使用 <code class="inline">readelf -n &lt;binary&gt;</code> 检查 GNU Property 中的 <code class="inline">GNU_PROPERTY_AARCH64_FEATURE_1_BTI</code>；使用 <code class="inline">objdump -d</code> 检查目标函数的入口指令是否为 <code class="inline">bti c</code> 或 <code class="inline">bti j</code>。如需确保生成 BTI，可使用 <code class="inline">__attribute__((used))</code> 使函数地址被保留，从而触发 BTI 生成。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">LLVM 21</span> Windows Secure Hot-Patching</h2>
+
+  <p>
+    虽然 Windows 热补丁场景与电信 / 数据通信产品的 Linux 环境通常不同，但 LLVM 21 新增的 Windows Secure Hot-Patching 支持（commit <code class="inline">0a3c5c42a178</code>）引入了一些通用的热补丁机制概念，值得了解：
+  </p>
+
+  <ul>
+    <li><strong>Patchable globals indirection：</strong> 被标记为 hot-patchable 的函数通过 <code class="inline">_ref_*</code> 全局变量间接访问全局变量，确保热补丁代码访问的是原始镜像中的变量，而非补丁镜像中的版本。</li>
+    <li><strong>CodeView <code class="inline">S_HOTPATCHFUNC</code> 符号：</strong> 在调试信息中标记已热补丁的函数，供调试器和分析工具使用。</li>
+    <li><strong>标记方式：</strong> <code class="inline">-fms-hotpatch-functions-list=func1,func2</code> 或 <code class="inline">-fms-hotpatch-functions-file=&lt;path&gt;</code>（Clang 层面）；<code class="inline">-mllvm --ms-hotpatch-functions-list=func1</code>（LLVM 层面）。</li>
+  </ul>
+
+  <div class="warning-box">
+    <strong>注意：</strong> Windows Secure Hot-Patching 是 LLVM 21 的新增功能，目前主要针对 Windows/COFF 目标，与 Linux/ELF 上的 <code class="inline">-fpatchable-function-entry</code> 机制是独立的两种热补丁方案。Linux 产品不需要迁移到此方案，但了解其存在有助于评估未来可能出现的跨平台热补丁标准化。
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2><span class="badge">综合</span> 影响矩阵与版本对照</h2>
+
+  <table>
+    <thead>
+      <tr><th>变更项</th><th>引入版本</th><th>风险等级</th><th>影响对象</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>-fpatchable-function-entry NOP 行为变化</td>
+        <td>跨版本累积</td>
+        <td>中</td>
+        <td>所有使用此 flag 的编译单元</td>
+      </tr>
+      <tr>
+        <td>自定义补丁记录段名（第三个参数）</td>
+        <td>LLVM 21</td>
+        <td>低</td>
+        <td>需要自定义段的场景</td>
+      </tr>
+      <tr>
+        <td>nooutline 字符串→枚举属性</td>
+        <td>LLVM 21</td>
+        <td>低</td>
+        <td>自定义 IR pass / 属性检查代码</td>
+      </tr>
+      <tr>
+        <td>.balign N, 0 填充变为 0x00</td>
+        <td>LLVM 20</td>
+        <td><strong>高</strong></td>
+        <td>AArch64/ARM/RISC-V/LoongArch 的内联汇编</td>
+      </tr>
+      <tr>
+        <td>Global Outlining（跨模块）</td>
+        <td>LLVM 20</td>
+        <td>中</td>
+        <td>启用 codegen data 的 LTO 构建</td>
+      </tr>
+      <tr>
+        <td>noipa 属性新增</td>
+        <td>LLVM 21</td>
+        <td>低（新工具）</td>
+        <td>需要阻止 IPA 的热补丁函数</td>
+      </tr>
+      <tr>
+        <td>BTI 在非地址取用函数上省略</td>
+        <td>LLVM 19</td>
+        <td><strong>高</strong></td>
+        <td>AArch64 + -mbranch-protection=bti</td>
+      </tr>
+      <tr>
+        <td>asm goto 不再生成 BTI</td>
+        <td>LLVM 21</td>
+        <td>中</td>
+        <td>使用 asm goto 实现跳转的热补丁</td>
+      </tr>
+      <tr>
+        <td>Windows Secure Hot-Patching</td>
+        <td>LLVM 21</td>
+        <td>N/A (Windows)</td>
+        <td>仅 Windows 目标</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ================================================================== -->
+<section>
+  <h2>验证建议</h2>
+
+  <h3>1. 检查函数入口 NOP 序列</h3>
+  <p>
+    升级编译器后，对于所有标记为 <code class="inline">patchable_function_entry</code> 的函数，使用 <code class="inline">objdump -d</code> 反汇编并验证：
+  </p>
+  <ul>
+    <li>入口处 NOP 数量是否与预期一致（与 <code class="inline">-fpatchable-function-entry=N,M</code> 参数匹配）</li>
+    <li>NOP 指令是否正确（AArch64: <code class="inline">nop</code> / <code class="inline">0xd503201f</code>；x86-64: <code class="inline">nop</code> / <code class="inline">0x90</code>）</li>
+    <li>NOP 之后的第一条实际指令偏移量是否符合 <code class="inline">M</code> 参数</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">NOP 序列验证脚本</span>
+<pre><code>#!/bin/bash
+# 验证所有 patchable 函数的 NOP 序列
+OBJDUMP=llvm-objdump-21
+FUNC=$1
+
+$OBJDUMP -d binary.o | awk -v func="$FUNC" '
+  /^[0-9a-f]+ <.*>:/ { current = $2; gsub(/[<>:]/, "", current) }
+  current == func && /nop/ { count++; print }
+  current == func && !/nop/ && count > 0 {
+    print "Total NOPs at entry: " count
+    if (count != expected) print "WARNING: NOP count mismatch!"
+    count = 0; exit
+  }'</code></pre>
+  </div>
+
+  <h3>2. 验证 nooutline 属性被遵守</h3>
+  <p>
+    对标记了 <code class="inline">nooutline</code> 的关键函数，确认 Machine Outliner 不会提取其代码。可以通过以下方式验证：
+  </p>
+  <ul>
+    <li>使用 <code class="inline">-Rpass=MachineOutliner</code> 检查优化记录，确认 critical 函数未出现在 outlining 决策中</li>
+    <li>使用 <code class="inline">llvm-objdump -d</code> 反汇编，确认函数体不含对 <code class="inline">OUTLINED_FUNCTION_*</code> 的调用</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">Outlining 检测命令</span>
+<pre><code># 编译时检查 outlining 备注
+clang -Oz -Rpass=MachineOutliner \
+      -Rpass-analysis=MachineOutliner \
+      critical.c -c -o critical.o 2>&1 | grep -i outline
+
+# 反汇编检查 outlined calls
+llvm-objdump-21 -d binary | grep 'OUTLINED_FUNCTION_'</code></pre>
+  </div>
+
+  <h3>3. 测试热补丁注入</h3>
+  <p>
+    在编译器升级后的二进制上实际执行一次完整的热补丁注入流程：
+  </p>
+  <ol>
+    <li>使用升级后的编译器重新构建目标二进制</li>
+    <li>在测试环境中使用热补丁工具注入一个测试补丁（例如替换一个函数的前几条指令）</li>
+    <li>验证补丁生效且不引发非法指令异常、Branch Target Exception 或段错误</li>
+    <li>特别关注 AArch64 目标，测试 BTI 启用和未启用两种场景</li>
+  </ol>
+
+  <h3>4. 统一使用 -fpatchable-function-entry</h3>
+  <p>
+    推荐在构建系统中统一使用 <code class="inline">-fpatchable-function-entry</code> 标志，避免依赖内联汇编中的 <code class="inline">.balign N, 0</code> NOP sled 或其他手工编写的入口 padding。标准的 <code class="inline">-fpatchable-function-entry</code> 会正确处理 NOP 生成、补丁记录段和 BTI 交互。
+  </p>
+
+  <div class="example-box">
+    <span class="label">推荐的 CMake 配置</span>
+<pre><code># 全局热补丁标志（所有需要热补丁的编译单元）
+set(HOTPATCH_FLAGS "-fpatchable-function-entry=4,2")
+
+# 对于关键的热补丁目标函数，额外属性
+# __attribute__((noipa, noinline, nooutline, patchable_function_entry(4, 2)))
+
+# AArch64 + BTI + 热补丁
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(HOTPATCH_FLAGS "${HOTPATCH_FLAGS} -mbranch-protection=bti")
+endif()
+
+# 禁用 Machine Outlining 以避免拆分热补丁函数
+set(HOTPATCH_FLAGS "${HOTPATCH_FLAGS} -mno-outline")
+
+target_compile_options(my_hotpatch_lib PRIVATE ${HOTPATCH_FLAGS})</code></pre>
+  </div>
+
+  <h3>5. 检查 .balign 用法</h3>
+  <p>
+    在升级到 LLVM 20+ 之前，扫描所有汇编源文件（<code class="inline">*.s</code>、<code class="inline">*.S</code>）、内联汇编（在 C/C++ 中）以及链接脚本（<code class="inline">*.ld</code>、<code class="inline">*.lds</code>）中的 <code class="inline">.balign</code> / <code class="inline">.p2align</code> 指令：
+  </p>
+  <ul>
+    <li>将代码段中的 <code class="inline">.balign N, 0</code> 改为 <code class="inline">.balign N</code>（去掉显式的 0 填充值）</li>
+    <li>数据段中的 <code class="inline">.balign N, 0</code> 保持不变（数据段本就应该用 0x00 填充）</li>
+  </ul>
+
+  <div class="example-box">
+    <span class="label">.balign 扫描脚本</span>
+<pre><code>#!/bin/bash
+# 扫描所有源文件中的 .balign 用法
+echo "=== 汇编文件 ==="
+grep -rn '\.balign.*,[[:space:]]*0' --include='*.s' --include='*.S' .
+
+echo "=== C/C++ 内联汇编 ==="
+grep -rn '\.balign.*,[[:space:]]*0' --include='*.c' --include='*.cpp' --include='*.h' .
+
+echo "=== 链接脚本 ==="
+grep -rn '\.balign.*,[[:space:]]*0' --include='*.ld' --include='*.lds' --include='*.x' .</code></pre>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <p>毕昇编译器升级 &mdash; 热补丁影响分析 &mdash; LLVM 15 ~ 21</p>
+</footer>
+
+</body>
+</html>
