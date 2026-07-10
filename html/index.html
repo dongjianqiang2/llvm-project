@@ -329,9 +329,7 @@
       编译器升级可带来免费的性能提升，但也需警惕性能倒退。关注执行速度、吞吐量和 i-cache 效率。
     </div>
 
-    <div style="text-align:right;margin-bottom:8px">
-      <a href="detail-perf.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">⚡ 查看性能详解 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-perf.html" class="detail-btn">⚡ 查看性能详解 →</a></div>
 
     <div class="co co-a mt-10">
       <strong>⚡ 关键性能优化改进</strong>
@@ -381,9 +379,7 @@
       嵌入式设备对代码体积敏感。<code>-Oz</code> / <code>-Os</code> 构建路径的优化演进可能带来免费的体积缩减，也可能引入意外的膨胀。
     </div>
 
-    <div style="text-align:right;margin-bottom:8px">
-      <a href="detail-size.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">📏 查看小型化详解 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-size.html" class="detail-btn">📏 查看小型化详解 →</a></div>
 
     <h4 style="color:var(--primary);font-size:15px">📈 代码体积优化进展</h4>
     <table>
@@ -464,9 +460,7 @@
       C 代码（驱动/协议栈/底层库）中<code>-Wimplicit-function-declaration</code> 和 <code>-Wimplicit-int</code> 升级为 error 影响最广。
       建议在迁移初期使用降级选项，逐步修复后移除。
     </div>
-    <div style="text-align:right;margin-top:14px">
-      <a href="detail-warnings.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看全部告警详解 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-warnings.html" class="detail-btn">📖 查看全部告警详解 →</a></div>
   </div>
 </section>
 
@@ -522,9 +516,7 @@
         <li><strong>生产构建</strong>：评估是否启用 <code>-fwrapv-pointer</code> 使指针溢出有明确定义</li>
       </ol>
     </div>
-    <div style="text-align:right;margin-top:14px">
-      <a href="detail-ub.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看全部 UB 详解 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-ub.html" class="detail-btn">📖 查看全部 UB 详解 →</a></div>
   </div>
 </section>
 
@@ -573,9 +565,7 @@
         <li><strong>生产环境</strong>：不启用 Sanitizer（有运行时开销），改用 libc++ Fast hardening + PAuth 等低开销方案</li>
       </ul>
     </div>
-    <div style="text-align:right;margin-top:14px">
-      <a href="detail-sanitizers.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">🛡️ 查看 Sanitizers 详解 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-sanitizers.html" class="detail-btn">🛡️ 查看 Sanitizers 详解 →</a></div>
   </div>
 </section>
 
@@ -623,9 +613,7 @@
         <li>LTO 场景下内联策略变化更大，需单独验证</li>
       </ul>
     </div>
-    <div style="text-align:right;margin-top:14px">
-      <a href="detail-inline.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)" onmouseover="this.style.background='rgba(212,168,67,.15)'" onmouseout="this.style.background='rgba(212,168,67,.06)'">📖 查看内联差异详解 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-inline.html" class="detail-btn">📖 查看内联差异详解 →</a></div>
   </div>
 </section>
 
@@ -698,9 +686,7 @@
         <li>搜索 <code>-fwrapv</code> 使用 → 评估是否需要添加 <code>-fwrapv-pointer</code></li>
       </ul>
     </div>
-    <div style="text-align:right;margin-top:14px">
-      <a href="detail-flags.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">⚙️ 查看全部编译选项差异 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-flags.html" class="detail-btn">⚙️ 查看全部编译选项差异 →</a></div>
   </div>
 </section>
 
@@ -762,9 +748,7 @@
         <li>CI 测试启用 Extensive hardening + ASan</li>
       </ul>
     </div>
-    <div style="text-align:right;margin-top:14px">
-      <a href="detail-libcxx.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">📚 查看 libc++ 详解 →</a>
-    </div>
+    <div class="detail-link-wrap"><a href="detail-libcxx.html" class="detail-btn">📚 查看 libc++ 详解 →</a></div>
   </div>
 </section>
 
