@@ -235,7 +235,8 @@
 <nav class="toc-bar">
   <div class="toc-bar-inner">
     <a href="#summary">核心结论</a><span class="toc-div">｜</span>
-    <a href="#perf-size">⚡性能与小型化</a><span class="toc-div">｜</span>
+    <a href="#perf">⚡性能</a><span class="toc-div">｜</span>
+    <a href="#size">📏小型化</a><span class="toc-div">｜</span>
     <a href="#warnings">⚠️告警</a><span class="toc-div">｜</span>
     <a href="#ub">🚫未定义行为</a><span class="toc-div">｜</span>
     <a href="#inline">🔗内联</a><span class="toc-div">｜</span>
@@ -313,38 +314,23 @@
 </section>
 
 <!-- ══════════════════════════════════════════════════════
-     PERFORMANCE & CODE SIZE
+     PERFORMANCE
      ══════════════════════════════════════════════════════ -->
-<section id="perf-size" class="section">
+<section id="perf" class="section">
   <div class="section-header">
     <span class="num">⚡</span>
-    <h2>性能与小型化</h2>
-    <span class="h2-tag">Performance &amp; Code Size</span>
+    <h2>性能</h2>
+    <span class="h2-tag">Performance</span>
   </div>
   <div class="section-body">
     <div class="co co-i">
       <strong>📌 数通产品线关注点</strong>
-      嵌入式 / 数通设备对代码体积（<code>-Oz</code> / <code>-Os</code>）和执行性能敏感。
-      编译器升级可能带来免费的性能提升，也可能引入意外的代码膨胀或性能倒退。
+      编译器升级可带来免费的性能提升，但也需警惕性能倒退。关注执行速度、吞吐量和 i-cache 效率。
     </div>
 
-    <div style="text-align:right;margin-bottom:8px;display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
+    <div style="text-align:right;margin-bottom:8px">
       <a href="detail-perf.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">⚡ 查看性能详解 →</a>
-      <a href="detail-size.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">📏 查看小型化详解 →</a>
     </div>
-    <h4 style="color:var(--primary);font-size:15px;margin-top:16px">📈 代码体积优化进展</h4>
-    <table>
-      <thead><tr><th>版本</th><th>变更</th><th>对代码体积的影响</th></tr></thead>
-      <tbody>
-        <tr><td><strong>LLVM 16</strong></td><td>GlobalOpt 改进；死代码消除增强</td><td class="text-s">小幅改善</td></tr>
-        <tr><td><strong>LLVM 17</strong></td><td>Opaque pointers 强制推行（消除 pointer bitcast 冗余）</td><td><span class="bg">中等改善</span> — 间接减少了大量 GEP/bitcast 链</td></tr>
-        <tr><td><strong>LLVM 18</strong></td><td>FatLTO 支持；<code>cdsort</code> 代码段布局排序算法</td><td><span class="bg">正面影响</span> — 按调用图优化布局，减少 i-cache miss</td></tr>
-        <tr><td><strong>LLVM 19</strong></td><td><code>nusw</code>/<code>nuw</code> GEP flags（更好的分析）；Debug records 基础设施</td><td class="text-s">间接正面</td></tr>
-        <tr><td><strong>LLVM 20</strong></td><td><strong>Size-aware Machine Block Placement</strong> (<span class="inline-code">#109711</span>)</td><td><span class="bg">显著改善</span> — 对 <code>-Oz</code>/<code>-Os</code> 场景的机器块布局进行了大小感知优化</td></tr>
-        <tr><td><strong>LLVM 20</strong></td><td><code>-fno-pointer-tbaa</code> 可用（但 TBAA 默认启用）</td><td><span class="bm">⚠ TBAA 可能因更积极优化而减小体积，但也可能导致错误</span></td></tr>
-        <tr><td><strong>LLVM 21</strong></td><td><code>nooutline</code> 属性语法变更；Lifetime DSE</td><td><span class="bm">⚠ Lifetime DSE 可能减小代码但改变语义</span></td></tr>
-      </tbody>
-    </table>
 
     <div class="co co-a mt-10">
       <strong>⚡ 关键性能优化改进</strong>
@@ -354,12 +340,11 @@
         <li><strong>LLVM 18</strong>：<code>cdsort</code> 排序算法替代 <code>hfsort</code>（调用面剖面条目排序更优）；FatLTO 支持</li>
         <li><strong>LLVM 19</strong>：<code>nusw</code>/<code>nuw</code> GEP flags → 更精确的越界分析；MMRAs 内存模型松弛标注</li>
         <li><strong>LLVM 20</strong>：<strong>TBAA 默认启用</strong> → 更激进的别名分析（性能收益 vs. 安全风险的权衡）</li>
-        <li><strong>LLVM 20</strong>：<strong>Size-aware Machine Block Placement</strong> → 对 <code>-Oz</code> 场景代码体积优化</li>
         <li><strong>LLVM 21</strong>：<strong>Lifetime DSE</strong> → 更积极消除死存储（可能提升性能，但需验证语义）</li>
       </ul>
     </div>
 
-    <h4 style="color:var(--primary);font-size:15px;margin-top:16px">⚠️ 可能的性能 / 体积回归风险</h4>
+    <h4 style="color:var(--primary);font-size:15px;margin-top:16px">⚠️ 可能的性能回归风险</h4>
     <table>
       <thead><tr><th>风险点</th><th>版本</th><th>说明</th><th>影响目标</th></tr></thead>
       <tbody>
@@ -368,16 +353,56 @@
         <tr><td>Lifetime DSE</td><td>21</td><td>死对象存储消除 → 资源释放标记/调试断言失效</td><td>通用</td></tr>
         <tr><td>SVE 自动向量化降级</td><td>19</td><td><code>-march=armv9-a</code> 不再默认 SVE → 性能回退到 NEON</td><td>AArch64</td></tr>
         <tr><td>向量化 Cost Model 变化</td><td>16–21</td><td>跨版本累积的 cost model 改变导致部分循环不再向量化</td><td>通用</td></tr>
-        <tr><td>Debug INFO 基础设施重写</td><td>19</td><td>Debug intrinsics → Debug records，可能影响 LTO 调试信息体积</td><td>调试构建</td></tr>
-        <tr><td>ConstantExpr 移除累积</td><td>16–21</td><td>逐步移除常量表达式变体，IR 构建方式变化</td><td>IR 生成工具</td></tr>
+      </tbody>
+    </table>
+
+    <div class="cg mt-10">
+      <div class="ic"><div class="il">建议验证1</div><div class="iv">性能基准测试</div>CoreMark / Dhrystone / 协议栈吞吐量等关键指标对比</div>
+      <div class="ic"><div class="il">建议验证2</div><div class="iv">LTO 测试</div>ThinLTO / Full LTO 行为对比，注意分布式 LTO 新特性</div>
+      <div class="ic"><div class="il">建议验证3</div><div class="iv">内联决策对比</div>使用 <code>-Rpass=inline</code> 对比关键函数内联差异</div>
+      <div class="ic"><div class="il">建议验证4</div><div class="iv">SVE 向量化检查</div>确认 <code>-march=</code> 配置是否需要添加 <code>+sve</code></div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     CODE SIZE
+     ══════════════════════════════════════════════════════ -->
+<section id="size" class="section">
+  <div class="section-header">
+    <span class="num">📏</span>
+    <h2>小型化</h2>
+    <span class="h2-tag">Code Size</span>
+  </div>
+  <div class="section-body">
+    <div class="co co-i">
+      <strong>📌 数通产品线关注点</strong>
+      嵌入式设备对代码体积敏感。<code>-Oz</code> / <code>-Os</code> 构建路径的优化演进可能带来免费的体积缩减，也可能引入意外的膨胀。
+    </div>
+
+    <div style="text-align:right;margin-bottom:8px">
+      <a href="detail-size.html" style="display:inline-block;border:1px solid var(--accent);color:var(--accent);text-decoration:none;padding:6px 18px;border-radius:6px;font-size:13px;font-weight:600;transition:.12s;background:rgba(212,168,67,.06)">📏 查看小型化详解 →</a>
+    </div>
+
+    <h4 style="color:var(--primary);font-size:15px">📈 代码体积优化进展</h4>
+    <table>
+      <thead><tr><th>版本</th><th>变更</th><th>对代码体积的影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>LLVM 16</strong></td><td>GlobalOpt 改进；死代码消除增强</td><td class="text-s">小幅改善</td></tr>
+        <tr><td><strong>LLVM 17</strong></td><td>Opaque pointers 强制推行（消除 pointer bitcast 冗余）</td><td><span class="bg">中等改善</span> — 间接减少了大量 GEP/bitcast 链</td></tr>
+        <tr><td><strong>LLVM 18</strong></td><td>FatLTO 支持；<code>cdsort</code> 代码段布局排序算法</td><td><span class="bg">正面影响</span> — 按调用图优化布局，减少 i-cache miss</td></tr>
+        <tr><td><strong>LLVM 19</strong></td><td><code>nusw</code>/<code>nuw</code> GEP flags（更好的分析）；Debug records 基础设施</td><td class="text-s">间接正面</td></tr>
+        <tr><td><strong>LLVM 20</strong></td><td><strong>Size-aware Machine Block Placement</strong> (<span class="inline-code">#109711</span>)</td><td><span class="bg">显著改善</span> — 对 <code>-Oz</code>/<code>-Os</code> 场景的机器块布局进行了大小感知优化</td></tr>
+        <tr><td><strong>LLVM 20</strong></td><td>TBAA 默认启用（间接影响）</td><td><span class="bm">⚠ TBAA 可能因更积极优化而减小体积，但也可能导致错误</span></td></tr>
+        <tr><td><strong>LLVM 21</strong></td><td><code>nooutline</code> 属性语法变更；Lifetime DSE</td><td><span class="bm">⚠ Lifetime DSE 可能减小代码但改变语义</span></td></tr>
       </tbody>
     </table>
 
     <div class="cg mt-10">
       <div class="ic"><div class="il">建议验证1</div><div class="iv">二进制体积对比</div>使用 <code>size(1)</code>/<code>bloaty</code> 对关键模块进行新旧编译器对比</div>
-      <div class="ic"><div class="il">建议验证2</div><div class="iv">性能基准测试</div>CoreMark / Dhrystone / 协议栈吞吐量等关键指标对比</div>
-      <div class="ic"><div class="il">建议验证3</div><div class="iv">-Oz 构建验证</div>确认 <code>-Oz</code> 路径的代码体积无异常膨胀</div>
-      <div class="ic"><div class="il">建议验证4</div><div class="iv">LTO 测试</div>ThinLTO / Full LTO 行为对比，注意分布式 LTO 新特性</div>
+      <div class="ic"><div class="il">建议验证2</div><div class="iv">-Oz 构建验证</div>确认 <code>-Oz</code> 路径的代码体积无异常膨胀</div>
+      <div class="ic"><div class="il">建议验证3</div><div class="iv">函数级别对比</div>使用 <code>nm --print-size</code> 检查关键函数体积变化</div>
+      <div class="ic"><div class="il">建议验证4</div><div class="iv">Machine Outliner</div>确认 outlining 行为是否符合预期</div>
     </div>
   </div>
 </section>
