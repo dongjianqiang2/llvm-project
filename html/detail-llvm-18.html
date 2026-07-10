@@ -47,12 +47,7 @@
   }
   .header h1{font-size:30px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
   .header .subtitle{font-size:15px;opacity:.78;max-width:680px;margin:0 auto 20px;position:relative;z-index:1}
-  .header .back{
-    display:inline-block;color:var(--accent);text-decoration:none;font-size:14px;
-    border:1px solid rgba(212,168,67,.4);padding:5px 18px;border-radius:6px;transition:background .12s;
-    position:relative;z-index:1;
-  }
-  .header .back:hover{background:rgba(212,168,67,.15)}
+  .header .header .back:hover{background:rgba(212,168,67,.15)}
 
   /* Container */
   .container{max-width:1000px;margin:0 auto;padding:20px 20px 0}
@@ -162,6 +157,14 @@
     .container{padding:12px}
     .section-body{padding:14px 16px 18px}
   }
+      .back-link {
+        display: inline-block; color: #d4a843; text-decoration: none;
+        border: 1px solid rgba(212,168,67,0.4); padding: 6px 18px;
+        border-radius: 6px; font-size: 14px; margin-top: 0; margin-bottom: 8px;
+        transition: background 0.15s;
+      }
+      .back-link:hover { background: rgba(212,168,67,0.12); }
+
 </style>
 </head>
 <body>
@@ -171,7 +174,7 @@
   <div class="header-badge">LLVM 18.1 · 2024年3月发布</div>
   <h1>LLVM 18 差异详解</h1>
   <p class="subtitle">毕昇编译器升级 — 函数模板 Name Mangling、__int128 ABI、PCH、常量表达式、FatLTO、C++20 Modules、AArch64、LLD 等关键变更详细说明</p>
-  <a class="back" href="index.html">&larr; 返回主页</a>
+  <a href="index.html" class="back-link">&larr; 返回主页</a>
 </header>
 
 <div class="container">

@@ -30,12 +30,7 @@
   }
   .header h1{font-size:28px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
   .header .sub{font-size:14px;opacity:.78;position:relative;z-index:1}
-  .header .back{
-    display:inline-block;margin-bottom:16px;color:var(--accent);text-decoration:none;font-size:13px;
-    border:1px solid rgba(212,168,67,.35);padding:5px 18px;border-radius:6px;transition:all .15s;
-    position:relative;z-index:1;
-  }
-  .header .back:hover{background:rgba(212,168,67,.15);border-color:rgba(212,168,67,.55)}
+  .header .header .back:hover{background:rgba(212,168,67,.15);border-color:rgba(212,168,67,.55)}
 
   .container{max-width:960px;margin:0 auto;padding:20px}
 
@@ -120,13 +115,21 @@
   hr{border:none;border-top:1px solid var(--border);margin:16px 0}
 
   .footer{text-align:center;padding:28px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:960px;margin:20px auto 0}
+      .back-link {
+        display: inline-block; color: #d4a843; text-decoration: none;
+        border: 1px solid rgba(212,168,67,0.4); padding: 6px 18px;
+        border-radius: 6px; font-size: 14px; margin-top: 0; margin-bottom: 8px;
+        transition: background 0.15s;
+      }
+      .back-link:hover { background: rgba(212,168,67,0.12); }
+
 </style>
 </head>
 <body>
 
 <!-- HEADER -->
 <header class="header">
-  <a class="back" href="index.html">&larr; 返回主页</a>
+  <a href="index.html" class="back-link">&larr; 返回主页</a>
   <h1>LLVM 19 差异详解</h1>
   <p class="sub">毕昇编译器升级 &mdash; AArch64 安全特性、C++ 语言变更、LLD 链接器、LLVM IR 全面覆盖</p>
 </header>

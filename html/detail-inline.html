@@ -284,6 +284,14 @@
     .section-body { padding: 1rem; }
     .example-box pre { font-size: 0.78rem; padding: 0.8rem; }
   }
+      .back-link {
+        display: inline-block; color: #d4a843; text-decoration: none;
+        border: 1px solid rgba(212,168,67,0.4); padding: 6px 18px;
+        border-radius: 6px; font-size: 14px; margin-top: 0; margin-bottom: 8px;
+        transition: background 0.15s;
+      }
+      .back-link:hover { background: rgba(212,168,67,0.12); }
+
 </style>
 </head>
 <body>
@@ -296,7 +304,7 @@
 
 <!-- ========== 返回导航 ========== -->
 <nav class="nav-back">
-  <a href="index.html">&larr; 返回主页</a>
+  <a href="index.html" class="back-link">&larr; 返回主页</a>
 </nav>
 
 <!-- ========== 主内容 ========== -->

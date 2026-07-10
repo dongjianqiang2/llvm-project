@@ -40,12 +40,7 @@
     background:radial-gradient(ellipse 60% 40% at 30% 50%,rgba(212,168,67,.10) 0%,transparent 70%);
     pointer-events:none;
   }
-  .header .back{
-    display:inline-block;color:var(--accent);text-decoration:none;font-size:14px;
-    border:1px solid rgba(212,168,67,.4);padding:5px 18px;border-radius:6px;
-    transition:all .15s;margin-bottom:18px;position:relative;z-index:1;
-  }
-  .header .back:hover{background:rgba(212,168,67,.15);color:var(--accent-light)}
+  .header .header .back:hover{background:rgba(212,168,67,.15);color:var(--accent-light)}
   .header h1{font-size:30px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
   .header .subtitle{font-size:15px;opacity:.75;max-width:680px;margin:0 auto;position:relative;z-index:1}
 
@@ -182,13 +177,21 @@
     .section-body{padding:14px 16px 18px}
     .section-header{padding:14px 16px 10px}
   }
+      .back-link {
+        display: inline-block; color: #d4a843; text-decoration: none;
+        border: 1px solid rgba(212,168,67,0.4); padding: 6px 18px;
+        border-radius: 6px; font-size: 14px; margin-top: 0; margin-bottom: 8px;
+        transition: background 0.15s;
+      }
+      .back-link:hover { background: rgba(212,168,67,0.12); }
+
 </style>
 </head>
 <body>
 
 <!-- HEADER -->
 <header class="header">
-  <a class="back" href="index.html">&#8592; 返回主页</a>
+  <a href="index.html" class="back-link">&larr; 返回主页</a>
   <h1>告警 (Warnings) 差异详解</h1>
   <p class="subtitle">毕昇编译器升级 &mdash; LLVM 15.0.4 &#8594; 21.1.8 告警变更完整说明，含代码示例与修复方案</p>
 </header>

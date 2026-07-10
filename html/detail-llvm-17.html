@@ -42,12 +42,7 @@
   }
   .header h1{font-size:30px;font-weight:700;margin-bottom:6px;position:relative;z-index:1}
   .header .subtitle{font-size:15px;opacity:.78;max-width:680px;margin:0 auto 20px;position:relative;z-index:1}
-  .header .back{
-    display:inline-block;color:var(--accent);text-decoration:none;font-size:14px;
-    border:1px solid rgba(212,168,67,.4);padding:5px 18px;border-radius:6px;
-    transition:all .15s;position:relative;z-index:1;
-  }
-  .header .back:hover{background:rgba(212,168,67,.15);color:#fff}
+  .header .header .back:hover{background:rgba(212,168,67,.15);color:#fff}
   .toc-bar{
     position:sticky;top:0;z-index:100;
     background:rgba(255,255,255,.93);backdrop-filter:blur(14px);
@@ -151,14 +146,22 @@
   .mt-8{margin-top:8px}.mt-10{margin-top:10px}.mb-8{margin-bottom:8px}
   .text-s{font-size:13px;color:var(--text2)}
   .flex{display:flex}.flex-wrap{flex-wrap:wrap}.gap-2{gap:6px}
-  .footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1100px;margin:32px auto 0}</style>
+  .footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid var(--border);max-width:1100px;margin:32px auto 0}
+      .back-link {
+        display: inline-block; color: #d4a843; text-decoration: none;
+        border: 1px solid rgba(212,168,67,0.4); padding: 6px 18px;
+        border-radius: 6px; font-size: 14px; margin-top: 0; margin-bottom: 8px;
+        transition: background 0.15s;
+      }
+      .back-link:hover { background: rgba(212,168,67,0.12); }
+</style>
 </head>
 <body>
 <header class="header">
   <div class="header-badge">LLVM 17.0.0 &nbsp;·&nbsp; 2023-09-05</div>
   <h1>LLVM 17 差异详解</h1>
   <p class="subtitle">毕昇编译器升级专项 &nbsp;—&nbsp; LLVM 16.0.4 &#8594; 17.0.0 关键变更与迁移指南</p>
-  <a class="back" href="index.html">&#8592; 返回主页</a>
+  <a href="index.html" class="back-link">&larr; 返回主页</a>
 </header>
 <nav class="toc-bar">
   <div class="toc-bar-inner">
