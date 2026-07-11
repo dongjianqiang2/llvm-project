@@ -60,6 +60,7 @@ bool EJitSwitchController::setEnabled(uint32_t dimType, uint32_t instanceId,
 //===----------------------------------------------------------------------===//
 
 EJitDedupResult EJitDedupTable::tryMarkPending(uint32_t funcIndex) {
+  funcIndex = stripReqTier(funcIndex); // PGO: dedup by stripped funcIndex
   if (funcIndex >= kCapacity)
     return EJitDedupResult::InvalidFuncIndex; // Reject, never fold.
   uint32_t expected = 0;
@@ -69,6 +70,7 @@ EJitDedupResult EJitDedupTable::tryMarkPending(uint32_t funcIndex) {
 }
 
 void EJitDedupTable::clear(uint32_t funcIndex) {
+  funcIndex = stripReqTier(funcIndex); // PGO: dedup by stripped funcIndex
   if (funcIndex >= kCapacity)
     return;
   inFlight_[funcIndex].storeRelease(0);
@@ -159,7 +161,9 @@ EJitCacheLookupResult EJitTaskPoolCache::lookup(uint32_t funcIndex,
     void *fn = reinterpret_cast<void *>(E.fnPtr);
     if (!fn)
       break;
-    E.hitCount.fetchAdd(1); // PGO: count the hit (Tier-2 trigger, §6)
+    uint64_t prev = E.hitCount.fetchAdd(1); // PGO: count the hit (§6)
+    if (tier2Threshold_ && prev + 1 == tier2Threshold_)
+      R.tier2Arm = true; // one-shot: the hit that crosses the threshold
     R.fnPtr = fn;
     R.bucketIndex = bucket;
     R.hasReadToken = true;
@@ -359,6 +363,7 @@ EJitTaskPool::classifyHit(const EJitCacheLookupResult &Hit) {
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
     R.hasReadToken = true;
+    R.tier2Arm = Hit.tier2Arm; // PGO: carry the Tier-2 arming signal
     R.fastPathTerminal = true;
     return R;
   }
@@ -486,8 +491,26 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (R.fastPathTerminal) {
     // Non-hit terminals surface the caller's fallback pointer (a hit already
     // carries the cached fnPtr + read token).
-    if (R.status != EJitCompileOrGetStatus::CacheHit)
+    if (R.status != EJitCompileOrGetStatus::CacheHit) {
       R.fnPtr = fallback;
+    } else if (R.tier2Arm && pgoEnabled_ &&
+               switch_.getMode() == EJitCompileMode::Async) {
+      // PGO (§6): the hit crossed the Tier-2 threshold - lazily enqueue a
+      // Tier-2 recompile. Best-effort: ignore AlreadyPending/QueueFull/Invalid
+      // (the Tier-2 is an upgrade; a miss here just delays it). The caller
+      // still gets the Tier-1 fnPtr until Tier-2 publishes.
+      EJitCompileRequest T2{};
+      T2.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
+      T2.numDims = numDims;
+      T2.fallbackPtr = reinterpret_cast<uintptr_t>(fallback);
+      for (uint32_t i = 0; i < numDims; ++i) {
+        T2.dims[i] = dims[i];
+        T2.versions[i] =
+            switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
+      }
+      if (queue_.tryEnqueue(T2) == EJitTaskQueue::EnqueueResult::Enqueued)
+        EJIT_DIAG_VERBOSE("taskpool PGO Tier-2 armed func=%u", funcIndex);
+    }
     return R;
   }
   // True miss: continue the slow path with the caller's fallback.
