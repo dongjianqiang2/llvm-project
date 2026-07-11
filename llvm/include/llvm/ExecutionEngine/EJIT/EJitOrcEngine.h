@@ -99,6 +99,12 @@ public:
   void setActiveContext(const SpecializationContext *ctx);
   const SpecializationContext *getActiveContext() const;
 
+  /// PGO: PGOFuncNames captured by the last Tier-1 compile (the suffix of each
+  /// __profc_<name> that captureCounterGlobals forced external). The compile
+  /// driver looks up __profc_/__profd_ by these names after a Tier-1 compile to
+  /// capture counter addresses for Tier-2 profile synthesis (§5.2).
+  ArrayRef<std::string> getLastCounterNames() const;
+
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal
   /// environments where dynamic symbol lookup is unavailable.
