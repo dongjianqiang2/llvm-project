@@ -1310,7 +1310,12 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info) {
   if (!fnPtr || req.numDims > 4)
     return EJitPublishStatus::InvalidParam;
-  uint64_t key = hashIdentity(req.funcIndex, req.dims, req.numDims);
+  // PGO: tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it
+  // for identity (slots store the stripped funcIndex so Tier-1/Tier-2 of the
+  // same (funcIndex, dims) match); decode for the future trigger (part3).
+  uint32_t tier = decodeReqTier(req.funcIndex);
+  uint32_t fidx = stripReqTier(req.funcIndex);
+  uint64_t key = hashIdentity(fidx, req.dims, req.numDims);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
 
@@ -1340,7 +1345,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     uint32_t st = Slot.state.loadAcquire();
     if (st != static_cast<uint32_t>(EJitSharedSlotState::Empty) &&
         Slot.generation == req.generation &&
-        slotIdentityMatches(Slot, req.funcIndex, req.dims, req.numDims)) {
+        slotIdentityMatches(Slot, fidx, req.dims, req.numDims)) {
       target = &Slot; // overwrite same identity in place
       break;
     }
@@ -1360,7 +1365,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
 
   target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Publishing));
-  target->funcIndex = req.funcIndex;
+  target->funcIndex = fidx;
   target->numDims = req.numDims;
   target->generation = req.generation; // the request's generation, not curGen
   target->identityHash = key;
@@ -1388,6 +1393,12 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   }
   target->rangeReserved = 0;
   target->fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
+  // PGO: reset stale hitCount + counter addrs on every publish (overwrite of a
+  // Tier-1 slot, or reuse of an evicted slot). Under the write lock + before
+  // state=Ready, so storeRelaxed is published by the Ready release (§7.1).
+  target->hitCount.storeRelaxed(0);
+  target->profcAddr.storeRelaxed(0);
+  target->profdAddr.storeRelaxed(0);
   const uint32_t OwnerCore = state_->ownerCoreId.loadAcquire();
   target->executableCoreMask.storeRelease(
       OwnerCore < 64 ? (uint64_t{1} << OwnerCore) : 0);
