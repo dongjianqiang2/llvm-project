@@ -26,6 +26,7 @@
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
+#include "llvm/Transforms/IPO/Inliner.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/IR/GlobalValue.h"
@@ -156,6 +157,15 @@ void EJitOptimizer::runPipeline(Module &M,
           /*Filename=*/"/ejit.prof", /*Remap=*/"", /*IsCS=*/false,
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(M, MAM_);
+    }
+    // PGO-guided inline (§12 阶段3): profile-aware inlining of callees, after
+    // PGOUse set ProfileSummary so the InlineAdvisor uses the profile. Requires
+    // non-pre-inlined bitcode (PASS1 PGO mode, stage 3b) to have callees to
+    // inline; a no-op on already-pre-inlined bitcode.
+    {
+      ModulePassManager InlineMPM;
+      InlineMPM.addPass(ModuleInlinerWrapperPass());
+      InlineMPM.run(M, MAM_);
     }
     runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",

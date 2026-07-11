@@ -145,3 +145,103 @@ TEST(EJitPgo, Tier2PgoUseAnnotatesBranchWeights) {
           foundProf = true;
   EXPECT_TRUE(foundProf);
 }
+
+namespace {
+// foo(i32) calls bar(i32) twice; bar(i32) = x*3 + 2 (small, inlinable).
+std::unique_ptr<Module> makeFooCallsBarModule(LLVMContext &Ctx) {
+  auto M = std::make_unique<Module>("pgo_inline", Ctx);
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *FnTy = FunctionType::get(I32, {I32}, false);
+  auto *Bar = Function::Create(FnTy, Function::ExternalLinkage, "bar", M.get());
+  {
+    BasicBlock *BB = BasicBlock::Create(Ctx, "b", Bar);
+    IRBuilder<> B(BB);
+    Value *M3 = B.CreateMul(Bar->getArg(0), ConstantInt::get(I32, 3));
+    B.CreateRet(B.CreateAdd(M3, ConstantInt::get(I32, 2)));
+  }
+  auto *Foo = Function::Create(FnTy, Function::ExternalLinkage, "foo", M.get());
+  {
+    BasicBlock *BB = BasicBlock::Create(Ctx, "b", Foo);
+    IRBuilder<> B(BB);
+    Value *V1 = B.CreateCall(Bar, {Foo->getArg(0)});
+    Value *V2 = B.CreateCall(Bar, {Foo->getArg(0)});
+    B.CreateRet(B.CreateAdd(V1, V2));
+  }
+  return M;
+}
+
+// Read FuncHash (field 1) + NumCounters from __profd_/__profc_<name> after Gen.
+bool readCounterInfo(const Module &M, const std::string &name, uint64_t &hash,
+                     unsigned &numCounters) {
+  const GlobalVariable *Profd = M.getGlobalVariable("__profd_" + name, true);
+  const GlobalVariable *Profc = M.getGlobalVariable("__profc_" + name, true);
+  if (!Profd || !Profc)
+    return false;
+  auto *Init = dyn_cast<ConstantStruct>(Profd->getInitializer());
+  if (!Init || Init->getNumOperands() < 2)
+    return false;
+  if (auto *CI = dyn_cast<ConstantInt>(Init->getOperand(1)))
+    hash = CI->getZExtValue();
+  else
+    return false;
+  numCounters = cast<ArrayType>(Profc->getValueType())->getNumElements();
+  return true;
+}
+} // namespace
+
+// PGO stage 3: Tier-2 PGOUse + ModuleInlinerWrapperPass inlines a hot callee
+// (bar) into its caller (foo). Verifies the CGSCC inline pass runs in the
+// Tier-2 pipeline and inlines (foo no longer has a call to bar).
+TEST(EJitPgo, Tier2PgoInlinesHotCallee) {
+  LLVMContext Ctx;
+  auto M0 = makeFooCallsBarModule(Ctx);
+  PeriodArrayRegistry reg;
+  EJitOptimizer opt(reg);
+
+  // Tier-1 Gen -> get foo/bar FuncHash + NumCounters.
+  auto M1 = CloneModule(*M0);
+  SpecializationContext sc1;
+  sc1.fnName = "foo";
+  sc1.tier = CompileTier::Instrumented;
+  opt.runPipeline(*M1, sc1);
+  uint64_t fooHash = 0, barHash = 0;
+  unsigned fooCnt = 0, barCnt = 0;
+  ASSERT_TRUE(readCounterInfo(*M1, "foo", fooHash, fooCnt));
+  ASSERT_TRUE(readCounterInfo(*M1, "bar", barHash, barCnt));
+
+  // Synthesize profiles: foo entry=100, bar entry=200 (called 2x, hot).
+  InstrProfWriter Writer;
+  consumeError(Writer.mergeProfileKind(InstrProfKind::IRInstrumentation));
+  auto addRec = [&](const char *name, uint64_t hash, unsigned cnt,
+                    uint64_t val) {
+    std::vector<uint64_t> C(cnt, 0);
+    C[0] = val;
+    NamedInstrProfRecord Rec(name, hash, C);
+    Writer.addRecord(std::move(Rec), 1, [](Error) {});
+  };
+  addRec("foo", fooHash, fooCnt, 100);
+  addRec("bar", barHash, barCnt, 200);
+  auto Buf = Writer.writeBuffer();
+  ASSERT_NE(Buf, nullptr);
+
+  // Tier-2 PGOUse + inline.
+  opt.clearAnalyses();
+  auto M2 = CloneModule(*M0);
+  SpecializationContext sc2;
+  sc2.fnName = "foo";
+  sc2.tier = CompileTier::PGOUse;
+  sc2.profileData = std::string(Buf->getBuffer());
+  opt.runPipeline(*M2, sc2);
+
+  // Verify bar inlined into foo: foo no longer has a call to bar.
+  Function *Foo = M2->getFunction("foo");
+  ASSERT_NE(Foo, nullptr);
+  bool hasCallToBar = false;
+  for (BasicBlock &BB : *Foo)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "bar")
+          hasCallToBar = true;
+  EXPECT_FALSE(hasCallToBar);
+}
