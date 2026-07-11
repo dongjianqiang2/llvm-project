@@ -91,7 +91,8 @@ private:
   /// constant, re-specializes the array accesses that unrolling turns into
   /// constant-index GEPs, then does a final cleanup. `level` is accepted for ABI
   /// compatibility and does not affect the pipeline.
-  void runOptimizationPipeline(Module &M, OptimizationLevel level);
+  void runOptimizationPipeline(Module &M, OptimizationLevel level,
+                               CompileTier tier);
 
   /// Pick the cached function-simplification FPM for an EJIT optimization tier.
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
@@ -116,6 +117,9 @@ private:
   FunctionPassManager simplifyO2_;
   FunctionPassManager simplifyO3_;
   FunctionPassManager cleanupFPM_;
+  // Tier-2-only profile-guided memory-operation specialization. The main
+  // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
+  FunctionPassManager pgoUseFPM_;
 
   // PGO: PGOFuncNames captured by the last Tier-1 compile (see
   // captureCounterGlobals). Cleared at the start of each runPipeline.

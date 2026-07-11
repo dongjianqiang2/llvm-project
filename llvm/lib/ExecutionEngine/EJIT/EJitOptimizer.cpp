@@ -71,6 +71,11 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   simplifyO3_ = PB.buildFunctionSimplificationPipeline(
       llvm::OptimizationLevel::O3, ThinOrFullLTOPhase::None);
 
+  // The standard Ox function-simplification pipeline already runs
+  // profile-aware loop transforms when !prof metadata is present. Keep only
+  // the additional Tier-2 memory-operation specialization here.
+  pgoUseFPM_.addPass(PGOMemOPSizeOpt());
+
   // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling turns
   // a loop-variant array access g_arr[k].field into constant-index GEPs
   // (g_arr[0]/[1]/...), which only then become substitutable. Once
@@ -152,14 +157,14 @@ void EJitOptimizer::runPipeline(Module &M,
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(M, MAM_);
     }
-    runOptimizationPipeline(M, ctx.optLevel);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
     return;
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
 }
@@ -285,7 +290,8 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 }
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            ejit::OptimizationLevel level) {
+                                            ejit::OptimizationLevel level,
+                                            CompileTier tier) {
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -299,6 +305,8 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
     if (!F.isDeclaration()) {
       lowerExpectFPM_.run(F, FAM_);
       simplifyFPM.run(F, FAM_);
+      if (tier == CompileTier::PGOUse)
+        pgoUseFPM_.run(F, FAM_);
     }
 
   // Phase 4: unrolling exposed new constant-index array accesses
