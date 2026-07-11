@@ -1004,6 +1004,12 @@ const SpecializationContext *EJitOrcEngine::getActiveContext() const {
   return P->activeCtx;
 }
 
+ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
+  if (P->optimizer)
+    return P->optimizer->getLastCounterNames();
+  return {};
+}
+
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
   P->userSymbols[name] = addr;

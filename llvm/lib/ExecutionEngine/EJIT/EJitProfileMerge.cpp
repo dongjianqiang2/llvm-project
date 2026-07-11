@@ -11,6 +11,8 @@
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include <cstdint>
+#include <vector>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -24,17 +26,41 @@ std::string ejit::synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters) {
   if (auto E = Writer.mergeProfileKind(InstrProfKind::IRInstrumentation))
     consumeError(std::move(E));
 
-  // Stage 1 (EJIT_ONLINE_PGO.md §5.3): for each counter, read the
-  // __llvm_profile_data struct at profdAddr (via InstrProfData.inc:
-  // FuncHash + Counters pointer + NumCounters), build a NamedInstrProfRecord
-  // with the counter values at profcAddr, and Writer.addRecord. The
-  // __llvm_profile_data layout matches this LLVM build (InstrProfData.inc).
-  //
-  // Skeleton (Stage 0): no records added yet; returning the empty-writer
-  // buffer exercises the InstrProfWriter link path so the PGO component
-  // deps are pulled into LLVMEJIT. Behavior is opt-in (PGO off) so this is
-  // not called until Stage 1 wires it.
-  (void)counters;
+  // Runtime layout of __llvm_profile_data, mirroring InstrProfData.inc (same
+  // LLVM build -> identical layout). Field offsets on 64-bit:
+  //   0  NameRef      (uint64_t)
+  //   8  FuncHash     (uint64_t)
+  //  16  CounterPtr   (uintptr_t) -- NOT used: EJIT resolves the counter array
+  //                                  address via ORC lookup (profcAddr), which
+  //                                  is absolute; the struct's CounterPtr may
+  //                                  be relative/biased.
+  //  24  BitmapPtr    32 FunctionPointer    40 Values
+  //  48  NumCounters  (uint32_t)
+  // EJIT_ONLINE_PGO.md §5.3.
+  static_assert(sizeof(uintptr_t) == 8,
+                "EJIT PGO runtime profile-data offsets assume 64-bit");
+  constexpr uintptr_t kFuncHashOff = 8;
+  constexpr uintptr_t kNumCountersOff = 48;
+  // Sanity cap: a single function's edge counter array is never huge; a bogus
+  // offset read (layout drift) would typically yield a wild NumCounters.
+  constexpr uint32_t kMaxCountersPerFunc = 1u << 20;
+
+  for (const PgoCounterRef &C : counters) {
+    if (!C.profdAddr || !C.profcAddr || !C.pgoName)
+      continue;
+    const auto *Data = reinterpret_cast<const uint8_t *>(C.profdAddr);
+    uint64_t FuncHash =
+        *reinterpret_cast<const uint64_t *>(Data + kFuncHashOff);
+    uint32_t NumCounters =
+        *reinterpret_cast<const uint32_t *>(Data + kNumCountersOff);
+    if (NumCounters == 0 || NumCounters > kMaxCountersPerFunc)
+      continue;
+    const auto *CounterArray =
+        reinterpret_cast<const uint64_t *>(C.profcAddr);
+    std::vector<uint64_t> Counts(CounterArray, CounterArray + NumCounters);
+    NamedInstrProfRecord Rec(C.pgoName, FuncHash, std::move(Counts));
+    Writer.addRecord(std::move(Rec), 1, [](Error) {});
+  }
 
   auto Buf = Writer.writeBuffer();
   if (!Buf)
