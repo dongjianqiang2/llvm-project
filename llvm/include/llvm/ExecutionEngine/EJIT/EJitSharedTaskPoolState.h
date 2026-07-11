@@ -165,6 +165,14 @@ struct EJitSharedCacheSlot {
   uint64_t poolSize;      ///< usable pool size
   uint32_t poolId;        ///< stable pool index (diagnostic / convenience key)
   uint32_t rangeReserved; ///< reserved, keeps the tail explicit (must be 0)
+  /// PGO (v7): per-slot hotspot counter + Tier-1 captured counter addresses.
+  /// hitCount increments on cache hit (Tier-2 trigger, §6); profcAddr/profdAddr
+  /// are 0 for Baseline and reset to 0 when Tier-2 publishes over a Tier-1
+  /// entry (§7.1). EJitAtomic cells keep the slot a trivially-constructible
+  /// POD (zero-initialized in the shared blob by the elected owner).
+  EJitAtomicU64 hitCount;
+  EJitAtomicUPtr profcAddr;
+  EJitAtomicUPtr profdAddr;
 };
 
 //===----------------------------------------------------------------------===//
@@ -261,6 +269,11 @@ struct EJitSharedCounters {
                                              ///< setInstanceEnabled(true) — i.e.
                                              ///< the init→activate window.
   EJitAtomicU64 executePrepareFailed;
+  /// PGO (v7, EJIT_ONLINE_PGO.md §10): Tier-1/Tier-2 compile counts + profile
+  /// synthesis failures. Zero when PGO is off; fields always present for ABI.
+  EJitAtomicU64 tier1Compiles;
+  EJitAtomicU64 tier2Compiles;
+  EJitAtomicU64 profileMergeFails;
 };
 
 //===----------------------------------------------------------------------===//

@@ -71,7 +71,12 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// the optional EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock reader.
 /// v7: full IR/ASM payloads are worker-local again; shared dump state contains
 /// only a bounded filter and latest-capture metadata. publishSeq is unchanged.
-constexpr uint32_t kEJitSharedAbiVersion = 7u;
+/// v8: each cache slot carries PGO fields (hitCount + profcAddr + profdAddr)
+/// for online PGO hotspot detection and Tier-1 counter capture (§6/§7.1).
+/// The shared counters struct gains tier1Compiles/tier2Compiles/
+/// profileMergeFails. PGO behavior is opt-in (Config::enablePgo); the fields
+/// exist in every build for a stable layout and are 0 when PGO is off.
+constexpr uint32_t kEJitSharedAbiVersion = 8u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

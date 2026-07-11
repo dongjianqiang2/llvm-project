@@ -1625,6 +1625,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
+  // v7 PGO fields: zero on a Baseline publish (PGO off / no Tier-1 counters).
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+  EXPECT_EQ(slot->profcAddr.loadRelaxed(), 0u);
+  EXPECT_EQ(slot->profdAddr.loadRelaxed(), 0u);
 }
 
 TEST_F(SharedTaskPoolTest, DumpStateHoldsOnlySmallMetadata) {
