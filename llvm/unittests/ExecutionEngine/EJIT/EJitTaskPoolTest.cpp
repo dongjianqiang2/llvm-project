@@ -401,6 +401,24 @@ TEST(EJitCacheTest, PublishTier2StripsTierAndOverwritesTier1) {
   C.releaseRead(R.bucketIndex);
 }
 
+// PGO (§6): each cache hit increments the entry's hitCount (the Tier-2 trigger
+// counter). Verified via the hitCountOf diagnostic accessor.
+TEST(EJitCacheTest, HitIncrementsHitCount) {
+  EJitSwitchController S;
+  EJitTaskPoolCache C(S);
+  EJitDimPair D[1] = {{0, 1}};
+  uint32_t versions[1] = {0};
+  EXPECT_EQ(C.publish(10, D, 1, versions, reinterpret_cast<void *>(&DummyFn0)),
+            EJitPublishStatus::Published);
+  EXPECT_EQ(C.hitCountOf(10, D, 1), 0u); // no hits yet
+  for (int i = 0; i < 3; ++i) {
+    EJitCacheLookupResult R = C.lookup(10, D, 1);
+    EXPECT_EQ(R.fnPtr, reinterpret_cast<void *>(&DummyFn0));
+    C.releaseRead(R.bucketIndex);
+  }
+  EXPECT_EQ(C.hitCountOf(10, D, 1), 3u); // 3 hits counted
+}
+
 TEST(EJitCacheTest, LookupMissUnknownKey) {
   EJitSwitchController S;
   EJitTaskPoolCache C(S);

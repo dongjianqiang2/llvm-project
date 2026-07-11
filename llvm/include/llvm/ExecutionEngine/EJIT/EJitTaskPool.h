@@ -154,10 +154,13 @@ struct EJitCacheEntry {
   uint32_t versions[4]{};
   uintptr_t fnPtr = 0;
   /// PGO hotspot counter (incremented on cache hit; Tier-2 trigger, §6).
-  /// Zeroed when Tier-2 publishes over a Tier-1 entry (§7.1).
-  uint64_t hitCount = 0;
+  /// Zeroed when Tier-2 publishes over a Tier-1 entry (§7.1). Atomic: the
+  /// non-shared cache is read under the bucket read lock by concurrent
+  /// business threads, so the hit-path increment is an atomic RMW.
+  EJitAtomicU64 hitCount{};
   /// Tier-1 captured counter/data global addresses (§5.2). 0 for Baseline and
-  /// after Tier-2 publish (Tier-2 carries no counters).
+  /// after Tier-2 publish (Tier-2 carries no counters). Plain: written under
+  /// the bucket write lock (publish) and not read concurrently.
   uintptr_t profcAddr = 0;
   uintptr_t profdAddr = 0;
 };
@@ -213,6 +216,11 @@ public:
   /// Retire a never-published function pointer (e.g. a rejected stale compile)
   /// through the release callback, if one is installed. No-op otherwise.
   void retireCode(void *fnPtr);
+
+  /// PGO test/diagnostic: the hitCount of the entry matching (funcIndex, dims),
+  /// or 0 if no match. Strips tier bits from funcIndex (publish stores stripped).
+  uint64_t hitCountOf(uint32_t funcIndex, const EJitDimPair *dims,
+                      uint32_t numDims);
 
   void releaseRead(uint32_t bucketIndex);
   uint32_t readyCount() const;
