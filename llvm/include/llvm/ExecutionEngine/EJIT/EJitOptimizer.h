@@ -80,7 +80,8 @@ private:
   /// constant, re-specializes the array accesses that unrolling turns into
   /// constant-index GEPs, then does a final cleanup. `level` is accepted for ABI
   /// compatibility and does not affect the pipeline.
-  void runOptimizationPipeline(Module &M, OptimizationLevel level);
+  void runOptimizationPipeline(Module &M, OptimizationLevel level,
+                               CompileTier tier);
 
   PeriodArrayRegistry &registry_;
 
@@ -98,6 +99,10 @@ private:
   //               array accesses and the second StructFieldPass (Phase 4).
   FunctionPassManager mainFPM_;
   FunctionPassManager cleanupFPM_;
+  // PGO (Tier-2) variant of mainFPM_: LoopUnrollPass (profile-aware) replaces
+  // LoopFullUnrollPass + PGOMemOPSizeOpt appended (§12 阶段2). Baseline stays
+  // on mainFPM_ (LoopFullUnroll) - PGO opt-in isolation.
+  FunctionPassManager mainFpmPgo_;
 
   // PGO: PGOFuncNames captured by the last Tier-1 compile (see
   // captureCounterGlobals). Cleared at the start of each runPipeline.

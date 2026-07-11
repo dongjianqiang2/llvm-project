@@ -86,6 +86,27 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   }
   mainFPM_.addPass(PromotePass());
 
+  // mainFpmPgo_ - PGO (Tier-2) variant of mainFPM_ (§12 阶段2): LoopUnrollPass
+  // (profile-aware partial unroll/peel via BFI/PSI) replaces LoopFullUnrollPass,
+  // + PGOMemOPSizeOpt (profile-guided mem-intrinsic size specialization).
+  // Baseline stays on mainFPM_ (LoopFullUnroll) so PGO is opt-in isolated.
+  mainFpmPgo_.addPass(InstCombinePass());
+  mainFpmPgo_.addPass(SCCPPass());
+  mainFpmPgo_.addPass(SimplifyCFGPass());
+  mainFpmPgo_.addPass(InstCombinePass());
+  mainFpmPgo_.addPass(SimplifyCFGPass());
+  mainFpmPgo_.addPass(ADCEPass());
+  mainFpmPgo_.addPass(LoopSimplifyPass());
+  mainFpmPgo_.addPass(LoopUnrollPass()); // FunctionPass, profile-aware (BFI/PSI)
+  {
+    LoopPassManager LPM;
+    LPM.addPass(IndVarSimplifyPass());
+    LPM.addPass(LoopDeletionPass());
+    mainFpmPgo_.addPass(createFunctionToLoopPassAdaptor(std::move(LPM)));
+  }
+  mainFpmPgo_.addPass(PromotePass());
+  mainFpmPgo_.addPass(PGOMemOPSizeOpt());
+
   // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling turns
   // a loop-variant array access g_arr[k].field into constant-index GEPs
   // (g_arr[0]/[1]/...), which only then become substitutable. Once
@@ -152,14 +173,14 @@ void EJitOptimizer::runPipeline(Module &M,
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(M, MAM_);
     }
-    runOptimizationPipeline(M, ctx.optLevel);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
     return;
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
 }
@@ -248,16 +269,21 @@ void EJitOptimizer::runStructFieldPass(Module &M) {
 }
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            OptimizationLevel level) {
+                                            OptimizationLevel level,
+                                            CompileTier tier) {
   // One fixed pipeline; `level` does not affect it.
   (void)level;
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s",
                   M.getName().str().c_str());
 
   // Phases 2-3: scalar fold/propagate/simplify fixed point, then loop folding.
+  // Tier-2 (PGOUse) uses mainFpmPgo_ (LoopUnroll profile-aware + PGOMemOPSizeOpt);
+  // Baseline/Instrumented use mainFPM_ (LoopFullUnroll). §12 阶段2 PGO opt-in.
+  FunctionPassManager &fpm =
+      (tier == CompileTier::PGOUse) ? mainFpmPgo_ : mainFPM_;
   for (Function &F : M.functions())
     if (!F.isDeclaration())
-      mainFPM_.run(F, FAM_);
+      fpm.run(F, FAM_);
 
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field → g_arr[0].field, g_arr[1].field, ...). Substitute them,
