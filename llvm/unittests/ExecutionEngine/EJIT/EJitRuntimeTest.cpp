@@ -1124,7 +1124,7 @@ TEST(EJitOptimizer, OptimizationPipelineL1) {
   EJitOptimizerTestAccess opt(reg);
 
   // L1 should not crash
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1, CompileTier::Baseline);
 }
 
 TEST(EJitOptimizer, OptimizationPipelineL2) {
@@ -1136,7 +1136,7 @@ TEST(EJitOptimizer, OptimizationPipelineL2) {
   EJitOptimizerTestAccess opt(reg);
 
   // L2 should not crash
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 }
 
 TEST(EJitOptimizer, OptimizationPipelineL3) {
@@ -1148,7 +1148,7 @@ TEST(EJitOptimizer, OptimizationPipelineL3) {
   EJitOptimizerTestAccess opt(reg);
 
   // L3 should not crash
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 }
 
 TEST(EJitOptimizer, FullPipelineEndToEnd) {
@@ -1173,7 +1173,7 @@ TEST(EJitOptimizer, FullPipelineEndToEnd) {
   // 3. Inline (no-op for a single function, but shouldn't crash)
 
   // 4. Optimization pipeline at L3
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2097,7 +2097,7 @@ TEST(EJitOptimizer, OptimizationL1DeadCodeElimination) {
 
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1, CompileTier::Baseline);
 
   // Dead block should be removed
   int bbAfter = (int)std::distance(F->begin(), F->end());
@@ -2142,7 +2142,7 @@ TEST(EJitOptimizer, OptimizationL2InlineAndSimplify) {
 
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   // After inlining 41+1, should fold to constant 42
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
@@ -2204,7 +2204,7 @@ TEST(EJitOptimizer, OptimizationL3LoopUnroll) {
   // Promote first (mem2reg)
   opt.runInstCombine(*M);
   // Then L3 with loop unroll
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 
   // After unrolling 0+1+2+3, should fold to constant 6
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
@@ -2234,7 +2234,7 @@ static std::string optimizeLoopFnAt(llvm::ejit::OptimizationLevel lvl) {
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, lvl);
+  opt.runOptimizationPipeline(*M, lvl, CompileTier::Baseline);
   std::string Out;
   raw_string_ostream OS(Out);
   M->print(OS, nullptr);
@@ -2344,7 +2344,7 @@ TEST(EJitEndToEnd, BranchFolding) {
 
   sfp.run(*F, FAM);
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
   ASSERT_NE(Ret, nullptr);
@@ -2373,7 +2373,7 @@ static std::string specializeBranchAt(llvm::ejit::OptimizationLevel lvl) {
   EJitOptimizerTestAccess opt(reg);
   opt.runInstCombine(*M);
   opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, lvl);
+  opt.runOptimizationPipeline(*M, lvl, CompileTier::Baseline);
 
   std::string Out;
   raw_string_ostream OS(Out);
@@ -2581,7 +2581,7 @@ TEST(EJitPipelineIR, BranchFoldingOnMayConst) {
 
   sfp.run(*F, FAM);
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   // After full pipeline: no loads should remain (all may_const replaced)
   int loadCount = 0;
@@ -2718,7 +2718,7 @@ TEST(EJitPipelineIR, CellProcessBranchFolding) {
 
   // 4. Final cleanup
   opt.runInstCombine(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
   // All may_const loads should be gone
   int mayConstLoads = 0;
