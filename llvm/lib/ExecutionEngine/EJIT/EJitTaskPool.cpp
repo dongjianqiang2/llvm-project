@@ -143,7 +143,7 @@ EJitCacheLookupResult EJitTaskPoolCache::lookup(uint32_t funcIndex,
 
   // A hash key may chain several distinct identities (collision); match the
   // full identity, then verify every dim's version is still current.
-  for (const EJitCacheEntry &E : It->second) {
+  for (EJitCacheEntry &E : It->second) {
     if (!identityMatches(E, funcIndex, dims, numDims))
       continue;
     bool versionsOk = true;
@@ -159,6 +159,7 @@ EJitCacheLookupResult EJitTaskPoolCache::lookup(uint32_t funcIndex,
     void *fn = reinterpret_cast<void *>(E.fnPtr);
     if (!fn)
       break;
+    E.hitCount.fetchAdd(1); // PGO: count the hit (Tier-2 trigger, §6)
     R.fnPtr = fn;
     R.bucketIndex = bucket;
     R.hasReadToken = true;
@@ -222,7 +223,7 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     // PGO: reset stale hitCount + counter addrs on every overwrite (Tier-1
     // recompile or Tier-2 upgrade); fresh entries are default-constructed to
     // 0. Under the write lock so plain fields are safe (§7.1).
-    E.hitCount = 0;
+    E.hitCount.storeRelaxed(0);
     E.profcAddr = 0;
     E.profdAddr = 0;
     B.lock.writeRelease();
@@ -236,7 +237,7 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     return EJitPublishStatus::Published;
   }
 
-  EJitCacheEntry Entry;
+  EJitCacheEntry Entry{}; // value-init: hitCount atomic zeroed
   Entry.funcIndex = funcIndex;
   Entry.numDims = numDims;
   Entry.fnPtr = reinterpret_cast<uintptr_t>(fnPtr);
@@ -244,9 +245,32 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     Entry.dims[i] = dims[i];
     Entry.versions[i] = versions[i];
   }
-  B.entries[key].push_back(Entry);
+  B.entries[key].push_back(std::move(Entry));
   B.lock.writeRelease();
   return EJitPublishStatus::Published;
+}
+
+uint64_t EJitTaskPoolCache::hitCountOf(uint32_t funcIndex,
+                                              const EJitDimPair *dims,
+                                              uint32_t numDims) {
+  funcIndex = stripReqTier(funcIndex);
+  if (numDims > 4)
+    return 0;
+  uint64_t key = hashKey(funcIndex, dims, numDims);
+  uint32_t bucket = static_cast<uint32_t>(key % kBuckets);
+  Bucket &B = buckets_[bucket];
+  if (!B.lock.tryRead())
+    return 0;
+  uint64_t hc = 0;
+  auto It = B.entries.find(key);
+  if (It != B.entries.end())
+    for (const EJitCacheEntry &E : It->second)
+      if (identityMatches(E, funcIndex, dims, numDims)) {
+        hc = E.hitCount.loadRelaxed();
+        break;
+      }
+  B.lock.readRelease();
+  return hc;
 }
 
 void EJitTaskPoolCache::retireCode(void *fnPtr) {

@@ -53,9 +53,20 @@ public:
   EJitAtomic() = default;
   explicit EJitAtomic(T init) : value_(init) {}
 
-  // Atomic cells are not copyable/movable: they identify a fixed memory slot.
+  // Atomic cells are not copyable: they identify a fixed memory slot. They ARE
+  // movable: the move copies the value non-atomically, which is safe ONLY under
+  // exclusive access (EJIT moves cache entries during vector reallocation under
+  // the bucket write lock, with readers drained). The value is preserved; the
+  // "fixed slot" address identity is not, which is fine for value-only uses
+  // like hit counters. Fixed-slot uses (shared slots/counters, fixed arrays)
+  // never move.
   EJitAtomic(const EJitAtomic &) = delete;
   EJitAtomic &operator=(const EJitAtomic &) = delete;
+  EJitAtomic(EJitAtomic &&O) : value_(O.value_) {}
+  EJitAtomic &operator=(EJitAtomic &&O) {
+    value_ = O.value_;
+    return *this;
+  }
 
   /// Acquire load — pairs with storeRelease() to publish dependent writes.
   T loadAcquire() const { return __atomic_load_n(&value_, __ATOMIC_ACQUIRE); }
