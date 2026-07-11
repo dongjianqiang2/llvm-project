@@ -948,6 +948,49 @@ TEST(EJitTaskPoolTest, OrderingInstanceCheckedBeforeCache) {
   EXPECT_FALSE(r.hasReadToken);
 }
 
+// PGO (§6): a cache hit that brings hitCount to exactly the Tier-2 threshold
+// lazily enqueues a Tier-2 recompile (Async only). The Tier-2 publish then
+// overwrites the Tier-1 slot and resets hitCount. End-to-end trigger test.
+TEST(EJitTaskPoolTest, PgoHitThresholdArmsTier2Recompile) {
+  EJitTaskPool P(8, false); // no auto-worker; pollOne drives compiles
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  P.setPgoEnabled(true, 3); // arm Tier-2 at hitCount==3
+  EJitDimPair D[1] = {{0, 1}};
+
+  // Tier-1: miss -> enqueue -> pollOne compiles + publishes.
+  P.compileOrGet(5, D, 1, nullptr);
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(P.pendingCount(), 0u);
+
+  void *fb = reinterpret_cast<void *>(&DummyFn2);
+  auto release = [&](EJitTaskPool::CompileOrGetResult &rr) {
+    if (rr.hasReadToken)
+      P.cache().releaseRead(rr.bucketIndex);
+  };
+
+  // Two hits: below threshold -> no Tier-2 armed.
+  for (int i = 0; i < 2; ++i) {
+    auto r = P.compileOrGet(5, D, 1, fb);
+    ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+    release(r);
+  }
+  EXPECT_EQ(P.pendingCount(), 0u); // no Tier-2 yet
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 2u);
+
+  // Third hit crosses the threshold -> Tier-2 armed (enqueued).
+  auto r3 = P.compileOrGet(5, D, 1, fb);
+  EXPECT_EQ(r3.status, EJitCompileOrGetStatus::CacheHit);
+  release(r3);
+  EXPECT_EQ(P.pendingCount(), 1u); // Tier-2 req in flight
+
+  // pollOne compiles the Tier-2 req + publishes (overwrites Tier-1, resets).
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(P.pendingCount(), 0u);
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 0u); // reset on Tier-2 publish
+}
+
 // §5.2: cache lookup precedes the Off check, so an existing cached entry is
 // still served while the pool is globally Off (Off only suppresses NEW
 // compiles).
