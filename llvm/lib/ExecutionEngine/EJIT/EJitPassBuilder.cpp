@@ -13,6 +13,9 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/DemandedBits.h"
+#include "llvm/Analysis/EphemeralValuesCache.h"
+#include "llvm/Analysis/InlineAdvisor.h"
+#include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/Analysis/LastRunTrackingAnalysis.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -51,6 +54,10 @@ void ejit::EJitPassBuilder::registerFunctionAnalyses(
   FAM.registerPass([&] { return BlockFrequencyAnalysis(); });
   FAM.registerPass([&] { return DemandedBitsAnalysis(); });
   FAM.registerPass([&] { return DominatorTreeAnalysis(); });
+  // PGO stage 3: required by InlinerPass (Inliner.cpp:395 fetches it per
+  // function). Upstream PassRegistry.def registers it, but EJIT's minimal
+  // PassBuilder did not - register it now for the Tier-2 PGO inline.
+  FAM.registerPass([&] { return EphemeralValuesAnalysis(); });
   FAM.registerPass([&] { return LazyValueAnalysis(); });
   FAM.registerPass([&] { return LoopAnalysis(); });
   // LastRunTrackingAnalysis needed by SimplifyCFG pass infrastructure.
@@ -87,6 +94,12 @@ void ejit::EJitPassBuilder::registerModuleAnalyses(
     ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return PassInstrumentationAnalysis(); });
   MAM.registerPass([&] { return ProfileSummaryAnalysis(); });
+  // PGO stage 3: ModuleInlinerWrapperPass fetches InlineAdvisorAnalysis from
+  // the MAM (Inliner.cpp wrapper::run). Required for the Tier-2 PGO inline.
+  MAM.registerPass([&] { return InlineAdvisorAnalysis(); });
+  // LazyCallGraphAnalysis: required by the ModuleToPostOrderCGSCCPassAdaptor
+  // the inline wrapper runs (builds the call graph for CGSCC traversal).
+  MAM.registerPass([&] { return LazyCallGraphAnalysis(); });
 }
 
 void ejit::EJitPassBuilder::crossRegisterProxies(
