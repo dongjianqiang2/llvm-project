@@ -1,6 +1,6 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
-**版本**: 0.6
+**版本**: 0.7
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
@@ -14,12 +14,14 @@
 > **v0.5 变更**: P0-6 实测激进内联 Flash 代价(三场景独立测量程序 `/tmp/pgo_p0_6_test.cpp`)。**推翻 v0.3/v0.4 "非内联版常 ≤ 内联版" 假设**:仅中等 callee 多调用点场景 B<A(−5.8%);小/可折叠 callee 场景 B>A(+14%~22%),成因=A 的 GlobalDCE 整删 callee 定义 + InstCombine 跨 callee 折叠。修正 §9 P0-5/P0-6、§12 阶段3 体积断言、新增 §11.11 Flash 代价风险。
 >
 > **v0.6 变更**: P0-1 运行时体积代价实测(独立 probe `--gc-sections`+`-Os`+strip):PGO 增 `LLVMInstrumentation`+`LLVMProfileData` 后 stripped 增量 **≈ 640 KB**(unstripped ≈ 1.0 MB),sanitizer 被 gc 裁掉,主体为 InstrProf 写/读+OnDisk 索引。更新 §9 P0-1 行、新增 §11.12 运行时体积风险。至此 P0-1(运行时)+P0-6(bitcode Flash)footprint 两维均实测。
+>
+> **v0.7 变更**:经独立检视核实并修正一批事实错误:(a)§0 价值前提--InstCombine 经 SimplifyLibCalls PGSO(`SimplifyLibCalls.cpp:1402/3457/3763`)**确消费 PSI/BFI**(v0.6 称"无 pass 消费"错),但 Baseline 无 ProfileSummary 时休眠、Tier-2 激活(小额 IR 层收益);(b)计数器全局默认 **PrivateLinkage**(P0 复测 value=8=Private;v0.4 误改 Internal 因 P0 枚举注释写反),撤回 v0.4 的 InternalLinkage 修正;(c)`InstrProfing.cpp` 文件名更正为 `InstrProfiling.cpp`;(d)P0-5 GlobalDCE cite 修正:`PassBuilderPipelines.cpp:1055` 那处条件性(CtxProfile+ThinLTOPostLink),无条件 GlobalDCE 在 :837/:1303;(e)§0 删"L1/L2/L3 固定编排";(f)§0 增"部署前提:Async 多核"(inline 是 stage 3 必做,单核 Sync 下 PGO 净负);(g)§12 阶段3 默认改"按 callee 形态自适应";(h)§13 EphemeralValues 补注(EJIT 自定义 PassBuilder 仍未注册);(i)§10 同步已实现项。
 
 ---
 
 ## 0. 背景与目标
 
-EmbeddedJIT 已实现"时间窗常量 + 结构体字段特化":AOT 嵌入 bitcode,运行期按 `(funcIndex, dims)` 特化,经 InstCombine/StructFieldPass/标准优化生成机器码,存入 taskpool bucket cache。优化等级 L1/L2/L3 固定编排,但**优化决策不感知真实运行频度**--分支概率、块布局、循环展开均按静态启发式。
+EmbeddedJIT 已实现"时间窗常量 + 结构体字段特化":AOT 嵌入 bitcode,运行期按 `(funcIndex, dims)` 特化,经 InstCombine/StructFieldPass/标准优化生成机器码,存入 taskpool bucket cache。runOptimizationPipeline 为单一固定管线(optLevel 参数被忽略),但**优化决策不感知真实运行频度**--分支概率、块布局、循环展开均按静态启发式。
 
 本方案在 EJIT 层引入**在线 PGO**:运行期采集边/块频度,反馈到重编译,用真实 profile 引导优化。面向 SRE 裸核,无文件系统、内存受限、单 worker。
 
@@ -29,9 +31,11 @@ EmbeddedJIT 已实现"时间窗常量 + 结构体字段特化":AOT 嵌入 bitcod
 3. 不破坏特化正确性与 fallback 语义。
 4. 内存有界,可降级。
 
+**部署前提(前置确认)**:PGO 的价值 hinge 在 Async 多核部署--Tier-2 重编译需 worker(stage 3 PGO 内联更是),单核 Sync 下要么 Tier-2 阻塞业务线程重编译、要么永不升级(白付 Tier-1 插桩开销),基本净负。EJIT 已确认要加 inline(stage 3),故**目标部署须为 Async 多核**;单核 Sync 部署应跳过 PGO 或仅做 stage 1 且接受不升级。
+
 **PGO 价值范围(经核实,务必如实理解)**:
-- EJIT 现有 IR pipeline(InstCombine/SCCP/SimplifyCFG/ADCE/LoopFullUnroll/IndVarSimplify/LoopDeletion/Promote)**没有一个 pass 消费 BFI/BPI/PSI**;`LoopFullUnrollPass` 硬编码 `/*BFI*/nullptr,/*PSI*/nullptr`(`LoopUnrollPass.cpp:1528`),且 JIT 禁用 Inline(`EJitOptimizer.cpp:12`)。
-- 因此 PGO 的**保底收益几乎全部来自后端 `MachineBlockPlacement` 的块布局**(热路径拉直、mispredict/icache 改善),该 pass 在 `CodeGenOptLevel::Default` 下运行(`TargetPassConfig.cpp:1224`,EJIT 未降级)。
+- EJIT 现有 IR pipeline 中,**InstCombine 经 SimplifyLibCalls 的 PGSO 消费 PSI/BFI**(`shouldOptimizeForSize`,`SimplifyLibCalls.cpp:1402/3457/3763`),但**仅在存在 ProfileSummary 时激活**(Baseline 无 summary -> 休眠;Tier-2 设 summary -> 激活,小额 IR 层收益)。其余 pass(SCCP/SimplifyCFG/ADCE/LoopFullUnroll/IndVarSimplify/LoopDeletion/Promote)不消费;`LoopFullUnrollPass` 硬编码 `/*BFI*/nullptr,/*PSI*/nullptr`(`LoopUnrollPass.cpp:1528`),且 JIT 禁用 Inline(`EJitOptimizer.cpp:12`)。
+- 因此 PGO 的**保底收益主要来自后端 `MachineBlockPlacement` 的块布局**(热路径拉直、mispredict/icache 改善);Tier-2 另激活 InstCombine PGSO(见上)带来小额 IR 层收益,该 pass 在 `CodeGenOptLevel::Default` 下运行(`TargetPassConfig.cpp:1224`,EJIT 未降级)。
 - IR 层的 profile 消费(内联/unroll/memop)**需要额外补 Pass**(§12 阶段 2/3),不是现成可得。
 - may_const 特化已消除大量分支,PGO 真正发力的是"剩余数据相关分支"--收益真实但非数量级提升,阶段 1 后应实测决定是否推进到阶段 3。
 
@@ -51,12 +55,12 @@ PGO **Pass** 经 Orc 的 `IRTransformLayer` 执行(EJIT 已通过 `getIRTransfor
 | `ProfileSummaryAnalysis`/`BFI`/`BPI` 已注册 | `EJitPassBuilder.cpp:50-51,89` | PGO Use Pass 的直接依赖**已就位** |
 | `PGOInstrumentationUse` 依赖 FAM proxy/TLI/BPI/BFI/LoopInfo/PSI/DomTree | `PGOInstrumentation.cpp:2377-2391` | 全已注册,不会 assert ✓ |
 | `PGOInstrumentationGen` **只插 `llvm.instrprof.*` intrinsic + 名字全局**,不造计数器全局 | `PGOInstrumentation.cpp:960-1035` | **必须再跑 `InstrProfilingLoweringPass`** 把 intrinsic lower 成 `__profc_*`/`__profd_*`,否则 codegen 失败 |
-| 计数器/数据全局默认 **InternalLinkage**(P0 实测,非 PrivateLinkage) | `InstrProfing.cpp:1575,1753`;`Module::getGlobalVariable` 默认 `AllowLocal=false` 跳过 local | ORC 按名 lookup **查不到**;`getGlobalVariable(name, /*AllowLocal=*/true)` 才能取到,transform 须强制 ExternalLinkage |
-| `InstrProfilingLoweringPass` 的 `emitInitialization` 引入 `__llvm_profile_register_functions` 外部符号 | `InstrProfing.cpp:2114` | 裸核无 compiler-rt -> 须提供 no-op stub(ORC 跳 global_ctors,该 ctor 不执行,仅链接需要) |
+| 计数器/数据全局默认 **PrivateLinkage**(P0 复测 value=8=Private;v0.4 误改 Internal) | `InstrProfiling.cpp:1557,1669`;`Module::getGlobalVariable` 默认 `AllowLocal=false` 跳过 local | ORC 按名 lookup **查不到**;`getGlobalVariable(name, /*AllowLocal=*/true)` 才能取到,transform 须强制 ExternalLinkage |
+| `emitInitialization`(`InstrProfiling.cpp:2114`)把 `__llvm_profile_register_functions`(若模块声明)挂进 global_ctors;真正的 runtime 符号是单数 `__llvm_profile_register_function` | `InstrProfiling.cpp:2010,2018,2114` | 裸核无 compiler-rt -> 须提供 no-op stub(ORC 跳 global_ctors,该 ctor 不执行,仅链接需要) |
 | code pool 数据段**保持 RW 不封固**,只封 exec 段 | `EJitCodePoolMemoryManager.cpp:29-33,55,174` | `__profc_*`/`__profd_*` 落 RW data 段,运行期可读写 ✓ |
 | 后端 `CodeGenOptLevel::Default`(EJIT 未降级) | `JITTargetMachineBuilder.h:154`,`EJitOrcEngine.cpp:608` | `MachineBlockPlacement`/TailDup/BranchFolding/MachineSink 全部运行(`TargetPassConfig.cpp:1140,1186,1197,1212,1224`) |
 | `SpecializationContext` 在 `EJitOrcEngine.h:49-58` | 字段:fnName/cacheKey/dimensions/optLevel | 加 `tier`+`profile` 字段;持 std::string,**不能进共享内存/队列** |
-| 编译唯一入口 `compileCold`/`compileNow` | `EJitCompileDriver.cpp:292-421,494` | tier 经 `SpecializationContext` 注入;cacheKey 无 tier 位(同 key 覆盖正确) |
+| 编译唯一入口 `compileCold`/`compileNow` | `EJitCompileDriver.cpp:292-421,494` | tier 经 `SpecializationContext` 注入;cacheKey = (funcIndex, dims),**不含 tier 也不含 version**(version 是独立 commit/lookup gate,`EJitTaskPool.cpp:113-124` identityMatches 只查 funcIndex+dims);故 Tier-1/Tier-2 同 key 覆盖正确 |
 | `cachePublish` 同 identity 原地覆盖 fnPtr,旧指针锁外 `releaseFn_` 释放 | `EJitTaskPool.cpp:209-225`,`EJitSharedTaskPool.cpp:999-1055` | Tier-2 直接覆盖 Tier-1 指针;覆盖时须显式重置 hitCount/profcAddr/profdAddr |
 | write-lock 自旋 drain readers==0 | `EJitRwLock.h:51-57`,`EJitSharedTaskPool.cpp:96-106` | 正在执行旧函数的线程安全(NO_RECLAIM 模式靠 seqlock) |
 | 三层 version 检查 | `EJitTaskPool.cpp:150-156,576,596,200-206` | instance toggle 后 profile 作废,丢弃 Tier-2 |
@@ -319,13 +323,13 @@ fnPtr 永不释放,seqlock 读(`EJitSharedTaskPool.cpp:56-61`),Tier-2 publish �
 |---|----|------|
 | 1 | trim 保留 PGO 依赖 | ✅ ProfileData/Instrumentation/VirtualFileSystem 源码与 CMake 均无 `EJIT_TRIM` guard,始终编译。**但** EJIT 运行时 `LINK_COMPONENTS`(`EJIT/CMakeLists.txt:114-123`)故意未链 `ProfileData`/`Instrumentation`/`IPO`(注释明说避免拖入 BitWriter/Linker/AsmParser)。→ 须加进 `LINK_COMPONENTS` + `ejit_minimal` 的 `EJIT_LLVM_LIBS`,**与库裁剪目标冲突**,增最小库体积。**P0-1 实测增量 ≈ 640 KB stripped**(见 §11.12)。 |
 | 2 | 闭环:Gen->Lowering->Writer->Use | ✅ `PGOInstrumentationGen`+`InstrProfilingLoweringPass` 产 `__profc_*`/`__profd_*`;`writeBuffer` 产 indexed profile;`InMemoryFileSystem`+`PGOInstrumentationUse` 标注 `!prof = !{!"branch_weights", i32 100, i32 1}`(正是所设计数)。零文件 I/O。 |
-| 3 | 计数器符号 + 强制 external | ✅ 默认 **InternalLinkage**(实测);`getGlobalVariable(name, /*AllowLocal=*/true)` 取到;`setLinkage(ExternalLinkage)` 成功。 |
+| 3 | 计数器符号 + 强制 external | ✅ 默认 **PrivateLinkage**(实测 value=8=Private;v0.4 误读为 Internal 因 P0 枚举注释写反);`getGlobalVariable(name, /*AllowLocal=*/true)` 取到;`setLinkage(ExternalLinkage)` 成功。 |
 | 4 | hash 匹配 | ✅ `__profd_*` 字段1 读出 FuncHash;Tier-1 Gen 与 Tier-2 PGOUse 在克隆同源 IR 上 hash 一致 -> Use 成功 annotate(annotate 即证明匹配)。 |
-| 5 | `buildModuleInlinerPipeline` 含 GlobalDCE | ✅ `PassBuilderPipelines.cpp:1055` 含 `GlobalDCEPass`。→ 当前预优化内联后 **整定义归零**(GlobalDCE 删 callee,非"保留一份")。**故激进版(保 live callee)并非 ≤ 当前**--见 P0-6 实测:小/可折叠 callee 场景 B > A。v0.4 此处"常 ≤ 当前/Flash 赢"的推断已撤销。 |
+| 5 | `buildModuleInlinerPipeline` 含 GlobalDCE | ✅ `buildModuleInlinerPipeline` 含 `GlobalDCEPass`(`PassBuilderPipelines.cpp:1055` 那处条件性 CtxProfile+ThinLTOPostLink,无条件 GlobalDCE 在 `:837`/`:1303`)。→ 当前预优化内联后 **整定义归零**(GlobalDCE 删 callee,非"保留一份")。**故激进版(保 live callee)并非 ≤ 当前**--见 P0-6 实测:小/可折叠 callee 场景 B > A。v0.4 此处"常 ≤ 当前/Flash 赢"的推断已撤销。 |
 | 6 | 内联 vs 非内联 bitcode 体积 | ⏳ → ✅ 见下:独立测量程序 `/tmp/pgo_p0_6_test.cpp`(复制 `extractAndSerialize` 两版 preOptimize:A=含 `buildModuleInlinerPipeline`,B=仅 `AlwaysInliner`+同 steps2-5;再 externalize 非常量全局 + `WriteBitcodeToFile` 量字节;delta 隔离内联决策,无需 clang 重建)。三场景(小模块,百分比上界偏大):**S1 可折叠算术+多调用点 +21.6%**(364B)**;S2 不可折叠(读 runtime 全局)结构地板 +14.2%**(236B)**;S3 中等 callee×5 独立调用点 −5.8%**(−108B,文档假设的 B≤A 体制,仅此处成立;A=1864B 甚至 >raw 1748B,5 份内联体 >1 定义+5 call)。成因两块:(a) 结构地板--A 的 GlobalDCE 整删 callee 定义,B 保留一份;(b) 折叠损失--A 的 InstCombine 跨 callee 折叠(如 `helper_small(a)=a+1`×5→`a+5`),B 的不透明 call 挡掉。 |
 
 **P0 新发现(已并入设计)**:
-- 计数器全局默认 **InternalLinkage**(非 PrivateLinkage);`Module::getGlobalVariable` 默认 `AllowLocal=false` 会漏取,须传 `true`。
+- 计数器全局默认 **PrivateLinkage**(P0 复测 value=8=Private;v0.4 误改 Internal,因 P0 枚举注释"7=Private,8=Internal"写反,实为 7=Internal/8=Private);`Module::getGlobalVariable` 默认 `AllowLocal=false` 会漏取,须传 `true`。
 - `InstrProfWriter` 手动 `addRecord` **不传播 IR-level 标志**,须显式 `mergeProfileKind(InstrProfKind::IRInstrumentation)`,否则 Use 报 "Not an IR level instrumentation profile"。
 - `addRecord` 返回 void(错误经 `function_ref<void(Error)>` Warn 回调),非 Error 返回。
 
@@ -341,13 +345,13 @@ fnPtr 永不释放,seqlock 读(`EJitSharedTaskPool.cpp:56-61`),Tier-2 publish �
 - `EJitOrcEngine.h`(`SpecializationContext`):`CompileTier tier` + `profile` 字段。
 - `EJitOptimizer.{h,cpp}`:`runPipeline` tier 分支;`runLightOptPipeline`;`captureCounterGlobals`;引入 Gen/Lowering/Use 头依赖。
 - `EJitCompileDriver.cpp`:`compileCold` 据 `req.tier` 设 ctx;Tier-2 前调 profile 合成。
-- `EJitTaskPool.{h,cpp}` / `EJitSharedTaskPoolState.h`:`EJitCacheEntry`/`EJitSharedCacheSlot` 加 `hitCount`+`profcAddr`+`profdAddr`;`EJitCompileRequest` 携带 `tier`;`cachePublish` 覆盖时重置新字段;`kEJitSharedAbiVersion` v6->v7。
-- `EJitOrcEngine.{h,cpp}`:Tier-1 lookup 后补 `__profc_*`/`__profd_*` 查找。
-- 新增 `EJitProfileMerge.{h,cpp}`:合成 + `__llvm_profile_data` 读取。
-- 新增 `EJitPgoStubs.c`:`__llvm_profile_register_functions` no-op stub。
-- `EJitPassBuilder.cpp`:阶段3 补注册 `EphemeralValuesAnalysis`(必要时 `InlineAdvisorAnalysis`)。
-- `EJitStats`:`tier1Compiles`/`tier2Compiles`/`profileMergeFails`。
-- `EJIT/CMakeLists.txt`(P0-1):`LINK_COMPONENTS` + `ejit_minimal` 的 `EJIT_LLVM_LIBS` 加 `ProfileData`/`Instrumentation`/`IPO`(实测必须;与裁剪目标冲突,增最小库体积)。
+- `EJitTaskPool.{h,cpp}` / `EJitSharedTaskPoolState.h`:`EJitCacheEntry`/`EJitSharedCacheSlot` 加 `hitCount`+`profcAddr`+`profdAddr` **[done stage0]**;`EJitCompileRequest` 携带 `tier`(bit-pack funcIndex 高2位,未破 ABI)**[done stage0]**;`cachePublish` 覆盖时重置新字段 **[TODO stage1c]**;`kEJitSharedAbiVersion` v6->v7 **[done stage0]**。
+- `EJitOrcEngine.{h,cpp}`:Tier-1 lookup 后补 `__profc_*`/`__profd_*` 查找 **[done stage1b;`getLastCounterNames()` accessor + compileCold 捕获]**。
+- 新增 `EJitProfileMerge.{h,cpp}`:合成 + `__llvm_profile_data` 读取(FuncHash@8/NumCounters@48/counter@profcAddr) **[done stage0/1b]**。
+- 新增 `EJitPgoStubs.c`:`__llvm_profile_register_function` no-op stub **[deferred]**:P0 闭环在无 stub 下跑通(emitInitialization 仅在模块声明该符号时引用,EJIT 不声明),verify-then-add。
+- `EJitPassBuilder.cpp`:阶段3 补注册 `EphemeralValuesAnalysis`(必要时 `InlineAdvisorAnalysis`) **[TODO stage3;注:上游 PassRegistry.def:356 已注册,但 EJIT 用自定义 EJitPassBuilder,未注册]**。
+- `EJitStats`:`tier1Compiles`/`tier2Compiles`/`profileMergeFails` **[done stage0]**。
+- `EJIT/CMakeLists.txt`(P0-1):`LINK_COMPONENTS` 加 `ProfileData`/`Instrumentation` **[done stage0]**;`ejit_minimal` fat archive 的 `EJIT_LLVM_LIBS` 暂未加(避撑爆 check-ejit-size fat archive,lipo `--gc-sections` 部署物整合时再加,见 §11.12) **[deferred to lipo integration]**。
 
 ---
 
@@ -385,8 +389,8 @@ FPM/MPM pass,无结构改动:
 - **`PGOMemOPSizeOpt`**(FunctionPass,`PGOInstrumentation.h:104`):mem-intrinsic size 特化。
 - (可选)**`PGOIndirectCallPromotion`**(ModulePass,`h:92`):SPEC4 暂不特化函数指针,收益有限。
 
-### 阶段 3:profile-guided 内联(默认激进,最大收益,中风险,结构性改造)
-**默认激进**:PASS1 嵌入未预内联 bitcode,JIT Tier-2 用 PGO 数据全权决定内联。这是 PGO 在 EJIT 的最大收益点(profile-guided 内联)。
+### 阶段 3:profile-guided 内联(默认按 callee 形态自适应,最大收益,中风险,结构性改造)
+**默认按 callee 形态自适应**(v0.7 改,与 P0-6 实测一致;原 v0.3"默认激进"对小 callee 是 Flash 代价):PASS1 嵌入未预内联 bitcode,JIT Tier-2 用 PGO 数据全权决定内联。这是 PGO 在 EJIT 的最大收益点(profile-guided 内联)。自适应规则:中等 callee 多调用点 -> 激进(非预内联 + JIT PGO 内联,B<A 省 Flash);小/可折叠 callee 主导 -> 保守(预内联 + JIT 仅补热点 callee,避 +14~22% Flash 代价)。
 
 Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inliner.cpp:215,382-383`),`DefaultInlineAdvisor` 自动创建(`:176`)。
 
@@ -394,7 +398,7 @@ Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inl
 - `computeTransitiveClosure`(`:82-100`)已收集全部内部 callee(有函数体、非 intrinsic);`extractAndSerialize`(`:311-334`)`CloneModule` 后仅删非闭包函数,callee 作为**独立函数定义**保留。故"保留 callee"无需新增收集,只需不合并。
 - `preOptimizeBitcode`(`:189-240`,仅 Release/NDEBUG)step 1 = `AlwaysInlinerPass` + `buildModuleInlinerPipeline(O2)`(`:202-208`)是合并 callee 的根因。**改动:PGO 模式下 drop `buildModuleInlinerPipeline`(cost-based 那行),保留 `AlwaysInlinerPass`(mandatory,无 profile 决策);保留 steps 2-5(Mem2Reg/EarlyCSE/InstCombine/SimplifyCFG/reAnnotateMayConst,均 per-function,不跨函数合并)**。即删一行 + 加 mode 判断。
 - `reAnnotateMayConst`(step 5)在非内联 bitcode 上仍生效,`!ejit.may_const` 被重建 -> JIT StructFieldPass 可用。✓
-- `buildModuleInlinerPipeline` **含 GlobalDCE**(P0-5 已确认 `PassBuilderPipelines.cpp:1055`),当前预内联后把 callee **整定义删掉**(非"保留一份")。激进版 callee 保持 live。**体积 delta 经 P0-6 实测并非"callsite 复制 vs 独立一份"那么简单**:小/可折叠 callee 场景 B>A(+14%~22%,A 还白赚跨 callee 折叠);中等 callee 多调用点场景 B<A(−5.8%,callsite 复制才占上风)。两版 `.bc` 用 `/tmp/pgo_p0_6_test.cpp` 量得(复制 `extractAndSerialize` + externalize + `WriteBitcodeToFile`,delta 隔离内联决策)。
+- `buildModuleInlinerPipeline` **含 GlobalDCE**(P0-5 已确认;`PassBuilderPipelines.cpp:1055` 那处条件性,无条件 GlobalDCE 在 `:837`/`:1303`),当前预内联后把 callee **整定义删掉**(非"保留一份")。激进版 callee 保持 live。**体积 delta 经 P0-6 实测并非"callsite 复制 vs 独立一份"那么简单**:小/可折叠 callee 场景 B>A(+14%~22%,A 还白赚跨 callee 折叠);中等 callee 多调用点场景 B<A(−5.8%,callsite 复制才占上风)。两版 `.bc` 用 `/tmp/pgo_p0_6_test.cpp` 量得(复制 `extractAndSerialize` + externalize + `WriteBitcodeToFile`,delta 隔离内联决策)。
 - Debug 构建 `preOptimizeBitcode` 是 no-op(`:242`),本就非内联(但也不 reAnnotate);Release 才是部署目标。
 - 符号注册(`generateSymbolRegisters`/`generateRegistryTable`)遍历原 Module M 的闭包,与提取模块是否内联无关,不受影响。✓
 
@@ -410,7 +414,7 @@ Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inl
 
 **bitcode 体积(P0-6 实测)**:非内联版对小/可折叠 callee **更大**(B>A +14%~22%:A 的 GlobalDCE 整删 callee + InstCombine 跨 callee 折叠,B 都拿不到);仅中等 callee 多调用点场景 B<A(−5.8%,callsite 复制占上风)。单模式单 bitcode(PGO on=非内联,off=内联),不翻倍。**结论:激进版对 EJIT 常见的小/可折叠 callee 是 Flash 代价,非收益**;此 Flash 代价须由 Tier-2 PGO 内联收益 justify,且 AOT 丢的折叠转嫁为 JIT 时 RAM/编译时间(JIT 重内联 + 重折叠)。SRE 模块本身小,百分比非纯上界--结构地板随 callee 数线性增长,不随模块体积摊薄。降级路径:Flash 不可承受时退保守(预内联 bitcode,JIT 仅补内联 AOT 漏掉的热点 callee),见 §11.11。
 
-**必须补注册** `EphemeralValuesAnalysis`(`Inliner.cpp:395`,未注册);建议注册 `InlineAdvisorAnalysis`。
+**必须补注册** `EphemeralValuesAnalysis`(`Inliner.cpp:395`)--上游 `PassRegistry.def:356` 虽已注册,但 EJIT 用自定义 `EJitPassBuilder`(`EJitPassBuilder.cpp:35-68` 注册列表不含它),故 stage 3 须在 `EJitPassBuilder` 补注册;建议注册 `InlineAdvisorAnalysis`。
 
 **结构改动**:EJitOptimizer 加 `CGSCCPassManager` + `ModuleToPostOrderCGSCCPassAdaptor`(当前只有 FPM/MPM)。阶段 3 主要工作量。
 
@@ -448,7 +452,7 @@ preReplacePeriodIndices -> InstCombine
 | 阶段 | 需补注册的分析 | 必须? | 依据 |
 |------|--------------|-------|------|
 | 前提/1/2 | 无(BFI/BPI/PSI/SCEV/DT/LI/TTI/AC 均已注册) | - | `EJitPassBuilder.cpp:50-89` |
-| 3 | `EphemeralValuesAnalysis` | 是 | `Inliner.cpp:395` |
+| 3 | `EphemeralValuesAnalysis` | 是 | `Inliner.cpp:395`;**注**:上游 `PassRegistry.def:356` 已注册,但 EJIT 用自定义 `EJitPassBuilder`(未注册它),故 stage 3 仍须补注册 |
 | 3 | `InlineAdvisorAnalysis` | 建议 | 否则每次自建 default advisor(`:166,176`) |
 
 ---
@@ -467,11 +471,11 @@ preReplacePeriodIndices -> InstCombine
 | 触发 | 懒触发(Async)/不升级(Sync) | Sync 无 worker |
 | 换入 | `cachePublish` 同 identity 覆盖 + 重置新字段 | write-lock drain 安全 |
 | 失效 | 复用三层 version 检查 | instance 变更即丢 profile |
-| 内联策略 | 默认激进(PASS1 非预内联 + JIT PGO 内联) | PGO 最大收益在内联;PGO opt-in 隔离 Baseline;不可承受时退保守 |
+| 内联策略 | 默认按 callee 形态自适应(v0.7;原默认激进与 P0-6 实测冲突) | PGO 最大收益在内联;按闭包 callee 体积/调用点数自适应选激进/保守;PGO opt-in 隔离 Baseline |
 | 内存控制 | 采样子集 + 总量上限 + 降级链 | 守 SRE RAM 约束 |
 
 ---
 
 *文档版本: 0.4*
 *创建日期: 2026-07-11*
-*更新日期: 2026-07-11(v0.4: P0 验证通过 + 修正 InternalLinkage/mergeProfileKind)*
+*更新日期: 2026-07-11(v0.7: 检视核实修正 PGSO 前提/PrivateLinkage/GlobalDCE cite/文件名 + Async 前提 + 阶段3 自适应默认 + 同步实现状态)*
