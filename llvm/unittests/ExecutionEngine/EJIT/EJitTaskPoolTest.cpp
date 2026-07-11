@@ -373,6 +373,34 @@ TEST(EJitCacheTest, PublishLookupHit) {
   C.releaseRead(R.bucketIndex);
 }
 
+// PGO (EJIT_ONLINE_PGO.md §7.1): a Tier-2 publish carries tier in funcIndex's
+// top 2 bits (EJitSreQueue.h). publish must strip it for identity so the Tier-2
+// recompile overwrites the Tier-1 slot (same stripped funcIndex + dims), not
+// land in a separate slot.
+TEST(EJitCacheTest, PublishTier2StripsTierAndOverwritesTier1) {
+  EJitSwitchController S;
+  EJitTaskPoolCache C(S);
+  EJitDimPair D[1] = {{0, 1}};
+  uint32_t versions[1] = {0};
+
+  // Tier-1 publish (plain funcIndex 10).
+  EXPECT_EQ(C.publish(10, D, 1, versions, reinterpret_cast<void *>(&DummyFn0)),
+            EJitPublishStatus::Published);
+
+  // Tier-2 publish: funcIndex carries PGOUse in the top 2 bits. Without strip
+  // this would be a different identity; with strip it must overwrite Tier-1.
+  uint32_t tier2Func = encodeReqTier(10, kEJitTierPgoUse);
+  EXPECT_NE(tier2Func, 10u);
+  EXPECT_EQ(C.publish(tier2Func, D, 1, versions,
+                       reinterpret_cast<void *>(&DummyFn1)),
+            EJitPublishStatus::Published);
+
+  // Lookup with the plain (stripped) funcIndex must see the Tier-2 fnPtr.
+  EJitCacheLookupResult R = C.lookup(10, D, 1);
+  EXPECT_EQ(R.fnPtr, reinterpret_cast<void *>(&DummyFn1));
+  C.releaseRead(R.bucketIndex);
+}
+
 TEST(EJitCacheTest, LookupMissUnknownKey) {
   EJitSwitchController S;
   EJitTaskPoolCache C(S);

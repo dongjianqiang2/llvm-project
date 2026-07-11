@@ -467,6 +467,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
               cacheKey, counters.size());
   }
 
+  // PGO Tier-2: profile consumed; drop the captured counters (§7.1).
+  if (ctx.tier == CompileTier::PGOUse)
+    tier1Counters_.erase(cacheKey);
+
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
   return funcPtr;

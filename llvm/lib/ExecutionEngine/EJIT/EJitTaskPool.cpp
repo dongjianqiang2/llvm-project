@@ -177,6 +177,12 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
   if (!fnPtr || numDims > 4)
     return EJitPublishStatus::InvalidParam;
 
+  // PGO: tier rides in funcIndex's top 2 bits (EJitSreQueue.h). Strip it for
+  // identity - the cache stores the stripped funcIndex so Tier-1 and Tier-2 of
+  // the same (funcIndex, dims) match; decode it for the Tier-2 reset below.
+  uint32_t tier = decodeReqTier(funcIndex);
+  funcIndex = stripReqTier(funcIndex);
+
   uint64_t key = hashKey(funcIndex, dims, numDims);
   uint32_t bucket = static_cast<uint32_t>(key % kBuckets);
   Bucket &B = buckets_[bucket];
@@ -213,6 +219,14 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     for (uint32_t i = 0; i < numDims; ++i)
       E.versions[i] = versions[i];
     E.fnPtr = reinterpret_cast<uintptr_t>(fnPtr);
+    // PGO: a Tier-2 publish overwrites a Tier-1 entry - reset the stale
+    // hitCount + counter addrs (§7.1). Under the write lock so plain fields
+    // are safe; hitCount reset is active once part2 increments it.
+    if (tier == kEJitTierPgoUse) {
+      E.hitCount = 0;
+      E.profcAddr = 0;
+      E.profdAddr = 0;
+    }
     B.lock.writeRelease();
     // Release the overwritten code OUTSIDE the bucket write lock: the callback
     // may re-enter the code pool / ORC / allocator / platform and must never
