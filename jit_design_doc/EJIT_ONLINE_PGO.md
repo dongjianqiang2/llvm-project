@@ -1,6 +1,6 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
-**版本**: 0.7
+**版本**: 0.8
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
@@ -16,6 +16,8 @@
 > **v0.6 变更**: P0-1 运行时体积代价实测(独立 probe `--gc-sections`+`-Os`+strip):PGO 增 `LLVMInstrumentation`+`LLVMProfileData` 后 stripped 增量 **≈ 640 KB**(unstripped ≈ 1.0 MB),sanitizer 被 gc 裁掉,主体为 InstrProf 写/读+OnDisk 索引。更新 §9 P0-1 行、新增 §11.12 运行时体积风险。至此 P0-1(运行时)+P0-6(bitcode Flash)footprint 两维均实测。
 >
 > **v0.7 变更**:经独立检视核实并修正一批事实错误:(a)§0 价值前提--InstCombine 经 SimplifyLibCalls PGSO(`SimplifyLibCalls.cpp:1402/3457/3763`)**确消费 PSI/BFI**(v0.6 称"无 pass 消费"错),但 Baseline 无 ProfileSummary 时休眠、Tier-2 激活(小额 IR 层收益);(b)计数器全局默认 **PrivateLinkage**(P0 复测 value=8=Private;v0.4 误改 Internal 因 P0 枚举注释写反),撤回 v0.4 的 InternalLinkage 修正;(c)`InstrProfing.cpp` 文件名更正为 `InstrProfiling.cpp`;(d)P0-5 GlobalDCE cite 修正:`PassBuilderPipelines.cpp:1055` 那处条件性(CtxProfile+ThinLTOPostLink),无条件 GlobalDCE 在 :837/:1303;(e)§0 删"L1/L2/L3 固定编排";(f)§0 增"部署前提:Async 多核"(inline 是 stage 3 必做,单核 Sync 下 PGO 净负);(g)§12 阶段3 默认改"按 callee 形态自适应";(h)§13 EphemeralValues 补注(EJIT 自定义 PassBuilder 仍未注册);(i)§10 同步已实现项。
+>
+> **v0.8 变更**:阶段1 gate 实测通过--保底收益(MachineBlockPlacement 块布局)真实。用 EJitOptimizer runPipeline 产 Baseline vs Tier-2(99/1 profile)IR,llc -O2 aarch64 lower:MBP 消费 !prof **翻转块布局**,热路径从 Baseline 的"分支 taken 99%"变 Tier-2 的"fall-through"(mispredict ~99%->~1% + 热路径 icache 连续)。!prof 经 runPipeline mainFPM_ 存活到 codegen(§11.1)并被 MBP 消费。Caveat:收益条件性--Baseline 自然布局已最优(热块已 fall-through)时无改善(实测 asm 相同);EJIT may_const 特化后剩余数据相关分支自然布局未必匹配热路径,故收益可期。gate 工具 `/tmp/pgo_stage1_gate.cpp`。
 
 ---
 
@@ -35,7 +37,8 @@ EmbeddedJIT 已实现"时间窗常量 + 结构体字段特化":AOT 嵌入 bitcod
 
 **PGO 价值范围(经核实,务必如实理解)**:
 - EJIT 现有 IR pipeline 中,**InstCombine 经 SimplifyLibCalls 的 PGSO 消费 PSI/BFI**(`shouldOptimizeForSize`,`SimplifyLibCalls.cpp:1402/3457/3763`),但**仅在存在 ProfileSummary 时激活**(Baseline 无 summary -> 休眠;Tier-2 设 summary -> 激活,小额 IR 层收益)。其余 pass(SCCP/SimplifyCFG/ADCE/LoopFullUnroll/IndVarSimplify/LoopDeletion/Promote)不消费;`LoopFullUnrollPass` 硬编码 `/*BFI*/nullptr,/*PSI*/nullptr`(`LoopUnrollPass.cpp:1528`),且 JIT 禁用 Inline(`EJitOptimizer.cpp:12`)。
-- 因此 PGO 的**保底收益主要来自后端 `MachineBlockPlacement` 的块布局**(热路径拉直、mispredict/icache 改善);Tier-2 另激活 InstCombine PGSO(见上)带来小额 IR 层收益,该 pass 在 `CodeGenOptLevel::Default` 下运行(`TargetPassConfig.cpp:1224`,EJIT 未降级)。
+- 因此 PGO 的**保底收益主要来自后端 `MachineBlockPlacement` 的块布局**(热路径拉直、mispredict/icache 改善);Tier-2 另激活 InstCombine PGSO(见上)带来小额 IR 层收益
+- **(v0.8 阶段1 gate 实测)**:构造 Baseline 自然布局次优的分支(冷块 fall-through、热块分支),Tier-2(99/1 profile)经 runPipeline 后 llc -O2:`MachineBlockPlacement` 消费 !prof **翻转布局**,热路径变 fall-through(分支 taken 99%->1%,mispredict 大降 + 热路径 icache 连续)。收益条件性:Baseline 自然布局已最优时无改善。,该 pass 在 `CodeGenOptLevel::Default` 下运行(`TargetPassConfig.cpp:1224`,EJIT 未降级)。
 - IR 层的 profile 消费(内联/unroll/memop)**需要额外补 Pass**(§12 阶段 2/3),不是现成可得。
 - may_const 特化已消除大量分支,PGO 真正发力的是"剩余数据相关分支"--收益真实但非数量级提升,阶段 1 后应实测决定是否推进到阶段 3。
 
