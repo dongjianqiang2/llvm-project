@@ -92,6 +92,12 @@ static_assert(sizeof(uintptr_t) == 4 || sizeof(uintptr_t) == 8,
 constexpr uint32_t kEJitTierShift = 30;
 constexpr uint32_t kEJitTierMask = 0x3u << kEJitTierShift;
 
+/// CompileTier values (mirror CompileTier in EJitOrcEngine.h) for code that
+/// must not include EJitOrcEngine.h (e.g. the taskpool).
+constexpr uint32_t kEJitTierBaseline = 0;
+constexpr uint32_t kEJitTierInstrumented = 1;
+constexpr uint32_t kEJitTierPgoUse = 2;
+
 /// Encode a tier (CompileTier value) into funcIndex's top 2 bits.
 inline uint32_t encodeReqTier(uint32_t funcIndex, uint32_t tier) {
   return (funcIndex & ~kEJitTierMask) | ((tier & 0x3u) << kEJitTierShift);
