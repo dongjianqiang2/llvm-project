@@ -5,8 +5,10 @@ set(LLVM_LINK_COMPONENTS
   EmbeddedJIT
   EJIT
   ExecutionEngine
+  Instrumentation
   OrcJIT
   Passes
+  ProfileData
   Support
   TargetParser
   )
@@ -15,6 +17,7 @@ add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp
+  EJitPgoTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )

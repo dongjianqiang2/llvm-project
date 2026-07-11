@@ -35,11 +35,23 @@ public:
   ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
   ///   4. StructFieldPass (may_const loads → runtime constants)
   ///   5. Core optimization pipeline (L1/L2/L3)
+  ///
+  /// ctx.tier selects the PGO branch (EJIT_ONLINE_PGO.md §4): Baseline (no
+  /// PGO), Instrumented (Tier-1: + PGOGen/Lowering/capture), PGOUse (Tier-2:
+  /// + PGOUse(profile) then the core pipeline).
   void runPipeline(Module &M, const SpecializationContext &ctx);
 
   /// Clear all cached analysis results. Must be called between compilations
   /// to avoid dangling pointers to IR units from previous modules.
   void clearAnalyses();
+
+  /// PGO counter global names captured during the last Instrumented (Tier-1)
+  /// compile (PGOFuncName suffix of each __profc_<name>). Empty for
+  /// Baseline/PGOUse. The compile driver looks up __profc_/__profd_ by these
+  /// names to capture counter addresses for Tier-2 profile synthesis.
+  ArrayRef<std::string> getLastCounterNames() const {
+    return lastCounterNames_;
+  }
 
 private:
   /// Replace ejit_period_arr_ind parameters with their runtime constants.
@@ -61,6 +73,17 @@ private:
   /// runs IPSCCP to propagate constant arguments into callee bodies and
   /// constant returns back to call sites.
   void runInterproceduralPropagation(Module &M);
+
+  /// Light fold pass run at the PGO Gen/Use point (InstCombine + SimplifyCFG)
+  /// to fold branches exposed by specialization. Identical prefix for Tier-1
+  /// and Tier-2 keeps the CFG (and thus the PGO hash) aligned.
+  void runLightOptPipeline(Module &M);
+
+  /// After PGOInstrumentationGen + InstrProfilingLoweringPass, force the
+  /// __profc_*/__profd_* counter globals to ExternalLinkage (default
+  /// InternalLinkage is invisible to ORC J->lookup, P0-3) and record each
+  /// PGOFuncName (suffix of __profc_<name>) in lastCounterNames_.
+  void captureCounterGlobals(Module &M);
 
   /// Run the EJIT optimization pipeline: a single fused sequence that exploits
   /// the just-substituted period-index / may_const constants to their fixed
@@ -93,6 +116,10 @@ private:
   FunctionPassManager simplifyO2_;
   FunctionPassManager simplifyO3_;
   FunctionPassManager cleanupFPM_;
+
+  // PGO: PGOFuncNames captured by the last Tier-1 compile (see
+  // captureCounterGlobals). Cleared at the start of each runPipeline.
+  SmallVector<std::string, 4> lastCounterNames_;
 
   // Grant the unit-test accessor visibility into the private pipeline steps.
   // runPipeline() remains the only production entry point; this friend keeps
