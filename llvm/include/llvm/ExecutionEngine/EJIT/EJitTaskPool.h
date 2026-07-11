@@ -153,6 +153,13 @@ struct EJitCacheEntry {
   EJitDimPair dims[4]{};
   uint32_t versions[4]{};
   uintptr_t fnPtr = 0;
+  /// PGO hotspot counter (incremented on cache hit; Tier-2 trigger, §6).
+  /// Zeroed when Tier-2 publishes over a Tier-1 entry (§7.1).
+  uint64_t hitCount = 0;
+  /// Tier-1 captured counter/data global addresses (§5.2). 0 for Baseline and
+  /// after Tier-2 publish (Tier-2 carries no counters).
+  uintptr_t profcAddr = 0;
+  uintptr_t profdAddr = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -262,6 +269,11 @@ struct EJitTaskPoolCounters {
   EJitAtomicU64 compileFailed;
   EJitAtomicU64 publishFailed;
   EJitAtomicU64 instanceDisabled;
+  /// PGO (EJIT_ONLINE_PGO.md §10): Tier-1/Tier-2 compile counts + profile
+  /// synthesis failures. Zero when PGO is off.
+  EJitAtomicU64 tier1Compiles;
+  EJitAtomicU64 tier2Compiles;
+  EJitAtomicU64 profileMergeFails;
 };
 
 struct EJitTaskPoolStatsSnapshot {

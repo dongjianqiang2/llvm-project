@@ -78,6 +78,34 @@ static_assert(sizeof(uintptr_t) == 4 || sizeof(uintptr_t) == 8,
               "EJitCompileRequest assumes a 32- or 64-bit pointer width");
 
 //===----------------------------------------------------------------------===//
+// Compile-tier encoding for the queue (EJIT_ONLINE_PGO.md §6.3).
+//
+// CompileTier (EJitOrcEngine.h) is {Baseline=0, Instrumented=1, PGOUse=2}. It
+// is transported through the queue in the TOP 2 BITS of funcIndex, which is
+// <2^30 in practice. This needs NO layout change and NO queue-ABI bump.
+//
+// CRITICAL: cacheKey is built from the STRIPPED funcIndex (stripReqTier), so
+// Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey - that is
+// how Tier-2 publish overwrites the Tier-1 slot (§2/§7.1). The tier is decoded
+// separately and carried on SpecializationContext, never in cacheKey.
+//===----------------------------------------------------------------------===//
+constexpr uint32_t kEJitTierShift = 30;
+constexpr uint32_t kEJitTierMask = 0x3u << kEJitTierShift;
+
+/// Encode a tier (CompileTier value) into funcIndex's top 2 bits.
+inline uint32_t encodeReqTier(uint32_t funcIndex, uint32_t tier) {
+  return (funcIndex & ~kEJitTierMask) | ((tier & 0x3u) << kEJitTierShift);
+}
+/// Decode the tier carried in funcIndex's top 2 bits.
+inline uint32_t decodeReqTier(uint32_t funcIndex) {
+  return (funcIndex >> kEJitTierShift) & 0x3u;
+}
+/// Strip the tier bits to recover the real funcIndex (for cacheKey).
+inline uint32_t stripReqTier(uint32_t funcIndex) {
+  return funcIndex & ~kEJitTierMask;
+}
+
+//===----------------------------------------------------------------------===//
 // EJitQueue
 //
 // Bounded multi-producer / single-consumer queue of EJitCompileRequest. The

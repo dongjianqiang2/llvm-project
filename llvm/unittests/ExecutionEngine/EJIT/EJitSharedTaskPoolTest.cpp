@@ -1599,7 +1599,7 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
 // table is POD, dump slots use dynamic payload pointers, and each bucket
 // carries the NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 6u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 7u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -1625,6 +1625,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
+  // v7 PGO fields: zero on a Baseline publish (PGO off / no Tier-1 counters).
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+  EXPECT_EQ(slot->profcAddr.loadRelaxed(), 0u);
+  EXPECT_EQ(slot->profdAddr.loadRelaxed(), 0u);
 }
 
 TEST_F(SharedTaskPoolTest, DumpDynamicPayloadsClearedOnInit) {
