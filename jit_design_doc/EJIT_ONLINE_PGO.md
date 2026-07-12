@@ -1,6 +1,6 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
-**版本**: 0.9
+**版本**: 0.10
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
@@ -20,6 +20,8 @@
 > **v0.8 变更**:阶段1 gate 实测通过--保底收益(MachineBlockPlacement 块布局)真实。用 EJitOptimizer runPipeline 产 Baseline vs Tier-2(99/1 profile)IR,llc -O2 aarch64 lower:MBP 消费 !prof **翻转块布局**,热路径从 Baseline 的"分支 taken 99%"变 Tier-2 的"fall-through"(mispredict ~99%->~1% + 热路径 icache 连续)。!prof 经 runPipeline mainFPM_ 存活到 codegen(§11.1)并被 MBP 消费。Caveat:收益条件性--Baseline 自然布局已最优(热块已 fall-through)时无改善(实测 asm 相同);EJIT may_const 特化后剩余数据相关分支自然布局未必匹配热路径,故收益可期。gate 工具 `/tmp/pgo_stage1_gate.cpp`。
 >
 > **v0.9 变更**:阶段3a 完成(JIT 侧 PGO 内联,`ModuleInlinerWrapperPass` + EJitPassBuilder 注册 EphemeralValuesAnalysis/InlineAdvisorAnalysis/LazyCallGraphAnalysis)+ 自适应默认策略实现(`EJitPgoPolicy.h::shouldUseNonPreInlinedBitcode`,非预内联 iff 闭包存在 callee instCount≥6 && callSiteCount≥2,P0-6 校准,阈值待真实闭包复核)。§12 阶段3 自适应规则具体化。注:分支切到 `ejit_online_pgo`(用户选留此)。3b(PASS1 接线,需 clang 重建)待做。
+>
+> **v0.10 变更**:Stage 3 方向反转(经 call-back 开销论证)。原 v0.9 方案"non-pre bitcode + JIT PGO 内联"反效果:去掉 AOT 预内联后,冷的小 callee 退化为 JIT 函数内的 call(正是要避免的 call-back 开销)。**改为:保留 AOT 预内联(buildModuleInliner,内联小/便宜 callee 消除其 call)+ JIT PGO 内联(Stage 3a,内联 AOT 没内联的热 medium/large callee)**。冷 callee 不内联(JIT hot-only 正确)。这样既最激进消除 call(只留冷 medium/large call),又避开 P0-6 Flash 代价(预内联不产生 +14~22%)。**放弃 3b-core**(不去 buildModuleInliner,无需 PASS1 改/clang 重建)。`EJitPgoPolicy`(non-pre 决策)moot,已删。§12 阶段3/§11.11/§11.9 同步。
 
 ---
 
@@ -370,9 +372,9 @@ fnPtr 永不释放,seqlock 读(`EJitSharedTaskPool.cpp:56-61`),Tier-2 publish �
 6. **Sync 模式 Tier-2**:单核 Sync 部署只能内联重编译(阻塞)或不升级;默认建议不升级。
 7. **阶段3 CGSCC 改造**:EJitOptimizer 现无 CGSCC 通道,加内联是结构性改造,工作量与风险最大,放最后。
 8. **tier 与 LTO 路径**:LTO 下 bitcode 形态不同,插桩点需复核。
-9. **激进内联拖累 Baseline**:PASS1 去掉 ModuleInliner 会使现有 Baseline 路径(callee 内 may_const 无法追溯)退化。须以 PGO opt-in 模式隔离:PGO 开才改 PASS1 + JIT 内联,关则维持现状。
+9. **激进内联拖累 Baseline**:[v0.10] PASS1 去 ModuleInliner **已放弃**(保留预内联),此风险 moot。原方案 PASS1 去掉 ModuleInliner 会使现有 Baseline 路径(callee 内 may_const 无法追溯)退化。须以 PGO opt-in 模式隔离:PGO 开才改 PASS1 + JIT 内联,关则维持现状。
 10. **CFG hash 匹配**:Tier-1 Gen 与 Tier-2 PGOUse 前缀须完全一致,否则 profile 不匹配(该函数无 PGO 收益,不崩溃)。须保证两 tier 预处理确定性一致(may_const 值相同 + 同 pass 序列)。
-11. **激进内联 Flash 代价(P0-6 实测)**:PASS1 去 `buildModuleInlinerPipeline` 后,嵌入 bitcode 对小/可折叠 callee **变大** +14%~22%(B>A),非 v0.3/v0.4 假设的"常 ≤"。两成因:(a) A 的 `GlobalDCE` 整删 callee 定义,B 保留一份(结构地板,随 callee 数线性增长,不随模块体积摊薄);(b) A 的 InstCombine 跨 callee 折叠,B 不透明 call 挡掉(转嫁为 JIT 时重内联+重折叠的 RAM/编译时间)。仅中等 callee 多调用点场景 B<A(−5.8%)。**影响**:SRE Flash 预算紧,激进版对小 callee 闭包(EJIT 常见)净增 Flash;须由 Tier-2 PGO 内联收益 justify,否则按 §12 阶段3 降级路径退保守(预内联 + JIT 仅补热点 callee)。 mitigations:按闭包 callee 体积/调用点数自适应选策略;Flash 预算达阈时局部回退预内联;实测时用真实 ejit_entry 闭包(非小模块样例)重测以校准百分比。
+11. **激进内联 Flash 代价(P0-6 实测)**:[v0.10] 保留预内联后此代价**不触发**(non-pre 路线已放弃,见 §12)。原 PASS1 去 `buildModuleInlinerPipeline` 后,嵌入 bitcode 对小/可折叠 callee **变大** +14%~22%(B>A),非 v0.3/v0.4 假设的"常 ≤"。两成因:(a) A 的 `GlobalDCE` 整删 callee 定义,B 保留一份(结构地板,随 callee 数线性增长,不随模块体积摊薄);(b) A 的 InstCombine 跨 callee 折叠,B 不透明 call 挡掉(转嫁为 JIT 时重内联+重折叠的 RAM/编译时间)。仅中等 callee 多调用点场景 B<A(−5.8%)。**影响**:SRE Flash 预算紧,激进版对小 callee 闭包(EJIT 常见)净增 Flash;须由 Tier-2 PGO 内联收益 justify,否则按 §12 阶段3 降级路径退保守(预内联 + JIT 仅补热点 callee)。 mitigations:按闭包 callee 体积/调用点数自适应选策略;Flash 预算达阈时局部回退预内联;实测时用真实 ejit_entry 闭包(非小模块样例)重测以校准百分比。
 12. **PGO 运行时体积代价(P0-1 实测)**:PGO 须把 `LLVMInstrumentation`+`LLVMProfileData` 加进 `ejit_minimal` 的 `EJIT_LLVM_LIBS`(裁剪设计现整体排除 `libLLVMInstrumentation.a`,见 `EJIT_LIBRARY_TRIMMING.md` §4.7)。独立 probe 实测(`-Os` + `--gc-sections` + `strip --strip-all`,只留 PGO 可达对象,sanitizer/coverage 被 gc 裁掉;probe 两版同链同档,base 版也跑 PassBuilder 隔离 PGO 专属对象):**stripped 增量 ≈ 640 KB**(655,560 B;unstripped ≈ 1.0 MB),主体是 InstrProf 写/读 + OnDisk 索引格式(272 符号)+ BFI/BPI + ProfileSummary。约占 12 MB 运行时二进制的 5%、`check-ejit-size` 10 MB fat-archive 预算的 6.4%。**影响**:SRE Flash/RAM 紧,640 KB 非可忽略,但远小于 fat-archive 上界(整体 Instrumentation.a 含 sanitizer 达数 MB)。mitigations:(a) 务必走 lipo `ld -r --gc-sections --entry=ejit_init` 管线而非直链 fat archive--天然裁 sanitizer,只留 PGO 对象;(b) 阶段3 若不上 CGSCC 内联,可只保留 Gen/Lowering/Use 必需对象进一步瘦身;(c) `check-ejit-size` 10 MB 预算须重估,640 KB 须计入;(d) caveat:probe 用上游 PassBuilder,runtime 用裁剪版 `EJitPassBuilder`,PGO 对象闭包一致故 delta 代表性强,但精确字节数实测期须在真实 runtime 上复测。
 ---
 
@@ -396,7 +398,7 @@ FPM/MPM pass,无结构改动:
 
 ### 阶段 3:profile-guided 内联(默认按 callee 形态自适应,最大收益,中风险,结构性改造)
 **默认按 callee 形态自适应**(v0.7 改,与 P0-6 实测一致;原 v0.3"默认激进"对小 callee 是 Flash 代价):PASS1 嵌入未预内联 bitcode,JIT Tier-2 用 PGO 数据全权决定内联。这是 PGO 在 EJIT 的最大收益点(profile-guided 内联)。自适应规则:中等 callee 多调用点 -> 激进(非预内联 + JIT PGO 内联,B<A 省 Flash);小/可折叠 callee 主导 -> 保守(预内联 + JIT 仅补热点 callee,避 +14~22% Flash 代价)。
-  **(v0.9 实现)** `EJitPgoPolicy.h::shouldUseNonPreInlinedBitcode(callees)`:非预内联 iff 闭包内存在 callee(`instCount >= 6 && callSiteCount >= 2`)。阈值 6 来自 P0-6 synthetic(中等 callee ~6-7 inst),待真实 ejit_entry 闭包复核。3b(PASS1 `preOptimizeBitcode` 接线,需 clang 重建)调用此函数。
+  **(v0.10 反转)** 放弃 non-pre。保留 AOT 预内联(`buildModuleInliner`,内联小/便宜 callee 消除其 call)+ JIT PGO 内联(Stage 3a `ModuleInlinerWrapperPass`,内联 AOT 未内联的热 medium/large callee)。冷 callee 不内联(JIT hot-only)。论证:JIT 函数经 blr 进入,内部 call 回 AOT 开销大 -> 尽量内联消除 call;non-pre 去掉 AOT 预内联反而让冷小 callee 退化为 call(反效果)。`EJitPgoPolicy` 已删。
 
 Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inliner.cpp:215,382-383`),`DefaultInlineAdvisor` 自动创建(`:176`)。
 
