@@ -699,7 +699,7 @@ EJitOrcEngine::Create(const Config &config,
   engine->P->J->getIRTransformLayer().setTransform(
       [engine = engine.get()](
           orc::ThreadSafeModule TSM,
-          const orc::MaterializationResponsibility &R)
+          orc::MaterializationResponsibility &R)
           -> Expected<orc::ThreadSafeModule> {
         TSM.withModuleDo([engine](Module &M) {
           LLVM_DEBUG(dbgs() << "ejit-orc-engine: JIT transform on "
@@ -815,6 +815,25 @@ EJitOrcEngine::Create(const Config &config,
             }
           }
         });
+        // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
+        // Gen creates them inside runPipeline (after addIRModule), so the
+        // MR's claim - computed at addIRModule from the original module -
+        // does NOT include them. defineMaterializing adds them so ORC
+        // lookup resolves (compileCold's Tier-1 counter capture, §5.2).
+        {
+          orc::SymbolFlagsMap symFlags;
+          for (const std::string &name :
+               engine->P->optimizer->getLastCounterNames()) {
+            symFlags[engine->P->J->mangleAndIntern("__profc_" + name)] =
+                JITSymbolFlags::Exported;
+            symFlags[engine->P->J->mangleAndIntern("__profd_" + name)] =
+                JITSymbolFlags::Exported;
+          }
+          if (!symFlags.empty())
+            if (auto Err = R.defineMaterializing(std::move(symFlags)))
+              EJIT_DIAG("transform: defineMaterializing PGO counters "
+                        "failed: %s", toString(std::move(Err)).c_str());
+        }
         return std::move(TSM);
       });
 
