@@ -418,7 +418,7 @@ Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inl
 - pass 1(pre-inline,Gen/Use 前):entry 函数自身 may_const(指针直接来自全局)。
 - pass 2(post-inline):callee 内 may_const 的 GEP 链内联展开后可追溯,再特化。
 
-**Tier-1 heuristic inline(默认开,Gen 之后)**:非内联 bitcode 下,callee 内 may_const 需 inline 展开 GEP 链才能特化,故 Tier-1 在 Gen 之后做 heuristic inline + StructFieldPass2(≈ 当前 Baseline 特化码 + 计数器)。Gen 仍 pre-inline 保 hash 匹配;profile 是 per-function pre-inline 计数器,与 inline 无关。可关以减 Tier-1 编译时间(代价:callee may_const 不特化、运行变慢)。
+**Tier-1 heuristic inline(v0.10 后 moot)**:此段原为 v0.9 non-pre 设计。v0.10 pivot 保留预内联后:AOT `buildModuleInliner` 已内联小/便宜 callee(其 may_const 已特化);Tier-1 heuristic inline(同 cost 阈值,无 profile)对 AOT 未内联的 medium/large 是 no-op(太大);热 medium/large 的跨函数 may_const 特化由 **Tier-2 PGO 内联 + StructFieldPass2** 负责。故 Tier-1 heuristic inline 不再需要(Tier-1 期间 medium/large 的 call 开销是临时的,Tier-2 到阈值即替换)。若要 Tier-1 期间也快,可加"比 AOT 更激进"的 Tier-1 inline(降阈值),但 cost-based 无 profile,粗糙+膨胀,收益窗口短,暂不做。
 
 **bitcode 体积(P0-6 实测)**:非内联版对小/可折叠 callee **更大**(B>A +14%~22%:A 的 GlobalDCE 整删 callee + InstCombine 跨 callee 折叠,B 都拿不到);仅中等 callee 多调用点场景 B<A(−5.8%,callsite 复制占上风)。单模式单 bitcode(PGO on=非内联,off=内联),不翻倍。**结论:激进版对 EJIT 常见的小/可折叠 callee 是 Flash 代价,非收益**;此 Flash 代价须由 Tier-2 PGO 内联收益 justify,且 AOT 丢的折叠转嫁为 JIT 时 RAM/编译时间(JIT 重内联 + 重折叠)。SRE 模块本身小,百分比非纯上界--结构地板随 callee 数线性增长,不随模块体积摊薄。降级路径:Flash 不可承受时退保守(预内联 bitcode,JIT 仅补内联 AOT 漏掉的热点 callee),见 §11.11。
 
