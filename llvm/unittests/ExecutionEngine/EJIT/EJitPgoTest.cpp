@@ -341,7 +341,7 @@ std::unique_ptr<Module> makeSimpleFooModule(LLVMContext &Ctx) {
 // though captureCounterGlobals forces them External. See EJIT_ONLINE_PGO.md
 // §5.2 finding. Fix direction: capture counter addrs via the code-pool memory
 // manager (post-compile) + JITDylib::define(absoluteSymbols), not ORC lookup.
-TEST(EJitPgo, DISABLED_OrcLookupAndRealAddrProfileMerge) {
+TEST(EJitPgo, OrcLookupAndRealAddrProfileMerge) {
   // Serialize foo to bitcode.
   std::string bitcode;
   {
