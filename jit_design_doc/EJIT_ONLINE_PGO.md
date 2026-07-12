@@ -1,6 +1,6 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
-**版本**: 0.10
+**版本**: 0.11
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
@@ -22,6 +22,8 @@
 > **v0.9 变更**:阶段3a 完成(JIT 侧 PGO 内联,`ModuleInlinerWrapperPass` + EJitPassBuilder 注册 EphemeralValuesAnalysis/InlineAdvisorAnalysis/LazyCallGraphAnalysis)+ 自适应默认策略实现(`EJitPgoPolicy.h::shouldUseNonPreInlinedBitcode`,非预内联 iff 闭包存在 callee instCount≥6 && callSiteCount≥2,P0-6 校准,阈值待真实闭包复核)。§12 阶段3 自适应规则具体化。注:分支切到 `ejit_online_pgo`(用户选留此)。3b(PASS1 接线,需 clang 重建)待做。
 >
 > **v0.10 变更**:Stage 3 方向反转(经 call-back 开销论证)。原 v0.9 方案"non-pre bitcode + JIT PGO 内联"反效果:去掉 AOT 预内联后,冷的小 callee 退化为 JIT 函数内的 call(正是要避免的 call-back 开销)。**改为:保留 AOT 预内联(buildModuleInliner,内联小/便宜 callee 消除其 call)+ JIT PGO 内联(Stage 3a,内联 AOT 没内联的热 medium/large callee)**。冷 callee 不内联(JIT hot-only 正确)。这样既最激进消除 call(只留冷 medium/large call),又避开 P0-6 Flash 代价(预内联不产生 +14~22%)。**放弃 3b-core**(不去 buildModuleInliner,无需 PASS1 改/clang 重建)。`EJitPgoPolicy`(non-pre 决策)moot,已删。§12 阶段3/§11.11/§11.9 同步。
+>
+> **v0.11 变更**:真实集成测试抓到 §5.2 设计 bug--ORC lookup `__profc_*/__profd_*` 失败。根因:JITDylib 符号 claim 在 `addIRModule` 时据原模块算,而 `__profc_*` 是 IRTransformLayer transform 内 Gen 生成(addIRModule 后,不在原模块)-> 未被 claim -> lookup 不到,即便 `captureCounterGlobals` 强制 External。此前 MockCompiler 触发测试 + fake-addr 合成测试均未覆盖此路径。修复方向:经码池内存管理器(post-compile)取计数器地址 + `JITDylib::define(absoluteSymbols)`,或 transform 后手动注册,非 ORC lookup。测试 `DISABLED_OrcLookupAndRealAddrProfileMerge` 留作复现。
 
 ---
 
@@ -212,6 +214,8 @@ void *profd = orcEngine->lookup(cacheKey, "__profd_" + pgoName);
 ```
 
 存入 `EJitCacheEntry` 新字段 `profcAddr`/`profdAddr`。
+
+**⚠ v0.11 finding(集成测试抓到)**:ORC `lookup(cacheKey, "__profc_"+pgoName)` **失败**--JITDylib 符号 claim 在 `addIRModule` 时据原模块算,而 `__profc_*` 是 transform 内 Gen 生成(addIRModule 后,不在原模块)-> 未被 claim -> lookup 不到(`captureCounterGlobals` 强制 External 也无效,因 claim 已定)。修复方向:不经 ORC lookup,改经码池内存管理器(post-compile 符号地址表)取计数器地址 + `JITDylib::define(absoluteSymbols)` 注册,或 transform 后手动注册。**当前 Tier-1 捕获路径在生产不工作**(compileCold 的 `__profc_` lookup 会失败,Tier-2 合成无 profile -> Tier-2 退化为无 PGO 的 Baseline)。
 
 ### 5.3 profile 合成(Tier-2 编译前,worker/调用线程内)
 
