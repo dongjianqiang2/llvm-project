@@ -991,6 +991,42 @@ TEST(EJitTaskPoolTest, PgoHitThresholdArmsTier2Recompile) {
   EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 0u); // reset on Tier-2 publish
 }
 
+// PGO (§7.2): a version bump (instance toggle) between Tier-2 arming and its
+// publish must discard the Tier-2 - publish VersionMismatch, the Tier-1 slot
+// is NOT overwritten (hitCount not reset to 0). Validates the three-layer
+// version checkpoint discards a stale Tier-2 on instance toggle.
+TEST(EJitTaskPoolTest, PgoTier2DiscardedOnVersionBump) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  P.setPgoEnabled(true, 3);
+  EJitDimPair D[1] = {{0, 1}};
+
+  P.compileOrGet(5, D, 1, nullptr);
+  ASSERT_TRUE(P.pollOne()); // Tier-1 published
+  void *fb = reinterpret_cast<void *>(&DummyFn2);
+  auto release = [&](EJitTaskPool::CompileOrGetResult &r) {
+    if (r.hasReadToken)
+      P.cache().releaseRead(r.bucketIndex);
+  };
+  for (int i = 0; i < 3; ++i) {
+    auto r = P.compileOrGet(5, D, 1, fb);
+    release(r);
+  }
+  ASSERT_EQ(P.pendingCount(), 1u); // Tier-2 armed
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 3u);
+
+  // Toggle the instance (version bump) BEFORE the Tier-2 publishes.
+  ASSERT_TRUE(P.switchController().setEnabled(0, 1, false));
+
+  // pollOne consumes the Tier-2 req, but publish must VersionMismatch (the
+  // req's versions are pre-toggle) -> Tier-2 discarded, Tier-1 untouched.
+  EXPECT_TRUE(P.pollOne());
+  EXPECT_EQ(P.pendingCount(), 0u);         // Tier-2 req consumed (not published)
+  EXPECT_EQ(P.cache().hitCountOf(5, D, 1), 3u); // NOT reset => Tier-2 discarded
+}
+
 // §5.2: cache lookup precedes the Off check, so an existing cached entry is
 // still served while the pool is globally Off (Off only suppresses NEW
 // compiles).
