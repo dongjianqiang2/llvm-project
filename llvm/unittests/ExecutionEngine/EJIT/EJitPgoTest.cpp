@@ -8,6 +8,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -246,3 +247,65 @@ TEST(EJitPgo, Tier2PgoInlinesHotCallee) {
   EXPECT_FALSE(hasCallToBar);
 }
 
+
+// PGO: EJitProfileMerge reads the runtime __llvm_profile_data layout
+// (FuncHash@8, NumCounters@48) + counter values at profcAddr. Validate the
+// offset reading by constructing a fake __llvm_profile_data struct + counter
+// array in memory, synthesizing a profile, and feeding it to PGOUse (which
+// must annotate !prof -> proves the FuncHash read at offset 8 matched the
+// Gen-point hash; a wrong offset would yield a garbage hash -> no match -> no
+// !prof -> test fails).
+TEST(EJitPgo, ProfileMergeReadsRuntimeLayout) {
+  LLVMContext Ctx;
+  auto M0 = makeFooModule(Ctx);
+  PeriodArrayRegistry reg;
+  EJitOptimizer opt(reg);
+
+  // Tier-1 Gen -> get foo's FuncHash + NumCounters (from the IR globals).
+  auto M1 = CloneModule(*M0);
+  SpecializationContext sc1;
+  sc1.fnName = "foo";
+  sc1.tier = CompileTier::Instrumented;
+  opt.runPipeline(*M1, sc1);
+  uint64_t fooHash = 0;
+  unsigned fooCnt = 0;
+  ASSERT_TRUE(readCounterInfo(*M1, "foo", fooHash, fooCnt));
+  ASSERT_GT(fooCnt, 0u);
+
+  // Fake __llvm_profile_data struct in memory (EJitProfileMerge reads FuncHash
+  // at offset 8, NumCounters at offset 48 - see EJitProfileMerge.cpp).
+  std::vector<uint8_t> fakeData(64, 0);
+  *reinterpret_cast<uint64_t *>(fakeData.data() + 8) = fooHash;
+  *reinterpret_cast<uint32_t *>(fakeData.data() + 48) =
+      static_cast<uint32_t>(fooCnt);
+  // Fake counter array: a 100/1 split (hot then-path).
+  std::vector<uint64_t> fakeCounters(fooCnt, 0);
+  fakeCounters[0] = 100;
+  if (fooCnt > 1)
+    fakeCounters[1] = 1;
+
+  // Synthesize the profile from the fake runtime addrs.
+  PgoCounterRef ref{"foo", reinterpret_cast<uintptr_t>(fakeCounters.data()),
+                    reinterpret_cast<uintptr_t>(fakeData.data())};
+  std::string profile = synthesizeProfileBuffer({ref});
+  ASSERT_FALSE(profile.empty());
+
+  // Tier-2 PGOUse with the synthesized profile -> must annotate !prof.
+  opt.clearAnalyses();
+  auto M2 = CloneModule(*M0);
+  SpecializationContext sc2;
+  sc2.fnName = "foo";
+  sc2.tier = CompileTier::PGOUse;
+  sc2.profileData = profile;
+  opt.runPipeline(*M2, sc2);
+
+  Function *Foo = M2->getFunction("foo");
+  ASSERT_NE(Foo, nullptr);
+  bool foundProf = false;
+  for (BasicBlock &BB : *Foo)
+    for (Instruction &I : BB)
+      if (auto *BI = dyn_cast<BranchInst>(&I))
+        if (BI->isConditional() && BI->hasMetadata("prof"))
+          foundProf = true;
+  EXPECT_TRUE(foundProf);
+}
