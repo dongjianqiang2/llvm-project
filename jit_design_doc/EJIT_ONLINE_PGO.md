@@ -1,6 +1,6 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
-**版本**: 0.13
+**版本**: 0.14
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
@@ -28,6 +28,8 @@
 > **v0.12 变更**:§5.2 bug 已修(`99ff0a02fdbf`)。根因确认:JITDylib 符号 claim 在 `addIRModule` 时据原模块算,`__profc_*` 是 transform 内 Gen 生成(addIRModule 后)未被 claim。修复:IRTransformLayer transform lambda 里 runPipeline 后对 `__profc_*/__profd_*` 调 `R.defineMaterializing(...)` 扩展 MR claim -> base 层 emit 注册 -> ORC lookup 可用。集成测试 `OrcLookupAndRealAddrProfileMerge`(原 DISABLED)现通过:真 ORC lookup + 真 addr FuncHash@8/NumCounters@48 匹配 IR + 真 addr 合成 profile。**PGO 生产阻塞解除**(Tier-1 捕获 -> Tier-2 真 profile -> PGOUse !prof + JIT profile-guided 内联 + MBP 块布局)。
 >
 > **v0.13 变更**:真实闭包校准(12 个真实 EJIT 测试程序,ejit_complex/perf_bench/zstd_bench/fold_loop/nested_struct/multidim/trace/timing/ptr_period/jit_verify/multiversion/new_attr)。**发现:全部 0 剩余 callee**--AOT 预内联(`buildModuleInlinerPipeline`)把所有 callee 内联进 entry,真实闭包(ejit_entry 37-87 insts)自包含。**含义:JIT PGO 内联(Stage 3a)对真实 EJIT 闭包是 no-op**(无可内联 callee)。PGO 在真实 EJIT 的价值 = **MBP 块布局(Stage 1 保底收益)only**,非内联。§0 价值前提重构 + §12 阶段3 标注 moot(仅未来大闭包有 medium/large callee AOT 未内联时才相关)。
+>
+> **v0.14 变更**:真实闭包 MBP 校准通过。ejit_complex_test.c 的真实 `process_multi_dim`(87 insts):12 个 `!prof` 经 runPipeline 存活到 codegen,MBP 消费后**真实 asm 与 Baseline 不同**--分支条件交换、块重排(热路径 fall-through)、分支方向反转(`b.ne`->`b.eq`)、冷块外提。**PGO 保底收益在真实 EJIT 闭包上验证成立**。PGO go/no-go:hinge on MBP 收益(已证真实闭包有效)是否 justify +640KB + 插桩 + 重编译开销。
 
 ---
 
