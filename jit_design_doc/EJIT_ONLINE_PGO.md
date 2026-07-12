@@ -1,6 +1,6 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
-**版本**: 0.12
+**版本**: 0.13
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
@@ -26,6 +26,8 @@
 > **v0.11 变更**:真实集成测试抓到 §5.2 设计 bug--ORC lookup `__profc_*/__profd_*` 失败。根因:JITDylib 符号 claim 在 `addIRModule` 时据原模块算,而 `__profc_*` 是 IRTransformLayer transform 内 Gen 生成(addIRModule 后,不在原模块)-> 未被 claim -> lookup 不到,即便 `captureCounterGlobals` 强制 External。此前 MockCompiler 触发测试 + fake-addr 合成测试均未覆盖此路径。修复方向:经码池内存管理器(post-compile)取计数器地址 + `JITDylib::define(absoluteSymbols)`,或 transform 后手动注册,非 ORC lookup。测试 `DISABLED_OrcLookupAndRealAddrProfileMerge` 留作复现。
 >
 > **v0.12 变更**:§5.2 bug 已修(`99ff0a02fdbf`)。根因确认:JITDylib 符号 claim 在 `addIRModule` 时据原模块算,`__profc_*` 是 transform 内 Gen 生成(addIRModule 后)未被 claim。修复:IRTransformLayer transform lambda 里 runPipeline 后对 `__profc_*/__profd_*` 调 `R.defineMaterializing(...)` 扩展 MR claim -> base 层 emit 注册 -> ORC lookup 可用。集成测试 `OrcLookupAndRealAddrProfileMerge`(原 DISABLED)现通过:真 ORC lookup + 真 addr FuncHash@8/NumCounters@48 匹配 IR + 真 addr 合成 profile。**PGO 生产阻塞解除**(Tier-1 捕获 -> Tier-2 真 profile -> PGOUse !prof + JIT profile-guided 内联 + MBP 块布局)。
+>
+> **v0.13 变更**:真实闭包校准(12 个真实 EJIT 测试程序,ejit_complex/perf_bench/zstd_bench/fold_loop/nested_struct/multidim/trace/timing/ptr_period/jit_verify/multiversion/new_attr)。**发现:全部 0 剩余 callee**--AOT 预内联(`buildModuleInlinerPipeline`)把所有 callee 内联进 entry,真实闭包(ejit_entry 37-87 insts)自包含。**含义:JIT PGO 内联(Stage 3a)对真实 EJIT 闭包是 no-op**(无可内联 callee)。PGO 在真实 EJIT 的价值 = **MBP 块布局(Stage 1 保底收益)only**,非内联。§0 价值前提重构 + §12 阶段3 标注 moot(仅未来大闭包有 medium/large callee AOT 未内联时才相关)。
 
 ---
 
@@ -49,6 +51,8 @@ EmbeddedJIT 已实现"时间窗常量 + 结构体字段特化":AOT 嵌入 bitcod
 - **(v0.8 阶段1 gate 实测)**:构造 Baseline 自然布局次优的分支(冷块 fall-through、热块分支),Tier-2(99/1 profile)经 runPipeline 后 llc -O2:`MachineBlockPlacement` 消费 !prof **翻转布局**,热路径变 fall-through(分支 taken 99%->1%,mispredict 大降 + 热路径 icache 连续)。收益条件性:Baseline 自然布局已最优时无改善。,该 pass 在 `CodeGenOptLevel::Default` 下运行(`TargetPassConfig.cpp:1224`,EJIT 未降级)。
 - IR 层的 profile 消费(内联/unroll/memop)**需要额外补 Pass**(§12 阶段 2/3),不是现成可得。
 - may_const 特化已消除大量分支,PGO 真正发力的是"剩余数据相关分支"--收益真实但非数量级提升,阶段 1 后应实测决定是否推进到阶段 3。
+
+**真实闭包校准(v0.13)**:测了 12 个真实 EJIT 测试程序的闭包(ejit_complex/perf_bench/zstd_bench 等),AOT 预内联后**全部 0 剩余 callee**(ejit_entry 37-87 insts,自包含)。故 **JIT PGO 内联(Stage 3)对真实 EJIT 闭包是 no-op**--无 callee 可内联。PGO 在真实 EJIT 的价值 = **MBP 块布局(Stage 1)only**。§0 原称"PGO 最大收益在内联"对真实 EJIT 不成立(无 callee);内联仅在未来出现大闭包(medium/large callee AOT 未内联)时才相关。Stage 2(LoopUnroll)对真实小闭包边际。**PGO go/no-go:hinge on MBP 收益(Stage 1 gate v0.8 已证机制)是否 justify +640KB 运行时 + Tier-1 插桩 + Tier-2 重编译开销**。
 
 ---
 
@@ -424,7 +428,9 @@ Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inl
 - pass 1(pre-inline,Gen/Use 前):entry 函数自身 may_const(指针直接来自全局)。
 - pass 2(post-inline):callee 内 may_const 的 GEP 链内联展开后可追溯,再特化。
 
-**Tier-1 heuristic inline(v0.10 后 moot)**:此段原为 v0.9 non-pre 设计。v0.10 pivot 保留预内联后:AOT `buildModuleInliner` 已内联小/便宜 callee(其 may_const 已特化);Tier-1 heuristic inline(同 cost 阈值,无 profile)对 AOT 未内联的 medium/large 是 no-op(太大);热 medium/large 的跨函数 may_const 特化由 **Tier-2 PGO 内联 + StructFieldPass2** 负责。故 Tier-1 heuristic inline 不再需要(Tier-1 期间 medium/large 的 call 开销是临时的,Tier-2 到阈值即替换)。若要 Tier-1 期间也快,可加"比 AOT 更激进"的 Tier-1 inline(降阈值),但 cost-based 无 profile,粗糙+膨胀,收益窗口短,暂不做。
+**Tier-1 heuristic inline(v0.10 后 moot)**:此段原为 v0.9 non-pre 设计。v0.10 pivot 保留预内联后:AOT `buildModuleInliner` 已内联小/便宜 callee(其 may_const 已特化);Tier-1 heuristic inline(同 cost 阈值,无 profile)对 AOT 未内联的 medium/large 是 no-op(太大);热 medium/large 的跨函数 may_const 特化由 **Tier-2 PGO 内联 + StructFieldPass2** 负责。故 Tier-1 heuristic inline 不再需要(Tier-1 期间 medium/large 的 call 开销是临时的,Tier-2 到阈值即替换)。
+
+**(v0.13 真实闭包校准)**:12 个真实 EJIT 测试闭包 AOT 预内联后**全部 0 剩余 callee** -> JIT PGO 内联(Stage 3a)对真实 EJIT 是 **no-op**。Stage 3 仅在未来大闭包(medium/large callee AOT 未内联)时才产生收益。当前 EJIT 闭包以小/自包含为主,PGO 价值 = Stage 1 MBP。若要 Tier-1 期间也快,可加"比 AOT 更激进"的 Tier-1 inline(降阈值),但 cost-based 无 profile,粗糙+膨胀,收益窗口短,暂不做。
 
 **bitcode 体积(P0-6 实测)**:非内联版对小/可折叠 callee **更大**(B>A +14%~22%:A 的 GlobalDCE 整删 callee + InstCombine 跨 callee 折叠,B 都拿不到);仅中等 callee 多调用点场景 B<A(−5.8%,callsite 复制占上风)。单模式单 bitcode(PGO on=非内联,off=内联),不翻倍。**结论:激进版对 EJIT 常见的小/可折叠 callee 是 Flash 代价,非收益**;此 Flash 代价须由 Tier-2 PGO 内联收益 justify,且 AOT 丢的折叠转嫁为 JIT 时 RAM/编译时间(JIT 重内联 + 重折叠)。SRE 模块本身小,百分比非纯上界--结构地板随 callee 数线性增长,不随模块体积摊薄。降级路径:Flash 不可承受时退保守(预内联 bitcode,JIT 仅补内联 AOT 漏掉的热点 callee),见 §11.11。
 
