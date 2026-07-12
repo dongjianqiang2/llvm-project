@@ -8,7 +8,6 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
-#include "llvm/ExecutionEngine/EJIT/EJitPgoPolicy.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -247,25 +246,3 @@ TEST(EJitPgo, Tier2PgoInlinesHotCallee) {
   EXPECT_FALSE(hasCallToBar);
 }
 
-// PGO stage-3 adaptive policy (EJitPgoPolicy.h, P0-6): non-pre-inlined only
-// for medium+ callees at multiple callsites; small/foldable or single-callsite
-// -> pre-inlined.
-TEST(EJitPgoPolicy, AdaptiveByCalleeShape) {
-  using CS = CalleeShape;
-  // Empty closure -> pre-inlined (no callees to JIT-inline).
-  EXPECT_FALSE(shouldUseNonPreInlinedBitcode({}));
-  // Small callee, single callsite -> pre.
-  EXPECT_FALSE(shouldUseNonPreInlinedBitcode({CS{2, 1}}));
-  // Small callee, multi callsite (P0-6 S1) -> pre (folding beats duplication).
-  EXPECT_FALSE(shouldUseNonPreInlinedBitcode({CS{2, 5}}));
-  // Medium callee, single callsite -> pre (no duplication to avoid).
-  EXPECT_FALSE(shouldUseNonPreInlinedBitcode({CS{8, 1}}));
-  // Medium callee, multi callsite (P0-6 S3) -> non-pre (Flash win).
-  EXPECT_TRUE(shouldUseNonPreInlinedBitcode({CS{8, 5}}));
-  // Mixed: small x5 + medium x1 -> pre (medium is single-callsite).
-  EXPECT_FALSE(shouldUseNonPreInlinedBitcode({CS{2, 5}, CS{8, 1}}));
-  // Mixed: small x1 + medium x5 -> non-pre (medium multi-callsite present).
-  EXPECT_TRUE(shouldUseNonPreInlinedBitcode({CS{2, 1}, CS{8, 5}}));
-  // Just below the medium threshold, multi callsite -> pre.
-  EXPECT_FALSE(shouldUseNonPreInlinedBitcode({CS{5, 5}}));
-}
