@@ -1,6 +1,6 @@
 # EmbeddedJIT 在线 PGO 设计方案
 
-**版本**: 0.8
+**版本**: 0.9
 **日期**: 2026-07-11
 **关联文档**: SPEC4.md, PLAN4.md, PASS6_EJitStructFieldPass.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_SRE_TASKPOOL.md, EJIT_SRE_CODE_POOL.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
 **目标平台**: SRE 裸核(AArch64, RAM 100KB–2MB, 无文件系统, 单 worker)
@@ -18,6 +18,8 @@
 > **v0.7 变更**:经独立检视核实并修正一批事实错误:(a)§0 价值前提--InstCombine 经 SimplifyLibCalls PGSO(`SimplifyLibCalls.cpp:1402/3457/3763`)**确消费 PSI/BFI**(v0.6 称"无 pass 消费"错),但 Baseline 无 ProfileSummary 时休眠、Tier-2 激活(小额 IR 层收益);(b)计数器全局默认 **PrivateLinkage**(P0 复测 value=8=Private;v0.4 误改 Internal 因 P0 枚举注释写反),撤回 v0.4 的 InternalLinkage 修正;(c)`InstrProfing.cpp` 文件名更正为 `InstrProfiling.cpp`;(d)P0-5 GlobalDCE cite 修正:`PassBuilderPipelines.cpp:1055` 那处条件性(CtxProfile+ThinLTOPostLink),无条件 GlobalDCE 在 :837/:1303;(e)§0 删"L1/L2/L3 固定编排";(f)§0 增"部署前提:Async 多核"(inline 是 stage 3 必做,单核 Sync 下 PGO 净负);(g)§12 阶段3 默认改"按 callee 形态自适应";(h)§13 EphemeralValues 补注(EJIT 自定义 PassBuilder 仍未注册);(i)§10 同步已实现项。
 >
 > **v0.8 变更**:阶段1 gate 实测通过--保底收益(MachineBlockPlacement 块布局)真实。用 EJitOptimizer runPipeline 产 Baseline vs Tier-2(99/1 profile)IR,llc -O2 aarch64 lower:MBP 消费 !prof **翻转块布局**,热路径从 Baseline 的"分支 taken 99%"变 Tier-2 的"fall-through"(mispredict ~99%->~1% + 热路径 icache 连续)。!prof 经 runPipeline mainFPM_ 存活到 codegen(§11.1)并被 MBP 消费。Caveat:收益条件性--Baseline 自然布局已最优(热块已 fall-through)时无改善(实测 asm 相同);EJIT may_const 特化后剩余数据相关分支自然布局未必匹配热路径,故收益可期。gate 工具 `/tmp/pgo_stage1_gate.cpp`。
+>
+> **v0.9 变更**:阶段3a 完成(JIT 侧 PGO 内联,`ModuleInlinerWrapperPass` + EJitPassBuilder 注册 EphemeralValuesAnalysis/InlineAdvisorAnalysis/LazyCallGraphAnalysis)+ 自适应默认策略实现(`EJitPgoPolicy.h::shouldUseNonPreInlinedBitcode`,非预内联 iff 闭包存在 callee instCount≥6 && callSiteCount≥2,P0-6 校准,阈值待真实闭包复核)。§12 阶段3 自适应规则具体化。注:分支切到 `ejit_online_pgo`(用户选留此)。3b(PASS1 接线,需 clang 重建)待做。
 
 ---
 
@@ -394,6 +396,7 @@ FPM/MPM pass,无结构改动:
 
 ### 阶段 3:profile-guided 内联(默认按 callee 形态自适应,最大收益,中风险,结构性改造)
 **默认按 callee 形态自适应**(v0.7 改,与 P0-6 实测一致;原 v0.3"默认激进"对小 callee 是 Flash 代价):PASS1 嵌入未预内联 bitcode,JIT Tier-2 用 PGO 数据全权决定内联。这是 PGO 在 EJIT 的最大收益点(profile-guided 内联)。自适应规则:中等 callee 多调用点 -> 激进(非预内联 + JIT PGO 内联,B<A 省 Flash);小/可折叠 callee 主导 -> 保守(预内联 + JIT 仅补热点 callee,避 +14~22% Flash 代价)。
+  **(v0.9 实现)** `EJitPgoPolicy.h::shouldUseNonPreInlinedBitcode(callees)`:非预内联 iff 闭包内存在 callee(`instCount >= 6 && callSiteCount >= 2`)。阈值 6 来自 P0-6 synthetic(中等 callee ~6-7 inst),待真实 ejit_entry 闭包复核。3b(PASS1 `preOptimizeBitcode` 接线,需 clang 重建)调用此函数。
 
 Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inliner.cpp:215,382-383`),`DefaultInlineAdvisor` 自动创建(`:176`)。
 
