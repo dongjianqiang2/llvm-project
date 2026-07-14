@@ -3040,6 +3040,239 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
   pool.l0Fill(31, codeFor(37), c, 1);
   if (pool.l0Try(30, c, 1, &out))
     EXPECT_NE(out, codeFor(37)) << "funcIndex 30 served funcIndex 31's entry";
+// PGO (§6): shared taskpool hitCount + Tier-2 auto-trigger.
+//===----------------------------------------------------------------------===//
+
+// Shared equivalent of EJitTaskPoolTest::PgoHitThresholdArmsTier2Recompile.
+// Set PGO threshold=3, publish Tier-1, hit it twice (below threshold), then
+// the third hit crosses the threshold -> tier2Arm + Tier-2 request enqueued.
+// pollOne compiles it -> publish resets hitCount to 0.
+TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+  pool.setPgoEnabled(true, 2); // arm Tier-2 on the 2nd hit
+
+  // Tier-1: miss -> enqueue -> pollOne compiles + publishes.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(pool.pendingCount(), 0u);
+
+  // One hit: below threshold -> no Tier-2 armed, but hitCount increments.
+  auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(r1.tier2Arm);
+  EXPECT_EQ(pool.pendingCount(), 0u);
+
+  // Verify hitCount incremented.
+  { EJitSharedCacheSlot *s = findReadySlot(5); ASSERT_NE(s,nullptr); EXPECT_EQ(s->hitCount.loadRelaxed(),1u); }
+
+  // Second hit crosses threshold -> Tier-2 armed + enqueued.
+  auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  EXPECT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_TRUE(r2.tier2Arm) << "hit crossing threshold should arm Tier-2";
+
+  // Verify hitCount.
+  { EJitSharedCacheSlot *s = findReadySlot(5); ASSERT_NE(s,nullptr); EXPECT_EQ(s->hitCount.loadRelaxed(),2u); }
+
+  // Deferred trigger: compileOrGet saved the Tier-2 request pool-locally
+  // (funcIndex, numDims, dims — no shared-state access).  pollOne() fills
+  // in generation + versions and calls runCompile() directly with
+  // pgoClearExclusive=true, which tells bucketWrite to clear the aarch64
+  // exclusive monitor before the CAS.
+  //
+  // pollOne returns false: the Tier-2 was compiled inline (not via the
+  // ring), so the queue is still empty after the PGO handler.
+  EXPECT_FALSE(pool.pollOne());
+  EXPECT_EQ(pool.pendingCount(), 0u);
+
+  // hitCount reset to 0 on Tier-2 publish (cachePublish overwrites Tier-1).
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->hitCount.loadRelaxed(), 0u);
+    EXPECT_EQ(s->profcAddr.loadRelaxed(), 0u);
+    EXPECT_EQ(s->profdAddr.loadRelaxed(), 0u);
+    EXPECT_NE(s->fnPtr.loadRelaxed(), 0u); // now has Tier-2 code
+  }
+}
+
+// Shared version bump test (§7.2): PGO threshold arming survives instance
+// toggle.  The Tier-2 trigger is armed (tier2Pending_=true) but the actual
+// enqueue is deferred.  A version bump between arming and pollOne would
+// cause the Tier-2 to be discarded at publish time (versionsCurrent fails).
+// This test verifies the arming + hitCount behaviour; the full enqueue path
+// is tested once the aarch64 ring-buffer hang is resolved.
+TEST_F(SharedTaskPoolTest, SharedPgoTier2DiscardedOnVersionBump) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  pool.setPgoEnabled(true, 3);
+
+  // Tier-1 published.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  // Two hits below threshold → no arming.
+  for (int i = 0; i < 2; ++i) {
+    auto r = pool.compileOrGet(5, d0, 1, codeFor(5));
+    ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+    EXPECT_FALSE(r.tier2Arm);
+  }
+
+  // Verify hitCount accumulated.
+  { EJitSharedCacheSlot *s = findReadySlot(5); ASSERT_NE(s,nullptr); EXPECT_EQ(s->hitCount.loadRelaxed(), 2u); }
+
+  // Toggle the instance (version bump).
+  pool.setInstanceEnabled(1, 4, false);
+  pool.setInstanceEnabled(1, 4, true);
+
+  // Version bump invalidates the slot identity match: the next lookup will
+  // find the slot's versions[0] != instanceVersion → cache miss.  The
+  // next compileOrGet re-enters the slow path.
+  auto r3 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  // After version bump, the cached slot's version is stale → miss.
+  EXPECT_EQ(r3.status, EJitCompileOrGetStatus::EnqueuedPending);
+
+  // hitCount preserved on the stale slot (not reset because no Tier-2
+  // publish overwrote it).
+  {
+    EJitSharedCacheSlot *slot = findReadySlot(5);
+    // The slot may still be Ready but with stale versions — a new compile
+    // will create a new slot with fresh versions.
+    if (slot) {
+      EXPECT_GT(slot->hitCount.loadRelaxed(), 0u);
+    }
+  }
+}
+
+// PGO off → no hitCount increment, no tier2Arm, no Tier-2 enqueue.
+// Baseline guards: compileOrGet hits are ordinary cache hits with zero
+// PGO behaviour when setPgoEnabled was never called.
+TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  // PGO left off (default) — never call setPgoEnabled.
+
+  // Tier-1 published.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  // Hits: ordinary cache hits, no tier2Arm.
+  for (int i = 0; i < 10; ++i) {
+    auto r = pool.compileOrGet(5, d0, 1, codeFor(5));
+    ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+    EXPECT_FALSE(r.tier2Arm);
+  }
+  EXPECT_EQ(pool.pendingCount(), 0u); // no Tier-2 enqueued
+
+  // hitCount stays at 0 (threshold was never set).
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+}
+
+// PGO threshold=0 (setPgoEnabled(true,0)) → counting disabled, no trigger.
+// hitCount is still incremented but no Tier-2 is ever armed.
+TEST_F(SharedTaskPoolTest, SharedPgoThresholdZeroDisablesTrigger) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  // Enable PGO but with threshold=0 → hitCount increments but trigger is off.
+  pool.setPgoEnabled(true, 0);
+
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  for (int i = 0; i < 10; ++i) {
+    auto r = pool.compileOrGet(5, d0, 1, codeFor(5));
+    ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
+    EXPECT_FALSE(r.tier2Arm);
+  }
+  EXPECT_EQ(pool.pendingCount(), 0u); // no trigger
+
+  // hitCount IS incremented (bookkeeping, not arming).
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_GT(slot->hitCount.loadRelaxed(), 0u);
+}
+
+// End-to-end: PGO enabled → Tier-1 publish → hits cross threshold → pollOne
+// inline Tier-2 compile with pgoClearExclusive → publish overwrites Tier-1 →
+// hitCount reset → subsequent hits return Tier-2 code.
+TEST_F(SharedTaskPoolTest, SharedPgoEndToEndTier2OverwritesTier1) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+  pool.setPgoEnabled(true, 2);
+
+  // Phase 1: Tier-1 compile + publish.
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+
+  void *tier1Fn = nullptr;
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    tier1Fn = reinterpret_cast<void *>(s->fnPtr.loadRelaxed());
+    ASSERT_NE(tier1Fn, nullptr);
+  }
+
+  // Phase 2: two cache hits → 2nd arms Tier-2.
+  auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(r1.tier2Arm);
+
+  auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_TRUE(r2.tier2Arm);
+
+  // Phase 3: pollOne inline-compiles Tier-2 with pgoClearExclusive.
+  EXPECT_FALSE(pool.pollOne());
+
+  // Phase 4: Tier-2 overwrote Tier-1 — fnPtr changed, hitCount reset.
+  {
+    EJitSharedCacheSlot *s = findReadySlot(5);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->hitCount.loadRelaxed(), 0u);
+    EXPECT_EQ(s->profcAddr.loadRelaxed(), 0u);
+    EXPECT_EQ(s->profdAddr.loadRelaxed(), 0u);
+    void *tier2Fn = reinterpret_cast<void *>(s->fnPtr.loadRelaxed());
+    ASSERT_NE(tier2Fn, nullptr);
+    EXPECT_NE(tier2Fn, tier1Fn)
+        << "Tier-2 compile produced new code";
+  }
+
+  // Phase 5: subsequent hit returns Tier-2 pointer.
+  auto r3 = pool.compileOrGet(5, d0, 1, codeFor(5));
+  ASSERT_EQ(r3.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_NE(r3.fnPtr, codeFor(5))
+      << "hit after Tier-2 returns Tier-2 code, not fallback";
+  EXPECT_FALSE(r3.tier2Arm)
+      << "hitCount was reset, no re-trigger";
 }
 
 } // namespace

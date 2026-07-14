@@ -282,6 +282,10 @@ public:
     /// This flag is an internal control signal; it does not affect status
     /// mapping or the C ABI.
     bool fastPathTerminal = false;
+    /// PGO (§6): set when this hit crosses the Tier-2 threshold — compileOrGet()
+    /// enqueues a one-shot Tier-2 (PGOUse) recompile. (Shared equivalent of
+    /// the non-shared CompileOrGetResult::tier2Arm.)
+    bool tier2Arm = false;
   };
   static_assert(kEJitSharedCacheBuckets < 255,
                 "bucketIndex is a uint8_t: the bucket count and its sentinel "
@@ -391,6 +395,19 @@ public:
   /// shared state during init(). After the blob is Ready this only stages the
   /// desired mode; use setSharedMode() to change the live cross-core mode.
   void setMode(EJitCompileMode mode) { configuredMode_ = mode; }
+
+  /// PGO (§6): enable the online-PGO Tier-2 auto-trigger on the shared
+  /// taskpool.  When enabled, every cache hit atomically increments the
+  /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
+  /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
+  /// the trigger (hits are still counted).
+  void setPgoEnabled(bool enable, uint32_t threshold) {
+    pgoEnabled_ = enable;
+    tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
+  }
+
+  /// True when the shared PGO auto-trigger is armed.
+  bool isPgoEnabled() const { return pgoEnabled_; }
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -605,6 +622,11 @@ private:
     /// first-touch path (which self-revalidates), so the seqlock caller must not
     /// second-guess it with the bucket publishSeq check.
     bool coldPrepared = false;
+    /// PGO (§6): set when this hit crosses the Tier-2 threshold, arming
+    /// a one-shot lazy enqueue of a PGOUse recompile. compileOrGet()
+    /// consumes it on the fast-hit path. (Shared equivalent of
+    /// EJitCacheLookupResult::tier2Arm.)
+    bool tier2Arm = false;
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -673,7 +695,8 @@ private:
   /// callers do those first).
   CompileOrGetResult classifyHit(const SharedLookup &Hit);
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
-                                 const EJitCompiledCodeInfo *info);
+                                 const EJitCompiledCodeInfo *info,
+                                 bool pgoClearExclusive = false);
 
   /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
   /// expensive per-core execute-permission preparation (split + enable_ex)
@@ -722,7 +745,7 @@ private:
   /// stale worker (older gen) therefore cannot clear a newer generation's bit.
   void dedupClear(uint32_t funcIndex, uint32_t gen);
 
-  void runCompile(const EJitCompileRequest &req);
+  void runCompile(const EJitCompileRequest &req, bool pgoClearExclusive = false);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -760,6 +783,11 @@ private:
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables
   // the cache. See setReleaser().
   bool icacheReclamationSafe_ = true;
+
+  bool pgoEnabled_ = false; // PGO (§6): gates the Tier-2 trigger
+  EJitAtomicU32 tier2Threshold_{0}; // PGO: threshold for Tier-2 arming
+  bool tier2Pending_{false}; // PGO: set by compileOrGet, cleared by pollOne
+  EJitCompileRequest tier2PendingReq_{}; // PGO: pending Tier-2 request data
 
   // Worker observability + startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};

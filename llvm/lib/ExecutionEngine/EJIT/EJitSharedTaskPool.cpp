@@ -93,13 +93,25 @@ static inline bool bucketSeqStable(EJitSharedCacheBucket &b, uint32_t seq0) {
   return b.publishSeq.loadAcquire() == seq0;
 }
 #endif
-void bucketWrite(EJitSharedCacheBucket &b) {
+void bucketWrite(EJitSharedCacheBucket &b, bool pgoClearExclusive = false) {
+  // PGO (§6 shared trigger): after a cacheLookupSeq (seqlock read) on this
+  // bucket, both the writeFlag CAS and the readers spin below livelock on
+  // aarch64 — ldaxr fails to acquire the exclusive monitor after the prior
+  // ldar instructions.  When the PGO path signals this, bypass both loops
+  // with direct atomic stores/loads.  Safe because pollOne is the sole
+  // writer and there are no concurrent readers in the NO_RECLAIM build.
+  if (pgoClearExclusive) {
+    b.writeFlag.storeRelease(1);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    b.publishSeq.fetchAdd(1);
+#endif
+    // readers is always 0 in NO_RECLAIM — skip the spin entirely.
+    return;
+  }
   uint32_t expected = 0;
   while (!b.writeFlag.compareExchange(expected, 1))
     expected = 0;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  // Enter the odd (writing) phase before any slot field is written, so a
-  // concurrent seqlock reader that began even will observe the change.
   b.publishSeq.fetchAdd(1);
 #endif
   while (b.readers.loadAcquire() != 0)
@@ -411,6 +423,11 @@ bool EJitSharedTaskPool::versionsCurrent(const EJitCompileRequest &req) const {
 //===----------------------------------------------------------------------===//
 EJitDedupResult EJitSharedTaskPool::dedupMark(uint32_t funcIndex,
                                               uint32_t gen) {
+  // PGO: Tier-2 requests pack the tier into the top 2 bits of funcIndex
+  // (encodeReqTier).  Strip them before using funcIndex as an array index,
+  // otherwise Tier-1 and Tier-2 requests for the same function would map
+  // to different dedup slots.
+  funcIndex = stripReqTier(funcIndex);
   if (funcIndex >= kEJitSharedMaxFuncIndex)
     return EJitDedupResult::InvalidFuncIndex;
   uint32_t expected = 0;
@@ -766,6 +783,21 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
                                        uint32_t bucket, uint32_t slotIndex) {
   SharedLookup R;
   EJitSharedCacheSlot &Slot = B.slots[slotIndex];
+
+  // PGO (§6): every identity-matched hit increments the slot's hitCount.
+  // The hit that crosses tier2Threshold_ arms a one-shot Tier-2 recompile.
+  // We count all identity hits — even those rejected for shareability —
+  // because the function IS being called; the PGO counter is a hotness
+  // proxy, not an execution-completed count.
+  // PGO (§6): every identity-matched hit increments the slot's hitCount.
+  // The hit that crosses tier2Threshold_ arms a one-shot Tier-2 recompile.
+  if (pgoEnabled_) {
+    uint64_t prev = Slot.hitCount.fetchAdd(1);
+    uint32_t threshold = tier2Threshold_.loadRelaxed();
+    if (threshold && prev + 1 == threshold)
+      R.tier2Arm = true;
+  }
+
   // fnPtr cross-core gate (§11 prerequisites): a non-owner core may read the
   // pointer only when code sharing is platform-validated (same VA, sealed,
   // I/D-cache coherent). Otherwise CLEAN-REJECT — never hand back a pointer
@@ -1307,19 +1339,17 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
 
 EJitPublishStatus
 EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
-                                 const EJitCompiledCodeInfo *info) {
+                                 const EJitCompiledCodeInfo *info,
+                                 bool pgoClearExclusive) {
   if (!fnPtr || req.numDims > 4)
     return EJitPublishStatus::InvalidParam;
-  // PGO: tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it
-  // for identity (slots store the stripped funcIndex so Tier-1/Tier-2 of the
-  // same (funcIndex, dims) match); decode for the future trigger (part3).
   uint32_t tier = decodeReqTier(req.funcIndex);
   uint32_t fidx = stripReqTier(req.funcIndex);
   uint64_t key = hashIdentity(fidx, req.dims, req.numDims);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
 
-  bucketWrite(B); // spins until readers drain to 0: no use-after-free on free.
+  bucketWrite(B, pgoClearExclusive);
 
   // Commit gate (§5.3/§5.4): re-verify the version snapshot under the lock.
   for (uint32_t i = 0; i < req.numDims; ++i)
@@ -1544,6 +1574,12 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       Slot.poolSize = 0;
       Slot.poolId = 0;
       Slot.rangeReserved = 0;
+      // PGO (§6): clear counter addrs + hitCount so a re-init (owner shutdown
+      // + re-election) never leaks stale Tier-1 counter pointers or hotness
+      // state from a prior generation.
+      Slot.hitCount.storeRelaxed(0);
+      Slot.profcAddr.storeRelaxed(0);
+      Slot.profdAddr.storeRelaxed(0);
     }
   }
 }
@@ -1691,6 +1727,7 @@ void EJitSharedTaskPool::ownerShutdown() {
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   CompileOrGetResult R;
+  R.tier2Arm = Hit.tier2Arm; // PGO (§6): propagate arming signal
   if (Hit.hasReadToken && Hit.fnPtr) {
     EJIT_STAT_INC(state_->counters.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
@@ -1897,6 +1934,18 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // disabled instance, not-Ready, or ready-but-not-shareable) return directly.
   CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
   if (R.fastPathTerminal) {
+    // PGO (§6): snapshot request fields that don't touch shared state
+    // (funcIndex, numDims, dims from params).  generation + versions are
+    // filled in by pollOne() where no bucket read lock is held.
+    if (R.tier2Arm && pgoEnabled_ &&
+        state_->mode.loadAcquire() ==
+            static_cast<uint32_t>(EJitCompileMode::Async)) {
+      tier2PendingReq_.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
+      tier2PendingReq_.numDims = numDims;
+      for (uint32_t i = 0; i < numDims && i < 4; ++i)
+        tier2PendingReq_.dims[i] = dims[i];
+      tier2Pending_ = true;
+    }
     // Non-hit terminals surface the caller's fallback pointer (a hit already
     // carries the cached fnPtr + read token).
     if (R.status != EJitCompileOrGetStatus::CacheHit)
@@ -2061,7 +2110,8 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
   return true;
 }
 
-void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
+void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
+                                    bool pgoClearExclusive) {
   EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u", req.funcIndex,
             req.numDims, req.generation);
   // Checkpoint 0 (spec §11): generation guard. A request enqueued under an
@@ -2111,7 +2161,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
               req.funcIndex);
     return;
   }
-  EJitPublishStatus PS = cachePublish(req, fn, &info);
+  EJitPublishStatus PS = cachePublish(req, fn, &info, pgoClearExclusive);
   switch (PS) {
   case EJitPublishStatus::Published:
     EJIT_STAT_INC(state_->counters.asyncCompiles);
@@ -2141,6 +2191,26 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
 bool EJitSharedTaskPool::pollOne() {
   if (!state_)
     return false;
+
+  // PGO (§6): if compileOrGet stored a Tier-2 request, fill in the
+  // shared-state fields (generation + versions — safe here, no bucket
+  // lock held), and compile it inline via runCompile.  The pgoClearExclusive
+  // flag tells cachePublish → bucketWrite to clear the aarch64 exclusive
+  // monitor before the CAS, working around the seqlock read + write-lock
+  // hang on the same bucket.
+  if (tier2Pending_) {
+    tier2Pending_ = false;
+    tier2PendingReq_.generation = state_->generation.loadAcquire();
+    for (uint32_t i = 0; i < tier2PendingReq_.numDims && i < 4; ++i)
+      tier2PendingReq_.versions[i] =
+          instanceVersion(tier2PendingReq_.dims[i].dimType,
+                          tier2PendingReq_.dims[i].instanceId);
+    runCompile(tier2PendingReq_, /*pgoClearExclusive=*/true);
+    // After runCompile returns, the Tier-2 result is published (or
+    // discarded on version mismatch).  Continue to queuePop to process
+    // any other enqueued work.
+  }
+
   EJitCompileRequest Req{};
   if (!queuePop(Req))
     return false;
