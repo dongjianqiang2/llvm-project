@@ -102,6 +102,10 @@ typedef struct {
   bool forceStaticRegistry;
   /// If non-NULL, dump JIT-optimized LLVM IR (.ll) to this directory.
   const char *dumpJITDir;
+  /// Enable online PGO (Tier-1 instrumentation + lazy Tier-2 PGOUse recompile).
+  /// Off by default.  Requires the runtime to be linked with LLVMProfileData +
+  /// LLVMInstrumentation (lipo includes them when this flag is anticipated).
+  bool enablePgo;
 } ejit_config_t;
 
 typedef struct {
