@@ -249,6 +249,215 @@ TEST(EJitPgo, Tier2PgoInlinesHotCallee) {
   EXPECT_FALSE(hasCallToBar);
 }
 
+namespace {
+// bar(i32 %x): medium-sized callee (~80 instructions, 7 basic blocks,
+// loads/stores to alloca'd locals + arithmetic). The static inline cost
+// exceeds the default threshold (225), so AOT buildModuleInlinerPipeline
+// cannot inline it. But PGO hot profile (entry count=1000, hot call site
+// in foo) lifts the threshold to 3000, letting the JIT PGO inliner inline
+// it at Tier-2. This is the key EJIT PGO value proposition for inlining:
+// AOT-static-skipped, JIT-PGO-hot-inlined.
+std::unique_ptr<Module> makeFooCallsMediumBarModule(LLVMContext &Ctx) {
+  auto M = std::make_unique<Module>("pgo_medium_inline", Ctx);
+  auto *I32 = Type::getInt32Ty(Ctx);
+
+  // bar(i32 %x): medium-sized callee with 6 basic blocks (entry + 4
+  // compute-blocks + 1 merge-block + exit). The 4 compute blocks form
+  // 2 if-else pairs — each pair tests a bit of %x and dispatches to
+  // one of two blocks. Both paths then converge at a merge block.
+  //
+  // Every compute/merge block loads 3 i32 slots from a local alloca,
+  // performs mul+add+ashr on each, and stores the results back. The
+  // alloca'd slots live on the per-call stack frame — the inliner
+  // cannot SROA them away during cost analysis.
+  //
+  // Total: ~36 loads + ~36 stores + ~36 arithmetic ops ≈ 108
+  // non-simplifiable instructions, plus basic-block overhead.
+  // Static inline cost lands in the 250–400 range — above the default
+  // 225 threshold (AOT would skip) but safely below the hot-call-site
+  // 3000 threshold (JIT PGO inliner accepts when profile marks call hot).
+  auto *BarFnTy = FunctionType::get(I32, {I32}, false);
+  auto *Bar = Function::Create(BarFnTy, Function::ExternalLinkage, "bar", M.get());
+
+  // Helper: add a load−compute−store sequence on slots [0..2] of Arr.
+  auto emitComputeOnSlots = [&](IRBuilder<> &B, AllocaInst *Arr, int seed) {
+    for (int i = 0; i < 3; ++i) {
+      Value *GEP = B.CreateConstGEP2_32(ArrayType::get(I32, 3), Arr, 0, i);
+      Value *V = B.CreateLoad(I32, GEP);
+      Value *M = B.CreateMul(V, ConstantInt::get(I32, seed * 7 + 3 + i));
+      Value *A = B.CreateAdd(M, ConstantInt::get(I32, seed * 11 + 5 + i));
+      Value *S = B.CreateAShr(A, ConstantInt::get(I32, (i + seed) % 3 + 1));
+      B.CreateStore(S, GEP);
+    }
+  };
+
+  {
+    // Entry: alloca [3 x i32], init slots with x+0, x+1, x+2, branch
+    // based on bit 0 of the argument.
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Bar);
+    IRBuilder<> B(Entry);
+    AllocaInst *Arr = B.CreateAlloca(ArrayType::get(I32, 3));
+    for (int i = 0; i < 3; ++i) {
+      Value *GEP = B.CreateConstGEP2_32(ArrayType::get(I32, 3), Arr, 0, i);
+      B.CreateStore(B.CreateAdd(Bar->getArg(0), ConstantInt::get(I32, i)),
+                    GEP);
+    }
+
+    BasicBlock *CompA = BasicBlock::Create(Ctx, "compA", Bar);
+    BasicBlock *CompB = BasicBlock::Create(Ctx, "compB", Bar);
+    BasicBlock *Merge1 = BasicBlock::Create(Ctx, "merge1", Bar);
+
+    Value *Bit0 = B.CreateAnd(Bar->getArg(0), ConstantInt::get(I32, 1));
+    Value *Cmp0 = B.CreateICmpEQ(Bit0, ConstantInt::get(I32, 0));
+    B.CreateCondBr(Cmp0, CompA, CompB);
+
+    // compA (bit 0 == 0): compute on slots, then → merge1.
+    { IRBuilder<> BA(CompA); emitComputeOnSlots(BA, Arr, 1); BA.CreateBr(Merge1); }
+    // compB (bit 0 == 1): compute on slots, then → merge1.
+    { IRBuilder<> BB_(CompB); emitComputeOnSlots(BB_, Arr, 2); BB_.CreateBr(Merge1); }
+
+    // merge1: compute on slots again, then dispatch on bit 1.
+    BasicBlock *CompC = BasicBlock::Create(Ctx, "compC", Bar);
+    BasicBlock *CompD = BasicBlock::Create(Ctx, "compD", Bar);
+    BasicBlock *Exit  = BasicBlock::Create(Ctx, "exit",  Bar);
+
+    { IRBuilder<> BM1(Merge1);
+      emitComputeOnSlots(BM1, Arr, 3);
+      Value *Bit1 = BM1.CreateAnd(Bar->getArg(0), ConstantInt::get(I32, 2));
+      Value *Cmp1 = BM1.CreateICmpEQ(Bit1, ConstantInt::get(I32, 0));
+      BM1.CreateCondBr(Cmp1, CompC, CompD); }
+
+    { IRBuilder<> BC(CompC); emitComputeOnSlots(BC, Arr, 4); BC.CreateBr(Exit); }
+    { IRBuilder<> BD(CompD); emitComputeOnSlots(BD, Arr, 5); BD.CreateBr(Exit); }
+
+    // Exit: load all 3 slots, sum them, add the original argument, return.
+    { IRBuilder<> BX(Exit);
+      Value *Sum = ConstantInt::get(I32, 0);
+      for (int i = 0; i < 3; ++i) {
+        Value *GEP = BX.CreateConstGEP2_32(ArrayType::get(I32, 3), Arr, 0, i);
+        Value *V = BX.CreateLoad(I32, GEP);
+        Sum = BX.CreateAdd(Sum, V);
+      }
+      BX.CreateRet(BX.CreateAdd(Sum, Bar->getArg(0))); }
+  }
+
+  // foo(i32 %n): calls bar(%n) and returns the result.
+  auto *FooFnTy = FunctionType::get(I32, {I32}, false);
+  auto *Foo = Function::Create(FooFnTy, Function::ExternalLinkage, "foo", M.get());
+  {
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Foo);
+    IRBuilder<> B(BB);
+    Value *V = B.CreateCall(Bar, {Foo->getArg(0)});
+    B.CreateRet(V);
+  }
+
+  return M;
+}
+} // namespace
+
+// PGO stage 3: a callee whose static inline cost exceeds the AOT default
+// threshold (225) but fits within the PGO hot threshold (3000). AOT's
+// buildModuleInlinerPipeline skips it; the JIT PGO inliner (Tier-2
+// PGOUse + ModuleInlinerWrapperPass) inlines it when the profile marks
+// the call site as hot.
+//
+// This is the EJIT online PGO inlining value proposition (§0/§12 stage 3):
+// the callee is too expensive for blind static inlining but becomes
+// worthwhile when real execution counts prove it's hot.
+TEST(EJitPgo, Tier2PgoInlinesAotRejectedCallee) {
+  LLVMContext Ctx;
+  auto M0 = makeFooCallsMediumBarModule(Ctx);
+  PeriodArrayRegistry reg;
+  EJitOptimizer opt(reg);
+
+  // Step 1 — Tier-1: instrument foo and bar, capture their FuncHash +
+  // NumCounters for profile synthesis.
+  auto M1 = CloneModule(*M0);
+  SpecializationContext sc1;
+  sc1.fnName = "foo";
+  sc1.tier = CompileTier::Instrumented;
+  opt.runPipeline(*M1, sc1);
+  uint64_t fooHash = 0, barHash = 0;
+  unsigned fooCnt = 0, barCnt = 0;
+  ASSERT_TRUE(readCounterInfo(*M1, "foo", fooHash, fooCnt));
+  ASSERT_TRUE(readCounterInfo(*M1, "bar", barHash, barCnt));
+
+  // Step 2 — synthesize a hot profile: use a high uniform count so both
+  // foo's and bar's entry counts sit above the profile-summary hot
+  // percentile.  When the caller foo's entry block carries a hot-enough
+  // profile count (> 80th percentile of the summary) the call to bar is
+  // classified as a hot call site, and the DefaultInlineAdvisor applies
+  // HotCallSiteThreshold (3000) instead of the static default (225).
+  // Bar's ~250-400 static cost then fits comfortably under 3000.
+  InstrProfWriter Writer;
+  consumeError(Writer.mergeProfileKind(InstrProfKind::IRInstrumentation));
+  auto addRec = [&](const char *name, uint64_t hash, unsigned cnt,
+                    uint64_t val) {
+    std::vector<uint64_t> C(cnt, 0);
+    C[0] = val;
+    NamedInstrProfRecord Rec(name, hash, C);
+    Writer.addRecord(std::move(Rec), 1, [](Error) {});
+  };
+  addRec("foo", fooHash, fooCnt, 10000);
+  addRec("bar", barHash, barCnt, 10000);
+  auto Buf = Writer.writeBuffer();
+  ASSERT_NE(Buf, nullptr);
+
+  // Step 3 — Tier-2 PGOUse + PGO inline: the hot profile enables the
+  // inliner to use the elevated hot threshold and inline bar into foo.
+  opt.clearAnalyses();
+  auto M2 = CloneModule(*M0);
+  SpecializationContext sc2;
+  sc2.fnName = "foo";
+  sc2.tier = CompileTier::PGOUse;
+  sc2.profileData = std::string(Buf->getBuffer());
+  opt.runPipeline(*M2, sc2);
+
+  // Verify: bar IS inlined into foo (no call to bar remains).
+  Function *Foo2 = M2->getFunction("foo");
+  ASSERT_NE(Foo2, nullptr);
+  bool hasCallToBar = false;
+  for (BasicBlock &BB : *Foo2)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "bar")
+          hasCallToBar = true;
+  EXPECT_FALSE(hasCallToBar)
+      << "PGO hot profile should inline medium callee that AOT would skip";
+}
+
+// Contrast test: without the PGO inliner (Baseline tier), the medium-sized
+// callee bar is NOT inlined. The Baseline path does not run any inline pass
+// (AOT pre-inline already handled small callees; medium ones remain as
+// calls). This establishes the baseline against which Tier2PgoInlinesAotRejectedCallee
+// proves PGO inline adds value.
+TEST(EJitPgo, BaselineDoesNotInlineMediumCallee) {
+  LLVMContext Ctx;
+  auto M0 = makeFooCallsMediumBarModule(Ctx);
+  PeriodArrayRegistry reg;
+  EJitOptimizer opt(reg);
+
+  // Baseline tier: specialization + main optimization pipeline, no inline pass.
+  SpecializationContext sc;
+  sc.fnName = "foo";
+  sc.tier = CompileTier::Baseline;
+  opt.runPipeline(*M0, sc);
+
+  // Verify: bar is NOT inlined (call to bar remains in foo).
+  Function *Foo = M0->getFunction("foo");
+  ASSERT_NE(Foo, nullptr);
+  bool hasCallToBar = false;
+  for (BasicBlock &BB : *Foo)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "bar")
+          hasCallToBar = true;
+  EXPECT_TRUE(hasCallToBar)
+      << "Baseline (no inline) should preserve call to medium callee — "
+         "this is what AOT pre-inline left behind";
+}
 
 // PGO: EJitProfileMerge reads the runtime __llvm_profile_data layout
 // (FuncHash@8, NumCounters@48) + counter values at profcAddr. Validate the
