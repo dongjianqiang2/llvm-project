@@ -1625,10 +1625,8 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
-  // v7 PGO fields: zero on a Baseline publish (PGO off / no Tier-1 counters).
+  // v7 PGO fields: zero on a Baseline publish (PGO off).
   EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
-  EXPECT_EQ(slot->profcAddr.loadRelaxed(), 0u);
-  EXPECT_EQ(slot->profdAddr.loadRelaxed(), 0u);
 }
 
 TEST_F(SharedTaskPoolTest, DumpDynamicPayloadsClearedOnInit) {
@@ -2680,8 +2678,6 @@ TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
     EJitSharedCacheSlot *s = findReadySlot(5);
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(s->hitCount.loadRelaxed(), 0u);
-    EXPECT_EQ(s->profcAddr.loadRelaxed(), 0u);
-    EXPECT_EQ(s->profdAddr.loadRelaxed(), 0u);
     EXPECT_NE(s->fnPtr.loadRelaxed(), 0u); // now has Tier-2 code
   }
 }
@@ -2843,8 +2839,6 @@ TEST_F(SharedTaskPoolTest, SharedPgoEndToEndTier2OverwritesTier1) {
     EJitSharedCacheSlot *s = findReadySlot(5);
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(s->hitCount.loadRelaxed(), 0u);
-    EXPECT_EQ(s->profcAddr.loadRelaxed(), 0u);
-    EXPECT_EQ(s->profdAddr.loadRelaxed(), 0u);
     void *tier2Fn = reinterpret_cast<void *>(s->fnPtr.loadRelaxed());
     ASSERT_NE(tier2Fn, nullptr);
     EXPECT_NE(tier2Fn, tier1Fn)

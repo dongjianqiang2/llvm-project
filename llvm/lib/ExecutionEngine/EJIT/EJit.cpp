@@ -287,8 +287,18 @@ EJit::EJit(const Config &config) : config_(config) {
         recordInitError(EJIT_ERR_COMPILE_FAILED,
                         "taskpool worker failed to start", "");
 #endif
-      else
+      else {
         EJIT_DIAG("taskpool async init complete: worker running");
+        // PGO opt-in: arm the Tier-2 auto-trigger when Config::enablePgo is set.
+        if (config_.enablePgo) {
+          constexpr uint32_t kDefaultPgoThreshold = 64;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+          compileDriver_->sharedTaskPool()->setPgoEnabled(true, kDefaultPgoThreshold);
+#else
+          compileDriver_->taskPool()->setPgoEnabled(true, kDefaultPgoThreshold);
+#endif
+        }
+      }
     } else {
       EJIT_DIAG_VERBOSE("taskpool sync init complete: worker remains stopped");
     }

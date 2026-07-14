@@ -101,12 +101,17 @@ void bucketWrite(EJitSharedCacheBucket &b, bool pgoClearExclusive = false) {
   // with direct atomic stores/loads.  Safe because pollOne is the sole
   // writer and there are no concurrent readers in the NO_RECLAIM build.
   if (pgoClearExclusive) {
-    b.writeFlag.storeRelease(1);
+    // PGO fast-path for NO_RECLAIM builds only.  Bypasses the writeFlag
+    // CAS (livelocks on aarch64 after seqlock read on the same cache line).
+    // Safe because pollOne is the sole writer and readers is always 0.
+    // In non-NO_RECLAIM builds the CAS is required for correctness (readers
+    // may be non-zero); the aarch64 livelock does not reproduce there.
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    b.writeFlag.storeRelease(1);
     b.publishSeq.fetchAdd(1);
+    return; // readers is always 0 — skip the spin
 #endif
-    // readers is always 0 in NO_RECLAIM — skip the spin entirely.
-    return;
+    // (non-NO_RECLAIM: fall through to the normal CAS path below)
   }
   uint32_t expected = 0;
   while (!b.writeFlag.compareExchange(expected, 1))
@@ -600,7 +605,7 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // proxy, not an execution-completed count.
   // PGO (§6): every identity-matched hit increments the slot's hitCount.
   // The hit that crosses tier2Threshold_ arms a one-shot Tier-2 recompile.
-  if (pgoEnabled_) {
+  if (pgoEnabled_.loadRelaxed()) {
     uint64_t prev = Slot.hitCount.fetchAdd(1);
     uint32_t threshold = tier2Threshold_.loadRelaxed();
     if (threshold && prev + 1 == threshold)
@@ -1232,12 +1237,10 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   }
   target->rangeReserved = 0;
   target->fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
-  // PGO: reset stale hitCount + counter addrs on every publish (overwrite of a
-  // Tier-1 slot, or reuse of an evicted slot). Under the write lock + before
-  // state=Ready, so storeRelaxed is published by the Ready release (§7.1).
+  // PGO: reset hitCount on every publish (overwrite of a Tier-1 slot, or
+  // reuse of an evicted slot). Under the write lock + before state=Ready,
+  // so storeRelaxed is published by the Ready release (§7.1).
   target->hitCount.storeRelaxed(0);
-  target->profcAddr.storeRelaxed(0);
-  target->profdAddr.storeRelaxed(0);
   const uint32_t OwnerCore = state_->ownerCoreId.loadAcquire();
   target->executableCoreMask.storeRelease(
       OwnerCore < 64 ? (uint64_t{1} << OwnerCore) : 0);
@@ -1384,12 +1387,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       Slot.poolSize = 0;
       Slot.poolId = 0;
       Slot.rangeReserved = 0;
-      // PGO (§6): clear counter addrs + hitCount so a re-init (owner shutdown
-      // + re-election) never leaks stale Tier-1 counter pointers or hotness
-      // state from a prior generation.
+      // PGO (§6): clear hitCount so a re-init (owner shutdown + re-election)
+      // never leaks stale hotness state from a prior generation.
       Slot.hitCount.storeRelaxed(0);
-      Slot.profcAddr.storeRelaxed(0);
-      Slot.profdAddr.storeRelaxed(0);
     }
   }
 }
@@ -1742,14 +1742,14 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     // PGO (§6): snapshot request fields that don't touch shared state
     // (funcIndex, numDims, dims from params).  generation + versions are
     // filled in by pollOne() where no bucket read lock is held.
-    if (R.tier2Arm && pgoEnabled_ &&
+    if (R.tier2Arm && pgoEnabled_.loadRelaxed() &&
         state_->mode.loadAcquire() ==
             static_cast<uint32_t>(EJitCompileMode::Async)) {
       tier2PendingReq_.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
       tier2PendingReq_.numDims = numDims;
       for (uint32_t i = 0; i < numDims && i < 4; ++i)
         tier2PendingReq_.dims[i] = dims[i];
-      tier2Pending_ = true;
+      tier2Pending_.storeRelease(1);
     }
     // Non-hit terminals surface the caller's fallback pointer (a hit already
     // carries the cached fnPtr + read token).
@@ -2003,8 +2003,8 @@ bool EJitSharedTaskPool::pollOne() {
   // flag tells cachePublish → bucketWrite to clear the aarch64 exclusive
   // monitor before the CAS, working around the seqlock read + write-lock
   // hang on the same bucket.
-  if (tier2Pending_) {
-    tier2Pending_ = false;
+  if (tier2Pending_.loadAcquire()) {
+    tier2Pending_.storeRelease(0);
     tier2PendingReq_.generation = state_->generation.loadAcquire();
     for (uint32_t i = 0; i < tier2PendingReq_.numDims && i < 4; ++i)
       tier2PendingReq_.versions[i] =

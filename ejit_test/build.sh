@@ -191,6 +191,7 @@ ALL_TESTS=(
   ejit_ptr_period_test
   ejit_trace_test
   ejit_volatile_test
+  ejit_pgo_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -237,6 +238,7 @@ TEST_ARGS[ejit_lifecycle_test]="3 7 2"
 TEST_ARGS[ejit_multidim_test]="0"
 TEST_ARGS[ejit_nested_struct_test]="0"
 TEST_ARGS[ejit_trace_test]="0"
+TEST_ARGS[ejit_pgo_test]="0"
 TEST_ARGS[ejit_attr_test]="0"
 TEST_ARGS[ejit_config_api_test]="0"
 TEST_ARGS[ejit_perf_bench]="0 1"

@@ -286,12 +286,12 @@ public:
   /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
   /// the trigger (hits are still counted).
   void setPgoEnabled(bool enable, uint32_t threshold) {
-    pgoEnabled_ = enable;
+    pgoEnabled_.storeRelaxed(enable ? 1 : 0);
     tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
   }
 
   /// True when the shared PGO auto-trigger is armed.
-  bool isPgoEnabled() const { return pgoEnabled_; }
+  bool isPgoEnabled() const { return pgoEnabled_.loadRelaxed() != 0; }
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -590,9 +590,12 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
-  bool pgoEnabled_ = false; // PGO (§6): gates the Tier-2 trigger
+  EJitAtomicU8 pgoEnabled_{0}; // PGO (§6): gates the Tier-2 trigger (atomic —
+                               // read by compileOrGet/resolveMatchedSlot on any
+                               // core, written by setPgoEnabled on the owner)
   EJitAtomicU32 tier2Threshold_{0}; // PGO: threshold for Tier-2 arming
-  bool tier2Pending_{false}; // PGO: set by compileOrGet, cleared by pollOne
+  EJitAtomicU8 tier2Pending_{0}; // PGO: set by compileOrGet, cleared by pollOne
+                                 // (atomic — accessed by producer & worker threads)
   EJitCompileRequest tier2PendingReq_{}; // PGO: pending Tier-2 request data
 
   // Worker observability + startup-wait bound (owner-local).

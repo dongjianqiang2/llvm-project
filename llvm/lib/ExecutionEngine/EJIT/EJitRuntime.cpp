@@ -127,6 +127,7 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
   dst.forceStaticRegistry = src->forceStaticRegistry;
   if (src->dumpJITDir && src->dumpJITDir[0])
     dst.dumpJITDir = src->dumpJITDir;
+  dst.enablePgo = src->enablePgo;
 #ifdef EJIT_FREESTANDING
   dst.enableLogger = false;
 #endif
