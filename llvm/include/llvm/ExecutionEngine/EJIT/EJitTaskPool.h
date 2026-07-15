@@ -166,6 +166,10 @@ struct EJitCacheEntry {
   /// the bucket write lock (publish) and not read concurrently.
   uintptr_t profcAddr = 0;
   uintptr_t profdAddr = 0;
+  /// PGO: compile tier of the published code. 0=Baseline/empty, 1=Tier-1,
+  /// 2=Tier-2 (PGOUse).  Suppresses repeat Tier-2 triggers on already-Tier-2
+  /// slots (§4).  Written under the bucket write lock (publish).
+  uint8_t tier = 0;
 };
 
 //===----------------------------------------------------------------------===//

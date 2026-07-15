@@ -161,9 +161,16 @@ EJitCacheLookupResult EJitTaskPoolCache::lookup(uint32_t funcIndex,
     void *fn = reinterpret_cast<void *>(E.fnPtr);
     if (!fn)
       break;
-    uint64_t prev = E.hitCount.fetchAdd(1); // PGO: count the hit (§6)
-    if (tier2Threshold_ && prev + 1 == tier2Threshold_)
-      R.tier2Arm = true; // one-shot: the hit that crosses the threshold
+    // PGO (§6): only increment when a non-zero threshold is set (opt-in),
+    // and only when the slot is not already Tier-2 (§4 repeat-trigger).
+    uint64_t prev = 0;
+    uint32_t threshold = tier2Threshold_;
+    if (threshold && E.tier < kEJitTierPgoUse) {
+      prev = E.hitCount.fetchAdd(1);
+      // >= (not ==): retry after transient enqueue failure (§7).
+      if (prev + 1 >= threshold)
+        R.tier2Arm = true;
+    }
     R.fnPtr = fn;
     R.bucketIndex = bucket;
     R.hasReadToken = true;
@@ -228,6 +235,7 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     // recompile or Tier-2 upgrade); fresh entries are default-constructed to
     // 0. Under the write lock so plain fields are safe (§7.1).
     E.hitCount.storeRelaxed(0);
+    E.tier = static_cast<uint8_t>(tier);
     E.profcAddr = 0;
     E.profdAddr = 0;
     B.lock.writeRelease();
