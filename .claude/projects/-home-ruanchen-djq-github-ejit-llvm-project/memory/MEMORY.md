@@ -1,2 +1,0 @@
-- [EJIT PGO P0 test build](ejit-pgo-p0-test-build.md) - /tmp 独立 P0 测试的 llvm-config 构建配方 + aarch64 -O1 RA-bug 绕过
-- [EJIT online PGO status](ejit-pgo-online-status.md) - 在线 PGO 进度:v0.6,P0 全过,footprint 两维实测完(运行时 +640KB / bitcode Flash +14~22%),待选 plan vs 实现阶段0
