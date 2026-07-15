@@ -20,6 +20,8 @@
 #ifndef EJIT_FREESTANDING
 #include <chrono>
 #endif
+#include <cstddef>
+#include <type_traits>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -127,15 +129,33 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
   dst.forceStaticRegistry = src->forceStaticRegistry;
   if (src->dumpJITDir && src->dumpJITDir[0])
     dst.dumpJITDir = src->dumpJITDir;
-  dst.enablePgo = src->enablePgo;
+  // NOTE: online PGO is NOT read from ejit_config_t. The public struct keeps
+  // its original (unversioned) layout, so a caller compiled against an older
+  // header never gets a tail field over-read. PGO is opted in through the
+  // dedicated ejit_init_pgo() entry point instead (dst.enablePgo defaults to
+  // false).
 #ifdef EJIT_FREESTANDING
   dst.enableLogger = false;
 #endif
 }
 
-extern "C" {
+// Compile-time regression guard: the public ejit_config_t layout MUST stay
+// exactly as originally released (no new tail field), so ejit_init() never
+// over-reads an old caller's smaller struct. Online PGO is exposed additively
+// via ejit_init_pgo(), never by growing this struct. If a field is added,
+// these asserts fire and force an explicit, versioned ABI decision.
+static_assert(offsetof(ejit_config_t, compileMode) == 0,
+              "ejit_config_t.compileMode must stay first (ABI)");
+static_assert(sizeof(ejit_config_t) ==
+                  offsetof(ejit_config_t, dumpJITDir) + sizeof(const char *),
+              "ejit_config_t must end at dumpJITDir (no online-PGO tail field "
+              "may be appended; use ejit_init_pgo instead)");
+static_assert(std::is_standard_layout<ejit_config_t>::value,
+              "ejit_config_t must be standard-layout for a stable C ABI");
 
-ejit_status_t ejit_init(const ejit_config_t *config) {
+// Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
+// the online-PGO auto-trigger on regardless of the (unversioned) config.
+static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
   if (gEJIT) {
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
@@ -143,6 +163,8 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
 
   Config cfg;
   parseConfig(config, cfg);
+  if (forcePgo)
+    cfg.enablePgo = true;
 
   gEJIT = new (std::nothrow) EJit(cfg);
   if (!gEJIT) {
@@ -167,10 +189,20 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   bindDumpSharedStateFromRuntime();
 #endif
-  EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u",
+  EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u pgo=%d",
             (int)cfg.compileMode, (int)cfg.optLevel, cfg.maxCacheSize,
-            (unsigned)cfg.maxCacheEntries);
+            (unsigned)cfg.maxCacheEntries, (int)cfg.enablePgo);
   return EJIT_OK;
+}
+
+extern "C" {
+
+ejit_status_t ejit_init(const ejit_config_t *config) {
+  return ejitInitImpl(config, /*forcePgo=*/false);
+}
+
+ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
+  return ejitInitImpl(config, /*forcePgo=*/true);
 }
 
 void ejit_shutdown(void) {

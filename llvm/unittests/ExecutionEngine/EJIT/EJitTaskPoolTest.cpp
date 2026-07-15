@@ -406,6 +406,10 @@ TEST(EJitCacheTest, PublishTier2StripsTierAndOverwritesTier1) {
 TEST(EJitCacheTest, HitIncrementsHitCount) {
   EJitSwitchController S;
   EJitTaskPoolCache C(S);
+  // hitCount is only accumulated when a PGO Tier-2 threshold is armed (PGO off
+  // has zero atomic-RMW overhead). Set a high threshold so hits are counted but
+  // never cross into a Tier-2 arm.
+  C.setTier2Threshold(100);
   EJitDimPair D[1] = {{0, 1}};
   uint32_t versions[1] = {0};
   EXPECT_EQ(C.publish(10, D, 1, versions, reinterpret_cast<void *>(&DummyFn0)),

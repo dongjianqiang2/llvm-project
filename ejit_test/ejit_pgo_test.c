@@ -41,11 +41,16 @@ int main(int argc, char **argv) {
 
   ejit_config_t cfg;
   ejit_default_config(&cfg);
-  cfg.enablePgo = true;
   printf("PGO enabled, mode=%d\n", (int)cfg.compileMode);
 
-  int rc = (int)ejit_init(&cfg);
-  if (rc != EJIT_OK) { printf("FAIL: ejit_init=%d\n", rc); return 1; }
+  // Online PGO is opted in through the dedicated, ABI-stable ejit_init_pgo()
+  // entry point (ejit_config_t keeps its original layout — no enablePgo tail
+  // field). Plain ejit_init() would run with PGO off.
+  int rc = (int)ejit_init_pgo(&cfg);
+  if (rc != EJIT_OK) {
+    printf("FAIL: ejit_init_pgo=%d\n", rc);
+    return 1;
+  }
 
   ejit_activate("cell", ci);
   g_cells[ci].cellType = 0xFF;

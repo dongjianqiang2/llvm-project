@@ -149,7 +149,15 @@ void EJitOptimizer::runPipeline(Module &M,
     runLightOptPipeline(M);
     ModulePassManager GenMPM;
     GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
-    GenMPM.addPass(InstrProfilingLoweringPass());
+    // Tier-1 machine code is SHARED and executed concurrently by multiple cores
+    // (shared taskpool). A plain __profc_* load/add/store would lose counts and
+    // let Tier-2 profile synthesis read a torn value. Lower with atomic counter
+    // updates (InstrProfOptions.Atomic) so each increment is an `atomicrmw add`
+    // (§5). Cost is confined to the temporary Tier-1 build; the final Baseline
+    // / Tier-2 (PGOUse) machine code carries no profiling instrumentation.
+    InstrProfOptions InstrProfOpts;
+    InstrProfOpts.Atomic = true;
+    GenMPM.addPass(InstrProfilingLoweringPass(InstrProfOpts));
     GenMPM.run(M, MAM_);
     captureCounterGlobals(M);
     EJIT_DIAG_VERBOSE("pipeline done (Tier-1) func=%s key=0x%016lx counters=%zu",

@@ -57,7 +57,15 @@ std::string ejit::synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters) {
       continue;
     const auto *CounterArray =
         reinterpret_cast<const uint64_t *>(C.profcAddr);
-    std::vector<uint64_t> Counts(CounterArray, CounterArray + NumCounters);
+    // The __profc_* counters are being updated concurrently by shared Tier-1
+    // machine code with `atomicrmw add` (§5). Read each counter with a RELAXED
+    // atomic load so this synthesis never tears a value another core is mid-way
+    // updating (a plain copy is a data race). Typed uint64_t scalar loads keep
+    // this endian-safe on aarch64_be (no byte-wise counter parsing).
+    std::vector<uint64_t> Counts;
+    Counts.reserve(NumCounters);
+    for (uint32_t i = 0; i < NumCounters; ++i)
+      Counts.push_back(__atomic_load_n(&CounterArray[i], __ATOMIC_RELAXED));
     NamedInstrProfRecord Rec(C.pgoName, FuncHash, std::move(Counts));
     Writer.addRecord(std::move(Rec), 1, [](Error) {});
   }

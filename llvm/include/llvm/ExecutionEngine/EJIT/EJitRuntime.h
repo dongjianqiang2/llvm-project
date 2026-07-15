@@ -102,10 +102,6 @@ typedef struct {
   bool forceStaticRegistry;
   /// If non-NULL, dump JIT-optimized LLVM IR (.ll) to this directory.
   const char *dumpJITDir;
-  /// Enable online PGO (Tier-1 instrumentation + lazy Tier-2 PGOUse recompile).
-  /// Off by default.  Requires the runtime to be linked with LLVMProfileData +
-  /// LLVMInstrumentation (lipo includes them when this flag is anticipated).
-  bool enablePgo;
 } ejit_config_t;
 
 typedef struct {
@@ -140,6 +136,14 @@ typedef struct {
 
 // Initialization
 ejit_status_t ejit_init(const ejit_config_t *config);
+/// Initialize with online PGO enabled (Tier-1 instrumentation + lazy Tier-2
+/// PGOUse recompile). Additive, ABI-compatible entry point: `ejit_config_t`
+/// keeps its original layout (no versioned tail field), so an old caller's
+/// struct is never over-read. Behaves exactly like ejit_init(config) but forces
+/// the runtime's online-PGO auto-trigger on. Requires the runtime to be linked
+/// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
+/// treats this as ejit_init). PGO is off for plain ejit_init().
+ejit_status_t ejit_init_pgo(const ejit_config_t *config);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)

@@ -21,6 +21,17 @@ add_llvm_unittest(EJITTests
   PARTIAL_SOURCES_INTENDED
   )
 
+# EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only
+# referenced at runtime (no CMake dependency edge), so when listed via
+# LLVM_LINK_COMPONENTS it can be ordered BEFORE LLVMEJIT on the static link
+# line and its LLVMInitialize<T>AsmParser symbol is dropped. Append each built
+# target's AsmParser lib AFTER the target so the reference resolves.
+foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
+  if(TARGET LLVM${ejit_target}AsmParser)
+    target_link_libraries(EJITTests PRIVATE LLVM${ejit_target}AsmParser)
+  endif()
+endforeach()
+
 # SRE code pool tests live in their own executable so they build and run
 # independently of EJITTests (host-runnable: mock allocator + mock enable_ex,
 # no real SRE symbols required).
