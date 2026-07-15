@@ -796,11 +796,18 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // proxy, not an execution-completed count.
   // PGO (§6): every identity-matched hit increments the slot's hitCount.
   // The hit that crosses tier2Threshold_ arms a one-shot Tier-2 recompile.
+  // A slot already at Tier-2 (PGOUse) is never re-armed — Tier-2 code does
+  // not need another Tier-2 compile (§4 repeat-trigger).
   if (pgoEnabled_.loadRelaxed()) {
-    uint64_t prev = Slot.hitCount.fetchAdd(1);
-    uint32_t threshold = tier2Threshold_.loadRelaxed();
-    if (threshold && prev + 1 == threshold)
-      R.tier2Arm = true;
+    uint8_t slotTier = Slot.tier.loadRelaxed();
+    if (slotTier < kEJitTierPgoUse) {
+      uint64_t prev = Slot.hitCount.fetchAdd(1);
+      uint32_t threshold = tier2Threshold_.loadRelaxed();
+      // >= (not ==): if the enqueue fails (queue full / already pending),
+      // the next hit can still arm — a transient failure is not fatal (§7).
+      if (threshold && prev + 1 >= threshold)
+        R.tier2Arm = true;
+    }
   }
 
   // fnPtr cross-core gate (§11 prerequisites): a non-owner core may read the
@@ -1428,10 +1435,11 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   }
   target->rangeReserved = 0;
   target->fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
-  // PGO: reset hitCount on every publish (overwrite of a Tier-1 slot, or
-  // reuse of an evicted slot). Under the write lock + before state=Ready,
-  // so storeRelaxed is published by the Ready release (§7.1).
+  // PGO: reset hitCount on every publish.  Record the compile tier so
+  // resolveMatchedSlot can suppress the Tier-2 trigger on already-Tier-2
+  // slots (§4 repeat-trigger).  Under the write lock + before state=Ready.
   target->hitCount.storeRelaxed(0);
+  target->tier.storeRelaxed(static_cast<uint8_t>(tier));
   const uint32_t OwnerCore = state_->ownerCoreId.loadAcquire();
   target->executableCoreMask.storeRelease(
       OwnerCore < 64 ? (uint64_t{1} << OwnerCore) : 0);
@@ -1577,9 +1585,10 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       Slot.poolSize = 0;
       Slot.poolId = 0;
       Slot.rangeReserved = 0;
-      // PGO (§6): clear hitCount so a re-init (owner shutdown + re-election)
-      // never leaks stale hotness state from a prior generation.
+      // PGO (§6): clear hitCount + tier so a re-init never leaks stale
+      // hotness state or tier-tracking from a prior generation.
       Slot.hitCount.storeRelaxed(0);
+      Slot.tier.storeRelaxed(0);
     }
   }
 }
@@ -1934,9 +1943,11 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // disabled instance, not-Ready, or ready-but-not-shareable) return directly.
   CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
   if (R.fastPathTerminal) {
-    // PGO (§6): snapshot request fields that don't touch shared state
-    // (funcIndex, numDims, dims from params).  generation + versions are
-    // filled in by pollOne() where no bucket read lock is held.
+    // PGO (§6): snapshot the full request at arm time, including
+    // generation + versions from the matched cache slot.  The slot was
+    // validated by the seqlock read in resolveMatchedSlot, so its
+    // generation/versions are the Tier-1 publish epoch.  PollOne()
+    // no longer re-reads them — no TOCTOU between arm and poll.
     if (R.tier2Arm && pgoEnabled_.loadRelaxed() &&
         state_->mode.loadAcquire() ==
             static_cast<uint32_t>(EJitCompileMode::Async)) {
@@ -1944,6 +1955,21 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       tier2PendingReq_.numDims = numDims;
       for (uint32_t i = 0; i < numDims && i < 4; ++i)
         tier2PendingReq_.dims[i] = dims[i];
+      // Read generation + versions from the cache slot we just matched.
+      if (R.bucketIndex < kEJitSharedCacheBuckets) {
+        EJitSharedCacheBucket &B = state_->buckets[R.bucketIndex];
+        for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+          EJitSharedCacheSlot &Slot = B.slots[s];
+          if (Slot.state.loadAcquire() !=
+                  static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+              Slot.funcIndex != funcIndex || Slot.numDims != numDims)
+            continue;
+          tier2PendingReq_.generation = Slot.generation;
+          for (uint32_t i = 0; i < numDims && i < 4; ++i)
+            tier2PendingReq_.versions[i] = Slot.versions[i];
+          break;
+        }
+      }
       tier2Pending_.storeRelease(1);
     }
     // Non-hit terminals surface the caller's fallback pointer (a hit already
@@ -2200,11 +2226,18 @@ bool EJitSharedTaskPool::pollOne() {
   // hang on the same bucket.
   if (tier2Pending_.loadAcquire()) {
     tier2Pending_.storeRelease(0);
-    tier2PendingReq_.generation = state_->generation.loadAcquire();
-    for (uint32_t i = 0; i < tier2PendingReq_.numDims && i < 4; ++i)
-      tier2PendingReq_.versions[i] =
-          instanceVersion(tier2PendingReq_.dims[i].dimType,
-                          tier2PendingReq_.dims[i].instanceId);
+    // generation + versions are normally snapshotted from the cache slot
+    // at arm time.  In NO_RECLAIM builds R.bucketIndex is the sentinel
+    // (kEJitSharedCacheBuckets) so the slot scan is skipped; fill them
+    // in here as a fallback.  The arm-time snapshot (when available) is
+    // preferred because it avoids a TOCTOU between arm and poll.
+    if (tier2PendingReq_.generation == 0) {
+      tier2PendingReq_.generation = state_->generation.loadAcquire();
+      for (uint32_t i = 0; i < tier2PendingReq_.numDims && i < 4; ++i)
+        tier2PendingReq_.versions[i] =
+            instanceVersion(tier2PendingReq_.dims[i].dimType,
+                            tier2PendingReq_.dims[i].instanceId);
+    }
     runCompile(tier2PendingReq_, /*pgoClearExclusive=*/true);
     // After runCompile returns, the Tier-2 result is published (or
     // discarded on version mismatch).  Continue to queuePop to process

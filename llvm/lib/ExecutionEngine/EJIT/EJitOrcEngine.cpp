@@ -858,6 +858,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   // different specializations (same TU bitcode loaded multiple times)
   // never conflict. Remove any stale JD from a previous compilation
   // of the same cacheKey (e.g., after ejit_clear_cache).
+  // PGO: a Tier-2 recompile for the same cacheKey removes the Tier-1
+  // JITDylib BEFORE the new compile.  This is safe under code-pool v1
+  // (NO_RECLAIM) where slab memory is never freed, so existing Tier-1
+  // fnPtrs in the cache remain valid.  A future retain-until-publish
+  // path (deferring removeJITDylib until after cachePublish succeeds)
+  // would be needed for reclaimable memory managers (§5 JD lifecycle).
   auto it = P->specDylibs.find(cacheKey);
   if (it != P->specDylibs.end()) {
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))

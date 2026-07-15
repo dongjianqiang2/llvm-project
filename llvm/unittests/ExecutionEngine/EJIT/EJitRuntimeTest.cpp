@@ -1223,7 +1223,7 @@ TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
 
   PeriodArrayRegistry reg;
   EJitOptimizerTestAccess opt(reg);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 
   // No llvm.expect should remain.
   bool hasExpect = false;

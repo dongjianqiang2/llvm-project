@@ -789,10 +789,16 @@ private:
                                // core, written by setPgoEnabled on the owner)
   EJitAtomicU32 tier2Threshold_{0}; // PGO: threshold for Tier-2 arming
   EJitAtomicU8 tier2Pending_{0}; // PGO: set by compileOrGet, cleared by pollOne
-                                 // (atomic — accessed by producer & worker threads)
-  EJitCompileRequest tier2PendingReq_{}; // PGO: pending Tier-2 request data
+                                 // storeRelease/loadAcquire pairs with
+                                 // tier2PendingReq_ (the flag's acquire sees
+                                 // all plain stores the release ordered)
+  EJitCompileRequest tier2PendingReq_{}; // PGO: pending Tier-2 request data.
+                                 // Written BEFORE tier2Pending_.storeRelease(1);
+                                 // read AFTER tier2Pending_.loadAcquire().
+                                 // Single-producer by invariant: only the
+                                 // owner facade has pgoEnabled_=true.
 
-  // Worker observability + startup-wait bound (owner-local).
+  // Worker observability+ startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};
   EJitAtomicU32 workerWaitedForReady_{0};
   EJitAtomicU64 workerIdleYields_{0};
