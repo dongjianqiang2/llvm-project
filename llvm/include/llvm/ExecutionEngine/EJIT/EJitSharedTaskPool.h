@@ -301,10 +301,31 @@ public:
   void setPgoEnabled(bool enable, uint32_t threshold) {
     pgoEnabled_.storeRelaxed(enable ? 1 : 0);
     tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
+    if (!state_ ||
+        state_->initState.loadAcquire() !=
+            static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return;
+
+    // Publish the threshold before enabling so a peer that acquires the
+    // enabled flag also observes the matching threshold. Disable first when
+    // turning PGO off so no new hit can arm a Tier-2 request.
+    if (enable) {
+      state_->tier2Threshold.storeRelease(threshold);
+      state_->pgoEnabled.storeRelease(1);
+    } else {
+      state_->pgoEnabled.storeRelease(0);
+      state_->tier2Threshold.storeRelease(0);
+    }
   }
 
   /// True when the shared PGO auto-trigger is armed.
-  bool isPgoEnabled() const { return pgoEnabled_.loadRelaxed() != 0; }
+  bool isPgoEnabled() const {
+    if (state_ &&
+        state_->initState.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return state_->pgoEnabled.loadAcquire() != 0;
+    return pgoEnabled_.loadRelaxed() != 0;
+  }
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -632,10 +653,10 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
-  EJitAtomicU8 pgoEnabled_{0}; // PGO (§6): gates the Tier-2 trigger (atomic —
-                               // read by compileOrGet/resolveMatchedSlot on any
-                               // core, written by setPgoEnabled on the owner)
-  EJitAtomicU32 tier2Threshold_{0}; // PGO: threshold for Tier-2 arming
+  // Pre-init staging only. Once the shared blob is Ready, state_->pgoEnabled
+  // and state_->tier2Threshold are the cross-core source of truth.
+  EJitAtomicU8 pgoEnabled_{0};
+  EJitAtomicU32 tier2Threshold_{0};
   // PGO (§6): Tier-2 requests are NOT held in a facade-local bypass. A hit that
   // crosses the threshold (on ANY producer core / facade) submits a fully
   // value-initialized EJitCompileRequest through the shared MPSC queue, so the

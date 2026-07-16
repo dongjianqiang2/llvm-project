@@ -1594,12 +1594,12 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v6 layout: the slot carries the executable range as fixed-width,
+// Shared ABI layout: the slot carries the executable range as fixed-width,
 // naturally-aligned scalars (read back by value — endian-safe), the pool-split
 // table is POD, dump slots use dynamic payload pointers, and each bucket
 // carries the NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 7u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 8u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -1625,7 +1625,7 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
-  // v7 PGO fields: zero on a Baseline publish (PGO off).
+  // PGO fields: zero on a Baseline publish (PGO off).
   EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
 }
 
@@ -2944,16 +2944,37 @@ uint32_t bucketOfIdentity(uint32_t funcIndex, const EJitDimPair *dims,
   return static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
 }
 
-// Attach a non-owner producer facade on \p core to the shared blob, with PGO
-// armed at \p threshold (every facade arms PGO in the real runtime — the owner
-// invariant that "only the owner has pgoEnabled" was the bug being fixed).
+// Attach a non-owner producer facade on \p core. PGO configuration is read
+// from the shared blob; the peer must not need facade-local configuration.
 void attachPeer(EJitSharedTaskPool &peer, EJitSharedTaskPoolState *state,
-                uint32_t core, uint32_t threshold) {
+                uint32_t core) {
   EJitCoreId::setCurrentForTest(core);
   peer.bind(state);
   peer.setMode(EJitCompileMode::Async);
-  peer.setPgoEnabled(true, threshold);
   ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
+}
+
+TEST_F(SharedTaskPoolTest, PgoControlIsSharedAcrossFacades) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 17);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_EQ(state_->pgoEnabled.loadAcquire(), 1u);
+  EXPECT_EQ(state_->tier2Threshold.loadAcquire(), 17u);
+
+  EJitSharedTaskPool peer;
+  attachPeer(peer, state_.get(), /*core=*/1);
+  EXPECT_TRUE(peer.isPgoEnabled());
+
+  // A live owner-side update is shared too; the peer has no local setter call.
+  EJitCoreId::setCurrentForTest(0);
+  owner.setPgoEnabled(false, 0);
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_FALSE(peer.isPgoEnabled());
+  EXPECT_EQ(state_->tier2Threshold.loadAcquire(), 0u);
 }
 
 // (1) A peer core crosses the Tier-2 threshold; the request travels the shared
@@ -2981,7 +3002,7 @@ TEST_F(SharedTaskPoolTest, PeerCrossesThresholdOwnerConsumes) {
 
   // A peer facade attaches on core 1 and drives the hits.
   EJitSharedTaskPool peer;
-  attachPeer(peer, state_.get(), /*core=*/1, /*threshold=*/3);
+  attachPeer(peer, state_.get(), /*core=*/1);
 
   // Peer hits: each increments the SHARED slot hitCount; the third crosses the
   // threshold and enqueues a Tier-2 request onto the shared queue.
@@ -3029,8 +3050,8 @@ TEST_F(SharedTaskPoolTest, MultiplePeersTriggerOnlyOneTier2) {
   ASSERT_TRUE(owner.pollOne());
 
   EJitSharedTaskPool peerA, peerB;
-  attachPeer(peerA, state_.get(), /*core=*/1, /*threshold=*/2);
-  attachPeer(peerB, state_.get(), /*core=*/2, /*threshold=*/2);
+  attachPeer(peerA, state_.get(), /*core=*/1);
+  attachPeer(peerB, state_.get(), /*core=*/2);
 
   // Both peers reach/exceed the threshold on the same (5, dim) identity.
   EJitCoreId::setCurrentForTest(1);
@@ -3304,4 +3325,3 @@ TEST_F(SharedTaskPoolTest, Tier2DedupClearStripsTierBits) {
 }
 
 } // namespace
-

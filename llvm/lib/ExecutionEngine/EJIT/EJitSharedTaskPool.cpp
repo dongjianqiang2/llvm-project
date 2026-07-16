@@ -611,11 +611,11 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // proxy, not an execution-completed count.
   // A slot already at Tier-2 (PGOUse) is never re-armed — Tier-2 code does
   // not need another Tier-2 compile (§4 repeat-trigger).
-  if (pgoEnabled_.loadRelaxed()) {
+  if (state_->pgoEnabled.loadAcquire()) {
     uint8_t slotTier = Slot.tier.loadRelaxed();
     if (slotTier < kEJitTierPgoUse) {
       uint64_t prev = Slot.hitCount.fetchAdd(1);
-      uint32_t threshold = tier2Threshold_.loadRelaxed();
+      uint32_t threshold = state_->tier2Threshold.loadAcquire();
       // >= (not ==): if the enqueue fails (queue full / already pending),
       // the next hit can still arm — a transient failure is not fatal (§7).
       if (threshold && prev + 1 >= threshold) {
@@ -1316,7 +1316,8 @@ namespace {
 // activated via ejit_activate before the JIT will compile it. This matches
 // the non-shared EJitRuntimeState::isActive default (no entry => inactive).
 // setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
-void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
+void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
+                       uint32_t pgoEnabled, uint32_t tier2Threshold) {
   bool canFreeDumpPayload =
       st->magic == kEJitSharedAbiMagic &&
       st->abiVersion == kEJitSharedAbiVersion &&
@@ -1327,6 +1328,8 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       st->version[d][i].storeRelaxed(0);
     }
   st->mode.storeRelaxed(mode);
+  st->tier2Threshold.storeRelaxed(pgoEnabled ? tier2Threshold : 0);
+  st->pgoEnabled.storeRelaxed(pgoEnabled ? 1 : 0);
   st->anyInstanceActivated.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
@@ -1453,7 +1456,9 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // We are the owner. Build the whole blob, then publish Ready LAST.
       uint32_t self = EJitCoreId::current();
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
-      initSharedStorage(state_, static_cast<uint32_t>(configuredMode_));
+      initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
+                        pgoEnabled_.loadRelaxed(),
+                        tier2Threshold_.loadRelaxed());
       state_->generation.storeRelease(nextGen);
       state_->ownerCoreId.storeRelease(self);
       state_->codeSharingEnabled.storeRelease(codeSharingEnabled_ ? 1u : 0u);
@@ -1793,7 +1798,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     // value-initialized and carries the generation + per-dim versions snapshot
     // of the EXACT slot that was hit (Snap.tier2Gen / Snap.tier2Versions), so it
     // never inherits a stale epoch or aliases a colliding slot.
-    if (R.tier2Arm && pgoEnabled_.loadRelaxed() &&
+    if (R.tier2Arm && state_->pgoEnabled.loadAcquire() &&
         state_->mode.loadAcquire() ==
             static_cast<uint32_t>(EJitCompileMode::Async)) {
       EJitCompileRequest T2{};

@@ -363,6 +363,8 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
+  EJitAtomicU32 pgoEnabled; ///< 1 => shared online-PGO trigger is enabled
+  EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.
