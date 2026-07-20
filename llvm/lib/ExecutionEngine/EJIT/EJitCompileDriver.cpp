@@ -10,6 +10,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
@@ -289,7 +290,8 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
     jitEngine_->addUserSymbol(name, addr);
 }
 
-void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
+void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
+                                          bool storeLru) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
   uint8_t dims[4] = {
@@ -369,6 +371,33 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
 
+  // PGO tier (EJIT_ONLINE_PGO.md §4). Gated by Config::enablePgo: off => the
+  // default Baseline (unchanged pipeline). On => first compile is Tier-1
+  // (Instrumented); a Tier-2 (PGOUse) recompile synthesizes the in-memory
+  // profile from Tier-1's captured counters BEFORE loadBitcode (§5.3: PGOUse
+  // consumes ctx.profileData during the JIT transform).
+  if (config_.enablePgo) {
+    if (static_cast<CompileTier>(tier) == CompileTier::PGOUse) {
+      ctx.tier = CompileTier::PGOUse;
+      auto it = tier1Counters_.find(cacheKey);
+      if (it != tier1Counters_.end() && !it->second.empty()) {
+        std::vector<PgoCounterRef> refs;
+        refs.reserve(it->second.size());
+        for (const auto &c : it->second)
+          refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
+        ctx.profileData = synthesizeProfileBuffer(refs);
+        if (ctx.profileData.empty())
+          EJIT_DIAG("compileCold Tier-2 key=0x%016lx: profile synthesis empty",
+                    cacheKey);
+      } else {
+        EJIT_DIAG("compileCold Tier-2 key=0x%016lx: no Tier-1 counters captured",
+                  cacheKey);
+      }
+    } else {
+      ctx.tier = CompileTier::Instrumented;
+    }
+  }
+
   if (!jitEngine_) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: no sync engine", cacheKey,
               funcName.c_str());
@@ -415,6 +444,33 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
   void *funcPtr = *addrOrErr;
 
+  // PGO Tier-1: capture counter addresses for a later Tier-2 synthesis (§5.2).
+  // The __profc_*/__profd_* globals were forced External by captureCounterGlobals
+  // during the transform; resolve them by name in the specialization JITDylib.
+  if (ctx.tier == CompileTier::Instrumented) {
+    auto &counters = tier1Counters_[cacheKey];
+    counters.clear();
+    for (const std::string &name : jitEngine_->getLastCounterNames()) {
+      auto profc = jitEngine_->lookup(cacheKey, "__profc_" + name);
+      auto profd = jitEngine_->lookup(cacheKey, "__profd_" + name);
+      if (profc && profd) {
+        counters.push_back({name, reinterpret_cast<uintptr_t>(*profc),
+                            reinterpret_cast<uintptr_t>(*profd)});
+      } else {
+        if (!profc)
+          consumeError(profc.takeError());
+        if (!profd)
+          consumeError(profd.takeError());
+      }
+    }
+    EJIT_DIAG("compileCold Tier-1 key=0x%016lx: captured %zu counter set(s)",
+              cacheKey, counters.size());
+  }
+
+  // PGO Tier-2: profile consumed; drop the captured counters (§7.1).
+  if (ctx.tier == CompileTier::PGOUse)
+    tier1Counters_.erase(cacheKey);
+
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
   return funcPtr;
@@ -422,10 +478,17 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
 #ifdef EJIT_SRE_TASKPOOL
 void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
-  EJIT_DIAG("compileNow begin func=%u dims=%u", req.funcIndex, req.numDims);
+  // PGO tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it to
+  // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
+  // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
+  // EJIT_ONLINE_PGO.md §2). tier is passed to compileCold, gated by enablePgo.
+  uint32_t tier = decodeReqTier(req.funcIndex);
+  uint32_t funcIdx = stripReqTier(req.funcIndex);
+
+  EJIT_DIAG("compileNow begin func=%u dims=%u tier=%u", funcIdx, req.numDims,
+            tier);
   if (req.numDims > 4) {
-    EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", req.funcIndex,
-              req.numDims);
+    EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", funcIdx, req.numDims);
     return nullptr;
   }
 
@@ -438,34 +501,31 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   for (uint32_t i = 0; i < req.numDims; ++i) {
     if (req.dims[i].instanceId > 255u) {
       EJIT_DIAG("compileNow reject func=%u: instanceId=%u > 255 (dim[%u])",
-                req.funcIndex, req.dims[i].instanceId, i);
+                funcIdx, req.dims[i].instanceId, i);
       return nullptr;
     }
 
     for (uint32_t j = 0; j < seenCount; ++j)
       if (seenDimTypes[j] == req.dims[i].dimType) {
         EJIT_DIAG("compileNow reject func=%u: duplicate dimType=%u (dim[%u])",
-                  req.funcIndex, req.dims[i].dimType, i);
+                  funcIdx, req.dims[i].dimType, i);
         return nullptr;
       }
 
-    // seenDimTypes is fixed-size; the numDims > 4 guard above bounds the loop,
-    // but assert explicitly so a future caller change can't silently overflow.
     assert(seenCount < 4 && "seenDimTypes overflow: numDims guard broken");
     seenDimTypes[seenCount++] = req.dims[i].dimType;
   }
 
   // meta.dimTypes[i] is the explicit dimType slot the loader read back BY NAME
-  // from the process-global EJitLifecycleRegistry — the SAME slot the wrapper
-  // baked into req.dims via its per-lifecycle global. No
-  // recomputation/guessing.
-  const auto &meta = loader_.getOrCacheFuncMeta(req.funcIndex);
+  // from the process-global EJitLifecycleRegistry - the SAME slot the wrapper
+  // baked into req.dims via its per-lifecycle global.
+  const auto &meta = loader_.getOrCacheFuncMeta(funcIdx);
   uint8_t packedDims[4] = {0, 0, 0, 0};
   for (unsigned i = 0; i < meta.dimCount && i < 4; ++i) {
     uint32_t wantedType = meta.dimTypes[i];
     if (wantedType == kEJitInvalidDimType) {
       EJIT_DIAG("compileNow reject func=%u: meta dim[%u] dimType invalid",
-                req.funcIndex, i);
+                funcIdx, i);
       return nullptr;
     }
     bool found = false;
@@ -478,19 +538,19 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
     }
     if (!found) {
       EJIT_DIAG("compileNow reject func=%u: no request dim for meta dimType=%u",
-                req.funcIndex, wantedType);
+                funcIdx, wantedType);
       return nullptr;
     }
   }
 
-  uint64_t cacheKey = (static_cast<uint64_t>(req.funcIndex) << 32) |
+  uint64_t cacheKey = (static_cast<uint64_t>(funcIdx) << 32) |
                       static_cast<uint64_t>(packedDims[0]) |
                       (static_cast<uint64_t>(packedDims[1]) << 8) |
                       (static_cast<uint64_t>(packedDims[2]) << 16) |
                       (static_cast<uint64_t>(packedDims[3]) << 24);
   EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
-            req.funcIndex, cacheKey, packedDims[0], packedDims[1], packedDims[2],
+            funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
-  return compileCold(cacheKey, /*storeLru=*/false);
+  return compileCold(cacheKey, tier, /*storeLru=*/false);
 }
 #endif

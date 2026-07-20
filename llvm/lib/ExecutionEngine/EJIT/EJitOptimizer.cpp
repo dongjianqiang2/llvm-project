@@ -22,6 +22,12 @@
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
+#include "llvm/Transforms/Instrumentation/InstrProfiling.h"
+#include "llvm/Transforms/IPO/Inliner.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/IR/GlobalValue.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -81,6 +87,27 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   }
   mainFPM_.addPass(PromotePass());
 
+  // mainFpmPgo_ - PGO (Tier-2) variant of mainFPM_ (§12 阶段2): LoopUnrollPass
+  // (profile-aware partial unroll/peel via BFI/PSI) replaces LoopFullUnrollPass,
+  // + PGOMemOPSizeOpt (profile-guided mem-intrinsic size specialization).
+  // Baseline stays on mainFPM_ (LoopFullUnroll) so PGO is opt-in isolated.
+  mainFpmPgo_.addPass(InstCombinePass());
+  mainFpmPgo_.addPass(SCCPPass());
+  mainFpmPgo_.addPass(SimplifyCFGPass());
+  mainFpmPgo_.addPass(InstCombinePass());
+  mainFpmPgo_.addPass(SimplifyCFGPass());
+  mainFpmPgo_.addPass(ADCEPass());
+  mainFpmPgo_.addPass(LoopSimplifyPass());
+  mainFpmPgo_.addPass(LoopUnrollPass()); // FunctionPass, profile-aware (BFI/PSI)
+  {
+    LoopPassManager LPM;
+    LPM.addPass(IndVarSimplifyPass());
+    LPM.addPass(LoopDeletionPass());
+    mainFpmPgo_.addPass(createFunctionToLoopPassAdaptor(std::move(LPM)));
+  }
+  mainFpmPgo_.addPass(PromotePass());
+  mainFpmPgo_.addPass(PGOMemOPSizeOpt());
+
   // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling turns
   // a loop-variant array access g_arr[k].field into constant-index GEPs
   // (g_arr[0]/[1]/...), which only then become substitutable. Once
@@ -103,34 +130,104 @@ void EJitOptimizer::clearAnalyses() {
 void EJitOptimizer::runPipeline(Module &M,
                                 const SpecializationContext &ctx) {
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
-                    "module=%s",
+                    "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
                     static_cast<int>(ctx.optLevel), ctx.dimensions.size(),
-                    M.getName().str().c_str());
+                    static_cast<int>(ctx.tier), M.getName().str().c_str());
+  lastCounterNames_.clear();
 
-  // Phase 1 — specialize: turn the period index and every may_const field into
-  // a compile-time constant.
-  //   (a) Substitute the ejit_period_arr_ind argument with its constant index.
+  // Phase 1 - specialize (common to all tiers): turn the period index and
+  // every may_const field into a compile-time constant.
   preReplacePeriodIndices(M, ctx);
-  EJIT_DIAG_DEBUG("pipeline phase1a done: preReplacePeriodIndices");
-  //   (b) Fold the constant GEP chains that exposes so StructFieldPass can
-  //       compute the byte offset of each may_const field access.
   runInstCombine(M);
-  EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
-  // Inlining is intentionally not run here: the AOT pre-optimization
-  // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) already expanded
-  // callee bodies in the embedded bitcode, so their may_const GEP chains are
-  // already traceable to the global.
-  //   (c) Replace the may_const loads with their runtime constant values.
   runStructFieldPass(M);
-  EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
 
-  // Phases 2-4 — exploit those constants (scalar fixed point → loops →
-  // re-specialize → cleanup). ctx.optLevel is accepted for ABI compatibility
-  // and does not affect the pipeline.
-  runOptimizationPipeline(M, ctx.optLevel);
+  if (ctx.tier == CompileTier::Instrumented) {
+    // Tier-1 (PGO Gen): lightOpt then instrument. lightOpt is the shared
+    // Gen/Use prefix (identical to Tier-2) so the CFG - and thus the PGO
+    // hash - matches. No mainFPM_: Tier-1 is temporary, lightly optimized.
+    runLightOptPipeline(M);
+    ModulePassManager GenMPM;
+    GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
+    // Tier-1 machine code is SHARED and executed concurrently by multiple cores
+    // (shared taskpool). A plain __profc_* load/add/store would lose counts and
+    // let Tier-2 profile synthesis read a torn value. Lower with atomic counter
+    // updates (InstrProfOptions.Atomic) so each increment is an `atomicrmw add`
+    // (§5). Cost is confined to the temporary Tier-1 build; the final Baseline
+    // / Tier-2 (PGOUse) machine code carries no profiling instrumentation.
+    InstrProfOptions InstrProfOpts;
+    InstrProfOpts.Atomic = true;
+    GenMPM.addPass(InstrProfilingLoweringPass(InstrProfOpts));
+    GenMPM.run(M, MAM_);
+    captureCounterGlobals(M);
+    EJIT_DIAG_VERBOSE("pipeline done (Tier-1) func=%s key=0x%016lx counters=%zu",
+                      ctx.fnName.c_str(), ctx.cacheKey, lastCounterNames_.size());
+    return; // codegen; counters land in RW data
+  }
+
+  if (ctx.tier == CompileTier::PGOUse) {
+    // Tier-2 (PGO Use): same prefix as Tier-1 (lightOpt) for hash match,
+    // then annotate !prof from the in-memory profile, then the full
+    // optimization pipeline (consumes !prof via BFI/BPI/PSI -> codegen block
+    // placement). If profile synthesis failed (empty), fall back to Baseline.
+    runLightOptPipeline(M);
+    if (!ctx.profileData.empty()) {
+      auto InMemFS = IntrusiveRefCntPtr<vfs::InMemoryFileSystem>(
+          new vfs::InMemoryFileSystem());
+      InMemFS->addFile("/ejit.prof", 0,
+                       MemoryBuffer::getMemBufferCopy(ctx.profileData));
+      ModulePassManager UseMPM;
+      UseMPM.addPass(PGOInstrumentationUse(
+          /*Filename=*/"/ejit.prof", /*Remap=*/"", /*IsCS=*/false,
+          IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
+      UseMPM.run(M, MAM_);
+    }
+    // PGO-guided inline (§12 阶段3): profile-aware inlining of callees, after
+    // PGOUse set ProfileSummary so the InlineAdvisor uses the profile. Requires
+    // non-pre-inlined bitcode (PASS1 PGO mode, stage 3b) to have callees to
+    // inline; a no-op on already-pre-inlined bitcode.
+    {
+      ModulePassManager InlineMPM;
+      InlineMPM.addPass(ModuleInlinerWrapperPass());
+      InlineMPM.run(M, MAM_);
+    }
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
+                      ctx.fnName.c_str(), ctx.cacheKey);
+    return;
+  }
+
+  // Baseline (PGO off): the existing full specialization pipeline.
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
+}
+
+void EJitOptimizer::runLightOptPipeline(Module &M) {
+  FunctionPassManager FPM;
+  FPM.addPass(InstCombinePass());
+  FPM.addPass(SimplifyCFGPass());
+  for (Function &F : M.functions())
+    if (!F.isDeclaration())
+      FPM.run(F, FAM_);
+}
+
+void EJitOptimizer::captureCounterGlobals(Module &M) {
+  lastCounterNames_.clear();
+  for (GlobalVariable &GV : M.globals()) {
+    StringRef Name = GV.getName();
+    bool IsProfc = Name.starts_with("__profc_");
+    bool IsProfd = Name.starts_with("__profd_");
+    if (!IsProfc && !IsProfd)
+      continue;
+    // Default InternalLinkage is invisible to ORC J->lookup (P0-3): force
+    // External so the compile driver can resolve counter addresses by name.
+    if (GV.hasLocalLinkage())
+      GV.setLinkage(GlobalValue::ExternalLinkage);
+    if (IsProfc)
+      // PGOFuncName = name with the "__profc_" prefix stripped.
+      lastCounterNames_.emplace_back(Name.drop_front(strlen("__profc_")).str());
+  }
 }
 
 void EJitOptimizer::preReplacePeriodIndices(
@@ -190,16 +287,21 @@ void EJitOptimizer::runStructFieldPass(Module &M) {
 }
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            OptimizationLevel level) {
+                                            OptimizationLevel level,
+                                            CompileTier tier) {
   // One fixed pipeline; `level` does not affect it.
   (void)level;
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s",
                   M.getName().str().c_str());
 
   // Phases 2-3: scalar fold/propagate/simplify fixed point, then loop folding.
+  // Tier-2 (PGOUse) uses mainFpmPgo_ (LoopUnroll profile-aware + PGOMemOPSizeOpt);
+  // Baseline/Instrumented use mainFPM_ (LoopFullUnroll). §12 阶段2 PGO opt-in.
+  FunctionPassManager &fpm =
+      (tier == CompileTier::PGOUse) ? mainFpmPgo_ : mainFPM_;
   for (Function &F : M.functions())
     if (!F.isDeclaration())
-      mainFPM_.run(F, FAM_);
+      fpm.run(F, FAM_);
 
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field → g_arr[0].field, g_arr[1].field, ...). Substitute them,

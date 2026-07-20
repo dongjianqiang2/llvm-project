@@ -176,7 +176,24 @@ public:
     /// When false the request is a true miss that still needs compileOrGet().
     /// This flag is an internal control signal; it does not affect status
     /// mapping or the C ABI.
-    bool fastPathTerminal = false;
+    bool fastPathTerminal : 1;
+    /// PGO (§6): set when this hit crosses the Tier-2 threshold — compileOrGet()
+    /// enqueues a one-shot Tier-2 (PGOUse) recompile. (Shared equivalent of
+    /// the non-shared CompileOrGetResult::tier2Arm.)
+    bool tier2Arm : 1;
+    // fastPathTerminal + tier2Arm are INTERNAL signals (the public caller
+    // never reads them; not part of the C ABI). They are bitfields sharing one
+    // tail byte so the struct stays <= 16 bytes (AAPCS register return, no
+    // sret) after PGO added tier2Arm; the public hot bools above stay full
+    // bytes (plain ldrb/strb). C++17 has no default member initializers for
+    // bitfields, so a ctor zeros them; other members pick up their NSDMI.
+    //
+    // The Tier-2 generation/version snapshot (tier2Gen + tier2Versions[4]) is
+    // NOT carried here: 20 bytes cannot fit the 16-byte AAPCS register-return
+    // limit (PR #91). It lives only in SharedLookup (internal, no size limit)
+    // and compileOrGet reads it directly from the SharedLookup tryCacheHit
+    // returns.
+    CompileOrGetResult() : fastPathTerminal(false), tier2Arm(false) {}
   };
   static_assert(kEJitSharedCacheBuckets < 255,
                 "bucketIndex is a uint8_t: the bucket count and its sentinel "
@@ -276,6 +293,40 @@ public:
   /// desired mode; use setSharedMode() to change the live cross-core mode.
   void setMode(EJitCompileMode mode) { configuredMode_ = mode; }
 
+  /// PGO (§6): enable the online-PGO Tier-2 auto-trigger on the shared
+  /// taskpool.  When enabled, every cache hit atomically increments the
+  /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
+  /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
+  /// the trigger (hits are still counted).
+  void setPgoEnabled(bool enable, uint32_t threshold) {
+    pgoEnabled_.storeRelaxed(enable ? 1 : 0);
+    tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
+    if (!state_ ||
+        state_->initState.loadAcquire() !=
+            static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return;
+
+    // Publish the threshold before enabling so a peer that acquires the
+    // enabled flag also observes the matching threshold. Disable first when
+    // turning PGO off so no new hit can arm a Tier-2 request.
+    if (enable) {
+      state_->tier2Threshold.storeRelease(threshold);
+      state_->pgoEnabled.storeRelease(1);
+    } else {
+      state_->pgoEnabled.storeRelease(0);
+      state_->tier2Threshold.storeRelease(0);
+    }
+  }
+
+  /// True when the shared PGO auto-trigger is armed.
+  bool isPgoEnabled() const {
+    if (state_ &&
+        state_->initState.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return state_->pgoEnabled.loadAcquire() != 0;
+    return pgoEnabled_.loadRelaxed() != 0;
+  }
+
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
   /// Compile mode is a shared control flag (engine/worker ownership stays
@@ -330,8 +381,23 @@ public:
   /// enabled, no shareable cached code) returns fastPathTerminal = false and
   /// the caller must fall through to compileOrGet(). compileOrGet() itself
   /// calls this so the ordering/counters/semantics stay identical.
+  ///
+  /// \p outSnap, when non-null, receives the SharedLookup that the cache lookup
+  /// produced (carrying the Tier-2 generation/version snapshot). compileOrGet()
+  /// passes one so it can build the Tier-2 request from the EXACT hit slot's
+  /// epoch without carrying the 20-byte snapshot through CompileOrGetResult
+  /// (which must stay <= 16 bytes for AAPCS register return). Only written on
+  /// the cache-lookup path; left untouched on the not-Ready / disabled
+  /// terminals (which never arm Tier-2). Fixed-dim entries omit it (default).
+private:
+  struct SharedLookup; // forward; full def below (private). A public method
+                       // may carry a pointer to a private nested type; callers
+                       // use the default nullptr and only compileOrGet() (a
+                       // member) passes a real SharedLookup.
+public:
   CompileOrGetResult tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
-                                 uint32_t numDims);
+                                 uint32_t numDims,
+                                 SharedLookup *outSnap = nullptr);
   /// Fixed-dimension fast cache-hit entries (0-4 dims). Same terminal
   /// semantics as tryCacheHit() but the instance-enabled check is unrolled and
   /// the dim identity is built directly on the stack (no numDims loop / no
@@ -417,6 +483,20 @@ private:
     /// first-touch path (which self-revalidates), so the seqlock caller must not
     /// second-guess it with the bucket publishSeq check.
     bool coldPrepared = false;
+    /// PGO (§6): set when this hit crosses the Tier-2 threshold, arming
+    /// a one-shot lazy enqueue of a PGOUse recompile. compileOrGet()
+    /// consumes it on the fast-hit path. (Shared equivalent of
+    /// EJitCacheLookupResult::tier2Arm.)
+    bool tier2Arm = false;
+    /// PGO (§6): generation + per-dim version snapshot of the EXACT matched
+    /// slot, captured under the lookup lock only when tier2Arm is set. Handed
+    /// to compileOrGet() via tryCacheHit's outSnap out-param (NOT carried
+    /// through CompileOrGetResult, which must stay <= 16 bytes for AAPCS) so
+    /// compileOrGet() builds the Tier-2 request from the real hit slot's
+    /// publish epoch, never a re-scanned/aliased slot. Only meaningful when
+    /// tier2Arm is true.
+    uint32_t tier2Gen = 0;
+    uint32_t tier2Versions[4] = {0, 0, 0, 0};
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -485,7 +565,8 @@ private:
   /// callers do those first).
   CompileOrGetResult classifyHit(const SharedLookup &Hit);
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
-                                 const EJitCompiledCodeInfo *info);
+                                 const EJitCompiledCodeInfo *info,
+                                 bool pgoClearExclusive = false);
 
   /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
   /// expensive per-core execute-permission preparation (split + enable_ex)
@@ -534,6 +615,13 @@ private:
   /// stale worker (older gen) therefore cannot clear a newer generation's bit.
   void dedupClear(uint32_t funcIndex, uint32_t gen);
 
+  /// Compile one dequeued request through the two version checkpoints and the
+  /// commit-gated publish. The Tier-2 aarch64 exclusive-monitor workaround
+  /// (pgoClearExclusive) is derived here from the request's encoded tier
+  /// (decodeReqTier), so a PGOUse (Tier-2) publish clears the monitor primed by
+  /// the arming hit's hitCount RMW while a Tier-1 publish keeps the normal
+  /// write lock. No caller-supplied flag: the worker owns this policy (spec
+  /// §4.9).
   void runCompile(const EJitCompileRequest &req);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
@@ -567,8 +655,17 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
+  // Pre-init staging only. Once the shared blob is Ready, state_->pgoEnabled
+  // and state_->tier2Threshold are the cross-core source of truth.
+  EJitAtomicU8 pgoEnabled_{0};
+  EJitAtomicU32 tier2Threshold_{0};
+  // PGO (§6): Tier-2 requests are NOT held in a facade-local bypass. A hit that
+  // crosses the threshold (on ANY producer core / facade) submits a fully
+  // value-initialized EJitCompileRequest through the shared MPSC queue, so the
+  // single owner worker consumes it via the normal pollOne()/runCompile() path.
+  // This is what lets a peer core's Tier-2 trigger actually be serviced.
 
-  // Worker observability + startup-wait bound (owner-local).
+  // Worker observability+ startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};
   EJitAtomicU32 workerWaitedForReady_{0};
   EJitAtomicU64 workerIdleYields_{0};

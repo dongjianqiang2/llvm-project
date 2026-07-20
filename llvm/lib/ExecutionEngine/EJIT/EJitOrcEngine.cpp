@@ -699,7 +699,7 @@ EJitOrcEngine::Create(const Config &config,
   engine->P->J->getIRTransformLayer().setTransform(
       [engine = engine.get()](
           orc::ThreadSafeModule TSM,
-          const orc::MaterializationResponsibility &R)
+          orc::MaterializationResponsibility &R)
           -> Expected<orc::ThreadSafeModule> {
         TSM.withModuleDo([engine](Module &M) {
           LLVM_DEBUG(dbgs() << "ejit-orc-engine: JIT transform on "
@@ -815,6 +815,25 @@ EJitOrcEngine::Create(const Config &config,
             }
           }
         });
+        // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
+        // Gen creates them inside runPipeline (after addIRModule), so the
+        // MR's claim - computed at addIRModule from the original module -
+        // does NOT include them. defineMaterializing adds them so ORC
+        // lookup resolves (compileCold's Tier-1 counter capture, §5.2).
+        {
+          orc::SymbolFlagsMap symFlags;
+          for (const std::string &name :
+               engine->P->optimizer->getLastCounterNames()) {
+            symFlags[engine->P->J->mangleAndIntern("__profc_" + name)] =
+                JITSymbolFlags::Exported;
+            symFlags[engine->P->J->mangleAndIntern("__profd_" + name)] =
+                JITSymbolFlags::Exported;
+          }
+          if (!symFlags.empty())
+            if (auto Err = R.defineMaterializing(std::move(symFlags)))
+              EJIT_DIAG("transform: defineMaterializing PGO counters "
+                        "failed: %s", toString(std::move(Err)).c_str());
+        }
         return std::move(TSM);
       });
 
@@ -884,6 +903,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   // different specializations (same TU bitcode loaded multiple times)
   // never conflict. Remove any stale JD from a previous compilation
   // of the same cacheKey (e.g., after ejit_clear_cache).
+  // PGO: a Tier-2 recompile for the same cacheKey removes the Tier-1
+  // JITDylib BEFORE the new compile.  This is safe under code-pool v1
+  // (NO_RECLAIM) where slab memory is never freed, so existing Tier-1
+  // fnPtrs in the cache remain valid.  A future retain-until-publish
+  // path (deferring removeJITDylib until after cachePublish succeeds)
+  // would be needed for reclaimable memory managers (§5 JD lifecycle).
   auto it = P->specDylibs.find(cacheKey);
   if (it != P->specDylibs.end()) {
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
@@ -1047,6 +1072,12 @@ void EJitOrcEngine::setActiveContext(const SpecializationContext *ctx) {
 
 const SpecializationContext *EJitOrcEngine::getActiveContext() const {
   return P->activeCtx;
+}
+
+ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
+  if (P->optimizer)
+    return P->optimizer->getLastCounterNames();
+  return {};
 }
 
 

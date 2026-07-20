@@ -46,6 +46,14 @@ void setDumpSharedState(EJitSharedTaskPoolState *state);
 /// capture at compile time, print selectively later.
 void printDumped(const char *name);
 
+/// Compile tier for online PGO (EJIT_ONLINE_PGO.md §3). Baseline is the
+/// existing no-PGO pipeline; the other two are opt-in via Config::enablePgo.
+enum class CompileTier : uint8_t {
+  Baseline = 0,      ///< No PGO: specialize + opt pipeline (current behavior).
+  Instrumented = 1,  ///< Tier-1: specialize + PGOInstrumentationGen + Lowering.
+  PGOUse = 2,        ///< Tier-2: specialize + PGOInstrumentationUse(profile) + opts.
+};
+
 struct SpecializationContext {
   std::string fnName;
   uint64_t cacheKey = 0;
@@ -55,6 +63,12 @@ struct SpecializationContext {
   };
   SmallVector<DimInfo, 4> dimensions;
   OptimizationLevel optLevel = OptimizationLevel::L2;
+  /// PGO tier (Baseline when PGO is disabled or for the first compile).
+  CompileTier tier = CompileTier::Baseline;
+  /// Tier-2 indexed profile buffer (synthesized from Tier-1 counters by
+  /// EJitProfileMerge before loadBitcode). Empty for Baseline/Instrumented.
+  /// Owned by the context; lives through the JIT transform that consumes it.
+  std::string profileData;
 };
 
 /// Wraps an LLJIT instance with EmbeddedJIT-specific configuration:
@@ -84,6 +98,12 @@ public:
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);
   const SpecializationContext *getActiveContext() const;
+
+  /// PGO: PGOFuncNames captured by the last Tier-1 compile (the suffix of each
+  /// __profc_<name> that captureCounterGlobals forced external). The compile
+  /// driver looks up __profc_/__profd_ by these names after a Tier-1 compile to
+  /// capture counter addresses for Tier-2 profile synthesis (§5.2).
+  ArrayRef<std::string> getLastCounterNames() const;
 
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal

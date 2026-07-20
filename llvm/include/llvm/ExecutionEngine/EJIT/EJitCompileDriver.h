@@ -20,6 +20,8 @@
 #endif
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace llvm {
 namespace ejit {
@@ -135,7 +137,21 @@ private:
 
   /// Cold compile path (decode → verify active → load bitcode → JIT compile).
   /// When \p storeLru is true the result is inserted into the LRU EJitCache.
-  void *compileCold(uint64_t cacheKey, bool storeLru);
+  /// \p tier is the CompileTier (uint32_t, EJitOrcEngine.h) decoded from
+  /// the request's funcIndex high bits (EJitSreQueue.h); gated by
+  /// Config::enablePgo (off => Baseline regardless).
+  void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru);
+
+  /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md
+  /// §5.2). Filled after a Tier-1 compile (ORC lookup of __profc_/__profd_
+  /// by the optimizer's captured names); consumed by a Tier-2 compile to
+  /// synthesize the in-memory profile before loadBitcode (§5.3).
+  struct Tier1CounterInfo {
+    std::string pgoName;
+    uintptr_t profcAddr = 0;
+    uintptr_t profdAddr = 0;
+  };
+  std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
 };
 
 } // namespace ejit

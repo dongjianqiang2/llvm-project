@@ -60,7 +60,8 @@ COMMON_LIBS = [
     "libLLVMipo.a", "libLLVMTransformUtils.a", "libLLVMCodeGen.a",
     "libLLVMCodeGenTypes.a", "libLLVMTarget.a", "libLLVMTargetParser.a",
     "libLLVMSelectionDAG.a", "libLLVMAsmPrinter.a", "libLLVMMC.a",
-    "libLLVMObject.a", "libLLVMProfileData.a", "libLLVMExecutionEngine.a",
+    "libLLVMObject.a", "libLLVMProfileData.a", "libLLVMInstrumentation.a",
+    "libLLVMExecutionEngine.a",
     "libLLVMOrcJIT.a", "libLLVMOrcShared.a", "libLLVMJITLink.a",
     "libLLVMRemarks.a", "libLLVMOption.a", "libLLVMMCDisassembler.a",
     "libLLVMIRPrinter.a",
@@ -354,7 +355,7 @@ def doit_gc_merge(args):
     # Optional roots are retained only when the input runtime defines them, so
     # taskpool-OFF archives do not acquire unresolved taskpool symbols.
     ejit_api = [
-        "ejit_init", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
+        "ejit_init", "ejit_init_pgo", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
         "ejit_activate_all", "ejit_deactivate_all", "ejit_is_active",
         "ejit_get_stats",
         "ejit_register_symbol", "ejit_register_bitcode",

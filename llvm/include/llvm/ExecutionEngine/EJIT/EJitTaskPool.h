@@ -54,6 +54,9 @@ struct EJitCacheLookupResult {
   void *fnPtr = nullptr;
   uint32_t bucketIndex = 0;
   bool hasReadToken = false;
+  /// PGO: set when this hit brought hitCount to exactly the Tier-2 threshold
+  /// (one-shot trigger signal, §6). False on miss / below threshold.
+  bool tier2Arm = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -153,6 +156,20 @@ struct EJitCacheEntry {
   EJitDimPair dims[4]{};
   uint32_t versions[4]{};
   uintptr_t fnPtr = 0;
+  /// PGO hotspot counter (incremented on cache hit; Tier-2 trigger, §6).
+  /// Zeroed when Tier-2 publishes over a Tier-1 entry (§7.1). Atomic: the
+  /// non-shared cache is read under the bucket read lock by concurrent
+  /// business threads, so the hit-path increment is an atomic RMW.
+  EJitAtomicU64 hitCount{};
+  /// Tier-1 captured counter/data global addresses (§5.2). 0 for Baseline and
+  /// after Tier-2 publish (Tier-2 carries no counters). Plain: written under
+  /// the bucket write lock (publish) and not read concurrently.
+  uintptr_t profcAddr = 0;
+  uintptr_t profdAddr = 0;
+  /// PGO: compile tier of the published code. 0=Baseline/empty, 1=Tier-1,
+  /// 2=Tier-2 (PGOUse).  Suppresses repeat Tier-2 triggers on already-Tier-2
+  /// slots (§4).  Written under the bucket write lock (publish).
+  uint8_t tier = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -189,6 +206,9 @@ public:
     releaseFn_ = fn;
     releaseCtx_ = ctx;
   }
+  /// PGO: set the Tier-2 trigger threshold (hitCount at which a hit arms a
+  /// Tier-2 recompile). 0 = disabled (no arming). §6.
+  void setTier2Threshold(uint32_t threshold) { tier2Threshold_ = threshold; }
 
   EJitCacheLookupResult lookup(uint32_t funcIndex, const EJitDimPair *dims,
                                uint32_t numDims);
@@ -206,6 +226,11 @@ public:
   /// Retire a never-published function pointer (e.g. a rejected stale compile)
   /// through the release callback, if one is installed. No-op otherwise.
   void retireCode(void *fnPtr);
+
+  /// PGO test/diagnostic: the hitCount of the entry matching (funcIndex, dims),
+  /// or 0 if no match. Strips tier bits from funcIndex (publish stores stripped).
+  uint64_t hitCountOf(uint32_t funcIndex, const EJitDimPair *dims,
+                      uint32_t numDims);
 
   void releaseRead(uint32_t bucketIndex);
   uint32_t readyCount() const;
@@ -242,6 +267,7 @@ private:
   Bucket buckets_[kBuckets];
   ReleaseCallback releaseFn_ = nullptr;
   void *releaseCtx_ = nullptr;
+  uint32_t tier2Threshold_ = 0; // PGO: 0 = Tier-2 trigger disabled (§6)
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   PrePublishHook prePublishHook_ = nullptr;
   void *prePublishCtx_ = nullptr;
@@ -262,6 +288,11 @@ struct EJitTaskPoolCounters {
   EJitAtomicU64 compileFailed;
   EJitAtomicU64 publishFailed;
   EJitAtomicU64 instanceDisabled;
+  /// PGO (EJIT_ONLINE_PGO.md §10): Tier-1/Tier-2 compile counts + profile
+  /// synthesis failures. Zero when PGO is off.
+  EJitAtomicU64 tier1Compiles;
+  EJitAtomicU64 tier2Compiles;
+  EJitAtomicU64 profileMergeFails;
 };
 
 struct EJitTaskPoolStatsSnapshot {
@@ -295,6 +326,10 @@ public:
     /// still needs compileOrGet(). Internal control signal only — it does not
     /// affect status mapping or the C ABI.
     bool fastPathTerminal = false;
+    /// PGO: set by tryCacheHit on a hit that crossed the Tier-2 threshold
+    /// (mirrors EJitCacheLookupResult::tier2Arm). compileOrGet enqueues a
+    /// Tier-2 recompile when this is set + PGO on + Async (§6).
+    bool tier2Arm = false;
   };
 
   explicit EJitTaskPool(
@@ -311,6 +346,13 @@ public:
   /// overwrites an existing cache entry (see EJitTaskPoolCache::setReleaser).
   void setReleaser(EJitTaskPoolCache::ReleaseCallback fn, void *ctx) {
     cache_.setReleaser(fn, ctx);
+  }
+  /// PGO opt-in + Tier-2 trigger threshold (§6). When enabled, a cache hit
+  /// that brings hitCount to exactly the threshold arms a lazy Tier-2
+  /// recompile (Async only). disable => threshold 0 (no arming).
+  void setPgoEnabled(bool enable, uint32_t threshold) {
+    pgoEnabled_ = enable;
+    cache_.setTier2Threshold(enable ? threshold : 0);
   }
 
   EJitSwitchController &switchController() { return switch_; }
@@ -382,6 +424,7 @@ private:
   EJitSwitchController switch_;
   EJitTaskQueue queue_;
   EJitTaskPoolCache cache_;
+  bool pgoEnabled_ = false; // PGO (§6): gates the Tier-2 trigger
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
   // Value-initialized: EJitAtomic now has a trivial default ctor (so the shared

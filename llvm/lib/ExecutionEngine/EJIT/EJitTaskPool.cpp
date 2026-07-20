@@ -60,6 +60,7 @@ bool EJitSwitchController::setEnabled(uint32_t dimType, uint32_t instanceId,
 //===----------------------------------------------------------------------===//
 
 EJitDedupResult EJitDedupTable::tryMarkPending(uint32_t funcIndex) {
+  funcIndex = stripReqTier(funcIndex); // PGO: dedup by stripped funcIndex
   if (funcIndex >= kCapacity)
     return EJitDedupResult::InvalidFuncIndex; // Reject, never fold.
   uint32_t expected = 0;
@@ -69,6 +70,7 @@ EJitDedupResult EJitDedupTable::tryMarkPending(uint32_t funcIndex) {
 }
 
 void EJitDedupTable::clear(uint32_t funcIndex) {
+  funcIndex = stripReqTier(funcIndex); // PGO: dedup by stripped funcIndex
   if (funcIndex >= kCapacity)
     return;
   inFlight_[funcIndex].storeRelease(0);
@@ -143,7 +145,7 @@ EJitCacheLookupResult EJitTaskPoolCache::lookup(uint32_t funcIndex,
 
   // A hash key may chain several distinct identities (collision); match the
   // full identity, then verify every dim's version is still current.
-  for (const EJitCacheEntry &E : It->second) {
+  for (EJitCacheEntry &E : It->second) {
     if (!identityMatches(E, funcIndex, dims, numDims))
       continue;
     bool versionsOk = true;
@@ -159,6 +161,16 @@ EJitCacheLookupResult EJitTaskPoolCache::lookup(uint32_t funcIndex,
     void *fn = reinterpret_cast<void *>(E.fnPtr);
     if (!fn)
       break;
+    // PGO (§6): only increment when a non-zero threshold is set (opt-in),
+    // and only when the slot is not already Tier-2 (§4 repeat-trigger).
+    uint64_t prev = 0;
+    uint32_t threshold = tier2Threshold_;
+    if (threshold && E.tier < kEJitTierPgoUse) {
+      prev = E.hitCount.fetchAdd(1);
+      // >= (not ==): retry after transient enqueue failure (§7).
+      if (prev + 1 >= threshold)
+        R.tier2Arm = true;
+    }
     R.fnPtr = fn;
     R.bucketIndex = bucket;
     R.hasReadToken = true;
@@ -176,6 +188,12 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
                                              void *fnPtr) {
   if (!fnPtr || numDims > 4)
     return EJitPublishStatus::InvalidParam;
+
+  // PGO: tier rides in funcIndex's top 2 bits (EJitSreQueue.h). Strip it for
+  // identity - the cache stores the stripped funcIndex so Tier-1 and Tier-2 of
+  // the same (funcIndex, dims) match; decode it for the Tier-2 reset below.
+  uint32_t tier = decodeReqTier(funcIndex);
+  funcIndex = stripReqTier(funcIndex);
 
   uint64_t key = hashKey(funcIndex, dims, numDims);
   uint32_t bucket = static_cast<uint32_t>(key % kBuckets);
@@ -213,6 +231,13 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     for (uint32_t i = 0; i < numDims; ++i)
       E.versions[i] = versions[i];
     E.fnPtr = reinterpret_cast<uintptr_t>(fnPtr);
+    // PGO: reset stale hitCount + counter addrs on every overwrite (Tier-1
+    // recompile or Tier-2 upgrade); fresh entries are default-constructed to
+    // 0. Under the write lock so plain fields are safe (§7.1).
+    E.hitCount.storeRelaxed(0);
+    E.tier = static_cast<uint8_t>(tier);
+    E.profcAddr = 0;
+    E.profdAddr = 0;
     B.lock.writeRelease();
     // Release the overwritten code OUTSIDE the bucket write lock: the callback
     // may re-enter the code pool / ORC / allocator / platform and must never
@@ -224,7 +249,7 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     return EJitPublishStatus::Published;
   }
 
-  EJitCacheEntry Entry;
+  EJitCacheEntry Entry{}; // value-init: hitCount atomic zeroed
   Entry.funcIndex = funcIndex;
   Entry.numDims = numDims;
   Entry.fnPtr = reinterpret_cast<uintptr_t>(fnPtr);
@@ -232,9 +257,32 @@ EJitPublishStatus EJitTaskPoolCache::publish(uint32_t funcIndex,
     Entry.dims[i] = dims[i];
     Entry.versions[i] = versions[i];
   }
-  B.entries[key].push_back(Entry);
+  B.entries[key].push_back(std::move(Entry));
   B.lock.writeRelease();
   return EJitPublishStatus::Published;
+}
+
+uint64_t EJitTaskPoolCache::hitCountOf(uint32_t funcIndex,
+                                              const EJitDimPair *dims,
+                                              uint32_t numDims) {
+  funcIndex = stripReqTier(funcIndex);
+  if (numDims > 4)
+    return 0;
+  uint64_t key = hashKey(funcIndex, dims, numDims);
+  uint32_t bucket = static_cast<uint32_t>(key % kBuckets);
+  Bucket &B = buckets_[bucket];
+  if (!B.lock.tryRead())
+    return 0;
+  uint64_t hc = 0;
+  auto It = B.entries.find(key);
+  if (It != B.entries.end())
+    for (const EJitCacheEntry &E : It->second)
+      if (identityMatches(E, funcIndex, dims, numDims)) {
+        hc = E.hitCount.loadRelaxed();
+        break;
+      }
+  B.lock.readRelease();
+  return hc;
 }
 
 void EJitTaskPoolCache::retireCode(void *fnPtr) {
@@ -323,6 +371,7 @@ EJitTaskPool::classifyHit(const EJitCacheLookupResult &Hit) {
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
     R.hasReadToken = true;
+    R.tier2Arm = Hit.tier2Arm; // PGO: carry the Tier-2 arming signal
     R.fastPathTerminal = true;
     return R;
   }
@@ -450,8 +499,26 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (R.fastPathTerminal) {
     // Non-hit terminals surface the caller's fallback pointer (a hit already
     // carries the cached fnPtr + read token).
-    if (R.status != EJitCompileOrGetStatus::CacheHit)
+    if (R.status != EJitCompileOrGetStatus::CacheHit) {
       R.fnPtr = fallback;
+    } else if (R.tier2Arm && pgoEnabled_ &&
+               switch_.getMode() == EJitCompileMode::Async) {
+      // PGO (§6): the hit crossed the Tier-2 threshold - lazily enqueue a
+      // Tier-2 recompile. Best-effort: ignore AlreadyPending/QueueFull/Invalid
+      // (the Tier-2 is an upgrade; a miss here just delays it). The caller
+      // still gets the Tier-1 fnPtr until Tier-2 publishes.
+      EJitCompileRequest T2{};
+      T2.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
+      T2.numDims = numDims;
+      T2.fallbackPtr = reinterpret_cast<uintptr_t>(fallback);
+      for (uint32_t i = 0; i < numDims; ++i) {
+        T2.dims[i] = dims[i];
+        T2.versions[i] =
+            switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
+      }
+      if (queue_.tryEnqueue(T2) == EJitTaskQueue::EnqueueResult::Enqueued)
+        EJIT_DIAG_VERBOSE("taskpool PGO Tier-2 armed func=%u", funcIndex);
+    }
     return R;
   }
   // True miss: continue the slow path with the caller's fallback.
