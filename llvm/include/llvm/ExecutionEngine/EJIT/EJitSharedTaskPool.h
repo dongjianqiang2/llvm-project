@@ -489,10 +489,12 @@ private:
     /// EJitCacheLookupResult::tier2Arm.)
     bool tier2Arm = false;
     /// PGO (§6): generation + per-dim version snapshot of the EXACT matched
-    /// slot, captured under the lookup lock only when tier2Arm is set. Carried
-    /// through classifyHit()/CompileOrGetResult so compileOrGet() builds the
-    /// Tier-2 request from the real hit slot's publish epoch, never a
-    /// re-scanned/aliased slot. Only meaningful when tier2Arm is true.
+    /// slot, captured under the lookup lock only when tier2Arm is set. Handed
+    /// to compileOrGet() via tryCacheHit's outSnap out-param (NOT carried
+    /// through CompileOrGetResult, which must stay <= 16 bytes for AAPCS) so
+    /// compileOrGet() builds the Tier-2 request from the real hit slot's
+    /// publish epoch, never a re-scanned/aliased slot. Only meaningful when
+    /// tier2Arm is true.
     uint32_t tier2Gen = 0;
     uint32_t tier2Versions[4] = {0, 0, 0, 0};
   };
