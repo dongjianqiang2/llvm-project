@@ -1,6 +1,7 @@
 set(LLVM_LINK_COMPONENTS
   Analysis
   AsmParser
+  BitWriter
   Core
   EmbeddedJIT
   EJIT
@@ -9,11 +10,13 @@ set(LLVM_LINK_COMPONENTS
   Passes
   Support
   TargetParser
+  native
   )
 
 add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
   EJitFieldOffsetTest.cpp
+  EJitOrcEnginePreloadTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )

@@ -25,6 +25,7 @@ namespace ejit {
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
+struct PreloadedBitcode;
 
 /// Set a function-name filter for JIT IR+ASM diagnostic capture. When non-
 /// empty, the engine captures (saves in memory) the post-optimization IR and
@@ -70,9 +71,39 @@ public:
          PeriodArrayRegistry &periodReg,
          EJitRuntimeState &runtimeState);
 
+  /// Parse \p bitcodeData now and cache the template loadBitcodeModule() would
+  /// otherwise build later. Unlike loadBitcodeModule(), which only caches a
+  /// blob seen twice, this caches immediately — use it for blobs known to
+  /// produce several specializations. Idempotent; same storage contract as
+  /// loadBitcodeModule(). Not safe to call concurrently with a compile: call
+  /// it during init, before the taskpool worker starts.
+  Error preLoadBitcodeUtil(StringRef bitcodeData);
+
+  /// Parsed-bitcode cache footprint and hit rate.
+  struct BitcodeCacheStats {
+    size_t entries = 0;
+    /// Derived from bitcode size, not measured from the allocator.
+    size_t approxBytes = 0;
+    /// Without caching this would equal the number of cold compiles.
+    uint64_t parses = 0;
+    uint64_t templateHits = 0;
+    uint64_t evictions = 0;
+  };
+  BitcodeCacheStats getBitcodeCacheStats() const;
+
+  /// Drop every cached template. In-flight modules are unaffected: each holds
+  /// its own reference to the context it was cloned into.
+  void clearBitcodeCache();
+
   /// Load a bitcode module into a per-specialization JITDylib identified
   /// by cacheKey. Each specialization gets its own JITDylib so symbols
   /// from the same TU bitcode can be defined multiple times without conflict.
+  ///
+  /// STORAGE CONTRACT: a blob is identified by its address and size, so
+  /// \p bitcodeData must stay alive and unmodified while the engine may
+  /// compile from it — rewriting it in place would compile the stale module.
+  /// AOT bitcode lives in a const image section and satisfies this; callers
+  /// with their own buffers must call clearBitcodeCache() after changing them.
   Error loadBitcodeModule(StringRef bitcodeData,
                           uint64_t cacheKey,
                           const std::string &origFnName);
@@ -105,6 +136,15 @@ public:
 #endif
 
 private:
+  /// Derive the template module + symbol scaffolding. Does not touch the
+  /// cache; the caller decides whether to retain the result.
+  Error buildPreloadedBitcode(StringRef bitcodeData, PreloadedBitcode &Out);
+
+  /// Retain \p PB, evicting least-recently-used entries to stay under
+  /// Config::maxPreloadCacheSize. Null if it does not fit at all.
+  PreloadedBitcode *retainPreloadedBitcode(StringRef bitcodeData,
+                                           PreloadedBitcode &&PB);
+
   struct Impl;
   std::unique_ptr<Impl> P;
 };

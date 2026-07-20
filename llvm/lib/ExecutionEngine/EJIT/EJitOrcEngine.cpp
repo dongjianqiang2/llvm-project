@@ -87,6 +87,53 @@ static void collectReferencedExternalDecls(
   }
 }
 
+namespace llvm {
+namespace ejit {
+
+/// An external declaration needing resolution, with the parts that do not
+/// change between specializations precomputed. `referenced` means a reachable
+/// use exists, and drives only the unresolved-external diagnostic.
+struct PreResolvedSym {
+  std::string name;
+  orc::SymbolStringPtr mangled;
+  bool referenced = false;
+};
+
+/// The per-blob invariants: a pristine template module cloned per
+/// specialization, plus the external-symbol scaffolding.
+///
+/// The template and its clones share one LLVMContext, which is safe because
+/// EJIT compiles on a single worker (LLJIT uses setNumCompileThreads(0)) and
+/// loadBitcodeModule was already serialized — it mutates Impl::specDylibs
+/// without a lock.
+struct PreloadedBitcode {
+  orc::ThreadSafeContext TSCtx;
+  std::unique_ptr<Module> Template;
+  SmallVector<PreResolvedSym, 16> extFuncs;
+  SmallVector<PreResolvedSym, 16> extGlobals;
+  size_t approxBytes = 0;
+  /// Monotonic tick of last use, for LRU eviction.
+  uint64_t lastUsed = 0;
+};
+
+/// Address *and* size: address alone would alias a recycled allocation onto a
+/// stale template.
+struct BlobKey {
+  const char *data = nullptr;
+  size_t size = 0;
+  bool operator<(const BlobKey &O) const {
+    return data != O.data ? data < O.data : size < O.size;
+  }
+};
+
+/// Measured at ~20x on representative EJIT translation units (a 3.5 KB blob
+/// retains ~70 KB). Charges entries against the budget without walking the
+/// module.
+static constexpr size_t kIRExpansionFactor = 20;
+
+} // namespace ejit
+} // namespace llvm
+
 struct EJitOrcEngine::Impl {
 #ifdef EJIT_SRE_CODE_POOL
   /// Dedicated 2MiB code pools backing all JIT machine code. Declared before
@@ -105,6 +152,19 @@ struct EJitOrcEngine::Impl {
   /// User-registered symbols (functions + globals) for bare-metal.
   /// Populated via ejit_register_symbol() / addUserSymbol().
   std::map<std::string, void *> userSymbols;
+  /// Parse + external-decl scaffolding cached per bitcode blob.
+  std::map<BlobKey, PreloadedBitcode> preloaded;
+  /// Load counts for blobs not yet cached; a few dozen bytes each, not a
+  /// parsed module. See the second-load gate in loadBitcodeModule().
+  std::map<BlobKey, unsigned> blobSeen;
+  /// Config::maxPreloadCacheSize; 0 disables caching.
+  size_t preloadBudget = 0;
+  size_t preloadBytes = 0;
+  uint64_t preloadClock = 0;
+  BitcodeCacheStats preloadStats;
+  /// Codegen-synthesized runtime symbols (memset/memcpy/... and the stack
+  /// protector). Engine-wide and never change, so mangle/intern them once.
+  orc::SymbolMap libcallSymbols;
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
@@ -586,6 +646,7 @@ EJitOrcEngine::Create(const Config &config,
   engine->P->periodReg = &periodReg;
   engine->P->runtimeState = &runtimeState;
   engine->P->dumpJITDir = config.dumpJITDir;
+  engine->P->preloadBudget = config.maxPreloadCacheSize;
 
   // Bare-metal / cross-compiled: use compile-time target triple.
   // Native host: auto-detect via detectHost().
@@ -822,34 +883,177 @@ EJitOrcEngine::Create(const Config &config,
   return engine;
 }
 
+/// Derive the per-specialization invariants of \p bitcodeData.
+///
+/// The entry-linkage fixup is deliberately NOT baked into the template: it
+/// depends on origFnName, and AOT emits bitcode per translation unit, so one
+/// blob is shared by every ejit_entry in that TU. It is applied per clone.
+Error EJitOrcEngine::buildPreloadedBitcode(StringRef bitcodeData,
+                                          PreloadedBitcode &Out) {
+  ++P->preloadStats.parses;
+  auto Ctx = std::make_unique<LLVMContext>();
+  auto Buf = MemoryBuffer::getMemBuffer(bitcodeData, "ejit_preload.bc");
+  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
+  if (!ModuleOrErr)
+    return ModuleOrErr.takeError();
+  std::unique_ptr<Module> M = std::move(*ModuleOrErr);
+
+  Triple TT(M->getTargetTriple());
+  if (TT.isAArch64() && TT.isOSBinFormatELF()) {
+    // These declarations resolve to process addresses, not co-located JIT
+    // storage. Clearing dso_local forces AArch64 PIC codegen to use GOT/PLT
+    // style indirection instead of near-page ADRP relocations.
+    for (Function &F : M->functions()) {
+      if (F.isDeclaration() && !F.isIntrinsic())
+        F.setDSOLocal(false);
+    }
+    for (GlobalVariable &GV : M->globals()) {
+      if (GV.isDeclaration())
+        GV.setDSOLocal(false);
+    }
+  }
+
+  // A full walk of every instruction operand, so it must not repeat per
+  // specialization even though only the diagnostic below consumes it.
+  SmallPtrSet<const Function *, 16> ReferencedFuncs;
+  SmallPtrSet<const GlobalVariable *, 16> ReferencedGlobals;
+  collectReferencedExternalDecls(*M, ReferencedFuncs, ReferencedGlobals);
+
+  Out.extFuncs.clear();
+  Out.extGlobals.clear();
+  for (Function &F : M->functions()) {
+    if (!F.isDeclaration() || F.getName().empty() || F.isIntrinsic())
+      continue;
+    PreResolvedSym S;
+    S.name = F.getName().str();
+    S.mangled = P->J->mangleAndIntern(S.name);
+    S.referenced = ReferencedFuncs.contains(&F);
+    Out.extFuncs.push_back(std::move(S));
+  }
+  for (GlobalVariable &GV : M->globals()) {
+    if (!GV.isDeclaration() || GV.getName().empty())
+      continue;
+    PreResolvedSym S;
+    S.name = GV.getName().str();
+    S.mangled = P->J->mangleAndIntern(S.name);
+    S.referenced = ReferencedGlobals.contains(&GV);
+    Out.extGlobals.push_back(std::move(S));
+  }
+
+  Out.TSCtx = orc::ThreadSafeContext(std::move(Ctx));
+  Out.Template = std::move(M);
+  Out.approxBytes = bitcodeData.size() * kIRExpansionFactor;
+  return Error::success();
+}
+
+PreloadedBitcode *
+EJitOrcEngine::retainPreloadedBitcode(StringRef bitcodeData,
+                                      PreloadedBitcode &&PB) {
+  const BlobKey Key{bitcodeData.data(), bitcodeData.size()};
+  // A single entry over budget is never worth holding.
+  if (PB.approxBytes > P->preloadBudget)
+    return nullptr;
+
+  // Dropping a template only costs a re-parse later; it cannot affect an
+  // in-flight compile, whose module holds its own reference to the context.
+  while (P->preloadBytes + PB.approxBytes > P->preloadBudget &&
+         !P->preloaded.empty()) {
+    auto Victim = P->preloaded.begin();
+    for (auto It = P->preloaded.begin(); It != P->preloaded.end(); ++It)
+      if (It->second.lastUsed < Victim->second.lastUsed)
+        Victim = It;
+    P->preloadBytes -= Victim->second.approxBytes;
+    ++P->preloadStats.evictions;
+    P->preloaded.erase(Victim);
+  }
+  if (P->preloadBytes + PB.approxBytes > P->preloadBudget)
+    return nullptr;
+
+  PB.lastUsed = ++P->preloadClock;
+  P->preloadBytes += PB.approxBytes;
+  // Erase before inserting: move-assigning over a live entry would overwrite
+  // members in declaration order, dropping the old TSCtx before the Template
+  // living in that context — a use-after-free. Erasing destroys in reverse
+  // declaration order, module before context.
+  auto Existing = P->preloaded.find(Key);
+  if (Existing != P->preloaded.end()) {
+    P->preloadBytes -= Existing->second.approxBytes;
+    P->preloaded.erase(Existing);
+  }
+  auto &Slot = P->preloaded[Key];
+  Slot = std::move(PB);
+  return &Slot;
+}
+
+Error EJitOrcEngine::preLoadBitcodeUtil(StringRef bitcodeData) {
+  const BlobKey Key{bitcodeData.data(), bitcodeData.size()};
+  if (P->preloaded.count(Key))
+    return Error::success();
+
+  PreloadedBitcode PB;
+  if (auto Err = buildPreloadedBitcode(bitcodeData, PB))
+    return Err;
+  size_t Bytes = PB.approxBytes;
+  bool Kept = retainPreloadedBitcode(bitcodeData, std::move(PB)) != nullptr;
+  EJIT_DIAG_VERBOSE("preLoadBitcode size=%zu approx=%zuB retained=%u",
+                    bitcodeData.size(), Bytes, (unsigned)Kept);
+  return Error::success();
+}
+
+EJitOrcEngine::BitcodeCacheStats
+EJitOrcEngine::getBitcodeCacheStats() const {
+  BitcodeCacheStats S = P->preloadStats;
+  S.entries = P->preloaded.size();
+  S.approxBytes = P->preloadBytes;
+  return S;
+}
+
+void EJitOrcEngine::clearBitcodeCache() {
+  P->preloaded.clear();
+  P->blobSeen.clear();
+  P->preloadBytes = 0;
+}
+
 Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
                                        uint64_t cacheKey,
                                        const std::string &origFnName) {
   EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
                     origFnName.c_str(), bitcodeData.size());
-  auto Ctx = std::make_unique<LLVMContext>();
-  auto Buf = MemoryBuffer::getMemBuffer(
-      bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"));
-  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
-  if (!ModuleOrErr) {
-    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
-    return ModuleOrErr.takeError();
-  }
+  // A template is retained only on a blob's *second* load: parsed IR costs
+  // ~20x the bitcode, so a blob yielding one specialization must not pay that.
+  // The first load therefore behaves as it did before this cache existed.
+  const BlobKey Key{bitcodeData.data(), bitcodeData.size()};
+  PreloadedBitcode *PB = nullptr;
+  PreloadedBitcode Local;
+  std::unique_ptr<Module> M;
+  orc::ThreadSafeContext TSCtx;
 
-  Triple TT((*ModuleOrErr)->getTargetTriple());
-  if (TT.isAArch64() && TT.isOSBinFormatELF()) {
-    // These declarations resolve to process addresses, not co-located JIT
-    // storage. Clearing dso_local forces AArch64 PIC codegen to use GOT/PLT
-    // style indirection instead of near-page ADRP relocations.
-    for (Function &F : (*ModuleOrErr)->functions()) {
-      if (F.isDeclaration() && !F.isIntrinsic())
-        F.setDSOLocal(false);
+  if (auto It = P->preloaded.find(Key); It != P->preloaded.end()) {
+    PB = &It->second;
+    PB->lastUsed = ++P->preloadClock;
+    ++P->preloadStats.templateHits;
+    M = CloneModule(*PB->Template);
+    TSCtx = PB->TSCtx;
+  } else {
+    if (auto Err = buildPreloadedBitcode(bitcodeData, Local)) {
+      EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
+      return Err;
     }
-    for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
-      if (GV.isDeclaration())
-        GV.setDSOLocal(false);
+    const bool Reused = ++P->blobSeen[Key] >= 2;
+    if (Reused && P->preloadBudget)
+      PB = retainPreloadedBitcode(bitcodeData, std::move(Local));
+    if (PB) {
+      P->blobSeen.erase(Key);
+      M = CloneModule(*PB->Template);
+      TSCtx = PB->TSCtx;
+    } else {
+      // Not cached: hand the parsed module straight over, no clone.
+      PB = &Local;
+      M = std::move(Local.Template);
+      TSCtx = Local.TSCtx;
     }
   }
+  M->setModuleIdentifier("spec_" + std::to_string(cacheKey) + ".bc");
 
   // ejit_entry functions may have internal linkage (e.g. declared `static` in
   // source). ORC's IR layer excludes local-linkage symbols from the JITDylib
@@ -858,26 +1062,23 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   // being compiled (origFnName) is the JIT lookup target — force it to
   // external linkage so ORC registers and can materialize it. Spec JITDylibs
   // are isolated, so this cannot collide with other specializations.
-  if (Function *EntryF = (*ModuleOrErr)->getFunction(origFnName))
+  if (Function *EntryF = M->getFunction(origFnName))
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
-  // Collect global variable addresses from the registry for symbols
-  // that appear as external declarations in the bitcode module.
+  // The decl list and its interned names are precomputed; only the address
+  // lookups are redone, since registrations can arrive between compiles.
   orc::SymbolMap globalSymbols;
-  for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
-    if (!GV.isDeclaration() || GV.getName().empty())
-      continue;
+  for (const PreResolvedSym &S : PB->extGlobals) {
     void *addr = nullptr;
-    if (const auto *info = P->periodReg->getArrayInfo(GV.getName().str()))
+    if (const auto *info = P->periodReg->getArrayInfo(S.name))
       addr = info->baseAddr;
     else
-      addr = P->periodReg->getStaticVarAddr(GV.getName().str());
+      addr = P->periodReg->getStaticVarAddr(S.name);
     if (!addr)
       continue;
-    globalSymbols[P->J->mangleAndIntern(GV.getName())] =
-        orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(addr),
-                               JITSymbolFlags::Exported);
+    globalSymbols[S.mangled] = orc::ExecutorSymbolDef(
+        orc::ExecutorAddr::fromPtr(addr), JITSymbolFlags::Exported);
   }
 
   // Each specialization gets its own JITDylib so that symbols from
@@ -907,47 +1108,35 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   size_t unresolvedGlobals = 0;
   SmallVector<std::string, 16> unresolvedNames;
   static constexpr size_t kMaxUnresolvedNames = 32;
-  SmallPtrSet<const Function *, 16> ReferencedExternalFuncs;
-  SmallPtrSet<const GlobalVariable *, 16> ReferencedExternalGlobals;
-  collectReferencedExternalDecls(**ModuleOrErr, ReferencedExternalFuncs,
-                                 ReferencedExternalGlobals);
-  for (Function &F : (*ModuleOrErr)->functions()) {
-    if (!F.isDeclaration() || F.getName().empty())
+  for (const PreResolvedSym &S : PB->extFuncs) {
+    if (globalSymbols.count(S.mangled))
       continue;
-    std::string name = F.getName().str();
-    if (globalSymbols.count(P->J->mangleAndIntern(name)))
-      continue;
-    auto it = P->userSymbols.find(name);
+    auto it = P->userSymbols.find(S.name);
     if (it == P->userSymbols.end()) {
-      if (!F.isIntrinsic() && ReferencedExternalFuncs.contains(&F)) {
+      if (S.referenced) {
         ++unresolvedFuncs;
         if (unresolvedNames.size() < kMaxUnresolvedNames)
-          unresolvedNames.push_back("f:" + name);
+          unresolvedNames.push_back("f:" + S.name);
       }
       continue;
     }
-    globalSymbols[P->J->mangleAndIntern(name)] =
-        orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(it->second),
-                               JITSymbolFlags::Exported);
+    globalSymbols[S.mangled] = orc::ExecutorSymbolDef(
+        orc::ExecutorAddr::fromPtr(it->second), JITSymbolFlags::Exported);
   }
-  for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
-    if (!GV.isDeclaration() || GV.getName().empty())
+  for (const PreResolvedSym &S : PB->extGlobals) {
+    if (globalSymbols.count(S.mangled))
       continue;
-    std::string name = GV.getName().str();
-    if (globalSymbols.count(P->J->mangleAndIntern(name)))
-      continue;
-    auto it = P->userSymbols.find(name);
+    auto it = P->userSymbols.find(S.name);
     if (it == P->userSymbols.end()) {
-      if (ReferencedExternalGlobals.contains(&GV)) {
+      if (S.referenced) {
         ++unresolvedGlobals;
         if (unresolvedNames.size() < kMaxUnresolvedNames)
-          unresolvedNames.push_back("g:" + name);
+          unresolvedNames.push_back("g:" + S.name);
       }
       continue;
     }
-    globalSymbols[P->J->mangleAndIntern(name)] =
-        orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(it->second),
-                               JITSymbolFlags::Exported);
+    globalSymbols[S.mangled] = orc::ExecutorSymbolDef(
+        orc::ExecutorAddr::fromPtr(it->second), JITSymbolFlags::Exported);
   }
   if (unresolvedFuncs || unresolvedGlobals)
     EJIT_DIAG("loadBitcode: %zu unresolved external(s) not registered "
@@ -968,10 +1157,15 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   // disabled, so without these every JIT compilation fails at link time.
   // They go into the spec JITDylib (which is isolated: it does not link back
   // to the main JITDylib) so each specialization resolves them locally.
-  for (const LibcallSymbol &LCS : getLibcallSymbols())
-    globalSymbols[P->J->mangleAndIntern(LCS.name)] =
-        orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(LCS.addr),
-                               JITSymbolFlags::Exported);
+  // Fixed for the life of the engine: mangled once, merged in wholesale.
+  if (P->libcallSymbols.empty()) {
+    for (const LibcallSymbol &LCS : getLibcallSymbols())
+      P->libcallSymbols[P->J->mangleAndIntern(LCS.name)] =
+          orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(LCS.addr),
+                                 JITSymbolFlags::Exported);
+  }
+  for (const auto &KV : P->libcallSymbols)
+    globalSymbols[KV.first] = KV.second;
 
   // Define all collected symbols in the spec JITDylib before loading the
   // IR module so the JIT linker can resolve external references.
@@ -984,8 +1178,10 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
                 cacheKey, nGlobals, toString(std::move(Err)).c_str());
   }
 
-  if (auto Err = P->J->addIRModule(*JDOrErr,
-      orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(Ctx)))) {
+  // The TSM holds a reference either way, so the context outlives
+  // materialization even if the cache entry is later evicted.
+  if (auto Err = P->J->addIRModule(
+          *JDOrErr, orc::ThreadSafeModule(std::move(M), TSCtx))) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error", cacheKey);
     return Err;
   }
@@ -1048,7 +1244,6 @@ void EJitOrcEngine::setActiveContext(const SpecializationContext *ctx) {
 const SpecializationContext *EJitOrcEngine::getActiveContext() const {
   return P->activeCtx;
 }
-
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
   P->userSymbols[name] = addr;

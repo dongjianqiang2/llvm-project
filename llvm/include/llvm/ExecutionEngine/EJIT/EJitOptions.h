@@ -32,6 +32,11 @@ struct Config {
   size_t maxCacheEntries = 4096;
   size_t maxCacheSize = 32 * 1024 * 1024;
   size_t maxSingleFuncSize = 512 * 1024;
+  /// Ceiling on host memory retained by the parsed-bitcode cache, evicted
+  /// least-recently-used. Parsed IR runs ~20x the size of its bitcode, so
+  /// without a bound this grows with the number of translation units ever
+  /// compiled. 0 disables the cache.
+  size_t maxPreloadCacheSize = 1 * 1024 * 1024;
   bool enableLogger = true;
   /// If true, skip the constructor-based registration path and use the
   /// static registry table (__ejit_registry_*[]).  For bare-metal where
