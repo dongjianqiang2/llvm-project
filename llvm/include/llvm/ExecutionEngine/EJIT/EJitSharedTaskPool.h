@@ -176,11 +176,18 @@ public:
     /// When false the request is a true miss that still needs compileOrGet().
     /// This flag is an internal control signal; it does not affect status
     /// mapping or the C ABI.
-    bool fastPathTerminal = false;
+    bool fastPathTerminal : 1;
     /// PGO (§6): set when this hit crosses the Tier-2 threshold — compileOrGet()
     /// enqueues a one-shot Tier-2 (PGOUse) recompile. (Shared equivalent of
     /// the non-shared CompileOrGetResult::tier2Arm.)
-    bool tier2Arm = false;
+    bool tier2Arm : 1;
+    // fastPathTerminal + tier2Arm are INTERNAL signals (the public caller
+    // never reads them; not part of the C ABI). They are bitfields sharing one
+    // tail byte so the struct stays <= 16 bytes (AAPCS register return, no
+    // sret) after PGO added tier2Arm; the public hot bools above stay full
+    // bytes (plain ldrb/strb). C++17 has no default member initializers for
+    // bitfields, so a ctor zeros them; other members pick up their NSDMI.
+    CompileOrGetResult() : fastPathTerminal(false), tier2Arm(false) {}
   };
   static_assert(kEJitSharedCacheBuckets < 255,
                 "bucketIndex is a uint8_t: the bucket count and its sentinel "
