@@ -29,6 +29,15 @@ inline uintptr_t addr(const void *P) {
   return reinterpret_cast<uintptr_t>(P);
 }
 
+bool rangeFitsPool(const CodePool &P, const void *Start, size_t Size) {
+  uintptr_t A = addr(Start);
+  uintptr_t B = addr(P.base);
+  if (A < B)
+    return false;
+  uintptr_t Offset = A - B;
+  return Offset <= P.size && Size <= P.size - Offset;
+}
+
 } // namespace
 
 EJitCodePoolManager::EJitCodePoolManager(Options Opts, RawAllocFn Alloc,
@@ -357,6 +366,13 @@ Error EJitCodePoolManager::sealCodeRange(const void *Start, size_t Size) {
             " is not owned by any code pool",
         inconvertibleErrorCode());
   }
+  if (!rangeFitsPool(*P, Start, Size)) {
+    EJIT_DIAG("sealCodeRange FAIL: range start=%p size=%zu crosses pool end",
+              Start, Size);
+    return make_error<StringError>(
+        "EJitCodePool: seal range crosses code-pool boundary",
+        inconvertibleErrorCode());
+  }
 
   // Seal every 4KiB page the written code overlaps: page-align the start down
   // and the end up, then enable_ex(1, pageVA) per page.
@@ -404,6 +420,13 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
             " is not owned by any code pool",
         inconvertibleErrorCode());
   }
+  if (!rangeFitsPool(*P, Start, Size)) {
+    EJIT_DIAG("enableRwRange FAIL: range start=%p size=%zu crosses pool end",
+              Start, Size);
+    return make_error<StringError>(
+        "EJitCodePool: writable range crosses code-pool boundary",
+        inconvertibleErrorCode());
+  }
   // Make every 4KiB page the slab overlaps writable, mirroring sealCodeRange.
   size_t Page = Opts_.sealPageSize;
   uintptr_t PageStart = alignDownAddr(addr(Start), Page);
@@ -421,29 +444,68 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
       // writable (W^X violation). Sealing (RW->RX) is security-benign (more
       // restrictive). The carved slab itself is left unused (a bounded hole in
       // the fixed region) rather than reclaimed, to keep this path simple.
-      for (uintptr_t RollVA = PageStart; RollVA < VA; RollVA += Page) {
-        if (Seal_) {
-          unsigned SealRc = Seal_(reinterpret_cast<void *>(RollVA));
-          // Best-effort rollback: a seal (RW->RX) failure here leaves this
-          // page writable in the code segment (a W^X leak) that we could not
-          // restore. Surface it so the leak is observable rather than silent;
-          // we still return the original enable_rw error below.
-          if (SealRc != 0)
-            EJIT_DIAG("enableRwRange rollback: seal (RW->RX) FAILED page=0x%llx "
-                      "rc=%u (page left RW - W^X leak)",
-                      static_cast<unsigned long long>(RollVA), SealRc);
-        }
-      }
-      return make_error<StringError>(
+      Error Err = make_error<StringError>(
           "EJitCodePool: enable_rw failed (rc=" + Twine(Rc) + ") for page " +
               Twine(VA),
           inconvertibleErrorCode());
+      for (uintptr_t RollVA = PageStart; RollVA < VA; RollVA += Page) {
+        unsigned SealRc = Seal_ ? Seal_(reinterpret_cast<void *>(RollVA)) : 1;
+        if (SealRc == 0) {
+          ++SealInvocations_;
+          continue;
+        }
+        EJIT_DIAG("enableRwRange rollback: seal (RW->RX) FAILED page=0x%llx "
+                  "rc=%u (page left RW - W^X leak)",
+                  static_cast<unsigned long long>(RollVA), SealRc);
+        Err = joinErrors(std::move(Err),
+                         make_error<StringError>(
+                             "EJitCodePool: rollback enable_ex failed (rc=" +
+                                 Twine(SealRc) + ") for page " + Twine(RollVA),
+                             inconvertibleErrorCode()));
+      }
+      return Err;
     }
     ++RwEnableInvocations_;
   }
   EJIT_DIAG("enableRwRange OK: start=%p size=%zu (invocations=%zu)", Start, Size,
             RwEnableInvocations_);
   return Error::success();
+}
+
+Error EJitCodePoolManager::restoreRxRange(const void *Start, size_t Size) {
+  if (!Opts_.needsEnableRw || Size == 0)
+    return Error::success();
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  CodePool *P = findPoolLocked(Start);
+  if (!P || !rangeFitsPool(*P, Start, Size)) {
+    EJIT_DIAG("restoreRxRange FAIL: range start=%p size=%zu not owned", Start,
+              Size);
+    return make_error<StringError>(
+        "EJitCodePool: restore range is not contained in one code pool",
+        inconvertibleErrorCode());
+  }
+
+  size_t Page = Opts_.sealPageSize;
+  uintptr_t PageStart = alignDownAddr(addr(Start), Page);
+  uintptr_t PageEnd = alignUpAddr(addr(Start) + Size, Page);
+  Error Err = Error::success();
+  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page) {
+    unsigned Rc = Seal_ ? Seal_(reinterpret_cast<void *>(VA)) : 1;
+    if (Rc == 0) {
+      ++SealInvocations_;
+      continue;
+    }
+    EJIT_DIAG("restoreRxRange FAIL: enable_ex page=0x%llx rc=%u",
+              static_cast<unsigned long long>(VA), Rc);
+    Err = joinErrors(
+        std::move(Err),
+        make_error<StringError>("EJitCodePool: restore enable_ex failed (rc=" +
+                                    Twine(Rc) + ") for page " + Twine(VA),
+                                inconvertibleErrorCode()));
+  }
+  return Err;
 }
 
 bool EJitCodePoolManager::contains(const void *Ptr) const {

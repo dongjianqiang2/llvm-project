@@ -934,3 +934,38 @@ TEST(EJitCodePoolFixed, EnableRwRangeFailsOnRc) {
   EXPECT_TRUE(bool(E)) << "enable_rw failure must propagate as an Error";
   consumeError(std::move(E));
 }
+
+// A range whose first byte is owned but whose end crosses the pool boundary
+// must be rejected before any platform permission callback runs.
+TEST(EJitCodePoolFixed, PermissionRangeCannotCrossPoolBoundary) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 256;
+  constexpr size_t kRegion = 512;
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fourKSeal = true;
+  O.sealPageSize = kAlign;
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+  O.needsEnableRw = true;
+
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, O);
+  void *P = cantFail(Mgr.allocateCode(128, 64));
+
+  Error RwErr = Mgr.enableRwRange(P, kPool + 1);
+  EXPECT_TRUE(bool(RwErr));
+  consumeError(std::move(RwErr));
+  EXPECT_EQ(M.RwEnableCalls, 0u);
+
+  Error SealErr = Mgr.sealCodeRange(P, kPool + 1);
+  EXPECT_TRUE(bool(SealErr));
+  consumeError(std::move(SealErr));
+  EXPECT_EQ(M.SealCalls, 0u);
+}

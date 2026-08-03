@@ -215,6 +215,13 @@ public:
   /// any enable_rw fails (in which case the slab must not be written).
   Error enableRwRange(const void *Start, size_t Size);
 
+  /// Code-segment mode failure cleanup: seal every page covering
+  /// [Start, Start + Size) back to RX. This is used when an allocation was
+  /// made writable but JITLink abandons it or fails before publication. No-op
+  /// when needsEnableRw is false. All pages are attempted and failures are
+  /// joined so a partial W^X restoration cannot be hidden.
+  Error restoreRxRange(const void *Start, size_t Size);
+
   /// True if this manager seals execute permission per 4KiB page (rather than
   /// per whole 2MiB pool).
   bool usesPageSeal() const { return Opts_.fourKSeal; }

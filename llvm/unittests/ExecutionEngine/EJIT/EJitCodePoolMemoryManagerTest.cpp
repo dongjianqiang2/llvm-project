@@ -635,3 +635,44 @@ TEST(EJitCodePoolMemMgr4K, FixedCodeSegmentEnablesRwThenSealsExecOnly) {
 
   cantFail(MM.deallocate(std::move(FA)));
 }
+
+// Once allocate() has made a fixed code-segment slab writable, abandoning the
+// JITLink allocation must restore every slab page to RX. The bump allocation is
+// intentionally not reclaimed, but no writable hole may remain in .text.ejit.
+TEST(EJitCodePoolMemMgr4K, AbandonRestoresWholeSlabToRx) {
+  constexpr size_t kRegion = kTwoMiB;
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kTwoMiB, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+  O.needsEnableRw = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); },
+      [&M](void *V) { return M.enableRw(V); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndDataGraph(0x1000, 0x2000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  ASSERT_GT(M.RwEnabledPages.size(), 0u);
+  size_t WritablePages = M.RwEnabledPages.size();
+
+  bool CallbackCalled = false;
+  bool AbandonFailed = false;
+  IFA->abandon([&](Error Err) {
+    CallbackCalled = true;
+    if (Err) {
+      AbandonFailed = true;
+      consumeError(std::move(Err));
+    }
+  });
+  EXPECT_TRUE(CallbackCalled);
+  EXPECT_FALSE(AbandonFailed);
+  EXPECT_EQ(M.SealCalls, WritablePages);
+  EXPECT_EQ(M.SealedPages.size(), WritablePages);
+}

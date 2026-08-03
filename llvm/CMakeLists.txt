@@ -826,6 +826,14 @@ if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)
     "EJIT_SRE_TASKPOOL_NO_RECLAIM requires EJIT_SRE_SHARED_TASKPOOL=ON")
 endif()
 
+# The fixed region is process-global, but its bump cursor belongs to one
+# EJitCodePoolManager. Require the shared taskpool's elected single owner so
+# independent managers cannot allocate the same fixed addresses.
+if(EJIT_FIXED_CODE_POOL AND NOT EJIT_SRE_SHARED_TASKPOOL)
+  message(FATAL_ERROR
+    "EJIT_FIXED_CODE_POOL requires EJIT_SRE_SHARED_TASKPOOL=ON so exactly one owner manages the fixed-region bump cursor")
+endif()
+
 set(LLVM_TARGETS_TO_BUILD "all"
     CACHE STRING "Semicolon-separated list of targets to build, or \"all\".")
 

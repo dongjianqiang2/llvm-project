@@ -92,9 +92,11 @@ SECTIONS
    * [__ejit_code_start, aligned start) are wasted slack (at most ~2MiB), so size
    * the region with that headroom (16M -> ~14M usable, ~7 pools). If the aligned
    * region is smaller than one pool (2MiB) the runtime falls back to
-   * SRE_MemDbgAlloc with a diagnostic. Add (NOLOAD) before the colon to reserve
-   * the VMA range without 16M of flash load data (the runtime zero-fills each
-   * slab on first use). Under EJIT_FREESTANDING these symbols are strong, so a
+   * SRE_MemDbgAlloc with a diagnostic. Use (NOLOAD) only when the final platform
+   * loader reserves/maps NOBITS ranges. Do not rely on NOLOAD in a relocatable
+   * (`clang -r`) intermediate: some product link pipelines discard its VMA
+   * reservation. The runtime zero-fills each slab on first use. Under
+   * EJIT_FREESTANDING these symbols are strong, so a
    * bare-metal link REQUIRES this block; a missing definition is a hard link
    * error (not silent).
    *
@@ -144,4 +146,21 @@ SECTIONS
  * With the INSERT form the linker still places .ejit_registry next to .rodata
  * in the same loadable segment, so it does not become a "custom segment" — it
  * rides in the normal data/rodata program header.
+ *
+ * EJIT_FIXED_CODE_POOL also needs a fixed-region INSERT fragment at the FINAL
+ * executable link (not merely at an intermediate `clang -r` link):
+ *
+ *   SECTIONS
+ *   {
+ *     .text.ejit : ALIGN(4096)
+ *     {
+ *       __ejit_code_start = .;
+ *       . = __ejit_code_start + 16M;
+ *       __ejit_code_end = .;
+ *     }
+ *   } INSERT AFTER .text;
+ *
+ * Use (NOLOAD) only if the target loader is known to map/reserve the resulting
+ * NOBITS range. Verify the final image with readelf -SW/-lW and confirm
+ * __ejit_code_end > __ejit_code_start.
  */

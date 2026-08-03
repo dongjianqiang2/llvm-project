@@ -18,6 +18,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if defined(EJIT_FIXED_CODE_POOL) && !defined(EJIT_SRE_SHARED_TASKPOOL)
+#error "EJIT_FIXED_CODE_POOL requires the shared taskpool"
+#endif
+
 #ifdef EJIT_SRE_CODE_POOL
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"

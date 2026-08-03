@@ -447,6 +447,11 @@ code pool 与 taskpool 关键路径埋了**默认空展开**的 trace 宏，便�
 可用，~7 个池）。区域耗尽是干净的 `Error`，**不回退动态分配**（特化回退 AOT），保住固定
 地址保证。
 
+该模式强制要求 `EJIT_SRE_SHARED_TASKPOOL=ON`。固定区域是进程级唯一资源，而 bump
+游标 `FixedUsed_` 属于单个 `EJitCodePoolManager`；只有 shared taskpool 选出的唯一
+owner 会创建 ORC/manager 并执行编译。多个独立 manager 会各自从 offset 0 开始切同一
+段内存并覆盖仍在使用的 JIT 代码，因此 CMake 拒绝这种配置。
+
 链接脚本（`ejit_registry.ld` 提供 `INSERT` 片段；段名仅是容器，运行时实际依赖
 `__ejit_code_start`/`__ejit_code_end` 两个符号）：
 
@@ -458,6 +463,24 @@ code pool 与 taskpool 关键路径埋了**默认空展开**的 trace 宏，便�
   __ejit_code_end = .;
 } > CODE        /* 代码段，近 .text（±128MiB 内 bl/adrp 直达 AOT） */
 ```
+
+若不能修改 vendor `SECTIONS`，必须在**最终可执行文件链接**时额外传入 fixed-region
+INSERT 脚本，不能只在 `clang -r` 中间链接使用：
+
+```ld
+SECTIONS
+{
+  .text.ejit : ALIGN(4096)
+  {
+    __ejit_code_start = .;
+    . = __ejit_code_start + 16M;
+    __ejit_code_end = .;
+  }
+} INSERT AFTER .text;
+```
+
+`NOLOAD` 仅适用于确认会为 NOBITS 预留并映射 VMA 的最终加载器。应对最终镜像执行
+`readelf -SW/-lW`，并检查 `__ejit_code_end > __ejit_code_start`。
 
 区域大小由链接脚本（上面的 `+ 16M`）决定，**无 CMake 旋钮**；运行时从
 `__ejit_code_end - __ejit_code_start` 读取实际大小。要改容量就改链接脚本里这一行。
@@ -510,3 +533,6 @@ freestanding strong，类似 `__start_ejit_bitcode`），缺失或对齐后太�
 - **部分失败回滚**：`enableRwRange` 中途某页 `enable_rw` 失败时，把已成功 RX->RW 的页
   用 `Seal_` 封回 RX（避免代码段永久可写 W^X 违规）；被 carve 的 slab 留作废弃孔洞
   （不回收，保简单），下次编译从下一位置切。
+- **后续失败回滚**：slab 已经 RX->RW 后，若 layout、JITLink finalize action、seal 或
+  abandon 失败，`restoreRxRange` 会尝试把整个废弃 slab 恢复为 RX，并合并报告回滚错误；
+  只有 finalize actions 全部成功后才记录可供 peer 查询的 finalized range。
