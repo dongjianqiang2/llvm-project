@@ -70,9 +70,44 @@ extern "C" unsigned
 ejit_sre_split_2m_to_4k(unsigned long long va,
                         unsigned long long size) __asm__("split_2m_to_4k");
 
+// Make a 4KiB page writable (RX -> RW) so JIT code can be written into a fixed
+// region placed in the executable code segment. Symmetric to enable_ex (which
+// makes a page executable, RW -> RX). Returns 0 on success. Only declared when
+// the fixed code pool is placed in the code segment
+// (EJIT_FIXED_CODE_POOL); the platform MUST supply the strong
+// definition - there is intentionally no weak no-op fallback, so a missing
+// enable_rw surfaces as a hard link error rather than silent non-writability.
+// Platform signature: unsigned enable_rw(unsigned level, unsigned long long va)
+// (level mirrors enable_ex's startLevel; the EnableRw lambda below passes 1).
+#if defined(EJIT_FIXED_CODE_POOL)
+extern "C" unsigned
+ejit_sre_enable_rw(unsigned level, unsigned long long va) __asm__("enable_rw");
+#endif
+
 extern "C" void *SRE_MemDbgAlloc(unsigned int mid, unsigned char ptNo,
                                  unsigned long size, const char *func,
                                  unsigned int line);
+
+// Fixed code-pool region bounds, defined by the linker script (a .text.ejit
+// output section bracketed by these two symbols). When EJIT_FIXED_CODE_POOL is
+// on, makeSreCodePoolManager() prefers this fixed region over dynamic
+// SRE_MemDbgAlloc so JIT code lands at a stable, predictable address (enabling
+// direct bl/adrp reach to AOT code). Declared weak on the host (absent -> null
+// -> dynamic fallback, so host tests link without a linker script) and strong
+// under EJIT_FREESTANDING, exactly like __start_ejit_bitcode in EJit.cpp: a
+// bare-metal link MUST define them via the linker script, and a missing
+// definition is a hard link error rather than a silent no-op.
+#if defined(EJIT_FIXED_CODE_POOL)
+extern "C" {
+#ifndef EJIT_FREESTANDING
+extern const unsigned char __ejit_code_start[] __attribute__((weak));
+extern const unsigned char __ejit_code_end[] __attribute__((weak));
+#else
+extern const unsigned char __ejit_code_start[];
+extern const unsigned char __ejit_code_end[];
+#endif
+}
+#endif
 
 namespace {
 /// Make newly-written JIT code in [Va, Va + Size) observable to instruction
@@ -141,6 +176,62 @@ llvm::ejit::makeSreCodePoolManager() {
   Opts.sealPageSize = k4KiB;
 #endif
 
+#ifdef EJIT_FIXED_CODE_POOL
+  // The linker script reserves [.text.ejit] = [__ejit_code_start, __ejit_code_end)
+  // with only page (4KiB) alignment. Align the start UP to the 2MiB large-page
+  // granularity here: split_2m_to_4k / enable_ex require 2MiB-aligned bases, so
+  // the runtime (not the linker script) owns the 2MiB alignment. The bytes
+  // [__ejit_code_start, AlignedBase) are wasted alignment slack (at most ~2MiB),
+  // so size the region with that headroom in mind (16M -> ~14M usable). Engage
+  // fixed mode only if the aligned region can hold at least one pool; otherwise
+  // fall back to SRE_MemDbgAlloc (a too-small fixed region would exhaust on
+  // every compile). A fixed region gives a stable JIT address range and, when
+  // placed within +-128MiB of .text, lets codegen use direct bl/adrp.
+  {
+    uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
+    uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
+    uintptr_t AlignedBase =
+        (FBase + (static_cast<uintptr_t>(k2MiB) - 1)) &
+        ~(static_cast<uintptr_t>(k2MiB) - 1);
+    if (FEnd > AlignedBase && (FEnd - AlignedBase) >= kSrePoolSize) {
+      Opts.fixedBase = AlignedBase;
+      Opts.fixedSize = FEnd - AlignedBase;
+      EJIT_DIAG("makeSreCodePoolManager: FIXED region sym=[0x%llx,0x%llx) "
+                "alignedBase=0x%llx usable=%llu (~%llu pools of %lluB)",
+                static_cast<unsigned long long>(FBase),
+                static_cast<unsigned long long>(FEnd),
+                static_cast<unsigned long long>(AlignedBase),
+                static_cast<unsigned long long>(FEnd - AlignedBase),
+                static_cast<unsigned long long>((FEnd - AlignedBase) / kSrePoolSize),
+                static_cast<unsigned long long>(kSrePoolSize));
+    } else {
+      EJIT_DIAG("makeSreCodePoolManager: fixed region absent or too small after "
+                "2MiB alignment (sym=[0x%llx,0x%llx) alignedBase=0x%llx "
+                "usable=%llu < poolSize=%llu), falling back to SRE_MemDbgAlloc "
+                "ptNo=%u",
+                static_cast<unsigned long long>(FBase),
+                static_cast<unsigned long long>(FEnd),
+                static_cast<unsigned long long>(AlignedBase),
+                static_cast<unsigned long long>(FEnd > AlignedBase
+                                                    ? FEnd - AlignedBase
+                                                    : 0),
+                static_cast<unsigned long long>(kSrePoolSize),
+                static_cast<unsigned>(kSrePtNo));
+    }
+  }
+#endif
+
+#ifdef EJIT_FIXED_CODE_POOL
+  // Code-segment placement: the fixed region is RX by default, so each slab
+  // must be enable_rw'd (RX -> RW) before writing. needsEnableRw makes
+  // EJitCodePoolMemoryManager::allocate call enableRwRange before memset. Only
+  // meaningful when the fixed region is actually engaged (fixedSize > 0).
+  if (Opts.fixedSize > 0) {
+    Opts.needsEnableRw = true;
+    EJIT_DIAG("makeSreCodePoolManager: code-segment placement -> needsEnableRw=1");
+  }
+#endif
+
   auto RawAlloc = [](size_t Bytes) -> void * {
     return SRE_MemDbgAlloc(kSreMid, kSrePtNo, static_cast<unsigned long>(Bytes),
                            __func__, __LINE__);
@@ -175,7 +266,23 @@ llvm::ejit::makeSreCodePoolManager() {
 #endif
   };
 
-  return std::make_unique<EJitCodePoolManager>(Opts, RawAlloc, Seal, Split);
+  auto EnableRw = [](void *Va) -> unsigned {
+#ifdef EJIT_FIXED_CODE_POOL
+    // Make one 4KiB page writable (RX -> RW) so JITLink can write code into the
+    // code-segment fixed region. enable_rw flips the PTE AP bit + TLB flush
+    // (no I-cache sync needed - we are about to WRITE, not execute). Per-core:
+    // only the compiling core calls this; peer cores only enable_ex to execute.
+    return ejit_sre_enable_rw(
+        /*level=*/1u,
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Va)));
+#else
+    (void)Va;
+    return 0;
+#endif
+  };
+
+  return std::make_unique<EJitCodePoolManager>(Opts, RawAlloc, Seal, Split,
+                                                EnableRw);
 }
 
 bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {

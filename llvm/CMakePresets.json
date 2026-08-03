@@ -78,6 +78,7 @@
         "EJIT_CODE_POOL_4K_SEAL": "ON",
         "EJIT_SRE_CODE_POOL": "ON",
         "EJIT_SRE_CODE_POOL_PTNO": "8",
+        "EJIT_FIXED_CODE_POOL": "ON",
         "EJIT_SRE_TASKPOOL": "ON",
         "EJIT_SRE_SHARED_TASKPOOL": "ON",
         "EJIT_SRE_TASKPOOL_NO_RECLAIM": "ON",

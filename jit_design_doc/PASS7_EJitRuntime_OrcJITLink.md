@@ -271,8 +271,11 @@ taskpool ABI。已经分配的 stub/GOT 不主动删除，因此本改动降低�
   code-pool 内存，pool lifetime 与 engine 一致。
 
 平台 adapter 只声明 `enable_ex`、`split_2m_to_4k` 和
-`SRE_MemDbgAlloc`。目标最终链接必须提供强定义；这些平台依赖不能由
-`ejit_register_symbol` 补齐。
+`SRE_MemDbgAlloc`（固定代码池模式 `EJIT_FIXED_CODE_POOL=ON` 下不调 `SRE_MemDbgAlloc`，
+改用链接脚本区域 `[__ejit_code_start, __ejit_code_end)`，并需 `enable_rw`，签名
+`unsigned enable_rw(unsigned level, unsigned long long va)`，与 `enable_ex` 对称）。目标
+最终链接必须提供强定义；这些平台依赖不能由 `ejit_register_symbol` 补齐。固定代码池区域
+详见 `EJIT_SRE_CODE_POOL.md` §14。
 
 <details>
 <summary>历史设计：固定 slab EJitJITLinkMemoryManager（已删除）</summary>

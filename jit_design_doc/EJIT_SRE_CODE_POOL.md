@@ -4,6 +4,7 @@
 **开关**:
 - `-DEJIT_SRE_CODE_POOL=ON`（默认 OFF，上游默认行为不变）
 - `-DEJIT_CODE_POOL_4K_SEAL=ON`（默认 ON，仅在 `EJIT_SRE_CODE_POOL=ON` 时生效；OFF 回退到旧的整 2MiB 池封固）
+- `-DEJIT_FIXED_CODE_POOL=ON`（默认 OFF）：代码池改用链接脚本固定区域 `[__ejit_code_start, __ejit_code_end)`（段名 `.text.ejit`，**代码段**），替代动态 `SRE_MemDbgAlloc`，给 JIT 稳定地址（±128MiB 内可直 `bl`/`adrp` 到 AOT）。写前 `enable_rw`（RX->RW）、finalize `enable_ex`（RW->RX）。需平台提供 `enable_rw`。详见 [§14](#14-固定代码池区域ejit_fixed_code_pool)。
 
 **关联代码**:
 - `llvm/include/llvm/ExecutionEngine/EJIT/EJitCodePool.h` / `llvm/lib/ExecutionEngine/EJIT/EJitCodePool.cpp`
@@ -191,6 +192,7 @@ cmake -S llvm -B build-ejit-sre-pool \
 | `EJIT_SRE_CODE_POOL_SIZE` | 2097152 (2MiB) | 每个池的可用字节数；4K 模式下向上取整为 2MiB 整数倍 |
 | `EJIT_SRE_CODE_POOL_PTNO` | 8 | 传给 `SRE_MemDbgAlloc` 的分区号 ptNo |
 | `EJIT_SRE_ENABLE_EX` | 随 `EJIT_SRE_CODE_POOL` | 关闭后代码仍走池，但不做权限翻转（bring-up/测量用） |
+| `EJIT_FIXED_CODE_POOL` | OFF | 固定区域代码池（**代码段**）：用链接脚本 `[__ejit_code_start, __ejit_code_end)`（段名 `.text.ejit`）替代 `SRE_MemDbgAlloc`，给 JIT 稳定地址（±128MiB 内直 `bl`/`adrp`）。写前 `enable_rw`（RX->RW）、finalize `enable_ex`（RW->RX）。需平台 `enable_rw`。仅在 `EJIT_SRE_CODE_POOL=ON` 时生效。详见 §14 |
 
 平台接口（在 `EJitSrePlatform.cpp` 内**仅声明、不定义**，避免污染通用命名空间）：
 
@@ -209,7 +211,8 @@ extern "C" void *SRE_MemDbgAlloc(unsigned int mid, unsigned char ptNo,
 
 - `enable_ex`
 - `split_2m_to_4k`
-- `SRE_MemDbgAlloc`
+- `SRE_MemDbgAlloc`（未用固定区域时；固定区域模式不调它）
+- `enable_rw`（`EJIT_FIXED_CODE_POOL=ON` 时；签名 `unsigned enable_rw(unsigned level, unsigned long long va)`，与 `enable_ex` 对称）
 - 若启用平台 taskpool 队列（`EJIT_SRE_TASKPOOL_PLATFORM_QUEUE`），还必须提供
   `QueueCreate` / `QueueWrite` / `QueueRead`（见 `EJitSreQueue.cpp`）。
 
@@ -430,3 +433,78 @@ code pool 与 taskpool 关键路径埋了**默认空展开**的 trace 宏，便�
   `allocateCode`（req / res）、`sealCodeRange`（范围 / 每页 rc）、`sealPoolContaining` 的
   4K 误用；taskpool 的 `compileOrGet`（enter / cacheHit / dedup / queuePush）、`runCompile`
   （begin / compiled / published）、`pollOne`（empty / dequeued）、`freeCode`（cancel/free）。
+
+---
+
+## 14. 固定代码池区域（EJIT_FIXED_CODE_POOL / 代码段放置 enable_rw）
+
+`EJIT_FIXED_CODE_POOL=ON` 时，代码池改用**链接脚本定义的固定区域**
+`[__ejit_code_start, __ejit_code_end)`（段名 `.text.ejit`），替代动态 `SRE_MemDbgAlloc`。
+`EJitCodePoolManager` 进入固定区域模式（`Options::fixedBase`/`fixedSize` + `FixedUsed_`
+游标），`newActivePoolLocked` 从该区域切出 2MiB 对齐的池，**不调 `RawAllocFn`**。运行时
+把 `__ejit_code_start` 向上对齐到 2MiB（链接脚本只需 `ALIGN(4096)`），
+`[__ejit_code_start, 对齐基)` 是浪费的 slack（最多 ~2MiB），区域要留余量（16M -> ~14M
+可用，~7 个池）。区域耗尽是干净的 `Error`，**不回退动态分配**（特化回退 AOT），保住固定
+地址保证。
+
+链接脚本（`ejit_registry.ld` 提供 `INSERT` 片段；段名仅是容器，运行时实际依赖
+`__ejit_code_start`/`__ejit_code_end` 两个符号）：
+
+```ld
+.text.ejit : ALIGN(4096)
+{
+  __ejit_code_start = .;
+  . = __ejit_code_start + 16M;
+  __ejit_code_end = .;
+} > CODE        /* 代码段，近 .text（±128MiB 内 bl/adrp 直达 AOT） */
+```
+
+区域大小由链接脚本（上面的 `+ 16M`）决定，**无 CMake 旋钮**；运行时从
+`__ejit_code_end - __ejit_code_start` 读取实际大小。要改容量就改链接脚本里这一行。
+
+`makeSreCodePoolManager` 自动探测 `__ejit_code_start`/`__ejit_code_end`（host weak /
+freestanding strong，类似 `__start_ejit_bitcode`），缺失或对齐后太小则回退
+`SRE_MemDbgAlloc` 并打诊断。`EJIT_FREESTANDING` 下这两个符号是 strong，裸核链接**必须**
+定义该块，缺失即硬链接错误。
+
+### 14.1 代码段放置
+
+固定区域放在**代码段**（近 `.text`），装载即 RX，给 JIT 稳定地址且 ±128MiB 内可直
+`bl`/`adrp` 到 AOT 代码。链接脚本用 `> CODE`（或代码段中 `.text` 之后）：
+
+```ld
+.text.ejit : ALIGN(4096)
+{
+  __ejit_code_start = .;
+  . = __ejit_code_start + 16M;
+  __ejit_code_end = .;
+} > CODE        /* 代码段，近 .text（±128MiB 内 bl/adrp 直达 AOT） */
+```
+
+| 阶段 | 权限 | 操作 |
+|---|---|---|
+| 装载 | RX | 链接脚本 `> CODE` |
+| 写前（每次 slab） | RX->RW | `enableRwRange`（逐 4K 页 `enable_rw`），在 `memset` 前 |
+| finalize | RW->RX | `sealCodeRange`（逐 4K 页 `enable_ex`）；.data/.got 页保持 RW 供 GOT 写 |
+| `enable_rw` | 必须平台提供 | 强 extern，缺失即硬链接错误 |
+| per-core | 编译核 `enable_rw`+`enable_ex`；peer 核只 `enable_ex` | 只读执行已写好的代码 |
+
+> **W^X 取舍**：为拿到 `bl` 直达，slab 整段（含 .data/.got 页）写前都被 `enable_rw` 成
+> RW，finalize 只把可执行页封回 RX，.data/.got 页保持 RW（供 GOT 写）。即代码段里非可执行
+> 数据页是可写的--这是"代码池放代码段换 bl 直达"的固有取舍。
+
+生产 preset `ejit-minimal-aarch64_be` 用 `EJIT_FIXED_CODE_POOL=ON`（代码段 + enable_rw）。
+
+### 14.2 enable_rw 机制
+
+- `EnableRwFn` callback + `enableRwRange(Start, Size)`：按页对齐、逐页翻转，与
+  `sealCodeRange` 对称。`EJitCodePoolMemoryManager::allocate` 在 `memset` **之前**调
+  `enableRwRange(slab, total)`。
+- 平台签名：`unsigned enable_rw(unsigned level, unsigned long long va)`，`level=1`（与
+  `enable_ex` 的 `startLevel` 对称）。翻转 PTE AP 位 + TLB flush。
+- `enable_rw` 是**强 extern**（platform-supplied，无 weak 兜底）--缺失即**硬链接错误**，
+  不会静默不可写。
+- per-core：编译核 `enable_rw`+`enable_ex`；peer 核只 `enable_ex`（只读执行已写好的代码）。
+- **部分失败回滚**：`enableRwRange` 中途某页 `enable_rw` 失败时，把已成功 RX->RW 的页
+  用 `Seal_` 封回 RX（避免代码段永久可写 W^X 违规）；被 carve 的 slab 留作废弃孔洞
+  （不回收，保简单），下次编译从下一位置切。

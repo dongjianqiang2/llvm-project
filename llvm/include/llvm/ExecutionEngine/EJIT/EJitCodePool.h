@@ -101,6 +101,13 @@ public:
   /// Options::fourKSeal is set.
   using SplitFn = std::function<unsigned(void *base, size_t size)>;
 
+  /// Make one 4KiB page writable (RX -> RW) so JIT code can be written into a
+  /// fixed region placed in the executable code segment (which is RX by
+  /// default). Returns 0 on success, non-zero on failure. On the target this
+  /// calls enable_rw(va); in tests, a mock. Only used when
+  /// Options::needsEnableRw is set (code-segment fixed-pool placement).
+  using EnableRwFn = std::function<unsigned(void *va)>;
+
   struct Options {
     /// Usable bytes per pool (EJIT_SRE_CODE_POOL_SIZE). Default 2MiB. In 4K
     /// seal mode this is rounded up to a multiple of poolAlign.
@@ -116,6 +123,25 @@ public:
     bool fourKSeal = false;
     /// Execute-permission seal granularity in 4K mode. Platform constant 4KiB.
     size_t sealPageSize = 4096;
+    /// When fixedSize > 0, new pools are carved sequentially from the fixed
+    /// pre-reserved region [fixedBase, fixedBase + fixedSize) (e.g. a
+    /// linker-script .text.ejit bounded by __ejit_code_start/__ejit_code_end)
+    /// instead of calling RawAllocFn. The region MUST be poolAlign-aligned
+    /// (2MiB); Split_/Seal_ still apply. Two placement modes:
+    ///   * data-region (default, needsEnableRw=false): region is RW at load,
+    ///     writable directly; enable_ex seals .text pages to RX.
+    ///   * code-segment (needsEnableRw=true): region is RX at load (placed in
+    ///     the code segment for bl/adrp reach to AOT .text); each slab must be
+    ///     enable_rw'd (RX->RW) before writing, then enable_ex'd (RW->RX) at
+    ///     finalize. Requires an EnableRwFn.
+    /// Exhausting the region is a clean Error (no fallback to RawAllocFn, which
+    /// would break the fixed-address guarantee). Default 0 = dynamic allocation.
+    uintptr_t fixedBase = 0;
+    size_t fixedSize = 0;
+    /// When true, the fixed region starts read-only (code segment, RX) and each
+    /// slab is enable_rw'd before writing. Ignored unless fixedSize > 0.
+    /// Default false (data-region placement, RW).
+    bool needsEnableRw = false;
   };
 
   struct Stats {
@@ -129,12 +155,14 @@ public:
                                 ///< (per 4K page in 4K seal mode)
     size_t splitInvocations = 0; ///< number of successful split_2m_to_4k calls
                                  ///< (one per pool in 4K seal mode)
+    size_t rwEnableInvocations = 0; ///< number of successful enable_rw calls
+                                    ///< (per 4K page, code-segment mode only)
     size_t finalizedRangeCount = 0; ///< distinct executable ranges recorded
                                     ///< (duplicates are not double-counted)
   };
 
   EJitCodePoolManager(Options Opts, RawAllocFn Alloc, SealFn Seal,
-                      SplitFn Split = nullptr);
+                      SplitFn Split = nullptr, EnableRwFn EnableRw = nullptr);
   ~EJitCodePoolManager();
 
   EJitCodePoolManager(const EJitCodePoolManager &) = delete;
@@ -171,6 +199,15 @@ public:
   /// Returns an Error if `Start` is not owned by any pool or if any page seal
   /// fails (in which case no callable pointer must be handed back).
   Error sealCodeRange(const void *Start, size_t Size);
+
+  /// Code-segment mode (Options::needsEnableRw): make the 4KiB pages covering
+  /// [Start, Start + Size) writable (RX -> RW) so JITLink can write code into
+  /// the fixed region placed in the executable code segment. Called by the
+  /// code-pool memory manager at allocate, BEFORE memset/JITLink writes.
+  /// No-op (returns success) when needsEnableRw is false (data-region placement
+  /// is already RW). Returns an Error if `Start` is not owned by any pool or if
+  /// any enable_rw fails (in which case the slab must not be written).
+  Error enableRwRange(const void *Start, size_t Size);
 
   /// True if this manager seals execute permission per 4KiB page (rather than
   /// per whole 2MiB pool).
@@ -209,12 +246,17 @@ private:
   RawAllocFn Alloc_;
   SealFn Seal_;
   SplitFn Split_;
+  EnableRwFn EnableRw_;
 
   // Pool descriptors (ordinary host bookkeeping; never holds code bytes).
   std::vector<std::unique_ptr<CodePool>> Pools_;
   CodePool *Active_ = nullptr;
   size_t SealInvocations_ = 0;
   size_t SplitInvocations_ = 0;
+  size_t RwEnableInvocations_ = 0;
+  /// Bump cursor (bytes consumed) over the fixed region [fixedBase, fixedBase +
+  /// fixedSize) when Options::fixedSize > 0; unused in dynamic-allocation mode.
+  size_t FixedUsed_ = 0;
 
   /// Finalized executable allocation extents (ordinary host bookkeeping; never
   /// holds code bytes). Recorded at finalize, queried by findRange(). Append

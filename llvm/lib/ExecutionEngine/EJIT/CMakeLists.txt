@@ -159,6 +159,15 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
 endif()
 
+# Pin the JIT code pool to a fixed linker-script region [__ejit_code_start,
+# __ejit_code_end) in the RX code segment (enable_rw write / enable_ex seal)
+# instead of dynamic SRE_MemDbgAlloc. The only user of this macro is the SRE
+# adapter (EJitSrePlatform.cpp), so scope it to LLVMEJIT like
+# EJIT_CODE_POOL_4K_SEAL above. Effective only when the SRE code pool is on.
+if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
+endif()
+
 # EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
 # Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
 # the AOT -mllvm -ejit-icache-dim-size value (both from the top-level CMake

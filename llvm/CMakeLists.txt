@@ -661,6 +661,26 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
 endif()
 
+# Pin the JIT code pool to a fixed, linker-script-defined region
+# [__ejit_code_start, __ejit_code_end) (the .text.ejit output section) in the
+# executable CODE segment, instead of dynamic SRE_MemDbgAlloc. A fixed region
+# gives a stable JIT address range and, placed within +-128MiB of .text, lets
+# codegen use direct bl/adrp with no GOT/stubs. The code segment is RX by
+# default, so the runtime enable_rw's each slab (RX->RW) before writing and
+# enable_ex's it (RW->RX) at finalize. REQUIRES the platform to supply
+# enable_rw (symmetric to enable_ex); a missing enable_rw is a hard link error.
+# When the linker script does NOT define the symbols, the runtime falls back to
+# SRE_MemDbgAlloc, so this is backward-compatible.
+# Default OFF: existing dynamic-allocation behavior is unchanged.
+# Authoritative size is __ejit_code_end - __ejit_code_start from the .text.ejit
+# linker-script block (no CMake size knob).
+option(EJIT_FIXED_CODE_POOL
+  "Pin the JIT code pool to a fixed linker-script region in the RX code segment (enable_rw write / enable_ex seal) instead of dynamic SRE_MemDbgAlloc. Needs platform enable_rw." OFF)
+if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
+  message(STATUS "EmbeddedJIT: fixed code-pool region enabled (code segment, enable_rw) "
+                 "(size is __ejit_code_end - __ejit_code_start from the linker script's .text.ejit block)")
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

@@ -146,6 +146,16 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
       return;
     }
     Slab = *MemOrErr;
+    // Code-segment fixed-pool placement: the slab sits in the RX code segment,
+    // so make its pages writable (RX -> RW via enable_rw) BEFORE any write. In
+    // data-region placement this is a no-op (already RW). Failure means the slab
+    // is not writable - do not hand it back for JITLink to write into.
+    if (auto Err = Pool_.enableRwRange(Slab, static_cast<size_t>(Total))) {
+      EJIT_DIAG("allocate FAIL: enableRwRange total=%llu",
+                static_cast<unsigned long long>(Total));
+      OnAllocated(std::move(Err));
+      return;
+    }
     // Zero-fill the whole slab up-front (covers zero-fill segments and any
     // inter-segment page padding).
     std::memset(Slab, 0, static_cast<size_t>(Total));

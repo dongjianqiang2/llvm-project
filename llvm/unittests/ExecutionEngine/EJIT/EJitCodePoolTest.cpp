@@ -318,6 +318,10 @@ struct MockSre4K {
   int FailSealOnCall = -1; // 1-based seal call index to fail; -1 = never
   unsigned SealFailRc = 7;
 
+  std::vector<uintptr_t> RwEnabledPages;
+  size_t RwEnableCalls = 0;
+  unsigned RwEnableRc = 0; // 0 = success; non-zero simulates enable_rw failure
+
   ~MockSre4K() {
     for (void *P : Origs)
       std::free(P);
@@ -349,6 +353,14 @@ struct MockSre4K {
     SealedPages.push_back(reinterpret_cast<uintptr_t>(PageVA));
     return 0;
   }
+
+  unsigned enableRw(void *PageVA) {
+    ++RwEnableCalls;
+    if (RwEnableRc != 0)
+      return RwEnableRc;
+    RwEnabledPages.push_back(reinterpret_cast<uintptr_t>(PageVA));
+    return 0;
+  }
 };
 
 EJitCodePoolManager::Options fourKOpts() {
@@ -366,7 +378,8 @@ EJitCodePoolManager makeManager4K(MockSre4K &M,
   return EJitCodePoolManager(
       Opts, [&M](size_t N) { return M.rawAlloc(N); },
       [&M](void *V) { return M.seal(V); },
-      [&M](void *B, size_t S) { return M.split(B, S); });
+      [&M](void *B, size_t S) { return M.split(B, S); },
+      [&M](void *V) { return M.enableRw(V); });
 }
 
 } // namespace
@@ -678,4 +691,246 @@ TEST(EJitCodePoolRange, OverlappingRangesResolveDeterministically) {
   // First (append order) containing range wins.
   EXPECT_EQ(Info.codeStart, A(P));
   EXPECT_EQ(Info.codeSize, 400u);
+}
+
+// ---- Fixed-region mode (EJIT_FIXED_CODE_POOL) ----
+// When Options::fixedSize > 0, pools are carved from the pre-reserved
+// [fixedBase, fixedBase+fixedSize) region instead of calling RawAllocFn. These
+// tests use tiny geometry (poolAlign=poolSize=256) so they run fast and never
+// touch real 2MiB pages; the carve math is identical at any scale.
+
+// Fixed-region mode carves poolAlign-aligned pools from the region WITHOUT ever
+// calling the raw allocator (dynamic SRE_MemDbgAlloc is the fallback only when
+// fixedSize == 0).
+TEST(EJitCodePoolFixed, CarvesAlignedPoolsWithoutAlloc) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 256;
+  constexpr size_t kRegion = 1024; // 4 pools
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+
+  MockSre M;
+  auto Mgr = makeManager(M, O);
+
+  uintptr_t RegionBase = reinterpret_cast<uintptr_t>(Region);
+  uintptr_t Prev = 0;
+  for (int i = 0; i < 4; ++i) {
+    void *P = cantFail(Mgr.allocateCode(kPool, 64));
+    uintptr_t AP = A(P);
+    EXPECT_GE(AP, RegionBase);
+    EXPECT_LT(AP, RegionBase + kRegion);
+    EXPECT_EQ(AP % kAlign, 0u);
+    EXPECT_NE(AP, Prev);
+    Prev = AP;
+  }
+  // The raw allocator is never consulted in fixed-region mode.
+  EXPECT_EQ(M.AllocCalls, 0u);
+}
+
+// Exhausting the fixed region is a clean Error (no crash, no silent fallback
+// to dynamic allocation), and pools already carved remain valid.
+TEST(EJitCodePoolFixed, ExhaustsCleanly) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 256;
+  constexpr size_t kRegion = 512; // 2 pools
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+
+  MockSre M;
+  auto Mgr = makeManager(M, O);
+
+  void *P0 = cantFail(Mgr.allocateCode(kPool, 64));
+  void *P1 = cantFail(Mgr.allocateCode(kPool, 64));
+  EXPECT_NE(A(P0), A(P1));
+  Expected<void *> E = Mgr.allocateCode(kPool, 64);
+  ASSERT_FALSE(E) << "fixed region must exhaust cleanly, not fall back";
+  consumeError(E.takeError());
+}
+
+// 4K page-seal mode still splits the fixed-region pool at creation and seals
+// the covering pages at finalize - the fixed region is RW until sealed, exactly
+// like a dynamically allocated pool.
+TEST(EJitCodePoolFixed, StillSplitsAndSealsIn4KMode) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 256;
+  constexpr size_t kPage = 256;
+  constexpr size_t kRegion = 512; // 2 pools
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fourKSeal = true;
+  O.sealPageSize = kPage;
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, O);
+
+  void *P = cantFail(Mgr.allocateCode(128, 64));
+  // Pool creation in 4K mode still split the fixed-region pool.
+  ASSERT_EQ(M.Splits.size(), 1u);
+  EXPECT_EQ(M.Splits[0].first, reinterpret_cast<uintptr_t>(Region));
+  EXPECT_EQ(M.Splits[0].second, kPool);
+  // Raw allocator never consulted.
+  EXPECT_EQ(M.AllocCalls, 0u);
+
+  // Sealing the carved code range flips the covering page. P is page-aligned
+  // (EffAlign >= sealPageSize in 4K mode), so exactly one page is sealed.
+  cantFail(Mgr.sealCodeRange(P, 128));
+  EXPECT_EQ(M.SealCalls, 1u);
+  ASSERT_EQ(M.SealedPages.size(), 1u);
+  EXPECT_EQ(M.SealedPages[0], A(P));
+}
+
+// A non-poolAlign-aligned fixedBase is aligned UP by the manager. The factory
+// (makeSreCodePoolManager) does this alignment itself; this test pins that the
+// manager stays robust to a misaligned base from any direct Options caller
+// (defense in depth): the first pool lands at alignUp(fixedBase, poolAlign),
+// inside the region, and the raw allocator is still never consulted.
+TEST(EJitCodePoolFixed, AlignsMisalignedBase) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 256;
+  // 256-aligned buffer; start the region at +100 so it is NOT 256-aligned, with
+  // enough headroom that the align-up still leaves room for a pool.
+  void *Buf = nullptr;
+  ASSERT_EQ(posix_memalign(&Buf, kAlign, kAlign + 1024), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Buf, std::free);
+  uintptr_t MisalignedBase = reinterpret_cast<uintptr_t>(Buf) + 100;
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fixedBase = MisalignedBase;
+  O.fixedSize = 1024;
+
+  MockSre M;
+  auto Mgr = makeManager(M, O);
+
+  uintptr_t ExpectedFirst =
+      (MisalignedBase + (kAlign - 1)) & ~(static_cast<uintptr_t>(kAlign) - 1);
+  void *P = cantFail(Mgr.allocateCode(kPool, 64));
+  EXPECT_EQ(A(P), ExpectedFirst);
+  EXPECT_GE(A(P), MisalignedBase);
+  EXPECT_LT(A(P), MisalignedBase + 1024);
+  EXPECT_EQ(A(P) % kAlign, 0u);
+  EXPECT_EQ(M.AllocCalls, 0u);
+}
+
+// ---- Code-segment placement (enable_rw) ----
+
+// enableRwRange makes the slab's 4K pages writable (RX -> RW) when
+// needsEnableRw is set (code-segment placement). Page-aligned like
+// sealCodeRange; one enable_rw per covered page.
+TEST(EJitCodePoolFixed, EnableRwRangeFlipsCoveredPages) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 1024; // >= the 384-byte request
+  constexpr size_t kPage = 256;
+  constexpr size_t kRegion = 2048; // 2 pools
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fourKSeal = true;
+  O.sealPageSize = kPage;
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+  O.needsEnableRw = true;
+
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, O);
+
+  // A 384-byte request spans 2 pages ([P, P+384) -> [P, P+512)).
+  void *P = cantFail(Mgr.allocateCode(384, 64));
+  cantFail(Mgr.enableRwRange(P, 384));
+  EXPECT_EQ(M.RwEnableCalls, 2u);
+  ASSERT_EQ(M.RwEnabledPages.size(), 2u);
+  EXPECT_EQ(M.RwEnabledPages[0], A(P));
+  EXPECT_EQ(M.RwEnabledPages[1], A(P) + kPage);
+}
+
+// enableRwRange is a clean no-op when needsEnableRw is false (data-region
+// placement is already RW) - enable_rw is never called.
+TEST(EJitCodePoolFixed, EnableRwRangeNoOpWhenNotNeeded) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 256;
+  constexpr size_t kPage = 256;
+  constexpr size_t kRegion = 512;
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fourKSeal = true;
+  O.sealPageSize = kPage;
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+  O.needsEnableRw = false; // data-region placement: no enable_rw
+
+  MockSre4K M;
+  auto Mgr = makeManager4K(M, O);
+
+  void *P = cantFail(Mgr.allocateCode(128, 64));
+  cantFail(Mgr.enableRwRange(P, 128));
+  EXPECT_EQ(M.RwEnableCalls, 0u);
+  EXPECT_TRUE(M.RwEnabledPages.empty());
+}
+
+// enableRwRange propagates an enable_rw failure as an Error (the slab must not
+// be written if a page cannot be made writable).
+TEST(EJitCodePoolFixed, EnableRwRangeFailsOnRc) {
+  constexpr size_t kAlign = 256;
+  constexpr size_t kPool = 256;
+  constexpr size_t kPage = 256;
+  constexpr size_t kRegion = 512;
+  void *Region = nullptr;
+  ASSERT_EQ(posix_memalign(&Region, kAlign, kRegion), 0);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, std::free);
+
+  EJitCodePoolManager::Options O;
+  O.poolSize = kPool;
+  O.poolAlign = kAlign;
+  O.minCodeAlign = 64;
+  O.fourKSeal = true;
+  O.sealPageSize = kPage;
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+  O.needsEnableRw = true;
+
+  MockSre4K M;
+  M.RwEnableRc = 5; // simulate enable_rw failure
+  auto Mgr = makeManager4K(M, O);
+
+  void *P = cantFail(Mgr.allocateCode(128, 64));
+  Error E = Mgr.enableRwRange(P, 128);
+  EXPECT_TRUE(bool(E)) << "enable_rw failure must propagate as an Error";
+  consumeError(std::move(E));
 }
