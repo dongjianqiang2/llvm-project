@@ -3073,6 +3073,82 @@ TEST_F(SharedTaskPoolTest, SharedPgoDisablesL0Fill) {
   EXPECT_FALSE(pool.l0Try(5, nullptr, 0, &out));
 }
 
+TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheWaitsForTier2) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  constexpr uint32_t kFunc = 5;
+  uintptr_t cell = 0;
+  ejitIcacheRegisterSlot(kFunc, &cell, 0);
+  pool.setPgoEnabled(true, 1);
+
+  // Publish Tier-1. Its first hit crosses the threshold, but the wrapper cell
+  // must remain empty so subsequent calls can continue observing the shared
+  // PGO state until Tier-2 lands.
+  ASSERT_EQ(pool.compileOrGet(kFunc, nullptr, 0, codeFor(kFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  auto tier1 = pool.tryCacheHit0D(kFunc);
+  ASSERT_EQ(tier1.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier1.fnPtr, nullptr, 0);
+  EXPECT_EQ(cell, 0u);
+  EXPECT_EQ(pool.pendingCount(), 1u);
+  if (tier1.hasReadToken)
+    pool.releaseRead(tier1.bucketIndex);
+
+  // Tier-2 replaces the slot. The next normal resolve returns the Tier-2
+  // pointer, which is now eligible for the calling core's private cell.
+  ASSERT_TRUE(pool.pollOne());
+  auto tier2 = pool.tryCacheHit0D(kFunc);
+  ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier2.fnPtr, nullptr, 0);
+  EXPECT_EQ(cell, reinterpret_cast<uintptr_t>(tier2.fnPtr));
+  EXPECT_NE(tier2.fnPtr, tier1.fnPtr);
+  if (tier2.hasReadToken)
+    pool.releaseRead(tier2.bucketIndex);
+
+  void *out = nullptr;
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, tier2.fnPtr);
+  ejitIcacheClearAll();
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheRequiresExactTier2Identity) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  constexpr uint32_t kFunc = 5;
+  constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
+  uintptr_t cells[D] = {};
+  ejitIcacheRegisterSlot(kFunc, cells, 1);
+  pool.setPgoEnabled(true, 1);
+  pool.setInstanceEnabled(1, 0, true);
+  pool.setInstanceEnabled(1, 1, true);
+  EJitDimPair d0[1] = {dim(1, 0)};
+  EJitDimPair d1[1] = {dim(1, 1)};
+
+  ASSERT_EQ(pool.compileOrGet(kFunc, d0, 1, codeFor(kFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  auto hit = pool.tryCacheHit1D(kFunc, 1, 0);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    pool.releaseRead(hit.bucketIndex);
+  ASSERT_TRUE(pool.pollOne()); // publish Tier-2 for d0 only
+  auto tier2 = pool.tryCacheHit1D(kFunc, 1, 0);
+  ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
+
+  pool.icacheFill(kFunc, tier2.fnPtr, d1, 1);
+  EXPECT_EQ(cells[1], 0u) << "a Tier-2 pointer must not fill another identity";
+  pool.icacheFill(kFunc, tier2.fnPtr, d0, 1);
+  EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(tier2.fnPtr));
+  if (tier2.hasReadToken)
+    pool.releaseRead(tier2.bucketIndex);
+  ejitIcacheClearAll();
+}
+
 // Shared equivalent of EJitTaskPoolTest::PgoHitThresholdArmsTier2Recompile.
 // Set PGO threshold=3, publish Tier-1, hit it twice (below threshold), then
 // the third hit crosses the threshold -> Tier-2 request enqueued.

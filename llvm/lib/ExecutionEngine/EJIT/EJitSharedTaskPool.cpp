@@ -350,6 +350,15 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
   if (!reg.base || numDims != reg.numDims)
     return; // unregistered, or shape mismatch: nowhere to write.
+  // A wrapper-inline-cache hit bypasses the shared slot and therefore both
+  // PGO hit counting and observation of a later Tier-2 publish. Keep Tier-1
+  // out of the cell while PGO is enabled; the first taskpool hit that resolves
+  // the published Tier-2 pointer fills it, after this core has passed the
+  // normal execute-permission gate. Steady state then regains the original
+  // direct wrapper hit with no added guard.
+  if (state_->pgoEnabled.loadAcquire() &&
+      !isPublishedTier2(funcIndex, fnPtr, dims, numDims))
+    return;
   // Plain store: the slot is per-core private, so this write (on the calling
   // core) is ordered before the wrapper's read (same core) by program order.
   // The specialization is invariant per identity under the contract + NO_RECLAIM,
@@ -534,6 +543,60 @@ static bool slotIdentityMatches(const EJitSharedCacheSlot &s,
         s.dims[i].instanceId != dims[i].instanceId)
       return false;
   return true;
+}
+
+bool EJitSharedTaskPool::isPublishedTier2(uint32_t funcIndex, void *fnPtr,
+                                          const EJitDimPair *dims,
+                                          uint32_t numDims) {
+  if (!state_ || !fnPtr || numDims > kEJitSharedMaxDims)
+    return false;
+
+  const uint64_t key = hashIdentity(funcIndex, dims, numDims);
+  const uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+
+  auto matchesTier2 = [&]() {
+    const uint32_t curGen = state_->generation.loadAcquire();
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      EJitSharedCacheSlot &Slot = B.slots[s];
+      if (Slot.identityHash != key)
+        continue;
+      if (Slot.state.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedSlotState::Ready))
+        continue;
+      if (Slot.generation != curGen ||
+          !slotIdentityMatches(Slot, funcIndex, dims, numDims))
+        continue;
+      for (uint32_t i = 0; i < numDims; ++i)
+        if (Slot.versions[i] !=
+            instanceVersion(dims[i].dimType, dims[i].instanceId))
+          return false;
+      return Slot.tier.loadRelaxed() >= kEJitTierPgoUse &&
+             reinterpret_cast<void *>(Slot.fnPtr.loadAcquire()) == fnPtr;
+    }
+    return false;
+  };
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+    uint32_t seq0;
+    if (!bucketSeqBegin(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    const bool match = matchesTier2();
+    if (bucketSeqStable(B, seq0))
+      return match;
+    cpuRelax();
+  }
+  return false;
+#else
+  if (!bucketTryRead(B))
+    return false;
+  const bool match = matchesTier2();
+  bucketReadRelease(B);
+  return match;
+#endif
 }
 
 EJitSharedTaskPool::SharedLookup

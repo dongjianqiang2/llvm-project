@@ -646,6 +646,12 @@ private:
   // shared cache helpers (POD table in the shared blob)
   uint64_t hashIdentity(uint32_t funcIndex, const EJitDimPair *dims,
                         uint32_t numDims) const;
+  /// True only when the shared cache currently publishes \p fnPtr as Tier-2
+  /// for this exact identity and version snapshot. Used while online PGO is
+  /// enabled to keep Tier-1 out of the wrapper's direct inline cache without
+  /// duplicating hit accounting or triggering another Tier-2 request.
+  bool isPublishedTier2(uint32_t funcIndex, void *fnPtr,
+                        const EJitDimPair *dims, uint32_t numDims);
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
