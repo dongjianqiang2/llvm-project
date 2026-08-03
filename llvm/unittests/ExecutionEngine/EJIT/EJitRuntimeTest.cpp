@@ -2564,7 +2564,8 @@ TEST(EJitInterprocedural, ConstantsStopAtCallEdgeWithoutIPSCCP) {
   EJitOptimizerTestAccess opt(reg);
   opt.runInstCombine(*M);
   opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Baseline);
 
   Function *Callee = M->getFunction("ip_callee");
   ASSERT_NE(Callee, nullptr);
@@ -2593,7 +2594,8 @@ TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
   opt.runInterproceduralPropagation(*M);
   opt.runInstCombine(*M);
   opt.runStructFieldPass(*M);
-  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Baseline);
 
   Function *Callee = M->getFunction("ip_callee");
   Function *Entry = M->getFunction("ip_entry");

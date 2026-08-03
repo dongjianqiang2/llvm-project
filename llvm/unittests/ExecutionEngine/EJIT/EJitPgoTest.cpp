@@ -36,6 +36,20 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+static void markEJitEntry(Function &F) {
+  LLVMContext &Ctx = F.getContext();
+  MDNode *Entry = MDNode::get(Ctx, {MDString::get(Ctx, TAG_EJIT_ENTRY)});
+  F.setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
+}
+
+static std::string findCapturedPgoName(const EJitOptimizer &Opt,
+                                       StringRef FunctionName) {
+  for (const std::string &Name : Opt.getLastCounterNames())
+    if (Name == FunctionName || StringRef(Name).ends_with(FunctionName))
+      return Name;
+  return {};
+}
+
 // foo(i32 %n): if (n > 0) call @ea(n); else call @eb(n); ret n.
 // Both arms have external calls (unknown side effects) so SimplifyCFG cannot
 // fold the if-then-else into a select - the conditional branch survives the
@@ -50,6 +64,7 @@ static std::unique_ptr<Module> makeFooModule(LLVMContext &Ctx) {
   M->getOrInsertFunction("eb", CallTy);
   auto *F = Function::Create(FunctionType::get(I32, {I32}, false),
                              Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*F);
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
   BasicBlock *Then = BasicBlock::Create(Ctx, "then", F);
   BasicBlock *Else = BasicBlock::Create(Ctx, "else", F);
@@ -167,6 +182,7 @@ std::unique_ptr<Module> makeFooCallsBarModule(LLVMContext &Ctx) {
     B.CreateRet(B.CreateAdd(M3, ConstantInt::get(I32, 2)));
   }
   auto *Foo = Function::Create(FnTy, Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*Foo);
   {
     BasicBlock *BB = BasicBlock::Create(Ctx, "b", Foo);
     IRBuilder<> B(BB);
@@ -211,23 +227,24 @@ TEST(EJitPgo, Tier2PgoInlinesHotCallee) {
   sc1.fnName = "foo";
   sc1.tier = CompileTier::Instrumented;
   opt.runPipeline(*M1, sc1);
+  std::string barPgoName = findCapturedPgoName(opt, "bar");
+  ASSERT_FALSE(barPgoName.empty());
   uint64_t fooHash = 0, barHash = 0;
   unsigned fooCnt = 0, barCnt = 0;
   ASSERT_TRUE(readCounterInfo(*M1, "foo", fooHash, fooCnt));
-  ASSERT_TRUE(readCounterInfo(*M1, "bar", barHash, barCnt));
+  ASSERT_TRUE(readCounterInfo(*M1, barPgoName, barHash, barCnt));
 
   // Synthesize profiles: foo entry=100, bar entry=200 (called 2x, hot).
   InstrProfWriter Writer;
   consumeError(Writer.mergeProfileKind(InstrProfKind::IRInstrumentation));
-  auto addRec = [&](const char *name, uint64_t hash, unsigned cnt,
-                    uint64_t val) {
+  auto addRec = [&](StringRef name, uint64_t hash, unsigned cnt, uint64_t val) {
     std::vector<uint64_t> C(cnt, 0);
     C[0] = val;
     NamedInstrProfRecord Rec(name, hash, C);
     Writer.addRecord(std::move(Rec), 1, [](Error) {});
   };
   addRec("foo", fooHash, fooCnt, 100);
-  addRec("bar", barHash, barCnt, 200);
+  addRec(barPgoName, barHash, barCnt, 200);
   auto Buf = Writer.writeBuffer();
   ASSERT_NE(Buf, nullptr);
 
@@ -348,6 +365,7 @@ std::unique_ptr<Module> makeFooCallsMediumBarModule(LLVMContext &Ctx) {
   // foo(i32 %n): calls bar(%n) and returns the result.
   auto *FooFnTy = FunctionType::get(I32, {I32}, false);
   auto *Foo = Function::Create(FooFnTy, Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*Foo);
   {
     BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Foo);
     IRBuilder<> B(BB);
@@ -381,10 +399,12 @@ TEST(EJitPgo, Tier2PgoInlinesAotRejectedCallee) {
   sc1.fnName = "foo";
   sc1.tier = CompileTier::Instrumented;
   opt.runPipeline(*M1, sc1);
+  std::string barPgoName = findCapturedPgoName(opt, "bar");
+  ASSERT_FALSE(barPgoName.empty());
   uint64_t fooHash = 0, barHash = 0;
   unsigned fooCnt = 0, barCnt = 0;
   ASSERT_TRUE(readCounterInfo(*M1, "foo", fooHash, fooCnt));
-  ASSERT_TRUE(readCounterInfo(*M1, "bar", barHash, barCnt));
+  ASSERT_TRUE(readCounterInfo(*M1, barPgoName, barHash, barCnt));
 
   // Step 2 — synthesize a hot profile: use a high uniform count so both
   // foo's and bar's entry counts sit above the profile-summary hot
@@ -395,15 +415,14 @@ TEST(EJitPgo, Tier2PgoInlinesAotRejectedCallee) {
   // Bar's ~250-400 static cost then fits comfortably under 3000.
   InstrProfWriter Writer;
   consumeError(Writer.mergeProfileKind(InstrProfKind::IRInstrumentation));
-  auto addRec = [&](const char *name, uint64_t hash, unsigned cnt,
-                    uint64_t val) {
+  auto addRec = [&](StringRef name, uint64_t hash, unsigned cnt, uint64_t val) {
     std::vector<uint64_t> C(cnt, 0);
     C[0] = val;
     NamedInstrProfRecord Rec(name, hash, C);
     Writer.addRecord(std::move(Rec), 1, [](Error) {});
   };
   addRec("foo", fooHash, fooCnt, 10000);
-  addRec("bar", barHash, barCnt, 10000);
+  addRec(barPgoName, barHash, barCnt, 10000);
   auto Buf = Writer.writeBuffer();
   ASSERT_NE(Buf, nullptr);
 
@@ -533,6 +552,7 @@ std::unique_ptr<Module> makeSimpleFooModule(LLVMContext &Ctx) {
   auto *I32 = Type::getInt32Ty(Ctx);
   auto *F = Function::Create(FunctionType::get(I32, {I32}, false),
                              Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*F);
   BasicBlock *BB = BasicBlock::Create(Ctx, "b", F);
   IRBuilder<> B(BB);
   B.CreateRet(B.CreateAdd(F->getArg(0), ConstantInt::get(I32, 1)));
