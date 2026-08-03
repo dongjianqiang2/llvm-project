@@ -106,6 +106,12 @@ public:
   /// default). Returns 0 on success, non-zero on failure. On the target this
   /// calls enable_rw(va); in tests, a mock. Only used when
   /// Options::needsEnableRw is set (code-segment fixed-pool placement).
+  ///
+  /// W^X contract: the platform enable_rw MUST clear execute permission
+  /// (set UXN/PXN on AArch64) as well as set write permission, so the page
+  /// transitions RX -> RW (writable, NOT executable) during the write window.
+  /// Flipping only the write/AP bit would leave the page RWX, violating W^X.
+  /// enable_ex (seal, RW -> RX) is the symmetric inverse.
   using EnableRwFn = std::function<unsigned(void *va)>;
 
   struct Options {

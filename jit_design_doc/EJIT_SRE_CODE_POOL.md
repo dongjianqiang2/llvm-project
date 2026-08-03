@@ -501,7 +501,9 @@ freestanding strong，类似 `__start_ejit_bitcode`），缺失或对齐后太�
   `sealCodeRange` 对称。`EJitCodePoolMemoryManager::allocate` 在 `memset` **之前**调
   `enableRwRange(slab, total)`。
 - 平台签名：`unsigned enable_rw(unsigned level, unsigned long long va)`，`level=1`（与
-  `enable_ex` 的 `startLevel` 对称）。翻转 PTE AP 位 + TLB flush。
+  `enable_ex` 的 `startLevel` 对称）。**必须**同时置写权限（AP 位）**并清执行权限**
+  （UXN/PXN）+ TLB flush，即 RX->RW（非 RWX），保 W^X；只翻 AP 位会留下 RWX 写窗口。
+  `enable_ex` 是对称逆操作（RW->RX：清写、置执行 + I-cache sync）。
 - `enable_rw` 是**强 extern**（platform-supplied，无 weak 兜底）--缺失即**硬链接错误**，
   不会静默不可写。
 - per-core：编译核 `enable_rw`+`enable_ex`；peer 核只 `enable_ex`（只读执行已写好的代码）。

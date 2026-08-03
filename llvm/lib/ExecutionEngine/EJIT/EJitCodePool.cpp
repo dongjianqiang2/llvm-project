@@ -56,6 +56,19 @@ EJitCodePoolManager::EJitCodePoolManager(Options Opts, RawAllocFn Alloc,
     if (Opts_.sealPageSize == 0 || !isPowerOf2_64(Opts_.sealPageSize))
       Opts_.sealPageSize = 4096;
   }
+  // Code-segment placement (needsEnableRw) is designed for 4K page-seal mode:
+  // finalize seals only the executable pages (RW->RX) and leaves .data/.got
+  // pages RW (the per-page W^X semantics in EJIT_SRE_CODE_POOL.md S14).
+  // Without fourKSeal, finalize does not seal (the whole pool is sealed RX
+  // later, at lookup, including data pages), so that per-page W^X behavior
+  // does not hold. Warn so the misconfiguration is observable rather than
+  // silent; the factory (makeSreCodePoolManager) always couples the two via
+  // the EJIT_FIXED_CODE_POOL + EJIT_CODE_POOL_4K_SEAL presets.
+  if (Opts_.needsEnableRw && !Opts_.fourKSeal) {
+    EJIT_DIAG("code pool ctor WARNING: needsEnableRw=1 without fourKSeal: "
+              "per-page W^X (data pages stay RW) requires 4K seal mode; "
+              "legacy mode seals the whole pool RX at lookup");
+  }
   EJIT_DIAG_VERBOSE("code pool ctor: poolSize=%zu poolAlign=%zu minCodeAlign=%zu "
                     "fourKSeal=%u sealPage=%zu",
                     Opts_.poolSize, Opts_.poolAlign, Opts_.minCodeAlign,
@@ -409,8 +422,17 @@ Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
       // restrictive). The carved slab itself is left unused (a bounded hole in
       // the fixed region) rather than reclaimed, to keep this path simple.
       for (uintptr_t RollVA = PageStart; RollVA < VA; RollVA += Page) {
-        if (Seal_)
-          Seal_(reinterpret_cast<void *>(RollVA));
+        if (Seal_) {
+          unsigned SealRc = Seal_(reinterpret_cast<void *>(RollVA));
+          // Best-effort rollback: a seal (RW->RX) failure here leaves this
+          // page writable in the code segment (a W^X leak) that we could not
+          // restore. Surface it so the leak is observable rather than silent;
+          // we still return the original enable_rw error below.
+          if (SealRc != 0)
+            EJIT_DIAG("enableRwRange rollback: seal (RW->RX) FAILED page=0x%llx "
+                      "rc=%u (page left RW - W^X leak)",
+                      static_cast<unsigned long long>(RollVA), SealRc);
+        }
       }
       return make_error<StringError>(
           "EJitCodePool: enable_rw failed (rc=" + Twine(Rc) + ") for page " +

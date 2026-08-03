@@ -79,6 +79,12 @@ ejit_sre_split_2m_to_4k(unsigned long long va,
 // enable_rw surfaces as a hard link error rather than silent non-writability.
 // Platform signature: unsigned enable_rw(unsigned level, unsigned long long va)
 // (level mirrors enable_ex's startLevel; the EnableRw lambda below passes 1).
+//
+// W^X contract: enable_rw MUST clear execute permission (set UXN/PXN on
+// AArch64) as well as set write permission (AP bit), so the page transitions
+// RX -> RW (writable, NOT executable) during the write window. Flipping only
+// the AP/write bit would leave the page RWX, violating W^X. enable_ex is the
+// symmetric inverse (RW -> RX: clear write, set executable + I-cache sync).
 #if defined(EJIT_FIXED_CODE_POOL)
 extern "C" unsigned
 ejit_sre_enable_rw(unsigned level, unsigned long long va) __asm__("enable_rw");
@@ -269,9 +275,13 @@ llvm::ejit::makeSreCodePoolManager() {
   auto EnableRw = [](void *Va) -> unsigned {
 #ifdef EJIT_FIXED_CODE_POOL
     // Make one 4KiB page writable (RX -> RW) so JITLink can write code into the
-    // code-segment fixed region. enable_rw flips the PTE AP bit + TLB flush
-    // (no I-cache sync needed - we are about to WRITE, not execute). Per-core:
-    // only the compiling core calls this; peer cores only enable_ex to execute.
+    // code-segment fixed region. enable_rw must set write permission (AP bit)
+    // AND clear execute permission (UXN/PXN) + TLB flush, so the page is
+    // RW-but-not-X (true W^X) during the write window - flipping only the AP
+    // bit would leave it RWX. No I-cache sync is needed here: we are about to
+    // WRITE, not execute (enable_ex / sealAndSyncCache syncs caches later, at
+    // RW -> RX). Per-core: only the compiling core calls this; peer cores only
+    // enable_ex to execute.
     return ejit_sre_enable_rw(
         /*level=*/1u,
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Va)));
