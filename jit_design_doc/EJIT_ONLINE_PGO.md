@@ -47,6 +47,12 @@ EmbeddedJIT 已实现"时间窗常量 + 结构体字段特化":AOT 嵌入 bitcod
 
 **部署前提(前置确认)**:PGO 的价值 hinge 在 Async 多核部署--Tier-2 重编译需 worker(stage 3 PGO 内联更是),单核 Sync 下要么 Tier-2 阻塞业务线程重编译、要么永不升级(白付 Tier-1 插桩开销),基本净负。EJIT 已确认要加 inline(stage 3),故**目标部署须为 Async 多核**;单核 Sync 部署应跳过 PGO 或仅做 stage 1 且接受不升级。
 
+**与 wrapper inline cache 的约束**:在线 PGO 测试不得同时启用
+`-mllvm -ejit-inline-cache=true`。该 wrapper cache 命中后会直接调用已缓存的
+Tier-1 指针，绕过 shared-taskpool 的 `hitCount` 和 Tier-2 发布观察，因此无法
+可靠触发或切换到 Tier-2。主线的 per-core L0 cache 已在 PGO 开启时自动停填并
+通过 `dispatchEpoch` 退役；wrapper inline cache 尚无等价的跨核动态失效协议。
+
 **PGO 价值范围(经核实,务必如实理解)**:
 - EJIT 现有 IR pipeline 中,**InstCombine 经 SimplifyLibCalls 的 PGSO 消费 PSI/BFI**(`shouldOptimizeForSize`,`SimplifyLibCalls.cpp:1402/3457/3763`),但**仅在存在 ProfileSummary 时激活**(Baseline 无 summary -> 休眠;Tier-2 设 summary -> 激活,小额 IR 层收益)。其余 pass(SCCP/SimplifyCFG/ADCE/LoopFullUnroll/IndVarSimplify/LoopDeletion/Promote)不消费;`LoopFullUnrollPass` 硬编码 `/*BFI*/nullptr,/*PSI*/nullptr`(`LoopUnrollPass.cpp:1528`),且 JIT 禁用 Inline(`EJitOptimizer.cpp:12`)。
 - 因此 PGO 的**保底收益主要来自后端 `MachineBlockPlacement` 的块布局**(热路径拉直、mispredict/icache 改善);Tier-2 另激活 InstCombine PGSO(见上)带来小额 IR 层收益

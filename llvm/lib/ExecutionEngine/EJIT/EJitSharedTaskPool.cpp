@@ -305,6 +305,11 @@ void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
                                 const EJitDimPair *dims, uint32_t numDims) {
   if (!icacheReclamationSafe_ || !state_ || !fnPtr)
     return;
+  // PGO hotness is counted in resolveMatchedSlot(). An L0 hit bypasses that
+  // path, so caching here would prevent the Tier-2 threshold from being
+  // reached. PGO-off behavior and its steady-state L0 hot path are unchanged.
+  if (state_->pgoEnabled.loadAcquire())
+    return;
   if (numDims > kEJitSharedMaxDims)
     return;
   if (state_->initState.loadAcquire() != kReady)
@@ -809,19 +814,8 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
       uint32_t threshold = state_->tier2Threshold.loadAcquire();
       // >= (not ==): if the enqueue fails (queue full / already pending),
       // the next hit can still arm — a transient failure is not fatal (§7).
-      if (threshold && prev + 1 >= threshold) {
-        R.tier2Arm = true;
-        // Snapshot the EXACT hit slot's publish epoch (generation + per-dim
-        // versions) HERE, under the lookup lock, while `Slot` is the verified
-        // match. compileOrGet() builds the Tier-2 queue request from this
-        // snapshot instead of re-scanning the bucket by (funcIndex,numDims),
-        // which could alias a different specialization that collided into the
-        // same bucket. Only taken when actually crossing the threshold, so a
-        // PGO-off / below-threshold hit adds no copy (spec §2/§3).
-        R.tier2Gen = Slot.generation;
-        for (uint32_t i = 0; i < Slot.numDims && i < 4; ++i)
-          R.tier2Versions[i] = Slot.versions[i];
-      }
+      if (threshold && prev + 1 >= threshold)
+        enqueueTier2FromSlot(Slot);
     }
   }
 
@@ -894,17 +888,38 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     return R;
   }
 
-  // Cold: this core has never prepared this code. Delegate to the out-of-line
-  // helper so the hit path stays small. peerPrepareSlot() builds a fresh
-  // SharedLookup, so the Tier-2 arming decision + slot snapshot computed above
-  // must be carried over onto its result \u2014 otherwise a peer's first-touch
-  // hit would silently drop the Tier-2 trigger (spec \u00a72.5).
-  SharedLookup Cold = peerPrepareSlot(B, bucket, slotIndex);
-  Cold.tier2Arm = R.tier2Arm;
-  Cold.tier2Gen = R.tier2Gen;
-  for (uint32_t i = 0; i < 4; ++i)
-    Cold.tier2Versions[i] = R.tier2Versions[i];
-  return Cold;
+  // Cold: this core has never prepared this code. Tier-2 submission, when
+  // armed above, has already captured the exact slot.
+  return peerPrepareSlot(B, bucket, slotIndex);
+}
+
+void EJitSharedTaskPool::enqueueTier2FromSlot(const EJitSharedCacheSlot &Slot) {
+  if (state_->mode.loadAcquire() !=
+      static_cast<uint32_t>(EJitCompileMode::Async))
+    return;
+
+  EJitCompileRequest T2{};
+  T2.funcIndex = encodeReqTier(Slot.funcIndex, kEJitTierPgoUse);
+  T2.numDims = Slot.numDims;
+  T2.generation = Slot.generation;
+  for (uint32_t i = 0; i < Slot.numDims && i < 4; ++i) {
+    T2.dims[i] = Slot.dims[i];
+    T2.versions[i] = Slot.versions[i];
+  }
+
+  if (dedupMark(T2.funcIndex, T2.generation) != EJitDedupResult::Claimed)
+    return;
+  if (queuePush(T2)) {
+    EJIT_STAT_INC(state_->counters.asyncEnqueues);
+    EJIT_DIAG_VERBOSE("shared taskpool PGO Tier-2 enqueued func=%u gen=%u",
+                      Slot.funcIndex, T2.generation);
+    return;
+  }
+
+  dedupClear(T2.funcIndex, T2.generation);
+  EJIT_STAT_INC(state_->counters.queueFull);
+  EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full",
+            Slot.funcIndex);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1764,13 +1779,6 @@ void EJitSharedTaskPool::ownerShutdown() {
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   CompileOrGetResult R;
-  R.tier2Arm = Hit.tier2Arm; // PGO (§6): propagate arming signal
-  // PGO (§6): carry the exact-slot generation/version snapshot out of the
-  // lookup so compileOrGet() constructs the Tier-2 request from the real hit
-  // slot (only populated when tier2Arm is set).
-  R.tier2Gen = Hit.tier2Gen;
-  for (uint32_t i = 0; i < 4; ++i)
-    R.tier2Versions[i] = Hit.tier2Versions[i];
   if (Hit.hasReadToken && Hit.fnPtr) {
     EJIT_STAT_INC(state_->counters.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
@@ -1977,48 +1985,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // disabled instance, not-Ready, or ready-but-not-shareable) return directly.
   CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
   if (R.fastPathTerminal) {
-    // PGO (§6): a hit that crossed the Tier-2 threshold submits a one-shot
-    // Tier-2 (PGOUse) recompile through the SHARED MPSC queue, so ANY producer
-    // core can trigger it and the single owner worker consumes it via the
-    // normal pollOne()/runCompile() path (there is no facade-local bypass — a
-    // peer core's trigger must be serviceable). The request is fully
-    // value-initialized and carries the generation + per-dim versions snapshot
-    // of the EXACT slot that was hit (R.tier2Gen / R.tier2Versions), so it
-    // never inherits a stale epoch or aliases a colliding slot.
-    if (R.tier2Arm && state_->pgoEnabled.loadAcquire() &&
-        state_->mode.loadAcquire() ==
-            static_cast<uint32_t>(EJitCompileMode::Async)) {
-      EJitCompileRequest T2{};
-      T2.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
-      T2.numDims = numDims;
-      T2.fallbackPtr = reinterpret_cast<uintptr_t>(fallback);
-      T2.generation = R.tier2Gen;
-      for (uint32_t i = 0; i < numDims && i < 4; ++i) {
-        T2.dims[i] = dims[i];
-        T2.versions[i] = R.tier2Versions[i];
-      }
-      // Shared dedup (keyed on the STRIPPED funcIndex, generation-aware): only
-      // ONE core wins the claim; the rest coalesce. Tier-1's dedup bit was
-      // already released at its publish, so a hit-time Tier-2 can always
-      // re-claim the same funcIndex (spec §4.1).
-      if (dedupMark(T2.funcIndex, T2.generation) == EJitDedupResult::Claimed) {
-        if (queuePush(T2)) {
-          EJIT_STAT_INC(state_->counters.asyncEnqueues);
-          EJIT_DIAG_VERBOSE(
-              "shared taskpool PGO Tier-2 enqueued func=%u gen=%u", funcIndex,
-              T2.generation);
-        } else {
-          // Queue full: roll back the in-flight claim so a later hit retries
-          // (spec §4.4). Never leave a dangling in-flight bit.
-          dedupClear(T2.funcIndex, T2.generation);
-          EJIT_STAT_INC(state_->counters.queueFull);
-          EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full",
-                    funcIndex);
-        }
-      }
-      // AlreadyPending / InvalidFuncIndex: leave any in-flight request intact
-      // (best-effort upgrade) — the caller still gets the Tier-1 fnPtr.
-    }
     // Non-hit terminals surface the caller's fallback pointer (a hit already
     // carries the cached fnPtr + read token).
     if (R.status != EJitCompileOrGetStatus::CacheHit)

@@ -3043,9 +3043,39 @@ TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
 // PGO (§6): shared taskpool hitCount + Tier-2 auto-trigger.
 //===----------------------------------------------------------------------===//
 
+TEST_F(SharedTaskPoolTest, SharedPgoFastHitEnqueuesTier2) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 1);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  ASSERT_EQ(pool.pendingCount(), 0u);
+
+  auto hit = pool.tryCacheHit0D(5);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(pool.pendingCount(), 1u)
+      << "the flattened C-API fast hit must enqueue Tier-2 itself";
+  if (hit.hasReadToken)
+    pool.releaseRead(hit.bucketIndex);
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoDisablesL0Fill) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2);
+
+  void *out = nullptr;
+  pool.l0Fill(5, codeFor(5), nullptr, 0);
+  EXPECT_FALSE(pool.l0Try(5, nullptr, 0, &out));
+}
+
 // Shared equivalent of EJitTaskPoolTest::PgoHitThresholdArmsTier2Recompile.
 // Set PGO threshold=3, publish Tier-1, hit it twice (below threshold), then
-// the third hit crosses the threshold -> tier2Arm + Tier-2 request enqueued.
+// the third hit crosses the threshold -> Tier-2 request enqueued.
 // pollOne compiles it -> publish resets hitCount to 0.
 TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
   EJitSharedTaskPool pool;
@@ -3065,7 +3095,6 @@ TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
   // One hit: below threshold -> no Tier-2 armed, but hitCount increments.
   auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
   ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_FALSE(r1.tier2Arm);
   EXPECT_EQ(pool.pendingCount(), 0u);
   if (r1.hasReadToken)
     pool.releaseRead(r1.bucketIndex);
@@ -3083,7 +3112,6 @@ TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
   // Tier-2 request.
   auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
   EXPECT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_TRUE(r2.tier2Arm) << "hit crossing threshold should arm Tier-2";
   EXPECT_EQ(pool.pendingCount(), 1u)
       << "Tier-2 request queued via shared queue";
   if (r2.hasReadToken)
@@ -3145,12 +3173,10 @@ TEST_F(SharedTaskPoolTest, SharedPgoTier2DiscardedOnVersionBump) {
   // (snapshotting the CURRENT versions).
   auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
   ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_FALSE(r1.tier2Arm);
   if (r1.hasReadToken)
     pool.releaseRead(r1.bucketIndex);
   auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
   ASSERT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_TRUE(r2.tier2Arm);
   EXPECT_EQ(pool.pendingCount(), 1u); // Tier-2 queued
   EXPECT_NE(state_->inFlight[5].loadRelaxed(), 0u);
   if (r2.hasReadToken)
@@ -3182,7 +3208,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoTier2DiscardedOnVersionBump) {
   }
 }
 
-// PGO off → no hitCount increment, no tier2Arm, no Tier-2 enqueue.
+// PGO off → no hitCount increment and no Tier-2 enqueue.
 // Baseline guards: compileOrGet hits are ordinary cache hits with zero
 // PGO behaviour when setPgoEnabled was never called.
 TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
@@ -3200,11 +3226,10 @@ TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
             EJitCompileOrGetStatus::EnqueuedPending);
   ASSERT_TRUE(pool.pollOne());
 
-  // Hits: ordinary cache hits, no tier2Arm.
+  // Hits remain ordinary cache hits and do not enqueue Tier-2.
   for (int i = 0; i < 10; ++i) {
     auto r = pool.compileOrGet(5, d0, 1, codeFor(5));
     ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
-    EXPECT_FALSE(r.tier2Arm);
     if (r.hasReadToken)
       pool.releaseRead(r.bucketIndex);
   }
@@ -3236,7 +3261,6 @@ TEST_F(SharedTaskPoolTest, SharedPgoThresholdZeroDisablesTrigger) {
   for (int i = 0; i < 10; ++i) {
     auto r = pool.compileOrGet(5, d0, 1, codeFor(5));
     ASSERT_EQ(r.status, EJitCompileOrGetStatus::CacheHit);
-    EXPECT_FALSE(r.tier2Arm);
     if (r.hasReadToken)
       pool.releaseRead(r.bucketIndex);
   }
@@ -3275,13 +3299,11 @@ TEST_F(SharedTaskPoolTest, SharedPgoEndToEndTier2OverwritesTier1) {
   // Phase 2: two cache hits → 2nd arms Tier-2.
   auto r1 = pool.compileOrGet(5, d0, 1, codeFor(5));
   ASSERT_EQ(r1.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_FALSE(r1.tier2Arm);
   if (r1.hasReadToken)
     pool.releaseRead(r1.bucketIndex);
 
   auto r2 = pool.compileOrGet(5, d0, 1, codeFor(5));
   ASSERT_EQ(r2.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_TRUE(r2.tier2Arm);
   EXPECT_EQ(pool.pendingCount(), 1u);
   if (r2.hasReadToken)
     pool.releaseRead(r2.bucketIndex);
@@ -3307,7 +3329,6 @@ TEST_F(SharedTaskPoolTest, SharedPgoEndToEndTier2OverwritesTier1) {
   ASSERT_EQ(r3.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_NE(r3.fnPtr, codeFor(5))
       << "hit after Tier-2 returns Tier-2 code, not fallback";
-  EXPECT_FALSE(r3.tier2Arm) << "hitCount was reset, no re-trigger";
   if (r3.hasReadToken)
     pool.releaseRead(r3.bucketIndex);
 }
@@ -3654,7 +3675,6 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
   ASSERT_EQ(state_->inFlight[5].loadRelaxed(), 0u);
   auto hit = pool.compileOrGet(5, d0, 1, codeFor(5));
   EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_TRUE(hit.tier2Arm);
   EXPECT_EQ(state_->inFlight[5].loadRelaxed(), 0u)
       << "queue-full Tier-2 must roll back its in-flight claim";
   if (hit.hasReadToken)
@@ -3667,7 +3687,6 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
   // Now the target can retrigger and successfully enqueue its Tier-2.
   auto hit2 = pool.compileOrGet(5, d0, 1, codeFor(5));
   EXPECT_EQ(hit2.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_TRUE(hit2.tier2Arm);
   EXPECT_NE(state_->inFlight[5].loadRelaxed(), 0u)
       << "retry after space frees must claim the in-flight bit";
   if (hit2.hasReadToken)

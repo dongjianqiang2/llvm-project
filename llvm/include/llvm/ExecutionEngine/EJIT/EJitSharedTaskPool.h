@@ -282,18 +282,6 @@ public:
     /// This flag is an internal control signal; it does not affect status
     /// mapping or the C ABI.
     bool fastPathTerminal = false;
-    /// PGO (§6): set when this hit crosses the Tier-2 threshold —
-    /// compileOrGet() enqueues a one-shot Tier-2 (PGOUse) recompile. (Shared
-    /// equivalent of the non-shared CompileOrGetResult::tier2Arm.)
-    bool tier2Arm = false;
-    /// PGO (§6): generation + per-dim version snapshot of the EXACT matched
-    /// cache slot, captured under the cache lookup lock at the instant
-    /// tier2Arm was set. compileOrGet() builds the Tier-2 queue request from
-    /// these so it carries the true publish epoch (generation/versions) of the
-    /// slot that was actually hit — never a value re-scanned from a colliding
-    /// slot. Only meaningful when tier2Arm is true.
-    uint32_t tier2Gen = 0;
-    uint32_t tier2Versions[4] = {0, 0, 0, 0};
   };
   static_assert(kEJitSharedCacheBuckets < 255,
                 "bucketIndex is a uint8_t: the bucket count and its sentinel "
@@ -426,6 +414,10 @@ public:
       state_->pgoEnabled.storeRelease(0);
       state_->tier2Threshold.storeRelease(0);
     }
+    // L0 hits bypass the shared slot hitCount. Retire every core's existing L0
+    // entries whenever PGO control changes; l0Fill() remains disabled while
+    // PGO is enabled so calls continue through the Tier-2 trigger path.
+    state_->dispatchEpoch.fetchAdd(1);
   }
 
   /// True when the shared PGO auto-trigger is armed.
@@ -649,18 +641,6 @@ private:
     /// first-touch path (which self-revalidates), so the seqlock caller must not
     /// second-guess it with the bucket publishSeq check.
     bool coldPrepared = false;
-    /// PGO (§6): set when this hit crosses the Tier-2 threshold, arming
-    /// a one-shot lazy enqueue of a PGOUse recompile. compileOrGet()
-    /// consumes it on the fast-hit path. (Shared equivalent of
-    /// EJitCacheLookupResult::tier2Arm.)
-    bool tier2Arm = false;
-    /// PGO (§6): generation + per-dim version snapshot of the EXACT matched
-    /// slot, captured under the lookup lock only when tier2Arm is set. Carried
-    /// through classifyHit()/CompileOrGetResult so compileOrGet() builds the
-    /// Tier-2 request from the real hit slot's publish epoch, never a
-    /// re-scanned/aliased slot. Only meaningful when tier2Arm is true.
-    uint32_t tier2Gen = 0;
-    uint32_t tier2Versions[4] = {0, 0, 0, 0};
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -714,6 +694,10 @@ private:
   /// by cacheLookup() and all fixed-dimension specializations.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
+  /// Submit Tier-2 from an identity/version-validated slot while its bucket
+  /// read lock is held. This preserves the exact slot snapshot without
+  /// enlarging the 16-byte CompileOrGetResult hot-path return value.
+  void enqueueTier2FromSlot(const EJitSharedCacheSlot &slot);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
