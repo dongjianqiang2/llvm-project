@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>EmbeddedJIT 总体逻辑架构设计图</title>
+<title>EmbeddedJIT 总体架构设计图</title>
 <style>
   :root{
     --primary:#2c5282; --primary-2:#1a365d; --accent:#3182ce;
@@ -14,6 +14,7 @@
     --dark:#1f2937; --gray:#4a5568; --muted:#718096;
     --border:#cbd5e1; --bg:#f7f9fc;
     --aot:#2c5282; --rt:#2f855a; --ui:#6b46c1; --infra:#c05621; --fail:#c53030;
+    --icache:#0891b2;
   }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0}
@@ -23,18 +24,19 @@
     line-height:1.45; font-size:13px;
   }
   .poster{
-    max-width:1320px; margin:0 auto; padding:20px 22px 26px;
+    max-width:1400px; margin:0 auto; padding:20px 22px 26px;
   }
   /* ---------- Header ---------- */
   header{
     background:linear-gradient(135deg,var(--primary),var(--primary-2));
-    color:#fff; border-radius:14px; padding:18px 24px;
+    color:#fff; border-radius:14px; padding:18px 28px;
     box-shadow:0 10px 26px rgba(44,82,130,.18);
     display:flex; align-items:center; justify-content:space-between; gap:18px; flex-wrap:wrap;
   }
-  header h1{margin:0; font-size:25px; letter-spacing:.5px}
-  header .sub{margin:4px 0 0; color:#cfe0f5; font-size:13.5px; max-width:780px}
-  header .meta{text-align:right; font-size:12px; color:#dbeafe; line-height:1.6}
+  header h1{margin:0; font-size:26px; letter-spacing:.5px}
+  header .sub{margin:5px 0 0; color:#cfe0f5; font-size:13.5px; max-width:900px}
+  header .sub b{color:#fff}
+  header .meta{text-align:right; font-size:12px; color:#dbeafe; line-height:1.6; flex-shrink:0}
   header .meta b{color:#fff}
 
   /* ---------- Lane ---------- */
@@ -43,32 +45,32 @@
     box-shadow:0 6px 18px rgba(30,41,59,.06); overflow:hidden;
   }
   .lane-head{
-    display:flex; align-items:center; gap:10px; padding:9px 16px; color:#fff;
+    display:flex; align-items:center; gap:10px; padding:10px 18px; color:#fff;
     font-size:14.5px; font-weight:700; letter-spacing:.3px;
   }
   .lane-head .tag{
     font-size:11px; font-weight:700; background:rgba(255,255,255,.22);
-    padding:2px 8px; border-radius:999px;
+    padding:2px 10px; border-radius:999px; white-space:nowrap;
   }
   .lane-head .desc{font-weight:500; font-size:12px; opacity:.92}
   .lane.aot  .lane-head{background:linear-gradient(90deg,var(--aot),#3a6ea5)}
   .lane.rt   .lane-head{background:linear-gradient(90deg,var(--rt),#3a9d6e)}
   .lane.ui   .lane-head{background:linear-gradient(90deg,var(--ui),#8a5cd0)}
-  .lane.body .lane-head{background:linear-gradient(90deg,var(--infra),#d97743)}
-
-  .lane-body{padding:14px 16px 16px}
+  .lane.infra .lane-head{background:linear-gradient(90deg,var(--infra),#d97743)}
+  .lane.icache .lane-head{background:linear-gradient(90deg,var(--icache),#0e7490)}
+  .lane-body{padding:14px 18px 18px}
 
   /* ---------- Flow row ---------- */
   .flow{display:flex; align-items:stretch; gap:0; flex-wrap:wrap}
   .node{
     flex:1 1 0; min-width:0; background:#fbfcfe; border:1px solid var(--border);
-    border-top:3px solid var(--slate); border-radius:10px; padding:9px 11px;
-    display:flex; flex-direction:column; gap:4px;
+    border-top:3px solid var(--slate); border-radius:10px; padding:10px 12px;
+    display:flex; flex-direction:column; gap:5px;
   }
   .node .nt{font-size:12.5px; font-weight:700; color:var(--dark); display:flex; align-items:center; gap:6px}
-  .node .nt .pill{font-size:10px; font-weight:700; padding:1px 6px; border-radius:6px; color:#fff}
-  .node ul{margin:0; padding-left:15px; font-size:11.4px; color:var(--gray)}
-  .node ul li{margin:1px 0}
+  .node .nt .pill{font-size:10px; font-weight:700; padding:1px 7px; border-radius:6px; color:#fff}
+  .node ul{margin:0; padding-left:16px; font-size:11.4px; color:var(--gray)}
+  .node ul li{margin:2px 0}
   .node .hint{font-size:10.8px; color:var(--muted); font-style:italic}
   .node code{font-family:ui-monospace,Menlo,Consolas,monospace; background:#eef2f7; border-radius:4px; padding:0 4px; font-size:10.8px}
 
@@ -79,51 +81,63 @@
   .node.c-ui    {border-top-color:var(--ui)}     .node.c-ui  .pill{background:var(--ui)}
   .node.c-fail  {border-top-color:var(--fail)}   .node.c-fail .pill{background:var(--fail)}
   .node.c-teal  {border-top-color:var(--teal)}   .node.c-teal .pill{background:var(--teal)}
+  .node.c-icache{border-top-color:var(--icache)} .node.c-icache .pill{background:var(--icache)}
 
   /* arrows */
   .ah{
     flex:0 0 auto; align-self:center; font-size:20px; font-weight:700;
-    color:var(--muted); padding:0 5px; user-select:none;
+    color:var(--muted); padding:0 6px; user-select:none;
   }
   .av{
     text-align:center; font-size:22px; font-weight:700; color:var(--muted);
-    padding:2px 0; line-height:1; user-select:none;
+    padding:3px 0; line-height:1; user-select:none;
   }
   .av .cap{display:block; font-size:11px; font-weight:600; color:var(--slate); letter-spacing:.2px; margin-top:-2px}
 
-  .subflow-label{font-size:11.5px; font-weight:700; color:var(--slate); margin:12px 2px 6px; display:flex; align-items:center; gap:6px}
-  .subflow-label::before{content:""; width:4px; height:14px; border-radius:3px; background:var(--slate); display:inline-block}
+  .subflow-label{font-size:12px; font-weight:700; color:var(--slate); margin:14px 2px 8px; display:flex; align-items:center; gap:8px}
+  .subflow-label::before{content:""; width:5px; height:16px; border-radius:3px; background:var(--slate); display:inline-block}
 
-  .two{display:grid; grid-template-columns:1fr 1fr; gap:10px}
-  .three{display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px}
+  .two{display:grid; grid-template-columns:1fr 1fr; gap:11px}
+  .three{display:grid; grid-template-columns:1fr 1fr 1fr; gap:11px}
+  .four{display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:11px}
 
   /* user band */
-  .uband{display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:14px}
-  .uband .panel{background:#fff; border:1px solid var(--border); border-radius:12px; padding:10px 14px; box-shadow:0 6px 16px rgba(30,41,59,.05)}
-  .uband .ph{font-size:12.5px; font-weight:700; color:var(--ui); margin-bottom:5px; display:flex; gap:8px; align-items:center}
+  .uband{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px}
+  .uband .panel{background:#fff; border:1px solid var(--border); border-radius:12px; padding:11px 15px; box-shadow:0 6px 16px rgba(30,41,59,.05)}
+  .uband .ph{font-size:12.5px; font-weight:700; color:var(--ui); margin-bottom:6px; display:flex; gap:8px; align-items:center}
   .uband .rt .ph{color:var(--rt)}
-  .chips{display:flex; flex-wrap:wrap; gap:5px}
+  .chips{display:flex; flex-wrap:wrap; gap:6px}
   .chip{font-size:11px; font-family:ui-monospace,Menlo,Consolas,monospace; background:#f0e9ff; color:var(--purple-2);
-        border:1px solid #ddd2f7; border-radius:7px; padding:2px 7px}
+        border:1px solid #ddd2f7; border-radius:7px; padding:2px 8px}
   .chip.c{background:#e8f5ee; color:var(--green-2); border-color:#bfe3cf}
   .chip small{color:var(--muted); font-family:inherit}
 
   /* footer bands */
-  .foot{display:grid; grid-template-columns:1.25fr 1fr 1fr; gap:12px; margin-top:14px}
-  .fcard{background:#fff; border:1px solid var(--border); border-radius:12px; padding:11px 14px; box-shadow:0 6px 16px rgba(30,41,59,.05); border-left:5px solid var(--slate)}
+  .foot{display:grid; grid-template-columns:1.3fr 1fr 1fr; gap:12px; margin-top:14px}
+  .fcard{background:#fff; border:1px solid var(--border); border-radius:12px; padding:11px 15px; box-shadow:0 6px 16px rgba(30,41,59,.05); border-left:5px solid var(--slate)}
   .fcard.f-inv{border-left-color:var(--orange)}
   .fcard.f-fb {border-left-color:var(--fail)}
   .fcard.f-key{border-left-color:var(--accent)}
+  .fcard.f-icache{border-left-color:var(--icache)}
   .fcard h4{margin:0 0 5px; font-size:12.5px; color:var(--dark)}
   .fcard ol,.fcard ul{margin:0; padding-left:17px; font-size:11.4px; color:var(--gray)}
   .fcard li{margin:2px 0}
-  .fcard .steps{display:flex; align-items:center; gap:5px; flex-wrap:wrap; font-size:11.2px; margin-top:3px}
+  .fcard .steps{display:flex; align-items:center; gap:5px; flex-wrap:wrap; font-size:11.2px; margin-top:4px}
   .fcard .steps b{background:#fff7ed; color:var(--orange-2); border:1px solid #fbd9b6; border-radius:6px; padding:1px 7px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:10.8px}
   .fcard .steps .ah{font-size:14px; padding:0 1px}
 
-  .legend{display:flex; flex-wrap:wrap; gap:14px; font-size:11px; color:var(--muted); margin-top:10px; justify-content:center}
+  /* table inside node */
+  .node table{width:100%; border-collapse:collapse; font-size:10.8px; margin-top:3px}
+  .node table th{text-align:left; background:#f1f5f9; padding:2px 6px; font-weight:700; color:var(--slate); border:1px solid var(--border)}
+  .node table td{padding:2px 6px; border:1px solid var(--border); color:var(--gray)}
+  .node table td code{font-size:10.2px}
+
+  .legend{display:flex; flex-wrap:wrap; gap:16px; font-size:11px; color:var(--muted); margin-top:12px; justify-content:center}
   .legend span{display:inline-flex; align-items:center; gap:5px}
   .legend i{width:12px; height:12px; border-radius:3px; display:inline-block}
+
+  .spec-note{font-size:10.5px; color:var(--muted); margin:8px 2px 0; font-style:italic}
+  .spec-note a{color:var(--accent)}
 
   @media print{
     @page{size:A3 landscape; margin:8mm}
@@ -133,7 +147,7 @@
     header{box-shadow:none}
   }
   @media (max-width:900px){
-    .two,.three,.uband,.foot{grid-template-columns:1fr}
+    .two,.three,.four,.uband,.foot{grid-template-columns:1fr}
     .flow{flex-direction:column}
     .ah{transform:rotate(90deg); padding:4px 0}
   }
@@ -145,34 +159,42 @@
   <!-- ===================== HEADER ===================== -->
   <header>
     <div>
-      <h1>EmbeddedJIT 总体逻辑架构设计图</h1>
-      <p class="sub">基于<b>时间窗常量</b>的运行时特化编译系统：AOT 阶段提取带元数据的 Bitcode 并插桩 Wrapper，运行时按时间窗实例 JIT 特化、缓存机器码，失败回退 AOT。</p>
+      <h1>EmbeddedJIT 总体架构设计图</h1>
+      <p class="sub">基于<b>时间窗常量</b>的嵌入式 JIT 特化编译系统 · AOT 阶段（PASS1–5 + Clang 前端）提取带元数据 Bitcode 并插桩 Wrapper · 运行时通过 <b>OrcJIT/JITLink</b> 按时间窗实例特化编译 · 支持同步/异步/Inline‑Cache 三种调度模式 · 失败回退 AOT</p>
+    </div>
+    <div class="meta">
+      基于 SPEC4.md / PLAN4.md<br>
+      PASS1–7 + SRE Code Pool + TaskPool<br>
+      Inline‑Cache Multi‑Version + 后端裁剪<br>
+      版本 3.0 · 2026-08
     </div>
   </header>
 
   <!-- ===================== 用户接口层 ===================== -->
   <div class="uband">
     <div class="panel">
-      <div class="ph"><span>⬛</span> 用户标注属性（Clang 前端，6 个）</div>
+      <div class="ph"><span>⬛</span> 用户标注属性（Clang 前端 — 6 个）</div>
       <div class="chips">
-        <span class="chip">EJIT_PERIOD_CONST<small> 成员可常量化</small></span>
-        <span class="chip">EJIT_IN_PERIOD(static)<small> 运行期不变</small></span>
-        <span class="chip">EJIT_IN_PERIOD_ARRAY(name)<small> 数组时间窗</small></span>
-        <span class="chip">EJIT_ENTRY<small> JIT 入口函数</small></span>
-        <span class="chip">EJIT_DIM(name)<small> 特化维度参数</small></span>
-        <span class="chip">EJIT_PERIOD_GUARD(name)<small> 生命周期管理函数</small></span>
+        <span class="chip">ejit_may_const<small> 字段可常量化</small></span>
+        <span class="chip">ejit_period("static")<small> 运行期不变全局变量</small></span>
+        <span class="chip">ejit_period_arr("name")<small> 数组时间窗</small></span>
+        <span class="chip">ejit_entry<small> JIT 入口函数</small></span>
+        <span class="chip">ejit_period_arr_ind("name")<small> 特化维度参数</small></span>
+        <span class="chip">ejit_period_lc("name")<small> 生命周期管理函数</small></span>
       </div>
+      <div class="spec-note">属性定义于 Attr.td → Sema 防呆（归属冲突/修改点/一致性检测）→ CodeGen 生成 !ejit.may_const / !ejit.metadata IR 元数据</div>
     </div>
     <div class="panel rt">
-      <div class="ph"><span>⬛</span> 运行时 C API（libejit.a）</div>
+      <div class="ph"><span>⬛</span> 运行时 C API（libejit.a — 分类）</div>
       <div class="chips">
-        <span class="chip c">ejit_init / shutdown</span>
-        <span class="chip c">ejit_activate / deactivate(_all)</span>
-        <span class="chip c">ejit_is_active</span>
-        <span class="chip c">ejit_taskpool_compile_or_get</span>
-        <span class="chip c">ejit_taskpool_release_read</span>
-        <span class="chip c">ejit_register_symbol</span>
-        <span class="chip c">ejit_set_compile_mode</span>
+        <span class="chip c">ejit_init / ejit_shutdown<small> 初始化·销毁</small></span>
+        <span class="chip c">ejit_activate / deactivate(name, idx)<small> 时间窗控制</small></span>
+        <span class="chip c">ejit_activate_all / deactivate_all<small> 批量控制</small></span>
+        <span class="chip c">ejit_is_active(name, idx)<small> 状态查询</small></span>
+        <span class="chip c">ejit_taskpool_compile_or_get<small> 统一编译入口</small></span>
+        <span class="chip c">ejit_taskpool_release_read<small> 释放读令牌</small></span>
+        <span class="chip c">ejit_register_symbol / bitcode<small> 符号·Bitcode 注册</small></span>
+        <span class="chip c">ejit_set_compile_mode<small> Sync/Async 切换</small></span>
       </div>
     </div>
   </div>
@@ -180,219 +202,297 @@
   <!-- ===================== 阶段 1: AOT 编译期 ===================== -->
   <div class="lane aot">
     <div class="lane-head">
-      <span class="tag">阶段 ①</span> AOT 编译期（Clang / LLVM）
-      <span class="desc">— 属性 → 元数据 → 提取 Bitcode → Wrapper 插桩 → 标准优化 → 可执行文件</span>
+      <span class="tag">阶段 ①</span> AOT 编译期（Clang + LLVM Pass Pipeline）
+      <span class="desc">— 属性解析 → IR 元数据生成 → 提取原始 Bitcode → Wrapper 插桩 → 标准优化 → 可执行文件（嵌入 Bitcode）</span>
     </div>
     <div class="lane-body">
+
       <div class="flow">
+        <!-- Clang CodeGen -->
         <div class="node c-aot">
           <div class="nt"><span class="pill">前端</span>Clang CodeGen</div>
           <ul>
-            <li>Attr.td 定义 6 属性 → Sema 语义/防呆检查</li>
-            <li>CodeGen 生成带元数据 IR：<code>!ejit.may_const</code> / <code>!ejit.metadata</code> / <code>!ejit.period_arr</code></li>
-            <li><span class="hint">may_const 经 load 元数据 + GV 级偏移列表双路标注</span></li>
+            <li><b>Attr.td</b> 定义 6 属性 → Sema 语义/防呆检查</li>
+            <li>CodeGen 生成：
+              <code>!ejit.may_const</code> 标注在 load 指令上（per-load metadata）
+              + <code>!ejit.metadata</code>（函数/全局变量级）
+              + <code>ejit_may_const_field</code> 偏移列表（GV 级回退）
+            </li>
+            <li><span class="hint">双机制：per-load metadata 主路径 + GV 偏移列表回退</span></li>
           </ul>
         </div>
         <div class="ah">▶</div>
+        <!-- PASS1 -->
         <div class="node c-aot">
           <div class="nt"><span class="pill">PASS1</span>EJitRegisterBitcode</div>
           <ul>
-            <li><b>早期 Pass（O2/O3 之前）</b>，提取<b>原始 Bitcode</b>（元数据完整）</li>
-            <li>AOT 预优化：Inline+Mem2Reg+EarlyCSE+InstCombine+SimplifyCFG</li>
-            <li><code>reAnnotateMayConst</code> 重挂被丢弃的 per-load 元数据</li>
-            <li>自动注册外部符号 → <code>EJitRegistrationStore</code></li>
+            <li><b>早期 Pass（始终在 O2/O3 之前）</b></li>
+            <li>识别 <code>!{"ejit_entry"}</code> 函数 → 计算传递闭包（调用图）</li>
+            <li>提取原始 Bitcode（<b>metadata 完整</b>，Wrapper 尚未插入）</li>
+            <li>AOT 预优化（Release only）：<br><code>AlwaysInline→ModuleInliner(O2)→Mem2Reg→EarlyCSE+InstCombine→SimplifyCFG</code></li>
+            <li><code>reAnnotateMayConst</code>：从 GV 偏移列表重挂被丢弃的 per-load metadata</li>
+            <li>自动扫描外部符号 → 生成 <code>ejit_register_symbol</code> 调用</li>
+            <li>产物：<code>@__ejit_bitcode</code>（嵌入段）+ <code>ejit_auto_register()</code></li>
           </ul>
         </div>
         <div class="ah">▶</div>
+        <!-- PASS2-4 -->
         <div class="node c-aot">
           <div class="nt"><span class="pill">PASS2-4</span>EJitAotModulePass</div>
           <ul>
-            <li><b>PASS2 RegisterPeriod</b>：生成 period 数组 / static 变量注册代码</li>
-            <li><b>PASS3 WrapperGen</b>：单函数混合 Wrapper（入口插 <code>compile_or_get</code>+<code>release_read</code>，失败续原逻辑）</li>
-            <li><b>PASS4 PeriodHandler</b>：为 <code>EJIT_PERIOD_GUARD</code> 入口插 deactivate / 出口插 activate</li>
-            <li><span class="hint">非LTO：O2 之前（优化 Wrapper IR）；LTO：O2 之后</span></li>
+            <li><b>PASS2 EJitRegisterPeriod</b>：扫描 <code>ejit_period_arr</code>/<code>ejit_period(static)</code> GV → 生成 <code>ejit_register_period_array()</code>/<code>ejit_register_static_var()</code> 调用追加到 <code>ejit_auto_register</code></li>
+            <li><b>PASS3 EJitWrapperGen</b>：<b>单函数混合 Wrapper</b><br>入口插 <code>ejit_taskpool_compile_or_get(funcIdx,&hellip;)</code> + 命中调特化函数 + 未命中 fall-through 原逻辑</li>
+            <li><b>PASS4 EJitPeriodHandler</b>：为 <code>ejit_period_lc</code> 函数入口插 deactivate / 所有出口插 activate</li>
+            <li><span class="hint">非LTO：O2 之前运行（Wrapper IR 被 O2 优化）；LTO：O2 之后运行</span></li>
           </ul>
         </div>
         <div class="ah">▶</div>
+        <!-- O2/O3 + Artifact -->
         <div class="node c-aot">
-          <div class="nt"><span class="pill">O2/O3</span>标准优化</div>
+          <div class="nt"><span class="pill">O2/O3</span>标准优化 + 产物</div>
           <ul>
-            <li>SROA / InstCombine / GVN / Inline …</li>
+            <li>SROA / InstCombine / GVN / Inline / SimplifyCFG …</li>
             <li>优化 Wrapper 的 fallback 路径（分支→select、PHI 合并）</li>
             <li><code>noinline</code> 在 inliner 前生效，防 Wrapper 被内联进 caller</li>
+            <li><b>产物</b>：可执行文件 + 嵌入 Bitcode 段 + 构造函数注册表</li>
           </ul>
         </div>
-        <div class="ah">▶</div>
-        <div class="node c-aot" style="flex:0.85">
-          <div class="nt"><span class="pill">产物</span>可执行文件</div>
-          <ul>
-            <li>静态链接 <code>libejit.a</code></li>
-            <li>嵌入 Bitcode 段（按需加载）</li>
-            <li>构造函数填充注册表</li>
-          </ul>
-        </div>
+      </div>
+
+      <div class="spec-note" style="margin-top:12px">
+        时序：PASS1（早期，O2 前提取原始 Bitcode）→ O2/O3 标准优化（非LTO）/ PASS2-5（LTO 于 O2 后）→ 目标代码生成。<br>
+        双路径注册：hosted（llvm.global_ctors → ejit_auto_register）| 裸核（静态注册表 __ejit_registry_bitcode[] + __ejit_registry_period[]）
       </div>
     </div>
   </div>
 
-  <div class="av">▼<span class="cap">嵌入 Bitcode 静态链接 · 运行时按需加载 · Wrapper 已在入口插桩</span></div>
+  <div class="av">▼<span class="cap">嵌入 Bitcode 静态链接 · 运行时按需加载 BitcodeTracker · Wrapper 已在入口插桩 · 构造函数/静态表填充注册表</span></div>
 
   <!-- ===================== 阶段 2: 运行期 ===================== -->
   <div class="lane rt">
     <div class="lane-head">
-      <span class="tag">阶段 ②</span> 运行期（libejit.a · OrcJIT/JITLink）
-      <span class="desc">— 激活时间窗 → 调用入口 → 查缓存 / 后台特化编译 → 缓存机器码 → 失败回退</span>
+      <span class="tag">阶段 ②</span> 运行期（libejit.a · OrcJIT/JITLink · 三种调度模式）
+      <span class="desc">— 初始化注册 → 时间窗激活 → 调用入口 → Cache 查询 / 后台编译 → IR 特化 → 机器码生成 → 密封 RX → 失败回退 AOT</span>
     </div>
     <div class="lane-body">
 
       <!-- Row A: 初始化 / 时间窗状态 / 热路径 -->
-      <div class="subflow-label">A. 初始化 · 时间窗状态 · 热路径入口</div>
+      <div class="subflow-label">A. 初始化与时间窗管理</div>
       <div class="flow">
-        <div class="node c-rt">
-          <div class="nt"><span class="pill">init</span>注册与初始化</div>
+        <div class="node c-rt" style="flex:1.2">
+          <div class="nt"><span class="pill">init</span>注册与初始化（ejit_init）</div>
           <ul>
-            <li><code>ejit_init</code> 消费 <code>EJitRegistrationStore</code></li>
-            <li><b>EJitFuncRegistry</b>：按名分配 funcIndex</li>
-            <li><b>EJitLifecycleRegistry</b>：分配 dimType 槽</li>
-            <li><b>PeriodArrayRegistry</b>：name→baseAddr</li>
-            <li><b>BitcodeTracker</b>：name→Bitcode（只读）</li>
+            <li>消费 <code>EJitRegistrationStore</code>（ctor 暂存）或遍历静态注册表</li>
+            <li><b>EJitFuncRegistry</b>：按函数名分配 dense funcIndex</li>
+            <li><b>EJitLifecycleRegistry</b>：按 periodName 分配 dimType 槽位</li>
+            <li><b>PeriodArrayRegistry</b>：periodName → vector{varName, baseAddr, size}</li>
+            <li><b>BitcodeTracker</b>：funcName → bitcode 数据（只读，按需 parse）</li>
+            <li>创建 <b>EJitOrcEngine</b>（LLJIT + 自定义 MemoryManager）</li>
+            <li>创建 CompileDriver + TaskPool + Worker</li>
+            <li>冻结 registration · Async 启动 worker · Shared 模式 owner 选举</li>
           </ul>
         </div>
         <div class="ah">▶</div>
-        <div class="node c-rt">
-          <div class="nt"><span class="pill">state</span>时间窗状态 EJitRuntimeState</div>
+        <div class="node c-rt" style="flex:0.9">
+          <div class="nt"><span class="pill">state</span>时间窗状态管理</div>
           <ul>
-            <li><code>ejit_activate/deactivate(name, idx)</code></li>
-            <li>键 = (dimType, instanceId)，无数组指针维度</li>
-            <li>状态 Inactive→Active→Invalid + 单调 version</li>
-            <li>deactivate：CAS(enabled 1→0) + version++</li>
+            <li><b>EJitRuntimeState</b>：核心状态机</li>
+            <li><code>ejit_activate(name, idx)</code>：<br>设置 (dimType, instanceId) → Active<br>release fence（保证全局变量写入对编译线程可见）</li>
+            <li><code>ejit_deactivate(name, idx)</code>：<br>CAS(enabled 1→0) + <b>单调 version++</b></li>
+            <li>键 = (dimType, instanceId)，<b>无数组指针维度</b></li>
+            <li>状态：Inactive → Active → Invalid</li>
           </ul>
         </div>
         <div class="ah">▶</div>
-        <div class="node c-rt" style="flex:1.6">
-          <div class="nt"><span class="pill">hot</span>Wrapper 热路径 → EJitTaskPool</div>
+        <div class="node c-rt" style="flex:1.5">
+          <div class="nt"><span class="pill">wrapper</span>Wrapper 热路径（AOT 插入的入口代码）</div>
           <ul>
-            <li><code>ejit_taskpool_compile_or_get(funcIndex, dims[], outFn, outBucket)</code></li>
-            <li>① SwitchController 检查每维 enabled + version</li>
-            <li>② TaskPoolCache.<b>lookup</b>（tryRead bucket + version 比较）</li>
-            <li><b>命中</b>→ 返回 {fnPtr, bucket}；调用 fnPtr 后 <code>release_read(bucket)</code></li>
-            <li><b>未命中</b>→ TaskQueue.<b>tryEnqueue</b>（dedup CAS + Vyukov 入队）→ 返回 <b>fallback</b>（执行 AOT 原逻辑）</li>
+            <li>从 per-lifecycle global 加载 dimType → 构造 <code>ejit_dim_pair_t dims[]</code></li>
+            <li>调用 <code>ejit_taskpool_compile_or_get(funcIndex, dims, numDims, &amp;outFn, &amp;outBucket)</code></li>
+            <li>① <b>SwitchController</b>：检查每维 enabled + version 匹配</li>
+            <li>② <b>TaskPoolCache.lookup</b>：hash(funcIndex,dims)→bucket→slot scan（identity/version/generation 匹配）→ 返回 {fnPtr, bucket}</li>
+            <li>③ <b>命中</b> → 调 fnPtr(args) → <code>ejit_taskpool_release_read(bucket)</code></li>
+            <li>④ <b>未命中</b> → TaskQueue.tryEnqueue (dedup CAS) → fallback（继续执行原 AOT 逻辑）</li>
+            <li>同步模式：未命中时<b>调用线程内联编译</b> → 返回 fnPtr；异步模式：入队返回 PENDING</li>
           </ul>
         </div>
       </div>
 
-      <!-- Row B: 后台编译 + JIT 流水线 -->
+      <!-- Row B: JIT 特化流水线 -->
       <div class="subflow-label">B. 后台编译 Worker · JIT 特化流水线（EJitOrcEngine / LLJIT）</div>
       <div class="flow">
-        <div class="node c-rt" style="flex:0.8">
+        <div class="node c-rt" style="flex:0.7">
           <div class="nt"><span class="pill">worker</span>EJitWorker</div>
           <ul>
-            <li>单消费者 MPSC（Vyukov 环 1024）</li>
-            <li>tryDequeue → checkpoint₁ 比版本</li>
+            <li>单消费者 MPSC（Vyukov 环 1024 slot）</li>
+            <li>tryDequeue → <b>checkpoint₁</b> 比 version</li>
             <li>→ CompileCallback → 编译</li>
-            <li>→ checkpoint₂ 比版本 → publish</li>
-            <li><span class="hint">同步模式：setNumCompileThreads(0)，调用线程 compileCold 内联编译</span></li>
+            <li>→ <b>checkpoint₂</b> 比 version → publish</li>
+            <li>publish gate：版本不匹配则丢弃结果</li>
+            <li>queue full → 回滚 dedup，返回 fallback</li>
+            <li><span class="hint">Sync 模式：调用线程执行 compileCold，不经过 worker 队列</span></li>
           </ul>
         </div>
         <div class="ah">▶</div>
-        <div class="node c-teal" style="flex:2.6">
-          <div class="nt"><span class="pill">JIT</span>IRTransformLayer 特化流水线</div>
-          <ul style="columns:2; column-gap:18px">
-            <li><b>1. 加载 Bitcode</b>（BitcodeTracker → Module）</li>
-            <li><b>2. 参数替换</b>：EJIT_DIM 参数 → 运行时常量</li>
-            <li><b>3. InstCombine</b>：折叠 zext/GEP 常量链、清 PHI</li>
-            <li><b>4. Inline</b>：展开跨函数 GEP 链</li>
-            <li><b>5. PASS6 EJitStructFieldPass</b>：<code>!ejit.may_const</code> load → 运行时常量（per-load 元数据 / GV 偏移回退双机制；baseAddr + accumulateConstantOffset → memcpy）</li>
-            <li><b>6. EJitOptimizer</b>：L1(SCCP+DCE) / L2(+Inline+CFG) / L3(+LoopUnroll)</li>
+        <div class="node c-teal" style="flex:3.2">
+          <div class="nt"><span class="pill">JIT</span>IRTransformLayer 特化流水线（EJitOptimizer::runPipeline）</div>
+          <ul style="columns:2; column-gap:20px">
+            <li><b>0. Bitcode 按需加载</b>（BitcodeTracker → parse Module）</li>
+            <li><b>1a. preReplacePeriodIndices</b>：ejit_period_arr_ind 参数 → ConstantInt（replaceAllUsesWith）</li>
+            <li><b>1b. InstCombine</b>：折叠 zext / GEP 常量链、清理 PHI</li>
+            <li><b>1c. PASS6 EJitStructFieldPass</b>：扫描 <code>!ejit.may_const</code> load → 从进程内存读取运行时值 → 替换为 Constant（双机制：per-load metadata 主路径 + GV 偏移列表回退）</li>
+            <li><b>1d. IPSCCP</b>（runInterproceduralPropagation）：内部化非 entry 定义 → 跨函数常量传播（替代 JIT 侧 Inline）</li>
+            <li><b>1e–1f. 二次 InstCombine + StructFieldPass</b>（对 callee 传播结果再做一轮）</li>
+            <li><b>2. LowerExpect</b>：降低 llvm.expect  intrinsic</li>
+            <li><b>3. buildFunctionSimplificationPipeline</b>（O1/O2/O3 预建缓存）：
+              <br>L1→O1: SCCP+DCE
+              <br>L2→O2: +GVN+LICM+CFGSimplify
+              <br>L3→O3: +LoopUnroll+Vectorize</li>
+            <li><b>4. 三次 StructFieldPass + cleanup</b>（InstCombine/SCCP/SimplifyCFG/ADCE）：循环展开后新暴露的常量下标数组访问</li>
           </ul>
         </div>
         <div class="ah">▶</div>
         <div class="node c-infra" style="flex:1.1">
           <div class="nt"><span class="pill">codegen</span>IRCompile → ObjectLinking</div>
           <ul>
-            <li>IRCompileLayer：LLVM→Object</li>
-            <li>ObjectLinkingLayer（JITLink）</li>
-            <li><b>EJitCodePoolMemoryManager</b>：从代码池 bump 分配</li>
-            <li>finalize → <b>4K 页密封</b> RW→RX（enable_ex）</li>
-            <li>lookup 返回 ExecutorAddr → fnPtr</li>
+            <li><b>IRCompileLayer</b>：LLVM IR → 目标机器码（Object）</li>
+            <li><b>ObjectLinkingLayer</b>（JITLink）：链接 + 重定位</li>
+            <li><b>PreFixup</b>：EJitLinkOptimizationPlugin — AArch64 近目标分支松弛（stub→GOT→target → 直接 B/BL，±128MiB 内）</li>
+            <li><b>PostFixup</b>：EJitLinkDiagPlugin — 审计所有分支重定位</li>
+            <li><b>EJitCodePoolMemoryManager</b>：从 CodePool bump 分配 → write → finalize（4K 页 RW→RX 密封 enable_ex）</li>
+            <li>lookup → ExecutorAddr → fnPtr</li>
           </ul>
         </div>
       </div>
 
-      <!-- Row C: 基础设施 -->
-      <div class="subflow-label">C. 运行时基础设施（并发安全 · 裸核/SRE 抽象）</div>
-      <div class="three">
-        <div class="node c-infra">
-          <div class="nt"><span class="pill">cache</span>代码缓存 EJitTaskPoolCache</div>
+      <!-- Row C: Inline Cache 模式（可选 lever B） -->
+      <div class="subflow-label">C. Inline Cache 模式（可选，-ejit-inline-cache，frame-less hit path）</div>
+      <div class="flow">
+        <div class="node c-icache" style="flex:1.2">
+          <div class="nt"><span class="pill">icache</span>Frame-less 命中路径</div>
           <ul>
-            <li>32 bucket，每 bucket 独立 <code>EJitRwLock</code></li>
-            <li><b>read-token</b>：lookup 不释放，调用方用完 release_read</li>
-            <li><b>publish</b>：spin 该 bucket readers==0 后覆盖旧 fnPtr</li>
-            <li>cacheKey = hash(funcIndex, dims[])，bucket = key % 32</li>
+            <li>per-function <code>@__ejit_icache_fn_&lt;name&gt;</code> 固定数组 <code>[D]^numDims</code></li>
+            <li>命中路径：<b>GEP[dimVals] + load slot + null-check + tail call</b></li>
+            <li><b>无栈帧、无 compile_or_get 调用、无 release_read</b></li>
+            <li><code>llvm.expect(hit, true)</code> 提示命中分支</li>
+            <li>实测：0 维 4 cycles / 1 维 5 / 2 维 6 / 3 维 8 / 4 维 9（aarch64_be, -Os）</li>
           </ul>
         </div>
-        <div class="node c-infra">
-          <div class="nt"><span class="pill">pool</span>代码池 EJitCodePoolManager</div>
+        <div class="ah">▶</div>
+        <div class="node c-icache" style="flex:0.8">
+          <div class="nt"><span class="pill">miss</span>Miss 慢路径</div>
           <ul>
-            <li>2MiB 对齐 bump allocator，来源 SRE_MemDbgAlloc 分区 8</li>
-            <li>禁用 malloc/mmap；写时 RW，密封后 RX</li>
-            <li>密封池永不重写，溢出则新开池（可靠优先于碎片）</li>
-            <li>跨核共享：每核 split_2m_to_4k + per-page enable_ex 记忆化</li>
-          </ul>
-        </div>
-        <div class="node c-infra">
-          <div class="nt"><span class="pill">sre</span>SRE 平台抽象 EJitSrePlatform</div>
-          <ul>
-            <li><code>EJitAtomic</code>（无 std::atomic）/ <code>EJitRwLock</code></li>
-            <li><code>EJitSreTask</code>（无 std::thread）/ Vyukov MPSC 队列</li>
-            <li>裸核修正：禁用进程符号链接、固定 triple、forceStaticRegistry</li>
-            <li>可选 <code>EJIT_SRE_SHARED_TASKPOOL</code>：owner 选举跨核共享</li>
-            <li><b>LLVM 后端裁剪</b>：移除 SVE/AdvSIMD/GlobalISel 等，lipo 合并 ejit.o</li>
+            <li>miss → tail call <code>&lt;name&gt;_miss</code>（noinline，自带栈帧）</li>
+            <li>MissFn 内：funcidx guard → compile_or_get → dispatch / fallback</li>
+            <li>MissFn 继承 F 的 target-cpu/features/tune-cpu + section</li>
           </ul>
         </div>
       </div>
+
+      <!-- Row D: 基础设施 -->
+      <div class="subflow-label">D. 运行时基础设施（并发安全 · 代码内存 · 裸核/SRE 抽象 · 后端裁剪）</div>
+      <div class="four">
+        <div class="node c-infra">
+          <div class="nt"><span class="pill">cache</span>代码缓存</div>
+          <ul>
+            <li>32 bucket · per-bucket EJitRwLock</li>
+            <li>16 slot/bucket · slot = {identity, version, generation, codeRange, fnPtr}</li>
+            <li><b>read-token</b>：lookup 不释放，release_read 释放（seqlock NO_RECLAIM 则为 no-op）</li>
+            <li><b>publish</b>：先写 identity/version/codeRange，再发布 Ready；spin readers==0 后覆盖</li>
+            <li>cacheKey = hash(funcIndex, dims[]) % 32</li>
+          </ul>
+        </div>
+        <div class="node c-infra">
+          <div class="nt"><span class="pill">pool</span>代码内存池</div>
+          <ul>
+            <li><b>EJitCodePoolManager</b>：2MiB 对齐 bump allocator</li>
+            <li>来源：SRE_MemDbgAlloc（动态）或固定区域 [__ejit_code_start, __ejit_code_end)（链接脚本）</li>
+            <li>写时 RW（enable_rw），finalize 密封 RX（enable_ex）</li>
+            <li>固定模式强制 shared taskpool（CMake + 源码双守卫）</li>
+            <li>边界检查 · 失败回滚 restoreRxRange（W^X 安全）</li>
+            <li>密封池不重写 · 溢出开新池 · 废弃 slab RX 恢复</li>
+          </ul>
+        </div>
+        <div class="node c-infra">
+          <div class="nt"><span class="pill">sre</span>SRE 平台抽象</div>
+          <ul>
+            <li><b>EJitAtomic</b>（无 std::atomic）· <b>EJitRwLock</b></li>
+            <li><b>EJitSreTask</b>（无 std::thread）· Vyukov MPSC 队列</li>
+            <li>裸核修正：禁用进程符号链接、固定 triple、forceStaticRegistry</li>
+            <li>可选 <b>EJIT_SRE_SHARED_TASKPOOL</b>：跨核共享 taskpool · owner 选举 · 共享 POD 状态</li>
+            <li>可选 <b>EJIT_SRE_TASKPOOL_NO_RECLAIM</b>：seqlock load-only hit</li>
+          </ul>
+        </div>
+        <div class="node c-infra">
+          <div class="nt"><span class="pill">trim</span>LLVM 后端裁剪</div>
+          <ul>
+            <li><b>EJitPassBuilder</b>：精简 ~20 analyses</li>
+            <li>移除：SVE/AdvSIMD/GlobalISel/MT 等</li>
+            <li>提取单 .o（lipo extract→gc-merge→merge）</li>
+            <li>仅 ARM/AArch64 目标</li>
+            <li>禁用 dlopen/dlsym · 固定 triple</li>
+          </ul>
+        </div>
+      </div>
+
     </div>
   </div>
 
-  <!-- ===================== 底部：失效 / 容错 / 关键决策 ===================== -->
+  <!-- ===================== 底部：失效 / 容错 / 关键决策 / ICache 约束 ===================== -->
   <div class="foot">
     <div class="fcard f-inv">
       <h4>⏳ 缓存失效（deactivate 触发，三层惰性，不遍历表项）</h4>
       <div class="steps">
-        <b>deactivate</b><span class="ah">→</span>version++<span class="ah">→</span>
+        <b>deactivate</b><span class="ah">→</span><b>version++</b><span class="ah">→</span>
         <span>① Cache lookup 版本不符 → miss</span><span class="ah">→</span>
         <span>② Queue checkpoint₁ 丢弃</span><span class="ah">→</span>
-        <span>③ In-flight checkpoint₂ 丢弃不 publish</span>
+        <span>③ In-flight checkpoint₂ 不 publish</span>
       </div>
-      <div class="hint" style="font-size:10.8px;color:var(--muted);margin-top:5px">物理回收：同 cacheKey 覆盖于 publish；旧 fnPtr 在 readers==0 后释放。freeCode 不在失效路径。</div>
+      <div class="hint" style="font-size:10.5px;color:var(--muted);margin-top:5px">
+        物理回收：同 cacheKey 覆盖于 publish spin readers==0 后。freeCode 不在失效路径。NO_RECLAIM 下永不回收。
+      </div>
     </div>
     <div class="fcard f-fb">
       <h4>🛡️ Fallback 容错原则</h4>
       <ul>
-        <li>所有 JIT 失败（Bitcode 解析 / 特化 / OOM / 越界 / 空指针 / 异步 pending）→ 继续执行<b>原函数 AOT 逻辑</b></li>
+        <li>所有 JIT 失败（Bitcode 解析/特化/OOM/越界/空指针/异步 pending）→ 继续执行<b>原函数 AOT 逻辑</b></li>
         <li>单函数混合方案：无独立 fallback 函数，失败即 fall-through</li>
+        <li>错误日志环形缓冲区（32 条）</li>
         <li>核心原则：<b>绝不崩溃</b>，仅记日志降级</li>
       </ul>
     </div>
     <div class="fcard f-key">
       <h4>🔑 关键设计决策</h4>
       <ul>
-        <li>特化维度 = 时间窗常量 + 结构体字段索引</li>
+        <li>特化维度 = 时间窗常量 + 结构体字段索引（非基于参数值）</li>
         <li>单函数 Wrapper（非独立函数）</li>
-        <li>元数据软标注，丢失仅错过一次特化</li>
+        <li>!ejit.may_const 软标注（丢失仅错过一次特化）</li>
         <li>taskpool 固定 bucket + read-token 并发安全</li>
         <li>两阶段 AOT：早期提 Bitcode / 晚期插桩</li>
-        <li>4K 页级 RW→RX 密封，密封池不重写</li>
+        <li>4K 页级 RW→RX 密封 · 代码池 bump 不回收</li>
+        <li>IPSCCP 替代 JIT 侧 Inline（减轻编译负担）</li>
+      </ul>
+    </div>
+    <div class="fcard f-icache">
+      <h4>⚡ Inline Cache 约束与安全</h4>
+      <ul>
+        <li>维度 ≤ EJIT_ICACHE_MAX_DIMS(=4)，超限编译报错</li>
+        <li>ejit_dim 参数值 &lt; D（无运行时边界检查，契约保证）</li>
+        <li>NO_RECLAIM 下 fnPtr 永不悬空（永不释放）</li>
+        <li>reclamation safety gate：有 code releaser 时自动关闭 cache</li>
+        <li>per-core private slot：无跨核 RMW，无 release_read</li>
       </ul>
     </div>
   </div>
 
+  <!-- ===================== Legend ===================== -->
   <div class="legend">
     <span><i style="background:var(--ui)"></i>用户接口</span>
     <span><i style="background:var(--aot)"></i>AOT 编译期</span>
     <span><i style="background:var(--rt)"></i>运行时调度/状态</span>
     <span><i style="background:var(--teal)"></i>JIT 特化流水线</span>
     <span><i style="background:var(--infra)"></i>基础设施（缓存/代码池/SRE）</span>
+    <span><i style="background:var(--icache)"></i>Inline Cache 模式</span>
     <span><i style="background:var(--fail)"></i>容错回退</span>
   </div>
 
