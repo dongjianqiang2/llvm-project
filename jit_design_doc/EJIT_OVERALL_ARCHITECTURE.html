@@ -160,7 +160,7 @@
   <header>
     <div>
       <h1>EmbeddedJIT 总体架构设计图</h1>
-      <p class="sub">基于<b>时间窗常量</b>的嵌入式 JIT 特化编译系统 · AOT 阶段（PASS1–5 + Clang 前端）提取带元数据 Bitcode 并插桩 Wrapper · 运行时通过 <b>OrcJIT/JITLink</b> 按时间窗实例特化编译 · 支持同步/异步/Inline‑Cache 三种调度模式 · 失败回退 AOT</p>
+      <p class="sub">基于<b>时间窗常量</b>的嵌入式 JIT 特化编译系统 · 用户通过大写宏（EJIT_PERIOD_CONST / EJIT_IN_PERIOD / EJIT_IN_PERIOD_ARRAY / EJIT_ENTRY / EJIT_DIM / EJIT_PERIOD_GUARD）标注 · AOT 阶段（PASS1–5）提取带元数据 Bitcode 并插桩 Wrapper · 运行时通过 <b>OrcJIT/JITLink</b> 按时间窗实例特化编译 · 支持同步/异步/Inline‑Cache 三种调度模式 · 失败回退 AOT</p>
     </div>
     <div class="meta">
       基于 SPEC4.md / PLAN4.md<br>
@@ -175,12 +175,12 @@
     <div class="panel">
       <div class="ph"><span>⬛</span> 用户标注属性（Clang 前端 — 6 个）</div>
       <div class="chips">
-        <span class="chip">ejit_may_const<small> 字段可常量化</small></span>
-        <span class="chip">ejit_period("static")<small> 运行期不变全局变量</small></span>
-        <span class="chip">ejit_period_arr("name")<small> 数组时间窗</small></span>
-        <span class="chip">ejit_entry<small> JIT 入口函数</small></span>
-        <span class="chip">ejit_period_arr_ind("name")<small> 特化维度参数</small></span>
-        <span class="chip">ejit_period_lc("name")<small> 生命周期管理函数</small></span>
+        <span class="chip">EJIT_PERIOD_CONST<small> 字段可常量化</small></span>
+        <span class="chip">EJIT_IN_PERIOD("static")<small> 运行期不变全局变量</small></span>
+        <span class="chip">EJIT_IN_PERIOD_ARRAY("name")<small> 数组时间窗</small></span>
+        <span class="chip">EJIT_ENTRY<small> JIT 入口函数</small></span>
+        <span class="chip">EJIT_DIM("name")<small> 特化维度参数</small></span>
+        <span class="chip">EJIT_PERIOD_GUARD("name")<small> 生命周期管理函数</small></span>
       </div>
       <div class="spec-note">属性定义于 Attr.td → Sema 防呆（归属冲突/修改点/一致性检测）→ CodeGen 生成 !ejit.may_const / !ejit.metadata IR 元数据</div>
     </div>
@@ -242,7 +242,7 @@
           <ul>
             <li><b>PASS2 EJitRegisterPeriod</b>：扫描 <code>ejit_period_arr</code>/<code>ejit_period(static)</code> GV → 生成 <code>ejit_register_period_array()</code>/<code>ejit_register_static_var()</code> 调用追加到 <code>ejit_auto_register</code></li>
             <li><b>PASS3 EJitWrapperGen</b>：<b>单函数混合 Wrapper</b><br>入口插 <code>ejit_taskpool_compile_or_get(funcIdx,&hellip;)</code> + 命中调特化函数 + 未命中 fall-through 原逻辑</li>
-            <li><b>PASS4 EJitPeriodHandler</b>：为 <code>ejit_period_lc</code> 函数入口插 deactivate / 所有出口插 activate</li>
+            <li><b>PASS4 EJitPeriodHandler</b>：为 <code>EJIT_PERIOD_GUARD("name")</code> 函数入口插 deactivate / 所有出口插 activate</li>
             <li><span class="hint">非LTO：O2 之前运行（Wrapper IR 被 O2 优化）；LTO：O2 之后运行</span></li>
           </ul>
         </div>
@@ -338,7 +338,7 @@
           <div class="nt"><span class="pill">JIT</span>IRTransformLayer 特化流水线（EJitOptimizer::runPipeline）</div>
           <ul style="columns:2; column-gap:20px">
             <li><b>0. Bitcode 按需加载</b>（BitcodeTracker → parse Module）</li>
-            <li><b>1a. preReplacePeriodIndices</b>：ejit_period_arr_ind 参数 → ConstantInt（replaceAllUsesWith）</li>
+            <li><b>1a. preReplacePeriodIndices</b>：EJIT_DIM("name") 参数 → ConstantInt（replaceAllUsesWith）</li>
             <li><b>1b. InstCombine</b>：折叠 zext / GEP 常量链、清理 PHI</li>
             <li><b>1c. PASS6 EJitStructFieldPass</b>：扫描 <code>!ejit.may_const</code> load → 从进程内存读取运行时值 → 替换为 Constant（双机制：per-load metadata 主路径 + GV 偏移列表回退）</li>
             <li><b>1d. IPSCCP</b>（runInterproceduralPropagation）：内部化非 entry 定义 → 跨函数常量传播（替代 JIT 侧 Inline）</li>
@@ -477,7 +477,7 @@
       <h4>⚡ Inline Cache 约束与安全</h4>
       <ul>
         <li>维度 ≤ EJIT_ICACHE_MAX_DIMS(=4)，超限编译报错</li>
-        <li>ejit_dim 参数值 &lt; D（无运行时边界检查，契约保证）</li>
+        <li>EJIT_DIM 参数值 &lt; D（无运行时边界检查，契约保证）</li>
         <li>NO_RECLAIM 下 fnPtr 永不悬空（永不释放）</li>
         <li>reclamation safety gate：有 code releaser 时自动关闭 cache</li>
         <li>per-core private slot：无跨核 RMW，无 release_read</li>
