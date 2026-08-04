@@ -16,7 +16,11 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "gtest/gtest.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <memory>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -981,6 +985,25 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntryConsumesThenStops) {
   EXPECT_EQ(d.cacheReadyCount, 3u);
 }
 
+// The real worker must not drain a long queue at full speed. After consumed
+// work it yields through the injected platform hook, giving heartbeat/business
+// tasks scheduler time even when more compile requests remain queued.
+TEST_F(SharedTaskPoolTest, RealWorkerThrottlesBetweenConsumedRequests) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  StopAfterCtx sa{state_.get(), 3};
+  pool.setCompiler(&compileThenStopAfter, &sa);
+  for (uint32_t f = 1; f <= 3; ++f)
+    ASSERT_EQ(pool.compileOrGet(f, nullptr, 0, codeFor(f)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+
+  uint64_t before = pool.workerIdleYields();
+  pool.runWorkerLoop();
+  EXPECT_GE(pool.workerConsumeLoops(), 3u);
+  EXPECT_GT(pool.workerIdleYields(), before);
+}
+
 // 七.2 — worker start failure publishes Failed and records the reason.
 TEST_F(SharedTaskPoolTest, WorkerStartFailurePublishesFailed) {
   WorkerHooks hooks;
@@ -1571,11 +1594,12 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v5 layout: the slot carries the executable range as fixed-width,
-// naturally-aligned scalars (read back by value — endian-safe), and the
-// pool-split table is POD.
+// 16/17 ABI v7 layout: the slot carries the executable range as fixed-width,
+// naturally-aligned scalars (read back by value — endian-safe), the pool-split
+// table is POD, dump state contains metadata only, and each bucket carries the
+// NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 5u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 7u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -1601,6 +1625,42 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
+}
+
+TEST_F(SharedTaskPoolTest, DumpStateHoldsOnlySmallMetadata) {
+  EXPECT_TRUE(std::is_standard_layout<EJitSharedDumpState>::value);
+  EXPECT_TRUE(std::is_trivially_destructible<EJitSharedDumpState>::value);
+  EXPECT_LE(sizeof(EJitSharedDumpState), 2u * kEJitSharedDumpNameBytes + 256u);
+}
+
+TEST_F(SharedTaskPoolTest, DumpMetadataClearedOnInit) {
+  state_->dump.filterEnabled.storeRelaxed(1);
+  state_->dump.hasDump.storeRelaxed(1);
+  state_->dump.status.storeRelaxed(4);
+  state_->dump.filterLen = 4;
+  state_->dump.resultNameLen = 4;
+  state_->dump.irSize = 123;
+  state_->dump.asmSize = 456;
+  state_->dump.keyHi = 0x12;
+  state_->dump.keyLo = 0x34;
+  state_->dump.workerCore = 7;
+  state_->dump.filterName[0] = 'f';
+  state_->dump.resultName[0] = 'g';
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+
+  EXPECT_EQ(state_->dump.filterEnabled.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.hasDump.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.status.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.filterLen, 0u);
+  EXPECT_EQ(state_->dump.resultNameLen, 0u);
+  EXPECT_EQ(state_->dump.irSize, 0u);
+  EXPECT_EQ(state_->dump.asmSize, 0u);
+  EXPECT_EQ(state_->dump.keyHi, 0u);
+  EXPECT_EQ(state_->dump.keyLo, 0u);
+  EXPECT_EQ(state_->dump.workerCore, kEJitInvalidCoreId);
+  EXPECT_EQ(state_->dump.filterName[0], 0);
+  EXPECT_EQ(state_->dump.resultName[0], 0);
 }
 
 // 18/ Code-sharing OFF in 4K mode: a non-owner cleanly rejects and triggers NO
@@ -2140,6 +2200,842 @@ TEST_F(SharedTaskPoolTest, FixedDimVersionMismatchMisses) {
   auto fixedMiss2 = owner.tryCacheHit2D(71, 0, 1, 1, 2);
   EXPECT_FALSE(fixedMiss2.fastPathTerminal);
   EXPECT_FALSE(fixedMiss2.hasReadToken);
+}
+
+//===----------------------------------------------------------------------===//
+// Read-token discipline + invalidation, valid in BOTH builds:
+//  * default (token) build: a hit holds a read token, keeps readers > 0, and
+//    hands back a real bucketIndex the caller releases.
+//  * EJIT_SRE_TASKPOOL_NO_RECLAIM (seqlock) build: a hit holds NO token, never
+//    touches readers, and returns the out-of-range sentinel bucketIndex so the
+//    wrapper's releaseRead() cleanly no-ops. The safety of skipping the token
+//    rests on published code never being freed in that build.
+// In EITHER build, activate/deactivate (a version bump) must still invalidate:
+// a hit for a re-disabled instance is never served stale code.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, HitTokenDisciplineAndVersionInvalidation) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitDimPair d0[1] = {dim(1u, 2u)};
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(1, 2, true); // enable the instance (bumps version)
+  ASSERT_EQ(owner.compileOrGet(9, d0, 1, codeFor(9)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  auto hit = owner.tryCacheHit1D(9, 1, 2);
+  ASSERT_TRUE(hit.fastPathTerminal);
+  EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(9)); // correct specialization pointer
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  EXPECT_FALSE(hit.hasReadToken);
+  EXPECT_EQ(hit.bucketIndex, kEJitSharedCacheBuckets); // sentinel
+  // No token was taken: readers stay 0 across the whole hit.
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    EXPECT_EQ(state_->buckets[b].readers.loadAcquire(), 0u);
+  owner.releaseRead(hit.bucketIndex); // sentinel -> safe no-op
+#else
+  EXPECT_TRUE(hit.hasReadToken);
+  EXPECT_LT(hit.bucketIndex, kEJitSharedCacheBuckets);
+  EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  owner.releaseRead(hit.bucketIndex);
+  EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+#endif
+
+  // Deactivate → re-activate bumps the instance version: the stale-version slot
+  // must NOT be served; the fast path cleanly reports it (disabled or miss) so
+  // the caller recompiles. This holds identically in the seqlock build.
+  owner.setInstanceEnabled(1, 2, false);
+  auto disabled = owner.tryCacheHit1D(9, 1, 2);
+  EXPECT_NE(disabled.status, EJitCompileOrGetStatus::CacheHit);
+  owner.setInstanceEnabled(1, 2, true);
+  auto stale = owner.tryCacheHit1D(9, 1, 2);
+  // Re-enabled but version moved on: identity matches, version does not → not a
+  // hit (a fresh compile must republish under the new version).
+  EXPECT_NE(stale.status, EJitCompileOrGetStatus::CacheHit);
+  if (stale.hasReadToken)
+    owner.releaseRead(stale.bucketIndex);
+}
+
+//===----------------------------------------------------------------------===//
+// Slot-depth diagnostics: 0D identities whose funcIndex is a multiple of
+// kEJitSharedCacheBuckets all hash to bucket 0 and fill its slots 0,1,2,... in
+// publish order (cachePublish uses first-empty). This deterministically places
+// a target at a chosen linear-scan depth, exercising the per-slot scan (and the
+// identityHash-first fast-reject reorder) and proving the deepest slot is still
+// found and correctly identified.
+//===----------------------------------------------------------------------===//
+namespace {
+// Return the linear slot index at which \p funcIndex is Ready in its bucket, or
+// -1 if not found. Pure diagnostic scan (no lock needed in the single-thread
+// test).
+int slotDepthOf(EJitSharedTaskPoolState *st, uint32_t funcIndex,
+                uint32_t numDims) {
+  uint32_t bucket = funcIndex % kEJitSharedCacheBuckets; // 0D key == funcIndex
+  auto &B = st->buckets[bucket];
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+    auto &Slot = B.slots[s];
+    if (Slot.state.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+        Slot.funcIndex == funcIndex && Slot.numDims == numDims)
+      return static_cast<int>(s);
+  }
+  return -1;
+}
+} // namespace
+
+TEST_F(SharedTaskPoolTest, SlotDepthHitsAtEveryDepth) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  const uint32_t kB = kEJitSharedCacheBuckets;
+
+  // Fill bucket 0 slots 0..15 with distinct 0D colliders.
+  for (uint32_t d = 0; d < kEJitSharedCacheSlots; ++d) {
+    uint32_t fi = d * kB;
+    ASSERT_EQ(owner.compileOrGet(fi, nullptr, 0, codeFor(fi)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+    EXPECT_EQ(slotDepthOf(state_.get(), fi, 0), static_cast<int>(d));
+  }
+
+  // Every colliding identity — including the deepest slot 15 — must still be a
+  // correct cache hit with its own specialization pointer.
+  for (uint32_t d = 0; d < kEJitSharedCacheSlots; ++d) {
+    uint32_t fi = d * kB;
+    auto hit = owner.tryCacheHit0D(fi);
+    ASSERT_TRUE(hit.fastPathTerminal) << "depth " << d;
+    EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit) << "depth " << d;
+    EXPECT_EQ(hit.fnPtr, codeFor(fi)) << "depth " << d;
+    if (hit.hasReadToken)
+      owner.releaseRead(hit.bucketIndex);
+  }
+
+  // An unpublished colliding key in the same (now full) bucket is a clean miss.
+  auto miss = owner.tryCacheHit0D(kEJitSharedCacheSlots * kB);
+  EXPECT_NE(miss.status, EJitCompileOrGetStatus::CacheHit);
+  if (miss.hasReadToken)
+    owner.releaseRead(miss.bucketIndex);
+}
+
+// The identityHash-first reorder must never alias two identities that share a
+// bucket: a wrong-funcIndex query with the same bucket must miss even when a
+// different identity is Ready there.
+TEST_F(SharedTaskPoolTest, SlotDepthNoIdentityAliasAcrossBucket) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  const uint32_t kB = kEJitSharedCacheBuckets;
+  // Publish only funcIndex 5*kB at slot 0 of bucket 0.
+  uint32_t present = 5 * kB;
+  ASSERT_EQ(owner.compileOrGet(present, nullptr, 0, codeFor(present)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  // A different colliding funcIndex (same bucket, different identity) misses.
+  auto miss = owner.tryCacheHit0D(9 * kB);
+  EXPECT_NE(miss.status, EJitCompileOrGetStatus::CacheHit);
+  if (miss.hasReadToken)
+    owner.releaseRead(miss.bucketIndex);
+  // The present one still hits with the right pointer.
+  auto hit = owner.tryCacheHit0D(present);
+  EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(present));
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+}
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+//===----------------------------------------------------------------------===//
+// NO_RECLAIM fixed-dimension seqlock specializations (cacheLookupSeq0D/1D/2D):
+// the unrolled seqlock lookups reached by tryCacheHit0D/1D/2D must return the
+// SAME result as the generic seqlock path (cacheLookupSeq via tryCacheHit), for
+// hits, deep-slot hits, misses, disabled instances, and version invalidation.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, SeqFixedDimMatchesGeneric0D1D2D) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(1, 2, true);
+  owner.setInstanceEnabled(3, 4, true);
+
+  // Publish a 0D, a 1D and a 2D specialization.
+  ASSERT_EQ(owner.compileOrGet(21, nullptr, 0, codeFor(21)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EJitDimPair d1[1] = {dim(1, 2)};
+  ASSERT_EQ(owner.compileOrGet(22, d1, 1, codeFor(22)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EJitDimPair d2[2] = {dim(1, 2), dim(3, 4)};
+  ASSERT_EQ(owner.compileOrGet(23, d2, 2, codeFor(23)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  // Fixed-dim seqlock entry vs generic seqlock entry: identical outcomes.
+  auto fixed0 = owner.tryCacheHit0D(21);
+  auto gen0 = owner.tryCacheHit(21, nullptr, 0);
+  EXPECT_EQ(fixed0.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fixed0.status, gen0.status);
+  EXPECT_EQ(fixed0.fnPtr, gen0.fnPtr);
+  EXPECT_EQ(fixed0.fnPtr, codeFor(21));
+
+  auto fixed1 = owner.tryCacheHit1D(22, 1, 2);
+  auto gen1 = owner.tryCacheHit(22, d1, 1);
+  EXPECT_EQ(fixed1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fixed1.status, gen1.status);
+  EXPECT_EQ(fixed1.fnPtr, gen1.fnPtr);
+  EXPECT_EQ(fixed1.fnPtr, codeFor(22));
+
+  auto fixed2 = owner.tryCacheHit2D(23, 1, 2, 3, 4);
+  auto gen2 = owner.tryCacheHit(23, d2, 2);
+  EXPECT_EQ(fixed2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fixed2.status, gen2.status);
+  EXPECT_EQ(fixed2.fnPtr, gen2.fnPtr);
+  EXPECT_EQ(fixed2.fnPtr, codeFor(23));
+
+  // A miss and a wrong-dim query must also agree (both miss).
+  EXPECT_NE(owner.tryCacheHit0D(99).status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_NE(owner.tryCacheHit1D(22, 1, 3).status,
+            EJitCompileOrGetStatus::CacheHit); // wrong instanceId
+}
+
+// Version bump after a seqlock fixed-dim publish must invalidate the old slot.
+TEST_F(SharedTaskPoolTest, SeqFixedDimVersionBumpMisses) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(2, 7, true);
+  EJitDimPair d1[1] = {dim(2, 7)};
+  ASSERT_EQ(owner.compileOrGet(31, d1, 1, codeFor(31)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(owner.tryCacheHit1D(31, 2, 7).status,
+            EJitCompileOrGetStatus::CacheHit);
+  // Deactivate (bumps version): stale slot must not be served.
+  owner.setInstanceEnabled(2, 7, false);
+  EXPECT_NE(owner.tryCacheHit1D(31, 2, 7).status,
+            EJitCompileOrGetStatus::CacheHit);
+}
+#endif // EJIT_SRE_TASKPOOL_NO_RECLAIM
+
+//===----------------------------------------------------------------------===//
+// Phase-1 hot-hit micro-benchmark (DISABLED by default; run explicitly with
+//   --gtest_also_run_disabled_tests --gtest_filter='*HotHitMicroBench*'
+// on an aarch64 host). Measures the per-hit cost of the shared taskpool hit
+// path components to drive the read-token optimization. Not a correctness test.
+//===----------------------------------------------------------------------===//
+#if defined(__aarch64__)
+namespace {
+static inline uint64_t benchNow() {
+  uint64_t v;
+  asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v)::"memory");
+  return v;
+}
+static inline uint64_t benchFreq() {
+  uint64_t v;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(v));
+  return v;
+}
+struct BatchStats {
+  double avgNs, p50, p90, p99, maxNs;
+  size_t samples;
+};
+static BatchStats summarize(std::vector<double> &perIterNs) {
+  std::sort(perIterNs.begin(), perIterNs.end());
+  BatchStats s;
+  s.samples = perIterNs.size();
+  double sum = 0;
+  for (double v : perIterNs)
+    sum += v;
+  s.avgNs = sum / perIterNs.size();
+  auto pct = [&](double p) {
+    size_t idx = static_cast<size_t>(p * (perIterNs.size() - 1));
+    return perIterNs[idx];
+  };
+  s.p50 = pct(0.50);
+  s.p90 = pct(0.90);
+  s.p99 = pct(0.99);
+  s.maxNs = perIterNs.back();
+  return s;
+}
+static void report(const char *name, const BatchStats &s) {
+  printf("  %-28s avg=%.1fns p50=%.1f p90=%.1f p99=%.1f max=%.1f (n=%zu batches)\n",
+         name, s.avgNs, s.p50, s.p90, s.p99, s.maxNs, s.samples);
+}
+} // namespace
+
+TEST_F(SharedTaskPoolTest, DISABLED_HotHitMicroBench) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 42);
+  EJitCoreId::setCurrentForTest(0); // owner-core hit path
+  const uint64_t freq = benchFreq();
+  const double tickNs = 1e9 / static_cast<double>(freq);
+  const uint32_t kIters = 2000;    // per batch
+  const uint32_t kBatches = 2000;  // distribution samples
+  printf("HotHit micro-bench: cntfrq=%llu Hz (%.3f ns/tick), %u iters x %u batches\n",
+         (unsigned long long)freq, tickNs, kIters, kBatches);
+
+  // Warm up + correctness sanity.
+  {
+    auto r = owner.tryCacheHit0D(42);
+    ASSERT_TRUE(r.fastPathTerminal);
+    ASSERT_NE(r.fnPtr, nullptr);
+    if (r.hasReadToken)
+      owner.releaseRead(r.bucketIndex);
+  }
+
+  auto runBatches = [&](auto &&body) {
+    std::vector<double> perIterNs;
+    perIterNs.reserve(kBatches);
+    for (uint32_t b = 0; b < kBatches; ++b) {
+      uint64_t t0 = benchNow();
+      for (uint32_t i = 0; i < kIters; ++i)
+        body();
+      uint64_t t1 = benchNow();
+      perIterNs.push_back((double)(t1 - t0) * tickNs / kIters);
+    }
+    return summarize(perIterNs);
+  };
+
+  volatile void *sink = nullptr;
+
+  // (A) Full current hit path: lookup (read-token acquire) + releaseRead.
+  auto full = runBatches([&] {
+    auto r = owner.tryCacheHit0D(42);
+    sink = r.fnPtr;
+    owner.releaseRead(r.bucketIndex);
+  });
+
+  // (B) Lookup only (read-token acquired but released untimed): isolates get_fn.
+  auto lookup = runBatches([&] {
+    auto r = owner.tryCacheHit0D(42);
+    sink = r.fnPtr;
+    owner.releaseRead(r.bucketIndex); // released, but the timed body is above
+  });
+  // Re-time (B) with release truly outside the measured region is not possible
+  // per-iter; instead measure release in isolation as (C).
+
+  // (C) releaseRead in isolation (lookup done untimed just before).
+  auto release = runBatches([&] {
+    auto r = owner.tryCacheHit0D(42); // untimed-ish, but included; see note
+    owner.releaseRead(r.bucketIndex);
+    sink = r.fnPtr;
+  });
+
+  // (D) Load-only seqlock-style read of the SAME slot: no RMW atomics, no
+  // release. This is the target design's per-hit cost.
+  EJitSharedCacheSlot *slot = findReadySlot(42);
+  ASSERT_NE(slot, nullptr);
+  auto seqlike = runBatches([&] {
+    // state(acquire) -> identity loads -> fnPtr(acquire) -> re-check state.
+    uint32_t s0 = slot->state.loadAcquire();
+    uint32_t fi = slot->funcIndex;
+    uint64_t h = slot->identityHash;
+    void *fn = reinterpret_cast<void *>(slot->fnPtr.loadAcquire());
+    uint32_t s1 = slot->state.loadAcquire();
+    if (s0 == s1 && fi == 42 && h)
+      sink = fn;
+  });
+  (void)sink;
+
+  printf("Shared taskpool owner-core 0D hot hit component costs:\n");
+  report("A full (lookup+release)", full);
+  report("B lookup+release (dup)", lookup);
+  report("C lookup+release iso", release);
+  report("D seqlock load-only", seqlike);
+  printf("Delta A-D (RMW+release removed) approx avg = %.1f ns/hit\n",
+         full.avgNs - seqlike.avgNs);
+}
+
+// Multi-core contention model of the real board: N cores hammering the SAME hot
+// function share one bucket cache line. The read-token RMW (fetchAdd/fetchSub on
+// bucket.readers) then bounces that line between cores; a load-only seqlock read
+// does not. This is the scenario the 6us regression comes from.
+TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 42);
+  EJitSharedCacheSlot *slot = findReadySlot(42);
+  ASSERT_NE(slot, nullptr);
+  EJitSharedCacheBucket *bucket = nullptr;
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets && !bucket; ++b)
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)
+      if (&state_->buckets[b].slots[s] == slot) {
+        bucket = &state_->buckets[b];
+        break;
+      }
+  ASSERT_NE(bucket, nullptr);
+  const double tickNs = 1e9 / static_cast<double>(benchFreq());
+  const uint32_t kIters = 200000;
+
+  for (unsigned T : {1u, 2u, 4u, 8u}) {
+    std::vector<double> tokDur(T), seqDur(T);
+    auto tokenBody = [&](unsigned idx) {
+      uint64_t t0 = benchNow();
+      volatile uint64_t acc = 0;
+      for (uint32_t i = 0; i < kIters; ++i) {
+        bucket->readers.fetchAdd(1);
+        acc += slot->fnPtr.loadAcquire();
+        bucket->readers.fetchSub(1);
+      }
+      uint64_t t1 = benchNow();
+      (void)acc;
+      tokDur[idx] = (double)(t1 - t0) * tickNs / kIters;
+    };
+    auto seqBody = [&](unsigned idx) {
+      uint64_t t0 = benchNow();
+      volatile uint64_t acc = 0;
+      for (uint32_t i = 0; i < kIters; ++i) {
+        uint32_t s0 = slot->state.loadAcquire();
+        acc += slot->fnPtr.loadAcquire();
+        uint32_t s1 = slot->state.loadAcquire();
+        acc += (s0 == s1);
+      }
+      uint64_t t1 = benchNow();
+      (void)acc;
+      seqDur[idx] = (double)(t1 - t0) * tickNs / kIters;
+    };
+    auto runContended = [&](auto body, std::vector<double> &dur) {
+      std::vector<std::thread> ths;
+      for (unsigned t = 0; t < T; ++t)
+        ths.emplace_back([&, t] { body(t); });
+      for (auto &th : ths)
+        th.join();
+      double sum = 0, mx = 0;
+      for (double d : dur) {
+        sum += d;
+        mx = std::max(mx, d);
+      }
+      return std::pair<double, double>(sum / T, mx);
+    };
+    auto tok = runContended(tokenBody, tokDur);
+    auto seq = runContended(seqBody, seqDur);
+    printf("T=%u cores same bucket: token(RMW) avg=%.1fns max=%.1f | "
+           "seqlock(load) avg=%.1fns max=%.1f | token/seqlock=%.1fx\n",
+           T, tok.first, tok.second, seq.first, seq.second,
+           seq.first > 0 ? tok.first / seq.first : 0.0);
+  }
+}
+#endif // __aarch64__
+
+//===----------------------------------------------------------------------===//
+// Per-function inline cache (v2 sticky monomorphic): frozen read, one-shot
+// fill, range guards, and the reclamation safety gate. Asserts behavior
+// (boolean + pointer), not stats.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool); // core 0 owner, Ready, code sharing off (owner-only).
+  constexpr uint32_t kFunc = 3;
+  // Register a per-function icache slot (the wrapper's @__ejit_icache_fn_
+  // global, here a test-local stand-in) so icacheFill has somewhere to write.
+  uintptr_t slot = 0;
+  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // Cold icache misses (empty slot).
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+
+  // Fill on a resolve -> subsequent probe hits, returning the frozen fnPtr.
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // Frozen: a period toggle bumps the version, but v2 does NOT re-validate, so
+  // the cached specialization is still served (the slot is never refilled or
+  // invalidated). This is the v2 contract - the specialization is invariant.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, false)); // bump version
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // No one-shot CAS (per-core-private slot -> plain store). A later fill
+  // OVERWRITES; under the contract the specialization is invariant per identity,
+  // so a later resolve carries the SAME pointer and the overwrite is harmless.
+  // Verify a same-pointer re-fill leaves the served pointer unchanged.
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // Out-of-range funcIndex misses without touching memory.
+  EXPECT_FALSE(pool.icacheTry(EJIT_ICACHE_FUNC_SLOTS, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+
+  ejitIcacheClearAll();
+}
+
+// Safety gate: wiring a releaser means code may be freed, and v2 does no
+// HP-scan retire, so the cache auto-disables (icacheTry always misses,
+// icacheFill no-op) to avoid UAF. Unwiring the releaser re-enables it.
+TEST_F(SharedTaskPoolTest, InlineCacheAutoDisablesWhenReclamationWired) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // Before a releaser: fill -> hit.
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // Wire a releaser: icache auto-disables (miss + no-op fill).
+  ReleaseLog rel;
+  pool.setReleaser(&mockRelease, &rel);
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+  pool.icacheFill(kFunc, fn, nullptr, 0); // no-op: the gate blocks the fill
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+
+  // Unwire the releaser: the gate re-opens; fill -> hit works again.
+  pool.setReleaser(nullptr, nullptr);
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  ejitIcacheClearAll();
+}
+
+// Multi-version: a 2-dim icache holds one frozen fnPtr per dim identity, so
+// different (i,j) combos serve different specializations (the v2 monomorphic
+// bug - one slot for all identities - is fixed). Distinct identities fill
+// distinct cells; one-shot per cell; shape mismatch misses.
+TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  // A 2-dim [D][D] slot (D = EJIT_ICACHE_DIM_SIZE), zero-initialized. The
+  // runtime reaches cells through an EJitAtomicUPtr* + linearized index.
+  constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
+  uintptr_t slots[D][D] = {};
+  ejitIcacheRegisterSlot(kFunc, &slots[0][0], 2);
+
+  void *fn00 = codeFor(kFunc);
+  void *fn01 = codeFor(kFunc + 1);
+  void *fn10 = codeFor(kFunc + 2);
+  EJitDimPair id00[2] = {{0, 0}, {0, 0}};
+  EJitDimPair id01[2] = {{0, 0}, {0, 1}};
+  EJitDimPair id10[2] = {{0, 1}, {0, 0}};
+  void *out = nullptr;
+
+  // Cold: every identity misses (cells start empty).
+  EXPECT_FALSE(pool.icacheTry(kFunc, id00, 2, &out));
+  EXPECT_FALSE(pool.icacheTry(kFunc, id01, 2, &out));
+
+  // Fill each identity with its own fnPtr.
+  pool.icacheFill(kFunc, fn00, id00, 2);
+  pool.icacheFill(kFunc, fn01, id01, 2);
+  pool.icacheFill(kFunc, fn10, id10, 2);
+
+  // Each identity serves its OWN fnPtr (multi-version: no cross-contamination).
+  EXPECT_TRUE(pool.icacheTry(kFunc, id00, 2, &out));
+  EXPECT_EQ(out, fn00);
+  EXPECT_TRUE(pool.icacheTry(kFunc, id01, 2, &out));
+  EXPECT_EQ(out, fn01);
+  EXPECT_TRUE(pool.icacheTry(kFunc, id10, 2, &out));
+  EXPECT_EQ(out, fn10);
+
+  // No one-shot CAS (per-core-private -> plain store): a later fill of (0,0)
+  // OVERWRITES with the latest pointer. Under the contract a later resolve of
+  // the same identity carries the same pointer, so re-fill with fn00 is a no-op
+  // semantically; verify the served pointer is still fn00.
+  pool.icacheFill(kFunc, fn00, id00, 2);
+  EXPECT_TRUE(pool.icacheTry(kFunc, id00, 2, &out));
+  EXPECT_EQ(out, fn00);
+
+  // Shape mismatch (caller numDims != registered 2): miss, no OOB access.
+  EXPECT_FALSE(pool.icacheTry(kFunc, id00, 1, &out));
+  EXPECT_FALSE(pool.icacheTry(kFunc, id00, 0, &out));
+
+  ejitIcacheClearAll();
+}
+
+//===----------------------------------------------------------------------===//
+// Per-core L0 dispatch cache
+//
+// Nothing on the hit path re-checks what makes it safe, so each invariant is
+// pinned here. Getting one wrong yields a stale or dangling code pointer, which
+// no value assertion elsewhere would catch.
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// Process-globals standing in for core-private storage: no test may inherit
+/// them from the one before it.
+void resetL0ForTest() {
+  for (uint32_t i = 0; i < kEJitL0Slots; ++i)
+    gEJitL0[i] = EJitL0Entry{};
+  gEJitL0State = nullptr;
+}
+} // namespace
+
+TEST_F(SharedTaskPoolTest, L0ServesARepeatDispatch) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 3;
+  const EJitDimPair dims[1] = {{0, 1}};
+
+  void *out = nullptr;
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "cold table must miss";
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
+
+  // A different identity must miss, not return the wrong pointer.
+  const EJitDimPair other[1] = {{0, 2}};
+  EXPECT_FALSE(pool.l0Try(kFunc, other, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0RetiredByPublishAndByVersionChange) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 4;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  publish(pool, 9);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out)) << "publish must retire the L0";
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // L0 entries carry no version of their own.
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "version change must retire the L0";
+}
+
+TEST_F(SharedTaskPoolTest, L0RetiredByExplicitFlush) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 5;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // ejit_clear_cache() / ejit_invalidate() / a compile-mode change reach the
+  // L0 only through this hook.
+  pool.retireDispatchCache();
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0EntryIsNotServedToAnotherCore) {
+  resetL0ForTest();
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  const uint32_t kFunc = 6;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitCoreId::setCurrentForTest(0);
+  owner.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(owner.l0Try(kFunc, dims, 1, &out));
+
+  // Cannot arise on hardware (core-private table), but can where cores are
+  // simulated: a peer taking the owner's entry would skip peerPrepareSlot().
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_FALSE(owner.l0Try(kFunc, dims, 1, &out))
+      << "a peer must not be served the owner's entry";
+
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_TRUE(owner.l0Try(kFunc, dims, 1, &out)) << "owner still hits";
+}
+
+TEST_F(SharedTaskPoolTest, L0DoesNotSurviveANewSharedBlob) {
+  resetL0ForTest();
+  const uint32_t kFunc = 7;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+  ASSERT_NE(gEJitL0State, nullptr);
+
+  // The table outlives the shared blob. A fresh blob starts from a low
+  // dispatchEpoch, so the epoch alone cannot separate the two instances -- the
+  // entry must be rejected because it was armed against another state.
+  auto other = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool fresh;
+  EJitCoreId::setCurrentForTest(0);
+  fresh.bind(other.get());
+  fresh.setCompiler(&mockCompile, nullptr);
+  fresh.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(fresh.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_FALSE(fresh.l0Try(kFunc, dims, 1, &out))
+      << "an entry armed against a previous blob must not validate";
+}
+
+TEST_F(SharedTaskPoolTest, L0DoesNotSurviveAReInitialization) {
+  resetL0ForTest();
+  const uint32_t kFunc = 11;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  // Same blob, torn down and stood back up: entries still point into a code
+  // pool that has been reset.
+  EJitCoreId::setCurrentForTest(0);
+  pool.ownerShutdown();
+  ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "an entry from the previous pool instance must not validate";
+
+  // ...and the cache re-arms normally afterwards.
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+TEST_F(SharedTaskPoolTest, L0RefusesToArmWhileAReleaserIsWired) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 8;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  // With a releaser wired, code can be freed under a caller, and an L0 hit
+  // carries no read token. Same gate the inline cache uses.
+  pool.setReleaser([](void *, void *) {}, nullptr);
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out));
+}
+
+// The gate is evaluated at fill, so wiring a releaser AFTER entries are armed
+// must retire them.
+TEST_F(SharedTaskPoolTest, L0EntriesAreRetiredWhenAReleaserIsWiredLater) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const uint32_t kFunc = 12;
+  const EJitDimPair dims[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(kFunc, codeFor(kFunc), dims, 1);
+  ASSERT_TRUE(pool.l0Try(kFunc, dims, 1, &out));
+
+  pool.setReleaser([](void *, void *) {}, nullptr);
+  EXPECT_FALSE(pool.l0Try(kFunc, dims, 1, &out))
+      << "an armed entry must not survive a releaser being wired";
+}
+
+TEST_F(SharedTaskPoolTest, ReleaseReadIgnoresTheNoBucketSentinel) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  // The wrapper calls releaseRead() unconditionally, so kEJitNoBucket must be
+  // a no-op rather than a spurious decrement of a real bucket.
+  pool.releaseRead(kEJitNoBucket);
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    EXPECT_EQ(state_->buckets[b].readers.loadRelaxed(), 0u)
+        << "bucket " << b << " reader count disturbed";
+}
+
+// A fill interrupted between its payload stores must not leave an old identity
+// paired with the new fnPtr. Core-private storage excludes other CORES, not
+// preemption on this one, so the seqlock is what makes the entry atomic.
+TEST_F(SharedTaskPoolTest, L0PartiallyWrittenEntryIsNotServed) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const EJitDimPair a[1] = {{0, 1}};
+  void *out = nullptr;
+
+  pool.l0Fill(20, codeFor(20), a, 1);
+  ASSERT_TRUE(pool.l0Try(20, a, 1, &out));
+  ASSERT_EQ(out, codeFor(20));
+
+  // The interleaving a preempted fill leaves: odd sequence, fnPtr replaced,
+  // identity not yet updated.
+  EJitL0Entry &e = gEJitL0[ejitL0Index(20, a, 1)];
+  e.seq = e.seq + 1u;
+  e.fn = codeFor(21);
+
+  EXPECT_FALSE(pool.l0Try(20, a, 1, &out))
+      << "a half-written entry must not be served";
+
+  e.seq = e.seq + 1u; // writer completes
+  EXPECT_TRUE(pool.l0Try(20, a, 1, &out));
+}
+
+// Two identities landing in the same slot must evict each other, never
+// cross-serve. The colliding pair is SEARCHED FOR rather than hard-coded, so
+// the test keeps its meaning if the hash changes.
+TEST_F(SharedTaskPoolTest, L0CollidingIdentitiesNeverCrossServe) {
+  resetL0ForTest();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  void *out = nullptr;
+
+  const EJitDimPair a[1] = {{0, 1}};
+  const uint32_t slot = ejitL0Index(30, a, 1);
+  EJitDimPair b[1] = {{0, 0}};
+  bool found = false;
+  for (uint32_t inst = 2; inst < kEJitSharedInstances && !found; ++inst) {
+    b[0].instanceId = inst;
+    found = ejitL0Index(30, b, 1) == slot;
+  }
+  ASSERT_TRUE(found) << "no colliding identity found in the instance space";
+
+  pool.l0Fill(30, codeFor(30), a, 1);
+  pool.l0Fill(30, codeFor(31), b, 1); // evicts a from the shared slot
+
+  EXPECT_FALSE(pool.l0Try(30, a, 1, &out))
+      << "the evicted identity must miss, not receive the evictor's pointer";
+  ASSERT_TRUE(pool.l0Try(30, b, 1, &out));
+  EXPECT_EQ(out, codeFor(31));
+
+  // The pair the old packed key aliased via dimType*31 + instanceId.
+  resetL0ForTest();
+  const EJitDimPair c[1] = {{0, 31}};
+  const EJitDimPair d[1] = {{1, 0}};
+  pool.l0Fill(30, codeFor(32), c, 1);
+  pool.l0Fill(30, codeFor(33), d, 1);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_EQ(out, codeFor(32)) << "(0,31) served (1,0)'s specialization";
+  if (pool.l0Try(30, d, 1, &out))
+    EXPECT_EQ(out, codeFor(33)) << "(1,0) served (0,31)'s specialization";
+
+  // Same funcIndex, differing arity must not alias.
+  resetL0ForTest();
+  const EJitDimPair two[2] = {{0, 31}, {0, 0}};
+  pool.l0Fill(30, codeFor(34), c, 1);
+  pool.l0Fill(30, codeFor(35), two, 2);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_EQ(out, codeFor(34)) << "1D identity served a 2D entry";
+  if (pool.l0Try(30, two, 2, &out))
+    EXPECT_EQ(out, codeFor(35));
+
+  // Different funcIndex, identical dims must not alias.
+  resetL0ForTest();
+  pool.l0Fill(30, codeFor(36), c, 1);
+  pool.l0Fill(31, codeFor(37), c, 1);
+  if (pool.l0Try(30, c, 1, &out))
+    EXPECT_NE(out, codeFor(37)) << "funcIndex 30 served funcIndex 31's entry";
 }
 
 } // namespace

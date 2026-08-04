@@ -28,7 +28,7 @@ ninja -C build_release_x86 LLVMEJIT lld</code></pre>
 
   <section class="step">
     <h2>1. 写一个可特化的配置结构体</h2>
-    <p>把时间窗内稳定的字段标记为 <code>ejit_may_const</code>。不要标记频繁变化字段。</p>
+    <p>把时间窗内稳定的字段标记为 <code>EJIT_PERIOD_CONST</code>。不要标记频繁变化字段。</p>
 <pre><code class="language-c">#include &lt;stdint.h&gt;
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 
@@ -36,23 +36,23 @@ ninja -C build_release_x86 LLVMEJIT lld</code></pre>
 #define MODE_SAFE 2
 
 struct CellConfig {
-    ejit_may_const uint32_t mode;
-    ejit_may_const uint32_t threshold;
+    EJIT_PERIOD_CONST uint32_t mode;
+    EJIT_PERIOD_CONST uint32_t threshold;
     uint32_t counter;
 };
 
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];</code></pre>
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];</code></pre>
   </section>
 
   <section class="step">
     <h2>2. 标记 JIT 入口函数</h2>
-    <p><code>ejit_entry</code> 标记原函数；<code>ejit_period_arr_ind(cell)</code> 告诉 EJIT 哪个参数是 <code>cell</code> 时间窗下标。</p>
+    <p><code>EJIT_ENTRY</code> 标记原函数；<code>EJIT_DIM(cell)</code> 告诉 EJIT 哪个参数是 <code>cell</code> 时间窗下标。</p>
 <pre><code class="language-c">static void fast_path(int v);
 static void safe_path(int v);
 static void default_path(int v);
 
-ejit_entry
-void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+EJIT_ENTRY
+void process_cell(EJIT_DIM(cell) uint8_t cellIdx, int value) {
     if (g_cellCfg[cellIdx].mode == MODE_FAST) {
         fast_path(value + g_cellCfg[cellIdx].threshold);
     } else if (g_cellCfg[cellIdx].mode == MODE_SAFE) {
@@ -65,9 +65,9 @@ void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
 
   <section class="step">
     <h2>3. 标记配置修改函数</h2>
-    <p>修改 <code>ejit_may_const</code> 字段时，用 <code>ejit_period_lc</code> 包住生命周期。编译器会自动插入 deactivate/activate。</p>
-<pre><code class="language-c">ejit_period_lc(cell)
-void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+    <p>修改 <code>EJIT_PERIOD_CONST</code> 字段时，用 <code>EJIT_PERIOD_GUARD</code> 包住生命周期。编译器会自动插入 deactivate/activate。</p>
+<pre><code class="language-c">EJIT_PERIOD_GUARD(cell)
+void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
                      uint32_t mode,
                      uint32_t threshold) {
     g_cellCfg[cellIdx].mode = mode;
@@ -131,9 +131,9 @@ void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
     <ol>
       <li>忘记调用 <code>ejit_init</code>。</li>
       <li>忘记 <code>ejit_activate("cell", idx)</code>。</li>
-      <li>字段没标 <code>ejit_may_const</code>。</li>
-      <li><code>ejit_entry</code> 参数没标 <code>ejit_period_arr_ind(cell)</code>。</li>
-      <li>直接修改配置字段，没走 <code>ejit_period_lc</code> 或手动 deactivate/activate。</li>
+      <li>字段没标 <code>EJIT_PERIOD_CONST</code>。</li>
+      <li><code>EJIT_ENTRY</code> 参数没标 <code>EJIT_DIM(cell)</code>。</li>
+      <li>直接修改配置字段，没走 <code>EJIT_PERIOD_GUARD</code> 或手动 deactivate/activate。</li>
     </ol>
     <div class="ok">如果任何一步失败，EJIT 的原则是返回 NULL 并 fallback 到 AOT，不应该影响程序正确性。</div>
   </section>

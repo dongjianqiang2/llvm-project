@@ -37,8 +37,8 @@
   <section>
     <h2>2. 症状：JIT 完全没触发</h2>
     <div class="check">
-      <h3>检查 1：函数是否标了 <code>ejit_entry</code></h3>
-      <p>没有 <code>ejit_entry</code>，AOT pass 不会为该函数嵌入 bitcode 和生成 wrapper。</p>
+      <h3>检查 1：函数是否标了 <code>EJIT_ENTRY</code></h3>
+      <p>没有 <code>EJIT_ENTRY</code>，AOT pass 不会为该函数嵌入 bitcode 和生成 wrapper。</p>
     </div>
     <div class="check">
       <h3>检查 2：是否用了带 EJIT 的 Clang</h3>
@@ -84,10 +84,10 @@ assert(ejit_is_active("cell", idx));</code></pre>
   <section>
     <h2>4. 症状：JIT 有了但分支没折叠</h2>
     <ol>
-      <li>字段是否标注 <code>ejit_may_const</code>？</li>
+      <li>字段是否标注 <code>EJIT_PERIOD_CONST</code>？</li>
       <li>字段是否是 <code>volatile</code>？volatile 不替换。</li>
-      <li>全局对象是否标注 <code>ejit_period(static)</code> 或 <code>ejit_period_arr(name)</code>？</li>
-      <li>入口参数是否标注同名 <code>ejit_period_arr_ind(name)</code>？</li>
+      <li>全局对象是否标注 <code>EJIT_IN_PERIOD(static)</code> 或 <code>EJIT_IN_PERIOD_ARRAY(name)</code>？</li>
+      <li>入口参数是否标注同名 <code>EJIT_DIM(name)</code>？</li>
       <li>访问是否是可分析的全局变量/GEP 链？复杂 PHI/select 指针会跳过。</li>
       <li>被调用函数里的 load 是否已经 inline 到入口函数闭包里？</li>
       <li>设置 <code>dumpJITDir</code>，检查 PASS6 后 IR。</li>
@@ -99,10 +99,10 @@ ejit_init(&amp;cfg);</code></pre>
 
   <section>
     <h2>5. 症状：修改配置后结果不对</h2>
-    <p>通常是旧特化代码没有失效。修改 <code>ejit_may_const</code> 字段时必须遵守生命周期。</p>
+    <p>通常是旧特化代码没有失效。修改 <code>EJIT_PERIOD_CONST</code> 字段时必须遵守生命周期。</p>
 <pre><code class="language-c">// 推荐：生命周期函数
-ejit_period_lc(cell)
-void update_cell(ejit_period_arr_ind(cell) uint8_t idx) {
+EJIT_PERIOD_GUARD(cell)
+void update_cell(EJIT_DIM(cell) uint8_t idx) {
     g_cellCfg[idx].mode = MODE_SAFE;
 }
 
@@ -117,14 +117,14 @@ ejit_activate("cell", idx);</code></pre>
     <h2>6. 编译期诊断速查</h2>
     <table>
       <tr><th>诊断</th><th>原因</th><th>修复</th></tr>
-      <tr><td>multiple period attributes</td><td>同一变量被多个 period 标记</td><td>只保留一个 <code>ejit_period</code> 或 <code>ejit_period_arr</code></td></tr>
-      <tr><td>period cannot be used on array</td><td>数组用了 <code>ejit_period</code></td><td>改用 <code>ejit_period_arr</code></td></tr>
-      <tr><td>period_arr requires array</td><td>标量用了 <code>ejit_period_arr</code></td><td>标量静态配置用 <code>ejit_period(static)</code></td></tr>
+      <tr><td>multiple period attributes</td><td>同一变量被多个 period 标记</td><td>只保留一个 <code>EJIT_IN_PERIOD</code> 或 <code>EJIT_IN_PERIOD_ARRAY</code></td></tr>
+      <tr><td>period cannot be used on array</td><td>数组用了 <code>EJIT_IN_PERIOD</code></td><td>改用 <code>EJIT_IN_PERIOD_ARRAY</code></td></tr>
+      <tr><td>period_arr requires array</td><td>标量用了 <code>EJIT_IN_PERIOD_ARRAY</code></td><td>标量静态配置用 <code>EJIT_IN_PERIOD(static)</code></td></tr>
       <tr><td>array too large</td><td>固定数组超过限制</td><td>缩小数组或改造数据组织</td></tr>
       <tr><td>period_arr_ind must be integer</td><td>维度参数不是整数</td><td>使用 <code>uint8_t</code>/<code>int</code></td></tr>
       <tr><td>too many dimensions</td><td>超过 4 个维度</td><td>拆分函数或合并业务维度</td></tr>
-      <tr><td>recursive ejit_entry</td><td>JIT 入口递归</td><td>移除递归或取消 <code>ejit_entry</code></td></tr>
-      <tr><td>lc requires matching index</td><td>生命周期函数没有同名下标参数</td><td>添加 <code>ejit_period_arr_ind(name)</code></td></tr>
+      <tr><td>recursive EJIT_ENTRY</td><td>JIT 入口递归</td><td>移除递归或取消 <code>EJIT_ENTRY</code></td></tr>
+      <tr><td>lc requires matching index</td><td>生命周期函数没有同名下标参数</td><td>添加 <code>EJIT_DIM(name)</code></td></tr>
     </table>
   </section>
 

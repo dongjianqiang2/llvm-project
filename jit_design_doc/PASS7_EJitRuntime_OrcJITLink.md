@@ -1,16 +1,13 @@
 # EmbeddedJIT 运行时库设计文档 — 基于 OrcJIT + JITLink
 
-**版本**: 1.1
-**日期**: 2026-04-29
+**版本**: 2.0
+**日期**: 2026-07-23
 **关联**: SPEC4.md, PLAN4.md, PASS1–6 设计文档
 
-> **v2 更新 (2026-07)**: 本文档描述原始设计。v2 重构中的关键变化：
-> - `ejit_compile_or_get` → `ejit_taskpool_compile_or_get`（统一 Sync/Async）
-> - `EJitAsyncCompiler` → 由 `EJitTaskPool` / `EJitSharedTaskPool` worker 取代
-> - `EJitCache` (LRU) → 由 taskpool bucket cache + shared pool lock-free cache 取代
-> - `EJitSyncCompiler` → 由 `EJitCompileDriver::compileCold` 直接调用 ORC engine
-> - `syncEngine/asyncEngine` → 统一为 `jitEngine_`
-> - 文档中 EJitAsyncCompiler、EJitCache、EJitSyncCompiler 的详细设计为历史参考
+> **v2 更新 (2026-07)**: 本文档已按当前实现同步。同步和异步请求共用
+> `EJitCompileDriver`、ORC 编译链以及 taskpool cache/dedup 协议；旧的
+> `EJitSyncCompiler`、`EJitAsyncCompiler`、LRU `EJitCache` 和双引擎设计
+> 已移入明确标记的折叠历史区，不再作为现行实现。
 **类型**: 运行时库 (libejit.a)
 **核心框架**: LLVM OrcJIT + JITLink
 
@@ -30,7 +27,7 @@ EmbeddedJIT 运行时库基于 LLVM OrcJIT + JITLink 构建，支持同步 (Sync
 │  │   C 语言 API 层        │    │   C++ 内部 API 层      │                       │
 │  │   (EJitRuntime.h)     │    │   (EJit.h)            │                       │
 │  │   ejit_init/shutdown  │    │   EJit class          │                       │
-│  │   ejit_activate/      │    │   EJitCache           │                       │
+│  │   ejit_activate/      │    │   Config / Registry   │                       │
 │  │     deactivate        │    │                       │                       │
 │  │   ejit_taskpool_compile_or_get │    │                       │                       │
 │  └──────────┬───────────┘    └───────────┬───────────┘                       │
@@ -55,19 +52,19 @@ EmbeddedJIT 运行时库基于 LLVM OrcJIT + JITLink 构建，支持同步 (Sync
 │  └──────────────────────────────────────────────────────────────────────┘   │
 │                                    │                                          │
 │  ┌─────────────────────────────────┴────────────────────────────────────┐   │
-│  │                     同步/异步编译隔离层                                │   │
+│  │                     Taskpool 编译调度层                                 │   │
 │  │                                                                       │   │
 │  │  ┌─────────────────────────┐    ┌───────────────────────────────┐    │   │
-│  │  │ EJitSyncCompiler        │    │ EJitAsyncCompiler              │    │   │
-│  │  │ (调用线程直接编译)        │    │ (后台线程 + 请求队列 + 隔离引擎) │    │   │
+│  │  │ EJitTaskPool            │    │ EJitSharedTaskPool            │    │   │
+│  │  │ (单实例调度)              │    │ (跨核共享 + 单 worker)          │    │   │
 │  │  └─────────────────────────┘    └───────────────────────────────┘    │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 │                                    │                                          │
 │  ┌─────────────────────────────────┴────────────────────────────────────┐   │
-│  │                      EJitCache (Code Cache)                           │   │
+│  │                      Taskpool Code Cache                              │   │
 │  │  ┌──────────────────────┐  ┌────────────────────────────────────┐    │   │
-│  │  uint64_t Cache Key    │  │ LRU 淘汰 + 大小限制                │    │   │
-│  │  funcIdx|dim[3..0]   │  │ (maxCacheSize, maxEntries)         │    │   │
+│  │  funcIndex + dims      │  │ bucket/slot + version gate        │    │   │
+│  │  + versions/generation │  │ shared publish protocol           │    │   │
 │  │  └──────────────────────┘  └────────────────────────────────────┘    │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -79,7 +76,7 @@ EmbeddedJIT 运行时库基于 LLVM OrcJIT + JITLink 构建，支持同步 (Sync
 | 考量 | MCJIT (旧) | OrcJIT + JITLink (新) |
 |------|-----------|---------------------|
 | 内存管理 | 固定 SectionMemoryManager | JITLinkMemoryManager 完全可覆盖 |
-| 并发支持 | 无内置线程池 | ExecutionSession + NumCompileThreads |
+| 并发支持 | 无内置线程池 | ExecutionSession 可扩展；当前内部线程数固定为 0 |
 | 模块隔离 | 弱 | JITDylib + ResourceTracker 精确控制 |
 | 嵌入式适配 | 困难 | 自定义 allocator + BasicLayout |
 | LLVM 演进 | Legacy (维护模式) | 当前主力 |
@@ -99,40 +96,24 @@ EJitOrcEngine 封装 LLJIT 实例，管理 JIT 编译生命周期。
 namespace llvm::ejit {
 
 class EJitOrcEngine {
-    LLVMContext Ctx;                       // 拥有者 LLVMContext (用于 bitcode 加载)
-    std::unique_ptr<orc::LLJIT> J;         // OrcJIT 实例
-    orc::JITDylib* MainJD;                // 主 JITDylib 引用
-    orc::ResourceTrackerSP DefaultRT;      // 默认 ResourceTracker (用于模块管理)
-
-    EJitJITLinkMemoryManager* MemMgr;      // 我们的嵌入式内存管理器
-
-    // JIT 编译上下文 — 每次编译前由 SyncCompiler/AsyncCompiler 设置
-    // 同步模式下在调用线程设置；异步模式下在后台线程设置，无竞态
-    SpecializationContext* ActiveCtx = nullptr;
-    OptimizationLevel OptLevel = OptimizationLevel::Level2;
+    struct Impl;
+    std::unique_ptr<Impl> P;               // LLJIT、optimizer、activeCtx 等私有状态
 
 public:
-    // 工厂方法: 创建 EJitOrcEngine
     static Expected<std::unique_ptr<EJitOrcEngine>>
-    Create(const EJitConfig& config);
+    Create(const Config& config,
+           PeriodArrayRegistry& periodReg,
+           EJitRuntimeState& runtimeState);
 
-    // 错误信息 (创建失败时)
-    static std::string getLastError() { return lastError_; }
-    static std::string lastError_;
-
-    // 加载 Bitcode Module 并注册到 JITDylib
     Error loadBitcodeModule(StringRef bitcodeData,
-                            StringRef funcName);
+                            uint64_t cacheKey,
+                            const std::string& funcName);
 
-    // 查询已编译符号
-    Expected<void*> lookup(StringRef funcName);
+    Expected<void*> lookup(uint64_t cacheKey,
+                           const std::string& funcName);
 
-    // 移除模块 (释放内存)
-    Error removeModule(orc::ResourceTrackerSP RT);
-
-    // 获取内存统计
-    size_t getCurrentCodeSize() const;
-    size_t getTotalAllocatedMemory() const;
+    void setActiveContext(const SpecializationContext* ctx);
+    void addUserSymbol(const std::string& name, void* addr);
 };
 
 } // namespace llvm::ejit
@@ -147,44 +128,28 @@ EJitOrcEngine::Create(const EJitConfig& config) {
 
     // 注意: 使用 Expected<> 返回错误，不在嵌入式场景调用 cantFail/abort
 
-    // 步骤 1: 创建嵌入式 JITLinkMemoryManager
-    auto memMgr = std::make_unique<EJitJITLinkMemoryManager>(
-        config.maxCodeMemory,      // 最大代码内存 (默认 512KB)
-        config.pageSize             // 页大小 (ARM/AArch64 通常 4KB)
-    );
-    engine->MemMgr = memMgr.get();
-
-    // 步骤 2: 配置 JITTargetMachineBuilder
+    // 步骤 1: 配置 JITTargetMachineBuilder
     auto JTMBOrErr = JITTargetMachineBuilder::detectHost();
     if (!JTMBOrErr) {
         return JTMBOrErr.takeError();
     }
     auto JTMB = std::move(*JTMBOrErr);
 
-    // 步骤 3: 构建 LLJIT
-    //   - 使用自定义 ObjectLinkingLayerCreator 注入嵌入式内存管理器
-    //   - 设置 compile threads 为 0 (同步) 或 1+ (异步)
-    //   - IRTransformLayer 注入 EJitStructFieldPass
+    // 步骤 2: 构建 LLJIT。ORC 内部编译线程始终关闭；
+    // 异步性由 ORC 外部的 taskpool worker 提供。
     orc::LLJITBuilder Builder;
 
-    Builder.setJITTargetMachineBuilder(std::move(JTMB));
+    Builder.setJITTargetMachineBuilder(JTMB);
 
-    // 注入嵌入式内存管理器
+    // 启用 code pool 时注入 EJitCodePoolMemoryManager。
     Builder.setObjectLinkingLayerCreator(
         [&](orc::ExecutionSession& ES)
             -> Expected<std::unique_ptr<orc::ObjectLayer>> {
             return std::make_unique<orc::ObjectLinkingLayer>(
-                ES, *engine->MemMgr);
+                ES, makeCodePoolMemoryManager());
         });
 
-    // 编译线程配置
-    if (config.compileMode == CompileMode::Sync) {
-        // 同步模式: 0 编译线程 = 在调用线程上编译
-        Builder.setNumCompileThreads(0);
-    } else {
-        // 异步模式: 1 个编译线程 (嵌入式场景资源受限)
-        Builder.setNumCompileThreads(1);
-    }
+    Builder.setNumCompileThreads(0);
 
     // 创建 LLJIT 实例
     auto JOrErr = Builder.create();
@@ -192,11 +157,27 @@ EJitOrcEngine::Create(const EJitConfig& config) {
         return JOrErr.takeError();
     }
     engine->J = std::move(*JOrErr);
-    engine->MainJD = &engine->J->getMainJITDylib();
-    engine->DefaultRT = engine->MainJD->getDefaultResourceTracker();
 
-    // 步骤 4: 注册 IRTransformLayer 回调
-    // 完整的 JIT Pipeline: 参数替换 → InstCombine → Inline → PASS6 → 标准优化 (详见 §2.4)
+    // PreFixup: retarget standard AArch64 pointer-jump stubs (branch ->
+    // $__STUBS -> $__GOT -> destination) to a direct B/BL when the resolved
+    // displacement fits the architectural ±128 MiB range. This plugin must
+    // run before the diagnostic plugin so PostFixup reporting sees the actual
+    // direct/stubbed result.
+    if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+            &engine->J->getObjLinkingLayer()))
+        OLL->addPlugin(std::make_shared<EJitLinkOptimizationPlugin>());
+
+    // PostFixup: EJitLinkDiagPlugin audits every AArch64 branch relocation
+    // and reports which remain bridged through a stub+GOT (out of ±128 MiB
+    // or unsafe chain) instead of a direct BL. INFO emits one summary per
+    // graph; VERBOSE additionally emits each relocation.
+    if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+            &engine->J->getObjLinkingLayer()))
+        OLL->addPlugin(std::make_shared<EJitLinkDiagPlugin>());
+
+    // 步骤 3: 注册 IRTransformLayer 回调
+    // 完整的 JIT Pipeline: 参数替换 → InstCombine → StructFieldPass → IPSCCP →
+    //   InstCombine → StructFieldPass → 标准优化 (详见 §2.4)
     // 注意: IRTransformLayer::TransformFunction 签名为
     //   Expected<ThreadSafeModule>(ThreadSafeModule, MaterializationResponsibility&)
     // withModuleDo 的回调签名为 Expected<Error>(Module&)，原地修改 Module
@@ -205,26 +186,24 @@ EJitOrcEngine::Create(const EJitConfig& config) {
                  orc::MaterializationResponsibility& R)
             -> Expected<orc::ThreadSafeModule> {
             Error Err = TSM.withModuleDo([engine](Module& M) -> Error {
-                if (!engine->ActiveCtx)
+                const SpecializationContext* ctx =
+                    engine->getActiveContext();
+                if (!ctx)
                     return Error::success();
 
-                // Step 1: 参数预处理 (替换 ejit_period_arr_ind 为常量)
-                preReplacePeriodIndices(M, engine->ActiveCtx);
-
-                // Step 2: InstCombine (折叠常量链)
-                runInstCombine(M);
-
-                // Step 3: Inline (展开跨函数 GEP 链)
-                runInline(M);
-
-                // Step 4: EJitStructFieldPass (may_const load → 常量)
-                EJitStructFieldPass SFPass;
-                SFPass.setSpecializationContext(engine->ActiveCtx);
-                ModuleAnalysisManager MAM;
-                SFPass.run(M, MAM);
-
-                // Step 5: 标准优化 (按 OptLevel 编排)
-                runOptimizationPipeline(M, engine->OptLevel);
+                // 完整流水线实现于 EJitOptimizer::runPipeline
+                // (llvm/lib/ExecutionEngine/EJIT/EJitOptimizer.cpp)。JIT 侧不再
+                // 单独运行 Inline —— callee 已在 AOT 预优化
+                // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) 内联，
+                // 跨函数常量改由 IPSCCP 在调用边界传播。
+                //   1a preReplacePeriodIndices —— ejit_period_arr_ind 参数 → 常量
+                //   1b runInstCombine          —— 折叠常量 GEP 链
+                //   1c EJitStructFieldPass      —— may_const load → 常量
+                //   1d runInterproceduralPropagation —— 内部化非 entry 定义 + IPSCCP
+                //   1e/1f runInstCombine + EJitStructFieldPass（对 callee 再做一轮）
+                //   2-4 LowerExpect + buildFunctionSimplificationPipeline(O1/O2/O3)
+                //        + 二次 StructFieldPass + cleanup(InstCombine/SCCP/SimplifyCFG/ADCE)
+                engine->P->optimizer->runPipeline(M, *ctx);
 
                 return Error::success();
             });
@@ -233,21 +212,73 @@ EJitOrcEngine::Create(const EJitConfig& config) {
             return std::move(TSM);
         });
 
-    // 步骤 5: 注册 Process Symbols JITDylib
-    // 使 JIT 代码可调用 AOT 编译的外部函数
-    if (auto Err = engine->J->getProcessSymbolsJITDylib()) {
-        // 外部符号在此 JITDylib 中解析
-    }
+    // 步骤 4: 注册静态变量和用户显式注册的 JIT 外部符号。
+    // 裸核构建关闭 host process-symbol 搜索；enable_ex、SRE_Task* 等
+    // 平台符号仍必须由最终链接提供强定义，不能由 ejit_register_symbol 补齐。
 
     return engine;
 }
 ```
 
+### 2.1.2 AArch64 近目标分支松弛
+
+JITLink 会先为外部 `B/BL` 目标建立
+`branch -> $__STUBS -> $__GOT -> destination` 链。代码池与 AOT 代码距离较近时，
+`EJitLinkOptimizationPlugin` 在 `PreFixup` 阶段读取已经解析的最终地址；若
+`Branch26PCRel` 的位移处于 `[-2^27, 2^27 - 4]` 字节且四字节对齐，则将边直接
+指向最终目标，由正常 fixup 编码单条 `B/BL`。否则保留原 stub 路径。
+
+**门控用地址，不用 `isExternal()`**：JITLink 的 `applyLookupResult` 在 PreFixup
+之前用 `Sym->getAddressable().setAddress(addr)` 解析外部符号，但**不**把它转成
+`isAbsolute`，所以已解析的外部符号 `isExternal()` 仍为 `true`。若用
+`if (Destination->isExternal()) continue` 门控，会把每个已解析外部 stub 全部跳过
+-> 0 放松（这是曾出现的 bug）。pass 改为按地址门控
+`if (TargetAddr == 0) continue`，仅跳过真正未解析的（如弱引用无定义的外部）。
+
+**skip 分类与审计**：pass 在 `EJIT_DIAG` INFO 行按原因分类每个 stubbed
+`Branch26PCRel`，与三个 skip 计数器对齐：`chain-mismatch`（stub/GOT 链不匹配，
+含非零 GOT addend）、`unresolved`（`TargetAddr == 0`）、`out-of-range`（超
+±128 MiB 或未对齐），以及 `relaxed`（已放松计数）。格式：
+`relaxAArch64BranchStubs: graph=<name> Branch26PCRel: <total> total,
+<stubbed> stubbed (chain-mismatch=<cm> unresolved=<ur> out-of-range=<oor>),
+<relaxed> relaxed`。
+
+**PostFixup 审计**：`EJitLinkDiagPlugin`（紧跟 optimization plugin 之后注册）对
+每条 AArch64 分支重定位审计：INFO 汇总 "N stubbed (M exceed ±128MB)"，VERBOSE
+逐条打印 `[STUBBED] <reloc> -> <target> (<dist>, within/EXCEEDS ±128MB)`。顺序
+固定（optimization 先、diag 后），使 PostFixup 审计看到放松后的真实结果。
+
+该优化只发生在链接阶段，不增加运行时热路径状态，也不改变 code-pool/shared
+taskpool ABI。已经分配的 stub/GOT 不主动删除，因此本改动降低执行开销，但不以
+缩小本次 JITLink allocation 为目标。
+
 ---
 
-## 2.2 EJitJITLinkMemoryManager — 嵌入式内存管理器
+## 2.2 EJitCodePoolMemoryManager — 嵌入式内存管理器
 
 ### 2.2.1 设计目标
+
+当前 `EJitCodePoolMemoryManager` 将 JITLink `BasicLayout` 的 segment
+从 `EJitCodePoolManager` 按需分配，而不是预留一块固定 slab：
+
+- code pool 默认大小为 2MiB，耗尽时按需创建下一池；
+- `allocate` 按 layout 分配连续空间并记录所有 executable segment；
+- 只对 executable segment 做 RX seal，rodata/GOT/writable data 不会误封；
+- legacy 模式在 lookup 时封整个 2MiB pool；
+- 4K 模式在 pool 创建时执行 `split_2m_to_4k`，finalize 后逐个
+  executable page 调用 `enable_ex` 并同步 I-cache；
+- `deallocate` 运行 JITLink dealloc actions，但当前不回收物理
+  code-pool 内存，pool lifetime 与 engine 一致。
+
+平台 adapter 只声明 `enable_ex`、`split_2m_to_4k` 和
+`SRE_MemDbgAlloc`（固定代码池模式 `EJIT_FIXED_CODE_POOL=ON` 下不调 `SRE_MemDbgAlloc`，
+改用链接脚本区域 `[__ejit_code_start, __ejit_code_end)`，并需 `enable_rw`，签名
+`unsigned enable_rw(unsigned level, unsigned long long va)`，与 `enable_ex` 对称）。目标
+最终链接必须提供强定义；这些平台依赖不能由 `ejit_register_symbol` 补齐。固定代码池区域
+详见 `EJIT_SRE_CODE_POOL.md` §14。
+
+<details>
+<summary>历史设计：固定 slab EJitJITLinkMemoryManager（已删除）</summary>
 
 | 约束 | 规格 |
 |------|------|
@@ -411,9 +442,39 @@ LRU 淘汰时:
 - 或者: 使用更好的 allocator 支持碎片回收 (后续优化)
 ```
 
+</details>
+
 ---
 
-## 2.3 同步/异步编译隔离
+## 2.3 Taskpool 同步/异步调度
+
+当前同步和异步模式使用同一条编译链：
+
+```text
+wrapper
+  └─ ejit_taskpool_compile_or_get[_0d...4d]
+       ├─ cache hit → 返回 JIT fnPtr
+       └─ cache miss
+            ├─ Off   → 返回 fallback
+            ├─ Sync  → 当前调用栈 compileNow → compileCold → publish
+            └─ Async → dedup + MPSC queue → 返回 fallback
+                                      └─ 单 worker 消费并 publish
+```
+
+- `EJitTaskPool` 用于单实例调度；`EJitSharedTaskPool` 将队列、dedup、
+  lifecycle version 和 cache 放入跨核共享 POD 状态。
+- shared 模式通过 CAS 选出一个 owner，只由 owner 启动一个 worker。
+  worker 使用 owner 私有的 `EJitCompileDriver` 和 `EJitOrcEngine`；peer
+  可以拥有自己的初始化对象，但不另启 worker 编译同一共享请求。
+- ORC 内部始终 `setNumCompileThreads(0)`。目标侧 worker 由
+  `EJitSreTask_sre.cpp` 的平台任务接口驱动，不依赖 C++ 线程库。
+- worker 在 `Initializing` 或 Ready 空队列时调用平台 yield；退出前由
+  owner stop/join，之后才允许析构 owner 私有 ORC 状态。
+- queue full 会回滚 dedup；编译前后及 publish 前会重查 generation 和
+  lifecycle version，避免 deactivate/re-init 后发布旧结果。
+
+<details>
+<summary>历史设计：独立 Sync/Async compiler 与 C++ 后台线程（已删除）</summary>
 
 ### 2.3.1 隔离架构
 
@@ -663,32 +724,36 @@ void EJitAsyncCompiler::compileOne(const CompileRequest& req) {
 | Code Cache | 调用线程访问 | 共享 (mutex 保护) |
 | PeriodArrayRegistry | 调用线程更新 (activate/deactivate) | 只读快照 |
 
+</details>
+
 ---
 
 ## 2.4 IRTransformLayer — EJitStructFieldPass 集成
 
 ### 2.4.1 Transform 回调
 
-Transform 回调在 §2.1.1 `EJitOrcEngine::Create()` 中注册为内联 lambda，直接捕获 `engine` 指针读取 `ActiveCtx` 和 `OptLevel`。不需要插件类：
+Transform 回调在 §2.1.1 `EJitOrcEngine::Create()` 中注册为内联 lambda。
+`EJitCompileDriver::compileCold` 在 load/lookup 前通过
+`setActiveContext(&ctx)` 安装当前特化上下文，并在所有返回路径清空；
+回调从 engine 私有实现读取该上下文。shared 模式只有 elected owner
+worker 进入这条编译链，不会由多个 core 并发改写同一个 `activeCtx`。
 
 ```cpp
 // §2.1.1 中的注册代码 (简化引用)
 engine->J->getIRTransformLayer().setTransform(
     [engine](orc::ThreadSafeModule TSM, ...) -> Expected<orc::ThreadSafeModule> {
         Error Err = TSM.withModuleDo([engine](Module& M) -> Error {
-            if (!engine->ActiveCtx)
+            const SpecializationContext* ctx = engine->getActiveContext();
+            if (!ctx)
                 return Error::success();
 
-            preReplacePeriodIndices(M, engine->ActiveCtx);
-            runInstCombine(M);
-            runInline(M);
-
-            EJitStructFieldPass SFPass;
-            SFPass.setSpecializationContext(engine->ActiveCtx);
-            ModuleAnalysisManager MAM;
-            SFPass.run(M, MAM);
-
-            runOptimizationPipeline(M, engine->OptLevel);
+            // 全部阶段封装在 EJitOptimizer::runPipeline 内（见 §2.4.2/§2.4.3）：
+            //   preReplacePeriodIndices → runInstCombine → EJitStructFieldPass
+            //   → runInterproceduralPropagation(内部化 + IPSCCP)
+            //   → runInstCombine → EJitStructFieldPass
+            //   → runOptimizationPipeline(LowerExpect + buildFunctionSimplificationPipeline)
+            // JIT 侧不再运行 Inline（AOT 预优化已内联）。
+            engine->P->optimizer->runPipeline(M, *ctx);
             return Error::success();
         });
         if (Err)
@@ -697,9 +762,7 @@ engine->J->getIRTransformLayer().setTransform(
     });
 ```
 
-`preReplacePeriodIndices`、`runInstCombine`、`runInline`、`runOptimizationPipeline` 为同一编译单元内的静态辅助函数（详见 §2.4.2, §2.4.3）。
-```
-
+`preReplacePeriodIndices`、`runInstCombine`、`runInterproceduralPropagation`、`runOptimizationPipeline` 现为 `EJitOptimizer` 的成员函数（`llvm/lib/ExecutionEngine/EJIT/EJitOptimizer.cpp`，详见 §2.4.2, §2.4.3）。
 ### 2.4.2 JIT Pipeline 各阶段实现
 
 **`preReplacePeriodIndices`** — 将 `ejit_period_arr_ind` 参数替换为运行时常量值：
@@ -737,74 +800,78 @@ void runInstCombine(Module& M) {
 }
 ```
 
-**`runInline`** — 内联 callee，使跨函数的 may_const load 暴露给 PASS6：
+**`runInterproceduralPropagation`** — 内部化所有非 `ejit_entry` 定义后运行 IPSCCP，把 1a–1c 在每个调用点变成常量的实参推进 callee 函数体（并把常量返回值推回调用点）。JIT 侧**不再单独运行 Inline**：callee 已在 AOT 预优化（`EJitRegisterBitcodePass`：AlwaysInline + ModuleInliner(O2)）内联。
 
 ```cpp
-void runInline(Module& M) {
-    // 使用 LLVM 默认 Inline 阈值
-    ModuleAnalysisManager MAM;
+void EJitOptimizer::runInterproceduralPropagation(Module& M) {
+    // IPSCCP 仅能推理 local linkage 且未被取地址函数的实参；
+    // 特化模块自包含（只对外查找 ejit_entry 符号），因此把每个
+    // 非 entry 定义内部化，使 IPSCCP 能枚举其所有调用点。
+    for (Function& F : M.functions()) {
+        if (F.isDeclaration() || F.hasLocalLinkage())
+            continue;
+        if (hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+            continue;
+        F.setVisibility(GlobalValue::DefaultVisibility);
+        F.setLinkage(GlobalValue::InternalLinkage);
+    }
     ModulePassManager MPM;
-    MPM.addPass(InlinerPass());
-    MPM.run(M, MAM);
+    MPM.addPass(IPSCCPPass());
+    MPM.run(M, MAM_);
 }
 ```
 
-### 2.4.3 优化 Pipeline (L1/L2/L3) — PASS6 之后
+### 2.4.3 优化 Pipeline (L1/L2/L3) — 第二次 StructFieldPass 之后
+
+后特化清理直接复用 **真实的 LLVM 函数级简化流水线** `PassBuilder::buildFunctionSimplificationPipeline`（O1/O2/O3 各预建一份并缓存），而不是手工拼装的 pass 序列。`ctx.optLevel`（L1→O1、L2→O2、L3→O3）只选择这三条已缓存的 FPM 之一；它**不改变**流水线其余部分。注意这是**函数级**简化流水线，并非完整的 `clang -O2` module 流水线——除 phase 1d 的 IPSCCP 外，不含 GlobalOpt、CalledValuePropagation、ArgumentPromotion 等 module/CGSCC pass。
 
 ```cpp
-void runOptimizationPipeline(Module& M, OptimizationLevel level) {
-    LoopAnalysisManager LAM;
-    FunctionAnalysisManager FAM;
-    CGSCCAnalysisManager CGAM;
-    ModuleAnalysisManager MAM;
+// 构造时预建（EJitOptimizer 构造函数）
+PassBuilder PB;
+PB.registerModuleAnalyses(MAM_);   PB.registerCGSCCAnalyses(CGAM_);
+PB.registerFunctionAnalyses(FAM_); PB.registerLoopAnalyses(LAM_);
+PB.crossRegisterProxies(LAM_, FAM_, CGAM_, MAM_);
+lowerExpectFPM_.addPass(LowerExpectIntrinsicPass());        // Phase 2
+simplifyO1_ = PB.buildFunctionSimplificationPipeline(O1, ThinOrFullLTOPhase::None);
+simplifyO2_ = PB.buildFunctionSimplificationPipeline(O2, ThinOrFullLTOPhase::None);
+simplifyO3_ = PB.buildFunctionSimplificationPipeline(O3, ThinOrFullLTOPhase::None);
+cleanupFPM_.addPass(InstCombinePass());  cleanupFPM_.addPass(SCCPPass());
+cleanupFPM_.addPass(SimplifyCFGPass());  cleanupFPM_.addPass(ADCEPass());
 
-    PassBuilder PB;
-
-    // 注册 analysis managers
-    PB.registerModuleAnalyses(MAM);
-    PB.registerCGSCCAnalyses(CGAM);
-    PB.registerFunctionAnalyses(FAM);
-    PB.registerLoopAnalyses(LAM);
-    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
-    ModulePassManager MPM;
-
-    // L1: 基础优化 (全等级执行)
-    MPM.addPass(SCCPPass());            // 稀疏条件常量传播
-    MPM.addPass(ADCEPass());            // 激进死代码消除
-    MPM.addPass(SimplifyCFGPass());     // CFG 简化 (分支折叠)
-
-    // L2: 中等优化 (二次内联)
-    // 注意：首次 Inline 已在 PASS6 之前完成（见 §2.4.1 Transform 函数）
-    // 此处的 Inline 用于内联 PASS6 常量替换后新暴露的调用机会
-    if (level >= OptimizationLevel::Level2) {
-        MPM.addPass(InlinerPass());     // 二次函数内联
-        MPM.addPass(SimplifyCFGPass()); // 内联后再次简化 CFG
-    }
-
-    // L3: 激进优化
-    if (level >= OptimizationLevel::Level3) {
-        MPM.addPass(LoopUnrollPass(    // 循环展开
-            LoopUnrollOptions()
-                .setPartial(false)      // 不全展开
-                .setPeeling(false)      // 不 peeling
-                .setRuntime(false)      // 不运行时展开
-                .setUpperBound(true)    // 使用上限
-                .setThreshold(50)       // 展开阈值
-        ));
-        MPM.addPass(SimplifyCFGPass()); // 展开后 CFG 简化
-    }
-
-    // 运行
-    MPM.run(M, MAM);
+void EJitOptimizer::runOptimizationPipeline(Module& M, ejit::OptimizationLevel level) {
+    FunctionPassManager& simplifyFPM = simplifyFPMForLevel(level); // L1→O1 / L2→O2 / L3→O3
+    for (Function& F : M.functions())
+        if (!F.isDeclaration()) {
+            lowerExpectFPM_.run(F, FAM_);   // Phase 2: LowerExpect（不在简化流水线内）
+            simplifyFPM.run(F, FAM_);       // Phase 3: 真实 -Ox 函数简化流水线
+        }
+    // Phase 4: 展开暴露出新的常量下标数组访问后，再跑一次 StructFieldPass + 轻量 cleanup
+    runStructFieldPass(M);
+    for (Function& F : M.functions())
+        if (!F.isDeclaration())
+            cleanupFPM_.run(F, FAM_);
 }
 ```
+
+> **注**：`buildFunctionSimplificationPipeline` 包含 SROA、InstCombine、SCCP、GVN、CorrelatedValuePropagation、BDCE、DSE、loop-rotate、LICM、loop-unroll 等，但**不含向量化**。首次 Inline 由 AOT 预优化完成；JIT 侧不再做二次 Inline。
 
 ---
 
 ## 2.5 EJitCompileDriver — 编译调度器
 
-编译调度器统一同步/异步编译路径，调用方不感知内部实现。
+`EJitCompileDriver` 是 taskpool compile callback 与 ORC 之间的统一冷路径：
+
+1. `compileNow(req)` 校验 `numDims <= 4`、instance 范围和重复 dimType；
+2. 按函数 metadata 的 dimType 顺序重排请求维度并构造 64-bit cache key；
+3. `compileCold(cacheKey, false)` 按 dense `funcIndex` 查函数名和 bitcode；
+4. 检查 lifecycle active 状态，构造 `SpecializationContext`；
+5. 在同一个 `jitEngine_` 上执行 load + lookup，返回 fnPtr。
+
+cache hit、dedup、enqueue 和 publish 均由 taskpool 完成，compile driver
+不再拥有独立的同步/异步 compiler 或 LRU cache。
+
+<details>
+<summary>历史设计：driver 内置 Sync/Async compiler（已删除）</summary>
 
 ```cpp
 // 编译调度器
@@ -889,9 +956,25 @@ void* EJitCompileDriver::getOrCompile(uint32_t funcIdx,
 }
 ```
 
+</details>
+
 ---
 
-## 2.6 EJitCache — Code Cache
+## 2.6 Taskpool Code Cache
+
+当前 cache 由 `EJitTaskPool` / `EJitSharedTaskPool` 持有：
+
+- identity 为 `funcIndex + dims`，并保存对应 lifecycle versions；
+- shared cache 使用固定 bucket/slot POD 布局和显式原子/短临界区；
+- publish 先写 identity、versions、code range 和 fnPtr，再发布 Ready；
+- reader 返回的 bucket token 由 `ejit_taskpool_release_read` 释放；
+- `EJIT_SRE_TASKPOOL_NO_RECLAIM` 在“代码生命周期内不物理回收”的前提下
+  改用 seqlock load-only hit，release 成为 no-op；
+- deactivate/version bump 后旧 slot 不会作为有效命中返回；编译中的旧结果
+  也会在 publish gate 被丢弃。
+
+<details>
+<summary>历史设计：独立 LRU EJitCache（已删除）</summary>
 
 ```cpp
 // Code Cache 管理器 — iterator-embedded LRU (单 hash 查找完成 LRU bump)
@@ -940,6 +1023,8 @@ private:
     size_t currentTotalSize_ = 0;
 };
 ```
+
+</details>
 
 ---
 
@@ -1040,6 +1125,22 @@ private:
 ```
 
 ### 2.7.2 ejit_init
+
+当前 `ejit_init` 创建一个 `EJit` 实例。初始化顺序为：
+
+1. 消费 constructor 注册数据，或在静态注册模式下遍历 linker ranges；
+2. 按名称分配 dense `funcIndex` 和 lifecycle `dimType`，回填 wrapper globals；
+3. 注册 bitcode、period arrays、static vars 和用户符号；
+4. 创建一个 `EJitOrcEngine` 并安装到 `EJitCompileDriver::jitEngine_`；
+5. 冻结 registration；
+6. Async 模式启动 private worker，或执行 shared owner election 并由 owner
+   启动唯一 worker；Sync/Off 不启动后台 worker。
+
+任何注册容量、ABI/fingerprint、engine 创建或 worker 启动失败都会使
+`ejit_init` 返回错误，不暴露半初始化 taskpool。
+
+<details>
+<summary>历史设计：双 engine 与 EJitAsyncCompiler 初始化（已删除）</summary>
 
 **全局单例类型定义**：
 
@@ -1158,6 +1259,8 @@ ejit_status_t ejit_init(const ejit_config_t* config) {
 }
 ```
 
+</details>
+
 ### 2.7.3 Auto Register 与 ejit_init 的时序
 
 ```
@@ -1181,9 +1284,10 @@ ejit_status_t ejit_init(const ejit_config_t* config) {
     │       │   → 取出所有暂存数据，清空 Store
     │       ├── 用暂存数据填充 PeriodArrayRegistry
     │       ├── 用暂存数据填充 BitcodeTracker
-    │       ├── 创建 Engine, Cache, CompileDriver
+    │       ├── 创建 CompileDriver 和单条 ORC 编译链
+    │       ├── 冻结 registration
     │       ├── 验证注册数据完整性
-    │       └── 启动异步编译器 (如果配置)
+    │       └── Async: 启动 private worker 或完成 shared owner election
     │
     └── 业务代码...
         └── ejit_activate("cell", 3)
@@ -1193,6 +1297,26 @@ ejit_status_t ejit_init(const ejit_config_t* config) {
 ---
 
 ## 3. 线程安全模型
+
+当前目标平台并发模型不是 C++ 线程模型：
+
+- shared state 只包含 fixed-width POD、`EJitAtomic`、queue cells、dedup、
+  switch/version、cache slots 和 counters；
+- LLVMContext、LLJIT、optimizer、STL 容器、callback 与平台 task 对象均为
+  owner 私有，不放入 shared section；
+- queue producer 写完整 request 后 release-publish sequence，consumer
+  acquire 后读取；
+- cache publish 在发布 Ready/fnPtr 前写完 identity、versions 和 code range；
+- 编译、ORC/JITLink、内存申请、平台 seal 和日志不在 bucket 短临界区内执行；
+- activate/deactivate bump version，worker 在 dequeue、compile 后和 publish
+  gate 复查版本；不匹配则释放/丢弃结果；
+- `aarch64_be` 下字段按声明类型访问，不做字节流解析，不使用 bitfield。
+
+host 测试适配层可以使用 `std::thread` 模拟 worker，但 target core 文件不依赖
+`std::thread`、`std::mutex`、`std::condition_variable`、future 或 promise。
+
+<details>
+<summary>历史设计：mutex/C++ 后台线程模型（已删除）</summary>
 
 ### 3.1 线程角色
 
@@ -1250,9 +1374,9 @@ ejit_status_t ejit_init(const ejit_config_t* config) {
 用户线程                          编译线程
 ───────                          ───────
 ejit_activate(name, idx)
-  ├─ 写入 RuntimeState               
-  │  (设置为 active)               
-  ├─ atomic_thread_fence            
+  ├─ 写入 RuntimeState
+  │  (设置为 active)
+  ├─ atomic_thread_fence
   │  (memory_order_release)    ─────────→  compileOne()
   │                                         ├─ isPeriodActive() → active
   │                                         ├─ atomic_thread_fence
@@ -1292,6 +1416,8 @@ void EJitRuntimeState::deactivate(const std::string& periodName, int cellIdx) {
 - `compileOne` 在读取 may_const 字段值前执行 `acquire` fence，与 activate 中的 `release` fence 配对，保证字段修改可见。
 - `isPeriodActive` 检查本身在 mutex 保护下，确保 deactivate 后提交的编译请求能看到失效状态。
 - 若 `isPeriodActive` 返回 false，`compileOne` 直接跳过，不读取任何字段值——因此不存在 "读到半修改值" 的窗口。
+
+</details>
 
 ---
 
@@ -1423,25 +1549,24 @@ public:
            │    ├─ejit_taskpool_compile_or_get()
            │    │   ├─查 Cache → MISS
            │    │   ├─验证时间窗状态
-           │    │   ├─syncCompiler.compile()
-           │    │   │   ├─loadBitcodeModule         (~5ms)
+           │    │   ├─compileNow() → compileCold()
+           │    │   │   ├─loadBitcodeModule
            │    │   │   ├─[IRTransformLayer]:
-           │    │   │   │   ├─参数预处理              (<1ms)
-           │    │   │   │   ├─InstCombine             (~2ms)
-           │    │   │   │   ├─Inline                  (~3ms)
-           │    │   │   │   ├─EJitStructFieldPass     (~2ms)
-           │    │   │   │   └─优化 Pipeline           (~12ms)
+           │    │   │   │   ├─参数替换 + InstCombine
+           │    │   │   │   ├─EJitStructFieldPass
+           │    │   │   │   ├─IPSCCP
+           │    │   │   │   └─函数级优化 Pipeline
            │    │   │   ├─IRCompileLayer:
-           │    │   │   │   └─LLVM → Object           (~20ms)
+           │    │   │   │   └─LLVM → Object
            │    │   │   ├─ObjectLinkingLayer:
-           │    │   │   │   └─JITLink 链接+分配        (~3ms)
+           │    │   │   │   └─JITLink 链接+code pool 分配
            │    │   │   └─lookup → 函数指针
-           │    │   ├─cache.put(entry)
+           │    │   ├─taskpool publish
            │    │   └─return pfn
            │    ├─pfn != NULL
            │    └─调用 pfn(idx) → 特化函数
            │
-           └─总延迟: ~48ms → 返回
+           └─编译耗时与目标函数大小、优化级别和平台有关
 ```
 
 ### 6.2 异步编译时序
@@ -1449,8 +1574,8 @@ public:
 ```
 时间 →
 
-调用线程:                后台线程:
-───────                ───────────
+业务核:                  单 taskpool worker:
+──────                  ─────────────────
 adjust_param(idx)
 │
 ├─ wrapper:
@@ -1458,15 +1583,15 @@ adjust_param(idx)
 │    ├─ejit_taskpool_compile_or_get()
 │    │   ├─查 Cache → MISS
 │    │   ├─提交 CompileRequest
-│    │   └─return NULL ─────→    workerLoop():
+│    │   └─return fallback ──→   runWorkerLoop():
 │    │                              ├─从队列取请求
-│    ├─pfn == NULL                  ├─compileOne()
+│    ├─pfn == NULL                  ├─runCompile()
 │    └─fallback(AOT)                │   ├─loadBitcode
 │                                   │   ├─IRTransform
 │    ←返回 (运行 AOT 代码)            │   ├─优化
 │                                   │   ├─CodeGen
 │                                   │   ├─MemoryAlloc
-│                                   │   └─cache.put()
+│                                   │   └─publish (version/generation gate)
 │                                   │
 下次调用:                             │
 adjust_param(idx)                   │
@@ -1476,7 +1601,7 @@ adjust_param(idx)                   │
 │    ├─return pfn ────────────────  │
 │    └─调用 pfn → 特化函数
 │
-└─总延迟: <1ms (Cache 命中)
+└─命中开销由 cache 查询、间接调用和 read-token release 构成
 ```
 
 ---
@@ -1488,11 +1613,13 @@ llvm/lib/ExecutionEngine/EJIT/
 ├── EJit.cpp                     # 主类实现 (EJit)
 ├── EJitRuntime.cpp              # C 运行时接口 (ejit_init/shutdown/activate...)
 ├── EJitOrcEngine.cpp            # LLJIT 封装 + 引擎创建
-├── EJitJITLinkMemoryManager.cpp # 嵌入式 JITLink 内存管理器
-├── EJitSyncCompiler.cpp         # 同步编译器
-├── EJitAsyncCompiler.cpp        # 异步编译器 (后台线程+队列)
+├── EJitCodePoolMemoryManager.cpp # code-pool JITLink 内存管理器
+├── EJitTaskPool.cpp             # 单实例 taskpool
+├── EJitSharedTaskPool.cpp       # 跨核共享 taskpool/cache/worker
+├── EJitSreTask_sre.cpp          # 目标平台 task 适配
+├── EJitSreQueue.cpp             # taskpool queue 适配
 ├── EJitCompileDriver.cpp        # 编译调度器 (Sync/Async 统一入口)
-├── EJitCache.cpp                # Code Cache (LRU + 大小限制)
+├── EJitCodePool.cpp             # code pool 分配与 2M/4K seal
 ├── EJitStructFieldPass.cpp      # 结构体字段特化 Pass (JIT Pipeline)
 ├── EJitOptimizer.cpp            # 优化 Pipeline (L1/L2/L3)
 ├── EJitModuleLoader.cpp         # Bitcode 按需加载器
@@ -1506,8 +1633,10 @@ llvm/include/llvm/ExecutionEngine/EJIT/
 ├── EJit.h                       # C++ 主 API
 ├── EJitRuntime.h                # C 运行时接口
 ├── EJitOrcEngine.h              # EJitOrcEngine 声明
-├── EJitJITLinkMemoryManager.h   # 内存管理器声明
-├── EJitCache.h                  # Cache 声明
+├── EJitCodePoolMemoryManager.h  # 内存管理器声明
+├── EJitTaskPool.h               # 单实例 taskpool
+├── EJitSharedTaskPool.h         # shared taskpool API
+├── EJitSharedTaskPoolState.h    # shared POD 状态布局
 ├── EJitStructFieldPass.h        # StructField Pass 声明
 ├── EJitOptimizer.h              # 优化 Pipeline 声明
 ├── EJitOptions.h                # 配置选项
@@ -1528,27 +1657,22 @@ llvm/include/llvm/ExecutionEngine/EJIT/
 // TEST(MemoryManager, ConcurrentAlloc)     - 并发分配
 // TEST(MemoryManager, MixedProtections)    - RX + RW 混合
 
-// EJitCacheTest.cpp
-// TEST(Cache, PutAndGet)                   - 基本读写
-// TEST(Cache, LRU_Eviction)                - LRU 淘汰
-// TEST(Cache, SizeLimit)                   - 大小限制
-// TEST(Cache, InvalidateByPeriod)          - 时间窗失效
+// EJitTaskPoolTest.cpp
+// - queue / dedup / sync / async / activate-version / freeCode / stats
 
-// EJitSyncCompilerTest.cpp
-// TEST(SyncCompiler, CompileBasicFunction) - 基本编译
-// TEST(SyncCompiler, StructFieldReplace)   - 字段替换后编译
-// TEST(SyncCompiler, MultiPeriod)          - 多时间窗编译
+// EJitSharedTaskPoolTest.cpp
+// - owner election / MPSC / cross-core dedup / cache publication
+// - generation / peer execute permission / big-endian layout / NO_RECLAIM
 
-// EJitAsyncCompilerTest.cpp
-// TEST(AsyncCompiler, SubmitAndRetrieve)   - 提交+结果
-// TEST(AsyncCompiler, ConcurrentSubmit)    - 并发提交
-// TEST(AsyncCompiler, StopDuringCompile)   - 编译中停止
+// EJitCodePoolMemoryManagerTest.cpp, EJitCodePoolTest.cpp
+// - JITLink layout / executable ranges / 2M and 4K sealing / failures
 
-// EJitCompileDriverTest.cpp
-// TEST(Driver, Sync_CacheHit)              - 同步+Cache 命中
-// TEST(Driver, Sync_CacheMiss)             - 同步+Cache 未命中
-// TEST(Driver, Async_FirstCallNull)        - 异步首次 NULL
-// TEST(Driver, Async_SecondCallHit)        - 异步第二次命中
+// EJitLinkOptimizationPluginTest.cpp
+// - relaxAArch64BranchStubs: forward/backward/in-range/boundary/out-of-range/
+//   misaligned/addend/GOT-addend/big-endian/other-arch
+// - setAddress 流程: RelaxesSetAddressResolvedExternal (in-range 外部符号经
+//   applyLookupResult 的 setAddress 解析后必须放松)、KeepsUnresolvedExternalStubbed
+//   (TargetAddr==0 不放松) -- 锁定 "门控用地址不用 isExternal()" 修复
 ```
 
 ### 8.2 集成测试
@@ -1563,15 +1687,14 @@ llvm/include/llvm/ExecutionEngine/EJIT/
 
 // 场景 2: 端到端异步编译
 //   同上，配置 EJIT_COMPILE_ASYNC
-//   首次调用返回 AOT 结果 → sleep(100ms) → 第二次调用返回 JIT 结果
+//   首次调用返回 AOT 结果 → worker poll/等待发布 → 后续调用返回 JIT 结果
 
 // 场景 3: 时间窗失效
 //   JIT 编译 → activate → deactivate → activate(new_value)
 //   验证特化函数使用新值重新编译
 
-// 场景 4: Cache 淘汰
-//   填充 Cache 到超过限制
-//   验证 LRU 正确淘汰旧条目
+// 场景 4: Cache 与并发协议
+//   验证 queue-full dedup rollback、publish gate、generation/version 失效
 
 // 场景 5: 多时间窗
 //   ejit_entry 依赖 cell+trp
@@ -1656,5 +1779,5 @@ typedef struct {
 
 ---
 
-*文档版本: 1.2*  
+*文档版本: 2.0*
 *更新日期: 2026-06-01*

@@ -59,6 +59,8 @@ set(EJIT_SOURCES
   EJitRuntime.cpp
   EJitRegistryTable.c
   EJitOrcEngine.cpp
+  EJitLinkDiagPlugin.cpp
+  EJitLinkOptimizationPlugin.cpp
   EJitLibcallStubs.cpp
   EJitCompileDriver.cpp
   EJitRuntimeState.cpp
@@ -126,7 +128,14 @@ add_llvm_component_library(LLVMEJIT
   # and AggressiveInstCombine.  Instead, they are added manually to the
   # ejit_minimal target below (see §6.5 of EJIT_LIBRARY_TRIMMING.md).
   # ExecutionEngine is not listed — it's already pulled by OrcJIT.
-  )
+)
+
+if(EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  message(STATUS
+    "EmbeddedJIT: NO_RECLAIM shared-cache hot path enabled (JIT code must never be physically reclaimed)")
+endif()
 
 # Propagate the target triple setting to the C++ code
 if(EJIT_DEFAULT_TARGET_TRIPLE)
@@ -142,11 +151,56 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
 endif()
 
+# Pin the JIT code pool to a fixed linker-script region [__ejit_code_start,
+# __ejit_code_end) in the RX code segment (enable_rw write / enable_ex seal)
+# instead of dynamic SRE_MemDbgAlloc. The only user of this macro is the SRE
+# adapter (EJitSrePlatform.cpp), so scope it to LLVMEJIT like
+# EJIT_CODE_POOL_4K_SEAL above. Effective only when the SRE code pool is on.
+if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
+endif()
+
+# EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
+# Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
+# the AOT -mllvm -ejit-icache-dim-size value (both from the top-level CMake
+# var). Scoped to LLVMEJIT (the icache runtime lives here); gated on the shared
+# taskpool, which is the only build the icache is compiled under.
+if(EJIT_SRE_SHARED_TASKPOOL)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE})
+endif()
+
 # EJIT_FREESTANDING must be visible in LLVMJITLink headers so that
 # std::promise / std::future usage is guarded (bare-metal has no <future>).
 if(EJIT_FREESTANDING)
   target_compile_definitions(LLVMJITLink PUBLIC EJIT_FREESTANDING)
 endif()
+
+#===-- Build-version header (ejit_print_version) -------------------------===#
+# Generate EJitVersion.h carrying the llvm-project git commit + branch of the
+# source tree the runtime was built from. The LLVM release version itself is
+# read at runtime from llvm/Config/llvm-config.h (LLVM_VERSION_STRING), so it
+# is not duplicated here.
+#
+# The header is regenerated on every build by a custom target, but the
+# generator script writes it with copy_if_different: the file's mtime (and
+# therefore EJitRuntime.cpp, the only includer) only changes when the commit
+# actually changes. This keeps ejit_print_version() fresh across rebuilds
+# (a rebuild after `git commit` picks up the new hash) without forcing a full
+# CMake reconfigure, and without recompiling on every no-op build.
+find_package(Git QUIET)
+set(EJIT_VERSION_HEADER "${CMAKE_CURRENT_BINARY_DIR}/EJitVersion.h")
+add_custom_target(ejit_version_header
+  COMMAND ${CMAKE_COMMAND}
+    -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+    -DSOURCE_DIR=${LLVM_MAIN_SRC_DIR}
+    -DOUT_FILE=${EJIT_VERSION_HEADER}
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/GenerateEJitVersion.cmake"
+  BYPRODUCTS "${EJIT_VERSION_HEADER}"
+  COMMENT "Refreshing EJIT build-version header (git commit/branch)"
+  VERBATIM)
+add_dependencies(LLVMEJIT ejit_version_header)
+# EJitRuntime.cpp #includes "EJitVersion.h"; put the build dir on the path.
+target_include_directories(LLVMEJIT PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 #===-- Minimal embedded runtime target -----------------------------------===#
 # Builds a single combined static library (libejit_minimal.a) that bundles

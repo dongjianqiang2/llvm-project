@@ -28,12 +28,14 @@
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
+#include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
@@ -55,6 +57,7 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::EJitOptimizer;
   using EJitOptimizer::preReplacePeriodIndices;
   using EJitOptimizer::runInstCombine;
+  using EJitOptimizer::runInterproceduralPropagation;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
 };
@@ -677,7 +680,6 @@ extern void ejit_register_static_var(const char *, void *);
 extern void ejit_register_lifecycle(const char *, uint32_t *);
 extern void ejit_set_log_level(int level);
 extern int ejit_get_log_level(void);
-extern void ejit_dump_all(bool enable);
 extern void ejit_print_registry(void);
 extern void ejit_print_func_meta(const char *funcName);
 // P0 diagnostics: code pool stats + active period map. Declared returning int
@@ -686,6 +688,7 @@ extern void ejit_print_func_meta(const char *funcName);
 extern int ejit_get_code_pool_stats(void *out);
 extern void ejit_print_code_pool_stats(void);
 extern void ejit_print_active(void);
+extern void ejit_print_version(void);
 }
 
 // The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
@@ -1175,6 +1178,79 @@ TEST(EJitOptimizer, FullPipelineEndToEnd) {
 
   // 4. Optimization pipeline at L3
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+}
+
+/// Verify the optimization pipeline folds llvm.expect-guarded constant
+/// branches and DCEs the dead calls they guard. The AOT IR carries
+/// __builtin_expect / LIKELY hints on top of may_const conditions; once
+/// specialization turns the condition into a constant, the expect intrinsic
+/// blocks InstCombine/SCCP from folding the branch unless LowerExpectIntrinsic
+/// runs first. Without it the dead block (and its calls) survive ADCE and the
+/// specialization does the same work as AOT plus JIT overhead.
+TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
+  LLVMContext Ctx;
+  auto M = std::make_unique<Module>("expect_fold", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  Type *I64Ty = B.getInt64Ty();
+
+  FunctionCallee ExpectFn = M->getOrInsertFunction(
+      "llvm.expect.i64", FunctionType::get(I64Ty, {I64Ty, I64Ty}, false));
+  FunctionCallee HeavyFn = M->getOrInsertFunction(
+      "heavy_dead_call", FunctionType::get(B.getVoidTy(), {}, false));
+
+  FunctionType *FT = FunctionType::get(I32Ty, {}, false);
+  auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, "test_expect", M.get());
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Taken = BasicBlock::Create(Ctx, "taken", F);
+  BasicBlock *Dead = BasicBlock::Create(Ctx, "dead", F);
+
+  // entry: %e = expect(0, 0); %c = icmp eq %e, 0; br %c, taken, dead
+  B.SetInsertPoint(Entry);
+  auto *E = B.CreateCall(ExpectFn, {B.getInt64(0), B.getInt64(0)}, "e");
+  auto *C = B.CreateICmpEQ(E, B.getInt64(0), "c");
+  B.CreateCondBr(C, Taken, Dead);
+
+  // taken: ret 0
+  B.SetInsertPoint(Taken);
+  B.CreateRet(B.getInt32(0));
+
+  // dead: call heavy(); ret 1   -- must be eliminated once the branch folds
+  B.SetInsertPoint(Dead);
+  B.CreateCall(HeavyFn, {});
+  B.CreateRet(B.getInt32(1));
+
+  PeriodArrayRegistry reg;
+  EJitOptimizerTestAccess opt(reg);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+
+  // No llvm.expect should remain.
+  bool hasExpect = false;
+  bool hasHeavyCall = false;
+  unsigned retCount = 0;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB) {
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "llvm.expect.i64")
+          hasExpect = true;
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "heavy_dead_call")
+          hasHeavyCall = true;
+      }
+      if (isa<ReturnInst>(&I))
+        ++retCount;
+    }
+  EXPECT_FALSE(hasExpect) << "llvm.expect was not lowered";
+  EXPECT_FALSE(hasHeavyCall) << "dead call in folded block was not DCE'd";
+  EXPECT_EQ(retCount, 1u);
+  // The single ret must be ret 0 (taken path), not ret 1 (dead path).
+  auto *Ret = dyn_cast<ReturnInst>(&F->back().back());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr);
+  EXPECT_EQ(RetVal->getZExtValue(), 0u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2075,16 +2151,23 @@ static Function *createDeadCodeFunc(LLVMContext &Ctx, Module &M) {
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
   B.SetInsertPoint(BB);
 
-  // Unreachable block
+  // Live block: the false target of the constant branch, so it is always taken.
+  BasicBlock *Live = BasicBlock::Create(Ctx, "live", F);
+  {
+    IRBuilder<> LB(Live);
+    LB.CreateRet(LB.getInt32(42));
+  }
+
+  // Unreachable block: the true target of `br false` (never taken).
   auto *DeadBB = BasicBlock::Create(Ctx, "dead", F);
   {
     IRBuilder<> DB(DeadBB);
     DB.CreateRet(DB.getInt32(999));
   }
 
-  // br on constant false -> unreachable branch should be eliminated
-  B.CreateCondBr(B.getFalse(), DeadBB, DeadBB);
-  B.CreateRet(B.getInt32(42));
+  // br i1 false -> always the false target (live); the true target (dead) is
+  // unreachable and should be eliminated.
+  B.CreateCondBr(B.getFalse(), DeadBB, Live);
 
   return F;
 }
@@ -2242,20 +2325,20 @@ static std::string optimizeLoopFnAt(llvm::ejit::OptimizationLevel lvl) {
   return Out;
 }
 
-TEST(EJitOptimizer, PipelineCollapseLevelEquivalence) {
+TEST(EJitOptimizer, OptimizationFoldsConstantLoopAtAllLevels) {
   std::string L1 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L1);
   std::string L2 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L2);
   std::string L3 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L3);
 
-  // Collapse proof: every level runs the identical single pipeline.
-  EXPECT_EQ(L1, L2) << "L1 vs L2 IR differs — the tiers were not collapsed";
-  EXPECT_EQ(L2, L3) << "L2 vs L3 IR differs — the tiers were not collapsed";
-
-  // No-regression proof: the single pipeline still fully optimizes at EVERY
-  // level (loop unrolled + folded to constant 6 — the old L3 outcome). Under the
-  // old tiers, L1 kept the loop and this find() would fail.
+  // No-regression: each tier (L1->O1, L2->O2, L3->O3) unrolls + folds the
+  // constant-bound loop to `ret i32 6`. Tiers are now distinct O1/O2/O3
+  // pipelines; byte-identical IR across tiers is no longer asserted.
   EXPECT_NE(L1.find("ret i32 6"), std::string::npos)
-      << "collapsed pipeline did not fold the loop at L1 (regressed vs old L3)";
+      << "L1 (O1) did not fold the constant loop";
+  EXPECT_NE(L2.find("ret i32 6"), std::string::npos)
+      << "L2 (O2) did not fold the constant loop";
+  EXPECT_NE(L3.find("ret i32 6"), std::string::npos)
+      << "L3 (O3) did not fold the constant loop";
 }
 
 //===----------------------------------------------------------------------===//
@@ -2382,15 +2465,154 @@ static std::string specializeBranchAt(llvm::ejit::OptimizationLevel lvl) {
   return Out;
 }
 
-TEST(EJitEndToEnd, PipelineLevelEquivalenceBranch) {
+TEST(EJitEndToEnd, PipelineFoldsMayConstBranchAtAllLevels) {
   std::string L1 = specializeBranchAt(llvm::ejit::OptimizationLevel::L1);
   std::string L2 = specializeBranchAt(llvm::ejit::OptimizationLevel::L2);
   std::string L3 = specializeBranchAt(llvm::ejit::OptimizationLevel::L3);
 
-  EXPECT_EQ(L1, L2) << "L1 vs L2 IR differs — level changed the pipeline";
-  EXPECT_EQ(L2, L3) << "L2 vs L3 IR differs — level changed the pipeline";
+  // No-regression: each tier (L1->O1, L2->O2, L3->O3) folds the may_const
+  // branch to the constant 100. Tiers are now distinct O1/O2/O3 pipelines;
+  // byte-identical IR across tiers is no longer asserted.
   EXPECT_NE(L1.find("ret i32 100"), std::string::npos)
-      << "pipeline did not fold the may_const branch to the constant 100";
+      << "L1 (O1) did not fold the may_const branch";
+  EXPECT_NE(L2.find("ret i32 100"), std::string::npos)
+      << "L2 (O2) did not fold the may_const branch";
+  EXPECT_NE(L3.find("ret i32 100"), std::string::npos)
+      << "L3 (O3) did not fold the may_const branch";
+}
+
+//===----------------------------------------------------------------------===//
+// Interprocedural propagation (phase 1d)
+//===----------------------------------------------------------------------===//
+
+// The AOT inliner keeps a call edge wherever it chose not to inline, so a
+// specialization used to stop at every such edge: the entry's substituted
+// dims arrive at the callee as ordinary constant arguments, but the callee
+// body still indexes the period array with a runtime value and re-tests
+// guards. These tests pin phase 1d (internalize + IPSCCP): the constants
+// cross the edge, the callee's may_const load becomes substitutable, and the
+// callee folds to a constant return like the entry does.
+namespace {
+
+/// Entry (has ejit_entry metadata) calls a callee with a constant cell index
+/// — the shape phase 1a leaves behind. The callee loads field 1 of
+/// g_ipcfg[cell] (may_const) and branches on it.
+std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    target datalayout = "e-m:e-i64:64-i128:128-n32:64-S128"
+    %S = type { i32, i32 }
+    @g_ipcfg = external global [4 x %S], !ejit.metadata !0
+
+    define i32 @ip_callee(i8 noundef %cell) {
+      %idx = zext i8 %cell to i64
+      %gep = getelementptr inbounds [4 x %S], ptr @g_ipcfg, i64 0, i64 %idx, i32 1
+      %v = load i32, ptr %gep, align 4, !ejit.may_const !2
+      %c = icmp eq i32 %v, 7
+      br i1 %c, label %then, label %else
+    then:
+      ret i32 100
+    else:
+      ret i32 200
+    }
+
+    define i32 @ip_entry() !ejit.metadata !3 {
+      %r = call i32 @ip_callee(i8 noundef 2)
+      ret i32 %r
+    }
+
+    !0 = !{!1}
+    !1 = !{!"ejit_period_arr", !"cell", i32 4}
+    !2 = !{}
+    !3 = !{!4}
+    !4 = !{!"ejit_entry"}
+  )",
+                              Err, Ctx);
+  if (!M)
+    Err.print("parseInterprocModule", errs());
+  return M;
+}
+
+/// Per-cell mock backing for @g_ipcfg; cell 2 has field 1 == 7 → callee
+/// returns 100 when specialized for cell 2.
+struct IpMockElem {
+  int32_t a, b;
+};
+
+unsigned countLoadsIn(const Function &F) {
+  unsigned n = 0;
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB)
+      n += isa<LoadInst>(&I);
+  return n;
+}
+
+} // anonymous namespace
+
+// Without phase 1d the callee is untouched: its load survives the whole
+// pipeline because the cell index stays a runtime argument inside it. This is
+// the baseline that motivates the pass.
+TEST(EJitInterprocedural, ConstantsStopAtCallEdgeWithoutIPSCCP) {
+  LLVMContext Ctx;
+  auto M = parseInterprocModule(Ctx);
+  ASSERT_NE(M, nullptr);
+
+  IpMockElem mock[4] = {{0, 1}, {0, 3}, {0, 7}, {0, 9}};
+  PeriodArrayRegistry reg;
+  reg.registerArray("cell", "g_ipcfg", mock, 4);
+
+  EJitOptimizerTestAccess opt(reg);
+  opt.runInstCombine(*M);
+  opt.runStructFieldPass(*M);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+
+  Function *Callee = M->getFunction("ip_callee");
+  ASSERT_NE(Callee, nullptr);
+  EXPECT_EQ(countLoadsIn(*Callee), 1u)
+      << "callee folded without IPSCCP — baseline assumption changed";
+}
+
+// With phase 1d in its pipeline position (after 1c, before the 1e/1f
+// re-fold), the constant argument crosses the edge, the callee's may_const
+// load folds against cell 2's runtime value, and the guard collapses: the
+// callee body becomes `ret i32 100`.
+TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
+  LLVMContext Ctx;
+  auto M = parseInterprocModule(Ctx);
+  ASSERT_NE(M, nullptr);
+
+  IpMockElem mock[4] = {{0, 1}, {0, 3}, {0, 7}, {0, 9}};
+  PeriodArrayRegistry reg;
+  reg.registerArray("cell", "g_ipcfg", mock, 4);
+
+  EJitOptimizerTestAccess opt(reg);
+  // Same order as runPipeline: 1b InstCombine, 1c StructField, 1d IPSCCP,
+  // 1e/1f re-fold, phases 2-4.
+  opt.runInstCombine(*M);
+  opt.runStructFieldPass(*M);
+  opt.runInterproceduralPropagation(*M);
+  opt.runInstCombine(*M);
+  opt.runStructFieldPass(*M);
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+
+  Function *Callee = M->getFunction("ip_callee");
+  Function *Entry = M->getFunction("ip_entry");
+  ASSERT_NE(Callee, nullptr);
+  ASSERT_NE(Entry, nullptr);
+
+  // The callee was internalized so IPSCCP could trust its call-site set; the
+  // entry must stay externally visible — it is the symbol the JIT looks up.
+  EXPECT_TRUE(Callee->hasLocalLinkage());
+  EXPECT_FALSE(Entry->hasLocalLinkage());
+
+  // The callee's period load and guard folded to the constant return.
+  EXPECT_EQ(countLoadsIn(*Callee), 0u) << "callee may_const load survived";
+  ASSERT_EQ(Callee->size(), 1u) << "callee guard branch survived";
+  auto *Ret = dyn_cast<ReturnInst>(Callee->getEntryBlock().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr) << "callee return did not fold";
+  EXPECT_EQ(RetVal->getSExtValue(), 100); // mock[2].b == 7 → then-branch
 }
 
 //===----------------------------------------------------------------------===//
@@ -2793,7 +3015,7 @@ TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
-// Log level + diagnostics C-API (ejit_set_log_level, ejit_dump_all,
+// Log level + diagnostics C-API (ejit_set_log_level,
 // ejit_print_registry, ejit_print_func_meta)
 //===----------------------------------------------------------------------===//
 
@@ -2817,12 +3039,6 @@ TEST(EJitDiagLogLevel, ClampsOutOfRange) {
   ejit_set_log_level(99);
   EXPECT_EQ(ejit_get_log_level(), 3);
   ejit_set_log_level(1); // restore
-}
-
-// ejit_dump_all must not crash whether or not the runtime is initialized.
-TEST(EJitDumpAll, ToggleWithoutCrash) {
-  ejit_dump_all(true);
-  ejit_dump_all(false);
 }
 
 // Registry / func-meta prints must not crash on an uninitialized runtime and on
@@ -2861,4 +3077,13 @@ TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
 
 TEST(EJitDiagnostics, PrintActiveNoCrash) {
   ejit_print_active(); // uninitialized: prints a notice
+}
+
+// ejit_print_version() prints the LLVM release version + source git commit
+// through the platform sink (SRE_printf on SRE builds, std::printf here). It
+// is unconditional - not gated on EJIT_DIAG_ENABLE and needs no initialized
+// runtime - so the build identity is always recoverable. The test only
+// asserts it does not crash; the version/commit are baked in at compile time.
+TEST(EJitDiagnostics, PrintVersionNoCrash) {
+  ejit_print_version();
 }

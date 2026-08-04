@@ -1,7 +1,7 @@
 //===-- EJitSreTask_host.cpp - Host task implementation -------------------===//
 
-#include "llvm/ExecutionEngine/EJIT/EJitSreTask.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSreTask.h"
 
 #ifndef EJIT_FREESTANDING
 #include <new>
@@ -62,5 +62,11 @@ void EJitSreTask::destroy(EJitSreTask &task) {
 }
 
 void EJitSreTask::yield() { std::this_thread::yield(); }
+
+void EJitSreTask::delay(uint32_t ticks) {
+  uint32_t n = ticks ? ticks : 1u;
+  for (uint32_t i = 0; i < n; ++i)
+    std::this_thread::yield();
+}
 
 #endif

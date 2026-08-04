@@ -8,8 +8,8 @@ tablegen(LLVM AArch64GenAsmWriter1.inc -gen-asm-writer -asmwriternum=1)
 tablegen(LLVM AArch64GenCallingConv.inc -gen-callingconv)
 tablegen(LLVM AArch64GenDAGISel.inc -gen-dag-isel)
 tablegen(LLVM AArch64GenDisassemblerTables.inc -gen-disassembler)
-tablegen(LLVM AArch64GenFastISel.inc -gen-fast-isel)
 if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL AND NOT EJIT_TRIM_LLVM_BACKEND)
+tablegen(LLVM AArch64GenFastISel.inc -gen-fast-isel)
 tablegen(LLVM AArch64GenGlobalISel.inc -gen-global-isel)
 tablegen(LLVM AArch64GenO0PreLegalizeGICombiner.inc -gen-global-isel-combiner
               -combiners="AArch64O0PreLegalizerCombiner")
@@ -45,7 +45,6 @@ set(AARCH64_CODEGEN_SOURCES
   AArch64ExpandImm.cpp
   AArch64ExpandPseudoInsts.cpp
   AArch64FalkorHWPFFix.cpp
-  AArch64FastISel.cpp
   AArch64A53Fix835769.cpp
   AArch64FrameLowering.cpp
   AArch64CompressJumpTables.cpp
@@ -79,6 +78,10 @@ set(AARCH64_CODEGEN_SOURCES
   )
 
 if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL AND NOT EJIT_TRIM_LLVM_BACKEND)
+  list(APPEND AARCH64_CODEGEN_SOURCES
+    AArch64FastISel.cpp
+    )
+
   list(APPEND AARCH64_CODEGEN_SOURCES
     SMEABIPass.cpp
     SMEPeepholeOpt.cpp

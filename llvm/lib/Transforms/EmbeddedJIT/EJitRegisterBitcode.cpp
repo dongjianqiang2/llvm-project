@@ -164,17 +164,29 @@ static void reAnnotateMayConst(Module &M) {
         auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI || LI->hasMetadata(MayConstKind))
           continue;
-        APInt Off;
-        const GlobalVariable *GV = findRootGV(LI->getPointerOperand(), Off, DL);
-        if (!GV)
+        // Never folded, so never re-annotated.
+        if (LI->isVolatile() || LI->isAtomic())
+          continue;
+        // The recorded offsets are element-relative, so match on the field
+        // coordinate rather than the total offset from the global.
+        const GlobalVariable *GV = nullptr;
+        auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, GV);
+        if (!Off || !GV)
           continue;
         auto it = mayConstMap.find(GV);
         if (it == mayConstMap.end())
           continue;
-        if (is_contained(it->second, Off.getZExtValue())) {
-          LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
-          count++;
-        }
+        if (!is_contained(it->second, *Off))
+          continue;
+        // The offset only says where the load starts. A wider load straddles the
+        // next field, which is free to change.
+        TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+        if (AccessSize.isScalable() ||
+            !ejitAccessFitsMayConstField(GV, *Off, AccessSize.getFixedValue(),
+                                         DL))
+          continue;
+        LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
+        count++;
       }
     }
   }

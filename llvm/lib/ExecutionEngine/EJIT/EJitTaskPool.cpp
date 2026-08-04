@@ -2,6 +2,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include <algorithm>
 #include <vector>
 
@@ -317,7 +318,7 @@ EJitTaskPool::CompileOrGetResult
 EJitTaskPool::classifyHit(const EJitCacheLookupResult &Hit) {
   CompileOrGetResult R;
   if (Hit.hasReadToken && Hit.fnPtr) {
-    counters_.cacheHits.fetchAdd(1);
+    EJIT_STAT_INC(counters_.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
@@ -342,7 +343,7 @@ EJitTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
   //    and never reaches the cache, so it is never served a stale cached JIT.
   for (uint32_t i = 0; i < numDims; ++i) {
     if (!switch_.isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
-      counters_.instanceDisabled.fetchAdd(1);
+      EJIT_STAT_INC(counters_.instanceDisabled);
       EJIT_DIAG_VERBOSE("taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex, i,
                 dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
@@ -374,7 +375,7 @@ EJitTaskPool::CompileOrGetResult
 EJitTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0) {
   CompileOrGetResult R;
   if (!switch_.isInstanceEnabled(dim0, inst0)) {
-    counters_.instanceDisabled.fetchAdd(1);
+    EJIT_STAT_INC(counters_.instanceDisabled);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -389,7 +390,7 @@ EJitTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
   CompileOrGetResult R;
   if (!switch_.isInstanceEnabled(dim0, inst0) ||
       !switch_.isInstanceEnabled(dim1, inst1)) {
-    counters_.instanceDisabled.fetchAdd(1);
+    EJIT_STAT_INC(counters_.instanceDisabled);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -406,7 +407,7 @@ EJitTaskPool::tryCacheHit3D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
   if (!switch_.isInstanceEnabled(dim0, inst0) ||
       !switch_.isInstanceEnabled(dim1, inst1) ||
       !switch_.isInstanceEnabled(dim2, inst2)) {
-    counters_.instanceDisabled.fetchAdd(1);
+    EJIT_STAT_INC(counters_.instanceDisabled);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -424,7 +425,7 @@ EJitTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
       !switch_.isInstanceEnabled(dim1, inst1) ||
       !switch_.isInstanceEnabled(dim2, inst2) ||
       !switch_.isInstanceEnabled(dim3, inst3)) {
-    counters_.instanceDisabled.fetchAdd(1);
+    EJIT_STAT_INC(counters_.instanceDisabled);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -485,7 +486,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     void *fn = nullptr;
     bool ok = compileFn_(compileCtx_, Req, &fn);
     if (!ok || !fn) {
-      counters_.compileFailed.fetchAdd(1);
+      EJIT_STAT_INC(counters_.compileFailed);
       EJIT_DIAG("taskpool sync compile failed func=%u ok=%u", funcIndex,
                 static_cast<unsigned>(ok));
       R.status = EJitCompileOrGetStatus::CompileFailed;
@@ -493,7 +494,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     }
     if (!versionsMatch(Req)) {
       cache_.retireCode(fn);
-      counters_.compileFailed.fetchAdd(1);
+      EJIT_STAT_INC(counters_.compileFailed);
       EJIT_DIAG("taskpool sync compile drop func=%u: version changed", funcIndex);
       R.status = EJitCompileOrGetStatus::CompileFailed;
       return R;
@@ -501,7 +502,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     EJitPublishStatus PS =
         cache_.publish(Req.funcIndex, Req.dims, Req.numDims, Req.versions, fn);
     if (PS == EJitPublishStatus::Published) {
-      counters_.asyncCompiles.fetchAdd(1); // "synchronous asyncCompiles"
+      EJIT_STAT_INC(counters_.asyncCompiles); // "synchronous asyncCompiles"
       // Re-lookup to obtain the read-token from the cache.
       EJitCacheLookupResult Hit2 = cache_.lookup(funcIndex, dims, numDims);
       if (Hit2.hasReadToken && Hit2.fnPtr) {
@@ -516,7 +517,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     } else {
       cache_.retireCode(fn);
     }
-    counters_.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(counters_.compileFailed);
     EJIT_DIAG("taskpool sync compile failed func=%u publish=%u", funcIndex,
               static_cast<unsigned>(PS));
     R.status = EJitCompileOrGetStatus::CompileFailed;
@@ -536,13 +537,13 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
 
   EJitTaskQueue::EnqueueResult EQ = queue_.tryEnqueue(Req);
   if (EQ == EJitTaskQueue::EnqueueResult::Enqueued) {
-    counters_.asyncEnqueues.fetchAdd(1);
+    EJIT_STAT_INC(counters_.asyncEnqueues);
     EJIT_DIAG_VERBOSE("taskpool enqueued func=%u", funcIndex);
     R.status = EJitCompileOrGetStatus::EnqueuedPending;
     return R;
   }
   if (EQ == EJitTaskQueue::EnqueueResult::AlreadyPending) {
-    counters_.alreadyPending.fetchAdd(1);
+    EJIT_STAT_INC(counters_.alreadyPending);
     EJIT_DIAG_VERBOSE("taskpool coalesced func=%u: already pending", funcIndex);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
@@ -554,7 +555,7 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   }
 
-  counters_.queueFull.fetchAdd(1);
+  EJIT_STAT_INC(counters_.queueFull);
   EJIT_DIAG("taskpool fallback func=%u: queue full", funcIndex);
   R.status = EJitCompileOrGetStatus::QueueFullFallback;
   return R;
@@ -574,7 +575,7 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
   // Checkpoint 1 (§5.3): drop a request invalidated before compilation started.
   if (!versionsMatch(req)) {
     queue_.release(req.funcIndex);
-    counters_.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(counters_.compileFailed);
     EJIT_DIAG("worker compile drop func=%u: version changed before compile",
               req.funcIndex);
     return;
@@ -585,7 +586,7 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
 
   if (!ok || !fn) {
     queue_.release(req.funcIndex);
-    counters_.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(counters_.compileFailed);
     EJIT_DIAG("worker compile failed func=%u ok=%u fn=%p", req.funcIndex,
               static_cast<unsigned>(ok), fn);
     return;
@@ -595,7 +596,7 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
   if (!versionsMatch(req)) {
     cache_.retireCode(fn); // Retire the now-stale code (real callback only).
     queue_.release(req.funcIndex);
-    counters_.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(counters_.compileFailed);
     EJIT_DIAG("worker compile drop func=%u: version changed after compile",
               req.funcIndex);
     return;
@@ -608,7 +609,7 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
       cache_.publish(req.funcIndex, req.dims, req.numDims, req.versions, fn);
   switch (PS) {
   case EJitPublishStatus::Published:
-    counters_.asyncCompiles.fetchAdd(1);
+    EJIT_STAT_INC(counters_.asyncCompiles);
     queue_.release(req.funcIndex);
     EJIT_DIAG_VERBOSE("worker publish ok func=%u fn=%p", req.funcIndex, fn);
     return;
@@ -617,14 +618,14 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
     // existing entry, release the dedup slot, count as a (cancelled) failure.
     cache_.retireCode(fn);
     queue_.release(req.funcIndex);
-    counters_.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(counters_.compileFailed);
     EJIT_DIAG("worker publish drop func=%u: version mismatch", req.funcIndex);
     return;
   case EJitPublishStatus::InvalidParam:
   case EJitPublishStatus::Failed:
     cache_.retireCode(fn);
     queue_.release(req.funcIndex);
-    counters_.publishFailed.fetchAdd(1);
+    EJIT_STAT_INC(counters_.publishFailed);
     EJIT_DIAG("worker publish failed func=%u status=%u", req.funcIndex,
               static_cast<unsigned>(PS));
     return;

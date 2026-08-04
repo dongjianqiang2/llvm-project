@@ -507,6 +507,67 @@ EJitPeriodHandlerPass    →  处理生命周期函数
 
 ---
 
-*文档版本: 1.1*
+## 10. Inline Cache 模式（LEVER B：frame-less hit path）
+
+开启 `-ejit-inline-cache`（默认 off）后，wrapper 的命中路径变为 **frame-less**：
+命中时直接尾调用缓存的特化函数，**无栈帧、无 `compile_or_get`、无 `release_read`**。
+慢路径被抽取到每函数独立的 `noinline MissFn`（`<name>_miss`），自带栈帧；miss 罕见，尾调用开销可忽略。
+完整设计（cache 数据结构、fill 线性化、安全模型、AOT↔runtime 契约）见 `EJIT_ICACHE_MULTIVERSION.md`。
+
+### 10.1 命中路径（F，frame-less）
+
+```llvm
+define i32 @funcA(args...) {
+jit_entry:                                       ; frame-less entry
+  slot = GEP @__ejit_icache_fn_funcA, 0, i0, i1    ; [D]^numDims 多维索引（纯移位）
+  p = load slot, align 8                           ; 普通 ldr（每核私有槽，无需 atomic）
+  hit = expect(p != null, true)
+  br hit, label %jit_icache_dispatch, label %jit_miss
+jit_icache_dispatch:                             ; 命中：尾调用特化（无 release_read）
+  tail call void %p(args...)
+  ret
+jit_miss:                                        ; miss：尾调用 MissFn
+  tail call void @funcA_miss(args...)
+  ret
+}
+
+define internal noinline void @funcA_miss(args...) {  ; 慢路径（自带栈帧；继承 F 的 target-cpu/features/tune-cpu + section）
+  ; funcidx 守卫 -> compile_or_get -> dispatch (call spec + release_read) / fallback (AOT body)
+}
+```
+
+- `@__ejit_icache_fn_<name>`：每函数私有 `[D]^numDims` 数组（`D = EJIT_ICACHE_DIM_SIZE = 8`，power-of-2），按 `ejit_dim` 参数值索引；numDims=0 退化为标量（= v2 单态）。
+- 命中路径**不调任何 runtime 函数**：直接 GEP + load + null-check + 尾调用。
+- `llvm.expect(hit, true)` 提示命中分支，使 regalloc / shrink-wrapping 对所有维度（含 0 维）保持 frame-less。
+- **musttail 仅在 `!EJitWrapperTiming` 时设置**：hit/miss 两条尾调用标 `TCK_MustTail`，降低成 `br`（复用调用方栈帧），故 wrapper 无栈帧。`-ejit-wrapper-timing` 开启时 hit 路径在 call 与 ret 之间插 `trace_now`/`trace_wrapper`，违反 musttail 规则，改用普通带帧 call + trace + ret（hit 路径不再 frame-less，但 IR 合法、功能不变；miss 路径仍 musttail）。
+- **MissFn 必须继承 F 的 target 属性**：`Function::Create` 新建的 MissFn 只继承 module 默认的 `uwtable`/`frame-pointer`，丢 F 的 `target-cpu`/`target-features`/`tune-cpu`。这会让 `TTI::areInlineCompatible` 判 MissFn 不是 helper 的 subtarget 超集 -> CGSCC InlinerPass 对所有 helper 报 `conflicting attributes` -> MissFn 零内联（AOT fallback 体积异常缩水）。修复：`MissFn->setAttributes(F->getAttributes())` 复制 F 全部属性，再 `addFnAttr(NoInline)`；同时 `setSection(F->getSection())` 让 MissFn 与 F 同段。`!ejit.metadata` 是 metadata（不在 `AttributeList` 里），不会被复制——MissFn 不应被当 ejit_entry 处理。
+- 跨函数 splice 修正：原函数体搬到 MissFn 后，把 `F->getArg(i)` 引用重映射到 `MissFn->getArg(i)`，否则跨函数参数引用会让 SelectionDAG 崩溃。
+- 幂等：`isAlreadyWrapped` 识别 entry 块中对 `@__ejit_icache_fn_<name>` 的 `LoadInst`/`GetElementPtrInst`（以及 `@__ejit_funcidx_<name>`），重复运行不会复制探针。
+
+### 10.2 性能（最新实测，`-Os`，aarch64_be，D=16）
+
+| numDims | hit 路径实测 cycle |
+|---|---|
+| 0 | 4 |
+| 1 | 5 |
+| 2 | 6 |
+| 3 | 8 |
+| 4 | 9 |
+
+命中路径 = 探针（GEP 移位索引 + load + null-check）+ 尾调用 `br`；无栈帧、无 call、无 `release_read`、无跨核 RMW。对比 icache off / 首次 miss 的 taskpool 路径（`compile_or_get` + `readers_` RMW + 桶扫描 + `release_read`），命中路径压到 4–9 cycle。2–4 维的实测 cycle 比指令数（4,5,7,9,11）还少，因为 `sxtw` 与 `adrp` 延迟重叠（ILP）。
+
+> 注：上述 frame-less / cycle 数据前提是 `!EJitWrapperTiming`。开启 `-ejit-wrapper-timing` 时 hit 路径退化为带帧 plain call + trace + ret（见 §10.1 musttail gating），cycle 不适用。
+
+
+
+### 10.3 约束与安全
+
+- 维度数 ≤ `EJIT_ICACHE_MAX_DIMS`(=4)，超限编译报错（`emitError`）。
+- 每个 `ejit_dim` 参数值 < `D`，无运行时边界检查（契约）。
+- 安全：生产 NO_RECLAIM（JIT 代码不释放）下缓存指针永不悬空；若 runtime 接了 code releaser，安全门（`icacheReclamationSafe_`）自动关闭缓存，退化为 taskpool 路径。
+
+---
+
+*文档版本: 1.2*
 *创建日期: 2026-04-26*
-*最后更新: 2026-04-29*
+*最后更新: 2026-07-25*

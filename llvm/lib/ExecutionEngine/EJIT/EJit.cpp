@@ -12,6 +12,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LLVMContext.h"
@@ -195,6 +196,32 @@ EJit::EJit(const Config &config) : config_(config) {
           if (idx == kEJitInvalidFuncIndex)
             recordInitError(EJIT_ERR_CACHE_FULL,
                             "funcIndex capacity exhausted for function",
+                            e->name1);
+          break;
+        }
+        case EJIT_REG_ICACHE_SLOT: {
+          // Wire the wrapper's per-function @__ejit_icache_fn_<name> slot into
+          // the runtime's slot registry (gIcacheSlots), keyed by the SAME
+          // registry funcIndex assigned above. e->size carries numDims (the
+          // [D]^numDims shape) so icacheFill can linearize. The wrapper reads
+          // the cell directly on the icache hit path (no ejit_icache_try call);
+          // icacheFill writes the frozen specialization pointer through it on
+          // resolve. A null fixup pointer or an exhausted funcIndex capacity is
+          // a hard init failure (the base stays null -> probe misses -> taskpool
+          // fallback, correct but without the icache fast path).
+          if (!e->name1 || !e->ptr) {
+            recordInitError(EJIT_ERR_INVALID_PARAM,
+                            "icache slot registration has a null fixup pointer",
+                            e->name1 ? e->name1 : "");
+            break;
+          }
+          uint32_t numDims = static_cast<uint32_t>(e->size);
+          uint32_t idx = EJitFuncRegistry::instance().resolveAssign(e->name1);
+          if (idx != kEJitInvalidFuncIndex)
+            ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr), numDims);
+          else
+            recordInitError(EJIT_ERR_CACHE_FULL,
+                            "funcIndex capacity exhausted for icache slot",
                             e->name1);
           break;
         }

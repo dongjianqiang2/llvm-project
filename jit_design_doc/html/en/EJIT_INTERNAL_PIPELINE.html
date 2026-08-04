@@ -34,18 +34,18 @@ Code Cache / fallback AOT</div>
     <h2>2. Clang metadata</h2>
     <table>
       <tr><th>metadata</th><th>Location</th><th>Purpose</th></tr>
-      <tr><td><code>!ejit.metadata</code></td><td>Function</td><td>Marks <code>ejit_entry</code>, <code>ejit_period_arr_ind</code>, <code>ejit_period_lc</code></td></tr>
-      <tr><td><code>!ejit.metadata</code></td><td>GlobalVariable</td><td>Marks <code>ejit_period</code>, <code>ejit_period_arr</code>, and may_const field-offset fallback info</td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>Function</td><td>Marks <code>EJIT_ENTRY</code>, <code>EJIT_DIM</code>, <code>EJIT_PERIOD_GUARD</code></td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>GlobalVariable</td><td>Marks <code>EJIT_IN_PERIOD</code>, <code>EJIT_IN_PERIOD_ARRAY</code>, and may_const field-offset fallback info</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>LoadInst</td><td>PASS6 main path identifies replaceable loads</td></tr>
     </table>
 <pre><code class="language-llvm">define void @process(i8 %idx) !ejit.metadata !0 { ... }
 !0 = distinct !{!1, !2}
-!1 = !{!"ejit_entry"}
-!2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+!1 = !{!"EJIT_ENTRY"}
+!2 = !{!"EJIT_DIM", !"cell", i32 0}
 
 @g_cellCfg = global [16 x %struct.CellConfig] zeroinitializer, !ejit.metadata !3
 !3 = distinct !{!4}
-!4 = !{!"ejit_period_arr", !"cell", i32 16}
+!4 = !{!"EJIT_IN_PERIOD_ARRAY", !"cell", i32 16}
 
 %v = load i32, ptr %field, !ejit.may_const !{}</code></pre>
   </section>
@@ -54,7 +54,7 @@ Code Cache / fallback AOT</div>
     <h2>3. AOT Pass responsibilities</h2>
     <table>
       <tr><th>Pass</th><th>Timing</th><th>Responsibility</th><th>Key artifact</th></tr>
-      <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>Before standard optimization</td><td>Extract the <code>ejit_entry</code> closure, preserve metadata, embed bitcode, auto-register external symbols</td><td><code>@__ejit_bitcode</code>, registry bitcode entries</td></tr>
+      <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>Before standard optimization</td><td>Extract the <code>EJIT_ENTRY</code> closure, preserve metadata, embed bitcode, auto-register external symbols</td><td><code>@__ejit_bitcode</code>, registry bitcode entries</td></tr>
       <tr><td>PASS2 <code>EJitRegisterPeriod</code></td><td>Before non-LTO optimization / after LTO optimization</td><td>Scan period/static metadata, generate registration calls or a static table</td><td>period registry entries</td></tr>
       <tr><td>PASS3 <code>EJitWrapperGen</code></td><td>Same</td><td>Insert cache key computation, runtime call, dispatch/fallback at the original function entry</td><td><code>jit_dispatch</code>, <code>jit_fallback</code></td></tr>
       <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>Same</td><td>Insert deactivate/activate at lifecycle function entry/exit</td><td><code>ejit_deactivate</code>, <code>ejit_activate</code></td></tr>
@@ -106,7 +106,7 @@ bit 7..0  : dim[0]</code></pre>
     <h2>7. Runtime JIT Pipeline</h2>
     <ol>
       <li>ModuleLoader finds the embedded bitcode by funcIndex/cacheKey.</li>
-      <li>Substitute <code>ejit_period_arr_ind</code> parameters with the current dimension constants.</li>
+      <li>Substitute <code>EJIT_DIM</code> parameters with the current dimension constants.</li>
       <li>InstCombine folds <code>zext</code>, GEP, and constant chains.</li>
       <li>Inline expands cross-function field accesses.</li>
       <li>PASS6 walks loads, recognizing <code>!ejit.may_const</code> or GV offset fallback.</li>

@@ -6,10 +6,10 @@ struct CellConfig {
   int xx;
 };
 
-// CHECK: @g_boardCfg = {{.*}} !ejit.metadata
+// CHECK-DAG: @g_boardCfg = {{.*}} !ejit.metadata
 __attribute__((ejit_in_period("static"))) struct CellConfig g_boardCfg;
 
-// CHECK: @g_cellCfg = {{.*}} !ejit.metadata
+// CHECK-DAG: @g_cellCfg = {{.*}} !ejit.metadata
 __attribute__((ejit_in_period_array("cell"))) struct CellConfig g_cellCfg[16];
 
 // CHECK: define {{.*}} @jit_entry({{.*}} !ejit.metadata

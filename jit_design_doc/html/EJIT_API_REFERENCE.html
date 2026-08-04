@@ -27,12 +27,12 @@
     <table>
       <thead><tr><th>宏</th><th>标记对象</th><th>作用</th><th>示例</th><th>关键约束</th></tr></thead>
       <tbody>
-        <tr><td><code>ejit_may_const</code></td><td>结构体字段</td><td>时间窗内可读作常量</td><td><code>ejit_may_const uint32_t mode;</code></td><td><code>volatile</code> 跳过；支持整型/布尔/浮点/嵌套结构体/数组</td></tr>
-        <tr><td><code>ejit_period(static)</code></td><td>非数组全局变量</td><td>运行期不变配置，永远激活</td><td><code>ejit_period(static) Cfg g_cfg;</code></td><td>当前推荐只用 <code>static</code> 标量时间窗</td></tr>
-        <tr><td><code>ejit_period_arr(name)</code></td><td>全局数组/结构体指针</td><td>按下标独立激活的时间窗数组</td><td><code>ejit_period_arr(cell) Cfg g_cells[16];</code></td><td>固定数组建议 &lt;100；全局最多 1024 个</td></tr>
-        <tr><td><code>ejit_entry</code></td><td>函数</td><td>JIT 特化入口</td><td><code>ejit_entry void f(...)</code></td><td>不支持递归；异步模式下副作用应幂等</td></tr>
-        <tr><td><code>ejit_period_arr_ind(name)</code></td><td>函数参数</td><td>声明特化维度下标</td><td><code>ejit_period_arr_ind(cell) uint8_t idx</code></td><td>必须整数；每函数最多 4 个维度</td></tr>
-        <tr><td><code>ejit_period_lc(name)</code></td><td>函数</td><td>修改时间窗数据的生命周期函数</td><td><code>ejit_period_lc(cell) void update(...)</code></td><td>必须有同名 <code>ejit_period_arr_ind</code> 参数；可多 period</td></tr>
+        <tr><td><code>EJIT_PERIOD_CONST</code></td><td>结构体字段</td><td>时间窗内可读作常量</td><td><code>EJIT_PERIOD_CONST uint32_t mode;</code></td><td><code>volatile</code> 跳过；支持整型/布尔/浮点/嵌套结构体/数组</td></tr>
+        <tr><td><code>EJIT_IN_PERIOD(static)</code></td><td>非数组全局变量</td><td>运行期不变配置，永远激活</td><td><code>EJIT_IN_PERIOD(static) Cfg g_cfg;</code></td><td>当前推荐只用 <code>static</code> 标量时间窗</td></tr>
+        <tr><td><code>EJIT_IN_PERIOD_ARRAY(name)</code></td><td>全局数组/结构体指针</td><td>按下标独立激活的时间窗数组</td><td><code>EJIT_IN_PERIOD_ARRAY(cell) Cfg g_cells[16];</code></td><td>固定数组建议 &lt;100；全局最多 1024 个</td></tr>
+        <tr><td><code>EJIT_ENTRY</code></td><td>函数</td><td>JIT 特化入口</td><td><code>EJIT_ENTRY void f(...)</code></td><td>不支持递归；异步模式下副作用应幂等</td></tr>
+        <tr><td><code>EJIT_DIM(name)</code></td><td>函数参数</td><td>声明特化维度下标</td><td><code>EJIT_DIM(cell) uint8_t idx</code></td><td>必须整数；每函数最多 4 个维度</td></tr>
+        <tr><td><code>EJIT_PERIOD_GUARD(name)</code></td><td>函数</td><td>修改时间窗数据的生命周期函数</td><td><code>EJIT_PERIOD_GUARD(cell) void update(...)</code></td><td>必须有同名 <code>EJIT_DIM</code> 参数；可多 period</td></tr>
       </tbody>
     </table>
   </section>
@@ -86,7 +86,7 @@ typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_leve
     <h2>5. 初始化 / 关闭</h2>
 <pre><code class="language-c">ejit_status_t ejit_init(const ejit_config_t *config);
 void ejit_shutdown(void);</code></pre>
-    <p>调用 <code>ejit_entry</code> 前必须先 <code>ejit_init</code>。传 <code>NULL</code> 使用默认配置。程序退出或不再使用 EJIT 时调用 <code>ejit_shutdown</code>。</p>
+    <p>调用 <code>EJIT_ENTRY</code> 前必须先 <code>ejit_init</code>。传 <code>NULL</code> 使用默认配置。程序退出或不再使用 EJIT 时调用 <code>ejit_shutdown</code>。</p>
   </section>
 
   <section>
@@ -155,7 +155,7 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);</code></pre>
 // 初始化配置数据
 g_cellCfg[idx].mode = MODE_FAST;
 
-// 激活后调用 ejit_entry
+// 激活后调用 EJIT_ENTRY
 ejit_activate("cell", idx);
 process_cell(idx, value);
 

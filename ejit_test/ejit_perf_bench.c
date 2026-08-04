@@ -81,6 +81,47 @@ uint64_t compute_cell_nojit(uint8_t ci)
   return sum;
 }
 
+//===-- Interprocedural: noinline 被调函数读 may_const 字段 -------------------===//
+//
+// The AOT inliner keeps this call edge (noinline), so the entry's specialized
+// cell index reaches the callee only as an ordinary argument. Without
+// interprocedural propagation (pipeline phase 1d) the callee re-loads the six
+// may_const fields and re-tests both guards on every call — the JIT run then
+// matches AOT. With phase 1d the callee folds to `sum + constant`.
+
+__attribute__((noinline))
+static uint64_t cell_step(uint8_t ci, uint64_t sum)
+{
+  struct CellCfg *p = &g_cfg[ci];
+  if (p->cellType == 0xFD) {
+    if (p->priority > 10)
+      return sum + p->maxPower * p->bandWidth / (p->timeSlot + 1);
+    return sum + p->minPower * p->bandWidth / (p->timeSlot + 1);
+  } else if (p->cellType == 0xEC) {
+    return sum + (p->maxPower + p->minPower) * p->bandWidth / (p->timeSlot + 1);
+  }
+  return sum;
+}
+
+ejit_entry
+uint64_t compute_cell_ip(
+    ejit_period_arr_ind(cell) uint8_t ci)
+{
+  uint64_t sum = 0;
+  for (uint64_t i = 0; i < LOOP_ITERS; i++)
+    sum = cell_step(ci, sum);
+  return sum;
+}
+
+// 纯 AOT 对照（无 attribute），同样经过 noinline 调用边界
+uint64_t compute_cell_ip_nojit(uint8_t ci)
+{
+  uint64_t sum = 0;
+  for (uint64_t i = 0; i < LOOP_ITERS; i++)
+    sum = cell_step(ci, sum);
+  return sum;
+}
+
 //===-- 运行时 API -----------------------------------------------------------===//
 
 extern void ejit_shutdown(void);
@@ -166,6 +207,42 @@ int main(int argc, char **argv) {
     }
   }
 
+  printf("\n--- Interproc AOT (noinline 调用边界, 无 attribute) ---\n");
+
+  uint64_t ip_pure_sum = 0;
+  double ip_pure_time = 0;
+  for (int w = 0; w < n_warmup; w++) {
+    double t0 = now_ms();
+    uint64_t r = compute_cell_ip_nojit(ci);
+    double t1 = now_ms();
+    ip_pure_time = t1 - t0;
+    ip_pure_sum = r;
+    if (w == n_warmup - 1) {
+      printf("  result=%llu  time=%.1f ms\n",
+             (unsigned long long)r, ip_pure_time);
+    }
+  }
+
+  printf("\n--- Interproc JIT (常量跨调用边界传播) ---\n");
+
+  // 预热: 触发编译并等待完成，再计时（异步模式下首个调用会走 AOT fallback）
+  compute_cell_ip(ci);
+  ejit_drain_taskpool();
+
+  uint64_t ip_jit_sum = 0;
+  double ip_jit_time = 0;
+  for (int w = 0; w < n_warmup; w++) {
+    double t0 = now_ms();
+    uint64_t r = compute_cell_ip(ci);
+    double t1 = now_ms();
+    ip_jit_time = t1 - t0;
+    ip_jit_sum = r;
+    if (w == n_warmup - 1) {
+      printf("  result=%llu  time=%.1f ms\n",
+             (unsigned long long)r, ip_jit_time);
+    }
+  }
+
   ejit_drain_taskpool();
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
@@ -206,6 +283,19 @@ int main(int argc, char **argv) {
     printf("  JIT vs Pure AOT 加速: %.1fx\n", pure_time / jit_time);
     printf("  AOT Fallback vs Pure overhead: %.1fx\n", aot_time / pure_time);
   }
+
+  if (ip_jit_sum == ip_pure_sum) {
+    printf("\n  Interproc Result MATCH: Pure=%llu JIT=%llu\n",
+           (unsigned long long)ip_pure_sum, (unsigned long long)ip_jit_sum);
+  } else {
+    printf("\n  Interproc Result MISMATCH: Pure=%llu JIT=%llu\n",
+           (unsigned long long)ip_pure_sum, (unsigned long long)ip_jit_sum);
+  }
+  printf("  Interproc Pure AOT: %.1f ms\n", ip_pure_time);
+  printf("  Interproc JIT:      %.1f ms\n", ip_jit_time);
+  if (ip_jit_time > 0)
+    printf("  Interproc JIT vs Pure AOT 加速: %.1fx\n",
+           ip_pure_time / ip_jit_time);
 
   printf("\n=== Benchmark Complete ===\n");
   return 0;

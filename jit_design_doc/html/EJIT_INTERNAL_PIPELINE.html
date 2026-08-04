@@ -35,18 +35,18 @@ Code Cache / fallback AOT</div>
     <h2>2. Clang metadata</h2>
     <table>
       <tr><th>metadata</th><th>位置</th><th>用途</th></tr>
-      <tr><td><code>!ejit.metadata</code></td><td>Function</td><td>标记 <code>ejit_entry</code>、<code>ejit_period_arr_ind</code>、<code>ejit_period_lc</code></td></tr>
-      <tr><td><code>!ejit.metadata</code></td><td>GlobalVariable</td><td>标记 <code>ejit_period</code>、<code>ejit_period_arr</code>、may_const 字段偏移回退信息</td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>Function</td><td>标记 <code>EJIT_ENTRY</code>、<code>EJIT_DIM</code>、<code>EJIT_PERIOD_GUARD</code></td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>GlobalVariable</td><td>标记 <code>EJIT_IN_PERIOD</code>、<code>EJIT_IN_PERIOD_ARRAY</code>、may_const 字段偏移回退信息</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>LoadInst</td><td>PASS6 主路径识别可替换 load</td></tr>
     </table>
 <pre><code class="language-llvm">define void @process(i8 %idx) !ejit.metadata !0 { ... }
 !0 = distinct !{!1, !2}
-!1 = !{!"ejit_entry"}
-!2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+!1 = !{!"EJIT_ENTRY"}
+!2 = !{!"EJIT_DIM", !"cell", i32 0}
 
 @g_cellCfg = global [16 x %struct.CellConfig] zeroinitializer, !ejit.metadata !3
 !3 = distinct !{!4}
-!4 = !{!"ejit_period_arr", !"cell", i32 16}
+!4 = !{!"EJIT_IN_PERIOD_ARRAY", !"cell", i32 16}
 
 %v = load i32, ptr %field, !ejit.may_const !{}</code></pre>
   </section>
@@ -55,7 +55,7 @@ Code Cache / fallback AOT</div>
     <h2>3. AOT Pass 职责</h2>
     <table>
       <tr><th>Pass</th><th>时机</th><th>职责</th><th>关键产物</th></tr>
-      <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>标准优化前</td><td>提取 <code>ejit_entry</code> 闭包，保留 metadata，嵌入 bitcode，自动注册外部符号</td><td><code>@__ejit_bitcode</code>、registry bitcode entries</td></tr>
+      <tr><td>PASS1 <code>EJitRegisterBitcode</code></td><td>标准优化前</td><td>提取 <code>EJIT_ENTRY</code> 闭包，保留 metadata，嵌入 bitcode，自动注册外部符号</td><td><code>@__ejit_bitcode</code>、registry bitcode entries</td></tr>
       <tr><td>PASS2 <code>EJitRegisterPeriod</code></td><td>非 LTO 优化前 / LTO 优化后</td><td>扫描 period/static metadata，生成注册调用或静态表</td><td>period registry entries</td></tr>
       <tr><td>PASS3 <code>EJitWrapperGen</code></td><td>同上</td><td>在原函数入口插入 cache key 计算、runtime 调用、dispatch/fallback</td><td><code>jit_dispatch</code>、<code>jit_fallback</code></td></tr>
       <tr><td>PASS4 <code>EJitPeriodHandler</code></td><td>同上</td><td>生命周期函数入口/出口插入 deactivate/activate</td><td><code>ejit_deactivate</code>、<code>ejit_activate</code></td></tr>
@@ -107,7 +107,7 @@ bit 7..0  : dim[0]</code></pre>
     <h2>7. Runtime JIT Pipeline</h2>
     <ol>
       <li>ModuleLoader 根据 funcIndex/cacheKey 找到嵌入 bitcode。</li>
-      <li>替换 <code>ejit_period_arr_ind</code> 参数为当前维度常量。</li>
+      <li>替换 <code>EJIT_DIM</code> 参数为当前维度常量。</li>
       <li>InstCombine 折叠 <code>zext</code>、GEP 和常量链。</li>
       <li>Inline 展开跨函数字段访问。</li>
       <li>PASS6 遍历 load，识别 <code>!ejit.may_const</code> 或 GV 偏移回退。</li>

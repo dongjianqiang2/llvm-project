@@ -192,7 +192,7 @@
   <div class="cards">
     <div class="card">
       <h3>核心思想</h3>
-      <p>在 <code>ejit_activate</code> 与 <code>ejit_deactivate</code> 之间，标注为 <code>ejit_may_const</code> 的字段可被 JIT 读成常量。</p>
+      <p>在 <code>ejit_activate</code> 与 <code>ejit_deactivate</code> 之间，标注为 <code>EJIT_PERIOD_CONST</code> 的字段可被 JIT 读成常量。</p>
     </div>
     <div class="card">
       <h3>主要收益</h3>
@@ -205,7 +205,7 @@
   </div>
 
   <div class="flow">用户源码标注 → Clang 生成 EJIT metadata → AOT Pass 嵌入 bitcode 并插入 wrapper →
-运行时 activate 时间窗 → 调用 ejit_entry → cache hit 则执行特化代码，否则 fallback AOT</div>
+运行时 activate 时间窗 → 调用 EJIT_ENTRY → cache hit 则执行特化代码，否则 fallback AOT</div>
 
   <p>典型使用场景：</p>
   <ul>
@@ -231,21 +231,21 @@
 #define MODE_TDD 2
 
 struct CellConfig {
-    ejit_may_const uint32_t mode;      // 时间窗内可特化为常量
-    ejit_may_const uint32_t threshold; // 时间窗内可特化为常量
+    EJIT_PERIOD_CONST uint32_t mode;      // 时间窗内可特化为常量
+    EJIT_PERIOD_CONST uint32_t threshold; // 时间窗内可特化为常量
     uint32_t runtimeCounter;           // 普通字段，不参与常量替换
 };
 
 // 每个 cell 下标是一个独立时间窗实例
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
 
 static void fdd_path(int value);
 static void tdd_path(int value);
 static void default_path(int value);
 
 // 用户仍然调用原函数名；编译器会在函数入口插入 wrapper
-ejit_entry
-void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+EJIT_ENTRY
+void process_cell(EJIT_DIM(cell) uint8_t cellIdx, int value) {
     if (g_cellCfg[cellIdx].mode == MODE_FDD) {
         fdd_path(value + g_cellCfg[cellIdx].threshold);
     } else if (g_cellCfg[cellIdx].mode == MODE_TDD) {
@@ -256,8 +256,8 @@ void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
 }
 
 // 修改 cell 配置的函数要标注生命周期，编译器自动插入 deactivate/activate
-ejit_period_lc(cell)
-void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+EJIT_PERIOD_GUARD(cell)
+void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
                      uint32_t mode,
                      uint32_t threshold) {
     g_cellCfg[cellIdx].mode = mode;
@@ -294,7 +294,7 @@ void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
     return 0;
 }</code></pre>
 
-  <div class="ok"><strong>最小使用闭环：</strong> 标注 <code>ejit_may_const</code> 字段 → 标注 <code>ejit_period_arr</code> 全局数组 → 标注 <code>ejit_entry</code> 和 <code>ejit_period_arr_ind</code> → <code>ejit_init</code> → <code>ejit_activate</code> → 调用原函数。</div>
+  <div class="ok"><strong>最小使用闭环：</strong> 标注 <code>EJIT_PERIOD_CONST</code> 字段 → 标注 <code>EJIT_IN_PERIOD_ARRAY</code> 全局数组 → 标注 <code>EJIT_ENTRY</code> 和 <code>EJIT_DIM</code> → <code>ejit_init</code> → <code>ejit_activate</code> → 调用原函数。</div>
 </section>
 
 <section id="annotations">
@@ -304,24 +304,24 @@ void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
   <table>
     <thead><tr><th>宏</th><th>标记对象</th><th>作用</th><th>常见约束</th></tr></thead>
     <tbody>
-      <tr><td><code>ejit_may_const</code></td><td>结构体字段</td><td>字段在激活时间窗内可被 JIT 当作常量</td><td>支持整型、布尔、浮点、嵌套结构体及数组；<code>volatile</code> 不特化</td></tr>
-      <tr><td><code>ejit_period(static)</code></td><td>非数组全局变量</td><td>运行期不变的全局配置，默认永远激活</td><td>当前推荐只使用内置 <code>static</code> 标量时间窗</td></tr>
-      <tr><td><code>ejit_period_arr(name)</code></td><td>全局数组或指向结构体的全局指针</td><td>定义按下标独立激活的时间窗数组</td><td>固定数组建议 &lt; 100；全程序最多 1024 个数组</td></tr>
-      <tr><td><code>ejit_entry</code></td><td>函数</td><td>标记可 JIT 特化的入口函数</td><td>不支持递归；异步模式下副作用应幂等</td></tr>
-      <tr><td><code>ejit_period_arr_ind(name)</code></td><td>函数参数</td><td>声明该参数是某个时间窗数组的下标维度</td><td>必须为整数；每函数最多 4 个维度</td></tr>
-      <tr><td><code>ejit_period_lc(name)</code></td><td>函数</td><td>标记会修改时间窗数据的生命周期函数</td><td>必须存在同名 <code>ejit_period_arr_ind</code> 参数；可标多个 period</td></tr>
+      <tr><td><code>EJIT_PERIOD_CONST</code></td><td>结构体字段</td><td>字段在激活时间窗内可被 JIT 当作常量</td><td>支持整型、布尔、浮点、嵌套结构体及数组；<code>volatile</code> 不特化</td></tr>
+      <tr><td><code>EJIT_IN_PERIOD(static)</code></td><td>非数组全局变量</td><td>运行期不变的全局配置，默认永远激活</td><td>当前推荐只使用内置 <code>static</code> 标量时间窗</td></tr>
+      <tr><td><code>EJIT_IN_PERIOD_ARRAY(name)</code></td><td>全局数组或指向结构体的全局指针</td><td>定义按下标独立激活的时间窗数组</td><td>固定数组建议 &lt; 100；全程序最多 1024 个数组</td></tr>
+      <tr><td><code>EJIT_ENTRY</code></td><td>函数</td><td>标记可 JIT 特化的入口函数</td><td>不支持递归；异步模式下副作用应幂等</td></tr>
+      <tr><td><code>EJIT_DIM(name)</code></td><td>函数参数</td><td>声明该参数是某个时间窗数组的下标维度</td><td>必须为整数；每函数最多 4 个维度</td></tr>
+      <tr><td><code>EJIT_PERIOD_GUARD(name)</code></td><td>函数</td><td>标记会修改时间窗数据的生命周期函数</td><td>必须存在同名 <code>EJIT_DIM</code> 参数；可标多个 period</td></tr>
     </tbody>
   </table>
 
-  <h3>3.2 静态配置：<code>ejit_period(static)</code></h3>
+  <h3>3.2 静态配置：<code>EJIT_IN_PERIOD(static)</code></h3>
 <pre><code class="language-c">struct BoardConfig {
-    ejit_may_const uint32_t boardType;
+    EJIT_PERIOD_CONST uint32_t boardType;
     uint32_t flags;
 };
 
-ejit_period(static) struct BoardConfig g_boardCfg;
+EJIT_IN_PERIOD(static) struct BoardConfig g_boardCfg;
 
-ejit_entry
+EJIT_ENTRY
 void process_board(void) {
     if (g_boardCfg.boardType == 1) {
         // JIT 时 boardType 可被折叠为常量
@@ -330,27 +330,27 @@ void process_board(void) {
 
   <p><code>static</code> 时间窗代表 JIT 运行期不变的全局配置，不需要调用 <code>ejit_activate</code>。</p>
 
-  <h3>3.3 数组时间窗：<code>ejit_period_arr(name)</code></h3>
+  <h3>3.3 数组时间窗：<code>EJIT_IN_PERIOD_ARRAY(name)</code></h3>
   <p>多个全局数组可以使用同一个时间窗名称。调用 <code>ejit_activate("cell", idx)</code> 会激活该名称下所有数组的同一下标。激活状态仅以时间窗名称 + 实例 index 为键，没有数组指针维度；若多个数组共享同一时间窗名称，激活对该 period 实例整体生效。</p>
 
-<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
-struct CellState  { ejit_may_const uint32_t state; };
+<pre><code class="language-c">struct CellConfig { EJIT_PERIOD_CONST uint32_t mode; };
+struct CellState  { EJIT_PERIOD_CONST uint32_t state; };
 
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
-ejit_period_arr(cell) struct CellState  g_cellState[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellState  g_cellState[16];
 
 // 激活 g_cellCfg[3] 和 g_cellState[3]
 ejit_activate("cell", 3);</code></pre>
 
   <h3>3.4 多维特化</h3>
-  <p>一个 <code>ejit_entry</code> 函数最多可声明 4 个时间窗数组下标。运行时 cache key 使用高 32 位函数索引 + 低 4 字节维度值编码。</p>
+  <p>一个 <code>EJIT_ENTRY</code> 函数最多可声明 4 个时间窗数组下标。运行时 cache key 使用高 32 位函数索引 + 低 4 字节维度值编码。</p>
 
-<pre><code class="language-c">ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
-ejit_period_arr(trp)  struct TrpConfig  g_trpCfg[8];
+<pre><code class="language-c">EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(trp)  struct TrpConfig  g_trpCfg[8];
 
-ejit_entry
-void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
-                  ejit_period_arr_ind(trp)  uint8_t trpIdx,
+EJIT_ENTRY
+void process_pair(EJIT_DIM(cell) uint8_t cellIdx,
+                  EJIT_DIM(trp)  uint8_t trpIdx,
                   int payload) {
     if (g_cellCfg[cellIdx].mode == 1 &amp;&amp; g_trpCfg[trpIdx].type == 2) {
         // cellIdx/trpIdx 均可成为特化维度
@@ -358,16 +358,16 @@ void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
 }</code></pre>
 
   <h3>3.5 生命周期函数</h3>
-  <p>凡是会修改 <code>ejit_may_const</code> 字段或其所在结构体的函数，建议用 <code>ejit_period_lc</code> 标注。编译器会在函数入口插入失效操作，在所有返回点前重新激活。</p>
+  <p>凡是会修改 <code>EJIT_PERIOD_CONST</code> 字段或其所在结构体的函数，建议用 <code>EJIT_PERIOD_GUARD</code> 标注。编译器会在函数入口插入失效操作，在所有返回点前重新激活。</p>
 
-<pre><code class="language-c">ejit_period_lc(cell) ejit_period_lc(trp)
-void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
-                 ejit_period_arr_ind(trp)  uint8_t trpIdx) {
+<pre><code class="language-c">EJIT_PERIOD_GUARD(cell) EJIT_PERIOD_GUARD(trp)
+void update_both(EJIT_DIM(cell) uint8_t cellIdx,
+                 EJIT_DIM(trp)  uint8_t trpIdx) {
     g_cellCfg[cellIdx].mode = 2;
     g_trpCfg[trpIdx].type = 4;
 }</code></pre>
 
-  <div class="warn"><strong>注意：</strong> 如果绕过生命周期函数直接修改已激活时间窗内的 <code>ejit_may_const</code> 字段，旧的特化代码可能基于旧值。请使用 <code>ejit_period_lc</code> 或手动 <code>ejit_deactivate</code> / 修改 / <code>ejit_activate</code>。</div>
+  <div class="warn"><strong>注意：</strong> 如果绕过生命周期函数直接修改已激活时间窗内的 <code>EJIT_PERIOD_CONST</code> 字段，旧的特化代码可能基于旧值。请使用 <code>EJIT_PERIOD_GUARD</code> 或手动 <code>ejit_deactivate</code> / 修改 / <code>ejit_activate</code>。</div>
 </section>
 
 <section id="runtime-api">
@@ -403,7 +403,7 @@ void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
     <thead><tr><th>模式</th><th>首次未命中行为</th><th>适用场景</th><th>注意事项</th></tr></thead>
     <tbody>
       <tr><td><code>EJIT_COMPILE_SYNC</code></td><td>阻塞等待 JIT 编译完成，成功后直接执行特化版本</td><td>可接受首次延迟，希望尽快获得性能收益</td><td>首次调用延迟更明显</td></tr>
-      <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>提交后台编译，当前调用 fallback 到 AOT</td><td>对首次延迟敏感</td><td><code>ejit_entry</code> 副作用应幂等，避免首次 AOT 与后续 JIT 行为不一致</td></tr>
+      <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>提交后台编译，当前调用 fallback 到 AOT</td><td>对首次延迟敏感</td><td><code>EJIT_ENTRY</code> 副作用应幂等，避免首次 AOT 与后续 JIT 行为不一致</td></tr>
     </tbody>
   </table>
 
@@ -496,7 +496,7 @@ build_release_x86/bin/clang -O2 -g \
   <h3>6.1 AOT 编译期做了什么</h3>
   <ol>
     <li>Clang 解析 EJIT 属性，生成函数/全局变量级 <code>!ejit.metadata</code>，并在 may_const 字段 load 上生成 <code>!ejit.may_const</code>。</li>
-    <li><strong>PASS1</strong> <code>EJitRegisterBitcode</code> 在标准优化前提取 <code>ejit_entry</code> 闭包 bitcode，嵌入二进制并生成注册信息。</li>
+    <li><strong>PASS1</strong> <code>EJitRegisterBitcode</code> 在标准优化前提取 <code>EJIT_ENTRY</code> 闭包 bitcode，嵌入二进制并生成注册信息。</li>
     <li><strong>PASS2</strong> <code>EJitRegisterPeriod</code> 生成 period 数组和 static 变量注册。</li>
     <li><strong>PASS3</strong> <code>EJitWrapperGen</code> 在原函数入口插入 wrapper：构造 cache key，调用运行时，成功则跳转特化函数，失败则继续原 AOT 函数体。</li>
     <li><strong>PASS4</strong> <code>EJitPeriodHandler</code> 在生命周期函数入口插入 deactivate，在所有 return 前插入 activate。</li>
@@ -507,10 +507,10 @@ build_release_x86/bin/clang -O2 -g \
   <ol>
     <li>按 cache key 查缓存，命中则返回函数指针。</li>
     <li>未命中时加载嵌入 bitcode。</li>
-    <li>把 <code>ejit_period_arr_ind</code> 参数替换为本次调用的常量下标。</li>
+    <li>把 <code>EJIT_DIM</code> 参数替换为本次调用的常量下标。</li>
     <li>运行 InstCombine 折叠 zext/GEP 等常量链。</li>
     <li>内联被调函数，使跨函数字段访问暴露为全局变量 GEP。</li>
-    <li><strong>PASS6</strong> <code>EJitStructFieldPass</code> 将 <code>ejit_may_const</code> 字段 load 替换为当前内存值常量。</li>
+    <li><strong>PASS6</strong> <code>EJitStructFieldPass</code> 将 <code>EJIT_PERIOD_CONST</code> 字段 load 替换为当前内存值常量。</li>
     <li>按 L1/L2/L3 运行标准 LLVM 优化，生成机器码，放入 cache。</li>
   </ol>
 
@@ -557,7 +557,7 @@ build_release_x86/bin/clang -O2 -g \
   <table>
     <thead><tr><th>检查项</th><th>期望</th></tr></thead>
     <tbody>
-      <tr><td><code>!ejit.metadata</code></td><td>函数和全局变量包含 <code>ejit_entry</code>、<code>ejit_period</code>、<code>ejit_period_arr</code> 等 metadata</td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>函数和全局变量包含 <code>EJIT_ENTRY</code>、<code>EJIT_IN_PERIOD</code>、<code>EJIT_IN_PERIOD_ARRAY</code> 等 metadata</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>标注字段的 load 指令带 may_const metadata</td></tr>
       <tr><td><code>@__ejit_bitcode</code></td><td>嵌入 bitcode 位于专用 section</td></tr>
       <tr><td><code>ejit_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
@@ -619,20 +619,20 @@ cd build_debug_x86
   <table>
     <thead><tr><th>现象</th><th>原因</th><th>处理</th></tr></thead>
     <tbody>
-      <tr><td><code>ejit_period</code> 用在数组上</td><td>数组应使用 <code>ejit_period_arr</code></td><td>改为 <code>ejit_period_arr(name)</code></td></tr>
-      <tr><td><code>ejit_period_arr</code> 用在非数组上</td><td>标量变量不应使用数组时间窗</td><td>静态标量使用 <code>ejit_period(static)</code></td></tr>
-      <tr><td><code>ejit_period_arr_ind</code> 参数不是整数</td><td>下标必须可编码为整数维度</td><td>使用 <code>uint8_t</code> / <code>int</code> 等整数类型</td></tr>
+      <tr><td><code>EJIT_IN_PERIOD</code> 用在数组上</td><td>数组应使用 <code>EJIT_IN_PERIOD_ARRAY</code></td><td>改为 <code>EJIT_IN_PERIOD_ARRAY(name)</code></td></tr>
+      <tr><td><code>EJIT_IN_PERIOD_ARRAY</code> 用在非数组上</td><td>标量变量不应使用数组时间窗</td><td>静态标量使用 <code>EJIT_IN_PERIOD(static)</code></td></tr>
+      <tr><td><code>EJIT_DIM</code> 参数不是整数</td><td>下标必须可编码为整数维度</td><td>使用 <code>uint8_t</code> / <code>int</code> 等整数类型</td></tr>
       <tr><td>超过 4 个维度</td><td>cache key 只编码 4 个 8-bit 维度</td><td>减少维度或拆分函数</td></tr>
-      <tr><td><code>ejit_period_lc</code> 没有同名 index 参数</td><td>生命周期函数无法知道修改哪个实例</td><td>添加 <code>ejit_period_arr_ind(name)</code> 参数</td></tr>
-      <tr><td>递归 <code>ejit_entry</code></td><td>当前不支持递归入口特化</td><td>移除 <code>ejit_entry</code> 或改造调用结构</td></tr>
+      <tr><td><code>EJIT_PERIOD_GUARD</code> 没有同名 index 参数</td><td>生命周期函数无法知道修改哪个实例</td><td>添加 <code>EJIT_DIM(name)</code> 参数</td></tr>
+      <tr><td>递归 <code>EJIT_ENTRY</code></td><td>当前不支持递归入口特化</td><td>移除 <code>EJIT_ENTRY</code> 或改造调用结构</td></tr>
     </tbody>
   </table>
 
   <h3>9.2 JIT 没有触发</h3>
   <ol>
-    <li>确认函数是否标注 <code>ejit_entry</code>。</li>
+    <li>确认函数是否标注 <code>EJIT_ENTRY</code>。</li>
     <li>确认使用的是带 EJIT 的 Clang，而不是系统 Clang。</li>
-    <li>确认 <code>ejit_init</code> 已在调用 <code>ejit_entry</code> 前执行。</li>
+    <li>确认 <code>ejit_init</code> 已在调用 <code>EJIT_ENTRY</code> 前执行。</li>
     <li>确认相关时间窗已经 <code>ejit_activate</code>。</li>
     <li>确认编译产物中存在 <code>@__ejit_bitcode</code> 和 <code>ejit_compile_or_get</code>。</li>
     <li>裸核场景确认 registry section 没被链接器垃圾回收。</li>
@@ -641,10 +641,10 @@ cd build_debug_x86
 
   <h3>9.3 JIT 触发但分支没有被折叠</h3>
   <ol>
-    <li>字段是否标注了 <code>ejit_may_const</code>。</li>
+    <li>字段是否标注了 <code>EJIT_PERIOD_CONST</code>。</li>
     <li>字段是否为 <code>volatile</code>；volatile 字段不会被常量替换。</li>
-    <li>全局变量是否标注 <code>ejit_period(static)</code> 或 <code>ejit_period_arr(name)</code>。</li>
-    <li>入口函数参数是否标注匹配的 <code>ejit_period_arr_ind(name)</code>。</li>
+    <li>全局变量是否标注 <code>EJIT_IN_PERIOD(static)</code> 或 <code>EJIT_IN_PERIOD_ARRAY(name)</code>。</li>
+    <li>入口函数参数是否标注匹配的 <code>EJIT_DIM(name)</code>。</li>
     <li>时间窗是否激活，且下标是否正确。</li>
     <li>访问模式是否能被 InstCombine/Inline 化为常量 GEP；复杂 PHI/select 指针路径可能被跳过。</li>
     <li>设置 <code>dumpJITDir</code>，检查优化后 IR 是否已将 load 替换为常量。</li>
@@ -658,7 +658,7 @@ cd build_debug_x86
     <li>外部符号未注册；</li>
     <li>JIT 编译失败、目标后端缺失；</li>
     <li>内存不足、cache 已满、单函数代码量超过上限；</li>
-    <li>指针型 <code>ejit_period_arr</code> 未初始化或越界；</li>
+    <li>指针型 <code>EJIT_IN_PERIOD_ARRAY</code> 未初始化或越界；</li>
     <li>字段访问模式太复杂，PASS6 安全跳过。</li>
   </ul>
 </section>
@@ -669,10 +669,10 @@ cd build_debug_x86
   <h3>10.1 当前限制</h3>
   <ul>
     <li>仅支持 Clang 属性路径；GCC 兼容为未来工作。</li>
-    <li><code>ejit_entry</code> 不支持递归。</li>
+    <li><code>EJIT_ENTRY</code> 不支持递归。</li>
     <li>函数指针调用目标暂不特化。</li>
-    <li>自定义标量 <code>ejit_period(name)</code> 依赖声明为未来扩展；当前标量建议使用 <code>static</code>。</li>
-    <li>单个函数最多 4 个 <code>ejit_period_arr_ind</code> 维度。</li>
+    <li>自定义标量 <code>EJIT_IN_PERIOD(name)</code> 依赖声明为未来扩展；当前标量建议使用 <code>static</code>。</li>
+    <li>单个函数最多 4 个 <code>EJIT_DIM</code> 维度。</li>
     <li>时间窗数组建议较小；固定数组设计目标为 &lt;100，全局最多 1024 个 period array。</li>
     <li><code>!ejit.may_const</code> 是软标注：丢失时只会少优化，不应影响正确性。</li>
     <li>复杂指针、PHI/select、非线性下标路径可能无法替换为常量。</li>
@@ -683,7 +683,7 @@ cd build_debug_x86
   <div class="cards">
     <div class="card">
       <h4>优先选择稳定配置字段</h4>
-      <p>只把真正时间窗内不变的字段标为 <code>ejit_may_const</code>，不要标记频繁变化字段。</p>
+      <p>只把真正时间窗内不变的字段标为 <code>EJIT_PERIOD_CONST</code>，不要标记频繁变化字段。</p>
     </div>
     <div class="card">
       <h4>让维度简单</h4>
@@ -691,7 +691,7 @@ cd build_debug_x86
     </div>
     <div class="card">
       <h4>集中修改配置</h4>
-      <p>通过 <code>ejit_period_lc</code> 函数修改配置，避免分散写 may_const 字段。</p>
+      <p>通过 <code>EJIT_PERIOD_GUARD</code> 函数修改配置，避免分散写 may_const 字段。</p>
     </div>
     <div class="card">
       <h4>先验证再优化</h4>
@@ -701,8 +701,8 @@ cd build_debug_x86
 
   <h3>10.3 上线前检查清单</h3>
   <ul>
-    <li>所有 <code>ejit_entry</code> 均有 fallback 正确性测试。</li>
-    <li>所有配置修改路径都有 <code>ejit_period_lc</code> 或手动 deactivate/activate。</li>
+    <li>所有 <code>EJIT_ENTRY</code> 均有 fallback 正确性测试。</li>
+    <li>所有配置修改路径都有 <code>EJIT_PERIOD_GUARD</code> 或手动 deactivate/activate。</li>
     <li>同步/异步模式下行为一致，异步首次 fallback 不影响业务副作用。</li>
     <li>cache size、单函数 size、code memory 上限符合目标设备内存约束。</li>
     <li>裸核场景确认外部符号、registry section、代码内存权限、I/D cache 刷新路径。</li>

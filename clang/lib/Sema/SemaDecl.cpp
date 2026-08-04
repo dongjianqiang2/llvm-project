@@ -76,6 +76,14 @@ using namespace sema;
 // Defined in SemaEJIT.cpp.
 void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
 
+// Forward declaration for EmbeddedJIT always_inline conflict check.
+// Defined in SemaEJIT.cpp.
+void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD);
+
+// Forward declaration for EmbeddedJIT may_const write check.
+// Defined in SemaEJIT.cpp.
+void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body);
+
 Sema::DeclGroupPtrTy Sema::ConvertDeclToDeclGroup(Decl *Ptr, Decl *OwnedType) {
   if (OwnedType) {
     Decl *Group[2] = { OwnedType, Ptr };
@@ -10510,6 +10518,10 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
   // Enforce at most 4 ejit_period_arr_ind parameters per function.
   checkEjitPeriodArrIndLimit(*this, NewFD);
 
+  // An ejit_entry / ejit_period_lc function must not carry always_inline
+  // (it conflicts with the noinline CodeGen/PASS3 add for LTO survival).
+  checkEjitAlwaysInlineConflict(*this, NewFD);
+
   const auto *NewTVA = NewFD->getAttr<TargetVersionAttr>();
   if (Context.getTargetInfo().getTriple().isAArch64() && NewTVA &&
       !NewTVA->isDefaultVersion() &&
@@ -16619,6 +16631,13 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body,
       // Verify that gotos and switch cases don't jump into scopes illegally.
       if (FSI->NeedsScopeChecking() && !PP.isCodeCompletionEnabled())
         DiagnoseInvalidJumps(Body);
+
+      // EmbeddedJIT: warn if a non-ejit_period_lc function writes an
+      // ejit_may_const field (would break the JIT's time-window constancy
+      // assumption). The check no-ops unless ejit_may_const is in use and the
+      // warning is enabled.
+      if (FD && !FD->isInvalidDecl())
+        checkEjitMayConstWrites(*this, FD, Body);
 
       if (CXXDestructorDecl *Destructor = dyn_cast<CXXDestructorDecl>(dcl)) {
         if (!Destructor->getParent()->isDependentType())

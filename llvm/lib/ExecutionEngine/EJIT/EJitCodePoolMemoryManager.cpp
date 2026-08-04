@@ -44,8 +44,9 @@ class EJitCodePoolMemoryManager::InFlightAllocImpl
     : public JITLinkMemoryManager::InFlightAlloc {
 public:
   InFlightAllocImpl(EJitCodePoolMemoryManager &MM, LinkGraph &G, BasicLayout BL,
-                    void *Base, std::vector<ExecSegRange> ExecRanges)
-      : Pool(&MM.getPool()), G(&G), BL(std::move(BL)), Base(Base),
+                    void *Base, size_t Size,
+                    std::vector<ExecSegRange> ExecRanges)
+      : Pool(&MM.getPool()), G(&G), BL(std::move(BL)), Base(Base), Size(Size),
         ExecRanges(std::move(ExecRanges)) {}
 
   void finalize(OnFinalizedFunction OnFinalized) override {
@@ -59,7 +60,8 @@ public:
     // be looked up. If any page fails to seal we must not hand back a callable
     // allocation. (Legacy whole-pool seal is driven later, at lookup, by the
     // engine.) We do not invalidate the instruction cache here either \u2014
-    // enable_ex performs that sync on the target.
+    // the SRE seal callback does it (sealAndSyncCache: make page executable +
+    // sync caches).
     if (Pool->usesPageSeal()) {
       for (const ExecSegRange &R : ExecRanges)
         if (auto Err = Pool->sealCodeRange(reinterpret_cast<void *>(R.Addr),
@@ -67,27 +69,26 @@ public:
           EJIT_DIAG("finalize FAIL: sealCodeRange addr=0x%llx size=%llu",
                     static_cast<unsigned long long>(R.Addr),
                     static_cast<unsigned long long>(R.Size));
-          OnFinalized(std::move(Err));
+          OnFinalized(
+              joinErrors(std::move(Err), Pool->restoreRxRange(Base, Size)));
           return;
         }
     }
-    // Record the real, fully-written/relocated (and, in 4K mode, RX-sealed)
-    // executable extent so a later function-pointer lookup can recover the
-    // exact [codeStart, codeSize) a peer core must seal in its own translation
-    // context. This is the only source of the cross-core code range — it is
-    // never estimated or recovered by scanning machine code.
-    for (const ExecSegRange &R : ExecRanges)
-      Pool->recordFinalizedRange(reinterpret_cast<void *>(R.Addr),
-                                 static_cast<size_t>(R.Size));
     runFinalizeActions(
         G->allocActions(),
         [this, OnFinalized = std::move(OnFinalized)](
             Expected<std::vector<WrapperFunctionCall>> DeallocActions) mutable {
           if (!DeallocActions) {
             EJIT_DIAG("finalize FAIL: runFinalizeActions error base=%p", Base);
-            OnFinalized(DeallocActions.takeError());
+            OnFinalized(joinErrors(DeallocActions.takeError(),
+                                   Pool->restoreRxRange(Base, Size)));
             return;
           }
+          // Publish executable ranges only after every finalize action has
+          // succeeded. Failed allocations must never look callable to peers.
+          for (const ExecSegRange &R : ExecRanges)
+            Pool->recordFinalizedRange(reinterpret_cast<void *>(R.Addr),
+                                       static_cast<size_t>(R.Size));
           auto *Info = new FinalizedInfo();
           Info->Base = Base;
           Info->DeallocActions = std::move(*DeallocActions);
@@ -99,11 +100,12 @@ public:
   }
 
   void abandon(OnAbandonedFunction OnAbandoned) override {
-    // v1 does not reclaim pool memory; just drop the in-flight state.
+    // Pool bytes are not reclaimed, but fixed code-segment pages must not stay
+    // writable after an abandoned link.
 #ifndef NDEBUG
     G = nullptr;
 #endif
-    OnAbandoned(Error::success());
+    OnAbandoned(Pool->restoreRxRange(Base, Size));
   }
 
 private:
@@ -111,6 +113,7 @@ private:
   LinkGraph *G;
   BasicLayout BL;
   void *Base;
+  size_t Size;
   std::vector<ExecSegRange> ExecRanges;
 };
 
@@ -145,6 +148,16 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
       return;
     }
     Slab = *MemOrErr;
+    // Code-segment fixed-pool placement: the slab sits in the RX code segment,
+    // so make its pages writable (RX -> RW via enable_rw) BEFORE any write. In
+    // data-region placement this is a no-op (already RW). Failure means the slab
+    // is not writable - do not hand it back for JITLink to write into.
+    if (auto Err = Pool_.enableRwRange(Slab, static_cast<size_t>(Total))) {
+      EJIT_DIAG("allocate FAIL: enableRwRange total=%llu",
+                static_cast<unsigned long long>(Total));
+      OnAllocated(std::move(Err));
+      return;
+    }
     // Zero-fill the whole slab up-front (covers zero-fill segments and any
     // inter-segment page padding).
     std::memset(Slab, 0, static_cast<size_t>(Total));
@@ -184,13 +197,16 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   if (auto Err = BL.apply()) {
     EJIT_DIAG("allocate FAIL: BasicLayout apply error graph=%s",
               G.getName().c_str());
-    OnAllocated(std::move(Err));
+    OnAllocated(
+        joinErrors(std::move(Err),
+                   Pool_.restoreRxRange(Slab, static_cast<size_t>(Total))));
     return;
   }
 
   EJIT_DIAG("allocate OK: slab=%p total=%llu execRanges=%zu", Slab,
             static_cast<unsigned long long>(Total), ExecRanges.size());
   OnAllocated(std::make_unique<InFlightAllocImpl>(*this, G, std::move(BL), Slab,
+                                                  static_cast<size_t>(Total),
                                                   std::move(ExecRanges)));
 }
 

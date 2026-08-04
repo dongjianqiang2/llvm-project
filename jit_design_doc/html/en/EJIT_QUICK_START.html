@@ -27,7 +27,7 @@ ninja -C build_release_x86 LLVMEJIT lld</code></pre>
 
   <section class="step">
     <h2>1. Write a specializable config struct</h2>
-    <p>Mark the fields that stay stable within a time window as <code>ejit_may_const</code>. Do not mark frequently changing fields.</p>
+    <p>Mark the fields that stay stable within a time window as <code>EJIT_PERIOD_CONST</code>. Do not mark frequently changing fields.</p>
 <pre><code class="language-c">#include &lt;stdint.h&gt;
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 
@@ -35,23 +35,23 @@ ninja -C build_release_x86 LLVMEJIT lld</code></pre>
 #define MODE_SAFE 2
 
 struct CellConfig {
-    ejit_may_const uint32_t mode;
-    ejit_may_const uint32_t threshold;
+    EJIT_PERIOD_CONST uint32_t mode;
+    EJIT_PERIOD_CONST uint32_t threshold;
     uint32_t counter;
 };
 
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];</code></pre>
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];</code></pre>
   </section>
 
   <section class="step">
     <h2>2. Annotate the JIT entry function</h2>
-    <p><code>ejit_entry</code> marks the original function; <code>ejit_period_arr_ind(cell)</code> tells EJIT which parameter is the <code>cell</code> time-window index.</p>
+    <p><code>EJIT_ENTRY</code> marks the original function; <code>EJIT_DIM(cell)</code> tells EJIT which parameter is the <code>cell</code> time-window index.</p>
 <pre><code class="language-c">static void fast_path(int v);
 static void safe_path(int v);
 static void default_path(int v);
 
-ejit_entry
-void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+EJIT_ENTRY
+void process_cell(EJIT_DIM(cell) uint8_t cellIdx, int value) {
     if (g_cellCfg[cellIdx].mode == MODE_FAST) {
         fast_path(value + g_cellCfg[cellIdx].threshold);
     } else if (g_cellCfg[cellIdx].mode == MODE_SAFE) {
@@ -64,9 +64,9 @@ void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
 
   <section class="step">
     <h2>3. Annotate the config-modification function</h2>
-    <p>When modifying an <code>ejit_may_const</code> field, wrap the lifecycle with <code>ejit_period_lc</code>. The compiler automatically inserts deactivate/activate.</p>
-<pre><code class="language-c">ejit_period_lc(cell)
-void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+    <p>When modifying an <code>EJIT_PERIOD_CONST</code> field, wrap the lifecycle with <code>EJIT_PERIOD_GUARD</code>. The compiler automatically inserts deactivate/activate.</p>
+<pre><code class="language-c">EJIT_PERIOD_GUARD(cell)
+void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
                      uint32_t mode,
                      uint32_t threshold) {
     g_cellCfg[cellIdx].mode = mode;
@@ -130,9 +130,9 @@ void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
     <ol>
       <li>Forgetting to call <code>ejit_init</code>.</li>
       <li>Forgetting <code>ejit_activate("cell", idx)</code>.</li>
-      <li>Not marking fields with <code>ejit_may_const</code>.</li>
-      <li>Not marking the <code>ejit_entry</code> parameter with <code>ejit_period_arr_ind(cell)</code>.</li>
-      <li>Modifying config fields directly, without <code>ejit_period_lc</code> or manual deactivate/activate.</li>
+      <li>Not marking fields with <code>EJIT_PERIOD_CONST</code>.</li>
+      <li>Not marking the <code>EJIT_ENTRY</code> parameter with <code>EJIT_DIM(cell)</code>.</li>
+      <li>Modifying config fields directly, without <code>EJIT_PERIOD_GUARD</code> or manual deactivate/activate.</li>
     </ol>
     <div class="ok">If any step fails, EJIT's principle is to return NULL and fall back to AOT — it should never affect program correctness.</div>
   </section>

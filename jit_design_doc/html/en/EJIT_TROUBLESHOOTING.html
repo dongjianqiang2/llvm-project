@@ -36,8 +36,8 @@
   <section>
     <h2>2. Symptom: JIT never triggers</h2>
     <div class="check">
-      <h3>Check 1: Is the function marked <code>ejit_entry</code></h3>
-      <p>Without <code>ejit_entry</code>, the AOT pass will not embed bitcode or generate a wrapper for that function.</p>
+      <h3>Check 1: Is the function marked <code>EJIT_ENTRY</code></h3>
+      <p>Without <code>EJIT_ENTRY</code>, the AOT pass will not embed bitcode or generate a wrapper for that function.</p>
     </div>
     <div class="check">
       <h3>Check 2: Are you using a Clang with EJIT</h3>
@@ -83,10 +83,10 @@ assert(ejit_is_active("cell", idx));</code></pre>
   <section>
     <h2>4. Symptom: JIT works but branches are not folded</h2>
     <ol>
-      <li>Is the field annotated <code>ejit_may_const</code>?</li>
+      <li>Is the field annotated <code>EJIT_PERIOD_CONST</code>?</li>
       <li>Is the field <code>volatile</code>? volatile is not substituted.</li>
-      <li>Is the global object annotated <code>ejit_period(static)</code> or <code>ejit_period_arr(name)</code>?</li>
-      <li>Is the entry parameter annotated with the matching <code>ejit_period_arr_ind(name)</code>?</li>
+      <li>Is the global object annotated <code>EJIT_IN_PERIOD(static)</code> or <code>EJIT_IN_PERIOD_ARRAY(name)</code>?</li>
+      <li>Is the entry parameter annotated with the matching <code>EJIT_DIM(name)</code>?</li>
       <li>Is the access an analyzable global variable / GEP chain? Complex PHI/select pointers are skipped.</li>
       <li>Has the load in the callee already been inlined into the entry function's closure?</li>
       <li>Set <code>dumpJITDir</code> and inspect the IR after PASS6.</li>
@@ -98,10 +98,10 @@ ejit_init(&amp;cfg);</code></pre>
 
   <section>
     <h2>5. Symptom: Wrong results after modifying config</h2>
-    <p>Usually the old specialized code was not invalidated. When modifying <code>ejit_may_const</code> fields you must respect the lifecycle.</p>
+    <p>Usually the old specialized code was not invalidated. When modifying <code>EJIT_PERIOD_CONST</code> fields you must respect the lifecycle.</p>
 <pre><code class="language-c">// recommended: lifecycle function
-ejit_period_lc(cell)
-void update_cell(ejit_period_arr_ind(cell) uint8_t idx) {
+EJIT_PERIOD_GUARD(cell)
+void update_cell(EJIT_DIM(cell) uint8_t idx) {
     g_cellCfg[idx].mode = MODE_SAFE;
 }
 
@@ -116,14 +116,14 @@ ejit_activate("cell", idx);</code></pre>
     <h2>6. Compile-time diagnostic reference</h2>
     <table>
       <tr><th>Diagnostic</th><th>Cause</th><th>Fix</th></tr>
-      <tr><td>multiple period attributes</td><td>The same variable is marked by multiple periods</td><td>Keep only one <code>ejit_period</code> or <code>ejit_period_arr</code></td></tr>
-      <tr><td>period cannot be used on array</td><td>An array used <code>ejit_period</code></td><td>Use <code>ejit_period_arr</code></td></tr>
-      <tr><td>period_arr requires array</td><td>A scalar used <code>ejit_period_arr</code></td><td>For static scalar config use <code>ejit_period(static)</code></td></tr>
+      <tr><td>multiple period attributes</td><td>The same variable is marked by multiple periods</td><td>Keep only one <code>EJIT_IN_PERIOD</code> or <code>EJIT_IN_PERIOD_ARRAY</code></td></tr>
+      <tr><td>period cannot be used on array</td><td>An array used <code>EJIT_IN_PERIOD</code></td><td>Use <code>EJIT_IN_PERIOD_ARRAY</code></td></tr>
+      <tr><td>period_arr requires array</td><td>A scalar used <code>EJIT_IN_PERIOD_ARRAY</code></td><td>For static scalar config use <code>EJIT_IN_PERIOD(static)</code></td></tr>
       <tr><td>array too large</td><td>The fixed array exceeds the limit</td><td>Shrink the array or reorganize the data</td></tr>
       <tr><td>period_arr_ind must be integer</td><td>The dimension parameter is not an integer</td><td>Use <code>uint8_t</code>/<code>int</code></td></tr>
       <tr><td>too many dimensions</td><td>More than 4 dimensions</td><td>Split the function or merge business dimensions</td></tr>
-      <tr><td>recursive ejit_entry</td><td>The JIT entry is recursive</td><td>Remove the recursion or drop <code>ejit_entry</code></td></tr>
-      <tr><td>lc requires matching index</td><td>The lifecycle function has no matching index parameter</td><td>Add an <code>ejit_period_arr_ind(name)</code></td></tr>
+      <tr><td>recursive EJIT_ENTRY</td><td>The JIT entry is recursive</td><td>Remove the recursion or drop <code>EJIT_ENTRY</code></td></tr>
+      <tr><td>lc requires matching index</td><td>The lifecycle function has no matching index parameter</td><td>Add an <code>EJIT_DIM(name)</code></td></tr>
     </table>
   </section>
 

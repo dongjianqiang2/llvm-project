@@ -154,6 +154,18 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 // funcIndex global; a capacity failure is recorded so ejit_init can fail.
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
+// Register the wrapper's per-function inline-cache slot (@__ejit_icache_fn_<name>
+// global address) by name, with its dimensionality (number of ejit_dim params).
+// The runtime writes the frozen specialization pointer through the [D]^numDims
+// cell at [i0][i1]... on a successful resolve (icacheFill); the wrapper reads
+// the cell directly on the hit path (GEP + one atomic load + null-check +
+// indirect call, no ejit_icache_try call). Keys the slot by the SAME registry
+// funcIndex assigned by ejit_register_funcindex. Called by AOT auto-registration.
+// A null slot or capacity exhaustion is recorded; the base stays null and the
+// probe misses.
+void ejit_register_icache_slot(const char *funcName, void *slot,
+                               uint32_t numDims);
+
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
 // with multiple arrays is activated as a whole for that instance).
@@ -209,7 +221,22 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);
+
 unsigned ejit_taskpool_pending_count(void);
+
+// Diagnostic wrapper timing helpers. AOT wrappers only call these when built
+// with -ejit-wrapper-timing. Runtime aggregates repeated calls and prints one
+// summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples (default 10000; set to 0
+// to suppress periodic output) to avoid flooding board logs. The timestamp unit
+// is platform-defined: SRE/freestanding builds use SRE_CycleCountGet64(), host
+// fallback uses steady_clock nanoseconds.
+uint64_t ejit_taskpool_trace_now(void);
+void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
+                                 void *fnPtr, uint32_t bucketIndex,
+                                 uint64_t tBeforeLookup,
+                                 uint64_t tAfterLookup,
+                                 uint64_t tAfterFn,
+                                 uint64_t tAfterRelease);
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned ejit_taskpool_poll_one(void);
@@ -248,28 +275,19 @@ uint32_t ejit_taskpool_get_worker_core();
 /// non-empty, the next time a specialization whose entry name exactly matches
 /// \p name is JIT-compiled, the engine saves (in memory) its post-optimization
 /// IR and emitted assembly for later printing. Pass NULL or "" to disable
-/// further capture (already-saved entries are retained). The special name "*"
-/// is a wildcard that captures EVERY specialization (see ejit_dump_all). For
-/// performance analysis of individual functions.
+/// further capture (already-saved entries are retained). Capture is exact-name
+/// unless name is "*", which captures every specialization. Full payloads stay
+/// on the worker core and are never copied into shared taskpool memory.
 void ejit_dump_func(const char *name);
 
-/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
-/// NULL or "") through the platform log, one line per IR/ASM line, labeled
-/// "dump IR func=..." / "dump ASM func=...". Names with no saved capture are
-/// reported as missing. Paired with ejit_dump_func(): capture at compile
-/// time, print selectively later.
+/// Print the saved worker-local IR+ASM for \p name through the platform log.
+/// Passing NULL or "" prints every entry saved on the calling core. A
+/// non-worker core reports which worker owns the latest matching capture.
 void ejit_print_dumped(const char *name);
 
-/// Convenience switch to capture IR+ASM for ALL JIT-compiled specializations
-/// (equivalent to ejit_dump_func("*")). When \p enable is true, every
-/// specialization's post-optimization IR and emitted assembly is saved (one
-/// entry per function name, overwritten on re-compile, so the store is bounded
-/// by the number of distinct entry functions); print later with
-/// ejit_print_dumped(NULL). When false, capture is disabled. NOTE: on a
-/// cross-core shared taskpool the captures live on the owner core (the one
-/// that runs the JIT worker); print from the owner core to see all entries,
-/// or use ejit_dump_func(name) for a single function whose capture is shared
-/// across cores.
+/// Enable or disable capture of every JIT-compiled specialization. Equivalent
+/// to ejit_dump_func("*") when enabled. Captures are keyed by function name in
+/// the worker-local store and replaced when the same function is recompiled.
 void ejit_dump_all(bool enable);
 
 /// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
@@ -326,6 +344,16 @@ void ejit_print_code_pool_stats(void);
 /// arrayStates_ otherwise). Static vars are always active. For diagnosing
 /// "why did/didn't this period instance compile".
 void ejit_print_active(void);
+
+/// Print the EJIT runtime's build identity through the platform log: the LLVM
+/// release version (major.minor.patch, from llvm/Config/llvm-config.h) and the
+/// git commit + branch of the llvm-project source tree the runtime was built
+/// from. The commit is captured at build time, so it tracks the source HEAD
+/// even across incremental rebuilds. Needs no initialized runtime and is not
+/// gated on the diagnostic log level, so the build identity is always
+/// recoverable - useful for correlating a field device's behavior with the
+/// exact source it was compiled from.
+void ejit_print_version(void);
 
 // Cache
 void ejit_clear_cache(void);

@@ -32,7 +32,9 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
+#include <atomic>
 #include <cstdint>
 
 namespace llvm {
@@ -78,6 +80,109 @@ enum class EJitWorkerStep : uint32_t {
   Idle,     ///< Ready: queue empty this iteration.
   Exit,     ///< Failed/Stopping/Uninitialized: leave the loop.
 };
+
+//===----------------------------------------------------------------------===//
+// Per-function inline cache (v2: sticky monomorphic).
+//
+// A single global slot per funcIndex holding a FROZEN specialization pointer:
+// written once (first resolution, one-shot CAS) and read forever. No version /
+// dims / generation re-validation, no refill, and no release_read on the hit
+// path - the probe is a single acquire load + null check.
+//
+// Correctness rests on a hard precondition: every ejit_entry's specialization
+// is invariant for process lifetime (period toggles do not change the baked
+// code; each entry is monomorphic - always called with one dim identity). If
+// that ever fails the cache silently runs a stale specialization; the safety
+// gate below does NOT cover that, only UAF.
+//
+// Lifetime safety: JIT code is never physically freed in production (NO_RECLAIM
+// + no releaseFn_ wired), so a cached pointer can never dangle. v2 does NO
+// hazard-pointer retire and never will: if a releaser IS wired (code may be
+// freed) the safety gate (icacheReclamationSafe_) auto-disables the cache
+// (icacheTry always misses, icacheFill no-ops) to avoid UAF.
+//
+// The code-sharing gate is retained: a non-owner core may only read a cached
+// pointer when EJIT_SRE_SHARED_CODE_POINTERS is platform-validated; otherwise it
+// misses and falls back to ejit_taskpool_compile_or_get. Under sharing=OFF only
+// the owner core uses the cache, so one global slot suffices.
+//===----------------------------------------------------------------------===//
+#ifndef EJIT_ICACHE_FUNC_SLOTS
+#define EJIT_ICACHE_FUNC_SLOTS 64u
+#endif
+
+// Per-dim bound D of the multi-version inline cache (@__ejit_icache_fn_<name>
+// is a [D]^numDims array). MUST be a power of 2 (the hit path indexes with
+// shifts, no multiply). The CMake EJIT_ICACHE_DIM_SIZE var overrides this
+// default; the AOT pass reads the same value via -mllvm -ejit-icache-dim-size
+// so array layout and runtime linearization agree.
+#ifndef EJIT_ICACHE_DIM_SIZE
+#define EJIT_ICACHE_DIM_SIZE 16u
+#endif
+// Maximum number of ejit_dim params a cached ejit_entry may have. An entry
+// with more is a compile error (the wrapper is not emitted). 4 matches the
+// taskpool DimCount cap.
+#ifndef EJIT_ICACHE_MAX_DIMS
+#define EJIT_ICACHE_MAX_DIMS 4u
+#endif
+
+// Test/diagnostic: clear every icache slot. The slot-pointer table is
+// process-static storage shared across pool instances, so tests clear it
+// between cases to avoid stale cross-test leakage.
+void ejitIcacheClearAll();
+
+// Register a per-function icache slot: \p base is the address of the wrapper's
+// @__ejit_icache_fn_<name> global (an EJitAtomicUPtr, or a [D]^numDims array of
+// them for a multi-version entry), and \p numDims is its dimensionality. The
+// runtime writes the frozen specialization pointer through the cell at
+// [i0][i1]... (linearized from dims) on a successful resolve (icacheFill); the
+// wrapper reads the cell directly. Called from ejit_register_icache_slot
+// (name->funcIndex resolution) at ejit_auto_register / .ejit_period time.
+// No-op for an out-of-range funcIndex or null base.
+void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
+
+/// One L0 slot, sized to a cache line. The identity is stored in full and
+/// re-checked on every hit, because the index hash is not injective: it selects
+/// a slot and nothing more, so a collision must evict, never answer.
+struct EJitL0Entry {
+  uint32_t seq; ///< even = stable, odd = mid-write
+  uint32_t epoch;
+  uint32_t core;
+  uint32_t funcIndex;
+  uint32_t numDims;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  void *fn; ///< null = empty
+};
+constexpr uint32_t kEJitL0Slots = 64; // 4KB/core
+
+// The two globals below are core-private: deliberately NOT in
+// EJIT_SHARED_SECTION_ATTR, so each core's image holds its own copy and
+// probing generates no coherence traffic.
+extern EJitL0Entry gEJitL0[kEJitL0Slots];
+
+/// The shared state this core's table was armed against, null if it has not
+/// passed the L0 gates. Not a member of EJitSharedTaskPool: that object lives
+/// in the compile driver and is SHARED, so one core would arm the probe for
+/// cores that never qualified. Holding the pointer rather than a bool also
+/// rejects entries armed against a DIFFERENT blob, which the epoch cannot: a
+/// fresh blob starts from a low epoch a stale entry can match by coincidence.
+extern const void *gEJitL0State;
+
+inline bool dimsEqual(const EJitDimPair *a, const EJitDimPair *b,
+                      uint32_t numDims) {
+  for (uint32_t i = 0; i < numDims; ++i)
+    if (a[i].dimType != b[i].dimType || a[i].instanceId != b[i].instanceId)
+      return false;
+  return true;
+}
+
+/// Slot selection only; correctness never depends on this being injective.
+inline uint32_t ejitL0Index(uint32_t funcIndex, const EJitDimPair *dims,
+                            uint32_t numDims) {
+  uint32_t k = funcIndex * 2654435761u;
+  for (uint32_t i = 0; i < numDims; ++i)
+    k = (k ^ (dims[i].dimType * 2654435761u) ^ dims[i].instanceId) * 2654435761u;
+  return (k >> 26) & (kEJitL0Slots - 1);
+}
 
 class EJitSharedTaskPool {
 public:
@@ -149,10 +254,21 @@ public:
     NoState,             ///< bind() not called.
   };
 
+  /// Returned by every lookup, so its size is on the per-call hot path: AAPCS64
+  /// returns an aggregate <= 16 bytes in x0:x1 but passes anything larger via
+  /// sret, i.e. the callee stores the fields to caller stack and the caller
+  /// loads them straight back. Two things keep this at 16: fnPtr comes first,
+  /// so its alignment forces no padding ahead of it, and bucketIndex is a byte,
+  /// which leaves the three flags exactly filling the tail.
   struct CompileOrGetResult {
-    EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
     void *fnPtr = nullptr;
-    uint32_t bucketIndex = 0;
+    EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
+    /// Narrowed to a byte purely to close the struct at 16 bytes (see above);
+    /// it holds 0..kEJitSharedCacheBuckets, the latter being the out-of-range
+    /// sentinel. A byte field costs a plain ldrb/strb, whereas packing these
+    /// four into a bit-field would trade the sret round-trip for ubfx/bfi
+    /// masking on every access.
+    uint8_t bucketIndex = 0;
     bool hasReadToken = false;
     /// True when a Ready result exists but this core may not read the
     /// cross-core pointer (code sharing not platform-validated): a clean
@@ -167,6 +283,12 @@ public:
     /// mapping or the C ABI.
     bool fastPathTerminal = false;
   };
+  static_assert(kEJitSharedCacheBuckets < 255,
+                "bucketIndex is a uint8_t: the bucket count and its sentinel "
+                "must fit in a byte");
+  static_assert(sizeof(CompileOrGetResult) <= 16,
+                "CompileOrGetResult must stay <= 16 bytes so AAPCS returns it "
+                "in registers rather than through sret memory");
 
   EJitSharedTaskPool() = default;
   EJitSharedTaskPool(const EJitSharedTaskPool &) = delete;
@@ -198,6 +320,17 @@ public:
   void setReleaser(ReleaseCallback fn, void *ctx) {
     releaseFn_ = fn;
     releaseCtx_ = ctx;
+    // v2 inline cache never reclaims (no HP-scan retire, ever). A wired
+    // releaser means code may be freed while a cached fnPtr still pins it ->
+    // UAF. Auto-disable the cache while a releaser is wired. Production wires
+    // no releaser, so the gate stays open and the cache is unconditionally safe.
+    icacheReclamationSafe_ = (fn == nullptr);
+    if (fn) {
+      // The gate is evaluated at fill, so blocking new fills is not enough:
+      // entries armed earlier would keep serving code the releaser may free.
+      gEJitL0State = nullptr;
+      retireDispatchCache();
+    }
   }
   void setPrepareCodeCallback(PrepareCodeCallback fn, void *ctx) {
     prepareCodeFn_ = fn;
@@ -346,6 +479,78 @@ public:
   /// false for an out-of-range dimType/instanceId (never reads out of bounds).
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
 
+  //--- per-function inline cache (multi-version direct-indexed) --------------
+  // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
+  // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
+  // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
+  // acquire load + null-check + indirect call, NO ejit_icache_try call, NO
+  // per-call guards. icacheTry is retained for unit tests / diagnostics: on a
+  // hit it sets *outFn to the frozen specialization for the given dims (call
+  // with NO releaseRead) and returns true; on a miss returns false. It keeps
+  // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
+  // (the latter matters in non-shared test builds; the wrapper's inline probe is
+  // only enabled under EJIT_SRE_SHARED_CODE_POINTERS, where the gate is
+  // compile-time true).
+  bool icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
+                 uint32_t numDims, void **outFn);
+  // Fill the per-function icache cell at [i0][i1]... (linearized from \p dims,
+  // row-major, dim0 = leftmost ejit_dim param - MUST match the AOT array order)
+  // with a freshly resolved specialization (call on a taskpool cache hit or a
+  // successful compile). One-shot per cell: the first resolver for an identity
+  // wins; later resolves of the same identity (same invariant pointer) no-op;
+  // a different identity fills a different cell. No-op when reclamation is not
+  // safe, the function is unregistered (no base wired) or numDims mismatches,
+  // funcIndex is out of range, or fnPtr is null.
+  /// Per-core L0 dispatch cache: serves the (funcIndex, dims) identity the
+  /// bucket lookup would resolve, skipping the rwlock and the 16-slot scan.
+  ///
+  /// A hit hands back a raw fnPtr with NO read token, so it runs under the
+  /// same gate as the inline cache (icacheReclamationSafe_): with a releaser
+  /// wired, code can be freed under the caller and the cache auto-disables.
+  /// Callers receive kEJitNoBucket, which releaseRead() ignores.
+  bool l0Try(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+             void **outFn) {
+    // Inline: an out-of-line call costs more than the probe it performs.
+    if (!state_ || gEJitL0State != state_ || numDims > kEJitSharedMaxDims)
+      return false;
+    EJitL0Entry &e = gEJitL0[ejitL0Index(funcIndex, dims, numDims)];
+
+    // Seqlock: core-private storage excludes other CORES, not preemption or
+    // interrupts on this one, which could otherwise leave a stale identity
+    // beside a new fnPtr. Signal fences suffice -- same-core ordering, not
+    // cross-core visibility.
+    const uint32_t s0 = e.seq;
+    if (s0 & 1u)
+      return false;
+    std::atomic_signal_fence(std::memory_order_acquire);
+
+    void *fn = e.fn;
+    const bool match = fn != nullptr && e.epoch == state_->dispatchEpoch.loadRelaxed() &&
+                       e.core == EJitCoreId::current() &&
+                       e.funcIndex == funcIndex && e.numDims == numDims &&
+                       dimsEqual(e.dims, dims, numDims);
+
+    std::atomic_signal_fence(std::memory_order_acquire);
+    if (e.seq != s0 || !match)
+      return false;
+
+    EJIT_STAT_INC(state_->counters.cacheHits);
+    *outFn = fn;
+    return true;
+  }
+
+  void l0Fill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
+              uint32_t numDims);
+
+  /// Retire every core's L0. Must be called from every path that can
+  /// invalidate an (identity -> fnPtr) mapping from OUTSIDE the taskpool --
+  /// ejit_clear_cache(), ejit_invalidate(), a compile-mode change -- since
+  /// those bypass cachePublish() and setInstanceEnabled().
+  void retireDispatchCache();
+
+  void icacheFill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
+                  uint32_t numDims);
+
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();
   unsigned pollBudget(unsigned maxItems);
@@ -391,6 +596,15 @@ private:
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;
+    /// EJIT_SRE_TASKPOOL_NO_RECLAIM only: a validated seqlock hit that holds NO
+    /// read token. classifyHit() treats it as a CacheHit; bucketIndex is the
+    /// out-of-range sentinel (kEJitSharedCacheBuckets) so the wrapper's
+    /// releaseRead() is a safe no-op (its range check rejects it).
+    bool noTokenHit = false;
+    /// Set by peerPrepareSlot() when the pointer came from the out-of-line cold
+    /// first-touch path (which self-revalidates), so the seqlock caller must not
+    /// second-guess it with the bucket publishSeq check.
+    bool coldPrepared = false;
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -398,6 +612,26 @@ private:
                         uint32_t numDims) const;
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  /// Load-only seqlock cache lookup (no per-hit read-token RMW). Returned hits
+  /// carry no read token (SharedLookup::noTokenHit). See the .cpp for the
+  /// never-free safety precondition.
+  SharedLookup cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
+                              uint32_t numDims);
+  /// Fixed-dimension load-only seqlock specializations (0-2 dims). Same
+  /// never-free seqlock discipline as cacheLookupSeq() but with the identity
+  /// hashing, slot identity comparison, and version comparison unrolled exactly
+  /// like cacheLookup0D/1D/2D — so a NO_RECLAIM fixed-dimension caller reaches
+  /// the shared slot resolution without the generic numDims loop, the
+  /// slotIdentityMatches() call, or variable-length dims[] handling. Behavior
+  /// is identical to cacheLookupSeq() with the matching numDims. 3D/4D keep
+  /// using the generic cacheLookupSeq() (rare on the hot path).
+  SharedLookup cacheLookupSeq0D(uint32_t funcIndex);
+  SharedLookup cacheLookupSeq1D(uint32_t funcIndex, uint32_t dim0,
+                                uint32_t inst0);
+  SharedLookup cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
+                                uint32_t inst0, uint32_t dim1, uint32_t inst1);
+#endif
   /// Fixed-dimension specializations of cacheLookup() (0-4 dims). Identity
   /// hashing, slot identity comparison, and version comparison are all unrolled
   /// (no numDims loops, no dims[] indexing), so a cache hit reaches the shared
@@ -521,6 +755,11 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
+  // Inline-cache safety gate: true while the cache is safe to use (no releaser
+  // wired - the production default). v2 does no HP-scan retire, so a wired
+  // releaser (code may be freed) + the cache = UAF; the gate then auto-disables
+  // the cache. See setReleaser().
+  bool icacheReclamationSafe_ = true;
 
   // Worker observability + startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};

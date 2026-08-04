@@ -78,14 +78,18 @@
         "EJIT_CODE_POOL_4K_SEAL": "ON",
         "EJIT_SRE_CODE_POOL": "ON",
         "EJIT_SRE_CODE_POOL_PTNO": "8",
+        "EJIT_FIXED_CODE_POOL": "ON",
         "EJIT_SRE_TASKPOOL": "ON",
         "EJIT_SRE_SHARED_TASKPOOL": "ON",
+        "EJIT_SRE_TASKPOOL_NO_RECLAIM": "ON",
         "EJIT_SRE_SHARED_CODE_POINTERS": "ON",
         "EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE": "262144",
         "EJIT_SHARED_SECTION_ATTR": "__attribute__((section(\".mc_shared\")))",
         "EJIT_DIAG_ENABLE": "ON",
         "EJIT_SRE_DIAG": "ON",
-        "EJIT_DUMP_ASM": "ON"
+        "EJIT_DUMP_ASM": "ON",
+        "EJIT_STATS_ENABLE": "ON",
+        "EJIT_ICACHE_DIM_SIZE": "16"
       }
     },
     {

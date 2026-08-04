@@ -564,6 +564,20 @@ if(EJIT_SRE_DIAG)
   add_definitions(-DEJIT_SRE_DIAG)
 endif()
 
+# Embed the per-call taskpool statistics counters (cacheHits, compiles, disabled
+# instances, ...). Each increment is an acq_rel atomic RMW on a shared cache
+# line, and cacheHits is hit on every JIT call, so this is the dominant per-call
+# cost on a multi-core target. Default OFF: the increments compile out to zero
+# cost and ejit_taskpool_get_stats() reports zeros; the counter fields remain in
+# their structs so the shared-memory layout / stats ABI is unchanged. Enable
+# with -DEJIT_STATS_ENABLE=ON (or build.sh --stats) for bring-up/field diagnosis.
+# Note: the code-pool stats are a separate cold-path diagnostic and are always
+# compiled; this option gates only the taskpool counters.
+option(EJIT_STATS_ENABLE "Embed EJIT taskpool statistics counters (per-call atomic cost; default OFF)" OFF)
+if(EJIT_STATS_ENABLE)
+  add_definitions(-DEJIT_STATS_ENABLE)
+endif()
+
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
@@ -581,7 +595,7 @@ if(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
 endif()
 
 # Re-enable textual assembly (.s) emission for the JIT IR/ASM diagnostic dump
-# (ejit_dump_func / ejit_dump_all) even in an EJIT_TRIM_LLVM_BACKEND build.
+# (ejit_dump_func / ejit_print_dumped) even in an EJIT_TRIM_LLVM_BACKEND build.
 # The trim normally #ifdef's out the AssemblyFile codegen path
 # (CodeGenTargetMachineImpl::createMCStreamer) to save image size; this option
 # overrides that so ejit_print_dumped can produce ASM on target. Cost: the
@@ -647,6 +661,48 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
 endif()
 
+# Pin the JIT code pool to a fixed, linker-script-defined region
+# [__ejit_code_start, __ejit_code_end) (the .text.ejit output section) in the
+# executable CODE segment, instead of dynamic SRE_MemDbgAlloc. A fixed region
+# gives a stable JIT address range and, placed within +-128MiB of .text, lets
+# codegen use direct bl/adrp with no GOT/stubs. The code segment is RX by
+# default, so the runtime enable_rw's each slab (RX->RW) before writing and
+# enable_ex's it (RW->RX) at finalize. REQUIRES the platform to supply
+# enable_rw (symmetric to enable_ex); a missing enable_rw is a hard link error.
+# When the linker script does NOT define the symbols, the runtime falls back to
+# SRE_MemDbgAlloc, so this is backward-compatible.
+# Default OFF: existing dynamic-allocation behavior is unchanged.
+# Authoritative size is __ejit_code_end - __ejit_code_start from the .text.ejit
+# linker-script block (no CMake size knob).
+option(EJIT_FIXED_CODE_POOL
+  "Pin the JIT code pool to a fixed linker-script region in the RX code segment (enable_rw write / enable_ex seal) instead of dynamic SRE_MemDbgAlloc. Needs platform enable_rw." OFF)
+if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
+  message(STATUS "EmbeddedJIT: fixed code-pool region enabled (code segment, enable_rw) "
+                 "(size is __ejit_code_end - __ejit_code_start from the linker script's .text.ejit block)")
+endif()
+
+#===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
+# EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
+# @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2
+# so the hit path indexes with shifts (no multiply). The same value is applied
+# to the runtime (LLVMEJIT -DEJIT_ICACHE_DIM_SIZE) and to the AOT pass (clang
+# -mllvm -ejit-icache-dim-size) so the AOT array layout and the runtime
+# linearization agree. Default 8; the product overrides it via the preset.
+set(EJIT_ICACHE_DIM_SIZE 16 CACHE STRING
+  "EJIT inline-cache per-dim bound D (must be a power of 2)")
+if(EJIT_ICACHE_DIM_SIZE LESS 1)
+  message(FATAL_ERROR
+    "EJIT_ICACHE_DIM_SIZE must be a positive power of 2, got ${EJIT_ICACHE_DIM_SIZE}")
+endif()
+math(EXPR _ejit_icache_dim_pow2
+  "${EJIT_ICACHE_DIM_SIZE} & (${EJIT_ICACHE_DIM_SIZE} - 1)")
+if(NOT _ejit_icache_dim_pow2 EQUAL 0)
+  message(FATAL_ERROR
+    "EJIT_ICACHE_DIM_SIZE must be a power of 2 (the hit path uses shift indexing, no multiply), got ${EJIT_ICACHE_DIM_SIZE}")
+endif()
+unset(_ejit_icache_dim_pow2)
+message(STATUS "EmbeddedJIT: inline-cache per-dim bound D=${EJIT_ICACHE_DIM_SIZE}")
+
 #===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
 # Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
 # instead of calling the synchronous compile driver directly. Sync and async
@@ -676,16 +732,24 @@ set(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX "4096" CACHE STRING
 # platform MUST measure the worker stack peak and tune it.
 set(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE "1048576" CACHE STRING
   "EmbeddedJIT taskpool worker task stack size in bytes (default only)")
+set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS "1" CACHE STRING
+  "EmbeddedJIT worker work items between throttle delays (0 disables)")
+set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS "100" CACHE STRING
+  "EmbeddedJIT worker throttle delay in scheduler ticks after each burst (0 disables)")
 if(EJIT_SRE_TASKPOOL)
   add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
   add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
   add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
+  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS})
+  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})
   message(STATUS "EmbeddedJIT: SRE taskpool enabled "
                  "(buckets=${EJIT_SRE_TASKPOOL_BUCKETS}, "
                  "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
                  "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
-                 "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})")
+                 "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
+                 "throttleItems=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS}, "
+                 "throttleDelayTicks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})")
 endif()
 
 #===-- EmbeddedJIT cross-core SHARED taskpool -----------------------------===#
@@ -696,6 +760,8 @@ endif()
 # requires EJIT_SRE_TASKPOOL (it reuses the request/identity model and macros).
 option(EJIT_SRE_SHARED_TASKPOOL
   "Enable the EmbeddedJIT cross-core shared taskpool (single shared worker owner)" ON)
+option(EJIT_SRE_TASKPOOL_NO_RECLAIM
+  "Use load-only shared-cache reads when published JIT code is never reclaimed" OFF)
 # Fixed cache slots per bucket in the shared POD cache (no std::unordered_map can
 # live in shared memory, so each bucket is a fixed slot array).
 set(EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS "16" CACHE STRING
@@ -753,6 +819,19 @@ if(EJIT_SRE_SHARED_TASKPOOL)
                  "platformCoreId=${EJIT_FREESTANDING}, "
                  "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
                  "sharedSection=${_ejit_shared_section})")
+endif()
+
+if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)
+  message(FATAL_ERROR
+    "EJIT_SRE_TASKPOOL_NO_RECLAIM requires EJIT_SRE_SHARED_TASKPOOL=ON")
+endif()
+
+# The fixed region is process-global, but its bump cursor belongs to one
+# EJitCodePoolManager. Require the shared taskpool's elected single owner so
+# independent managers cannot allocate the same fixed addresses.
+if(EJIT_FIXED_CODE_POOL AND NOT EJIT_SRE_SHARED_TASKPOOL)
+  message(FATAL_ERROR
+    "EJIT_FIXED_CODE_POOL requires EJIT_SRE_SHARED_TASKPOOL=ON so exactly one owner manages the fixed-region bump cursor")
 endif()
 
 set(LLVM_TARGETS_TO_BUILD "all"

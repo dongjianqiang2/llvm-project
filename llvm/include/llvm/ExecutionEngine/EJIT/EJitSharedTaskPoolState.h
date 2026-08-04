@@ -73,40 +73,27 @@
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
-// Per-slot IR/ASM text capacity in the cross-core dump table (each slot holds
-// one captured function's name + IR + ASM, truncated to this size per text).
-#ifndef EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES
-#define EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES 8192u
-#endif
-// Number of per-name result slots in the cross-core dump table. Each captured
-// specialization occupies one slot keyed by entry name; when full, the oldest
-// slot is round-robin evicted. Covers this many distinct functions for
-// cross-core ejit_print_dumped(name) retrieval. NOTE: the table lives in the
-// fixed shared section, so sizeof(EJitSharedTaskPoolState) scales with
-// SLOT_COUNT * (2 * SLOT_TEXT_BYTES); resize the linker section accordingly.
-#ifndef EJIT_SRE_SHARED_DUMP_SLOT_COUNT
-#define EJIT_SRE_SHARED_DUMP_SLOT_COUNT 50u
-#endif
-
 namespace llvm {
 namespace ejit {
 
 //===----------------------------------------------------------------------===//
 // Fixed capacities and the cache-line size used to avoid false sharing.
 //===----------------------------------------------------------------------===//
+/// Max dims in one identity; matches EJitSharedCacheSlot::dims.
+constexpr uint32_t kEJitSharedMaxDims = 4u;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
 constexpr uint32_t kEJitSharedInstances = 256u;
 constexpr uint32_t kEJitSharedMaxFuncIndex = EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX;
 constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
+
+/// Out-bucket for a lookup served without a read token (the per-core L0).
+/// releaseRead() ignores it, so the caller shape -- call fn, then release --
+/// needs no wrapper change.
+constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
-constexpr uint32_t kEJitSharedDumpNameBytes =
-    EJIT_SRE_SHARED_DUMP_NAME_BYTES;
-constexpr uint32_t kEJitSharedDumpSlotTextBytes =
-    EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES;
-constexpr uint32_t kEJitSharedDumpSlotCount =
-    EJIT_SRE_SHARED_DUMP_SLOT_COUNT;
+constexpr uint32_t kEJitSharedDumpNameBytes = EJIT_SRE_SHARED_DUMP_NAME_BYTES;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -188,7 +175,16 @@ struct EJitSharedCacheSlot {
 //===----------------------------------------------------------------------===//
 struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {
   EJitAtomicU32 writeFlag; ///< 0 = free, 1 = writer holds/pending
-  EJitAtomicU32 readers;   ///< active reader count
+  EJitAtomicU32 readers;   ///< active reader count (token model)
+  /// Monotonic publish sequence for the EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock
+  /// reader: the publisher makes it ODD before writing a slot and EVEN after
+  /// (see bucketWrite/bucketWriteRelease). A load-only reader captures it before
+  /// its scan and re-checks it after loading fnPtr; an unequal/odd value means a
+  /// publish raced the read, so the reader discards and cleanly falls back. Zero
+  /// per-hit atomic RMW on this line (unlike the token's readers counter). Only
+  /// bumped in a NO_RECLAIM build; stays 0 otherwise, so the default token path
+  /// is byte-for-byte unchanged.
+  EJitAtomicU32 publishSeq;
   EJitSharedCacheSlot slots[kEJitSharedCacheSlots];
 };
 
@@ -219,45 +215,37 @@ struct EJitSharedPoolSplit {
 };
 
 //===----------------------------------------------------------------------===//
-// EJitSharedDumpState: fixed-size cross-core diagnostic exchange.
+// EJitSharedDumpState: fixed-size cross-core diagnostic metadata.
 //
-// The owner worker captures IR/ASM in its private ORC path, but shell/debug
-// requests can arrive on a different core. std::map/std::string cannot live in
-// shared memory, so the shared path uses one bounded filter plus a bounded
-// per-name result TABLE: each captured specialization occupies one slot keyed
-// by entry name; when the table is full the oldest slot is round-robin
-// evicted. This lets a non-owner core retrieve any recently-captured function
-// by name (not just the latest). It is diagnostic-only: long IR/ASM is
-// truncated (per-slot) instead of blocking normal JIT progress; the full,
-// untruncated IR/ASM remains available on the owner core via the per-core
-// gDumpStore + ejit_print_dumped(NULL).
+// Full IR/ASM text remains in the owner worker's private gDumpStore. Shared
+// memory carries only the active filter and enough metadata to direct a
+// non-owner caller to the worker core that owns the latest capture.
 //===----------------------------------------------------------------------===//
-struct alignas(kEJitSharedCacheLine) EJitSharedDumpSlot {
-  EJitAtomicU32 valid;       ///< 1 => name/ir/asm hold a capture
-  EJitAtomicU32 truncated;   ///< bit0 IR, bit1 ASM, bit2 name truncated
-  uint32_t nameLen;
+struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {
+  EJitAtomicU32 lock;          ///< 0 free, 1 locked by filter/capture/print
+  EJitAtomicU32 filterEnabled; ///< 1 => filterName is active
+  EJitAtomicU32 hasDump;       ///< 1 => latest-capture metadata is valid
+  EJitAtomicU32 status;        ///< bit2 => resultName was truncated
+  uint32_t filterLen;
+  uint32_t resultNameLen;
   uint32_t irSize;
   uint32_t asmSize;
   uint32_t keyHi;
   uint32_t keyLo;
-  uint32_t reserved0;
-  char name[kEJitSharedDumpNameBytes];
-  char ir[kEJitSharedDumpSlotTextBytes];
-  char asmText[kEJitSharedDumpSlotTextBytes];
-};
-
-struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {
-  EJitAtomicU32 lock;          ///< 0 free, 1 locked by filter/capture/print
-  EJitAtomicU32 filterEnabled; ///< 1 => filterName is active
-  uint32_t filterLen;
-  uint32_t nextSlot;           ///< round-robin eviction cursor (under lock)
+  uint32_t workerCore;
   uint32_t reserved0;
   char filterName[kEJitSharedDumpNameBytes];
-  EJitSharedDumpSlot slots[kEJitSharedDumpSlotCount];
+  char resultName[kEJitSharedDumpNameBytes];
 };
 
 //===----------------------------------------------------------------------===//
 // EJitSharedCounters: lock-free statistics, all monotonic.
+//
+// The increments are gated by EJIT_STATS_ENABLE (see EJitStats.h): when that
+// macro is undefined the EJIT_STAT_INC* call sites compile to nothing, so the
+// per-call cacheHits RMW - the steady-state hot-path cost - vanishes. The
+// FIELDS always remain here (shared-memory layout / stats ABI is stable); with
+// stats off they simply stay zero and ejit_taskpool_get_stats() reports zeros.
 //===----------------------------------------------------------------------===//
 struct EJitSharedCounters {
   EJitAtomicU64 cacheHits;
@@ -337,6 +325,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU64 workerTaskId;       ///< platform worker task id (diagnostic)
   EJitAtomicU64 registrationFingerprint; ///< owner funcIndex/dimType mapping
                                          ///< digest; peers validate on attach
+  /// Bumps on any event that can invalidate a cached (identity -> fnPtr)
+  /// mapping: publish, eviction, version change, (re)initialization. Per-core
+  /// L0 entries record the epoch they were filled at and are discarded on a
+  /// mismatch. Read once per dispatch, written only on those rare events, so
+  /// the line stays Shared in every core's L1 rather than bouncing. Sits in
+  /// this cache line's padding, so sizeof() and later offsets are unchanged.
+  EJitAtomicU32 dispatchEpoch;
 
   //--- SwitchController state (own cache line)
   alignas(kEJitSharedCacheLine)
@@ -347,6 +342,12 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.
                                       ///< Reset on each (re)initialization.
+                                      ///< Stats-only: this field and the
+                                      ///< instanceDisabledPreActivate increment
+                                      ///< are read/written only under
+                                      ///< EJIT_STATS_ENABLE (see EJitStats.h);
+                                      ///< with stats off the acquire-load gate
+                                      ///< on the disabled path is compiled out.
 
   //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
   //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen

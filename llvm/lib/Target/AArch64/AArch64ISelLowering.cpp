@@ -2777,7 +2777,15 @@ bool AArch64TargetLowering::allowsMisalignedMemoryAccesses(
 FastISel *
 AArch64TargetLowering::createFastISel(FunctionLoweringInfo &funcInfo,
                                       const TargetLibraryInfo *libInfo) const {
+#ifndef EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
   return AArch64::createFastISel(funcInfo, libInfo);
+#else
+  // FastISel is trimmed (AArch64FastISel.cpp is not built). A null FastISel is
+  // a supported SelectionDAGISel fallback, so codegen uses SelectionDAG.
+  (void)funcInfo;
+  (void)libInfo;
+  return nullptr;
+#endif
 }
 
 MachineBasicBlock *

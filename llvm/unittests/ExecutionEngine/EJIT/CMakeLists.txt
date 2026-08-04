@@ -1,5 +1,6 @@
 set(LLVM_LINK_COMPONENTS
   Analysis
+  AsmParser
   Core
   EmbeddedJIT
   EJIT
@@ -12,6 +13,8 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
+  EJitFieldOffsetTest.cpp
+  EJitLinkOptimizationPluginTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
@@ -54,6 +57,7 @@ set(LLVM_LINK_COMPONENTS "${EJIT_TASKPOOL_LINK_COMPONENTS_SAVED}")
 target_compile_definitions(EJITTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
+  EJIT_STATS_ENABLE
   EJIT_SRE_TASKPOOL_BUCKETS=32
   EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
   EJIT_TASKPOOL_SOURCE_DIR="${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT"
@@ -88,10 +92,24 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL
   EJIT_SRE_SHARED_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
+  EJIT_STATS_ENABLE
   EJIT_SRE_TASKPOOL_BUCKETS=32
   EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
   EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
   )
+
+# Opt-in: build the shared taskpool tests with the load-only NO_RECLAIM seqlock
+# hit path (and cross-core code sharing, so the peer path is exercised too), to
+# validate the optimization. Configure a separate build dir with
+# -DEJIT_TEST_NO_RECLAIM=ON. Off by default so the normal build tests the token
+# path.
+option(EJIT_TEST_NO_RECLAIM
+  "Build EJITSharedTaskPoolTests with EJIT_SRE_TASKPOOL_NO_RECLAIM" OFF)
+if(EJIT_TEST_NO_RECLAIM)
+  target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
+    EJIT_SRE_TASKPOOL_NO_RECLAIM
+    EJIT_SRE_SHARED_CODE_POINTERS)
+endif()
 
 # Convenience target: build + run only the cross-core shared taskpool tests.
 add_custom_target(check-ejit-shared-taskpool
@@ -100,3 +118,36 @@ add_custom_target(check-ejit-shared-taskpool
   COMMENT "Running EmbeddedJIT cross-core shared taskpool unit tests"
   USES_TERMINAL
   )
+
+# Optional cache-query microbenchmark (NOT a gtest binary: standalone main()).
+# Off by default so it never bloats normal test builds. Enable with
+# -DEJIT_BUILD_CACHE_QUERY_BENCH=ON to build a host-runnable binary that prints a
+# machine-readable table of the 0D/1D/2D owner/peer cache-hit query cost by slot
+# depth (drive it under `perf stat -e instructions` for per-hit attribution).
+# Links only the shared-taskpool sources + platform, like the tests above.
+option(EJIT_BUILD_CACHE_QUERY_BENCH
+  "Build the EJIT shared taskpool cache-query microbenchmark" OFF)
+if(EJIT_BUILD_CACHE_QUERY_BENCH)
+  add_llvm_executable(EJITSharedCacheQueryBench
+    EJitSharedCacheQueryBench.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+
+    PARTIAL_SOURCES_INTENDED
+    )
+  target_compile_definitions(EJITSharedCacheQueryBench PRIVATE
+    EJIT_SRE_TASKPOOL
+    EJIT_SRE_SHARED_TASKPOOL
+    EJIT_SRE_TASKPOOL_TESTING
+    EJIT_SRE_TASKPOOL_BUCKETS=32
+    EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+    )
+  # Opt-in: build the benchmark with the load-only NO_RECLAIM seqlock hit path
+  # + cross-core code sharing (so peer hits and the fixed-dim seqlock lookups
+  # are exercised), mirroring EJIT_TEST_NO_RECLAIM above.
+  if(EJIT_TEST_NO_RECLAIM)
+    target_compile_definitions(EJITSharedCacheQueryBench PRIVATE
+      EJIT_SRE_TASKPOOL_NO_RECLAIM
+      EJIT_SRE_SHARED_CODE_POINTERS)
+  endif()
+endif()

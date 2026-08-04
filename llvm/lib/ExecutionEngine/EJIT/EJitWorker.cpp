@@ -7,6 +7,14 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS 1u
+#endif
+
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS 100u
+#endif
+
 bool EJitWorker::start() {
   // Idempotent: a second start while already owning a task is a no-op success.
   uint32_t expected = 0;
@@ -45,10 +53,17 @@ void EJitWorker::taskEntry(void *ctx) { static_cast<EJitWorker *>(ctx)->run(); }
 void EJitWorker::run() {
   EJIT_DIAG("worker loop enter");
   running_.storeRelease(1);
+  uint32_t consumedSinceThrottle = 0;
   while (!task_.stopRequested()) {
-    if (pool_.pollOne())
+    if (pool_.pollOne()) {
       processed_.fetchAdd(1);
-    else {
+      if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS != 0u &&
+          EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u &&
+          ++consumedSinceThrottle >= EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS) {
+        consumedSinceThrottle = 0;
+        EJitSreTask::delay(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS);
+      }
+    } else {
       spins_.fetchAdd(1);
       // Idle hint so the single consumer does not spin the core at full speed.
       EJitSreTask::yield();

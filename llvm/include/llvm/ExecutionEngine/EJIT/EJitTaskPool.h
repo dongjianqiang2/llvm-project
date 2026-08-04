@@ -248,6 +248,11 @@ private:
 #endif
 };
 
+/// Monotonic taskpool statistics. The increments are gated by EJIT_STATS_ENABLE
+/// (see EJitStats.h): with stats off the EJIT_STAT_INC call sites compile to
+/// nothing (zero per-call atomic cost) and these fields stay zero; the fields
+/// remain so getStats() still works (reporting zeros). Default OFF for
+/// production.
 struct EJitTaskPoolCounters {
   EJitAtomicU64 cacheHits;
   EJitAtomicU64 asyncCompiles;

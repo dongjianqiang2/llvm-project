@@ -26,12 +26,12 @@
     <table>
       <thead><tr><th>Macro</th><th>Applies to</th><th>Purpose</th><th>Example</th><th>Key constraints</th></tr></thead>
       <tbody>
-        <tr><td><code>ejit_may_const</code></td><td>Struct field</td><td>Readable as a constant within the time window</td><td><code>ejit_may_const uint32_t mode;</code></td><td><code>volatile</code> is skipped; supports integer/bool/float/nested struct/array</td></tr>
-        <tr><td><code>ejit_period(static)</code></td><td>Non-array global variable</td><td>Config that does not change at runtime, always active</td><td><code>ejit_period(static) Cfg g_cfg;</code></td><td>Currently recommended to use only the <code>static</code> scalar time window</td></tr>
-        <tr><td><code>ejit_period_arr(name)</code></td><td>Global array / struct pointer</td><td>A time-window array activated independently per index</td><td><code>ejit_period_arr(cell) Cfg g_cells[16];</code></td><td>Fixed arrays should stay &lt;100; at most 1024 globals</td></tr>
-        <tr><td><code>ejit_entry</code></td><td>Function</td><td>JIT specialization entry</td><td><code>ejit_entry void f(...)</code></td><td>No recursion; side effects should be idempotent in async mode</td></tr>
-        <tr><td><code>ejit_period_arr_ind(name)</code></td><td>Function parameter</td><td>Declares a specialization dimension index</td><td><code>ejit_period_arr_ind(cell) uint8_t idx</code></td><td>Must be an integer; at most 4 dimensions per function</td></tr>
-        <tr><td><code>ejit_period_lc(name)</code></td><td>Function</td><td>Lifecycle function that modifies time-window data</td><td><code>ejit_period_lc(cell) void update(...)</code></td><td>Must have a matching <code>ejit_period_arr_ind</code> parameter; multiple periods allowed</td></tr>
+        <tr><td><code>EJIT_PERIOD_CONST</code></td><td>Struct field</td><td>Readable as a constant within the time window</td><td><code>EJIT_PERIOD_CONST uint32_t mode;</code></td><td><code>volatile</code> is skipped; supports integer/bool/float/nested struct/array</td></tr>
+        <tr><td><code>EJIT_IN_PERIOD(static)</code></td><td>Non-array global variable</td><td>Config that does not change at runtime, always active</td><td><code>EJIT_IN_PERIOD(static) Cfg g_cfg;</code></td><td>Currently recommended to use only the <code>static</code> scalar time window</td></tr>
+        <tr><td><code>EJIT_IN_PERIOD_ARRAY(name)</code></td><td>Global array / struct pointer</td><td>A time-window array activated independently per index</td><td><code>EJIT_IN_PERIOD_ARRAY(cell) Cfg g_cells[16];</code></td><td>Fixed arrays should stay &lt;100; at most 1024 globals</td></tr>
+        <tr><td><code>EJIT_ENTRY</code></td><td>Function</td><td>JIT specialization entry</td><td><code>EJIT_ENTRY void f(...)</code></td><td>No recursion; side effects should be idempotent in async mode</td></tr>
+        <tr><td><code>EJIT_DIM(name)</code></td><td>Function parameter</td><td>Declares a specialization dimension index</td><td><code>EJIT_DIM(cell) uint8_t idx</code></td><td>Must be an integer; at most 4 dimensions per function</td></tr>
+        <tr><td><code>EJIT_PERIOD_GUARD(name)</code></td><td>Function</td><td>Lifecycle function that modifies time-window data</td><td><code>EJIT_PERIOD_GUARD(cell) void update(...)</code></td><td>Must have a matching <code>EJIT_DIM</code> parameter; multiple periods allowed</td></tr>
       </tbody>
     </table>
   </section>
@@ -85,7 +85,7 @@ typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_leve
     <h2>5. Initialization / shutdown</h2>
 <pre><code class="language-c">ejit_status_t ejit_init(const ejit_config_t *config);
 void ejit_shutdown(void);</code></pre>
-    <p>You must call <code>ejit_init</code> before calling any <code>ejit_entry</code> function. Pass <code>NULL</code> to use default config. Call <code>ejit_shutdown</code> when the program exits or EJIT is no longer needed.</p>
+    <p>You must call <code>ejit_init</code> before calling any <code>EJIT_ENTRY</code> function. Pass <code>NULL</code> to use default config. Call <code>ejit_shutdown</code> when the program exits or EJIT is no longer needed.</p>
   </section>
 
   <section>
@@ -154,7 +154,7 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);</code></pre>
 // initialize config data
 g_cellCfg[idx].mode = MODE_FAST;
 
-// activate, then call ejit_entry
+// activate, then call EJIT_ENTRY
 ejit_activate("cell", idx);
 process_cell(idx, value);
 

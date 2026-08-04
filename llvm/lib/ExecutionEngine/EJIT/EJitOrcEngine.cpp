@@ -1,31 +1,40 @@
 //===-- EJitOrcEngine.cpp - OrcJIT Engine Wrapper -------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitLinkDiagPlugin.h"
+#include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#include "llvm/Bitcode/BitcodeReader.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
+
+#ifdef EJIT_FREESTANDING
+extern "C" uint32_t SRE_TaskDelay(uint32_t tick);
+#endif
 
 #ifdef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitBareMetal.h"
@@ -36,7 +45,6 @@
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
-#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
@@ -141,20 +149,41 @@ using DumpMutexType = DumpSpinLock;
 using DumpMutexType = std::mutex;
 #endif
 
-// Process-wide function-name filter for the IR+ASM diagnostic dump. Set via
-// ejit_dump_func() / setDumpFuncFilter(). Read in the IR transform layer.
-// A diagnostic: set before triggering the compile of interest; concurrent
-// set/read is benign (worst case a missed or extra dump).
+#ifndef EJIT_DUMP_PRINT_THROTTLE_LINES
+#define EJIT_DUMP_PRINT_THROTTLE_LINES 16
+#endif
+
+#ifndef EJIT_DUMP_PRINT_THROTTLE_TICKS
+#define EJIT_DUMP_PRINT_THROTTLE_TICKS 50
+#endif
+
+static void throttleDumpPrint(unsigned printedLines) {
+#if defined(EJIT_FREESTANDING) && EJIT_DUMP_PRINT_THROTTLE_LINES > 0 &&        \
+    EJIT_DUMP_PRINT_THROTTLE_TICKS > 0
+  if (printedLines != 0 &&
+      (printedLines % EJIT_DUMP_PRINT_THROTTLE_LINES) == 0)
+    (void)SRE_TaskDelay(EJIT_DUMP_PRINT_THROTTLE_TICKS);
+#else
+  (void)printedLines;
+#endif
+}
+
+// Process-wide function-name filter and payload store. The mutex protects both
+// because the shell may update/print while the worker captures.
+static DumpMutexType gDumpMutex;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 EJitSharedTaskPoolState *gDumpSharedState = nullptr;
 #endif
 static std::string gDumpFuncFilter;
 
 void setDumpFuncFilter(const std::string &name) {
-  gDumpFuncFilter = name;
-  EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
-            gDumpFuncFilter.empty() ? "(off)" : gDumpFuncFilter.c_str(),
-            (void *)&gDumpFuncFilter);
+  {
+    std::lock_guard<DumpMutexType> lock(gDumpMutex);
+    gDumpFuncFilter = name;
+    EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
+                    gDumpFuncFilter.empty() ? "(off)" : gDumpFuncFilter.c_str(),
+                    (void *)&gDumpFuncFilter);
+  }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (gDumpSharedState) {
     EJitSharedDumpState &D = gDumpSharedState->dump;
@@ -170,15 +199,15 @@ void setDumpFuncFilter(const std::string &name) {
     }
     D.filterName[len] = 0;
     D.filterLen = len;
-    // A filter change invalidates all captured slots so stale results don't
-    // surface after re-arming.
-    for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-      D.slots[s].valid.storeRelease(0);
-      D.slots[s].nameLen = 0;
-      D.slots[s].irSize = 0;
-      D.slots[s].asmSize = 0;
-    }
-    D.nextSlot = 0;
+    D.hasDump.storeRelease(0);
+    D.status.storeRelease(0);
+    D.resultNameLen = 0;
+    D.irSize = 0;
+    D.asmSize = 0;
+    D.keyHi = 0;
+    D.keyLo = 0;
+    D.workerCore = kEJitInvalidCoreId;
+    D.resultName[0] = 0;
     D.filterEnabled.storeRelease(len ? 1u : 0u);
     D.lock.storeRelease(0);
     EJIT_DIAG_DEBUG("set_dump_filter shared enabled=%u len=%u &shared=%p",
@@ -191,13 +220,18 @@ void setDumpFuncFilter(const std::string &name) {
 void setDumpSharedState(EJitSharedTaskPoolState *state) {
   gDumpSharedState = state;
   EJIT_DIAG_DEBUG("set_dump_shared_state state=%p", (void *)state);
-  // If a filter was set before the shared state was bound — e.g. ejit_dump_all
-  // or ejit_dump_func called during the init_array phase, before ejit_init —
+  // If a filter was set before the shared state was bound — e.g. ejit_dump_func
+  // called during the init_array phase, before ejit_init —
   // propagate it into the now-bound shared state. Otherwise the owner worker
   // (possibly a different core) sees an empty shared filter and never captures,
   // even though the producer thinks dump is armed.
-  if (gDumpSharedState && !gDumpFuncFilter.empty())
-    setDumpFuncFilter(gDumpFuncFilter);
+  std::string filter;
+  {
+    std::lock_guard<DumpMutexType> lock(gDumpMutex);
+    filter = gDumpFuncFilter;
+  }
+  if (gDumpSharedState && !filter.empty())
+    setDumpFuncFilter(filter);
 }
 
 static void sharedDumpLock(EJitSharedDumpState &D) {
@@ -234,6 +268,7 @@ static bool getActiveDumpFilter(std::string &out) {
   if (getSharedDumpFilter(out))
     return true;
 #endif
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
   if (gDumpFuncFilter.empty())
     return false;
   out = gDumpFuncFilter;
@@ -252,13 +287,13 @@ struct DumpEntry {
 // thread). Guarded by gDumpMutex. These are ordinary process statics, not part
 // of the shared taskpool state; cross-core visibility depends on the worker
 // running in the same process image (addresses are logged to diagnose this).
-static DumpMutexType gDumpMutex;
 static std::map<std::string, DumpEntry> gDumpStore;
 
 static void dumpBytesSafe(const char *label, const char *data, size_t n) {
   EJIT_DIAG("=== %s begin size=%u ===", label, (unsigned)n);
   size_t i = 0;
   unsigned lineNo = 0;
+  unsigned printedLines = 0;
   while (i < n) {
     size_t lineEnd = i;
     while (lineEnd < n && data[lineEnd] != '\n')
@@ -275,6 +310,7 @@ static void dumpBytesSafe(const char *label, const char *data, size_t n) {
         pos += chunk;
       }
     }
+    throttleDumpPrint(++printedLines);
     ++lineNo;
     i = lineEnd + 1;
   }
@@ -304,95 +340,82 @@ static uint32_t copyDumpBytes(char *dst, uint32_t cap, const char *src,
   return n;
 }
 
-static void captureSharedDump(const std::string &fnName, uint64_t cacheKey,
-                              const std::string &IR, const std::string &ASM) {
+static void captureSharedDumpMetadata(const std::string &fnName,
+                                      uint64_t cacheKey, size_t irSize,
+                                      size_t asmSize) {
   if (!gDumpSharedState)
     return;
   EJitSharedDumpState &D = gDumpSharedState->dump;
+  uint32_t core = EJitCoreId::current();
   sharedDumpLock(D);
-  // Find an existing slot for fnName (overwrite it in place). Distinct names
-  // accumulate; a repeat re-capture refreshes the same slot rather than
-  // consuming another.
-  uint32_t target = kEJitSharedDumpSlotCount;
-  for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-    if (D.slots[s].valid.loadRelaxed() != 0 &&
-        D.slots[s].nameLen == fnName.size() &&
-        std::memcmp(D.slots[s].name, fnName.data(), fnName.size()) == 0) {
-      target = s;
-      break;
-    }
-  }
-  if (target == kEJitSharedDumpSlotCount) {
-    // New name: prefer a free slot, else round-robin evict the oldest.
-    target = D.nextSlot;
-    for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-      uint32_t idx = (D.nextSlot + s) % kEJitSharedDumpSlotCount;
-      if (D.slots[idx].valid.loadRelaxed() == 0) {
-        target = idx;
-        break;
-      }
-    }
-    D.nextSlot = (target + 1) % kEJitSharedDumpSlotCount;
-  }
-  EJitSharedDumpSlot &Slot = D.slots[target];
-  bool nameTrunc = false, irTrunc = false, asmTrunc = false;
-  Slot.valid.storeRelease(0); // invalidate while writing (readers hold the lock)
-  Slot.nameLen = copyDumpBytes(Slot.name, kEJitSharedDumpNameBytes,
-                               fnName.data(), fnName.size(), nameTrunc);
-  Slot.irSize = copyDumpBytes(Slot.ir, kEJitSharedDumpSlotTextBytes, IR.data(),
-                              IR.size(), irTrunc);
-  Slot.asmSize = copyDumpBytes(Slot.asmText, kEJitSharedDumpSlotTextBytes,
-                               ASM.data(), ASM.size(), asmTrunc);
-  Slot.keyHi = (uint32_t)(cacheKey >> 32);
-  Slot.keyLo = (uint32_t)(cacheKey & 0xffffffffu);
-  Slot.truncated.storeRelease((nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) |
-                              (asmTrunc ? 2u : 0u));
-  Slot.valid.storeRelease(1);
+  bool nameTrunc = false;
+  D.hasDump.storeRelease(0);
+  D.resultNameLen = copyDumpBytes(D.resultName, kEJitSharedDumpNameBytes,
+                                  fnName.data(), fnName.size(), nameTrunc);
+  D.irSize = irSize > 0xffffffffu ? 0xffffffffu : (uint32_t)irSize;
+  D.asmSize = asmSize > 0xffffffffu ? 0xffffffffu : (uint32_t)asmSize;
+  D.keyHi = (uint32_t)(cacheKey >> 32);
+  D.keyLo = (uint32_t)(cacheKey & 0xffffffffu);
+  D.workerCore = core;
+  D.status.storeRelease(nameTrunc ? 4u : 0u);
+  D.hasDump.storeRelease(1);
   sharedDumpUnlock(D);
-  EJIT_DIAG_DEBUG("capture shared func=%s slot=%u ir=%u asm=%u trunc=0x%x &shared=%p",
-            fnName.c_str(), target, (unsigned)IR.size(), (unsigned)ASM.size(),
-            (nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) | (asmTrunc ? 2u : 0u),
-            (void *)gDumpSharedState);
+  EJIT_DIAG_DEBUG(
+      "capture shared metadata func=%s core=%u ir=%u asm=%u &shared=%p",
+      fnName.c_str(), core, (unsigned)irSize, (unsigned)asmSize,
+      (void *)gDumpSharedState);
 }
 
-static bool printSharedDumped(const char *name) {
+static bool printSharedDumpHint(const char *name) {
   if (!gDumpSharedState)
     return false;
   EJitSharedDumpState &D = gDumpSharedState->dump;
-  bool hasName = name && name[0];
   sharedDumpLock(D);
-  bool any = false;
-  for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-    EJitSharedDumpSlot &Slot = D.slots[s];
-    if (Slot.valid.loadAcquire() == 0)
-      continue;
-    bool match = true;
-    if (hasName) {
-      uint32_t i = 0;
-      while (i < Slot.nameLen && name[i] && name[i] == Slot.name[i])
-        ++i;
-      match = (i == Slot.nameLen && name[i] == 0);
-    }
-    if (!match)
-      continue;
-    uint32_t trunc = Slot.truncated.loadAcquire();
-    EJIT_DIAG("print_dumped shared hit requested=%s stored=%s slot=%u "
-              "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u trunc=0x%x",
-              hasName ? name : "(all)", Slot.name, s, Slot.keyHi, Slot.keyLo,
-              Slot.irSize, Slot.asmSize, trunc);
-    if (Slot.irSize)
-      dumpBytesSafe("dump IR", Slot.ir, Slot.irSize);
-    if (Slot.asmSize)
-      dumpBytesSafe("dump ASM", Slot.asmText, Slot.asmSize);
-    any = true;
-    if (hasName)
-      break; // single-name query: done after the first match
+  if (D.hasDump.loadAcquire() == 0) {
+    sharedDumpUnlock(D);
+    return false;
   }
+  bool hasName = name && name[0];
+  bool match = true;
+  if (hasName) {
+    uint32_t i = 0;
+    while (i < D.resultNameLen && name[i] && name[i] == D.resultName[i])
+      ++i;
+    match = i == D.resultNameLen && name[i] == 0;
+  }
+  if (!match) {
+    sharedDumpUnlock(D);
+    return false;
+  }
+  uint32_t workerCore = D.workerCore;
+  uint32_t irSize = D.irSize;
+  uint32_t asmSize = D.asmSize;
+  uint32_t keyHi = D.keyHi;
+  uint32_t keyLo = D.keyLo;
+  char stored[kEJitSharedDumpNameBytes];
+  uint32_t n = D.resultNameLen;
+  if (n >= kEJitSharedDumpNameBytes)
+    n = kEJitSharedDumpNameBytes - 1;
+  for (uint32_t i = 0; i < n; ++i)
+    stored[i] = D.resultName[i];
+  stored[n] = 0;
   sharedDumpUnlock(D);
-  if (!any)
-    EJIT_DIAG_DEBUG("print_dumped shared miss name=%s &shared=%p",
-                    hasName ? name : "(all)", (void *)gDumpSharedState);
-  return any;
+  (void)irSize;
+  (void)asmSize;
+  (void)keyHi;
+  (void)keyLo;
+  (void)stored;
+  if (workerCore == kEJitInvalidCoreId)
+    EJIT_DIAG("print_dumped: dump for \"%s\" is worker-local; run "
+              "ejit_print_dumped(\"%s\") on the worker core. ir_size=%u "
+              "asm_size=%u key_hi=0x%08x key_lo=0x%08x",
+              stored, stored, irSize, asmSize, keyHi, keyLo);
+  else
+    EJIT_DIAG("print_dumped: dump for \"%s\" is stored on worker core %u; "
+              "run ejit_print_dumped(\"%s\") on that core. ir_size=%u "
+              "asm_size=%u key_hi=0x%08x key_lo=0x%08x",
+              stored, workerCore, stored, irSize, asmSize, keyHi, keyLo);
+  return true;
 }
 #endif
 
@@ -408,8 +431,9 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
   gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+  // Publish only small metadata. Full text remains in the worker-local map.
   const DumpEntry &E = gDumpStore[fnName];
-  captureSharedDump(fnName, cacheKey, E.IR, E.ASM);
+  captureSharedDumpMetadata(fnName, cacheKey, E.IR.size(), E.ASM.size());
 #endif
 }
 
@@ -424,7 +448,7 @@ static void printOneDumpSafe(const char *requestedName,
   (void)keyLo;
   EJIT_DIAG("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
             "key_lo=0x%08x ir_size=%u asm_size=%u",
-            requestedName ? requestedName : "(all)", storedName.c_str(), keyHi,
+            requestedName ? requestedName : "(list)", storedName.c_str(), keyHi,
             keyLo, (unsigned)e.IR.size(), (unsigned)e.ASM.size());
   if (!e.IR.empty())
     dumpLinesSafe("dump IR", e.IR);
@@ -432,17 +456,15 @@ static void printOneDumpSafe(const char *requestedName,
     dumpLinesSafe("dump ASM", e.ASM);
 }
 
-/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
-/// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
-/// saved capture are reported as missing.
+/// Print saved IR+ASM through EJIT_DIAG, one line per IR/ASM line. A null/empty
+/// name prints all payloads available on this core.
 void printDumped(const char *name) {
   EJIT_DIAG_DEBUG("print_dumped enter name=%s &filter=%p &store=%p",
-            (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
-            (void *)&gDumpStore);
+                  (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
+                  (void *)&gDumpStore);
   bool hasName = name && name[0];
-  // Try the local (owner-side, untruncated) store first — it has the full
-  // IR/ASM for every captured function. For a specific name this is a direct
-  // hit on the owner core; for "print all" it lists every capture in full.
+  // The complete payloads are worker-local. A specific name prints one entry;
+  // an empty name prints every entry captured by this core.
   {
     std::lock_guard<DumpMutexType> lock(gDumpMutex);
     if (hasName) {
@@ -452,17 +474,16 @@ void printDumped(const char *name) {
         return;
       }
     } else if (!gDumpStore.empty()) {
+      EJIT_DIAG("print_dumped saved entries=%u", (unsigned)gDumpStore.size());
       for (auto &kv : gDumpStore)
         printOneDumpSafe(nullptr, kv.first, kv.second);
       return;
     }
   }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Local miss / empty (e.g. a non-owner core, whose per-core gDumpStore is
-  // empty): serve from the cross-core shared per-name table. The table holds
-  // the last N captured functions (truncated to the slot text size); a specific
-  // name retrieves its slot, NULL lists all of them.
-  if (printSharedDumped(name))
+  // A non-worker core cannot read the worker-private payload. Shared state
+  // carries only enough metadata to direct the caller to the owning core.
+  if (printSharedDumpHint(name))
     return;
 #endif
   if (hasName)
@@ -507,8 +528,15 @@ EJitOrcEngine::Create(const Config &config,
     return JTMBOrErr.takeError();
   }
 
-  // Use Large code model so JITLink can generate 64-bit absolute relocations.
-  JTMBOrErr->setCodeModel(CodeModel::Large);
+  // Use Small code model so data accesses use ADRP+LDR (2 insns/global, ±4GB
+  // PC-relative) instead of movz/movk absolute (5 insns/global). The JIT slab
+  // is ~1.5-2.2GB from .text (within ADRP's ±4GB range), confirmed by
+  // compileFailed=0 with dso_local=true. Function calls are always BL on
+  // AArch64 (unaffected by code model); JITLink auto-stubs out-of-range BL.
+  // With Large, the 3 extra movz/movk instructions per global access eaten
+  // the specialization savings (fewer BBs / folded branches). Small makes
+  // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
+  JTMBOrErr->setCodeModel(CodeModel::Small);
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
@@ -558,6 +586,24 @@ EJitOrcEngine::Create(const Config &config,
   }
 
   engine->P->J = std::move(*J);
+
+  // Retarget standard AArch64 pointer-jump stubs to their final destination
+  // when the resolved B/BL displacement fits the architectural range. This
+  // plugin must run before the diagnostic plugin so PostFixup reporting sees
+  // the actual direct/stubbed result.
+  if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+          &engine->P->J->getObjLinkingLayer()))
+    OLL->addPlugin(std::make_shared<EJitLinkOptimizationPlugin>());
+
+  // Attach the JITLink branch-relocation diagnostic plugin. It appends a
+  // PostFixup pass that audits every AArch64 branch relocation and reports
+  // which ones remain bridged through a $__STUBS PointerJumpStub + $__GOT
+  // (because the resolved target is out of +-128MB or the chain is not safe to
+  // relax) instead of a direct BL. INFO emits one summary per graph; VERBOSE
+  // additionally emits each relocation. Output uses SRE_printf on bare-metal.
+  if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+          &engine->P->J->getObjLinkingLayer()))
+    OLL->addPlugin(std::make_shared<EJitLinkDiagPlugin>());
 
   // Override the default error reporter (logErrorsToStdErr → errs() →
   // raw_fd_ostream) with a bare-metal-safe version using EJIT_DIAG.  On
@@ -644,22 +690,21 @@ EJitOrcEngine::Create(const Config &config,
           // ejit_print_dumped(). Bare-metal-safe (strings only, no
           // raw_fd_ostream). Captures the post-optimization IR and the emitted
           // assembly (from the same TargetMachine the JIT compiles with).
-          // The filter value "*" is a wildcard: every specialization is captured
-          // (ejit_dump_all(true) sets it). The local gDumpStore keeps one entry
-          // per function name (overwritten on re-compile), so dump-all is
-          // bounded by the number of distinct entry functions; the cross-core
-          // shared result keeps only the latest capture (see ejit_print_dumped).
+          // Capture is exact-name only. The local gDumpStore keeps one dynamic
+          // IR/ASM payload per captured function name (overwritten on
+          // re-compile); the shared dump table keeps cross-core visible dynamic
+          // payloads for recent captures.
           {
             std::string DumpFilter;
             bool hasFilter = getActiveDumpFilter(DumpFilter);
-            bool wildcard = hasFilter && DumpFilter == "*";
-            bool match = wildcard || (hasFilter && ctx->fnName == DumpFilter);
+            bool match =
+                hasFilter && (DumpFilter == "*" || ctx->fnName == DumpFilter);
             EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
-                            "key_lo=0x%08x match=%d wildcard=%d &filter=%p",
+                            "key_lo=0x%08x match=%d &filter=%p",
                             hasFilter ? DumpFilter.c_str() : "(off)",
                             ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
                             (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
-                            wildcard ? 1 : 0, (void *)&gDumpFuncFilter);
+                            (void *)&gDumpFuncFilter);
             if (match) {
               // IR capture always runs first so it succeeds even if the ASM
               // diagnostic path is disabled or fails.
@@ -743,16 +788,21 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
 
   Triple TT((*ModuleOrErr)->getTargetTriple());
   if (TT.isAArch64() && TT.isOSBinFormatELF()) {
-    // These declarations resolve to process addresses, not co-located JIT
-    // storage. Clearing dso_local forces AArch64 PIC codegen to use GOT/PLT
-    // style indirection instead of near-page ADRP relocations.
+    // External-symbol access from JIT specializations. The JIT slab is
+    // SRE_MemAlloc'd ~2-3GB from the main binary's .text/.data - beyond the
+    // AArch64 BL reach (±128MB) but within ADRP reach (±4GB). Treat the two
+    // kinds differently rather than clearing dso_local on both:
+    //   * Functions: clear dso_local so calls route through JITLink PLT stubs
+    //     (PointerJumpStub = ADRP x16; LDR x16,[x16]; BR x16), which bridge the
+    //     ±128MB BL gap via a GOT entry. A direct BL to a 2-3GB-distant target
+    //     would overflow.
+    //   * Globals: keep dso_local so data access is ADRP+LDR (direct, ±4GB
+    //     reaches the slab). Clearing them forced a per-global GOT load (62 GOT
+    //     loads / ~1700c on DlschCcScheduler vs 0 in AOT) for no reach benefit,
+    //     since ADRP already reaches. So globals are NOT cleared.
     for (Function &F : (*ModuleOrErr)->functions()) {
       if (F.isDeclaration() && !F.isIntrinsic())
         F.setDSOLocal(false);
-    }
-    for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
-      if (GV.isDeclaration())
-        GV.setDSOLocal(false);
     }
   }
 

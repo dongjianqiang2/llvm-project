@@ -242,10 +242,10 @@
 
         <rect x="35" y="70" width="220" height="155" rx="14" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" class="box-shadow" />
         <text x="64" y="100" class="svg-label">User source</text>
-        <text x="62" y="128" class="svg-small">• ejit_may_const fields</text>
-        <text x="62" y="152" class="svg-small">• ejit_period/static</text>
-        <text x="62" y="176" class="svg-small">• ejit_period_arr + index</text>
-        <text x="62" y="200" class="svg-small">• ejit_entry / lifecycle</text>
+        <text x="62" y="128" class="svg-small">• EJIT_PERIOD_CONST fields</text>
+        <text x="62" y="152" class="svg-small">• EJIT_IN_PERIOD/static</text>
+        <text x="62" y="176" class="svg-small">• EJIT_IN_PERIOD_ARRAY + index</text>
+        <text x="62" y="200" class="svg-small">• EJIT_ENTRY / lifecycle</text>
 
         <rect x="310" y="70" width="220" height="155" rx="14" fill="url(#gBlue)" class="box-shadow" />
         <text x="338" y="100" class="svg-white">Clang frontend/CodeGen</text>
@@ -374,8 +374,8 @@
       <tbody>
         <tr><td>PASS1</td><td>Raw IR with metadata</td><td><code>__ejit_bitcode</code> / function-closure bitcode</td><td>The runtime JIT needs intact, optimizable IR.</td></tr>
         <tr><td>PASS2</td><td>period/static global metadata</td><td>Dynamic registration calls or a static registry table</td><td>The runtime needs to know which memory objects belong to which time window.</td></tr>
-        <tr><td>PASS3</td><td><code>ejit_entry</code> function metadata</td><td>Wrapper at the original function entry</td><td>The user does not change call sites; calling the original function name triggers JIT.</td></tr>
-        <tr><td>PASS4</td><td><code>ejit_period_lc</code> metadata</td><td>deactivate / activate instrumentation</td><td>Automatically invalidates the old cache when config changes, preserving may_const semantics.</td></tr>
+        <tr><td>PASS3</td><td><code>EJIT_ENTRY</code> function metadata</td><td>Wrapper at the original function entry</td><td>The user does not change call sites; calling the original function name triggers JIT.</td></tr>
+        <tr><td>PASS4</td><td><code>EJIT_PERIOD_GUARD</code> metadata</td><td>deactivate / activate instrumentation</td><td>Automatically invalidates the old cache when config changes, preserving may_const semantics.</td></tr>
       </tbody>
     </table>
   </section>
@@ -383,7 +383,7 @@
   <section id="runtime-decision">
     <h2>3. Runtime hot path and mode selection</h2>
     <p>The wrapper hot path first does cheap checks: is the runtime initialized, is the time window active, is the cache hit. Only on a miss when JIT is allowed does it enter the sync or async path based on <code>ejit_config_t::compileMode</code>.</p>
-    <div class="flow">User calls the ejit_entry original function
+    <div class="flow">User calls the EJIT_ENTRY original function
   ↓
 wrapper reads period index / computes cacheKey
   ↓
@@ -424,7 +424,7 @@ compileMode == ASYNC → submit background compile task → current call falls b
 
         <rect x="40" y="80" width="170" height="86" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
         <text x="74" y="112" class="svg-label">Business thread</text>
-        <text x="70" y="140" class="svg-small">call ejit_entry</text>
+        <text x="70" y="140" class="svg-small">call EJIT_ENTRY</text>
 
         <rect x="270" y="80" width="190" height="86" rx="12" fill="#fff" stroke="#2c5282" stroke-width="2" />
         <text x="330" y="112" class="svg-label">Wrapper</text>
@@ -578,9 +578,9 @@ ORC LLJIT / JITLink: target codegen + symbol resolution + code memory finalize</
     <table>
       <thead><tr><th>Stage</th><th>Role</th><th>User-observable result</th></tr></thead>
       <tbody>
-        <tr><td>Parameter substitution</td><td>Substitutes <code>ejit_period_arr_ind</code> parameters with the current instance constants</td><td>Array indices and GEP paths become foldable</td></tr>
+        <tr><td>Parameter substitution</td><td>Substitutes <code>EJIT_DIM</code> parameters with the current instance constants</td><td>Array indices and GEP paths become foldable</td></tr>
         <tr><td>Inline</td><td>Expands config reads in small functions into the entry closure</td><td>Cross-function config reads can also be recognized by PASS6</td></tr>
-        <tr><td>PASS6</td><td>Reads the <code>ejit_may_const</code> field value within the active time window and replaces the load</td><td>Loads become constants in the IR; branch conditions are fixed</td></tr>
+        <tr><td>PASS6</td><td>Reads the <code>EJIT_PERIOD_CONST</code> field value within the active time window and replaces the load</td><td>Loads become constants in the IR; branch conditions are fixed</td></tr>
         <tr><td>Standard optimization</td><td>Constant propagation, branch folding, dead code elimination, CFG simplification</td><td>The dump IR shows only the current-config path retained</td></tr>
         <tr><td>JITLink</td><td>Generates machine code, resolves external symbols, places it in executable memory</td><td>Cache entries increase; later hits increase</td></tr>
       </tbody>
@@ -620,7 +620,7 @@ ORC LLJIT / JITLink: target codegen + symbol resolution + code memory finalize</
         <text x="612" y="308" class="svg-small">re-activate after modification</text>
 
         <rect x="100" y="270" width="760" height="48" rx="10" fill="#ebf2fa" stroke="#3182ce" />
-        <text x="132" y="300" class="svg-label">ejit_period_lc(name)</text>
+        <text x="132" y="300" class="svg-label">EJIT_PERIOD_GUARD(name)</text>
         <text x="292" y="300" class="svg-small">auto deactivate at entry; auto activate before every return.</text>
       </svg>
     </div>

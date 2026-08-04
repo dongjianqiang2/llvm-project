@@ -13510,6 +13510,11 @@ def warn_ejit_undeclared_period_dep : Warning<
   "function %0 references ejit_period_arr '%1' but does not declare "
   "a dependency on it via ejit_period_arr_ind">,
   InGroup<EmbeddedJIT>;
+def warn_ejit_always_inline_conflict : Warning<
+  "'always_inline' is incompatible with %0, which must remain "
+  "out-of-line so it survives the inliner for JIT specialization; "
+  "ignoring 'always_inline'">,
+  InGroup<EmbeddedJIT>;
 def note_ejit_period_arr_defined_here : Note<
   "ejit_period_arr '%0' defined here">;
 def note_ejit_entry_defined_here : Note<

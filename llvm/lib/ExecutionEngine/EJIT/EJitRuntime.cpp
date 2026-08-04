@@ -2,7 +2,9 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
+#include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
@@ -10,17 +12,106 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+// Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
+// llvm-project source tree). Lives in the LLVMEJIT build directory.
+#include "EJitVersion.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
+#ifndef EJIT_FREESTANDING
+#include <chrono>
+#endif
+// ejit_print_version() falls back to std::printf when not routing through the
+// SRE platform sink. Mirrors the EJIT_DIAG <cstdio> include (non-SRE path).
+#ifndef EJIT_SRE_DIAG
+#include <cstdio>
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
 
 static EJit *gEJIT = nullptr;
+
+#ifdef EJIT_FREESTANDING
+extern "C" uint64_t SRE_CycleCountGet64(void);
+#endif
+
+// ejit_print_version() prints unconditionally (not via EJIT_DIAG), so on SRE
+// builds it calls SRE_printf directly. EJitDiag.h only declares SRE_printf
+// under EJIT_DIAG_ENABLE; declare it here for the SRE-but-diagnostics-off case
+// so the function links. When EJIT_DIAG_ENABLE is also on, EJitDiag.h already
+// provides the identical declaration and this guard skips a redundant one.
+#if defined(EJIT_SRE_DIAG) && !defined(EJIT_DIAG_ENABLE)
+extern "C" int SRE_printf(const char *fmt, ...);
+#endif
+
+#ifndef EJIT_WRAPPER_TIMING_REPORT_EVERY
+#define EJIT_WRAPPER_TIMING_REPORT_EVERY 100000u
+#endif
+
+namespace {
+class TimingSpinLock {
+public:
+  void lock() {
+    uint32_t expected = 0;
+    while (!flag_.compareExchange(expected, 1u))
+      expected = 0;
+  }
+  void unlock() { flag_.storeRelease(0u); }
+
+private:
+  EJitAtomicU32 flag_;
+};
+
+struct WrapperTimingSlot {
+  bool Valid = false;
+  uint32_t FuncIndex = 0;
+  uint32_t Status = 0;
+  void *FnPtr = nullptr;
+  uint32_t BucketIndex = 0;
+  uint64_t Count = 0;
+  uint64_t GetFnSum = 0;
+  uint64_t FnCallSum = 0;
+  uint64_t ReleaseSum = 0;
+  uint64_t TotalSum = 0;
+};
+
+static TimingSpinLock gWrapperTimingLock;
+static WrapperTimingSlot gWrapperTimingSlots[32];
+
+static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
+                            uint32_t Status, void *FnPtr,
+                            uint32_t BucketIndex) {
+  S.Valid = true;
+  S.FuncIndex = FuncIndex;
+  S.Status = Status;
+  S.FnPtr = FnPtr;
+  S.BucketIndex = BucketIndex;
+  S.Count = 0;
+  S.GetFnSum = 0;
+  S.FnCallSum = 0;
+  S.ReleaseSum = 0;
+  S.TotalSum = 0;
+}
+
+// [[maybe_unused]]: only called from the EVERY>0 periodic branch; an EVERY=0
+// build (suppress periodic output) would otherwise flag this as unused.
+[[maybe_unused]] static void reportTimingSlot(const WrapperTimingSlot &S) {
+  if (S.Count == 0)
+    return;
+  EJIT_DIAG("wrapper_timing_agg func=%u status=%u fn=%p bucket=%u count=%llu "
+            "get_fn_avg=%llu fn_call_avg=%llu release_avg=%llu total_avg=%llu",
+            S.FuncIndex, S.Status, S.FnPtr, S.BucketIndex,
+            static_cast<unsigned long long>(S.Count),
+            static_cast<unsigned long long>(S.GetFnSum / S.Count),
+            static_cast<unsigned long long>(S.FnCallSum / S.Count),
+            static_cast<unsigned long long>(S.ReleaseSum / S.Count),
+            static_cast<unsigned long long>(S.TotalSum / S.Count));
+}
+} // namespace
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 static void bindDumpSharedStateFromRuntime() {
@@ -255,6 +346,46 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
   }
 }
 
+void ejit_register_icache_slot(const char *funcName, void *slot,
+                               uint32_t numDims) {
+  // Wire the wrapper's per-function @__ejit_icache_fn_<name> slot into the
+  // runtime slot registry, keyed by the SAME registry funcIndex
+  // ejit_register_funcindex assigns by name. numDims is the [D]^numDims shape
+  // so icacheFill can linearize. The wrapper reads the cell directly on the
+  // icache hit path; icacheFill writes the frozen specialization pointer through
+  // it on resolve. Idempotent by name (resolveAssign is). A null slot or
+  // unresolvable name is recorded; the base stays null and the wrapper's probe
+  // cleanly misses -> taskpool fallback.
+  if (!funcName || !slot) {
+    EJIT_DIAG("register_icache_slot reject: name=%p slot=%p",
+              (const void *)funcName, slot);
+    return;
+  }
+  EJIT_DIAG_VERBOSE("register_icache_slot name=%s numDims=%u", funcName, numDims);
+#ifdef EJIT_SRE_TASKPOOL
+  if (gEJIT && gEJIT->registrationFrozen()) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_INVALID_PARAM, "icache slot registration after init is frozen",
+        funcName);
+    EJIT_DIAG("register_icache_slot reject name=%s: registration frozen",
+              funcName);
+    return;
+  }
+#endif
+  uint32_t idx = EJitFuncRegistry::instance().resolveAssign(funcName);
+  if (idx == kEJitInvalidFuncIndex) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_CACHE_FULL, "funcIndex capacity exhausted for icache slot",
+        funcName);
+    EJIT_DIAG("register_icache_slot FAIL name=%s: funcIndex capacity exhausted",
+              funcName);
+    return;
+  }
+  ejitIcacheRegisterSlot(idx, slot, numDims);
+  EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
+                    funcName, idx, numDims);
+}
+
 ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("activate(%s,%u) failed: not initialized", periodName, cellIdx);
@@ -320,14 +451,24 @@ void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
 
 void ejit_clear_cache(void) {
   EJIT_DIAG("clear_cache");
-  if (gEJIT)
-    gEJIT->clearCache();
+  if (!gEJIT)
+    return;
+  gEJIT->clearCache();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (auto *tp = gEJIT->sharedTaskPool())
+    tp->retireDispatchCache();
+#endif
 }
 
 void ejit_invalidate(const char *periodName, uint8_t cellIdx) {
   EJIT_DIAG("invalidate(%s,%u)", periodName, cellIdx);
-  if (gEJIT)
-    gEJIT->invalidateByPeriod(periodName, cellIdx);
+  if (!gEJIT)
+    return;
+  gEJIT->invalidateByPeriod(periodName, cellIdx);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (auto *tp = gEJIT->sharedTaskPool())
+    tp->retireDispatchCache();
+#endif
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
@@ -354,11 +495,16 @@ const ejit_error_t *ejit_get_last_error(void) {
 
 void ejit_set_compile_mode(ejit_compile_mode_t mode) {
   EJIT_DIAG("set_compile_mode mode=%u", static_cast<unsigned>(mode));
-  if (gEJIT)
-    (void)gEJIT->setCompileMode(mode == EJIT_COMPILE_ASYNC ? CompileMode::Async
-                                                           : CompileMode::Sync);
-  else
+  if (!gEJIT) {
     EJIT_DIAG("set_compile_mode reject: not initialized");
+    return;
+  }
+  (void)gEJIT->setCompileMode(mode == EJIT_COMPILE_ASYNC ? CompileMode::Async
+                                                        : CompileMode::Sync);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (auto *tp = gEJIT->sharedTaskPool())
+    tp->retireDispatchCache();
+#endif
 }
 
 ejit_compile_mode_t ejit_get_compile_mode(void) {
@@ -408,6 +554,30 @@ inline EJitTaskPool *activeTaskPool() {
   return gEJIT ? gEJIT->taskPool() : nullptr;
 }
 #endif
+
+// Fill the calling core's icache slot on a successful taskpool resolve (cache
+// hit or fresh compile), so a cold icache is filled on the first taskpool hit,
+// not only on a fresh compile. Multi-version: one-shot per cell (the
+// specialization is invariant per identity - no version snapshot); dims selects
+// the [D]^numDims cell. No-op without the shared pool or a null fnPtr. Always
+// defined (a no-op without the shared taskpool) so call sites need no #ifdef
+// guards.
+inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
+                                    const EJitDimPair *dims,
+                                    uint32_t numDims) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!fnPtr)
+    return;
+  EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
+  if (sp)
+    sp->icacheFill(funcIndex, fnPtr, dims, numDims);
+#else
+  (void)funcIndex;
+  (void)fnPtr;
+  (void)dims;
+  (void)numDims;
+#endif
+}
 } // namespace
 
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
@@ -466,6 +636,12 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
   // so a hit still hands back outBucket for ejit_taskpool_release_read and a
   // disabled instance never returns stale code. A true miss falls through to
   // compileOrGet unchanged (enqueue/dedup/compile).
+  void *l0Fn = nullptr;
+  if (tp->l0Try(funcIndex, dimsCast, numDims, &l0Fn)) {
+    if (outFn) *outFn = l0Fn;
+    if (outBucket) *outBucket = kEJitNoBucket;
+    return EJIT_OK;
+  }
   auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -475,6 +651,9 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u fast status=%u fn=%p",
                       funcIndex, static_cast<unsigned>(fast.status),
                       fast.fnPtr);
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dimsCast, numDims);
+    if (fast.fnPtr)
+      tp->l0Fill(funcIndex, fast.fnPtr, dimsCast, numDims);
     return taskpoolStatus(fast.status);
   }
 
@@ -486,6 +665,9 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outBucket = r.bucketIndex;
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
                     funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dimsCast, numDims);
+  if (r.fnPtr)
+    tp->l0Fill(funcIndex, r.fnPtr, dimsCast, numDims);
   return taskpoolStatus(r.status);
 }
 
@@ -522,12 +704,19 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
 
+  void *l0Fn = nullptr;
+  if (tp->l0Try(funcIndex, nullptr, 0, &l0Fn)) {
+    if (outFn) *outFn = l0Fn;
+    if (outBucket) *outBucket = kEJitNoBucket;
+    return EJIT_OK;
+  }
   auto fast = tp->tryCacheHit0D(funcIndex);
   if (fast.fastPathTerminal) {
     if (outFn)
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, nullptr, 0);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, nullptr, 0, /*fallback=*/nullptr);
@@ -535,6 +724,9 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, nullptr, 0);
+  if (r.fnPtr)
+    tp->l0Fill(funcIndex, r.fnPtr, nullptr, 0);
   return taskpoolStatus(r.status);
 }
 
@@ -553,20 +745,36 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
   if (!ejitTaskpoolDimInRange(dim0, inst0))
     return EJIT_ERR_INVALID_PARAM;
 
+  const EJitDimPair dims[1] = {{dim0, inst0}};
+  // Per-core L0: steady-state hit with no rwlock, scan, or read token.
+  // kEJitNoBucket tells the caller no token was taken.
+  void *l0Fn = nullptr;
+  if (tp->l0Try(funcIndex, dims, 1, &l0Fn)) {
+    if (outFn)
+      *outFn = l0Fn;
+    if (outBucket)
+      *outBucket = kEJitNoBucket;
+    return EJIT_OK;
+  }
   auto fast = tp->tryCacheHit1D(funcIndex, dim0, inst0);
   if (fast.fastPathTerminal) {
     if (outFn)
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 1);
+    if (fast.fnPtr)
+      tp->l0Fill(funcIndex, fast.fnPtr, dims, 1);
     return taskpoolStatus(fast.status);
   }
-  const EJitDimPair dims[1] = {{dim0, inst0}};
   auto r = tp->compileOrGet(funcIndex, dims, 1, /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 1);
+  if (r.fnPtr)
+    tp->l0Fill(funcIndex, r.fnPtr, dims, 1);
   return taskpoolStatus(r.status);
 }
 
@@ -587,20 +795,32 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
       !ejitTaskpoolDimInRange(dim1, inst1))
     return EJIT_ERR_INVALID_PARAM;
 
+  const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
+  void *l0Fn = nullptr;
+  if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
+    if (outFn) *outFn = l0Fn;
+    if (outBucket) *outBucket = kEJitNoBucket;
+    return EJIT_OK;
+  }
   auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
   if (fast.fastPathTerminal) {
     if (outFn)
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 2);
+    if (fast.fnPtr)
+      tp->l0Fill(funcIndex, fast.fnPtr, dims, 2);
     return taskpoolStatus(fast.status);
   }
-  const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
   auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 2);
+  if (r.fnPtr)
+    tp->l0Fill(funcIndex, r.fnPtr, dims, 2);
   return taskpoolStatus(r.status);
 }
 
@@ -623,6 +843,13 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
       !ejitTaskpoolDimInRange(dim2, inst2))
     return EJIT_ERR_INVALID_PARAM;
 
+  const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
+  void *l0Fn = nullptr;
+  if (tp->l0Try(funcIndex, dims, 3, &l0Fn)) {
+    if (outFn) *outFn = l0Fn;
+    if (outBucket) *outBucket = kEJitNoBucket;
+    return EJIT_OK;
+  }
   auto fast =
       tp->tryCacheHit3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2);
   if (fast.fastPathTerminal) {
@@ -630,14 +857,19 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 3);
+    if (fast.fnPtr)
+      tp->l0Fill(funcIndex, fast.fnPtr, dims, 3);
     return taskpoolStatus(fast.status);
   }
-  const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
   auto r = tp->compileOrGet(funcIndex, dims, 3, /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 3);
+  if (r.fnPtr)
+    tp->l0Fill(funcIndex, r.fnPtr, dims, 3);
   return taskpoolStatus(r.status);
 }
 
@@ -662,6 +894,14 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
       !ejitTaskpoolDimInRange(dim3, inst3))
     return EJIT_ERR_INVALID_PARAM;
 
+  const EJitDimPair dims[4] = {
+      {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
+  void *l0Fn = nullptr;
+  if (tp->l0Try(funcIndex, dims, 4, &l0Fn)) {
+    if (outFn) *outFn = l0Fn;
+    if (outBucket) *outBucket = kEJitNoBucket;
+    return EJIT_OK;
+  }
   auto fast = tp->tryCacheHit4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
                                 inst2, dim3, inst3);
   if (fast.fastPathTerminal) {
@@ -669,15 +909,19 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 4);
+    if (fast.fnPtr)
+      tp->l0Fill(funcIndex, fast.fnPtr, dims, 4);
     return taskpoolStatus(fast.status);
   }
-  const EJitDimPair dims[4] = {
-      {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
   auto r = tp->compileOrGet(funcIndex, dims, 4, /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 4);
+  if (r.fnPtr)
+    tp->l0Fill(funcIndex, r.fnPtr, dims, 4);
   return taskpoolStatus(r.status);
 }
 
@@ -759,6 +1003,73 @@ unsigned ejit_taskpool_pending_count(void) {
     return 0;
   }
   return tp->pendingCount();
+}
+
+uint64_t ejit_taskpool_trace_now(void) {
+#ifdef EJIT_FREESTANDING
+  return SRE_CycleCountGet64();
+#else
+  using clock = std::chrono::steady_clock;
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          clock::now().time_since_epoch())
+          .count());
+#endif
+}
+
+void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
+                                 void *fnPtr, uint32_t bucketIndex,
+                                 uint64_t tBeforeLookup,
+                                 uint64_t tAfterLookup,
+                                 uint64_t tAfterFn,
+                                 uint64_t tAfterRelease) {
+  uint64_t getFn = tAfterLookup - tBeforeLookup;
+  uint64_t fnCall = tAfterFn - tAfterLookup;
+  uint64_t release = tAfterRelease - tAfterFn;
+  uint64_t total = tAfterRelease - tBeforeLookup;
+  // No lock: under per-core BSS each core has its own gWrapperTimingSlots,
+  // so there is no cross-core contention on the slot.
+  unsigned SlotIdx = funcIndex % (sizeof(gWrapperTimingSlots) /
+                                  sizeof(gWrapperTimingSlots[0]));
+  WrapperTimingSlot &S = gWrapperTimingSlots[SlotIdx];
+  // Aggregate by (funcIndex, status) only - fnPtr/bucket are deliberately NOT
+  // part of the key. With EJIT_SRE_SHARED_CODE_POINTERS off the same function
+  // returns a different fnPtr per core, and recompilation changes fnPtr too;
+  // keying on it displaced the slot on nearly every hit, so reportTimingSlot
+  // fired on every churn and flooded the log regardless of
+  // EJIT_WRAPPER_TIMING_REPORT_EVERY (which only gates the periodic print
+  // below). On a real function change we now reset SILENTLY: the displaced
+  // window is always a partial (< EVERY) one, and printing it on every churn
+  // was the flood source. Stable functions still report via the EVERY periodic
+  // print; colliding functions (>32, funcIndex % 32) just reset silently.
+  if (!S.Valid || S.FuncIndex != funcIndex || S.Status != status) {
+    resetTimingSlot(S, funcIndex, status, fnPtr, bucketIndex);
+  } else {
+    // Same function: refresh the informational fnPtr/bucket to the latest hit
+    // so the report's fn=/bucket= reflect the current specialization/core
+    // rather than a stale first-seen value.
+    S.FnPtr = fnPtr;
+    S.BucketIndex = bucketIndex;
+  }
+
+  ++S.Count;
+  S.GetFnSum += getFn;
+  S.FnCallSum += fnCall;
+  S.ReleaseSum += release;
+  S.TotalSum += total;
+
+#if EJIT_WRAPPER_TIMING_REPORT_EVERY > 0
+  if ((S.Count % EJIT_WRAPPER_TIMING_REPORT_EVERY) == 0) {
+    reportTimingSlot(S);
+    S.Count = 0;
+    S.GetFnSum = 0;
+    S.FnCallSum = 0;
+    S.ReleaseSum = 0;
+    S.TotalSum = 0;
+  }
+#else
+  (void)tAfterRelease;
+#endif
 }
 
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
@@ -909,6 +1220,11 @@ void ejit_print_dumped(const char *name) {
   printDumped(name);
 }
 
+void ejit_dump_all(bool enable) {
+  EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
+  setDumpFuncFilter(enable ? std::string("*") : std::string());
+}
+
 // Sentinel returned when no owner core is elected (e.g. not initialized or the
 // shared taskpool has not bound state). Distinct from any valid core id.
 constexpr uint32_t kEJitInvalidOwnerCore = 0xFFFFFFFFu;
@@ -929,19 +1245,6 @@ uint32_t ejit_taskpool_get_worker_core() {
   // a private per-instance taskpool has no cross-core owner to report.
   return kEJitInvalidOwnerCore;
 #endif
-}
-
-//===----------------------------------------------------------------------===//
-// General diagnostics (available in every build, not only taskpool).
-//===----------------------------------------------------------------------===//
-
-void ejit_dump_all(bool enable) {
-  // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
-  // The "*" filter is a wildcard matched by every specialization in the IR
-  // transform layer (see getActiveDumpFilter / the capture condition). Capture
-  // is bounded by distinct function names; print with ejit_print_dumped(NULL).
-  EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
-  setDumpFuncFilter(enable ? std::string("*") : std::string());
 }
 
 void ejit_set_log_level(ejit_log_level_t level) {
@@ -1008,6 +1311,24 @@ void ejit_print_active(void) {
     return;
   }
   gEJIT->printActive();
+}
+
+void ejit_print_version(void) {
+  // LLVM release version (major.minor.patch) comes from llvm/Config/llvm-config.h
+  // (LLVM_VERSION_STRING); the git commit + branch come from the build-time
+  // generated EJitVersion.h. Printed unconditionally - not through EJIT_DIAG and
+  // not gated on EJIT_DIAG_ENABLE or gEJitDiagLevel - so the build identity is
+  // always recoverable, even on a build with diagnostics compiled out and before
+  // ejit_init(). Routes through the same platform sink as EJIT_DIAG: SRE_printf
+  // on SRE/bare-metal builds (declared at file scope above / by EJitDiag.h),
+  // std::printf otherwise.
+#ifdef EJIT_SRE_DIAG
+  SRE_printf("[EJIT] LLVM version %s, branch %s, commit %s\n",
+             LLVM_VERSION_STRING, EJIT_GIT_BRANCH, EJIT_GIT_COMMIT);
+#else
+  std::printf("[EJIT] LLVM version %s, branch %s, commit %s\n",
+              LLVM_VERSION_STRING, EJIT_GIT_BRANCH, EJIT_GIT_COMMIT);
+#endif
 }
 
 } // extern "C"

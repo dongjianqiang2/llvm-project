@@ -27,9 +27,10 @@ void lc_func(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx) {
   g_cellCfg[cellIdx].xx = 42; // modify non-may_const field
 }
 
-// CHECK-DAG: ![[PERIOD_META]] = distinct !{![[PERIOD:[0-9]+]]}
+// CHECK-DAG: ![[MAYCONST_FIELD:[0-9]+]] = !{!"ejit_may_const_field", i32 0}
+// CHECK-DAG: ![[PERIOD_META]] = distinct !{![[PERIOD:[0-9]+]], ![[MAYCONST_FIELD]]}
 // CHECK-DAG: ![[PERIOD]] = !{!"ejit_period", !"static"}
-// CHECK-DAG: ![[ARR_META]] = distinct !{![[ARR:[0-9]+]]}
+// CHECK-DAG: ![[ARR_META]] = distinct !{![[ARR:[0-9]+]], ![[MAYCONST_FIELD]]}
 // CHECK-DAG: ![[ARR]] = !{!"ejit_period_arr", !"cell", i32 16}
 // CHECK-DAG: ![[ENTRY_META]] = distinct !{![[ENTRY:[0-9]+]], ![[IND:[0-9]+]]}
 // CHECK-DAG: ![[ENTRY]] = !{!"ejit_entry"}

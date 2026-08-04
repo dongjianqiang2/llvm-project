@@ -190,6 +190,8 @@ ALL_TESTS=(
   ejit_perf_bench
   ejit_ptr_period_test
   ejit_trace_test
+  ejit_volatile_test
+  ejit_l0_dispatch_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -225,6 +227,7 @@ EXTRA_SRCS[ejit_baremetal_link_test]="ejit_multi_tu_test_b.c"
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"
+TEST_ARGS[ejit_l0_dispatch_test]="1"
 TEST_ARGS[ejit_fold_loop_test]="0"
 TEST_ARGS[ejit_opt_level_test]="L2"
 TEST_ARGS[ejit_multiversion_test]="0 3 7"

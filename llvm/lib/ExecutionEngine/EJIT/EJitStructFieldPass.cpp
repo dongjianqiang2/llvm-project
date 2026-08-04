@@ -138,16 +138,28 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
 static bool
 isMayConstLoad(LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
                const DataLayout &DL) {
+  // Never substituted. Checked ahead of the metadata, not just ahead of the
+  // fallback, so that a pass which copies !ejit.may_const onto a volatile or
+  // atomic load cannot defeat the frontend's exclusion.
+  if (LI->isVolatile() || LI->isAtomic())
+    return false;
+
   if (LI->hasMetadata(MD_EJIT_MAY_CONST))
     return true;
 
-  // v1.7 fallback: check GV-level may_const field offsets
-  Value *Ptr = LI->getPointerOperand();
-  if (auto *RootGV = findRootGV(Ptr)) {
+  // v1.7 fallback for loads whose marker an earlier pass dropped. The recorded
+  // offsets are element-relative, so match on the field coordinate rather than
+  // the total offset from the global, and require the access to fit inside the
+  // field it starts at.
+  const GlobalVariable *RootGV = nullptr;
+  auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
+  if (Off && RootGV) {
     auto It = mayConstFieldMap.find(RootGV);
-    if (It != mayConstFieldMap.end()) {
-      auto Off = accumulateFullOffset(DL, Ptr);
-      if (Off && is_contained(It->second, *Off))
+    if (It != mayConstFieldMap.end() && is_contained(It->second, *Off)) {
+      TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+      if (!AccessSize.isScalable() &&
+          ejitAccessFitsMayConstField(RootGV, *Off, AccessSize.getFixedValue(),
+                                      DL))
         return true;
     }
   }

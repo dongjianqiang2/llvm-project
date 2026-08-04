@@ -139,9 +139,14 @@ void EJitSreTask::destroy(EJitSreTask &task) {
   task.ctx_ = nullptr;
 }
 
-// Let the worker sleep for one scheduler tick instead of spinning on an empty
-// queue. The queue/state visibility contract remains in EJitAtomic acquire /
-// release operations; TaskDelay is only a scheduling hint.
-void EJitSreTask::yield() { (void)SRE_TaskDelay(1); }
+// Let the worker sleep instead of spinning on an empty queue or immediately
+// starting the next expensive LLVM compile. The queue/state visibility contract
+// remains in EJitAtomic acquire / release operations; TaskDelay is only a
+// scheduling hint.
+void EJitSreTask::yield() { delay(1); }
+
+void EJitSreTask::delay(uint32_t ticks) {
+  (void)SRE_TaskDelay(ticks ? ticks : 1u);
+}
 
 #endif

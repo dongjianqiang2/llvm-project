@@ -1,22 +1,13 @@
-; RUN: opt -passes=ejit-wrapper-gen -disable-output %s
+; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
 ;
-; XFAIL: *
-;
-; KNOWN BUG (recorded now, fix tracked separately).
-;
-; EJitWrapperGen unconditionally adds the `noinline` attribute to every
-; ejit_entry function (EJitNoInlineEntry defaults to true). If the user wrote
-;     __attribute__((always_inline)) ejit_entry ...
-; the function already carries `alwaysinline`, and `noinline` + `alwaysinline`
-; are mutually exclusive — the module verifier aborts the whole AOT compile:
-;     Attributes 'noinline and alwaysinline' are incompatible!
-;     LLVM ERROR: Broken module found, compilation aborted!
-;
-; This RUN line currently aborts (non-zero exit) -> the test fails -> XFAIL
-; matches. The fix should make the pass not create conflicting attributes
-; (e.g. skip adding noinline when alwaysinline is present, or drop
-; alwaysinline). Once fixed, opt's built-in verifier passes, this RUN
-; succeeds, and lit reports XPASS -> remove the XFAIL line.
+; An ejit_entry function carrying always_inline must not also receive
+; noinline from EJitWrapperGen: the two are mutually exclusive and would
+; abort the verifier ("Attributes 'noinline and alwaysinline' are
+; incompatible!"). Sema rejects this combination at the source level
+; (warn_ejit_always_inline_conflict drops always_inline); this test
+; backstops hand-written IR by verifying the pass skips noinline when
+; alwaysinline is present - the function keeps alwaysinline and noinline
+; is added nowhere in the module.
 
 define void @always_inline_entry() alwaysinline !ejit.metadata !0 {
 entry:
@@ -24,3 +15,7 @@ entry:
 }
 
 !0 = distinct !{!{!"ejit_entry"}}
+
+; CHECK: define void @always_inline_entry() #[[A:[0-9]+]]
+; CHECK: attributes #[[A]] = { {{.*}}alwaysinline{{.*}} }
+; CHECK-NOT: noinline

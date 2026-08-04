@@ -18,13 +18,13 @@
     <h2>1. static 全局配置特化</h2>
     <p>适合板级配置、编译后运行期不变的全局配置。无需 <code>ejit_activate</code>。</p>
 <pre><code class="language-c">struct BoardConfig {
-    ejit_may_const uint32_t boardType;
+    EJIT_PERIOD_CONST uint32_t boardType;
     uint32_t flags;
 };
 
-ejit_period(static) struct BoardConfig g_boardCfg;
+EJIT_IN_PERIOD(static) struct BoardConfig g_boardCfg;
 
-ejit_entry
+EJIT_ENTRY
 void process_board(int x) {
     if (g_boardCfg.boardType == 1) {
         board_type_1_path(x);
@@ -37,14 +37,14 @@ void process_board(int x) {
   <section class="case">
     <h2>2. 单维 cell 时间窗</h2>
 <pre><code class="language-c">struct CellConfig {
-    ejit_may_const uint32_t mode;
-    ejit_may_const uint32_t threshold;
+    EJIT_PERIOD_CONST uint32_t mode;
+    EJIT_PERIOD_CONST uint32_t threshold;
 };
 
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
 
-ejit_entry
-int process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+EJIT_ENTRY
+int process_cell(EJIT_DIM(cell) uint8_t cellIdx, int value) {
     if (g_cellCfg[cellIdx].mode == 1)
         return value + g_cellCfg[cellIdx].threshold;
     return value;
@@ -60,15 +60,15 @@ void run(void) {
 
   <section class="case">
     <h2>3. 多维 cell + trp 特化</h2>
-<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
-struct TrpConfig  { ejit_may_const uint32_t type; };
+<pre><code class="language-c">struct CellConfig { EJIT_PERIOD_CONST uint32_t mode; };
+struct TrpConfig  { EJIT_PERIOD_CONST uint32_t type; };
 
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
-ejit_period_arr(trp)  struct TrpConfig  g_trpCfg[8];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(trp)  struct TrpConfig  g_trpCfg[8];
 
-ejit_entry
-void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
-                  ejit_period_arr_ind(trp)  uint8_t trpIdx,
+EJIT_ENTRY
+void process_pair(EJIT_DIM(cell) uint8_t cellIdx,
+                  EJIT_DIM(trp)  uint8_t trpIdx,
                   int payload) {
     if (g_cellCfg[cellIdx].mode == 1 && g_trpCfg[trpIdx].type == 2)
         fast_pair_path(payload);
@@ -84,17 +84,17 @@ process_pair(cellIdx, trpIdx, payload);</code></pre>
   <section class="case">
     <h2>4. 嵌套结构体字段</h2>
 <pre><code class="language-c">struct Inner {
-    ejit_may_const uint32_t subMode;
+    EJIT_PERIOD_CONST uint32_t subMode;
 };
 struct CellConfig {
     struct Inner inner;
     uint32_t runtimeCounter;
 };
 
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
 
-ejit_entry
-void process_nested(ejit_period_arr_ind(cell) uint8_t idx) {
+EJIT_ENTRY
+void process_nested(EJIT_DIM(cell) uint8_t idx) {
     if (g_cellCfg[idx].inner.subMode == 3)
         nested_fast();
 }</code></pre>
@@ -102,17 +102,17 @@ void process_nested(ejit_period_arr_ind(cell) uint8_t idx) {
 
   <section class="case">
     <h2>5. 指针型 period array</h2>
-    <p>全局指针指向结构体数组。用户必须保证在调用 <code>ejit_entry</code> 前完成初始化并保证下标不越界。</p>
-<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
+    <p>全局指针指向结构体数组。用户必须保证在调用 <code>EJIT_ENTRY</code> 前完成初始化并保证下标不越界。</p>
+<pre><code class="language-c">struct CellConfig { EJIT_PERIOD_CONST uint32_t mode; };
 
-ejit_period_arr(cell) struct CellConfig *g_cellPtr;
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig *g_cellPtr;
 
 void init_cells(struct CellConfig *buf) {
     g_cellPtr = buf;
 }
 
-ejit_entry
-void process_ptr(ejit_period_arr_ind(cell) uint8_t idx) {
+EJIT_ENTRY
+void process_ptr(EJIT_DIM(cell) uint8_t idx) {
     if (g_cellPtr[idx].mode == 1)
         ptr_fast();
 }</code></pre>
@@ -120,8 +120,8 @@ void process_ptr(ejit_period_arr_ind(cell) uint8_t idx) {
 
   <section class="case">
     <h2>6. 生命周期函数</h2>
-<pre><code class="language-c">ejit_period_lc(cell)
-void update_cell(ejit_period_arr_ind(cell) uint8_t idx, uint32_t mode) {
+<pre><code class="language-c">EJIT_PERIOD_GUARD(cell)
+void update_cell(EJIT_DIM(cell) uint8_t idx, uint32_t mode) {
     g_cellCfg[idx].mode = mode;
 }
 
@@ -141,7 +141,7 @@ ejit_init(&amp;cfg);
 ejit_activate("cell", idx);
 process_cell(idx, 100); // 第一次通常 fallback，并提交后台编译
 process_cell(idx, 101); // 后续可能命中 JIT cache</code></pre>
-    <div class="note">异步模式下，<code>ejit_entry</code> 的副作用应幂等，避免首次 AOT fallback 与后续 JIT 版本产生业务差异。</div>
+    <div class="note">异步模式下，<code>EJIT_ENTRY</code> 的副作用应幂等，避免首次 AOT fallback 与后续 JIT 版本产生业务差异。</div>
   </section>
 
   <section class="case">

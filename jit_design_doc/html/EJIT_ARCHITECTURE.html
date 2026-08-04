@@ -240,10 +240,10 @@
 
         <rect x="35" y="70" width="220" height="155" rx="14" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" class="box-shadow" />
         <text x="64" y="100" class="svg-label">用户源码</text>
-        <text x="62" y="128" class="svg-small">• ejit_may_const 字段</text>
-        <text x="62" y="152" class="svg-small">• ejit_period/static</text>
-        <text x="62" y="176" class="svg-small">• ejit_period_arr + index</text>
-        <text x="62" y="200" class="svg-small">• ejit_entry / lifecycle</text>
+        <text x="62" y="128" class="svg-small">• EJIT_PERIOD_CONST 字段</text>
+        <text x="62" y="152" class="svg-small">• EJIT_IN_PERIOD/static</text>
+        <text x="62" y="176" class="svg-small">• EJIT_IN_PERIOD_ARRAY + index</text>
+        <text x="62" y="200" class="svg-small">• EJIT_ENTRY / lifecycle</text>
 
         <rect x="310" y="70" width="220" height="155" rx="14" fill="url(#gBlue)" class="box-shadow" />
         <text x="352" y="100" class="svg-white">Clang 前端/CodeGen</text>
@@ -372,8 +372,8 @@
       <tbody>
         <tr><td>PASS1</td><td>带 metadata 的原始 IR</td><td><code>__ejit_bitcode</code> / 函数闭包 bitcode</td><td>运行时 JIT 需要未被破坏的可优化 IR。</td></tr>
         <tr><td>PASS2</td><td>period/static 全局 metadata</td><td>动态注册调用或静态 registry 表</td><td>运行时需要知道哪些内存对象属于哪个时间窗。</td></tr>
-        <tr><td>PASS3</td><td><code>ejit_entry</code> 函数 metadata</td><td>原函数入口 wrapper</td><td>用户不改调用点，仍调用原函数名即可触发 JIT。</td></tr>
-        <tr><td>PASS4</td><td><code>ejit_period_lc</code> metadata</td><td>deactivate / activate 插桩</td><td>配置修改时自动失效旧 cache，维持 may_const 语义。</td></tr>
+        <tr><td>PASS3</td><td><code>EJIT_ENTRY</code> 函数 metadata</td><td>原函数入口 wrapper</td><td>用户不改调用点，仍调用原函数名即可触发 JIT。</td></tr>
+        <tr><td>PASS4</td><td><code>EJIT_PERIOD_GUARD</code> metadata</td><td>deactivate / activate 插桩</td><td>配置修改时自动失效旧 cache，维持 may_const 语义。</td></tr>
       </tbody>
     </table>
   </section>
@@ -381,7 +381,7 @@
   <section id="runtime-decision">
     <h2>3. Runtime 热路径与模式选择</h2>
     <p>wrapper 热路径先做低成本判断：runtime 是否初始化、时间窗是否 active、cache 是否命中。只有 miss 且允许 JIT 时，才根据 <code>ejit_config_t::compileMode</code> 进入同步或异步路径。</p>
-    <div class="flow">用户调用 ejit_entry 原函数
+    <div class="flow">用户调用 EJIT_ENTRY 原函数
   ↓
 wrapper 读取 period index / 计算 cacheKey
   ↓
@@ -422,7 +422,7 @@ compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 
 
         <rect x="40" y="80" width="170" height="86" rx="12" fill="#ebf2fa" stroke="#3182ce" stroke-width="2" />
         <text x="78" y="112" class="svg-label">业务线程</text>
-        <text x="70" y="140" class="svg-small">调用 ejit_entry</text>
+        <text x="70" y="140" class="svg-small">调用 EJIT_ENTRY</text>
 
         <rect x="270" y="80" width="190" height="86" rx="12" fill="#fff" stroke="#2c5282" stroke-width="2" />
         <text x="330" y="112" class="svg-label">Wrapper</text>
@@ -576,9 +576,9 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
     <table>
       <thead><tr><th>阶段</th><th>作用</th><th>用户可观察结果</th></tr></thead>
       <tbody>
-        <tr><td>参数替换</td><td>把 <code>ejit_period_arr_ind</code> 参数替换为当前实例常量</td><td>数组下标、GEP 路径变得可折叠</td></tr>
+        <tr><td>参数替换</td><td>把 <code>EJIT_DIM</code> 参数替换为当前实例常量</td><td>数组下标、GEP 路径变得可折叠</td></tr>
         <tr><td>Inline</td><td>把小函数中的配置读取展开到入口闭包</td><td>跨函数读配置也可被 PASS6 识别</td></tr>
-        <tr><td>PASS6</td><td>读取 active 时间窗内 <code>ejit_may_const</code> 字段值，替换 load</td><td>IR 中 load 变成常量，分支条件固定</td></tr>
+        <tr><td>PASS6</td><td>读取 active 时间窗内 <code>EJIT_PERIOD_CONST</code> 字段值，替换 load</td><td>IR 中 load 变成常量，分支条件固定</td></tr>
         <tr><td>标准优化</td><td>常量传播、分支折叠、死代码删除、CFG 简化</td><td>dump IR 可看到只保留当前配置路径</td></tr>
         <tr><td>JITLink</td><td>生成机器码，解析外部符号，放入可执行内存</td><td>cache entry 增加，后续 hits 增加</td></tr>
       </tbody>
@@ -618,7 +618,7 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
         <text x="612" y="308" class="svg-small">修改完成后再次 activate</text>
 
         <rect x="100" y="270" width="760" height="48" rx="10" fill="#ebf2fa" stroke="#3182ce" />
-        <text x="132" y="300" class="svg-label">ejit_period_lc(name)</text>
+        <text x="132" y="300" class="svg-label">EJIT_PERIOD_GUARD(name)</text>
         <text x="292" y="300" class="svg-small">函数入口自动 deactivate；每个 return 前自动 activate。</text>
       </svg>
     </div>

@@ -10,6 +10,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSRETASK_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
+#include <cstdint>
 
 namespace llvm {
 namespace ejit {
@@ -30,6 +31,10 @@ public:
   /// through std::this_thread::yield; freestanding builds delay for one
   /// scheduler tick through the platform task API.
   static void yield();
+
+  /// Scheduling throttle for a worker that just consumed work. Host builds
+  /// yield repeatedly; freestanding builds delay for \p ticks scheduler ticks.
+  static void delay(uint32_t ticks);
 
   bool stopRequested() const { return stopFlag_.loadAcquire() != 0; }
 

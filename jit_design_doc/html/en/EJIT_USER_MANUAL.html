@@ -195,7 +195,7 @@
   <div class="cards">
     <div class="card">
       <h3>Core idea</h3>
-      <p>Between <code>ejit_activate</code> and <code>ejit_deactivate</code>, fields annotated <code>ejit_may_const</code> can be read as constants by the JIT.</p>
+      <p>Between <code>ejit_activate</code> and <code>ejit_deactivate</code>, fields annotated <code>EJIT_PERIOD_CONST</code> can be read as constants by the JIT.</p>
     </div>
     <div class="card">
       <h3>Main benefits</h3>
@@ -208,7 +208,7 @@
   </div>
 
   <div class="flow">User source annotations → Clang emits EJIT metadata → AOT pass embeds bitcode and inserts the wrapper →
-runtime activates the time window → calls ejit_entry → on a cache hit runs specialized code, otherwise falls back to AOT</div>
+runtime activates the time window → calls EJIT_ENTRY → on a cache hit runs specialized code, otherwise falls back to AOT</div>
 
   <p>Typical scenarios:</p>
   <ul>
@@ -234,21 +234,21 @@ runtime activates the time window → calls ejit_entry → on a cache hit runs s
 #define MODE_TDD 2
 
 struct CellConfig {
-    ejit_may_const uint32_t mode;      // can be specialized as a constant within the time window
-    ejit_may_const uint32_t threshold; // can be specialized as a constant within the time window
+    EJIT_PERIOD_CONST uint32_t mode;      // can be specialized as a constant within the time window
+    EJIT_PERIOD_CONST uint32_t threshold; // can be specialized as a constant within the time window
     uint32_t runtimeCounter;           // ordinary field, does not participate in constant substitution
 };
 
 // each cell index is an independent time-window instance
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
 
 static void fdd_path(int value);
 static void tdd_path(int value);
 static void default_path(int value);
 
 // the user still calls the original function name; the compiler inserts a wrapper at the function entry
-ejit_entry
-void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
+EJIT_ENTRY
+void process_cell(EJIT_DIM(cell) uint8_t cellIdx, int value) {
     if (g_cellCfg[cellIdx].mode == MODE_FDD) {
         fdd_path(value + g_cellCfg[cellIdx].threshold);
     } else if (g_cellCfg[cellIdx].mode == MODE_TDD) {
@@ -259,8 +259,8 @@ void process_cell(ejit_period_arr_ind(cell) uint8_t cellIdx, int value) {
 }
 
 // functions that modify cell config must be annotated with lifecycle; the compiler auto-inserts deactivate/activate
-ejit_period_lc(cell)
-void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
+EJIT_PERIOD_GUARD(cell)
+void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
                      uint32_t mode,
                      uint32_t threshold) {
     g_cellCfg[cellIdx].mode = mode;
@@ -297,7 +297,7 @@ void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
     return 0;
 }</code></pre>
 
-  <div class="ok"><strong>Minimal usage loop:</strong> Annotate <code>ejit_may_const</code> fields → annotate the <code>ejit_period_arr</code> global array → annotate <code>ejit_entry</code> and <code>ejit_period_arr_ind</code> → <code>ejit_init</code> → <code>ejit_activate</code> → call the original function.</div>
+  <div class="ok"><strong>Minimal usage loop:</strong> Annotate <code>EJIT_PERIOD_CONST</code> fields → annotate the <code>EJIT_IN_PERIOD_ARRAY</code> global array → annotate <code>EJIT_ENTRY</code> and <code>EJIT_DIM</code> → <code>ejit_init</code> → <code>ejit_activate</code> → call the original function.</div>
 </section>
 
 <section id="annotations">
@@ -307,24 +307,24 @@ void update_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIdx,
   <table>
     <thead><tr><th>Macro</th><th>Applies to</th><th>Purpose</th><th>Common constraints</th></tr></thead>
     <tbody>
-      <tr><td><code>ejit_may_const</code></td><td>Struct field</td><td>The field can be treated as a constant by the JIT within an active time window</td><td>Supports integer, bool, float, nested struct, and array; <code>volatile</code> is not specialized</td></tr>
-      <tr><td><code>ejit_period(static)</code></td><td>Non-array global variable</td><td>Global config that does not change at runtime, always active by default</td><td>Currently recommended to use only the built-in <code>static</code> scalar time window</td></tr>
-      <tr><td><code>ejit_period_arr(name)</code></td><td>Global array or global pointer to a struct</td><td>Defines a time-window array activated independently per index</td><td>Fixed arrays should stay &lt; 100; at most 1024 arrays per program</td></tr>
-      <tr><td><code>ejit_entry</code></td><td>Function</td><td>Marks a JIT-specializable entry function</td><td>No recursion; side effects should be idempotent in async mode</td></tr>
-      <tr><td><code>ejit_period_arr_ind(name)</code></td><td>Function parameter</td><td>Declares that this parameter is the index dimension of a time-window array</td><td>Must be an integer; at most 4 dimensions per function</td></tr>
-      <tr><td><code>ejit_period_lc(name)</code></td><td>Function</td><td>Marks a lifecycle function that modifies time-window data</td><td>Must have a matching <code>ejit_period_arr_ind</code> parameter; multiple periods allowed</td></tr>
+      <tr><td><code>EJIT_PERIOD_CONST</code></td><td>Struct field</td><td>The field can be treated as a constant by the JIT within an active time window</td><td>Supports integer, bool, float, nested struct, and array; <code>volatile</code> is not specialized</td></tr>
+      <tr><td><code>EJIT_IN_PERIOD(static)</code></td><td>Non-array global variable</td><td>Global config that does not change at runtime, always active by default</td><td>Currently recommended to use only the built-in <code>static</code> scalar time window</td></tr>
+      <tr><td><code>EJIT_IN_PERIOD_ARRAY(name)</code></td><td>Global array or global pointer to a struct</td><td>Defines a time-window array activated independently per index</td><td>Fixed arrays should stay &lt; 100; at most 1024 arrays per program</td></tr>
+      <tr><td><code>EJIT_ENTRY</code></td><td>Function</td><td>Marks a JIT-specializable entry function</td><td>No recursion; side effects should be idempotent in async mode</td></tr>
+      <tr><td><code>EJIT_DIM(name)</code></td><td>Function parameter</td><td>Declares that this parameter is the index dimension of a time-window array</td><td>Must be an integer; at most 4 dimensions per function</td></tr>
+      <tr><td><code>EJIT_PERIOD_GUARD(name)</code></td><td>Function</td><td>Marks a lifecycle function that modifies time-window data</td><td>Must have a matching <code>EJIT_DIM</code> parameter; multiple periods allowed</td></tr>
     </tbody>
   </table>
 
-  <h3>3.2 Static config: <code>ejit_period(static)</code></h3>
+  <h3>3.2 Static config: <code>EJIT_IN_PERIOD(static)</code></h3>
 <pre><code class="language-c">struct BoardConfig {
-    ejit_may_const uint32_t boardType;
+    EJIT_PERIOD_CONST uint32_t boardType;
     uint32_t flags;
 };
 
-ejit_period(static) struct BoardConfig g_boardCfg;
+EJIT_IN_PERIOD(static) struct BoardConfig g_boardCfg;
 
-ejit_entry
+EJIT_ENTRY
 void process_board(void) {
     if (g_boardCfg.boardType == 1) {
         // at JIT time boardType can be folded to a constant
@@ -333,27 +333,27 @@ void process_board(void) {
 
   <p>The <code>static</code> time window represents global config that does not change during JIT runtime; it does not require calling <code>ejit_activate</code>.</p>
 
-  <h3>3.3 Array time window: <code>ejit_period_arr(name)</code></h3>
+  <h3>3.3 Array time window: <code>EJIT_IN_PERIOD_ARRAY(name)</code></h3>
   <p>Multiple global arrays can share the same time-window name. Calling <code>ejit_activate("cell", idx)</code> activates the same index across all arrays of that name. Active state is keyed by time-window name + instance index only; there is no array-pointer dimension, so if multiple arrays share a name, activation applies to that period instance as a whole.</p>
 
-<pre><code class="language-c">struct CellConfig { ejit_may_const uint32_t mode; };
-struct CellState  { ejit_may_const uint32_t state; };
+<pre><code class="language-c">struct CellConfig { EJIT_PERIOD_CONST uint32_t mode; };
+struct CellState  { EJIT_PERIOD_CONST uint32_t state; };
 
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
-ejit_period_arr(cell) struct CellState  g_cellState[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(cell) struct CellState  g_cellState[16];
 
 // activate g_cellCfg[3] and g_cellState[3]
 ejit_activate("cell", 3);</code></pre>
 
   <h3>3.4 Multi-dimension specialization</h3>
-  <p>A single <code>ejit_entry</code> function can declare up to 4 time-window array indices. The runtime cache key encodes the high 32 bits as the function index and the low 4 bytes as the dimension values.</p>
+  <p>A single <code>EJIT_ENTRY</code> function can declare up to 4 time-window array indices. The runtime cache key encodes the high 32 bits as the function index and the low 4 bytes as the dimension values.</p>
 
-<pre><code class="language-c">ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
-ejit_period_arr(trp)  struct TrpConfig  g_trpCfg[8];
+<pre><code class="language-c">EJIT_IN_PERIOD_ARRAY(cell) struct CellConfig g_cellCfg[16];
+EJIT_IN_PERIOD_ARRAY(trp)  struct TrpConfig  g_trpCfg[8];
 
-ejit_entry
-void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
-                  ejit_period_arr_ind(trp)  uint8_t trpIdx,
+EJIT_ENTRY
+void process_pair(EJIT_DIM(cell) uint8_t cellIdx,
+                  EJIT_DIM(trp)  uint8_t trpIdx,
                   int payload) {
     if (g_cellCfg[cellIdx].mode == 1 &amp;&amp; g_trpCfg[trpIdx].type == 2) {
         // both cellIdx/trpIdx can become specialization dimensions
@@ -361,16 +361,16 @@ void process_pair(ejit_period_arr_ind(cell) uint8_t cellIdx,
 }</code></pre>
 
   <h3>3.5 Lifecycle functions</h3>
-  <p>Any function that modifies an <code>ejit_may_const</code> field or its containing struct should be annotated with <code>ejit_period_lc</code>. The compiler inserts an invalidation operation at the function entry and re-activates before every return point.</p>
+  <p>Any function that modifies an <code>EJIT_PERIOD_CONST</code> field or its containing struct should be annotated with <code>EJIT_PERIOD_GUARD</code>. The compiler inserts an invalidation operation at the function entry and re-activates before every return point.</p>
 
-<pre><code class="language-c">ejit_period_lc(cell) ejit_period_lc(trp)
-void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
-                 ejit_period_arr_ind(trp)  uint8_t trpIdx) {
+<pre><code class="language-c">EJIT_PERIOD_GUARD(cell) EJIT_PERIOD_GUARD(trp)
+void update_both(EJIT_DIM(cell) uint8_t cellIdx,
+                 EJIT_DIM(trp)  uint8_t trpIdx) {
     g_cellCfg[cellIdx].mode = 2;
     g_trpCfg[trpIdx].type = 4;
 }</code></pre>
 
-  <div class="warn"><strong>Note:</strong> If you bypass the lifecycle function and directly modify an <code>ejit_may_const</code> field inside an already-active time window, the old specialized code may be based on the old value. Use <code>ejit_period_lc</code> or manually <code>ejit_deactivate</code> / modify / <code>ejit_activate</code>.</div>
+  <div class="warn"><strong>Note:</strong> If you bypass the lifecycle function and directly modify an <code>EJIT_PERIOD_CONST</code> field inside an already-active time window, the old specialized code may be based on the old value. Use <code>EJIT_PERIOD_GUARD</code> or manually <code>ejit_deactivate</code> / modify / <code>ejit_activate</code>.</div>
 </section>
 
 <section id="runtime-api">
@@ -406,7 +406,7 @@ void update_both(ejit_period_arr_ind(cell) uint8_t cellIdx,
     <thead><tr><th>Mode</th><th>First-miss behavior</th><th>Suitable scenarios</th><th>Caveats</th></tr></thead>
     <tbody>
       <tr><td><code>EJIT_COMPILE_SYNC</code></td><td>Blocks until JIT compilation finishes, then directly runs the specialized version on success</td><td>You can accept first-call latency and want performance gains as early as possible</td><td>First-call latency is more noticeable</td></tr>
-      <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>Submits a background compile; the current call falls back to AOT</td><td>Sensitive to first-call latency</td><td><code>ejit_entry</code> side effects should be idempotent, to avoid inconsistency between the first AOT and later JIT behavior</td></tr>
+      <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>Submits a background compile; the current call falls back to AOT</td><td>Sensitive to first-call latency</td><td><code>EJIT_ENTRY</code> side effects should be idempotent, to avoid inconsistency between the first AOT and later JIT behavior</td></tr>
     </tbody>
   </table>
 
@@ -499,7 +499,7 @@ build_release_x86/bin/clang -O2 -g \
   <h3>6.1 What the AOT compile phase does</h3>
   <ol>
     <li>Clang parses the EJIT attributes, emits function/global-level <code>!ejit.metadata</code>, and emits <code>!ejit.may_const</code> on loads of may_const fields.</li>
-    <li><strong>PASS1</strong> <code>EJitRegisterBitcode</code> extracts the <code>ejit_entry</code> closure bitcode before standard optimization, embeds it in the binary, and generates registration info.</li>
+    <li><strong>PASS1</strong> <code>EJitRegisterBitcode</code> extracts the <code>EJIT_ENTRY</code> closure bitcode before standard optimization, embeds it in the binary, and generates registration info.</li>
     <li><strong>PASS2</strong> <code>EJitRegisterPeriod</code> generates period-array and static-variable registration.</li>
     <li><strong>PASS3</strong> <code>EJitWrapperGen</code> inserts the wrapper at the original function entry: builds the cache key, calls the runtime, jumps to the specialized function on success, or continues the original AOT body on failure.</li>
     <li><strong>PASS4</strong> <code>EJitPeriodHandler</code> inserts deactivate at lifecycle-function entries and activate before every return.</li>
@@ -510,10 +510,10 @@ build_release_x86/bin/clang -O2 -g \
   <ol>
     <li>Look up the cache by cache key; on a hit, return the function pointer.</li>
     <li>On a miss, load the embedded bitcode.</li>
-    <li>Substitute the <code>ejit_period_arr_ind</code> parameters with the constant indices for this call.</li>
+    <li>Substitute the <code>EJIT_DIM</code> parameters with the constant indices for this call.</li>
     <li>Run InstCombine to fold zext/GEP and other constant chains.</li>
     <li>Inline callees so cross-function field accesses are exposed as global-variable GEPs.</li>
-    <li><strong>PASS6</strong> <code>EJitStructFieldPass</code> replaces <code>ejit_may_const</code> field loads with the current memory-value constant.</li>
+    <li><strong>PASS6</strong> <code>EJitStructFieldPass</code> replaces <code>EJIT_PERIOD_CONST</code> field loads with the current memory-value constant.</li>
     <li>Run standard LLVM optimization at L1/L2/L3, generate machine code, and place it in the cache.</li>
   </ol>
 
@@ -560,7 +560,7 @@ build_release_x86/bin/clang -O2 -g \
   <table>
     <thead><tr><th>Check item</th><th>Expected</th></tr></thead>
     <tbody>
-      <tr><td><code>!ejit.metadata</code></td><td>Functions and globals carry <code>ejit_entry</code>, <code>ejit_period</code>, <code>ejit_period_arr</code>, etc. metadata</td></tr>
+      <tr><td><code>!ejit.metadata</code></td><td>Functions and globals carry <code>EJIT_ENTRY</code>, <code>EJIT_IN_PERIOD</code>, <code>EJIT_IN_PERIOD_ARRAY</code>, etc. metadata</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>Loads of annotated fields carry may_const metadata</td></tr>
       <tr><td><code>@__ejit_bitcode</code></td><td>The embedded bitcode is in a dedicated section</td></tr>
       <tr><td><code>ejit_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
@@ -622,20 +622,20 @@ cd build_debug_x86
   <table>
     <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
     <tbody>
-      <tr><td><code>ejit_period</code> used on an array</td><td>Arrays should use <code>ejit_period_arr</code></td><td>Change to <code>ejit_period_arr(name)</code></td></tr>
-      <tr><td><code>ejit_period_arr</code> used on a non-array</td><td>A scalar variable should not use an array time window</td><td>For a static scalar use <code>ejit_period(static)</code></td></tr>
-      <tr><td><code>ejit_period_arr_ind</code> parameter is not an integer</td><td>The index must be encodable as an integer dimension</td><td>Use an integer type such as <code>uint8_t</code> / <code>int</code></td></tr>
+      <tr><td><code>EJIT_IN_PERIOD</code> used on an array</td><td>Arrays should use <code>EJIT_IN_PERIOD_ARRAY</code></td><td>Change to <code>EJIT_IN_PERIOD_ARRAY(name)</code></td></tr>
+      <tr><td><code>EJIT_IN_PERIOD_ARRAY</code> used on a non-array</td><td>A scalar variable should not use an array time window</td><td>For a static scalar use <code>EJIT_IN_PERIOD(static)</code></td></tr>
+      <tr><td><code>EJIT_DIM</code> parameter is not an integer</td><td>The index must be encodable as an integer dimension</td><td>Use an integer type such as <code>uint8_t</code> / <code>int</code></td></tr>
       <tr><td>More than 4 dimensions</td><td>The cache key only encodes four 8-bit dimensions</td><td>Reduce dimensions or split the function</td></tr>
-      <tr><td><code>ejit_period_lc</code> has no matching index parameter</td><td>The lifecycle function cannot tell which instance to modify</td><td>Add an <code>ejit_period_arr_ind(name)</code> parameter</td></tr>
-      <tr><td>Recursive <code>ejit_entry</code></td><td>Recursive entry specialization is not supported</td><td>Drop <code>ejit_entry</code> or restructure the calls</td></tr>
+      <tr><td><code>EJIT_PERIOD_GUARD</code> has no matching index parameter</td><td>The lifecycle function cannot tell which instance to modify</td><td>Add an <code>EJIT_DIM(name)</code> parameter</td></tr>
+      <tr><td>Recursive <code>EJIT_ENTRY</code></td><td>Recursive entry specialization is not supported</td><td>Drop <code>EJIT_ENTRY</code> or restructure the calls</td></tr>
     </tbody>
   </table>
 
   <h3>9.2 JIT did not trigger</h3>
   <ol>
-    <li>Confirm the function is annotated <code>ejit_entry</code>.</li>
+    <li>Confirm the function is annotated <code>EJIT_ENTRY</code>.</li>
     <li>Confirm you are using an EJIT-enabled Clang, not a system Clang.</li>
-    <li>Confirm <code>ejit_init</code> ran before calling <code>ejit_entry</code>.</li>
+    <li>Confirm <code>ejit_init</code> ran before calling <code>EJIT_ENTRY</code>.</li>
     <li>Confirm the relevant time window has been <code>ejit_activate</code>-d.</li>
     <li>Confirm the build output contains <code>@__ejit_bitcode</code> and <code>ejit_compile_or_get</code>.</li>
     <li>On bare-metal, confirm the registry section was not garbage-collected by the linker.</li>
@@ -644,10 +644,10 @@ cd build_debug_x86
 
   <h3>9.3 JIT triggered but branches were not folded</h3>
   <ol>
-    <li>Is the field annotated <code>ejit_may_const</code>.</li>
+    <li>Is the field annotated <code>EJIT_PERIOD_CONST</code>.</li>
     <li>Is the field <code>volatile</code>; volatile fields are not substituted by constants.</li>
-    <li>Is the global annotated <code>ejit_period(static)</code> or <code>ejit_period_arr(name)</code>.</li>
-    <li>Is the entry-function parameter annotated with the matching <code>ejit_period_arr_ind(name)</code>.</li>
+    <li>Is the global annotated <code>EJIT_IN_PERIOD(static)</code> or <code>EJIT_IN_PERIOD_ARRAY(name)</code>.</li>
+    <li>Is the entry-function parameter annotated with the matching <code>EJIT_DIM(name)</code>.</li>
     <li>Is the time window active, and is the index correct.</li>
     <li>Can the access pattern be reduced to a constant GEP by InstCombine/Inline; complex PHI/select pointer paths may be skipped.</li>
     <li>Set <code>dumpJITDir</code> and check whether the optimized IR has replaced the load with a constant.</li>
@@ -661,7 +661,7 @@ cd build_debug_x86
     <li>External symbols not registered;</li>
     <li>JIT compilation failed or the target backend is missing;</li>
     <li>Out of memory, cache full, or a single function's code size exceeds the cap;</li>
-    <li>A pointer-type <code>ejit_period_arr</code> was not initialized or is out of bounds;</li>
+    <li>A pointer-type <code>EJIT_IN_PERIOD_ARRAY</code> was not initialized or is out of bounds;</li>
     <li>The field access pattern is too complex and PASS6 safely skips it.</li>
   </ul>
 </section>
@@ -672,10 +672,10 @@ cd build_debug_x86
   <h3>10.1 Current limitations</h3>
   <ul>
     <li>Only the Clang attribute path is supported; GCC compatibility is future work.</li>
-    <li><code>ejit_entry</code> does not support recursion.</li>
+    <li><code>EJIT_ENTRY</code> does not support recursion.</li>
     <li>Function-pointer call targets are not specialized yet.</li>
-    <li>Custom scalar <code>ejit_period(name)</code> depends on declarations planned as a future extension; for now scalars should use <code>static</code>.</li>
-    <li>At most 4 <code>ejit_period_arr_ind</code> dimensions per function.</li>
+    <li>Custom scalar <code>EJIT_IN_PERIOD(name)</code> depends on declarations planned as a future extension; for now scalars should use <code>static</code>.</li>
+    <li>At most 4 <code>EJIT_DIM</code> dimensions per function.</li>
     <li>Time-window arrays should be small; fixed arrays target &lt;100, with at most 1024 period arrays globally.</li>
     <li><code>!ejit.may_const</code> is a soft annotation: losing it only means less optimization, never incorrectness.</li>
     <li>Complex pointers, PHI/select, and non-linear index paths may not be replaceable by constants.</li>
@@ -686,7 +686,7 @@ cd build_debug_x86
   <div class="cards">
     <div class="card">
       <h4>Prefer stable config fields</h4>
-      <p>Only mark fields that are truly constant within the time window as <code>ejit_may_const</code>; do not annotate frequently changing fields.</p>
+      <p>Only mark fields that are truly constant within the time window as <code>EJIT_PERIOD_CONST</code>; do not annotate frequently changing fields.</p>
     </div>
     <div class="card">
       <h4>Keep dimensions simple</h4>
@@ -694,7 +694,7 @@ cd build_debug_x86
     </div>
     <div class="card">
       <h4>Centralize config modification</h4>
-      <p>Modify config through <code>ejit_period_lc</code> functions; avoid scattered writes to may_const fields.</p>
+      <p>Modify config through <code>EJIT_PERIOD_GUARD</code> functions; avoid scattered writes to may_const fields.</p>
     </div>
     <div class="card">
       <h4>Verify before optimizing</h4>
@@ -704,8 +704,8 @@ cd build_debug_x86
 
   <h3>10.3 Pre-launch checklist</h3>
   <ul>
-    <li>All <code>ejit_entry</code> functions have fallback-correctness tests.</li>
-    <li>All config-modification paths use <code>ejit_period_lc</code> or manual deactivate/activate.</li>
+    <li>All <code>EJIT_ENTRY</code> functions have fallback-correctness tests.</li>
+    <li>All config-modification paths use <code>EJIT_PERIOD_GUARD</code> or manual deactivate/activate.</li>
     <li>Behavior is consistent across sync/async; the async first-call fallback does not affect business side effects.</li>
     <li>Cache size, single-function size, and code-memory caps fit the target device's memory constraints.</li>
     <li>On bare-metal, confirm external symbols, the registry section, code-memory permissions, and the I/D cache flush path.</li>

@@ -35,6 +35,15 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   if (FD->hasAttr<EjitEntryAttr>()) {
     Entries.push_back(llvm::MDNode::get(Ctx,
         llvm::MDString::get(Ctx, TAG_EJIT_ENTRY)));
+    // Prevent the inliner from merging ejit_entry into its callers.
+    // In LTO pipelines the inliner runs before EJitWrapperGenPass can
+    // add this attribute; emitting it at CodeGen time ensures the
+    // function survives so PASS1 can extract its bitcode and PASS3
+    // can insert the JIT wrapper. Sema rejects always_inline on
+    // ejit_entry; the AlwaysInline guard is a backstop for hand-written
+    // IR (noinline + alwaysinline is illegal and aborts the verifier).
+    if (!F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+      F->addFnAttr(llvm::Attribute::NoInline);
   }
 
   // ejit_period_lc
@@ -44,6 +53,17 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
         llvm::MDString::get(Ctx, LCA->getPeriodName())
     }));
   }
+  // Same LTO-inliner hazard as ejit_entry: in FullLTO the inliner runs
+  // before EJitAotModulePass, so PASS4 (EJitPeriodHandler) would see an
+  // inlined-away function and fail to emit ejit_deactivate/ejit_activate
+  // at its entry/returns. Unlike ejit_entry, PASS4 does not self-defend
+  // with NoInline, so the CodeGen-time attribute is the only guard.
+  // Lifecycle guards are entered/left rarely, so NoInline has no real
+  // perf cost. Sema rejects always_inline here too; the guard backstops
+  // hand-written IR.
+  if (FD->hasAttr<EjitPeriodLcAttr>() &&
+      !F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+    F->addFnAttr(llvm::Attribute::NoInline);
 
   // ejit_period_arr_ind (on parameters)
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {
@@ -68,14 +88,23 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
 static void collectMayConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
                                         uint64_t BaseOffset,
                                         SmallVectorImpl<uint64_t> &Offsets) {
+  // Union members all share an offset, so an offset cannot identify one member:
+  // recording a may_const member would also match a load of a mutable sibling.
+  // The per-load !ejit.may_const marker stays, so a genuine may_const union
+  // member is still specialized; only the offset-based fallback is withheld.
+  if (RD->isUnion())
+    return;
+
   const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
   for (const FieldDecl *FD : RD->fields()) {
     if (FD->isBitField())
       continue;
     uint64_t FieldOff = BaseOffset + Layout.getFieldOffset(FD->getFieldIndex()) / 8;
-    if (FD->hasAttr<EjitMayConstAttr>())
+    // A volatile field is read exactly as written and can never be folded, so
+    // clang withholds its per-load marker (see EmitLValueForField). Recording
+    // its offset would let the fallback hand that marker back.
+    if (FD->hasAttr<EjitMayConstAttr>() && !FD->getType().isVolatileQualified())
       Offsets.push_back(FieldOff);
-    // Recurse into nested structs
     if (const auto *InnerRD = FD->getType()->getAsRecordDecl())
       collectMayConstFieldOffsets(Ctx, InnerRD, FieldOff, Offsets);
   }

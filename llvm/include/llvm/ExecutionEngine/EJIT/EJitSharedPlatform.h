@@ -66,7 +66,12 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// (codeStart/codeSize/poolBase/poolSize/poolId) and the shared state gains a
 /// per-core, per-pool 4K split-readiness table, so a non-owner core in 4K-seal
 /// mode can split its pool once and seal exactly the pages the code covers.
-constexpr uint32_t kEJitSharedAbiVersion = 5u;
+/// v6: dump slots carry dynamic IR/ASM payload pointers instead of fixed text
+/// buffers, and each cache bucket carries a monotonic publishSeq word used by
+/// the optional EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock reader.
+/// v7: full IR/ASM payloads are worker-local again; shared dump state contains
+/// only a bounded filter and latest-capture metadata. publishSeq is unchanged.
+constexpr uint32_t kEJitSharedAbiVersion = 7u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
