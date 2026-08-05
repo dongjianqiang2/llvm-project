@@ -18,7 +18,7 @@
 // ejit_deactivate/ejit_activate calls.
 
 struct Cfg { int t; };
-__attribute__((ejit_period_arr("cell"))) struct Cfg g_cell[16];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct Cfg g_cell[16];
 extern void sink(int);
 
 // Small, otherwise-inlineable entry. @caller calls it; the functions are

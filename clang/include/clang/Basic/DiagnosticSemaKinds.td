@@ -13503,6 +13503,10 @@ def err_ejit_entry_recursive : Error<
   "ejit_entry function %0 cannot be recursive">;
 def err_ejit_period_lc_no_index : Error<
   "ejit_period_lc(%0) requires a corresponding ejit_period_arr_ind(%0) parameter">;
+def err_ejit_missing_shared_section : Error<
+  "global variable %0 has %1 but is missing "
+  "'__attribute__((section(\".mc_shared\")))'; "
+  "ejit period variables must reside in cross-core shared memory">;
 def warn_ejit_may_const_modified_without_lc : Warning<
   "modifying ejit_may_const field %0 of %1 without ejit_period_lc attribute">,
   InGroup<EmbeddedJIT>;

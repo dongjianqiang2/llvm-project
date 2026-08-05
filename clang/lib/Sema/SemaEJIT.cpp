@@ -328,6 +328,31 @@ void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD) {
   }
 }
 
+/// checkEjitPeriodSharedSection - Check that global variables marked with
+/// ejit_period or ejit_period_arr also have __attribute__((section(...)))
+/// placing them in cross-core shared memory.
+/// Called from ActOnVariableDeclarator after ProcessDeclAttributes, so the
+/// check is independent of the source order of the two attributes.
+void checkEjitPeriodSharedSection(Sema &S, VarDecl *VD) {
+  if (!VD)
+    return;
+
+  bool HasPeriod = VD->hasAttr<EjitPeriodAttr>() ||
+                   VD->hasAttr<EjitPeriodArrAttr>();
+  if (!HasPeriod)
+    return;
+
+  if (!VD->hasAttr<SectionAttr>()) {
+    // Try to get the attribute location for a good diagnostic.
+    if (auto *PA = VD->getAttr<EjitPeriodAttr>())
+      S.Diag(PA->getLocation(), diag::err_ejit_missing_shared_section)
+          << VD << "ejit_period";
+    else if (auto *PAA = VD->getAttr<EjitPeriodArrAttr>())
+      S.Diag(PAA->getLocation(), diag::err_ejit_missing_shared_section)
+          << VD << "ejit_period_arr";
+  }
+}
+
 /// If \p E is an lvalue that writes an ejit_may_const field, return that field
 /// and set \p BaseVar to the underlying variable (if any). Strips parentheses
 /// and implicit casts, and walks through array-subscript / member chains to

@@ -10,8 +10,8 @@ struct CellConfig {
   int xx;
 };
 
-__attribute__((ejit_period("static"))) int g_board;
-__attribute__((ejit_period_arr("cell"))) struct CellConfig g_cells[16];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period("static"))) int g_board;
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct CellConfig g_cells[16];
 
 __attribute__((ejit_entry))
 void process_task(__attribute__((ejit_period_arr_ind("cell"))) int idx);
@@ -28,6 +28,7 @@ __attribute__((ejit_period_arr("cell"))) int g_not_array;
 // expected-error@-1 {{ejit_period_arr attribute requires an array type; 'g_not_array' is not an array}}
 
 // === Error: duplicate period attributes (only second usage triggers error) ===
+__attribute__((section(".mc_shared")))
 __attribute__((ejit_period("one")))
 __attribute__((ejit_period("two")))
 // expected-error@-1 {{variable 'g_conflict' cannot have multiple ejit_period or ejit_period_arr attributes}}
@@ -61,7 +62,7 @@ struct WarnCfg {
   int plain;
 };
 
-__attribute__((ejit_period_arr("cell"))) struct WarnCfg g_warn[4];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct WarnCfg g_warn[4];
 
 // A plain function (no ejit_period_lc) that writes may_const fields -> warn.
 void bad_writer(int i, int v) {

@@ -84,6 +84,10 @@ void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD);
 // Defined in SemaEJIT.cpp.
 void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body);
 
+// Forward declaration for EmbeddedJIT shared-section check.
+// Defined in SemaEJIT.cpp.
+void checkEjitPeriodSharedSection(Sema &S, VarDecl *VD);
+
 Sema::DeclGroupPtrTy Sema::ConvertDeclToDeclGroup(Decl *Ptr, Decl *OwnedType) {
   if (OwnedType) {
     Decl *Group[2] = { OwnedType, Ptr };
@@ -8030,6 +8034,10 @@ NamedDecl *Sema::ActOnVariableDeclarator(
 
   // Handle attributes prior to checking for duplicates in MergeVarDecl
   ProcessDeclAttributes(S, NewVD, D);
+
+  // EmbeddedJIT: global variables with ejit_period / ejit_period_arr must also
+  // have __attribute__((section(...))) for cross-core shared memory.
+  checkEjitPeriodSharedSection(*this, NewVD);
 
   if (getLangOpts().HLSL)
     HLSL().ActOnVariableDeclarator(NewVD);

@@ -8,7 +8,7 @@
 // noinline at -O1.
 
 struct Cfg { int t; };
-__attribute__((ejit_period_arr("cell"))) struct Cfg g_cell[16];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct Cfg g_cell[16];
 extern void sink(int);
 
 __attribute__((ejit_entry))

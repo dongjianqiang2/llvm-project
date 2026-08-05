@@ -12,7 +12,7 @@ struct Outer {
   struct Inner inner;
 };
 
-__attribute__((ejit_period_arr("cell"))) struct Outer g_data[8];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct Outer g_data[8];
 
 // CHECK-DAG: @g_data = {{.*}} !ejit.metadata ![[ARR_META:[0-9]+]]
 

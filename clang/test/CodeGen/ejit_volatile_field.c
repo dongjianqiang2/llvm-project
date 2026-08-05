@@ -7,7 +7,7 @@ struct Config {
   int normalField;
 };
 
-__attribute__((ejit_period_arr("cell"))) struct Config g_cfg[10];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct Config g_cfg[10];
 
 __attribute__((ejit_entry))
 int test_volatile(__attribute__((ejit_period_arr_ind("cell"))) int ci) {

@@ -7,10 +7,10 @@ struct CellConfig {
 };
 
 // CHECK-DAG: @g_boardCfg = {{.*}} !ejit.metadata ![[PERIOD_META:[0-9]+]]
-__attribute__((ejit_period("static"))) struct CellConfig g_boardCfg;
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period("static"))) struct CellConfig g_boardCfg;
 
 // CHECK-DAG: @g_cellCfg = {{.*}} !ejit.metadata ![[ARR_META:[0-9]+]]
-__attribute__((ejit_period_arr("cell"))) struct CellConfig g_cellCfg[16];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct CellConfig g_cellCfg[16];
 
 // CHECK: define {{.*}}void @jit_entry({{.*}} !ejit.metadata ![[ENTRY_META:[0-9]+]]
 __attribute__((ejit_entry))

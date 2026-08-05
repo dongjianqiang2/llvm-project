@@ -22,7 +22,7 @@ struct Cfg {
   struct Inner inner;
 };
 
-__attribute__((ejit_period_arr("cell"))) struct Cfg g_cfg[8];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct Cfg g_cfg[8];
 
 extern void barrier(void);
 

@@ -28,7 +28,7 @@
 // CHECK-DAG: declare {{.*}} @ejit_deactivate
 // CHECK-DAG: declare {{.*}} @ejit_activate
 
-int cell_data[16] __attribute__((ejit_period_arr("cell")));
+int cell_data[16] __attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell")));
 
 __attribute__((ejit_entry))
 void process_cell(int __attribute__((ejit_period_arr_ind("cell"))) cell_idx) {

@@ -12,13 +12,13 @@ struct CellPhy {
 };
 
 // CHECK-DAG: @cellCfg = {{.*}} !ejit.metadata ![[CELL_META:[0-9]+]]
-__attribute__((ejit_period_arr("cell"))) struct CellConfig cellCfg[16];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct CellConfig cellCfg[16];
 
 // CHECK-DAG: @cellPhy = {{.*}} !ejit.metadata ![[PHY_META:[0-9]+]]
-__attribute__((ejit_period_arr("cell"))) struct CellPhy cellPhy[16];
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period_arr("cell"))) struct CellPhy cellPhy[16];
 
 // CHECK-DAG: @boardCfg = {{.*}} !ejit.metadata ![[BOARD_META:[0-9]+]]
-__attribute__((ejit_period("static"))) int boardCfg;
+__attribute__((section(".mc_shared"))) __attribute__((ejit_period("static"))) int boardCfg;
 
 __attribute__((ejit_entry))
 int process_cell(__attribute__((ejit_period_arr_ind("cell"))) int ci) {
