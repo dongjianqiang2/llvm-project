@@ -521,22 +521,65 @@ bool EJitCodePoolManager::contains(const void *Ptr) const {
   return false;
 }
 
-void EJitCodePoolManager::recordFinalizedRange(const void *Base, size_t Size) {
+bool EJitCodePoolManager::recordFinalizedRange(
+    const void *Base, size_t Size, const EJitWritableRange *Writables,
+    uint32_t WritableCount) {
   if (!Base || Size == 0) {
     EJIT_DIAG("recordFinalizedRange skip: base=%p size=%zu", Base, Size);
-    return;
+    return true; // benign no-op (no executable extent to record).
   }
-  EJIT_DIAG("recordFinalizedRange: base=%p size=%zu", Base, Size);
+  // Over-bound writable set: REJECT (do not record). Truncating to zero would
+  // let findRange() resolve an executable range that omits pages the code
+  // writes, so a peer would under-prepare and fault. Rejecting makes findRange
+  // fail -> the owner never publishes a callable pointer for it.
+  if (WritableCount > kEJitMaxWritableRanges) {
+    EJIT_DIAG("recordFinalizedRange REJECT: base=%p writableCount=%u > max=%u",
+              Base, WritableCount, kEJitMaxWritableRanges);
+    return false;
+  }
+  // A non-zero count with no array is malformed: reject rather than silently
+  // record zero writable ranges.
+  if (WritableCount > 0 && !Writables) {
+    EJIT_DIAG("recordFinalizedRange REJECT: base=%p writableCount=%u but null "
+              "Writables",
+              Base, WritableCount);
+    return false;
+  }
+  EJIT_DIAG("recordFinalizedRange: base=%p size=%zu writable=%u", Base, Size,
+            WritableCount);
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
 #endif
   uintptr_t Start = addr(Base);
-  // Overflow guard: a range whose end wraps is malformed; ignore it (findRange
+  // Overflow guard: a range whose end wraps is malformed; reject it (findRange
   // would otherwise admit any pointer).
   if (Start + Size < Start) {
-    EJIT_DIAG("recordFinalizedRange skip: wraparound start=0x%llx size=%zu",
+    EJIT_DIAG("recordFinalizedRange REJECT: wraparound start=0x%llx size=%zu",
               static_cast<unsigned long long>(Start), Size);
-    return;
+    return false;
+  }
+  // The executable extent must belong to a known pool; every writable range
+  // must lie wholly inside that SAME pool (the peer's split/enable_rw granule).
+  // Any writable range that is empty, wraps, or escapes the pool is rejected so
+  // a malformed set can never be published as a callable, under-prepared range.
+  CodePool *Owner = findPoolLocked(Base);
+  if (!Owner) {
+    EJIT_DIAG("recordFinalizedRange REJECT: base=%p not owned by any pool",
+              Base);
+    return false;
+  }
+  for (uint32_t I = 0; I < WritableCount; ++I) {
+    uintptr_t WStart = Writables[I].addr;
+    uint64_t WSize = Writables[I].size;
+    if (WSize == 0 || WStart + static_cast<uintptr_t>(WSize) < WStart ||
+        !rangeFitsPool(*Owner, reinterpret_cast<const void *>(WStart),
+                       static_cast<size_t>(WSize))) {
+      EJIT_DIAG("recordFinalizedRange REJECT: base=%p writable[%u] "
+                "addr=0x%llx size=%llu invalid or out of pool",
+                Base, I, static_cast<unsigned long long>(WStart),
+                static_cast<unsigned long long>(WSize));
+      return false;
+    }
   }
   // Idempotent record: re-finalizing the identical [Start, Size) extent (e.g. a
   // retried finalize of the same allocation) must not grow the table or create
@@ -549,12 +592,16 @@ void EJitCodePoolManager::recordFinalizedRange(const void *Base, size_t Size) {
     if (R.start == Start && R.size == static_cast<uint64_t>(Size)) {
       EJIT_DIAG("recordFinalizedRange dup: base=%p size=%zu (already recorded)",
                 Base, Size);
-      return;
+      return true;
     }
-  FinalizedRanges_.push_back(
-      FinalizedRange{Start, static_cast<uint64_t>(Size)});
-  EJIT_DIAG("recordFinalizedRange OK: base=%p size=%zu total=%zu", Base, Size,
-            FinalizedRanges_.size());
+  FinalizedRange Rec{Start, static_cast<uint64_t>(Size)};
+  Rec.writableCount = WritableCount;
+  for (uint32_t I = 0; I < WritableCount; ++I)
+    Rec.writables[I] = Writables[I];
+  FinalizedRanges_.push_back(Rec);
+  EJIT_DIAG("recordFinalizedRange OK: base=%p size=%zu writable=%u total=%zu",
+            Base, Size, Rec.writableCount, FinalizedRanges_.size());
+  return true;
 }
 
 bool EJitCodePoolManager::findRange(const void *Ptr,
@@ -591,10 +638,24 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       Out.poolBase = B;
       Out.poolSize = static_cast<uint64_t>(P.size);
       Out.poolId = static_cast<uint32_t>(I);
+      // Runtime-writable extents of this allocation (e.g. __profc_): a peer
+      // core enable_rw's exactly these before executing. Copied by value.
+      Out.writableCount = Found->writableCount;
+      for (uint32_t W = 0; W < kEJitMaxWritableRanges; ++W)
+        Out.writableRanges[W] = (W < Found->writableCount)
+                                    ? Found->writables[W]
+                                    : EJitWritableRange{};
+      // Whether a peer must actually enable_rw those pages depends on the pool
+      // kind: only a fixed RX code-segment pool (needsEnableRw) needs it; a
+      // dynamic SRE_MemDbgAlloc pool is already RW, so the ranges are then
+      // diagnostic only.
+      Out.requiresPeerEnableRw = Opts_.needsEnableRw ? 1u : 0u;
       Out.reserved = 0;
-      EJIT_DIAG("findRange OK: ptr=%p codeStart=0x%llx codeSize=%llu poolId=%u",
+      EJIT_DIAG("findRange OK: ptr=%p codeStart=0x%llx codeSize=%llu poolId=%u "
+                "writable=%u peerRw=%u",
                 Ptr, static_cast<unsigned long long>(Out.codeStart),
-                static_cast<unsigned long long>(Out.codeSize), Out.poolId);
+                static_cast<unsigned long long>(Out.codeSize), Out.poolId,
+                Out.writableCount, Out.requiresPeerEnableRw);
       return true;
     }
   }

@@ -38,6 +38,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSHAREDTASKPOOLSTATE_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h" // EJitWritableRange bound
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitCompileRequest, EJitDimPair
 #include <cstddef>
@@ -83,6 +84,14 @@ namespace ejit {
 constexpr uint32_t kEJitSharedMaxDims = 4u;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
 constexpr uint32_t kEJitSharedInstances = 256u;
+/// Max runtime-writable ranges carried per cache slot (v9). Kept in lockstep
+/// with the code-pool descriptor bound so a range published by the owner is
+/// never truncated crossing the shared slot; an allocation with more writable
+/// segments is rejected before publish (see EJitCodePoolManager).
+constexpr uint32_t kEJitSharedMaxWritableRanges = kEJitMaxWritableRanges;
+static_assert(kEJitSharedMaxWritableRanges == kEJitMaxWritableRanges,
+              "shared-slot and code-pool writable-range bounds must match so "
+              "a published range is never silently truncated");
 constexpr uint32_t kEJitSharedMaxFuncIndex = EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX;
 constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 
@@ -137,6 +146,16 @@ enum class EJitSharedSlotState : uint32_t {
 };
 
 //===----------------------------------------------------------------------===//
+// EJitSharedWritableRange: one runtime-writable extent of a published code
+// allocation (e.g. the Tier-1 __profc_ counters). Plain fixed-width scalars so
+// it lives in the shared blob and is read by value on any core (endian-safe).
+//===----------------------------------------------------------------------===//
+struct EJitSharedWritableRange {
+  uintptr_t addr; ///< start of the runtime-writable extent (0 = unused entry)
+  uint64_t size;  ///< size in bytes of that extent (0 = unused entry)
+};
+
+//===----------------------------------------------------------------------===//
 // EJitSharedCacheSlot: one POD result-cache entry.
 //===----------------------------------------------------------------------===//
 struct EJitSharedCacheSlot {
@@ -165,6 +184,28 @@ struct EJitSharedCacheSlot {
   uint64_t poolSize;      ///< usable pool size
   uint32_t poolId;        ///< stable pool index (diagnostic / convenience key)
   uint32_t rangeReserved; ///< reserved, keeps the tail explicit (must be 0)
+  /// Runtime-writable extents of the published code (v9): the pages the JIT
+  /// body writes at runtime (e.g. Tier-1 __profc_ counters). A non-owner core
+  /// in 4K-seal mode MUST enable_rw exactly these in its own translation
+  /// context BEFORE it may execute the code — otherwise the first counter
+  /// atomicrmw faults with a write-permission abort (the fixed code segment is
+  /// RX on every core at load; only the owner made these pages RW). Written
+  /// under the bucket write lock BEFORE state=Ready is released, so an
+  /// acquiring reader sees them consistently. writableCount 0 => no
+  /// runtime-writable data (non-PGO / Tier-2 code): the peer seals only the
+  /// executable pages. These ranges are page-disjoint from [codeStart,
+  /// codeStart+codeSize) by construction (the finalize layout is page-aligned),
+  /// so making them RW on a peer never touches a code page (no RWX).
+  uint32_t writableCount; ///< valid entries in writableRanges (<= max)
+  /// 1 => a peer core MUST enable_rw these pages before executing (the code is
+  /// in a fixed RX code-segment pool). 0 => the pool is already RW (dynamic
+  /// SRE_MemDbgAlloc): the ranges are diagnostic only and a peer executes with
+  /// NO enable_rw. This separates "has runtime-writable data" (writableCount)
+  /// from "peer must flip it writable" (requiresPeerEnableRw), so a dynamic
+  /// pool is never forced to fall back merely because it carries writable
+  /// metadata.
+  uint32_t requiresPeerEnableRw;
+  EJitSharedWritableRange writableRanges[kEJitSharedMaxWritableRanges];
   /// PGO (v7): per-slot hotspot counter for the Tier-2 auto-trigger (§6).
   /// Incremented on cache hit; reset to 0 when Tier-2 publishes over Tier-1
   /// (§7.1).  Counter addresses (__profc_/__profd_) are resolved by the
@@ -433,6 +474,11 @@ static_assert(
         std::is_trivially_destructible<EJitSharedCacheSlot>::value &&
         std::is_trivially_default_constructible<EJitSharedCacheSlot>::value,
     "EJitSharedCacheSlot must be POD-style");
+static_assert(
+    std::is_standard_layout<EJitSharedWritableRange>::value &&
+        std::is_trivially_destructible<EJitSharedWritableRange>::value &&
+        std::is_trivially_default_constructible<EJitSharedWritableRange>::value,
+    "EJitSharedWritableRange must be POD-style");
 static_assert(
     std::is_standard_layout<EJitSharedQueueCell>::value &&
         std::is_trivially_destructible<EJitSharedQueueCell>::value &&

@@ -121,6 +121,20 @@ bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
   return false;
 #endif
 }
+
+// Per-core enable_rw for a JIT function's runtime-writable data pages (e.g.
+// Tier-1 __profc_): a non-owner core must make these RW in its own translation
+// context before executing code that writes them (the fixed .text.ejit segment
+// is RX on every core). Only meaningful in 4K-seal fixed-code-pool builds.
+[[maybe_unused]] bool sharedEnableRwPageThunk(void * /*ctx*/,
+                                              uintptr_t pageVA) {
+#ifdef EJIT_SRE_CODE_POOL
+  return ejitSreEnableRwPageForCurrentCore(pageVA);
+#else
+  (void)pageVA;
+  return false;
+#endif
+}
 #endif
 } // namespace
 #endif
@@ -198,6 +212,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.setSealMode(true);
   sharedPool_.setSplitPoolCallback(&sharedSplitPoolThunk, this);
   sharedPool_.setSealPageCallback(&sharedSealPageThunk, this);
+  // And, for a JIT function with runtime-writable data (Tier-1 __profc_
+  // counters), make those data pages writable per-core before execution.
+  sharedPool_.setEnableRwPageCallback(&sharedEnableRwPageThunk, this);
 #else
   // Legacy whole-2MiB-pool seal: align fnPtr to its pool base and enable_ex.
   sharedPool_.setSealMode(false);

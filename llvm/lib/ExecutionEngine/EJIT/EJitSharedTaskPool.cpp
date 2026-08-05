@@ -1017,6 +1017,19 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   Snap.codeSize = Slot.codeSize;
   Snap.poolBase = Slot.poolBase;
   Snap.poolSize = Slot.poolSize;
+  // Snapshot the runtime-writable extents too: the per-core enable_rw must run
+  // with NO bucket lock held (like the split/seal below). Keep the raw count so
+  // prepareExecForCurrentCore stays the single authority that rejects an
+  // over-bound count; only the array copy is bounded.
+  Snap.writableCount = Slot.writableCount;
+  Snap.requiresPeerEnableRw = Slot.requiresPeerEnableRw;
+  uint32_t copyN = Slot.writableCount > kEJitSharedMaxWritableRanges
+                       ? kEJitSharedMaxWritableRanges
+                       : Slot.writableCount;
+  for (uint32_t i = 0; i < copyN; ++i) {
+    Snap.writables[i].addr = Slot.writableRanges[i].addr;
+    Snap.writables[i].size = Slot.writableRanges[i].size;
+  }
   bucketReadRelease(B);
 
   if (!prepareExecForCurrentCore(Snap, self)) {
@@ -1432,21 +1445,90 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
     return false;
   }
 
-  // Seal every 4KiB page the code overlaps: page-align start down, end up.
   const uintptr_t Page = static_cast<uintptr_t>(kEJitSharedSealPage);
-  uintptr_t PageStart = R.codeStart & ~(Page - 1);
-  uintptr_t PageEnd =
+  const uintptr_t CodePageStart = R.codeStart & ~(Page - 1);
+  const uintptr_t CodePageEnd =
       (R.codeStart + static_cast<uintptr_t>(R.codeSize) + Page - 1) &
       ~(Page - 1);
-  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page)
+
+  // STEP 1: prepare the runtime-writable data pages (e.g. Tier-1 __profc_)
+  // FIRST, making them writable (enable_rw, RX -> RW) in THIS core's
+  // translation context, before any executable page is sealed and before the
+  // core-prepared bit is published. This is required ONLY for a fixed RX
+  // code-segment pool (requiresPeerEnableRw): its pages are RX on every core at
+  // load, so the JIT body's first counter atomicrmw would otherwise fault with
+  // a write-permission abort. A dynamic SRE_MemDbgAlloc pool
+  // (requiresPeerEnableRw=0) is already RW, so the writable ranges are
+  // diagnostic only and are NOT flipped here (and no enable_rw callback is
+  // required). Any anomaly on the fixed path is a clean fallback (no fnPtr, no
+  // core bit) so a peer that cannot be made safe simply runs AOT.
+  if (R.requiresPeerEnableRw && R.writableCount > 0) {
+    if (R.writableCount > kEJitSharedMaxWritableRanges) {
+      EJIT_DIAG("prepareExec fallback: core=%u writableCount=%u > max=%u", self,
+                R.writableCount, kEJitSharedMaxWritableRanges);
+      return false;
+    }
+    if (!enableRwPageFn_) {
+      EJIT_DIAG("prepareExec FAIL: core=%u fixed RX pool needs enable_rw but "
+                "no callback",
+                self);
+      return false;
+    }
+    for (uint32_t i = 0; i < R.writableCount; ++i) {
+      const uintptr_t WStart = R.writables[i].addr;
+      const uint64_t WSize = R.writables[i].size;
+      if (WSize == 0)
+        continue;
+      if (WStart + static_cast<uintptr_t>(WSize) < WStart) {
+        EJIT_DIAG_VERBOSE(
+            "prepareExec fallback: core=%u writable range overflow", self);
+        return false;
+      }
+      // Must lie wholly inside the code's pool (same split granule) so the page
+      // is already split to 4K in this core's translation.
+      if (WStart < R.poolBase ||
+          WStart + static_cast<uintptr_t>(WSize) > R.poolBase + R.poolSize) {
+        EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u writable not in pool",
+                          self);
+        return false;
+      }
+      const uintptr_t WPageStart = WStart & ~(Page - 1);
+      const uintptr_t WPageEnd =
+          (WStart + static_cast<uintptr_t>(WSize) + Page - 1) & ~(Page - 1);
+      // W^X guard: a writable range must NEVER share a 4KiB page with the
+      // executable extent, or enable_rw would make a code page writable (RWX).
+      // The finalize layout guarantees this; re-verify so a malformed/hostile
+      // slot cannot bypass it.
+      if (WPageStart < CodePageEnd && CodePageStart < WPageEnd) {
+        EJIT_DIAG("prepareExec FAIL: core=%u writable page overlaps code "
+                  "(wStart=0x%llx codeStart=0x%llx) - refusing RWX",
+                  self, static_cast<unsigned long long>(WStart),
+                  static_cast<unsigned long long>(R.codeStart));
+        return false;
+      }
+      for (uintptr_t VA = WPageStart; VA < WPageEnd; VA += Page)
+        if (!enableRwPageFn_(enableRwPageCtx_, VA)) {
+          EJIT_DIAG("prepareExec FAIL: core=%u enable_rw pageVA=0x%llx", self,
+                    static_cast<unsigned long long>(VA));
+          return false; // failed enable_rw -> no callable pointer, no core bit.
+        }
+    }
+    EJIT_DIAG_VERBOSE("prepareExec: core=%u writable pages prepared count=%u",
+                      self, R.writableCount);
+  }
+
+  // STEP 2: seal every 4KiB page the code overlaps (enable_ex, RX): page-align
+  // start down, end up. Only after BOTH the writable and executable pages are
+  // prepared may the caller publish this core's prepared bit.
+  for (uintptr_t VA = CodePageStart; VA < CodePageEnd; VA += Page)
     if (!sealPageFn_ || !sealPageFn_(sealPageCtx_, VA)) {
       EJIT_DIAG("prepareExec FAIL: core=%u sealPage pageVA=0x%llx",
                 self, static_cast<unsigned long long>(VA));
       return false; // any page failure -> no callable pointer is returned.
     }
-  EJIT_DIAG_VERBOSE("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self, R.fn,
-            static_cast<unsigned long long>(PageStart),
-            static_cast<unsigned long long>(PageEnd));
+  EJIT_DIAG_VERBOSE("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self,
+                    R.fn, static_cast<unsigned long long>(CodePageStart),
+                    static_cast<unsigned long long>(CodePageEnd));
   return true;
 }
 
@@ -1456,6 +1538,15 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  bool pgoClearExclusive) {
   if (!fnPtr || req.numDims > 4)
     return EJitPublishStatus::InvalidParam;
+  // Over-bound writable set: REJECT the publish outright (before touching any
+  // slot). Clamping would drop counter pages a peer must enable_rw, so the peer
+  // would under-prepare and fault. Rejecting here means no slot goes Ready, no
+  // fnPtr is published, and no executableCoreMask bit is set for this identity.
+  if (info && info->writableCount > kEJitSharedMaxWritableRanges) {
+    EJIT_DIAG("cachePublish REJECT: writableCount=%u > max=%u",
+              info->writableCount, kEJitSharedMaxWritableRanges);
+    return EJitPublishStatus::InvalidParam;
+  }
   uint32_t tier = decodeReqTier(req.funcIndex);
   uint32_t fidx = stripReqTier(req.funcIndex);
   uint64_t key = hashIdentity(fidx, req.dims, req.numDims);
@@ -1527,12 +1618,35 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     target->poolBase = info->poolBase;
     target->poolSize = info->poolSize;
     target->poolId = info->poolId;
+    // Runtime-writable extents (v9): copy the bounded set the peer may need to
+    // enable_rw. The over-bound case was already rejected at entry, so this
+    // never truncates. requiresPeerEnableRw records whether the peer must
+    // actually flip these writable (fixed RX pool) or they are diagnostic only
+    // (dynamic RW pool).
+    uint32_t wc = info->writableCount;
+    target->writableCount = wc;
+    target->requiresPeerEnableRw = info->requiresPeerEnableRw ? 1u : 0u;
+    for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+      if (i < wc) {
+        target->writableRanges[i].addr = info->writableRanges[i].addr;
+        target->writableRanges[i].size = info->writableRanges[i].size;
+      } else {
+        target->writableRanges[i].addr = 0;
+        target->writableRanges[i].size = 0;
+      }
+    }
   } else {
     target->codeStart = 0;
     target->codeSize = 0;
     target->poolBase = 0;
     target->poolSize = 0;
     target->poolId = 0;
+    target->writableCount = 0;
+    target->requiresPeerEnableRw = 0;
+    for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+      target->writableRanges[i].addr = 0;
+      target->writableRanges[i].size = 0;
+    }
   }
   target->rangeReserved = 0;
   target->fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
@@ -1689,6 +1803,14 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       Slot.poolSize = 0;
       Slot.poolId = 0;
       Slot.rangeReserved = 0;
+      // Runtime-writable ranges (ABI v9): cleared so a re-init never leaves a
+      // stale writable extent a peer could enable_rw for retired code.
+      Slot.writableCount = 0;
+      Slot.requiresPeerEnableRw = 0;
+      for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+        Slot.writableRanges[i].addr = 0;
+        Slot.writableRanges[i].size = 0;
+      }
       // PGO (§6): clear hitCount + tier so a re-init never leaks stale
       // hotness state or tier-tracking from a prior generation.
       Slot.hitCount.storeRelaxed(0);

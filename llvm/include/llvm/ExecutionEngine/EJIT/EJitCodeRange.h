@@ -32,6 +32,29 @@
 namespace llvm {
 namespace ejit {
 
+/// Maximum number of runtime-writable ranges carried with one finalized
+/// compilation. A finalized allocation normally has a single writable data
+/// segment (the Tier-1 __profc_ counters); the small fixed bound leaves head
+/// room for the rare graph with several writable segments while keeping the
+/// descriptor POD and fixed-size. More writable segments than this is a clean
+/// reject (never a silent truncation): the allocation is not published, so a
+/// peer core never faults writing an un-prepared counter page. This value MUST
+/// stay in lockstep with kEJitSharedMaxWritableRanges (the shared-slot bound).
+constexpr uint32_t kEJitMaxWritableRanges = 4u;
+
+/// One runtime-writable range of a finalized compilation: the extent a peer
+/// core must make writable (enable_rw, RX -> RW) in its own translation context
+/// before it may execute the JIT function, whose body writes here at runtime
+/// (e.g. the Tier-1 __profc_ atomicrmw profile counters). Read-only data
+/// (e.g. __profd_) is NOT listed: a peer reads it fine from an RX page. Every
+/// field is a fixed-width scalar accessed by value (endian-safe on aarch64_be).
+struct EJitWritableRange {
+  /// Start of the runtime-writable extent (inside the same pool as the code).
+  uintptr_t addr = 0;
+  /// Size in bytes of that writable extent. 0 => unused entry.
+  uint64_t size = 0;
+};
+
 /// Real executable extent of one finalized compilation. Every field is a
 /// fixed-width scalar accessed by value (endian-safe on aarch64_be).
 struct EJitCompiledCodeInfo {
@@ -50,6 +73,21 @@ struct EJitCompiledCodeInfo {
   /// Stable identifier of the pool (its index in the manager). Lets callers
   /// key per-pool readiness without comparing raw bases when convenient.
   uint32_t poolId = 0;
+  /// Number of valid entries in writableRanges (0..kEJitMaxWritableRanges). A
+  /// value of 0 means the code has no runtime-writable data (e.g. a non-PGO or
+  /// Tier-2 function): a peer core seals only the executable pages.
+  uint32_t writableCount = 0;
+  /// 1 when a peer core MUST make the writableRanges writable (enable_rw) in
+  /// its own translation context before executing, i.e. the code lives in a
+  /// fixed RX code-segment pool (EJitCodePoolManager Options::needsEnableRw). 0
+  /// for a dynamic pool whose backing memory is already RW (SRE_MemDbgAlloc
+  /// data mapping): the writableRanges are then diagnostic only and a peer
+  /// executes without any enable_rw. Fixed-width so it rides through the shared
+  /// cache.
+  uint32_t requiresPeerEnableRw = 0;
+  /// The runtime-writable extents a peer core must enable_rw before executing.
+  /// Only the first writableCount entries are meaningful.
+  EJitWritableRange writableRanges[kEJitMaxWritableRanges] = {};
   /// Reserved (must be 0). Keeps the struct's tail explicit.
   uint32_t reserved = 0;
 };

@@ -379,4 +379,37 @@ bool llvm::ejit::ejitSreSealPageForCurrentCore(uintptr_t PageVA) {
 #endif
 }
 
+bool llvm::ejit::ejitSreEnableRwPageForCurrentCore(uintptr_t PageVA) {
+#if defined(EJIT_FIXED_CODE_POOL) && defined(EJIT_CODE_POOL_4K_SEAL)
+  if (PageVA == 0) {
+    EJIT_DIAG("enableRwPageForCurrentCore reject: null PageVA");
+    return false;
+  }
+  // Per-core: flip the 4KiB page containing PageVA to RW (writable, NOT
+  // executable) in the CALLING core's stage-1 translation. This is used for a
+  // JIT function's runtime-writable data pages (e.g. Tier-1 __profc_ counters):
+  // the fixed .text.ejit code segment is RX on every core at load, and only the
+  // owner previously made these pages writable, so a non-owner core must
+  // enable_rw them here before executing code that writes them. No I-cache sync
+  // is needed (this enables a data write, not code execution). The caller only
+  // passes pages that are page-disjoint from executable code, so this never
+  // makes a code page writable (no RWX). enable_rw must also clear execute
+  // permission (UXN/PXN) so the page is RW-but-not-X (W^X) — see the enable_rw
+  // contract note above.
+  unsigned Rc = ejit_sre_enable_rw(
+      /*level=*/1u, static_cast<unsigned long long>(PageVA));
+  if (Rc != 0) {
+    EJIT_DIAG("enableRwPageForCurrentCore FAIL: enable_rw pageVA=0x%llx rc=%u",
+              static_cast<unsigned long long>(PageVA), Rc);
+    return false;
+  }
+  return true;
+#else
+  EJIT_DIAG("enableRwPageForCurrentCore unsupported config: pageVA=0x%llx",
+            static_cast<unsigned long long>(PageVA));
+  (void)PageVA;
+  return false;
+#endif
+}
+
 #endif // EJIT_SRE_CODE_POOL

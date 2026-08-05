@@ -529,10 +529,68 @@ freestanding strong，类似 `__start_ejit_bitcode`），缺失或对齐后太�
   `enable_ex` 是对称逆操作（RW->RX：清写、置执行 + I-cache sync）。
 - `enable_rw` 是**强 extern**（platform-supplied，无 weak 兜底）--缺失即**硬链接错误**，
   不会静默不可写。
-- per-core：编译核 `enable_rw`+`enable_ex`；peer 核只 `enable_ex`（只读执行已写好的代码）。
+- per-core：编译核 `enable_rw`+`enable_ex`；peer 核对**可执行页** `enable_ex`，并对
+  **运行期可写页**（如 Tier-1 `__profc_`）`enable_rw`（见 §14.3）。
 - **部分失败回滚**：`enableRwRange` 中途某页 `enable_rw` 失败时，把已成功 RX->RW 的页
   用 `Seal_` 封回 RX（避免代码段永久可写 W^X 违规）；被 carve 的 slab 留作废弃孔洞
   （不回收，保简单），下次编译从下一位置切。
 - **后续失败回滚**：slab 已经 RX->RW 后，若 layout、JITLink finalize action、seal 或
   abandon 失败，`restoreRxRange` 会尝试把整个废弃 slab 恢复为 RX，并合并报告回滚错误；
   只有 finalize actions 全部成功后才记录可供 peer 查询的 finalized range。
+
+### 14.3 跨核运行期可写页准备（Online-PGO Tier-1，v9）
+
+Tier-1 instrumented 代码在函数体内对 `__profc_*` 计数器做 `atomicrmw` 写。固定
+RX 代码池（`Options::needsEnableRw==true`）里，这些计数器页在**每个核**加载时都是
+RX；编译核 finalize 时对整段 slab `enable_rw`、只把**可执行页**封回 RX，所以计数器页
+在编译核上保持 RW，但 peer 核的 stage-1 页表里仍是 RX。若 peer 核只 `enable_ex` 代码
+就执行，第一次计数器写会触发**写权限 abort**。
+
+**固定 RX 池 vs 动态池——是否需要 peer `enable_rw`**
+
+- 固定 RX 池（`needsEnableRw=true`）：代码段整体 RX，peer **必须**在自身翻译上下文里
+  对可写计数器页 `enable_rw`（RX->RW）后才能执行。
+- 动态池（`SRE_MemDbgAlloc`，`needsEnableRw=false`）：底层就是 RW 数据映射，peer
+  **无需** `enable_rw`；此时 writable ranges 仅作诊断（比对 FAR 与 `__profc_`/`__profd_`
+  地址），peer **不得**因缺少 `enable_rw` callback 而回退。
+
+这一区分由固定宽度 POD 标记 `requiresPeerEnableRw` 承载：`findRange()` 依据
+`Options::needsEnableRw` 打标，随 `EJitCompiledCodeInfo` 进入 shared cache slot。
+`EJIT_FIXED_CODE_POOL` 宏开启但运行期 fixed region 缺失、回退 `SRE_MemDbgAlloc` 时，
+`needsEnableRw` 为 false，故 `requiresPeerEnableRw` 也为 false——与动态池行为一致。
+
+**准备顺序（peer 首次触达，4K seal）**
+
+    split（每池一次） → 对可写页 enable_rw（RX->RW） → 对代码页 enable_ex（RX） → 置 prepared bit
+
+`executableCoreMask` 的 prepared bit **只在** RW 与 EX 两阶段**都成功后**才置位；置位后
+该核后续命中走 memoized 快路径，**不再**产生任何权限 callback（命中路径零新增原子流量）。
+可写页与可执行页按构造页不相交（finalize 布局按页对齐），peer 对可写页 `enable_rw`
+永不触及代码页——不产生 RWX。
+
+**超限永远拒绝，绝不截断/清零后发布**
+
+writable range 数量超过 `kEJitMaxWritableRanges`、数组为空但计数非零、单个范围越界/回绕
+或越过所属 pool——一律视为 clean fallback：
+
+- `recordFinalizedRange()` 返回 `false`，**不记录**该 executable range，故 `findRange()`
+  解析失败；memory manager finalize 随即失败并 `restoreRxRange`，owner 不会交回可调用指针。
+- `cachePublish()` 遇 `info->writableCount > max` **直接拒绝 publish**：slot 不进入
+  Ready、不发布 fnPtr、不置 `executableCoreMask`。
+- 绝不把超限降级成 `writableCount=0` 后照常发布——那会让 peer 以为“无可写页”而返回
+  fnPtr，代码真写 `__profc_` 时再次 fault。
+
+**失败与重试语义**
+
+peer 准备任一步失败（缺 `enable_rw` callback、`enable_rw`/`enable_ex` 返回非零、范围
+非法、pool 未 split）都返回 `readyButNotShareable`（无 fnPtr、不置 prepared bit），
+该核回退到 AOT。因为 prepared bit 未置位，后续命中会**重新尝试**准备，而不会执行未
+完全准备的代码。中途 `enable_rw` 失败时已翻成 RW 的计数器页保持 RW（数据页，良性，
+非 RWX），下次成功准备可幂等复用。
+
+**Tier-2 覆盖 / reinit 的 stale 清零**
+
+`cachePublish` 每次发布都整段重写 slot 的 writable 元数据（含 `writableCount`、
+`requiresPeerEnableRw`、`writableRanges[]`），Tier-2 覆盖 Tier-1 时不会继承旧可写范围；
+`initSharedStorage`（owner 选举/reinit）把所有 slot 的 writable 元数据与 prepared bit
+清零，generation 不匹配的发布在 commit gate 被拒——stale writable range 不会被新 slot 继承。

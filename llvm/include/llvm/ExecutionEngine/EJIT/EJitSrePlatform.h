@@ -52,6 +52,17 @@ bool ejitSreSplitPoolForCurrentCore(uintptr_t PoolBase, uint64_t PoolSize);
 /// success. A no-op returning false when the platform seal symbol is not built.
 bool ejitSreSealPageForCurrentCore(uintptr_t PageVA);
 
+/// 4K page-seal mode, per-core: make one 4KiB page at \p PageVA writable
+/// (RX -> RW, enable_rw) in the CALLING core's translation context. Used for a
+/// JIT function's runtime-writable data pages (e.g. the Tier-1 __profc_
+/// counters) so a non-owner core running from the fixed RX .text.ejit code
+/// segment can execute code that writes them without a write-permission abort.
+/// The caller only passes pages that are page-disjoint from executable code, so
+/// this never makes a code page writable (no RWX). Returns true on success. A
+/// no-op returning false when the fixed code pool / enable_rw symbol is not
+/// built.
+bool ejitSreEnableRwPageForCurrentCore(uintptr_t PageVA);
+
 } // namespace ejit
 } // namespace llvm
 

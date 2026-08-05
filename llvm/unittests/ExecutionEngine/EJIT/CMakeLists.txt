@@ -133,6 +133,46 @@ add_custom_target(check-ejit-shared-taskpool
   USES_TERMINAL
   )
 
+# Cross-core runtime-writable (Online-PGO Tier-1) END-TO-END integration test.
+# It spans BOTH real components changed by the fix in one binary: the code-pool
+# JITLink finalize path (EJitCodePool / EJitCodePoolMemoryManager) AND the
+# shared taskpool peer preparation (EJitSharedTaskPool). The shared-taskpool
+# sources are compiled directly here (with the shared macros + code sharing) so
+# the peer read path is active; the code-pool sources are compiled directly too
+# so the target links only JITLink + OrcShared (never libLLVMEJIT, which would
+# duplicate the directly-compiled EJitSharedTaskPool symbols). No real SRE
+# platform symbols are needed (all callbacks are mocked).
+set(EJIT_TIER1_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS JITLink OrcShared Support TargetParser)
+add_llvm_unittest(EJITTier1WritableIntegrationTests
+  EJitTier1WritableIntegrationTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_TIER1_LINK_COMPONENTS_SAVED}")
+
+target_compile_definitions(EJITTier1WritableIntegrationTests PRIVATE
+  EJIT_SRE_TASKPOOL
+  EJIT_SRE_SHARED_TASKPOOL
+  EJIT_SRE_TASKPOOL_TESTING
+  EJIT_SRE_SHARED_CODE_POINTERS
+  EJIT_STATS_ENABLE
+  EJIT_SRE_TASKPOOL_BUCKETS=32
+  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
+  EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
+  )
+
+add_custom_target(check-ejit-tier1-writable
+  COMMAND $<TARGET_FILE:EJITTier1WritableIntegrationTests>
+  DEPENDS EJITTier1WritableIntegrationTests
+  COMMENT "Running EmbeddedJIT Tier-1 runtime-writable integration test"
+  USES_TERMINAL
+  )
+
 # Optional cache-query microbenchmark (NOT a gtest binary: standalone main()).
 # Off by default so it never bloats normal test builds. Enable with
 # -DEJIT_BUILD_CACHE_QUERY_BENCH=ON to build a host-runnable binary that prints a

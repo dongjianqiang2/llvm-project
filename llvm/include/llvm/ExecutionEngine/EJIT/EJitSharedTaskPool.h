@@ -223,6 +223,15 @@ public:
   /// Per-core platform primitive: seal one 4KiB page at \p pageVA to RX in the
   /// CALLING core's translation context (enable_ex). Returns true on success.
   using SealPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
+  /// Per-core platform primitive: make one 4KiB page at \p pageVA writable
+  /// (RX -> RW, enable_rw) in the CALLING core's translation context. Returns
+  /// true on success. Used only in 4K page-seal mode, for the runtime-writable
+  /// data pages of a JIT function (e.g. the Tier-1 __profc_ counters), so a
+  /// non-owner core running from the fixed RX .text.ejit segment may execute
+  /// code that writes them without a write-permission abort. Applied ONLY to
+  /// writable, non-executable pages (page-disjoint from the code), so it never
+  /// makes an executable page writable (no RWX).
+  using EnableRwPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
 
   /// Worker loop entry (provided by this class, run on the injected task).
   using WorkerEntryFn = void (*)(void *ctx);
@@ -364,6 +373,14 @@ public:
   void setSealPageCallback(SealPageCallback fn, void *ctx) {
     sealPageFn_ = fn;
     sealPageCtx_ = ctx;
+  }
+  /// 4K mode: per-core per-page enable_rw primitive for runtime-writable data
+  /// (see EnableRwPageCallback). Optional: when unset, a slot that carries
+  /// runtime-writable ranges cannot be prepared on a peer core (clean fallback,
+  /// no fnPtr) rather than executing code whose counter writes would fault.
+  void setEnableRwPageCallback(EnableRwPageCallback fn, void *ctx) {
+    enableRwPageFn_ = fn;
+    enableRwPageCtx_ = ctx;
   }
   void setWorkerHooks(WorkerStartFn start, WorkerStopFn stop, void *ctx) {
     workerStart_ = start;
@@ -739,6 +756,15 @@ private:
     uint64_t codeSize = 0;
     uintptr_t poolBase = 0;
     uint64_t poolSize = 0;
+    /// Runtime-writable extents (e.g. __profc_) this core must enable_rw before
+    /// it may execute the code. Snapshotted with the range so the per-core
+    /// enable_rw runs with NO bucket lock held. writableCount 0 => none.
+    uint32_t writableCount = 0;
+    /// 1 => this pool is a fixed RX region: the peer must enable_rw the
+    /// writable pages. 0 => dynamic RW pool: no enable_rw (ranges are
+    /// diagnostic only).
+    uint32_t requiresPeerEnableRw = 0;
+    EJitSharedWritableRange writables[kEJitSharedMaxWritableRanges] = {};
   };
   /// Prepare execute permission for the current core over \p R's code range
   /// WITHOUT holding any bucket lock. 2M mode delegates to prepareCodeFn_; 4K
@@ -799,6 +825,8 @@ private:
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;
   void *sealPageCtx_ = nullptr;
+  EnableRwPageCallback enableRwPageFn_ = nullptr;
+  void *enableRwPageCtx_ = nullptr;
   bool fourKSeal_ = false;
   WorkerStartFn workerStart_ = nullptr;
   WorkerStopFn workerStop_ = nullptr;

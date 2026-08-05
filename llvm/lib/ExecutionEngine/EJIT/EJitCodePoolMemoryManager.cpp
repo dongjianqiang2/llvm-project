@@ -45,9 +45,11 @@ class EJitCodePoolMemoryManager::InFlightAllocImpl
 public:
   InFlightAllocImpl(EJitCodePoolMemoryManager &MM, LinkGraph &G, BasicLayout BL,
                     void *Base, size_t Size,
-                    std::vector<ExecSegRange> ExecRanges)
+                    std::vector<ExecSegRange> ExecRanges,
+                    std::vector<EJitWritableRange> WritableRanges)
       : Pool(&MM.getPool()), G(&G), BL(std::move(BL)), Base(Base), Size(Size),
-        ExecRanges(std::move(ExecRanges)) {}
+        ExecRanges(std::move(ExecRanges)),
+        WritableRanges(std::move(WritableRanges)) {}
 
   void finalize(OnFinalizedFunction OnFinalized) override {
     // The content has already been written into working memory, which (for an
@@ -86,9 +88,32 @@ public:
           }
           // Publish executable ranges only after every finalize action has
           // succeeded. Failed allocations must never look callable to peers.
+          // Each executable range of this allocation carries the allocation's
+          // runtime-writable extents (e.g. __profc_) so a peer core resolving
+          // any executable pointer learns exactly which pages to enable_rw.
+          // recordFinalizedRange REJECTS (returns false) an over-bound or
+          // malformed writable set rather than truncating it; that must fail
+          // finalize (no callable pointer) so a peer is never handed code whose
+          // counter pages it cannot fully prepare. Restore W^X and report.
           for (const ExecSegRange &R : ExecRanges)
-            Pool->recordFinalizedRange(reinterpret_cast<void *>(R.Addr),
-                                       static_cast<size_t>(R.Size));
+            if (!Pool->recordFinalizedRange(
+                    reinterpret_cast<void *>(R.Addr),
+                    static_cast<size_t>(R.Size),
+                    WritableRanges.empty() ? nullptr : WritableRanges.data(),
+                    static_cast<uint32_t>(WritableRanges.size()))) {
+              EJIT_DIAG(
+                  "finalize FAIL: recordFinalizedRange rejected addr=0x%llx"
+                  " writable=%zu",
+                  static_cast<unsigned long long>(R.Addr),
+                  WritableRanges.size());
+              OnFinalized(joinErrors(
+                  make_error<StringError>(
+                      "EJitCodePool: finalized allocation has an over-bound or "
+                      "malformed runtime-writable range set",
+                      inconvertibleErrorCode()),
+                  Pool->restoreRxRange(Base, Size)));
+              return;
+            }
           auto *Info = new FinalizedInfo();
           Info->Base = Base;
           Info->DeallocActions = std::move(*DeallocActions);
@@ -115,6 +140,7 @@ private:
   void *Base;
   size_t Size;
   std::vector<ExecSegRange> ExecRanges;
+  std::vector<EJitWritableRange> WritableRanges;
 };
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(EJitCodePoolManager &Pool,
@@ -173,7 +199,16 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   // (page-aligned) layout guarantees an executable segment never shares a 4KiB
   // page with a writable/read-only one, so sealing these ranges never flips a
   // data/GOT page to RX. An allocation may have several executable segments.
+  //
+  // In parallel, collect the RUNTIME-WRITABLE segments (Write but NOT Exec):
+  // these are the pages the JIT function writes at runtime (e.g. the Tier-1
+  // __profc_ counters). A peer core must enable_rw exactly these before it may
+  // execute the code; read-only data (e.g. __profd_) is deliberately excluded
+  // because a peer reads it fine from an RX page. The same page-aligned layout
+  // guarantees a writable segment never shares a 4KiB page with an executable
+  // one, so making these RW on a peer never touches a code page (no RWX).
   std::vector<ExecSegRange> ExecRanges;
+  std::vector<EJitWritableRange> WritableRanges;
   for (auto &KV : BL.segments()) {
     auto &AG = KV.first;
     auto &Seg = KV.second;
@@ -184,14 +219,38 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
 
     Seg.WorkingMem = SegAddr.toPtr<char *>();
     Seg.Addr = SegAddr;
-    if ((AG.getMemProt() & orc::MemProt::Exec) != orc::MemProt::None) {
-      uint64_t SegSize =
-          static_cast<uint64_t>(Seg.ContentSize) + Seg.ZeroFillSize;
+    uint64_t SegSize =
+        static_cast<uint64_t>(Seg.ContentSize) + Seg.ZeroFillSize;
+    bool IsExec = (AG.getMemProt() & orc::MemProt::Exec) != orc::MemProt::None;
+    bool IsWrite =
+        (AG.getMemProt() & orc::MemProt::Write) != orc::MemProt::None;
+    if (IsExec) {
       if (SegSize > 0)
         ExecRanges.push_back(
             {reinterpret_cast<uintptr_t>(SegAddr.toPtr<char *>()), SegSize});
+    } else if (IsWrite) {
+      if (SegSize > 0)
+        WritableRanges.push_back(
+            {reinterpret_cast<uintptr_t>(SegAddr.toPtr<char *>()), SegSize});
     }
     SegAddr += alignTo(Seg.ContentSize + Seg.ZeroFillSize, PageSize_);
+  }
+
+  // Bounded, never-truncated writable set: an allocation with more writable
+  // data segments than the fixed descriptor can carry is a clean reject here
+  // (before any code is executable) rather than a silent drop that would leave
+  // a peer core faulting on an un-prepared counter page.
+  if (WritableRanges.size() > kEJitMaxWritableRanges) {
+    EJIT_DIAG("allocate FAIL: writable segments=%zu > max=%u graph=%s",
+              WritableRanges.size(), kEJitMaxWritableRanges,
+              G.getName().c_str());
+    OnAllocated(joinErrors(
+        make_error<StringError>(
+            "EJitCodePool: allocation has more runtime-writable segments than "
+            "the fixed cross-core bound",
+            inconvertibleErrorCode()),
+        Pool_.restoreRxRange(Slab, static_cast<size_t>(Total))));
+    return;
   }
 
   if (auto Err = BL.apply()) {
@@ -203,11 +262,12 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     return;
   }
 
-  EJIT_DIAG("allocate OK: slab=%p total=%llu execRanges=%zu", Slab,
-            static_cast<unsigned long long>(Total), ExecRanges.size());
-  OnAllocated(std::make_unique<InFlightAllocImpl>(*this, G, std::move(BL), Slab,
-                                                  static_cast<size_t>(Total),
-                                                  std::move(ExecRanges)));
+  EJIT_DIAG("allocate OK: slab=%p total=%llu execRanges=%zu writableRanges=%zu",
+            Slab, static_cast<unsigned long long>(Total), ExecRanges.size(),
+            WritableRanges.size());
+  OnAllocated(std::make_unique<InFlightAllocImpl>(
+      *this, G, std::move(BL), Slab, static_cast<size_t>(Total),
+      std::move(ExecRanges), std::move(WritableRanges)));
 }
 
 void EJitCodePoolMemoryManager::deallocate(std::vector<FinalizedAlloc> Allocs,

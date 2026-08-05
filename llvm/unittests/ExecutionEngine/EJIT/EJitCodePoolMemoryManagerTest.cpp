@@ -477,6 +477,149 @@ TEST(EJitCodePoolMemMgr4K, SealsAndRecordsOnlyExecutableSegment) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
+// The finalized executable range carries the allocation's RUNTIME-WRITABLE data
+// extent (the __data / __profc_ segment) so a peer core can enable_rw exactly
+// those pages before executing. The writable range must be page-disjoint from
+// the code (no shared 4K page) — the guarantee that makes per-core enable_rw
+// safe (never RWX).
+TEST(EJitCodePoolMemMgr4K, FinalizedRangeCarriesWritableDataExtent) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndDataGraph(0x1000, 0x2000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrByExec(*G, /*WantExec=*/true);
+  void *DataAddr = blockAddrByExec(*G, /*WantExec=*/false);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(DataAddr, nullptr);
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(TextAddr, Info));
+  ASSERT_EQ(Info.writableCount, 1u);
+  EXPECT_EQ(Info.writableRanges[0].addr, reinterpret_cast<uintptr_t>(DataAddr));
+  EXPECT_GT(Info.writableRanges[0].size, 0u);
+  // Data-region pool (needsEnableRw=false): a peer does NOT need enable_rw.
+  EXPECT_EQ(Info.requiresPeerEnableRw, 0u);
+
+  // Page-disjoint from the executable extent.
+  auto pageDown = [](uintptr_t A) {
+    return A & ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  auto pageUp = [](uintptr_t A) {
+    return (A + kFourKiB - 1) & ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  uintptr_t CodePS = pageDown(Info.codeStart);
+  uintptr_t CodePE = pageUp(Info.codeStart + Info.codeSize);
+  uintptr_t WPS = pageDown(Info.writableRanges[0].addr);
+  uintptr_t WPE =
+      pageUp(Info.writableRanges[0].addr + Info.writableRanges[0].size);
+  EXPECT_TRUE(WPE <= CodePS || CodePE <= WPS); // no shared 4K page
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// A fixed RX code-segment pool (needsEnableRw=true) stamps requiresPeerEnableRw
+// on the range: a peer MUST enable_rw the writable pages. The whole slab is
+// enable_rw'd at allocate, then only the exec pages are sealed at finalize, so
+// the writable data page stays RW on the owner.
+TEST(EJitCodePoolMemMgr4K, FixedRxPoolMarksRequiresPeerEnableRw) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.needsEnableRw = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); },
+      [&M](void *V) { return M.enableRw(V); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndDataGraph(0x1000, 0x2000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrByExec(*G, /*WantExec=*/true);
+  ASSERT_NE(TextAddr, nullptr);
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(TextAddr, Info));
+  EXPECT_EQ(Info.writableCount, 1u);
+  EXPECT_EQ(Info.requiresPeerEnableRw, 1u); // fixed RX pool -> peer enable_rw
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// A code-only allocation (no writable data, e.g. non-PGO or Tier-2) records a
+// range with ZERO writable extents, so a peer seals only the code pages.
+TEST(EJitCodePoolMemMgr4K, CodeOnlyAllocationHasNoWritableExtent) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeCodeGraph(64, 0x1000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *CodeAddr = firstBlockAddr(*G);
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(CodeAddr, Info));
+  EXPECT_EQ(Info.writableCount, 0u);
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// recordFinalizedRange must never truncate: an over-bound writable count is
+// REJECTED (returns false) and the executable range is NOT recorded, so
+// findRange fails and the owner never publishes a callable, under-prepared
+// pointer. A malformed set (null array + non-zero count, or a writable range
+// outside the pool) is rejected the same way.
+TEST(EJitCodePoolMemMgr4K, RecordRejectsOverflowWritableRanges) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+
+  // Carve a real pool so the recorded range resolves to a known pool.
+  void *P = cantFail(Pool.allocateCode(4096, 64));
+  EJitWritableRange W[kEJitMaxWritableRanges + 1];
+  for (uint32_t i = 0; i < kEJitMaxWritableRanges + 1; ++i) {
+    W[i].addr = reinterpret_cast<uintptr_t>(P) + 0x1000 * (i + 1);
+    W[i].size = 16;
+  }
+  // Over-bound count -> rejected, nothing recorded.
+  EXPECT_FALSE(
+      Pool.recordFinalizedRange(P, 200, W, kEJitMaxWritableRanges + 1));
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Pool.findRange(P, Info)); // NOT recorded -> resolve fails
+
+  // Non-zero count with a null array -> rejected.
+  EXPECT_FALSE(Pool.recordFinalizedRange(P, 200, nullptr, 1));
+  EXPECT_FALSE(Pool.findRange(P, Info));
+
+  // A writable range outside the owning pool -> rejected.
+  EJitWritableRange OutRange[1];
+  OutRange[0].addr =
+      reinterpret_cast<uintptr_t>(P) + kTwoMiB * 4; // far outside
+  OutRange[0].size = 16;
+  EXPECT_FALSE(Pool.recordFinalizedRange(P, 200, OutRange, 1));
+  EXPECT_FALSE(Pool.findRange(P, Info));
+
+  // A well-formed set at the bound records fine and resolves.
+  EJitWritableRange OkRange[1];
+  OkRange[0].addr = reinterpret_cast<uintptr_t>(P) + 0x800;
+  OkRange[0].size = 16;
+  EXPECT_TRUE(Pool.recordFinalizedRange(P, 200, OkRange, 1));
+  ASSERT_TRUE(Pool.findRange(P, Info));
+  EXPECT_EQ(Info.writableCount, 1u);
+}
+
 // Code-segment placement (needsEnableRw): allocate must enable_rw the slab's
 // pages (RX -> RW) BEFORE memset/JITLink writes, so the RX code-segment pages
 // are writable. enable_rw happens at allocate; enable_ex (seal) only later at

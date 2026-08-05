@@ -78,7 +78,18 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// exist in every build for a stable layout and are 0 when PGO is off.
 /// Online-PGO enable/threshold control also lives in the v8 shared blob so
 /// every producer core observes the owner's configuration.
-constexpr uint32_t kEJitSharedAbiVersion = 8u;
+/// v9: each cache slot carries a bounded set of runtime-writable code ranges
+/// (writableCount + writableRanges[]) — the pages the JIT body writes at
+/// runtime, e.g. the Tier-1 __profc_ counters — plus a requiresPeerEnableRw
+/// flag. A non-owner core running from a fixed RX .text.ejit code segment
+/// (requiresPeerEnableRw=1) must enable_rw exactly these in its own translation
+/// context before executing, or the first counter atomicrmw faults with a
+/// write-permission abort. For a dynamic SRE_MemDbgAlloc pool
+/// (requiresPeerEnableRw=0) the backing memory is already RW, so the ranges are
+/// diagnostic only and a peer executes without enable_rw. The ranges are
+/// page-disjoint from the executable extent, so a peer never makes a code page
+/// writable (no RWX).
+constexpr uint32_t kEJitSharedAbiVersion = 9u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

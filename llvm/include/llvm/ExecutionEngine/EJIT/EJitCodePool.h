@@ -226,6 +226,16 @@ public:
   /// per whole 2MiB pool).
   bool usesPageSeal() const { return Opts_.fourKSeal; }
 
+  /// True when this pool is a fixed RX code-segment region whose slabs must be
+  /// enable_rw'd (RX -> RW) before writing (Options::needsEnableRw). A peer
+  /// core executing this pool's code must therefore make the runtime-writable
+  /// pages writable in its own translation context. False for a dynamic pool
+  /// (SRE_MemDbgAlloc), whose backing memory is already RW, so a peer needs no
+  /// enable_rw. findRange() stamps this into EJitCompiledCodeInfo::
+  /// requiresPeerEnableRw so the shared cache can gate per-core enable_rw
+  /// correctly (the same JITLink layout is used by both pool kinds).
+  bool needsPeerEnableRw() const { return Opts_.needsEnableRw; }
+
   /// Record the executable extent of a finalized JITLink allocation
   /// [Base, Base + Size). Called by the code-pool memory manager at finalize,
   /// after all writes/relocations are complete (and, in 4K mode, after the
@@ -233,7 +243,24 @@ public:
   /// executable allocation; findRange() later resolves a function pointer back
   /// to it so a peer core can seal exactly the pages it covers. A zero-size
   /// record is ignored.
-  void recordFinalizedRange(const void *Base, size_t Size);
+  ///
+  /// \p Writables / \p WritableCount give the allocation's runtime-writable
+  /// data extents (e.g. the Tier-1 __profc_ counters) that a peer core must
+  /// enable_rw before executing this code. They are recorded verbatim against
+  /// the executable range and returned by findRange(). Returns true when the
+  /// executable range was recorded, false when it was REJECTED (and therefore
+  /// NOT recorded, so findRange() will not resolve \p Base). Rejection cases —
+  /// each a clean fallback, never a silent truncation to zero:
+  ///   * WritableCount > kEJitMaxWritableRanges (over-bound set);
+  ///   * WritableCount > 0 but Writables == nullptr (malformed);
+  ///   * any writable range with size 0, an address wrap, or an extent not
+  ///     wholly inside the pool that owns \p Base.
+  /// A null/zero writable set (WritableCount == 0) records the executable range
+  /// with no writable data and returns true. A benign no-op (Base null / Size
+  /// 0) also returns true.
+  bool recordFinalizedRange(const void *Base, size_t Size,
+                            const EJitWritableRange *Writables = nullptr,
+                            uint32_t WritableCount = 0);
 
   /// Resolve a function pointer to the finalized executable allocation and pool
   /// that contain it, filling \p Out (codeStart/codeSize from the recorded
@@ -278,6 +305,12 @@ private:
   struct FinalizedRange {
     uintptr_t start = 0;
     uint64_t size = 0;
+    /// Runtime-writable data extents of THIS allocation (e.g. __profc_) that a
+    /// peer core must enable_rw before executing the code. 0..writableCount are
+    /// valid; the rest are unused. Bounded, POD, never truncated (overflow is
+    /// rejected at record time).
+    uint32_t writableCount = 0;
+    EJitWritableRange writables[kEJitMaxWritableRanges] = {};
   };
   std::vector<FinalizedRange> FinalizedRanges_;
 

@@ -82,8 +82,11 @@ bool mockPrepareCode(void *ctx, const void * /*fnPtr*/) {
 struct FourKLog {
   std::vector<std::pair<uintptr_t, uint32_t>> splits; // (poolBase, core)
   std::vector<std::pair<uintptr_t, uint32_t>> seals;  // (pageVA, core)
+  std::vector<std::pair<uintptr_t, uint32_t>> rwPages; // (pageVA, core)
   bool splitOk = true;
   int failSealAtIndex = -1;           // fail the Nth (0-based) seal call
+  bool rwOk = true;                   // enable_rw success/fail switch
+  int failRwAtIndex = -1;             // fail the Nth (0-based) enable_rw call
   void (*raceHook)(void *) = nullptr; // run during a chosen seal (no lock held)
   void *raceCtx = nullptr;
   int raceAtSealIndex = -1;
@@ -103,6 +106,17 @@ bool mockSealPage(void *ctx, uintptr_t pageVA) {
     return false;
   return true;
 }
+// Per-core enable_rw of a JIT function's runtime-writable data pages (e.g. the
+// Tier-1 __profc_ counters). Logs (pageVA, core) so a test can prove the peer
+// made exactly the counter pages writable before executing.
+bool mockEnableRwPage(void *ctx, uintptr_t pageVA) {
+  auto *l = static_cast<FourKLog *>(ctx);
+  int idx = static_cast<int>(l->rwPages.size());
+  l->rwPages.push_back({pageVA, EJitCoreId::current()});
+  if (l->failRwAtIndex == idx)
+    return false;
+  return l->rwOk;
+}
 
 // Owner-side resolver of a compiled pointer to a (test-controlled) executable
 // range. Mutating the RangeCtx between compiles models distinct code extents.
@@ -113,6 +127,15 @@ struct RangeCtx {
   uint64_t codeSize = 64;
   uint32_t poolId = 0;
   bool provide = true;
+  // Runtime-writable ranges (v9): 0 => none (non-PGO / Tier-2). When set,
+  // models the Tier-1 __profc_ counter pages a peer core must enable_rw.
+  uint32_t writableCount = 0;
+  uintptr_t writableAddr[kEJitSharedMaxWritableRanges] = {};
+  uint64_t writableSize[kEJitSharedMaxWritableRanges] = {};
+  // 1 => fixed RX pool: a peer must enable_rw the writable pages. Defaults true
+  // so the writable-range tests exercise the enable_rw path; a dynamic-pool
+  // test sets it false.
+  uint32_t requiresPeerEnableRw = 1;
 };
 bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   auto *r = static_cast<RangeCtx *>(ctx);
@@ -124,6 +147,14 @@ bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   out->poolBase = r->poolBase;
   out->poolSize = r->poolSize;
   out->poolId = r->poolId;
+  out->writableCount = r->writableCount;
+  out->requiresPeerEnableRw = r->requiresPeerEnableRw;
+  for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+    out->writableRanges[i].addr =
+        (i < r->writableCount) ? r->writableAddr[i] : 0;
+    out->writableRanges[i].size =
+        (i < r->writableCount) ? r->writableSize[i] : 0;
+  }
   return true;
 }
 
@@ -202,6 +233,7 @@ protected:
     pool.setCodeRangeProvider(&mockCodeRange, &range);
     pool.setSplitPoolCallback(&mockSplitPool, &fourK);
     pool.setSealPageCallback(&mockSealPage, &fourK);
+    pool.setEnableRwPageCallback(&mockEnableRwPage, &fourK);
     ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
   }
 
@@ -1315,6 +1347,352 @@ TEST_F(SharedTaskPoolTest, FourKPeerSealsEveryCoveredPageUnaligned) {
   EXPECT_EQ(fourK.seals[1].first, 0x40001000ull); // page-aligned up
 }
 
+//===----------------------------------------------------------------------===//
+// Cross-core runtime-writable (Online-PGO Tier-1) peer preparation (v9).
+//
+// A JIT function whose body writes runtime data (e.g. the Tier-1 __profc_
+// counters) lives in the fixed RX .text.ejit code segment. A non-owner core
+// must make those data pages writable (enable_rw) in its own translation
+// context BEFORE executing, or the first counter atomicrmw faults. These tests
+// drive that path with the enable_rw mock.
+//===----------------------------------------------------------------------===//
+
+// A peer's first touch of a Tier-1 entry enable_rw's the counter page(s) AND
+// enable_ex's the code page(s), on that peer core, before the pointer is
+// returned. enable_rw happens before the seal (RW data prepared first).
+TEST_F(SharedTaskPoolTest, FourKPeerFirstTouchEnablesRwThenSeals) {
+  FourKLog fourK;
+  RangeCtx range; // code at 0x40000000 size 64 (page 0)
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull; // __profc_ page 1 (disjoint from code)
+  range.writableSize[0] = 32;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(1));
+  owner.releaseRead(hit.bucketIndex);
+
+  // enable_rw ran on core 3 for the counter page, and the code page was sealed.
+  ASSERT_EQ(fourK.rwPages.size(), 1u);
+  EXPECT_EQ(fourK.rwPages[0].first, 0x40001000ull);
+  EXPECT_EQ(fourK.rwPages[0].second, 3u);
+  ASSERT_EQ(fourK.seals.size(), 1u);
+  EXPECT_EQ(fourK.seals[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.seals[0].second, 3u);
+  // The peer's executable+writable ready bit is set (memoized).
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_NE(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A writable range spanning an unaligned start/end enable_rw's every covered
+// 4K page, and none of them is a code page.
+TEST_F(SharedTaskPoolTest, FourKPeerEnablesRwEveryCounterPage) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40002F00ull; // unaligned, near end of page 2
+  range.writableSize[0] = 0x200;         // crosses into page 3
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(4);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  ASSERT_EQ(fourK.rwPages.size(), 2u);
+  EXPECT_EQ(fourK.rwPages[0].first, 0x40002000ull);
+  EXPECT_EQ(fourK.rwPages[1].first, 0x40003000ull);
+}
+
+// A repeated hit on the SAME peer core (after the first-touch prepared it) does
+// NO enable_rw / enable_ex callback: the per-core ready bit is memoized, so the
+// cache-hit path adds no permission traffic.
+TEST_F(SharedTaskPoolTest, FourKRepeatedPeerHitNoRwCallback) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto h1 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h1.bucketIndex);
+  auto h2 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h2.bucketIndex);
+
+  EXPECT_EQ(fourK.rwPages.size(), 1u); // not repeated on the second hit
+  EXPECT_EQ(fourK.seals.size(), 1u);
+}
+
+// enable_rw failure on a peer: NO fnPtr is handed back, NO code page is sealed
+// (enable_rw runs first), and the peer's ready bit stays clear so a later hit
+// re-attempts rather than executing un-prepared code.
+TEST_F(SharedTaskPoolTest, FourKPeerEnableRwFailureNoFnPtrNoMask) {
+  FourKLog fourK;
+  fourK.failRwAtIndex = 0; // fail the first enable_rw
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_EQ(r.fnPtr, fallback);        // clean fallback, never the shared ptr
+  EXPECT_EQ(fourK.rwPages.size(), 1u); // attempted once
+  EXPECT_TRUE(fourK.seals.empty());    // never reached the code seal
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A non-PGO / Tier-2 entry carries NO writable ranges: the peer seals code
+// pages but makes no enable_rw call (nothing to prepare).
+TEST_F(SharedTaskPoolTest, FourKPeerNoWritableDataSkipsRw) {
+  FourKLog fourK;
+  RangeCtx range; // writableCount defaults to 0
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  EXPECT_TRUE(
+      fourK.rwPages.empty());        // no runtime-writable data -> no enable_rw
+  EXPECT_EQ(fourK.seals.size(), 1u); // code still sealed
+}
+
+// W^X guard: a writable range that shares a 4K page with the executable extent
+// is refused (never enable_rw'd), so a peer never makes a code page writable.
+TEST_F(SharedTaskPoolTest, FourKPeerRejectsWritableOverlappingCode) {
+  FourKLog fourK;
+  RangeCtx range; // code at 0x40000000 size 64
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40000040ull; // SAME page as the code -> illegal
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_EQ(r.fnPtr, fallback);
+  EXPECT_TRUE(fourK.rwPages.empty()); // refused before any enable_rw
+  EXPECT_TRUE(fourK.seals.empty());   // and before any seal
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A writable range that lies outside the code's pool is rejected (a peer only
+// splits/prepares within the pool it knows).
+TEST_F(SharedTaskPoolTest, FourKPeerRejectsWritableOutOfPool) {
+  FourKLog fourK;
+  RangeCtx range; // pool [0x40000000, 0x40200000)
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x50000000ull; // outside the pool
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_TRUE(fourK.rwPages.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// Two peer cores each independently enable_rw the counter page in their OWN
+// translation context (execute permission and write permission are per-core).
+TEST_F(SharedTaskPoolTest, FourKTwoPeerCoresEachEnableRw) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto h3 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h3.bucketIndex);
+  EJitCoreId::setCurrentForTest(4);
+  auto h4 = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(h4.bucketIndex);
+
+  ASSERT_EQ(fourK.rwPages.size(), 2u);
+  EXPECT_EQ(fourK.rwPages[0].second, 3u);
+  EXPECT_EQ(fourK.rwPages[1].second, 4u);
+}
+
+// An over-bound writable count on a slot (should never occur: the owner rejects
+// an over-bound allocation before publish) is a clean fallback, never a
+// truncated/partial enable_rw.
+TEST_F(SharedTaskPoolTest, FourKPeerRejectsOverflowWritableCount) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  // Corrupt the slot to claim more writable ranges than the fixed bound.
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  slot->writableCount = kEJitSharedMaxWritableRanges + 1;
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_TRUE(fourK.rwPages.empty()); // never partially prepared
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// The owner core itself already made its counter pages RW at compile time, so a
+// hit on the owner core performs NO peer enable_rw / seal callback.
+TEST_F(SharedTaskPoolTest, FourKOwnerHitDoesNotEnableRw) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(0); // owner core
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  EXPECT_TRUE(fourK.rwPages.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+// A DYNAMIC RW pool (requiresPeerEnableRw=0) that still carries writable
+// metadata: a peer seals the code pages but makes NO enable_rw call, and
+// succeeds even though the writable ranges are present (they are diagnostic
+// only — the pool memory is already RW). This is the dynamic-pool + 4K + shared
+// pointers configuration that must NOT be forced to fall back.
+TEST_F(SharedTaskPoolTest, FourKDynamicPoolWritableRangesNoEnableRw) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 32;
+  range.requiresPeerEnableRw = 0; // dynamic pool: already RW
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit.fnPtr, codeFor(1));
+  owner.releaseRead(hit.bucketIndex);
+
+  EXPECT_TRUE(fourK.rwPages.empty()); // dynamic pool -> no enable_rw
+  ASSERT_EQ(fourK.seals.size(), 1u);  // code still sealed per-core
+  EXPECT_EQ(fourK.seals[0].second, 3u);
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->requiresPeerEnableRw, 0u);
+  EXPECT_NE(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// A fixed RX pool (requiresPeerEnableRw=1) with writable ranges but NO
+// enable_rw callback wired: clean fallback (no fnPtr, no seal, no core bit).
+TEST_F(SharedTaskPoolTest, FourKFixedPoolMissingEnableRwCallbackFallsBack) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40001000ull;
+  range.writableSize[0] = 16;
+  range.requiresPeerEnableRw = 1;
+  // Bring up WITHOUT an enable_rw callback (mimic a build/config that forgot
+  // it).
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedTaskPool owner;
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setSealMode(true);
+  owner.setCodeRangeProvider(&mockCodeRange, &range);
+  owner.setSplitPoolCallback(&mockSplitPool, &fourK);
+  owner.setSealPageCallback(&mockSealPage, &fourK);
+  // NOTE: setEnableRwPageCallback intentionally NOT called.
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_TRUE(r.readyButNotShareable);
+  EXPECT_EQ(r.fnPtr, fallback);
+  EXPECT_TRUE(fourK.rwPages.empty());
+  EXPECT_TRUE(fourK.seals.empty()); // enable_rw needed first -> never sealed
+  EJitSharedCacheSlot *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->executableCoreMask.loadRelaxed() & (uint64_t{1} << 3), 0u);
+}
+
+// An over-bound writableCount from the code-range provider must make the owner
+// REJECT the publish entirely: no slot goes Ready, no fnPtr is shared, so a
+// peer (and even the owner) cleanly misses instead of running under-prepared
+// code. This is the end-to-end guard for the "never degrade to writableCount=0
+// and publish anyway" rule.
+TEST_F(SharedTaskPoolTest, FourKOverflowWritableRejectsPublish) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.writableCount = kEJitSharedMaxWritableRanges + 1; // over-bound
+  range.requiresPeerEnableRw = 1;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+
+  // Owner compile + attempted publish: the publish is rejected, so no Ready
+  // slot.
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(1, nullptr, 0, codeFor(1)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  owner.pollOne(); // runs the compile + rejected publish
+
+  EXPECT_EQ(findReadySlot(1), nullptr); // nothing published
+
+  // A peer lookup finds no Ready slot -> clean miss/fallback, no fnPtr shared.
+  EJitCoreId::setCurrentForTest(3);
+  void *fallback = reinterpret_cast<void *>(0xFEEDull);
+  auto r = owner.compileOrGet(1, nullptr, 0, fallback);
+  EXPECT_NE(r.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_TRUE(fourK.rwPages.empty());
+}
+
 // 4/ Repeated hit on the SAME core does NOT re-split or re-seal (memoized).
 TEST_F(SharedTaskPoolTest, FourKSameCoreRepeatHitNoRework) {
   FourKLog fourK;
@@ -1599,11 +1977,14 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
 // table is POD, dump state contains metadata only, and each bucket carries the
 // NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 8u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 9u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
       std::is_trivially_default_constructible<EJitSharedPoolSplit>::value);
+  EXPECT_TRUE(std::is_standard_layout<EJitSharedWritableRange>::value);
+  EXPECT_TRUE(
+      std::is_trivially_default_constructible<EJitSharedWritableRange>::value);
 
   FourKLog fourK;
   RangeCtx range;
@@ -1612,6 +1993,9 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   range.poolBase = 0x40000000ull;
   range.poolSize = 0x200000ull;
   range.poolId = 7;
+  range.writableCount = 1;
+  range.writableAddr[0] = 0x40080000ull;
+  range.writableSize[0] = 0x40;
   EJitSharedTaskPool owner;
   bringUpOwner4K(owner, fourK, range);
   EXPECT_EQ(state_->abiVersion, kEJitSharedAbiVersion);
@@ -1625,6 +2009,11 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
+  // Runtime-writable ranges (v9): published verbatim from the code-range info.
+  EXPECT_EQ(slot->writableCount, 1u);
+  EXPECT_EQ(slot->requiresPeerEnableRw, 1u); // RangeCtx default: fixed RX pool
+  EXPECT_EQ(slot->writableRanges[0].addr, 0x40080000ull);
+  EXPECT_EQ(slot->writableRanges[0].size, 0x40ull);
   // PGO fields: zero on a Baseline publish (PGO off).
   EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
 }
@@ -1719,6 +2108,12 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       Slot.poolSize = 0x4444;
       Slot.poolId = 0x5555;
       Slot.rangeReserved = 0x6666;
+      Slot.writableCount = 0x7777;
+      Slot.requiresPeerEnableRw = 0x8888;
+      for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+        Slot.writableRanges[i].addr = 0x9999 + i;
+        Slot.writableRanges[i].size = 0xAAAA + i;
+      }
     }
 
   // init-state was left Uninitialized, so owner election runs
@@ -1746,6 +2141,12 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       EXPECT_EQ(Slot.poolSize, 0u);
       EXPECT_EQ(Slot.poolId, 0u);
       EXPECT_EQ(Slot.rangeReserved, 0u);
+      EXPECT_EQ(Slot.writableCount, 0u);
+      EXPECT_EQ(Slot.requiresPeerEnableRw, 0u);
+      for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+        EXPECT_EQ(Slot.writableRanges[i].addr, 0u);
+        EXPECT_EQ(Slot.writableRanges[i].size, 0u);
+      }
     }
 }
 
