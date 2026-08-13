@@ -20,6 +20,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
+#include <algorithm>
 #include <cstdlib>
 
 using namespace llvm;
@@ -616,6 +617,20 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     if (slotTier < kEJitTierPgoUse) {
       uint64_t prev = Slot.hitCount.fetchAdd(1);
       uint32_t threshold = state_->tier2Threshold.loadAcquire();
+      if (slotTier == kEJitTierInstrumented && threshold &&
+          state_->pgoActiveFunc.loadAcquire() == Slot.funcIndex + 1) {
+        uint32_t quarter = static_cast<uint32_t>(
+            std::min<uint64_t>(4, ((prev + 1) * 4) / threshold));
+        uint32_t oldQuarter = state_->pgoProgressQuarter.loadRelaxed();
+        while (quarter > oldQuarter &&
+               !state_->pgoProgressQuarter.compareExchange(oldQuarter,
+                                                            quarter)) {
+        }
+        if (quarter > oldQuarter)
+          EJIT_DIAG("PGO profile progress func=%u: %u%% (%llu/%u hits)",
+                    Slot.funcIndex, quarter * 25,
+                    static_cast<unsigned long long>(prev + 1), threshold);
+      }
       // >= (not ==): if the enqueue fails (queue full / already pending),
       // the next hit can still arm — a transient failure is not fatal (§7).
       if (threshold && prev + 1 >= threshold) {
@@ -714,6 +729,55 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   for (uint32_t i = 0; i < 4; ++i)
     Cold.tier2Versions[i] = R.tier2Versions[i];
   return Cold;
+}
+
+bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
+                                          bool &newlyAdmitted) {
+  newlyAdmitted = false;
+  const uint32_t encoded = funcIndex + 1;
+  uint32_t active = state_->pgoActiveFunc.loadAcquire();
+  if (active == encoded)
+    return true;
+  if (active != 0) {
+    state_->pgoDeferredMisses.fetchAdd(1);
+    return false;
+  }
+
+  uint32_t expected = 0;
+  if (!state_->pgoActiveFunc.compareExchange(expected, encoded)) {
+    if (expected == encoded)
+      return true;
+    state_->pgoDeferredMisses.fetchAdd(1);
+    return false;
+  }
+
+  newlyAdmitted = true;
+  state_->pgoProgressQuarter.storeRelease(0);
+  EJIT_DIAG("PGO profile start func=%u: 0%% (other functions stay on AOT)",
+            funcIndex);
+  return true;
+}
+
+void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex,
+                                           bool completed) {
+  uint32_t expected = funcIndex + 1;
+  if (state_->pgoActiveFunc.loadAcquire() != expected)
+    return;
+  // Reset progress while ownership is still held. Releasing active first would
+  // let the next function advance and then have its progress overwritten here.
+  state_->pgoProgressQuarter.storeRelease(0);
+  if (!state_->pgoActiveFunc.compareExchange(expected, 0))
+    return;
+  if (completed) {
+    uint64_t done = state_->pgoCompletedFunctions.fetchAdd(1) + 1;
+    EJIT_DIAG("PGO profile complete func=%u: completed=%llu deferred=%llu",
+              funcIndex, static_cast<unsigned long long>(done),
+              static_cast<unsigned long long>(
+                  state_->pgoDeferredMisses.loadRelaxed()));
+  } else {
+    EJIT_DIAG("PGO profile aborted func=%u; next function may start",
+              funcIndex);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -1330,6 +1394,10 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->mode.storeRelaxed(mode);
   st->tier2Threshold.storeRelaxed(pgoEnabled ? tier2Threshold : 0);
   st->pgoEnabled.storeRelaxed(pgoEnabled ? 1 : 0);
+  st->pgoActiveFunc.storeRelaxed(0);
+  st->pgoProgressQuarter.storeRelaxed(0);
+  st->pgoCompletedFunctions.storeRelaxed(0);
+  st->pgoDeferredMisses.storeRelaxed(0);
   st->anyInstanceActivated.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
@@ -1348,6 +1416,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->counters.instanceDisabled.storeRelaxed(0);
   st->counters.instanceDisabledPreActivate.storeRelaxed(0);
   st->counters.executePrepareFailed.storeRelaxed(0);
+  st->counters.tier1Compiles.storeRelaxed(0);
+  st->counters.tier2Compiles.storeRelaxed(0);
+  st->counters.profileMergeFails.storeRelaxed(0);
   // Code-pool stats mirror: zero until the owner publishes the first snapshot
   // after a successful compile (the pools are owner-private and empty at init).
   st->codePoolStats.poolCount.storeRelaxed(0);
@@ -1924,9 +1995,19 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   }
   // Dedup + enqueue (§5.2 step 3) — Async path.
+  bool newlyAdmitted = false;
+  if (state_->pgoEnabled.loadAcquire() &&
+      !admitPgoFunction(funcIndex, newlyAdmitted)) {
+    // Another function is collecting a profile. Keep this miss on the AOT
+    // fallback and do not add work to the compiler queue.
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    return R;
+  }
   uint32_t gen = state_->generation.loadAcquire();
   EJitCompileRequest Req{};
-  Req.funcIndex = funcIndex;
+  Req.funcIndex = state_->pgoEnabled.loadAcquire()
+                      ? encodeReqTier(funcIndex, kEJitTierInstrumented)
+                      : funcIndex;
   Req.numDims = numDims;
   Req.fallbackPtr = reinterpret_cast<uintptr_t>(fallback);
   Req.generation = gen;
@@ -1941,6 +2022,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
   case EJitDedupResult::InvalidFuncIndex:
+    if (newlyAdmitted)
+      finishPgoFunction(funcIndex, /*completed=*/false);
     EJIT_DIAG("shared taskpool reject func=%u: out of range", funcIndex);
     R.status = EJitCompileOrGetStatus::InvalidParam;
     return R;
@@ -1948,6 +2031,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     break;
   }
   if (!queuePush(Req)) {
+    if (newlyAdmitted)
+      finishPgoFunction(funcIndex, /*completed=*/false);
     dedupClear(funcIndex, gen); // queue full → roll back the in-flight slot.
     EJIT_STAT_INC(state_->counters.queueFull);
     EJIT_DIAG("shared taskpool fallback func=%u: queue full", funcIndex);
@@ -2002,8 +2087,20 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   // an arming hit whose hitCount.fetchAdd primed the monitor on this bucket, so
   // derive pgoClearExclusive from the request's encoded tier here in the
   // worker.
-  const bool pgoClearExclusive =
-      decodeReqTier(req.funcIndex) == kEJitTierPgoUse;
+  const uint32_t tier = decodeReqTier(req.funcIndex);
+  const uint32_t realFuncIndex = stripReqTier(req.funcIndex);
+  const bool pgoClearExclusive = tier == kEJitTierPgoUse;
+  auto finishPgoOnFailure = [&]() {
+    if (tier == kEJitTierInstrumented) {
+      finishPgoFunction(realFuncIndex, /*completed=*/false);
+    } else if (tier == kEJitTierPgoUse) {
+      // Tier-1 is still published and instrumented. Retain admission so a
+      // later hit retries Tier-2 instead of allowing a second instrumented
+      // function to start concurrently.
+      EJIT_DIAG("PGO Tier-2 failed func=%u; profile remains active for retry",
+                realFuncIndex);
+    }
+  };
   EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u", req.funcIndex,
             req.numDims, req.generation);
   // Checkpoint 0 (spec §11): generation guard. A request enqueued under an
@@ -2018,6 +2115,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   }
   // Checkpoint 1: invalidated before compile started.
   if (!versionsCurrent(req)) {
+    if (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse)
+      finishPgoFunction(realFuncIndex, /*completed=*/false);
     dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile drop func=%u: version changed before compile",
@@ -2027,6 +2126,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   void *fn = nullptr;
   bool ok = compileFn_ && compileFn_(compileCtx_, req, &fn);
   if (!ok || !fn) {
+    finishPgoOnFailure();
     dedupClear(req.funcIndex, req.generation);
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile failed func=%u ok=%u fn=%p", req.funcIndex,
@@ -2045,6 +2145,9 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   // the result.
   if (req.generation != state_->generation.loadAcquire() ||
       !versionsCurrent(req)) {
+    if (req.generation == state_->generation.loadAcquire() &&
+        (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
+      finishPgoFunction(realFuncIndex, /*completed=*/false);
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
@@ -2057,11 +2160,22 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   switch (PS) {
   case EJitPublishStatus::Published:
     EJIT_STAT_INC(state_->counters.asyncCompiles);
+    if (tier == kEJitTierInstrumented) {
+      EJIT_STAT_INC(state_->counters.tier1Compiles);
+      EJIT_DIAG("PGO Tier-1 published func=%u: collecting 0/%u hits",
+                realFuncIndex, state_->tier2Threshold.loadAcquire());
+    } else if (tier == kEJitTierPgoUse) {
+      EJIT_STAT_INC(state_->counters.tier2Compiles);
+      finishPgoFunction(realFuncIndex, /*completed=*/true);
+    }
     publishCodePoolStats();
     dedupClear(req.funcIndex, req.generation);
     EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex, fn);
     return;
   case EJitPublishStatus::VersionMismatch:
+    if (req.generation == state_->generation.loadAcquire() &&
+        (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
+      finishPgoFunction(realFuncIndex, /*completed=*/false);
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
@@ -2070,6 +2184,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     return;
   case EJitPublishStatus::InvalidParam:
   case EJitPublishStatus::Failed:
+    finishPgoOnFailure();
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
@@ -2222,4 +2337,14 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
       state_->counters.instanceDisabledPreActivate.loadRelaxed();
   out.executePrepareFailed =
       state_->counters.executePrepareFailed.loadRelaxed();
+  uint32_t active = state_->pgoActiveFunc.loadAcquire();
+  out.pgoActiveFunc = active ? active - 1 : kEJitSharedMaxFuncIndex;
+  out.pgoProgressPercent =
+      state_->pgoProgressQuarter.loadAcquire() * 25;
+  out.pgoCompletedFunctions =
+      state_->pgoCompletedFunctions.loadRelaxed();
+  out.pgoDeferredMisses = state_->pgoDeferredMisses.loadRelaxed();
+  out.tier1Compiles = state_->counters.tier1Compiles.loadRelaxed();
+  out.tier2Compiles = state_->counters.tier2Compiles.loadRelaxed();
+  out.profileMergeFails = state_->counters.profileMergeFails.loadRelaxed();
 }

@@ -365,6 +365,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
   EJitAtomicU32 pgoEnabled; ///< 1 => shared online-PGO trigger is enabled
   EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
+  /// Staged PGO admission. 0 means idle; otherwise funcIndex + 1 identifies
+  /// the only function currently allowed to compile/run instrumented Tier-1.
+  EJitAtomicU32 pgoActiveFunc;
+  /// Last logged progress quarter for the active function: 0..4.
+  EJitAtomicU32 pgoProgressQuarter;
+  EJitAtomicU64 pgoCompletedFunctions;
+  EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.

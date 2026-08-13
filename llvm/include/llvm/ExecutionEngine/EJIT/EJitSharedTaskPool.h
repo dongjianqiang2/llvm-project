@@ -64,6 +64,13 @@ struct EJitSharedDiagnostics {
   uint64_t instanceDisabled;
   uint64_t instanceDisabledPreActivate; ///< instanceDisabled before first activate.
   uint64_t executePrepareFailed;
+  uint32_t pgoActiveFunc;
+  uint32_t pgoProgressPercent;
+  uint64_t pgoCompletedFunctions;
+  uint64_t pgoDeferredMisses;
+  uint64_t tier1Compiles;
+  uint64_t tier2Compiles;
+  uint64_t profileMergeFails;
 };
 
 //===----------------------------------------------------------------------===//
@@ -326,6 +333,11 @@ public:
       return state_->pgoEnabled.loadAcquire() != 0;
     return pgoEnabled_.loadRelaxed() != 0;
   }
+
+  /// Return true when this miss may start/continue the single staged PGO
+  /// function. A different function remains on its AOT fallback until the
+  /// active function publishes Tier-2 or terminates with an error.
+  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -623,6 +635,11 @@ private:
   /// write lock. No caller-supplied flag: the worker owns this policy (spec
   /// §4.9).
   void runCompile(const EJitCompileRequest &req);
+
+  /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
+  /// completion and terminal worker failures call this; transient queue-full
+  /// leaves ownership intact so the next hit can retry.
+  void finishPgoFunction(uint32_t funcIndex, bool completed);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every

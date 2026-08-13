@@ -78,7 +78,10 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// exist in every build for a stable layout and are 0 when PGO is off.
 /// v8: online-PGO enable/threshold control moves into the shared blob so every
 /// producer core observes the owner's configuration.
-constexpr uint32_t kEJitSharedAbiVersion = 8u;
+/// v9: online-PGO Tier-1 admission is serialized across functions. The shared
+/// blob records the active function, progress milestone, completed-function
+/// count, and deferred misses.
+constexpr uint32_t kEJitSharedAbiVersion = 9u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
