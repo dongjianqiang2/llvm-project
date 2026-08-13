@@ -205,6 +205,16 @@ bool startOkIgnoreCtx(void * /*ctx*/,
   return true;
 }
 
+// A well-formed registration. In a correct link every entry names the one
+// linkonce_odr @__ejit_icache_epoch, so honour a window a test bound
+// explicitly. The mixed-version tests call the entry point directly.
+EJitIcacheEpochRef gTestWindow;
+bool registerSlot(uint32_t funcIndex, void *base, uint32_t numDims) {
+  void *w = ejitIcacheBoundWindow();
+  return ejitIcacheRegisterSlot(funcIndex, base, numDims,
+                                w ? w : &gTestWindow, kEJitIcacheProbeAbi);
+}
+
 EJitDimPair dim(uint32_t t, uint32_t i) { return EJitDimPair{t, i}; }
 
 class SharedTaskPoolTest : public ::testing::Test {
@@ -1646,12 +1656,13 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v7 layout: the slot carries the executable range as fixed-width,
+// 16/17 ABI v8 layout: the slot carries the executable range as fixed-width,
 // naturally-aligned scalars (read back by value — endian-safe), the pool-split
-// table is POD, dump state contains metadata only, and each bucket carries the
-// NO_RECLAIM seqlock publishSeq word.
+// table is POD, dump state contains metadata only, each bucket carries the
+// NO_RECLAIM seqlock publishSeq word, and the SwitchController line carries
+// icacheEpoch.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 7u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 8u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -2684,9 +2695,11 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   // Register a per-function icache slot (the wrapper's @__ejit_icache_fn_
   // global, here a test-local stand-in) so icacheFill has somewhere to write.
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
+  // compile_or_get syncs at entry before every fill; mirror that here.
+  pool.icacheSyncEpoch();
 
   // Cold icache misses (empty slot).
   EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
@@ -2697,9 +2710,10 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, fn);
 
-  // Frozen: a period toggle bumps the version, but v2 does NOT re-validate, so
-  // the cached specialization is still served (the slot is never refilled or
-  // invalidated). This is the v2 contract - the specialization is invariant.
+  // Frozen between syncs: a period toggle bumps the version, and the cell holds
+  // no version, so the cached specialization is still served until this core
+  // syncs. Invalidation is published (icacheEpoch) and observed per core, never
+  // re-checked on the probe -- see InlineCacheDrainsOnPeriodToggle.
   ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
   ASSERT_TRUE(pool.setInstanceEnabled(0, 5, false)); // bump version
   EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
@@ -2734,9 +2748,12 @@ TEST_F(SharedTaskPoolTest, InlineCacheHighFuncIndex) {
   // Top of the table: funcIndex = EJIT_ICACHE_FUNC_SLOTS - 1.
   constexpr uint32_t kTop = EJIT_ICACHE_FUNC_SLOTS - 1;
   uintptr_t slotTop = 0;
-  ejitIcacheRegisterSlot(kTop, &slotTop, 0);
+  registerSlot(kTop, &slotTop, 0);
   void *fnTop = codeFor(kTop);
   void *out = nullptr;
+  // compile_or_get syncs at entry before every fill; mirror that here, or
+  // icacheFill drops the fill as raced by a toggle it never saw.
+  pool.icacheSyncEpoch();
 
   EXPECT_FALSE(pool.icacheTry(kTop, nullptr, 0, &out));
   EXPECT_EQ(out, nullptr);
@@ -2747,7 +2764,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheHighFuncIndex) {
   // Mid-table index that the old 64-slot table would have dropped.
   constexpr uint32_t kMid = 2000;
   uintptr_t slotMid = 0;
-  ejitIcacheRegisterSlot(kMid, &slotMid, 0);
+  registerSlot(kMid, &slotMid, 0);
   void *fnMid = codeFor(kMid);
   pool.icacheFill(kMid, fnMid, nullptr, 0);
   EXPECT_TRUE(pool.icacheTry(kMid, nullptr, 0, &out));
@@ -2771,9 +2788,10 @@ TEST_F(SharedTaskPoolTest, InlineCacheAutoDisablesWhenReclamationWired) {
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
+  pool.icacheSyncEpoch();
 
   // Before a releaser: fill -> hit.
   pool.icacheFill(kFunc, fn, nullptr, 0);
@@ -2811,7 +2829,8 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
   // runtime reaches cells through an EJitAtomicUPtr* + linearized index.
   constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
   uintptr_t slots[D][D] = {};
-  ejitIcacheRegisterSlot(kFunc, &slots[0][0], 2);
+  registerSlot(kFunc, &slots[0][0], 2);
+  pool.icacheSyncEpoch();
 
   void *fn00 = codeFor(kFunc);
   void *fn01 = codeFor(kFunc + 1);
@@ -3320,6 +3339,778 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
   ASSERT_EQ(state_->initState.loadAcquire(),
             static_cast<uint32_t>(EJitSharedInitState::Ready));
   EXPECT_FALSE(owner.asyncServiceAvailable());
+}
+
+//===----------------------------------------------------------------------===//
+// Epoch-driven drain: a period toggle cannot invalidate a cell (no version in
+// the cell) and cannot reach a peer core (cells are core-private), so the
+// toggle publishes icacheEpoch and each core drains its own table on sync.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, InlineCacheDrainsOnPeriodToggle) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0);
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // Arm this core against the blob FIRST (the initial sync always drains, which
+  // is what makes a core that boots with a stale table safe), then warm.
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  ASSERT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  ASSERT_EQ(out, fn);
+
+  // No toggle -> sync reports no drain and the warm cell SURVIVES. (Guards
+  // against a drain that fires unconditionally, which would make the assertions
+  // below pass for the wrong reason.)
+  EXPECT_FALSE(pool.icacheSyncEpoch());
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // Activate: the epoch moves, but the probe still hits until this core syncs
+  // -- the drain is observed, never checked on the hit path.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // Sync -> drained: the cell is empty and the next call must re-resolve.
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+  EXPECT_EQ(slot, 0u);
+
+  // Idempotent: a second sync with no further toggle does nothing.
+  EXPECT_FALSE(pool.icacheSyncEpoch());
+
+  // The registration SURVIVES the drain (unlike ejitIcacheClearAll, which
+  // unregisters), so the next resolve refills the same wired cell.
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  // Deactivate drains too -- both directions of the toggle bump the epoch.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, false));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  // A toggle that does not move the BIT still drains: it is a second core
+  // bracketing its own period writes over the shared bit -- see
+  // TwoCoresReconfiguringBothInvalidate.
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_FALSE(pool.setInstanceEnabled(0, 5, false)); // bit already 0 ...
+  EXPECT_TRUE(pool.icacheSyncEpoch());                // ... but still published
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+
+  ejitIcacheClearAll();
+}
+
+// Why the drain above is not gated on the enabled bit moving.
+//
+// Period DATA is core-private; the specialization compiled from it is SHARED, so
+// every core brackets its own writes over one shared enabled bit and only the
+// first in each direction wins the CAS. Publishing on the transition alone loses
+// every other core: their writes land in a window nothing announced, and they
+// keep being served a peer's pre-write values -- silently, forever.
+TEST_F(SharedTaskPoolTest, TwoCoresReconfiguringBothInvalidate) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kDim = 0, kInst = 5, kFunc = 9;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0);
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true)); // steady state
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  ASSERT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  // Interleave two cores exactly as the SRE reconfiguration path does. Core A
+  // wins both CASes; core B loses both, and it is core B's write (between the
+  // two calls it makes) that must still be announced.
+  const uint32_t v0 = pool.state()->version[kDim][kInst].loadAcquire();
+  EXPECT_TRUE(pool.setInstanceEnabled(kDim, kInst, false));  // core A deactivate
+  EXPECT_FALSE(pool.setInstanceEnabled(kDim, kInst, false)); // core B deactivate
+  EXPECT_TRUE(pool.setInstanceEnabled(kDim, kInst, true));   // core A activate
+  // ... core B writes ITS copy of the period values here ...
+  const uint32_t vBeforeB = pool.state()->version[kDim][kInst].loadAcquire();
+  EXPECT_FALSE(pool.setInstanceEnabled(kDim, kInst, true)); // core B activate
+
+  // Core B's bracket moved the icache epoch, so every core drains its cells --
+  // which is what makes its write visible, since a cell holds no version.
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(slot, 0u);
+
+  // version[] does NOT move for core B: it changed no shared state, and its
+  // consumer discards in-flight compiles. See NoTransitionDoesNotBumpVersion.
+  EXPECT_EQ(pool.state()->version[kDim][kInst].loadAcquire(), vBeforeB);
+  EXPECT_GT(pool.state()->version[kDim][kInst].loadAcquire(), v0);
+
+  ejitIcacheClearAll();
+}
+
+//===----------------------------------------------------------------------===//
+// Mixed-version links: the probe contract travels per entry, so a TU built
+// before the epoch check existed can never register against a newer TU's
+// window and get cells its probe cannot invalidate.
+//===----------------------------------------------------------------------===//
+
+// New TU first, then old. The old TU must NOT inherit the bound window.
+TEST_F(SharedTaskPoolTest, MixedVersionNewThenOldDeclinesTheOldTU) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowNew{};
+  uintptr_t cellNew = 0, cellOld = 0;
+
+  EXPECT_TRUE(ejitIcacheRegisterSlot(1, &cellNew, 0, &windowNew,
+                                     kEJitIcacheProbeAbi));
+  ASSERT_EQ(ejitIcacheBoundWindow(), &windowNew);
+
+  // A pre-epoch object reports ABI 0 and brings no window; a global gate would
+  // say "a window is bound, go ahead".
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellOld, 0, nullptr, 0))
+      << "a pre-epoch TU rode in on the new TU's window";
+  // Naming the window does not help it either: the version is what is checked.
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellOld, 0, &windowNew, 0));
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellOld, 0, &windowNew, 1));
+
+  ejitIcacheClearAll();
+}
+
+// Old TU first: it is declined and leaves nothing bound, so the new TU still
+// comes up with a working cache.
+TEST_F(SharedTaskPoolTest, MixedVersionOldThenNewStillServesTheNewTU) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowNew{};
+  uintptr_t cellOld = 0, cellNew = 0;
+
+  EXPECT_FALSE(ejitIcacheRegisterSlot(1, &cellOld, 0, nullptr, 0));
+  EXPECT_EQ(ejitIcacheBoundWindow(), nullptr)
+      << "a declined entry must not bind a window";
+
+  EXPECT_TRUE(ejitIcacheRegisterSlot(2, &cellNew, 0, &windowNew,
+                                     kEJitIcacheProbeAbi));
+  EXPECT_EQ(ejitIcacheBoundWindow(), &windowNew);
+
+  ejitIcacheClearAll();
+}
+
+// A future version means obligations this runtime does not implement.
+TEST_F(SharedTaskPoolTest, FutureProbeAbiIsRejected) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef window{};
+  uintptr_t cell = 0;
+  EXPECT_FALSE(ejitIcacheRegisterSlot(1, &cell, 0, &window,
+                                      kEJitIcacheProbeAbi + 1));
+  EXPECT_EQ(ejitIcacheBoundWindow(), nullptr);
+  ejitIcacheClearAll();
+}
+
+// Two window addresses means the linkonce_odr copies were not merged, so one
+// probe would read storage the runtime never writes.
+TEST_F(SharedTaskPoolTest, ConflictingEpochWindowIsRejected) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowA{}, windowB{};
+  uintptr_t cellA = 0, cellB = 0;
+
+  EXPECT_TRUE(ejitIcacheRegisterSlot(1, &cellA, 0, &windowA,
+                                     kEJitIcacheProbeAbi));
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellB, 0, &windowB,
+                                      kEJitIcacheProbeAbi));
+  EXPECT_EQ(ejitIcacheBoundWindow(), &windowA) << "the first binding stands";
+
+  ejitIcacheClearAll();
+}
+
+// A declined entry is never half wired up: its cell stays null, so the taskpool
+// serves every call.
+TEST_F(SharedTaskPoolTest, DeclinedEntryLeavesNoCellWired) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 6;
+  uintptr_t cell = 0;
+  void *out = nullptr;
+
+  EXPECT_FALSE(ejitIcacheRegisterSlot(kFunc, &cell, 0, nullptr, 0));
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0);
+
+  EXPECT_EQ(cell, 0u) << "a declined entry must never be filled";
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  ejitIcacheClearAll();
+}
+
+// The drain walks only the index range this core actually filled. It must NOT
+// stop at the first zero cell: fills land at the dim identity, so a core using
+// instance 5 alone leaves 0..4 zero with a live pointer behind them.
+TEST_F(SharedTaskPoolTest, DrainClearsSparseCellsBeyondALeadingHole) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 4;
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
+  ASSERT_TRUE(registerSlot(kFunc, cells, 1));
+
+  pool.icacheSyncEpoch();
+  const EJitDimPair five[1] = {{0, 5}};
+  const EJitDimPair eleven[1] = {{0, 11}};
+  pool.icacheFill(kFunc, codeFor(kFunc), five, 1);
+  pool.icacheFill(kFunc, codeFor(kFunc + 1), eleven, 1);
+  ASSERT_NE(cells[5], 0u);
+  ASSERT_NE(cells[11], 0u);
+  ASSERT_EQ(cells[0], 0u) << "the leading hole the drain must not stop at";
+
+  pool.setInstanceEnabled(0, 5, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  for (uint32_t i = 0; i < EJIT_ICACHE_DIM_SIZE; ++i)
+    EXPECT_EQ(cells[i], 0u) << "cell " << i << " survived the drain";
+
+  ejitIcacheClearAll();
+}
+
+// More filled cells than the global log holds: the drain falls back to walking
+// the slot table and whole-array clearing every touched slot, instead of
+// clearing only the cells it managed to record.
+TEST_F(SharedTaskPoolTest, DrainFallsBackWhenTheFilledListOverflows) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 9;
+  constexpr uint32_t kD = EJIT_ICACHE_DIM_SIZE;
+  // A 3D entry: kD^3 cells, so this one slot alone can outrun the log.
+  constexpr uint32_t kUsed = EJIT_ICACHE_DRAIN_LIST + 4u;
+  static_assert(kUsed <= kD * kD * kD,
+                "need more cells than the log holds to exercise the fallback");
+  // Flat, in the row-major order icacheLinearize produces, so the identity
+  // (i/kD^2, (i/kD)%kD, i%kD) lands exactly on cells[i].
+  uintptr_t cells[kD * kD * kD] = {};
+  ASSERT_TRUE(registerSlot(kFunc, cells, 3));
+  pool.icacheSyncEpoch();
+
+  for (uint32_t i = 0; i < kUsed; ++i) {
+    const EJitDimPair d[3] = {
+        {0, i / (kD * kD)}, {1, (i / kD) % kD}, {2, i % kD}};
+    pool.icacheFill(kFunc, codeFor(kFunc + i), d, 3);
+  }
+  for (uint32_t i = 0; i < kUsed; ++i)
+    ASSERT_NE(cells[i], 0u) << "identity " << i;
+
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  for (uint32_t i = 0; i < kUsed; ++i)
+    EXPECT_EQ(cells[i], 0u)
+        << "identity " << i << " survived the overflow drain";
+
+  ejitIcacheClearAll();
+}
+
+// The drain log is ONE table shared by every slot, so a drain has to resolve
+// each entry back to its own slot. Interleaving fills across slots would come
+// out right for free with a per-slot list; with a shared log it is the thing
+// that can break, and a cell drained against the wrong base is a silent stale
+// hit. Stays under the cap so this exercises the precise path, not the walk.
+TEST_F(SharedTaskPoolTest, DrainLogIsSharedAcrossSlots) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kSlots = 8;
+  constexpr uint32_t kD = EJIT_ICACHE_DIM_SIZE;
+  static_assert(kSlots * 2 <= EJIT_ICACHE_DRAIN_LIST,
+                "must stay under the cap to test the precise drain path");
+  uintptr_t cells[kSlots][kD] = {};
+  for (uint32_t s = 0; s < kSlots; ++s)
+    ASSERT_TRUE(registerSlot(s, cells[s], 1));
+  pool.icacheSyncEpoch();
+
+  // Two identities per slot, interleaved so no slot's entries are contiguous.
+  for (uint32_t id : {3u, 11u})
+    for (uint32_t s = 0; s < kSlots; ++s) {
+      const EJitDimPair d[1] = {{0, id}};
+      pool.icacheFill(s, codeFor(s * kD + id), d, 1);
+    }
+  for (uint32_t s = 0; s < kSlots; ++s) {
+    ASSERT_NE(cells[s][3], 0u) << "slot " << s;
+    ASSERT_NE(cells[s][11], 0u) << "slot " << s;
+    cells[s][7] = 0xDEADBEEF; // never filled: the precise drain must miss it
+  }
+
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  for (uint32_t s = 0; s < kSlots; ++s) {
+    EXPECT_EQ(cells[s][3], 0u) << "slot " << s << " identity 3 survived";
+    EXPECT_EQ(cells[s][11], 0u) << "slot " << s << " identity 11 survived";
+    EXPECT_EQ(cells[s][7], 0xDEADBEEFu)
+        << "slot " << s << " lost a cell it never filled";
+  }
+
+  ejitIcacheClearAll();
+}
+
+// A slot with no fills since the last drain is skipped entirely, so an
+// untouched 4D entry costs nothing instead of 16^4 stores.
+TEST_F(SharedTaskPoolTest, DrainSkipsSlotsWithNoFills) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 7;
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
+  ASSERT_TRUE(registerSlot(kFunc, cells, 1));
+  pool.icacheSyncEpoch();
+
+  // Poison a cell behind the runtime's back: a drain that thinks this slot has
+  // fills would clear it, one that tracks fills correctly leaves it alone.
+  cells[3] = 0xDEADBEEF;
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(cells[3], 0xDEADBEEFu) << "drained a slot it never filled";
+
+  // ...and once really filled, the next drain does clear it.
+  const EJitDimPair d[1] = {{0, 3}};
+  pool.icacheFill(kFunc, codeFor(kFunc), d, 1);
+  pool.setInstanceEnabled(0, 1, false);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(cells[3], 0u);
+
+  ejitIcacheClearAll();
+}
+
+// A call that moves no shared state must not bump version[]. runCompile's
+// checkpoints DISCARD a finished compile when the version changes, and nothing
+// re-enqueues a dropped one -- so a redundant activate that bumped the version
+// would abort whatever the worker had in flight, permanently. Every core
+// activating the periods it shares is the normal startup shape, so this is the
+// difference between the JIT publishing and the JIT never publishing at all.
+TEST_F(SharedTaskPoolTest, NoTransitionDoesNotBumpVersion) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kDim = 0, kInst = 3;
+
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true)); // first core wins
+  const uint32_t v = pool.state()->version[kDim][kInst].loadAcquire();
+  const uint32_t e = pool.state()->icacheEpoch.loadAcquire();
+
+  // 20 more cores activate the same instance, as they do at startup.
+  for (int i = 0; i < 20; ++i)
+    EXPECT_FALSE(pool.setInstanceEnabled(kDim, kInst, true));
+
+  EXPECT_EQ(pool.state()->version[kDim][kInst].loadAcquire(), v)
+      << "a redundant activate aborts every in-flight compile";
+  // The epochs still move: those callers may have rewritten core-private data.
+  EXPECT_GT(pool.state()->icacheEpoch.loadAcquire(), e);
+}
+
+// The drain covers EVERY cell of a multi-dim array and every registered
+// function, not just the one that happened to be probed.
+TEST_F(SharedTaskPoolTest, InlineCacheDrainCoversAllCellsAndFunctions) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
+  constexpr uint32_t kFuncA = 3;
+  constexpr uint32_t kFuncB = 7;
+  uintptr_t cells2d[D][D] = {};
+  uintptr_t cell0d = 0;
+  registerSlot(kFuncA, &cells2d[0][0], 2);
+  registerSlot(kFuncB, &cell0d, 0);
+
+  // Fill the corners of the 2-dim array (including the LAST cell, which catches
+  // a drain that under-counts the array) plus the unrelated 0-dim function.
+  EJitDimPair id00[2] = {{0, 0}, {0, 0}};
+  EJitDimPair idLast[2] = {{0, D - 1}, {0, D - 1}};
+  pool.icacheSyncEpoch(); // arm before warming
+  pool.icacheFill(kFuncA, codeFor(kFuncA), id00, 2);
+  pool.icacheFill(kFuncA, codeFor(kFuncA + 1), idLast, 2);
+  pool.icacheFill(kFuncB, codeFor(kFuncB), nullptr, 0);
+  ASSERT_NE(cells2d[0][0], 0u);
+  ASSERT_NE(cells2d[D - 1][D - 1], 0u);
+  ASSERT_NE(cell0d, 0u);
+
+  ASSERT_TRUE(pool.setInstanceEnabled(1, 2, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+
+  EXPECT_EQ(cells2d[0][0], 0u);
+  EXPECT_EQ(cells2d[D - 1][D - 1], 0u);
+  EXPECT_EQ(cell0d, 0u); // a toggle on ANY instance drains every function
+
+  ejitIcacheClearAll();
+}
+
+// A fresh shared blob restarts icacheEpoch from a low value that a stale
+// seen-epoch can match by coincidence, so the sync keys on the blob identity
+// too. Without that, cells filled against the previous blob would survive.
+TEST_F(SharedTaskPoolTest, InlineCacheDrainsAgainstADifferentBlob) {
+  ejitIcacheClearAll();
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // Blob A: arm, warm, and leave the core's seen-epoch at A's CURRENT value.
+  EJitSharedTaskPool poolA;
+  bringUpOwner(poolA); // binds the fixture's state_
+  registerSlot(kFunc, &slot, 0);
+  poolA.icacheSyncEpoch();
+  poolA.icacheFill(kFunc, fn, nullptr, 0);
+  ASSERT_TRUE(poolA.icacheTry(kFunc, nullptr, 0, &out));
+  ASSERT_EQ(out, fn);
+  const uint32_t seenEpoch = poolA.state()->icacheEpoch.loadAcquire();
+
+  // Blob B: a genuinely separate region, whose epoch is forced to EQUAL the
+  // epoch this core last synced against. The epoch comparison alone therefore
+  // says "up to date" and only the blob-identity check can catch this.
+  auto stateB = std::make_unique<EJitSharedTaskPoolState>();
+  EJitSharedTaskPool poolB;
+  EJitCoreId::setCurrentForTest(0);
+  poolB.bind(stateB.get());
+  poolB.setCompiler(&mockCompile, nullptr);
+  poolB.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(poolB.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_NE(poolB.state(), poolA.state());
+  stateB->icacheEpoch.storeRelease(seenEpoch);
+
+  EXPECT_TRUE(poolB.icacheSyncEpoch()); // drained on blob identity alone
+  EXPECT_FALSE(poolB.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(slot, 0u);
+
+  ejitIcacheClearAll();
+}
+
+// A re-initialization REUSES the blob, so the blob-identity check cannot see it
+// and the epoch must carry the signal: cells filled in the previous generation
+// point at code that generation owned, and must not survive into the next one.
+TEST_F(SharedTaskPoolTest, InlineCacheDrainsAcrossAReInitialization) {
+  ejitIcacheClearAll();
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  EJitSharedTaskPool poolA;
+  bringUpOwner(poolA);
+  registerSlot(kFunc, &slot, 0);
+  poolA.icacheSyncEpoch();
+  poolA.icacheFill(kFunc, fn, nullptr, 0);
+  ASSERT_TRUE(poolA.icacheTry(kFunc, nullptr, 0, &out));
+  poolA.ownerShutdown();
+
+  // Same blob, next generation. The blob ADDRESS is unchanged, so only the
+  // epoch bumped by ownerShutdown can make this core drain.
+  EJitSharedTaskPool poolB;
+  bringUpOwner(poolB);
+  ASSERT_EQ(poolB.state(), poolA.state()); // genuinely the same blob
+  EXPECT_TRUE(poolB.icacheSyncEpoch());
+  EXPECT_FALSE(poolB.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(slot, 0u);
+
+  ejitIcacheClearAll();
+}
+
+// End-to-end deactivate semantics, and the defect this exists to fix: a period
+// is deactivated, its values change, it is reactivated, and the entry must run
+// the NEW specialization. Before the epoch drain the cell kept serving the
+// pointer baked with the old values, silently and forever.
+TEST_F(SharedTaskPoolTest, DeactivateReactivateServesTheNewSpecialization) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  constexpr uint32_t kDim = 0, kInst = 5;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0);
+  void *fnOldValues = codeFor(kFunc);
+  void *fnNewValues = codeFor(kFunc + 1);
+  ASSERT_NE(fnOldValues, fnNewValues);
+  void *out = nullptr;
+
+  // Period active, entry warmed with the specialization for the old values.
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true));
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, fnOldValues, nullptr, 0);
+  ASSERT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  ASSERT_EQ(out, fnOldValues);
+
+  // ejit_deactivate: the C API toggles the instance and then syncs this core.
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, false));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  // Period values change while inactive, then ejit_activate.
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true));
+
+  // The next call misses, re-resolves, and fills the NEW pointer (the resolve
+  // path syncs at entry, so the activate's epoch bump is absorbed first).
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, fnNewValues, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fnNewValues);
+
+  ejitIcacheClearAll();
+}
+
+// An out-of-cap numDims must be REJECTED at registration. The drain walks
+// [D]^numDims cells and zeroes each, so a bogus value is a write far past the
+// end of the wrapper's global -- 16^5 cells is 8MB, 16^8 is 34GB, and it would
+// happen on every ejit_deactivate. numDims reaches the runtime from a uint64
+// registry field and from the public C ABI, so it cannot be assumed sane.
+TEST_F(SharedTaskPoolTest, InlineCacheRejectsOutOfCapNumDims) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+
+  // A one-cell array deliberately registered with a wildly wrong shape. If
+  // registration accepted it, the drain below would run off the end of it.
+  uintptr_t lone = 0x1234;
+  registerSlot(kFunc, &lone, EJIT_ICACHE_MAX_DIMS + 1u);
+
+  void *out = nullptr;
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out)) << "slot must be unregistered";
+  pool.icacheSyncEpoch();
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch()); // drains; must not touch the lone cell
+  EXPECT_EQ(lone, 0x1234u) << "drain wrote through a rejected registration";
+
+  // The cap itself is still accepted, so the rejection is a bound and not an
+  // off-by-one that disables legitimate 4-dim entries.
+  ejitIcacheClearAll();
+  std::vector<uintptr_t> maxCells(1u << (4u * 4u), 0); // D=16 ^ 4 dims
+  registerSlot(kFunc, maxCells.data(), EJIT_ICACHE_MAX_DIMS);
+  pool.icacheSyncEpoch();
+  EJitDimPair d4[4] = {{0, 1}, {0, 2}, {0, 3}, {0, 4}};
+  pool.icacheFill(kFunc, codeFor(kFunc), d4, 4);
+  EXPECT_TRUE(pool.icacheTry(kFunc, d4, 4, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 6, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_FALSE(pool.icacheTry(kFunc, d4, 4, &out)) << "4-dim array must drain";
+
+  ejitIcacheClearAll();
+}
+
+// The reclamation gate disables the cache but must not disable the drain: a
+// releaser wired mid-life means code can be freed, so cells must still be
+// emptied rather than left holding pointers that are about to dangle.
+TEST_F(SharedTaskPoolTest, InlineCacheDrainStillRunsWhileAReleaserIsWired) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0);
+  void *out = nullptr;
+
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0);
+  ASSERT_NE(slot, 0u);
+
+  // Wire a releaser: the cache auto-disables (probe misses, fill no-ops) but
+  // the warm cell is still physically there and the wrapper reads it directly,
+  // so a toggle must still zero it.
+  ReleaseLog rel;
+  pool.setReleaser(&mockRelease, &rel);
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out)); // gate closed
+  ASSERT_NE(slot, 0u) << "the gate must not clear cells by itself";
+
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(slot, 0u) << "drain must run even with the cache gated off";
+
+  pool.setReleaser(nullptr, nullptr);
+  ejitIcacheClearAll();
+}
+
+// A slot registered AFTER a drain must start empty and stay usable: late
+// registration is normal on SRE, where auto-registration order across TUs is
+// not fixed.
+TEST_F(SharedTaskPoolTest, InlineCacheSlotRegisteredAfterADrainIsUsable) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kEarly = 3, kLate = 4;
+  uintptr_t early = 0, late = 0xDEAD;
+  void *out = nullptr;
+
+  registerSlot(kEarly, &early, 0);
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kEarly, codeFor(kEarly), nullptr, 0);
+  ASSERT_TRUE(pool.icacheTry(kEarly, nullptr, 0, &out));
+
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(early, 0u);
+
+  // Registered only now: the drain already ran, so nothing zeroed this cell.
+  registerSlot(kLate, &late, 0);
+  late = 0; // the wrapper's global is zero-initialised in .bss
+  pool.icacheFill(kLate, codeFor(kLate), nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kLate, nullptr, 0, &out));
+  EXPECT_EQ(out, codeFor(kLate));
+
+  // ...and a later toggle drains the late slot too.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 6, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(late, 0u);
+
+  ejitIcacheClearAll();
+}
+
+// A toggle landing BETWEEN the pre-resolve sync and the fill must drop the
+// fill. Otherwise the cell would hold a pointer specialized for the pre-toggle
+// values while the seen-epoch was already brought up to date, so no later sync
+// would ever drain it -- a permanently stale cell.
+TEST_F(SharedTaskPoolTest, InlineCacheFillDroppedWhenAToggleRacesTheResolve) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0);
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // compile_or_get entry: sync, bringing this core level with the epoch.
+  pool.icacheSyncEpoch();
+
+  // ...the resolve runs, and a period toggles on another core meanwhile.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+
+  // ...the resolve returns and fills. The fill must be DROPPED: fn was
+  // specialized under the pre-toggle values.
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_EQ(slot, 0u);
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  // Once this core syncs again, fills are accepted normally.
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
+
+  ejitIcacheClearAll();
+}
+
+// The resolve path syncs BEFORE it fills, so a toggle that lands just before a
+// cold resolve cannot wipe the freshly resolved pointer.
+TEST_F(SharedTaskPoolTest, InlineCacheResolveFillSurvivesAPendingDrain) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0);
+  void *stale = codeFor(kFunc);
+  void *fresh = codeFor(kFunc + 1);
+  void *out = nullptr;
+
+  pool.icacheSyncEpoch(); // arm before warming
+  pool.icacheFill(kFunc, stale, nullptr, 0);
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true)); // drain now pending
+
+  // Mirror ejitIcacheFillOnSuccess: sync, then fill with the fresh resolve.
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  pool.icacheFill(kFunc, fresh, nullptr, 0);
+
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fresh); // the fresh fill survived, the stale one did not
+
+  ejitIcacheClearAll();
+}
+
+//===----------------------------------------------------------------------===//
+// __ejit_icache_epoch: the window the AOT probe reads on every call.
+//
+// These assert the CONDITION the probe evaluates (seen == *shared), not
+// icacheTry -- icacheTry models a raw cell read and deliberately does not check
+// the epoch, because it stands in for the cell load alone.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, IcacheEpochRefIsBoundBySync) {
+  ejitIcacheClearAll();
+  // Stand in for the AOT-emitted @__ejit_icache_epoch: the runtime writes
+  // through the address it is given, so the test can watch the exact bytes a
+  // probe would read.
+  EJitIcacheEpochRef window{};
+  ejitIcacheBindEpochWindow(&window);
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+
+  pool.icacheSyncEpoch();
+
+  // Bound at the blob's epoch word: this is what lets the probe observe a
+  // toggle performed by a core that cannot reach this core's cells.
+  ASSERT_EQ(window.shared, pool.state()->icacheEpoch.raw());
+  EXPECT_EQ(window.seen, *window.shared)
+      << "probe would take the miss path with nothing having changed";
+
+  ejitIcacheBindEpochWindow(nullptr);
+  ejitIcacheClearAll();
+}
+
+// The window the runtime writes MUST be the one the probe reads. Binding by
+// address is what guarantees it; this pins that contract.
+TEST_F(SharedTaskPoolTest, IcacheEpochWindowIsTheBoundObject) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowA{}, windowB{};
+  ejitIcacheBindEpochWindow(&windowA);
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.icacheSyncEpoch();
+  ASSERT_NE(windowA.shared, nullptr);
+
+  // Rebinding moves every subsequent publish to the new object, and the old one
+  // is left untouched -- an unbound/stale window never silently keeps updating.
+  const uint64_t staleSeen = windowA.seen;
+  ejitIcacheBindEpochWindow(&windowB);
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 3, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(windowA.seen, staleSeen) << "unbound window still being written";
+  EXPECT_EQ(windowB.seen, *windowB.shared);
+
+  ejitIcacheBindEpochWindow(nullptr);
+  ejitIcacheClearAll();
+}
+
+TEST_F(SharedTaskPoolTest, IcacheEpochRefDivergesOnToggleWithoutAnySync) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef window{};
+  ejitIcacheBindEpochWindow(&window);
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 11;
+  uintptr_t slot = 0;
+  registerSlot(kFunc, &slot, 0);
+
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0);
+  ASSERT_NE(slot, 0u); // warm: this core would now hit forever
+
+  // Steady state: probe passes, so a hit dispatches.
+  ASSERT_EQ(window.seen, *window.shared);
+
+  // A toggle on ANOTHER core. This core does NOT sync -- it is the "always
+  // hits, never enters the runtime" case the drain alone cannot reach.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 7, true));
+
+  // The cell is still warm (nothing drained it) ...
+  EXPECT_NE(slot, 0u);
+  // ... but the probe's comparison now FAILS, so the call takes the miss path
+  // and gets drained there. This is the whole point of the shared epoch.
+  EXPECT_NE(window.seen, *window.shared)
+      << "a core that only ever hits would keep running the old specialization";
+
+  // Taking the miss path drains and re-arms: the probe passes again.
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(slot, 0u);
+  EXPECT_EQ(window.seen, *window.shared);
+
+  ejitIcacheBindEpochWindow(nullptr);
+  ejitIcacheClearAll();
 }
 
 } // namespace

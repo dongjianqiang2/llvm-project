@@ -92,6 +92,13 @@ public:
   /// bit) without a read-modify-write race.
   T fetchAnd(T v) { return __atomic_fetch_and(&value_, v, __ATOMIC_ACQ_REL); }
 
+  /// Address of the underlying storage, for the one consumer that cannot go
+  /// through this class: the AOT-emitted inline-cache probe, which loads the
+  /// shared icache epoch inline. That read is a PLAIN load -- observing a stale
+  /// epoch costs at most one more call into the previous specialization, never
+  /// incorrectness, so it needs no acquire (see EJitIcacheEpochRef).
+  const T *raw() const { return &value_; }
+
 private:
   // mutable so const load helpers can form a non-const pointer for the builtin.
   mutable T value_;

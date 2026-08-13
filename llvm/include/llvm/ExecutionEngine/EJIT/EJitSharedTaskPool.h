@@ -84,16 +84,20 @@ enum class EJitWorkerStep : uint32_t {
 //===----------------------------------------------------------------------===//
 // Per-function inline cache (v2: sticky monomorphic).
 //
-// A single global slot per funcIndex holding a FROZEN specialization pointer:
-// written once (first resolution, one-shot CAS) and read forever. No version /
-// dims / generation re-validation, no refill, and no release_read on the hit
-// path - the probe is a single acquire load + null check.
+// A cell per (funcIndex, dim identity) holding a specialization pointer, read
+// with no version / dims / generation re-validation and no release_read - the
+// probe is a plain load + null check, then the epoch check below.
 //
-// Correctness rests on a hard precondition: every ejit_entry's specialization
-// is invariant for process lifetime (period toggles do not change the baked
-// code; each entry is monomorphic - always called with one dim identity). If
-// that ever fails the cache silently runs a stale specialization; the safety
-// gate below does NOT cover that, only UAF.
+// A cell therefore cannot be invalidated in place. Instead an activate or
+// deactivate bumps the shared icacheEpoch, and each core drains its whole table
+// when it observes a change (icacheSyncEpoch). Cells are core-private, so the
+// toggling core cannot reach a peer's table; publishing an epoch and having
+// each core observe it is what makes the invalidation cross-core.
+//
+// The probe itself checks that epoch on every call (see EJitIcacheEpochRef), so
+// a core discovers a toggle even if it never misses and never reaches any other
+// sync point. ejit_icache_sync() remains available but is no longer required
+// for correctness.
 //
 // Lifetime safety: JIT code is never physically freed in production (NO_RECLAIM
 // + no releaseFn_ wired), so a cached pointer can never dangle. v2 does NO
@@ -124,6 +128,70 @@ enum class EJitWorkerStep : uint32_t {
 #ifndef EJIT_ICACHE_MAX_DIMS
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif
+// Capacity of the ONE core-private log of (slot, cell) pairs filled since the
+// last drain, which lets the drain clear exactly those cells instead of walking
+// all EJIT_ICACHE_FUNC_SLOTS entries. Beyond this the drain falls back to that
+// walk, whole-array clearing every touched slot.
+//
+// The log is global, NOT per slot: a per-slot list is reserved for all
+// EJIT_ICACHE_FUNC_SLOTS (4096) entries however few a core calls, so 16 entries
+// would cost 64B x 4096 = 256KB of core-private BSS, while the same 16 entries
+// cost 128 bytes once here. That is what makes a generous cap affordable.
+//
+// Size it above the number of distinct (entry, dim identity) pairs one core
+// resolves between two period toggles -- roughly the count of ejit_entry
+// functions it calls, since the usual shape is one identity per core. 1024
+// covers the ~435-entry field image with headroom, for 8KB.
+#ifndef EJIT_ICACHE_DRAIN_LIST
+#define EJIT_ICACHE_DRAIN_LIST 1024u
+#endif
+
+//===----------------------------------------------------------------------===//
+// Probe-visible epoch reference: core-private storage, shared target.
+//
+// The probe compares `seen` against `*shared` on every call. Cells are
+// core-private .bss, so a toggling core cannot reach a peer's table -- it can
+// only publish. Having the READER consult shared memory inverts that, so a core
+// that always hits still observes the toggle without cooperating.
+//
+// `shared` is bound by the first icacheSyncEpoch() on this core, and is null
+// before that. The probe checks the cell FIRST: a non-null cell implies a fill,
+// every fill is preceded by a sync on the same core, so `shared` is bound by
+// then -- which is why the probe needs no null check on it.
+//
+// Both loads are plain: a stale read costs at most one more call into the
+// previous specialization, the same window a racing drain already has.
+//===----------------------------------------------------------------------===//
+struct EJitIcacheEpochRef {
+  /// Epoch this core last drained at. 64-bit purely so it pairs with `shared`
+  /// in one ldp -- the value itself is the 32-bit icacheEpoch.
+  uint64_t seen;
+  const uint32_t *shared; ///< -> blob icacheEpoch; null until the pool binds
+};
+
+/// Bind the probe's epoch window. \p window is the address of the AOT-emitted
+/// @__ejit_icache_epoch, handed over at registration (name2 of the icache
+/// entry) exactly like a cell array base.
+///
+/// The runtime deliberately does NOT define that symbol. If it did, the probe's
+/// reference and the runtime's definition would have to be matched up by the
+/// linker, and any mismatch (visibility, GOT, a copy relocation) would leave
+/// them on different storage -- silently, because a zeroed window reads
+/// seen == *shared == 0, i.e. "always fresh", and every core keeps hitting a
+/// stale cell. Binding by address makes them the same bytes by construction.
+void ejitIcacheBindEpochWindow(void *window);
+
+/// Whether a probe window has been bound on this core.
+///
+/// The probe reads `shared` WITHOUT a null check, on the strength of "a non-null
+/// cell implies a fill, hence registration, hence a bound window". That holds
+/// because ejitIcacheRegisterSlot() binds the window it was handed before
+/// wiring the cell up, and declines any entry that brings none.
+bool ejitIcacheEpochWindowBound();
+
+/// The window currently bound on this core, or null. Diagnostic, and the way a
+/// caller can check that two registrations name the same merged window.
+void *ejitIcacheBoundWindow();
 
 // Test/diagnostic: clear every icache slot. The slot-pointer table is
 // process-static storage shared across pool instances, so tests clear it
@@ -135,10 +203,21 @@ void ejitIcacheClearAll();
 // them for a multi-version entry), and \p numDims is its dimensionality. The
 // runtime writes the frozen specialization pointer through the cell at
 // [i0][i1]... (linearized from dims) on a successful resolve (icacheFill); the
-// wrapper reads the cell directly. Called from ejit_register_icache_slot
+// wrapper reads the cell directly. Called from ejit_register_icache_entry
 // (name->funcIndex resolution) at ejit_auto_register / .ejit_period time.
-// No-op for an out-of-range funcIndex or null base.
-void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
+//
+// \p window and \p probeAbi are the ENTRY'S OWN evidence that its wrapper
+// carries the current probe contract. Per-entry, not a process-global
+// handshake: a global "is some window bound?" gate is satisfied by whichever TU
+// registered first, so in a mixed link a pre-epoch TU would register against a
+// newer TU's window and get cells its probe can never invalidate.
+//
+// Returns false (registering nothing) for an out-of-range funcIndex, a null
+// base, numDims above the cap, probeAbi != kEJitIcacheProbeAbi, a null window,
+// or a window disagreeing with one already bound. Declining is the safe
+// degradation: the cell stays null and the taskpool serves every call.
+bool ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims,
+                            void *window, uint32_t probeAbi);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
 /// Shows funcIndex, base pointer, numDims, and cell[0] (the scalar or
@@ -588,6 +667,27 @@ public:
                                    uint32_t inst2, uint32_t dim3,
                                    uint32_t inst3);
   void releaseRead(uint32_t bucketIndex);
+  /// Drive one end of a period-value mutation window for a lifecycle instance.
+  ///
+  /// Three things move here, on two different triggers.
+  ///
+  /// The shared `enabled` bit is the JIT compile gate and is CAS'd, so only the
+  /// first caller in each direction moves it.
+  ///
+  /// The two EPOCHS move on EVERY call. Period data is core-private while the
+  /// specialization is SHARED, so N cores each bracket their own writes over the
+  /// one shared bit; a caller that lost the CAS may still have rewritten its own
+  /// copy, and neither the L0 nor the inline cache stores a version, so an epoch
+  /// is the only thing that can drop what they cached.
+  ///
+  /// version[] moves ONLY on a real transition. Its consumer is runCompile's
+  /// checkpoints, which DISCARD a finished compile when it changes - so bumping
+  /// it for a call that changed nothing aborts in-flight compiles. Every core
+  /// activating the periods it shares is the normal startup shape, and a dropped
+  /// compile is never re-enqueued, so an unconditional bump there stalls the JIT
+  /// permanently.
+  ///
+  /// \returns whether the enabled BIT flipped. The epochs publish either way.
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
   /// Query the shared activation bit for a lifecycle instance — the read
   /// counterpart of setInstanceEnabled, and the single cross-core source of
@@ -599,10 +699,11 @@ public:
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
   // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
   // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
-  // acquire load + null-check + indirect call, NO ejit_icache_try call, NO
-  // per-call guards. icacheTry is retained for unit tests / diagnostics: on a
-  // hit it sets *outFn to the frozen specialization for the given dims (call
-  // with NO releaseRead) and returns true; on a miss returns false. It keeps
+  // plain load + null-check, the shared-epoch check, then the indirect call. NO
+  // ejit_icache_try call, NO per-call guards. icacheTry is retained for unit
+  // tests / diagnostics: on a hit it sets *outFn to the frozen specialization
+  // for the given dims (call with NO releaseRead) and returns true; on a miss
+  // returns false. It keeps
   // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
   // (the latter matters in non-shared test builds; the wrapper's inline probe is
   // only enabled under EJIT_SRE_SHARED_CODE_POINTERS, where the gate is
@@ -664,8 +765,26 @@ public:
   /// those bypass cachePublish() and setInstanceEnabled().
   void retireDispatchCache();
 
+  //
+  // Requires the caller to have run icacheSyncEpoch() before resolving fnPtr:
+  // the fill is DROPPED if the epoch moved since, because fnPtr may then be
+  // specialized for the pre-toggle period values.
   void icacheFill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
                   uint32_t numDims);
+
+  /// Bring THIS core's inline cache up to date with the shared icacheEpoch,
+  /// draining every cell if a period toggled since this core last synced.
+  /// Returns true if a drain occurred. Also drains when this core last synced
+  /// against a DIFFERENT blob, which the epoch alone cannot catch: a fresh blob
+  /// restarts from a low epoch a stale seen-epoch can match by coincidence.
+  ///
+  /// Draining is all-or-nothing: toggles are rare, so the refill is paid once
+  /// per toggle rather than adding a check to the hit path.
+  ///
+  /// Called from ejit_deactivate (the toggling core) and at compile_or_get
+  /// entry, before any bucket lock is taken - a drain must never run under a
+  /// read token.
+  bool icacheSyncEpoch();
 
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();

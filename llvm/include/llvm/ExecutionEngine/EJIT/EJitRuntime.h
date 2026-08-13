@@ -154,17 +154,34 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 // funcIndex global; a capacity failure is recorded so ejit_init can fail.
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
-// Register the wrapper's per-function inline-cache slot (@__ejit_icache_fn_<name>
-// global address) by name, with its dimensionality (number of ejit_dim params).
-// The runtime writes the frozen specialization pointer through the [D]^numDims
-// cell at [i0][i1]... on a successful resolve (icacheFill); the wrapper reads
-// the cell directly on the hit path (GEP + one atomic load + null-check +
-// indirect call, no ejit_icache_try call). Keys the slot by the SAME registry
-// funcIndex assigned by ejit_register_funcindex. Called by AOT auto-registration.
-// A null slot or capacity exhaustion is recorded; the base stays null and the
-// probe misses.
+// Register a per-function inline-cache slot with the evidence that its wrapper
+// carries the current probe contract: \p window is that object's
+// @__ejit_icache_epoch, \p probeAbi the version it was built against. Declined
+// on probeAbi != kEJitIcacheProbeAbi, a null/conflicting window, or numDims
+// above the cap; a declined slot leaves its cell null so every call resolves
+// through the taskpool.
 void ejit_register_icache_slot(const char *funcName, void *slot,
-                               uint32_t numDims);
+                               uint32_t numDims, void *window,
+                               uint32_t probeAbi);
+
+// Superseded by the window/probeAbi parameters above. No-op, kept so an object
+// built before that change still links.
+void ejit_register_icache_epoch(void *window, uint32_t probeAbi);
+
+// Bring the CALLING core's inline cache up to date, dropping every cached
+// specialization if a period toggled since this core last synced. Cheap when
+// nothing changed (one shared load); a no-op when the inline cache is not used.
+//
+// Cells are core-private, so ejit_deactivate only drains the core it runs on,
+// and the runtime syncs a core whenever it resolves through the taskpool. A core
+// whose cells are ALL warm reaches neither -- so the wrapper's probe compares
+// the shared epoch on every call and treats a mismatch as a miss, which routes
+// that core through the taskpool and drains it. Correctness therefore does NOT
+// depend on calling this.
+//
+// It remains useful to force the drain at a known point (tests, or to move the
+// one-off re-resolve cost off a latency-critical call) but it is optional.
+void ejit_icache_sync(void);
 
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name

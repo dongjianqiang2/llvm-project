@@ -347,28 +347,22 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
 }
 
 void ejit_register_icache_slot(const char *funcName, void *slot,
-                               uint32_t numDims) {
+                               uint32_t numDims, void *window,
+                               uint32_t probeAbi) {
   // Wire the wrapper's per-function @__ejit_icache_fn_<name> slot into the
   // runtime slot registry, keyed by the SAME registry funcIndex
-  // ejit_register_funcindex assigns by name. numDims is the [D]^numDims shape
-  // so icacheFill can linearize. The wrapper reads the cell directly on the
-  // icache hit path; icacheFill writes the frozen specialization pointer through
-  // it on resolve. Idempotent by name (resolveAssign is). A null slot or
-  // unresolvable name is recorded; the base stays null and the wrapper's probe
-  // cleanly misses -> taskpool fallback.
+  // ejit_register_funcindex assigns by name. \p window and \p probeAbi are this
+  // object's own evidence that its probe carries the shared-epoch check.
   if (!funcName || !slot) {
     EJIT_DIAG("register_icache_slot reject: name=%p slot=%p",
               (const void *)funcName, slot);
     return;
   }
-  EJIT_DIAG_VERBOSE("register_icache_slot name=%s numDims=%u", funcName, numDims);
 #ifdef EJIT_SRE_TASKPOOL
   if (gEJIT && gEJIT->registrationFrozen()) {
     EJitRegistrationStore::instance().recordError(
         EJIT_ERR_INVALID_PARAM, "icache slot registration after init is frozen",
         funcName);
-    EJIT_DIAG("register_icache_slot reject name=%s: registration frozen",
-              funcName);
     return;
   }
 #endif
@@ -377,14 +371,58 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
     EJitRegistrationStore::instance().recordError(
         EJIT_ERR_CACHE_FULL, "funcIndex capacity exhausted for icache slot",
         funcName);
-    EJIT_DIAG("register_icache_slot FAIL name=%s: funcIndex capacity exhausted",
-              funcName);
     return;
   }
-  ejitIcacheRegisterSlot(idx, slot, numDims);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!ejitIcacheRegisterSlot(idx, slot, numDims, window, probeAbi)) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_INVALID_PARAM,
+        "icache slot declined (probe ABI mismatch, missing/conflicting epoch "
+        "window, or numDims above the cap)",
+        funcName);
+    EJIT_DIAG("icache DISABLED for %s: probeAbi=%u (expected %u) window=%p "
+              "bound=%p numDims=%u -- rebuild this object with THIS clang",
+              funcName, probeAbi,
+              static_cast<unsigned>(kEJitIcacheProbeAbi), window,
+              ejitIcacheBoundWindow(), numDims);
+    return;
+  }
   EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
                     funcName, idx, numDims);
+#else
+  (void)slot;
+  (void)numDims;
+  (void)window;
+  (void)probeAbi;
+#endif
 }
+
+// Superseded: the window now travels with each slot. Kept as a no-op so an
+// object built before that change still links; it must NOT bind anything,
+// since a process-global window is what let a pre-epoch TU register.
+void ejit_register_icache_epoch(void *window, uint32_t probeAbi) {
+  (void)window;
+  (void)probeAbi;
+}
+
+
+namespace {
+// Drain THIS core's inline cache if a period toggled since it last synced.
+// Reached from the taskpool entry points, i.e. the miss path -- which is where
+// the probe sends a call once it sees the shared epoch move. No-op in a
+// non-shared build. Must run before any bucket lock is taken.
+inline void ejitIcacheSyncThisCore() {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr) {
+    if (sp->icacheSyncEpoch())
+      EJIT_DIAG("icache drained on core %u (period toggle)",
+                EJitCoreId::current());
+  }
+#endif
+}
+} // namespace
+
+void ejit_icache_sync(void) { ejitIcacheSyncThisCore(); }
 
 ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx) {
   if (!gEJIT) {
@@ -570,6 +608,9 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
     EJIT_DIAG("icacheFillOnSuccess SKIP func=%u: fnPtr is null", funcIndex);
     return;
   }
+  // Called with the caller's bucket read token held, so this must stay a single
+  // store. The epoch sync runs at compile_or_get entry instead, before any
+  // taskpool lock is taken; icacheFill itself drops a fill that a toggle raced.
   EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
   if (!sp) {
     EJIT_DIAG("icacheFillOnSuccess SKIP func=%u: no shared pool (gEJIT=%p)",
@@ -607,6 +648,7 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: no taskpool", funcIndex);
     return EJIT_ERR_NOT_ACTIVE;
   }
+  ejitIcacheSyncThisCore();
 
   if (numDims > 4) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: numDims=%u > 4",
@@ -709,6 +751,7 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
 
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, nullptr, 0, &l0Fn)) {
@@ -748,6 +791,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0))
     return EJIT_ERR_INVALID_PARAM;
 
@@ -797,6 +841,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0) ||
       !ejitTaskpoolDimInRange(dim1, inst1))
     return EJIT_ERR_INVALID_PARAM;
@@ -844,6 +889,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0) ||
       !ejitTaskpoolDimInRange(dim1, inst1) ||
       !ejitTaskpoolDimInRange(dim2, inst2))
@@ -894,6 +940,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0) ||
       !ejitTaskpoolDimInRange(dim1, inst1) ||
       !ejitTaskpoolDimInRange(dim2, inst2) ||

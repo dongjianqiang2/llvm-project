@@ -215,14 +215,33 @@ EJit::EJit(const Config &config) : config_(config) {
                             e->name1 ? e->name1 : "");
             break;
           }
+          // Each entry carries its own probe contract: numDims in the low 32
+          // bits of size, the probe version in the high 32, the epoch window in
+          // name2. An object predating the stamp reports 0 and is declined.
           uint32_t numDims = static_cast<uint32_t>(e->size);
+          uint32_t probeAbi = static_cast<uint32_t>(e->size >> 32);
           uint32_t idx = EJitFuncRegistry::instance().resolveAssign(e->name1);
-          if (idx != kEJitInvalidFuncIndex)
-            ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr), numDims);
-          else
+          if (idx == kEJitInvalidFuncIndex) {
             recordInitError(EJIT_ERR_CACHE_FULL,
                             "funcIndex capacity exhausted for icache slot",
                             e->name1);
+            break;
+          }
+          if (!ejitIcacheRegisterSlot(
+                  idx, const_cast<void *>(e->ptr), numDims,
+                  const_cast<void *>(static_cast<const void *>(e->name2)),
+                  probeAbi)) {
+            // Declined: the cell stays null, every call to this function
+            // resolves through the taskpool. Correct, just without the fast
+            // path -- and far better than a probe that cannot observe a period
+            // toggle running quietly wrong forever.
+            EJIT_DIAG("icache DISABLED for %s: probeAbi=%u (expected %u) "
+                      "window=%p numDims=%u -- rebuild this object with THIS "
+                      "clang; the runtime alone is not enough",
+                      e->name1, probeAbi,
+                      static_cast<unsigned>(kEJitIcacheProbeAbi),
+                      static_cast<const void *>(e->name2), numDims);
+          }
           break;
         }
         default:

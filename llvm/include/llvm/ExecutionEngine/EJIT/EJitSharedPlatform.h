@@ -71,7 +71,21 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// the optional EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock reader.
 /// v7: full IR/ASM payloads are worker-local again; shared dump state contains
 /// only a bounded filter and latest-capture metadata. publishSeq is unchanged.
-constexpr uint32_t kEJitSharedAbiVersion = 7u;
+/// v8: the SwitchController line gains icacheEpoch, bumped on every
+/// setInstanceEnabled CALL so each core can drain its per-core inline cache
+/// after an activate/deactivate — including one issued by a core that lost the
+/// CAS on the shared enabled bit but still rewrote its own period values.
+constexpr uint32_t kEJitSharedAbiVersion = 8u;
+
+/// Contract version between the AOT-emitted inline-cache probe and the runtime,
+/// carried by every icache registration.
+///   1 = cell load + null check only; a core that only ever hits never
+///       invalidates.
+///   2 = adds the shared-epoch freshness check (see EJitIcacheEpochRef).
+/// The runtime requires EQUALITY: the number moves when the probe's obligations
+/// change, so a higher one means obligations this runtime does not implement.
+/// An object built before the stamp existed reports 0.
+constexpr uint32_t kEJitIcacheProbeAbi = 2;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

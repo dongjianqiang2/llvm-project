@@ -15,6 +15,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMMON_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h" // kEJitIcacheProbeAbi
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -81,13 +82,18 @@ constexpr const char *FN_REGISTER_PERIOD_ARRAY = "ejit_register_period_array";
 constexpr const char *FN_REGISTER_STATIC_VAR = "ejit_register_static_var";
 constexpr const char *FN_REGISTER_LIFECYCLE = "ejit_register_lifecycle";
 constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
-// Per-function inline-cache slot registration: the wrapper's per-function
-// @__ejit_icache_fn_<name> global (a frozen, sticky specialization pointer) is
-// registered by name so the runtime can backfill it on a successful resolve
-// (icacheFill). The wrapper reads it directly with an inline atomic load - no
-// ejit_icache_try call - so the hit path is one load + null-check + indirect
-// call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
+// Per-function inline-cache slot registration. Carries the cell array base,
+// its dimensionality, and the epoch window + probe ABI of the object it came
+// from, so a mixed link cannot let a pre-epoch TU register against a newer TU's
+// window. Signature:
+//   void ejit_register_icache_slot(const char *name, void *slot,
+//                                  uint32_t numDims, void *window,
+//                                  uint32_t probeAbi).
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
+
+// kEJitIcacheProbeAbi lives in EJitSharedPlatform.h so the runtime, the AOT
+// pass and the standalone taskpool tests share one definition. The static
+// registry stamps it into the high 32 bits of `size` (low 32 = numDims).
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper

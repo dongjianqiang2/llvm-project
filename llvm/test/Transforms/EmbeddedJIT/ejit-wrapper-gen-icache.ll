@@ -21,6 +21,7 @@
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-wrapper-timing -S %s | FileCheck %s --check-prefix=TIMING
 
 ; --- icache globals: [D]^numDims, D=8 (EJIT_ICACHE_DIM_SIZE). 0D is scalar. ---
+; ICACHE-DAG: @__ejit_icache_epoch = linkonce_odr hidden global { i64, ptr }
 ; ICACHE-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr null, align 8
 ; ICACHE-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, align 8
 ; ICACHE-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, align 8
@@ -68,14 +69,30 @@
 ; OPT-SAME: #[[MISS_ATTRS]]
 ; OPT-DAG: attributes #[[MISS_ATTRS]] = { cold noinline }
 
-; --- registration carries numDims (3rd arg): 0 / 1 / 2 (DAG: order-independent). ---
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 0)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 2)
+; --- Epoch freshness: the probe compares this core's seen epoch against the
+; --- SHARED one on every call, so a core that only ever hits still observes a
+; --- period toggle performed by a core that cannot reach its cells. Checked
+; --- after the cell null test, so the shared pointer is known bound. ---
+; ICACHE: jit_icache_epoch:
+; ICACHE: %ejit_ic_seen = load i64, ptr @__ejit_icache_epoch
+; ICACHE: %ejit_ic_shared_p = load ptr, ptr getelementptr {{.*}} @__ejit_icache_epoch, i32 0, i32 1
+; The shared word is written by peers with an atomic RMW, so the probe reads it
+; atomically. monotonic lowers to the same LDR as a plain load on AArch64.
+; ICACHE: %ejit_ic_epoch = load atomic i32, ptr %ejit_ic_shared_p monotonic
+; ICACHE: %ejit_icache_fresh = icmp eq
+; ICACHE: br i1 {{.*}}, label %jit_icache_dispatch, label %jit_miss
+
+; --- registration carries numDims (3rd arg): 0 / 1 / 2, and each entry carries
+; --- its OWN window + probe ABI so a mixed link cannot let a pre-epoch TU
+; --- register against a newer TU's window (DAG: order-independent). ---
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 0, ptr @__ejit_icache_epoch, i32 2)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1, ptr @__ejit_icache_epoch, i32 2)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 2, ptr @__ejit_icache_epoch, i32 2)
 
 ; --- Default (flag OFF): no icache anywhere; original compile_or_get path. ---
 ; NOICACHE-LABEL: define i32 @one_dim_entry(
 ; NOICACHE-NOT: __ejit_icache_fn
+; NOICACHE-NOT: __ejit_icache_epoch
 ; NOICACHE-NOT: ejit_register_icache_slot
 ; NOICACHE: call i32 @ejit_taskpool_compile_or_get_1d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
 

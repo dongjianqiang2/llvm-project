@@ -343,6 +343,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
+  EJitAtomicU32 icacheEpoch; ///< inline-cache invalidation counter. Bumped by
+                             ///< every setInstanceEnabled CALL, not only the
+                             ///< one that moves the bit: only the first of N
+                             ///< cores wins the CAS, so the rest would go
+                             ///< unannounced. Each core compares it against its
+                             ///< private seen-epoch and drains its whole table
+                             ///< when they diverge. Bumped, never reset.
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.
