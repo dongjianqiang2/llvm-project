@@ -33,6 +33,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
+#include <algorithm>
 #include <cstdint>
 
 namespace llvm {
@@ -64,8 +65,8 @@ struct EJitSharedDiagnostics {
   uint64_t instanceDisabled;
   uint64_t instanceDisabledPreActivate; ///< instanceDisabled before first activate.
   uint64_t executePrepareFailed;
-  uint32_t pgoActiveFunc;
-  uint32_t pgoProgressPercent;
+  uint32_t pgoActiveFunctionCount;
+  uint32_t pgoMaxActiveFunctions;
   uint64_t pgoCompletedFunctions;
   uint64_t pgoDeferredMisses;
   uint64_t tier1Compiles;
@@ -305,9 +306,14 @@ public:
   /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
   /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
   /// the trigger (hits are still counted).
-  void setPgoEnabled(bool enable, uint32_t threshold) {
+  void setPgoEnabled(bool enable, uint32_t threshold,
+                     uint32_t maxConcurrentProfiles = 1) {
+    maxConcurrentProfiles =
+        std::max(1u, std::min(maxConcurrentProfiles,
+                              kEJitSharedMaxConcurrentProfiles));
     pgoEnabled_.storeRelaxed(enable ? 1 : 0);
     tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
+    pgoMaxConcurrentProfiles_.storeRelaxed(maxConcurrentProfiles);
     if (!state_ ||
         state_->initState.loadAcquire() !=
             static_cast<uint32_t>(EJitSharedInitState::Ready))
@@ -318,6 +324,7 @@ public:
     // turning PGO off so no new hit can arm a Tier-2 request.
     if (enable) {
       state_->tier2Threshold.storeRelease(threshold);
+      state_->pgoMaxActiveFunctions.storeRelease(maxConcurrentProfiles);
       state_->pgoEnabled.storeRelease(1);
     } else {
       state_->pgoEnabled.storeRelease(0);
@@ -334,9 +341,7 @@ public:
     return pgoEnabled_.loadRelaxed() != 0;
   }
 
-  /// Return true when this miss may start/continue the single staged PGO
-  /// function. A different function remains on its AOT fallback until the
-  /// active function publishes Tier-2 or terminates with an error.
+  /// Return true when this miss may start/continue a staged PGO function.
   bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
@@ -676,6 +681,7 @@ private:
   // and state_->tier2Threshold are the cross-core source of truth.
   EJitAtomicU8 pgoEnabled_{0};
   EJitAtomicU32 tier2Threshold_{0};
+  EJitAtomicU32 pgoMaxConcurrentProfiles_{1};
   // PGO (§6): Tier-2 requests are NOT held in a facade-local bypass. A hit that
   // crosses the threshold (on ANY producer core / facade) submits a fully
   // value-initialized EJitCompileRequest through the shared MPSC queue, so the

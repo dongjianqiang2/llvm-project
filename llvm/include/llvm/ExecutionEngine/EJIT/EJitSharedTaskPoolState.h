@@ -95,6 +95,7 @@ constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
+constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
 constexpr uint32_t kEJitSharedDumpNameBytes =
     EJIT_SRE_SHARED_DUMP_NAME_BYTES;
 constexpr uint32_t kEJitSharedDumpSlotCount =
@@ -365,11 +366,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
   EJitAtomicU32 pgoEnabled; ///< 1 => shared online-PGO trigger is enabled
   EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
-  /// Staged PGO admission. 0 means idle; otherwise funcIndex + 1 identifies
-  /// the only function currently allowed to compile/run instrumented Tier-1.
-  EJitAtomicU32 pgoActiveFunc;
-  /// Last logged progress quarter for the active function: 0..4.
-  EJitAtomicU32 pgoProgressQuarter;
+  /// Staged PGO admission. Entries are funcIndex + 1; zero means free.
+  EJitAtomicU32 pgoAdmissionLock;
+  EJitAtomicU32 pgoMaxActiveFunctions;
+  EJitAtomicU32 pgoActiveFunctionCount;
+  EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
+  /// Last logged progress quarter for each admission slot: 0..4.
+  EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
   EJitAtomicU64 pgoCompletedFunctions;
   EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first

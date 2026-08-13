@@ -81,7 +81,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v9: online-PGO Tier-1 admission is serialized across functions. The shared
 /// blob records the active function, progress milestone, completed-function
 /// count, and deferred misses.
-constexpr uint32_t kEJitSharedAbiVersion = 9u;
+/// v10: staged PGO admission has a configurable fixed-capacity slot table, so
+/// several functions may profile concurrently with independent progress.
+constexpr uint32_t kEJitSharedAbiVersion = 10u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

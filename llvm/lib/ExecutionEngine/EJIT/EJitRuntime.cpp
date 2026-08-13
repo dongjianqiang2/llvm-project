@@ -155,7 +155,8 @@ static_assert(std::is_standard_layout<ejit_config_t>::value,
 
 // Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
 // the online-PGO auto-trigger on regardless of the (unversioned) config.
-static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
+static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
+                                  uint32_t maxConcurrentProfiles = 1) {
   if (gEJIT) {
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
@@ -163,8 +164,10 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 
   Config cfg;
   parseConfig(config, cfg);
-  if (forcePgo)
+  if (forcePgo) {
     cfg.enablePgo = true;
+    cfg.pgoMaxConcurrentProfiles = maxConcurrentProfiles;
+  }
 
   gEJIT = new (std::nothrow) EJit(cfg);
   if (!gEJIT) {
@@ -189,9 +192,11 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   bindDumpSharedStateFromRuntime();
 #endif
-  EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u pgo=%d",
+  EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u pgo=%d "
+            "pgo_concurrency=%u",
             (int)cfg.compileMode, (int)cfg.optLevel, cfg.maxCacheSize,
-            (unsigned)cfg.maxCacheEntries, (int)cfg.enablePgo);
+            (unsigned)cfg.maxCacheEntries, (int)cfg.enablePgo,
+            cfg.pgoMaxConcurrentProfiles);
   return EJIT_OK;
 }
 
@@ -203,6 +208,16 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
 
 ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
   return ejitInitImpl(config, /*forcePgo=*/true);
+}
+
+ejit_status_t ejit_init_pgo_with_options(const ejit_config_t *config,
+                                         const ejit_pgo_options_t *options) {
+  if (!options || options->structSize < sizeof(ejit_pgo_options_t))
+    return EJIT_ERR_INVALID_PARAM;
+  uint32_t maxConcurrent = options->maxConcurrentProfiles;
+  if (maxConcurrent == 0)
+    maxConcurrent = 1;
+  return ejitInitImpl(config, /*forcePgo=*/true, maxConcurrent);
 }
 
 void ejit_shutdown(void) {

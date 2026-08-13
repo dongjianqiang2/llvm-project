@@ -104,6 +104,13 @@ typedef struct {
   const char *dumpJITDir;
 } ejit_config_t;
 
+/// Versioned options for ejit_init_pgo_with_options(). Callers must set
+/// structSize to sizeof(ejit_pgo_options_t). Zero-valued fields use defaults.
+typedef struct {
+  uint32_t structSize;
+  uint32_t maxConcurrentProfiles;
+} ejit_pgo_options_t;
+
 typedef struct {
   size_t entryCount;
   size_t totalCodeSize;
@@ -144,6 +151,10 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
+/// Initialize online PGO with explicit staging controls. The legacy
+/// ejit_init_pgo() entry point is equivalent to maxConcurrentProfiles=1.
+ejit_status_t ejit_init_pgo_with_options(const ejit_config_t *config,
+                                         const ejit_pgo_options_t *options);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)

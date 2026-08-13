@@ -1599,7 +1599,7 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
 // table is POD, dump slots use dynamic payload pointers, and each bucket
 // carries the NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 9u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 10u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -2695,11 +2695,13 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
   bringUpOwner(pool);
   EJitCoreId::setCurrentForTest(0);
   pool.setPgoEnabled(true, 2);
+  EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 1u);
 
   // The first miss owns staged profiling and is explicitly queued as Tier-1.
   ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
             EJitCompileOrGetStatus::EnqueuedPending);
-  EXPECT_EQ(state_->pgoActiveFunc.loadAcquire(), 6u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 6u);
   EXPECT_EQ(state_->enqueuePos.loadRelaxed() -
                 state_->dequeuePos.loadRelaxed(),
             1u);
@@ -2726,17 +2728,51 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
     if (hit.hasReadToken)
       pool.releaseRead(hit.bucketIndex);
   }
-  EXPECT_EQ(state_->pgoProgressQuarter.loadAcquire(), 4u);
+  EXPECT_EQ(state_->pgoProgressQuarters[0].loadAcquire(), 4u);
   EXPECT_EQ(pool.pendingCount(), 1u);
 
   // Tier-2 completion releases admission. The next called function can then
   // begin its own Tier-1; there is never more than one instrumented function.
   ASSERT_TRUE(pool.pollOne());
-  EXPECT_EQ(state_->pgoActiveFunc.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
   EXPECT_EQ(state_->pgoCompletedFunctions.loadRelaxed(), 1u);
   ASSERT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
             EJitCompileOrGetStatus::EnqueuedPending);
-  EXPECT_EQ(state_->pgoActiveFunc.loadAcquire(), 7u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 7u);
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoHonorsConcurrentProfileLimit) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2, 2);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
+  EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 2u);
+
+  auto deferred = pool.compileOrGet(7, nullptr, 0, codeFor(7));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.fnPtr, codeFor(7));
+  ASSERT_TRUE(pool.pollOne());
+  ASSERT_TRUE(pool.pollOne());
+
+  for (unsigned i = 0; i < 2; ++i) {
+    auto hit = pool.compileOrGet(5, nullptr, 0, codeFor(5));
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      pool.releaseRead(hit.bucketIndex);
+  }
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+
+  ASSERT_EQ(pool.compileOrGet(7, nullptr, 0, codeFor(7)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
 }
 
 // Shared version bump test (§7.2 / §4): a Tier-2 request that was queued when
@@ -3371,7 +3407,7 @@ TEST_F(SharedTaskPoolTest, Tier2DedupClearStripsTierBits) {
   ASSERT_TRUE(pool.pollOne()); // Tier-2 compile fails
   EXPECT_EQ(state_->inFlight[9].loadRelaxed(), 0u)
       << "failed Tier-2 compile must clear the in-flight bit";
-  EXPECT_EQ(state_->pgoActiveFunc.loadAcquire(), 10u)
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u)
       << "valid Tier-1 remains instrumented, so staged admission must stay "
          "with this function for a later Tier-2 retry";
 }

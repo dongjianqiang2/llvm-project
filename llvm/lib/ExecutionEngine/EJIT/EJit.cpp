@@ -293,7 +293,9 @@ EJit::EJit(const Config &config) : config_(config) {
         if (config_.enablePgo) {
           constexpr uint32_t kDefaultPgoThreshold = 64;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-          compileDriver_->sharedTaskPool()->setPgoEnabled(true, kDefaultPgoThreshold);
+          compileDriver_->sharedTaskPool()->setPgoEnabled(
+              true, kDefaultPgoThreshold,
+              config_.pgoMaxConcurrentProfiles);
 #else
           compileDriver_->taskPool()->setPgoEnabled(true, kDefaultPgoThreshold);
 #endif

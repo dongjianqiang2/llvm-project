@@ -617,18 +617,28 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     if (slotTier < kEJitTierPgoUse) {
       uint64_t prev = Slot.hitCount.fetchAdd(1);
       uint32_t threshold = state_->tier2Threshold.loadAcquire();
-      if (slotTier == kEJitTierInstrumented && threshold &&
-          state_->pgoActiveFunc.loadAcquire() == Slot.funcIndex + 1) {
+      uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
+      if (slotTier == kEJitTierInstrumented && threshold) {
+        const uint32_t encoded = Slot.funcIndex + 1;
+        for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+          if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
+            admissionSlot = i;
+            break;
+          }
+        }
+      }
+      if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
         uint32_t quarter = static_cast<uint32_t>(
             std::min<uint64_t>(4, ((prev + 1) * 4) / threshold));
-        uint32_t oldQuarter = state_->pgoProgressQuarter.loadRelaxed();
+        uint32_t oldQuarter =
+            state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
         while (quarter > oldQuarter &&
-               !state_->pgoProgressQuarter.compareExchange(oldQuarter,
-                                                            quarter)) {
+               !state_->pgoProgressQuarters[admissionSlot].compareExchange(
+                   oldQuarter, quarter)) {
         }
         if (quarter > oldQuarter)
-          EJIT_DIAG("PGO profile progress func=%u: %u%% (%llu/%u hits)",
-                    Slot.funcIndex, quarter * 25,
+          EJIT_DIAG("PGO profile progress func=%u: %llu/%u",
+                    Slot.funcIndex,
                     static_cast<unsigned long long>(prev + 1), threshold);
       }
       // >= (not ==): if the enqueue fails (queue full / already pending),
@@ -735,39 +745,62 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
                                           bool &newlyAdmitted) {
   newlyAdmitted = false;
   const uint32_t encoded = funcIndex + 1;
-  uint32_t active = state_->pgoActiveFunc.loadAcquire();
-  if (active == encoded)
-    return true;
-  if (active != 0) {
-    state_->pgoDeferredMisses.fetchAdd(1);
-    return false;
-  }
-
   uint32_t expected = 0;
-  if (!state_->pgoActiveFunc.compareExchange(expected, encoded)) {
-    if (expected == encoded)
+  while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
+    expected = 0;
+
+  uint32_t freeSlot = kEJitSharedMaxConcurrentProfiles;
+  for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+    uint32_t active = state_->pgoActiveFunctions[i].loadRelaxed();
+    if (active == encoded) {
+      state_->pgoAdmissionLock.storeRelease(0);
       return true;
+    }
+    if (active == 0 && freeSlot == kEJitSharedMaxConcurrentProfiles)
+      freeSlot = i;
+  }
+
+  uint32_t activeCount = state_->pgoActiveFunctionCount.loadRelaxed();
+  uint32_t maxActive = state_->pgoMaxActiveFunctions.loadRelaxed();
+  if (activeCount >= maxActive ||
+      freeSlot == kEJitSharedMaxConcurrentProfiles) {
+    state_->pgoAdmissionLock.storeRelease(0);
     state_->pgoDeferredMisses.fetchAdd(1);
     return false;
   }
 
+  state_->pgoProgressQuarters[freeSlot].storeRelaxed(0);
+  state_->pgoActiveFunctions[freeSlot].storeRelease(encoded);
+  state_->pgoActiveFunctionCount.storeRelease(activeCount + 1);
+  state_->pgoAdmissionLock.storeRelease(0);
   newlyAdmitted = true;
-  state_->pgoProgressQuarter.storeRelease(0);
-  EJIT_DIAG("PGO profile start func=%u: 0%% (other functions stay on AOT)",
-            funcIndex);
+  EJIT_DIAG("PGO profile start func=%u: 0/%u (active=%u/%u)", funcIndex,
+            state_->tier2Threshold.loadRelaxed(), activeCount + 1, maxActive);
   return true;
 }
 
 void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex,
                                            bool completed) {
-  uint32_t expected = funcIndex + 1;
-  if (state_->pgoActiveFunc.loadAcquire() != expected)
+  const uint32_t encoded = funcIndex + 1;
+  uint32_t expected = 0;
+  while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
+    expected = 0;
+
+  uint32_t slot = kEJitSharedMaxConcurrentProfiles;
+  for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i)
+    if (state_->pgoActiveFunctions[i].loadRelaxed() == encoded) {
+      slot = i;
+      break;
+    }
+  if (slot == kEJitSharedMaxConcurrentProfiles) {
+    state_->pgoAdmissionLock.storeRelease(0);
     return;
-  // Reset progress while ownership is still held. Releasing active first would
-  // let the next function advance and then have its progress overwritten here.
-  state_->pgoProgressQuarter.storeRelease(0);
-  if (!state_->pgoActiveFunc.compareExchange(expected, 0))
-    return;
+  }
+  state_->pgoProgressQuarters[slot].storeRelaxed(0);
+  state_->pgoActiveFunctions[slot].storeRelease(0);
+  uint32_t activeCount = state_->pgoActiveFunctionCount.loadRelaxed();
+  state_->pgoActiveFunctionCount.storeRelease(activeCount - 1);
+  state_->pgoAdmissionLock.storeRelease(0);
   if (completed) {
     uint64_t done = state_->pgoCompletedFunctions.fetchAdd(1) + 1;
     EJIT_DIAG("PGO profile complete func=%u: completed=%llu deferred=%llu",
@@ -1381,7 +1414,8 @@ namespace {
 // the non-shared EJitRuntimeState::isActive default (no entry => inactive).
 // setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
 void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
-                       uint32_t pgoEnabled, uint32_t tier2Threshold) {
+                       uint32_t pgoEnabled, uint32_t tier2Threshold,
+                       uint32_t pgoMaxConcurrentProfiles) {
   bool canFreeDumpPayload =
       st->magic == kEJitSharedAbiMagic &&
       st->abiVersion == kEJitSharedAbiVersion &&
@@ -1394,8 +1428,13 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->mode.storeRelaxed(mode);
   st->tier2Threshold.storeRelaxed(pgoEnabled ? tier2Threshold : 0);
   st->pgoEnabled.storeRelaxed(pgoEnabled ? 1 : 0);
-  st->pgoActiveFunc.storeRelaxed(0);
-  st->pgoProgressQuarter.storeRelaxed(0);
+  st->pgoAdmissionLock.storeRelaxed(0);
+  st->pgoMaxActiveFunctions.storeRelaxed(pgoMaxConcurrentProfiles);
+  st->pgoActiveFunctionCount.storeRelaxed(0);
+  for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+    st->pgoActiveFunctions[i].storeRelaxed(0);
+    st->pgoProgressQuarters[i].storeRelaxed(0);
+  }
   st->pgoCompletedFunctions.storeRelaxed(0);
   st->pgoDeferredMisses.storeRelaxed(0);
   st->anyInstanceActivated.storeRelaxed(0);
@@ -1529,7 +1568,8 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
       initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
                         pgoEnabled_.loadRelaxed(),
-                        tier2Threshold_.loadRelaxed());
+                        tier2Threshold_.loadRelaxed(),
+                        pgoMaxConcurrentProfiles_.loadRelaxed());
       state_->generation.storeRelease(nextGen);
       state_->ownerCoreId.storeRelease(self);
       state_->codeSharingEnabled.storeRelease(codeSharingEnabled_ ? 1u : 0u);
@@ -1998,8 +2038,8 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   bool newlyAdmitted = false;
   if (state_->pgoEnabled.loadAcquire() &&
       !admitPgoFunction(funcIndex, newlyAdmitted)) {
-    // Another function is collecting a profile. Keep this miss on the AOT
-    // fallback and do not add work to the compiler queue.
+    // All profiling slots are occupied. Keep this miss on the AOT fallback
+    // and do not add work to the compiler queue.
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
   }
@@ -2095,8 +2135,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
       finishPgoFunction(realFuncIndex, /*completed=*/false);
     } else if (tier == kEJitTierPgoUse) {
       // Tier-1 is still published and instrumented. Retain admission so a
-      // later hit retries Tier-2 instead of allowing a second instrumented
-      // function to start concurrently.
+      // later hit retries Tier-2 instead of freeing this admission slot while
+      // its instrumented Tier-1 code remains live.
       EJIT_DIAG("PGO Tier-2 failed func=%u; profile remains active for retry",
                 realFuncIndex);
     }
@@ -2337,10 +2377,9 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
       state_->counters.instanceDisabledPreActivate.loadRelaxed();
   out.executePrepareFailed =
       state_->counters.executePrepareFailed.loadRelaxed();
-  uint32_t active = state_->pgoActiveFunc.loadAcquire();
-  out.pgoActiveFunc = active ? active - 1 : kEJitSharedMaxFuncIndex;
-  out.pgoProgressPercent =
-      state_->pgoProgressQuarter.loadAcquire() * 25;
+  out.pgoActiveFunctionCount =
+      state_->pgoActiveFunctionCount.loadAcquire();
+  out.pgoMaxActiveFunctions = state_->pgoMaxActiveFunctions.loadAcquire();
   out.pgoCompletedFunctions =
       state_->pgoCompletedFunctions.loadRelaxed();
   out.pgoDeferredMisses = state_->pgoDeferredMisses.loadRelaxed();
