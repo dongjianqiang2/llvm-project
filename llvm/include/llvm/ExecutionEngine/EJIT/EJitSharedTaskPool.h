@@ -307,7 +307,8 @@ public:
   /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
   /// the trigger (hits are still counted).
   void setPgoEnabled(bool enable, uint32_t threshold,
-                     uint32_t maxConcurrentProfiles = 1) {
+                     uint32_t maxConcurrentProfiles =
+                         EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
     maxConcurrentProfiles =
         std::max(1u, std::min(maxConcurrentProfiles,
                               kEJitSharedMaxConcurrentProfiles));

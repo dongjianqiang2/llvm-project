@@ -31,7 +31,7 @@
 >
 > **v0.14 变更**:真实闭包 MBP 校准通过。ejit_complex_test.c 的真实 `process_multi_dim`(87 insts):12 个 `!prof` 经 runPipeline 存活到 codegen,MBP 消费后**真实 asm 与 Baseline 不同**--分支条件交换、块重排(热路径 fall-through)、分支方向反转(`b.ne`->`b.eq`)、冷块外提。**PGO 保底收益在真实 EJIT 闭包上验证成立**。PGO go/no-go:hinge on MBP 收益(已证真实闭包有效)是否 justify +640KB + 插桩 + 重编译开销。
 
-> **v0.16 变更**:共享 taskpool 的 PGO admission 并发数可通过 `ejit_init_pgo_with_options()` 控制，默认 1、上限 16。未获准函数不排编译任务，继续执行 AOT fallback；每个 admission slot 独立记录进度，并按 `current/total`（例如 `16/64`）输出里程碑。Tier-2 成功发布后释放对应名额；Tier-2 暂时失败时保留该名额和 Tier-1。共享 ABI 升至 v10。
+> **v0.16 变更**:共享 taskpool 的 PGO admission 并发数由构建宏 `EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES` 控制，默认 1，合法范围 1..16。未获准函数不排编译任务，继续执行 AOT fallback；每个 admission slot 独立记录进度，并按 `current/total`（例如 `16/64`）输出里程碑。Tier-2 成功发布后释放对应名额；Tier-2 暂时失败时保留该名额和 Tier-1。共享 ABI 升至 v10。
 
 ---
 

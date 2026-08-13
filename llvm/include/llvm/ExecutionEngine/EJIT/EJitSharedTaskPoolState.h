@@ -57,6 +57,9 @@
 #ifndef EJIT_SRE_TASKPOOL_QUEUE_CAPACITY
 #define EJIT_SRE_TASKPOOL_QUEUE_CAPACITY 1024u
 #endif
+#ifndef EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES
+#define EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES 1u
+#endif
 // Fixed slots per cache bucket. The shared cache is a fixed-capacity POD table
 // (no std::unordered_map can live in shared memory), so each bucket holds a
 // fixed array of slots. A bucket that fills evicts its oldest-generation slot.
@@ -96,6 +99,10 @@ constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
 constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
+static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
+                  EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES <=
+                      kEJitSharedMaxConcurrentProfiles,
+              "EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES must be in [1, 16]");
 constexpr uint32_t kEJitSharedDumpNameBytes =
     EJIT_SRE_SHARED_DUMP_NAME_BYTES;
 constexpr uint32_t kEJitSharedDumpSlotCount =

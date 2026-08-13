@@ -46,9 +46,6 @@ struct Config {
   /// (~640 KB stripped runtime, P0-1) is incurred whenever the PGO component
   /// libs are linked, regardless of this flag; this flag only gates behavior.
   bool enablePgo = false;
-  /// Maximum number of functions allowed to run instrumented Tier-1 code at
-  /// once. Shared-taskpool builds clamp this to their fixed admission capacity.
-  uint32_t pgoMaxConcurrentProfiles = 1;
 };
 
 } // namespace ejit

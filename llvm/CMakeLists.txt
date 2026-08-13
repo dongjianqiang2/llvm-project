@@ -683,6 +683,8 @@ set(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY "1024" CACHE STRING
 # Flat dedup table capacity = max dense funcIndex (spec §3.5 inFlight_[]).
 set(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX "4096" CACHE STRING
   "EmbeddedJIT SRE taskpool flat dedup capacity (max dense funcIndex)")
+set(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES "1" CACHE STRING
+  "EmbeddedJIT concurrent functions collecting online PGO profiles (1-16)")
 # Single source of truth for the worker task stack size (bytes). The worker —
 # shared OR per-instance — runs LLVM optimize/codegen/ORC/JITLink on its OWN
 # stack via EJitSreTask, so this drives the platform SRE_TaskCreate stack too
@@ -698,6 +700,7 @@ if(EJIT_SRE_TASKPOOL)
   add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
   add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
   add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
+  add_definitions(-DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})
@@ -705,6 +708,7 @@ if(EJIT_SRE_TASKPOOL)
                  "(buckets=${EJIT_SRE_TASKPOOL_BUCKETS}, "
                  "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
                  "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
+                 "pgoConcurrentProfiles=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}, "
                  "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
                  "throttleItems=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS}, "
                  "throttleDelayTicks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})")
