@@ -252,11 +252,48 @@ static bool getActiveDumpFilter(std::string &out) {
   return true;
 }
 
-/// Saved IR+ASM for a captured specialization (latest per function name).
+bool isDumpTarget(const char *name) {
+  if (!name || !name[0])
+    return false;
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gDumpSharedState) {
+    EJitSharedDumpState &D = gDumpSharedState->dump;
+    sharedDumpLock(D);
+    bool enabled = D.filterEnabled.loadAcquire() != 0;
+    bool wildcard = enabled && D.filterLen == 1 && D.filterName[0] == '*';
+    bool match = wildcard;
+    if (enabled && !wildcard) {
+      uint32_t i = 0;
+      while (i < D.filterLen && name[i] && name[i] == D.filterName[i])
+        ++i;
+      match = i == D.filterLen && name[i] == 0;
+    }
+    sharedDumpUnlock(D);
+    // Once shared state is bound it is authoritative. Falling back to a stale
+    // core-local filter after another core disables the shared filter could
+    // unexpectedly re-arm capture on the worker.
+    return enabled && match;
+  }
+#endif
+
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  if (gDumpFuncFilter.size() == 1 && gDumpFuncFilter[0] == '*')
+    return true;
+  size_t i = 0;
+  while (i < gDumpFuncFilter.size() && name[i] && name[i] == gDumpFuncFilter[i])
+    ++i;
+  return i == gDumpFuncFilter.size() && name[i] == 0;
+}
+
+/// Saved IR+ASM+post-link code for a captured specialization.
 struct DumpEntry {
   uint64_t cacheKey = 0;
   std::string IR;
   std::string ASM;
+  std::string Code;
+  uintptr_t codeStart = 0;
+  uintptr_t fnPtr = 0;
 };
 
 // Process-wide store of captured IR+ASM, filled by the IR transform layer
@@ -265,6 +302,76 @@ struct DumpEntry {
 // of the shared taskpool state; cross-core visibility depends on the worker
 // running in the same process image (addresses are logged to diagnose this).
 static std::map<std::string, DumpEntry> gDumpStore;
+
+void captureCodeDump(const std::string &fnName, const void *fnPtr,
+                     const void *codeStart, uint32_t size) {
+  if (!fnPtr || !codeStart || size == 0)
+    return;
+  uintptr_t start = reinterpret_cast<uintptr_t>(codeStart);
+  uintptr_t fn = reinterpret_cast<uintptr_t>(fnPtr);
+  if (fn < start || fn - start >= size) {
+    EJIT_DIAG("capture code rejected func=%s: fn=%p outside [%p,+%u)",
+              fnName.c_str(), fnPtr, codeStart, size);
+    return;
+  }
+
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  auto it = gDumpStore.find(fnName);
+  if (it == gDumpStore.end()) {
+    EJIT_DIAG("capture code skipped func=%s: no matching IR/ASM capture",
+              fnName.c_str());
+    return;
+  }
+  const auto *bytes = static_cast<const char *>(codeStart);
+  it->second.Code.assign(bytes, size);
+  it->second.codeStart = start;
+  it->second.fnPtr = fn;
+  EJIT_DIAG_DEBUG("capture code func=%s start=%p fn=%p offset=%u size=%u",
+                  fnName.c_str(), codeStart, fnPtr,
+                  static_cast<unsigned>(fn - start), size);
+}
+
+void printDumpedCode(const char *name) {
+  bool hasName = name && name[0];
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  if (!hasName) {
+    EJIT_DIAG("print_dumped_code: %u entries", (unsigned)gDumpStore.size());
+    for (const auto &kv : gDumpStore) {
+      (void)kv;
+      EJIT_DIAG("  %s: code=%u bytes", kv.first.c_str(),
+                (unsigned)kv.second.Code.size());
+    }
+    return;
+  }
+
+  auto it = gDumpStore.find(name);
+  if (it == gDumpStore.end() || it->second.Code.empty()) {
+    EJIT_DIAG("print_dumped_code: no code capture for %s", name);
+    return;
+  }
+
+  const DumpEntry &entry = it->second;
+  uint64_t fnOffset = entry.fnPtr - entry.codeStart;
+  (void)fnOffset;
+  EJIT_DIAG("=== post-link code hex dump name=%s start=0x%llx fn=0x%llx "
+            "fn_offset=0x%llx size=%u ===",
+            name, static_cast<unsigned long long>(entry.codeStart),
+            static_cast<unsigned long long>(entry.fnPtr),
+            static_cast<unsigned long long>(fnOffset),
+            (unsigned)entry.Code.size());
+  unsigned printedLines = 0;
+  for (size_t i = 0; i < entry.Code.size(); i += 4) {
+    uint8_t bytes[4] = {};
+    size_t count = std::min<size_t>(4, entry.Code.size() - i);
+    for (size_t j = 0; j < count; ++j)
+      bytes[j] = static_cast<uint8_t>(entry.Code[i + j]);
+    EJIT_DIAG("  %016llx: %02x %02x %02x %02x",
+              static_cast<unsigned long long>(entry.codeStart + i), bytes[0],
+              bytes[1], bytes[2], bytes[3]);
+    throttleDumpPrint(++printedLines);
+  }
+  EJIT_DIAG("=== post-link code hex dump end ===");
+}
 
 static void dumpBytesSafe(const char *label, const char *data, size_t n) {
   EJIT_DIAG_RAW("=== %s begin size=%u ===", label, (unsigned)n);
@@ -408,7 +515,8 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
             (void *)&gDumpStore);
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
   EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)gDumpStore.size());
-  gDumpStore[fnName] = DumpEntry{cacheKey, std::move(IR), std::move(ASM)};
+  gDumpStore[fnName] =
+      DumpEntry{cacheKey, std::move(IR), std::move(ASM), {}, 0, 0};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Publish only small metadata. Full text remains in the worker-local map.

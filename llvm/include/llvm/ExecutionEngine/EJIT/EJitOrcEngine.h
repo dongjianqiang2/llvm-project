@@ -46,6 +46,16 @@ void setDumpSharedState(EJitSharedTaskPoolState *state);
 /// capture at compile time, print selectively later.
 void printDumped(const char *name);
 
+/// Allocation-free exact-name/wildcard check used after JITLink. This avoids
+/// constructing a temporary std::string on the SRE compile worker.
+bool isDumpTarget(const char *name);
+
+/// Save and print the final relocated bytes for a JITLink executable range.
+/// \p fnPtr may point inside [\p codeStart, \p codeStart + \p size).
+void captureCodeDump(const std::string &fnName, const void *fnPtr,
+                     const void *codeStart, uint32_t size);
+void printDumpedCode(const char *name);
+
 struct SpecializationContext {
   std::string fnName;
   uint64_t cacheKey = 0;

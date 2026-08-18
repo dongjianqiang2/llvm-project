@@ -476,6 +476,27 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
+
+  // Capture only an authoritative finalized executable range. A function may
+  // start inside the allocation (after stubs/helpers), so preserve both the
+  // range base and fnPtr for correct PC-relative offline disassembly.
+  if (isDumpTarget(funcName.c_str())) {
+#ifdef EJIT_SRE_CODE_POOL
+    EJitCompiledCodeInfo info;
+    if (jitEngine_->findCodeRange(funcPtr, info) && info.codeStart &&
+        info.codeSize > 0 && info.codeSize <= UINT32_MAX) {
+      captureCodeDump(funcName, funcPtr,
+                      reinterpret_cast<const void *>(info.codeStart),
+                      static_cast<uint32_t>(info.codeSize));
+    } else {
+      EJIT_DIAG("dump code unavailable func=%s: no finalized code range",
+                funcName.c_str());
+    }
+#else
+    EJIT_DIAG("dump code unavailable func=%s: code pool disabled",
+              funcName.c_str());
+#endif
+  }
   return funcPtr;
 }
 

@@ -1521,6 +1521,11 @@ void ejit_print_dumped(const char *name) {
   printDumped(name);
 }
 
+void ejit_print_dumped_code(const char *name) {
+  EJIT_DIAG("print_dumped_code name=%s", (name && name[0]) ? name : "(list)");
+  printDumpedCode(name);
+}
+
 void ejit_dump_all(bool enable) {
   EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
   setDumpFuncFilter(enable ? std::string("*") : std::string());

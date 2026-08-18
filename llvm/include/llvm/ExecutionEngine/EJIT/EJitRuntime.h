@@ -302,6 +302,12 @@ void ejit_dump_func(const char *name);
 /// non-worker core reports which worker owns the latest matching capture.
 void ejit_print_dumped(const char *name);
 
+/// Print final post-JITLink machine-code bytes captured for \p name. The dump
+/// includes the executable allocation start, function pointer, and function
+/// offset so PC-relative branches can be decoded accurately. Pass NULL or ""
+/// to list available captures on the calling (normally worker) core.
+void ejit_print_dumped_code(const char *name);
+
 /// Enable or disable capture of every JIT-compiled specialization. Equivalent
 /// to ejit_dump_func("*") when enabled. Captures are keyed by function name in
 /// the worker-local store and replaced when the same function is recompiled.

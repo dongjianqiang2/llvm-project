@@ -20,6 +20,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -3102,6 +3103,21 @@ TEST(EJitDiagnostics, DiagPermille) {
 
 TEST(EJitDiagnostics, PrintActiveNoCrash) {
   ejit_print_active(); // uninitialized: prints a notice
+}
+
+TEST(EJitDumpTarget, ExactAndWildcardMatch) {
+  setDumpFuncFilter("dump_me");
+  EXPECT_TRUE(isDumpTarget("dump_me"));
+  EXPECT_FALSE(isDumpTarget("dump_m"));
+  EXPECT_FALSE(isDumpTarget("dump_me_too"));
+  EXPECT_FALSE(isDumpTarget(nullptr));
+
+  setDumpFuncFilter("*");
+  EXPECT_TRUE(isDumpTarget("dump_me"));
+  EXPECT_TRUE(isDumpTarget("another_function"));
+
+  setDumpFuncFilter("");
+  EXPECT_FALSE(isDumpTarget("dump_me"));
 }
 
 // ejit_print_version() prints the LLVM release version + source git commit
