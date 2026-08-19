@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.4**（2026-08-19）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。
+> 状态：**讨论稿 v0.4.1**（2026-08-19）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。**v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）**：剔除"常量"成分、判定必须在参数替换前（AOT）、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11（嵌入实例集复核，可选优化）。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -221,11 +221,13 @@ period P = (d1..dk)，各维折叠值域 **D_i = min(spec_i, fold operand_i)**�
 
 **pattern 判定规则**（作用于访问链的每个索引成分）：
 
-1. 索引成分 ∈ {**dim 参数直用**（1:1，如 `g[cell]`）、**dim 的 fold 表达式**（匹配该 period 的 fold 声明，如 `g[cell][slot%10]`）、常量} → 该成分应用常量假设。
-2. 任一成分非 pattern（`SomeOther()` 等非 dim 下标、dim 直用不符 fold 形态如 `g[cell][slot]`）→ **整条访问不应用**（保守正确）。
-3. b 形态展平索引：表达式由 {+, ×（常数乘）} 组合 + 常量构成（线性组合），逐成分判定；其他算子（/、`<<`、函数调用）→ 不判为 pattern（advisory warning，C21）。
-4. 取地址：`&g[...]` 元素地址在**同函数内**传递（SSA 拷贝/PHI）后解引用的 load 继续应用——JIT 编译期 direct GEP 全常量路径已支持（索引替换后全常量，`EJitStructFieldPass.cpp:230-269`），无需新机制；**跨函数调用传递 → 放弃**（O-10）。
-5. slot 值本身永不常量（spec_fold 语义）：`printf(cell, slot)` 不应用；只有 pattern 访问中的 fold 表达式固化为折叠常量。
+1. 索引成分 ∈ {**dim 参数直用**（1:1，如 `g[cell]`）、**dim 的 fold 表达式**（匹配该 period 的 fold 声明，如 `g[cell][slot%10]`）} → 该成分应用常量假设。
+2. 任一成分非 pattern（常量下标 `g[5]`、dim 派生变换 `g[cell+1]`、非 dim 下标 `g[SomeOther()]`、dim 直用不符 fold 形态如 `g[cell][slot]`）→ **整条访问不应用**（保守正确），保持运行期读取。
+3. **判定时机（v0.4.1）**：判定必须在参数替换**之前**（AOT，源码形态）完成。替换后 `g[cell]` 与 `g[cell+1]` 变成 `g[0]`/`g[1]`，编译产物无法区分；"字面量 vs dim 派生"的区分在替换后不成立。
+4. **安全论证（v0.4.1）**：允许嵌值 ⟺ 访问下标元组**精确等于**本次调用的 dim 取值元组（版本复核覆盖的实例元组）。实例可**重新激活并重写数据**，而复核只覆盖本次调用 dims 推导的实例；嵌值与复核覆盖同一组格子 ⟹ 数据一变即版本提升 → 复核发现 → 重编译，永远一致。`g[cell+1]` 对应实例 (1) 不在 f_0（cell=0）的复核范围 (0) 内——实例 (1) 重激活重写时 f_0 无感知，数据过期。**收紧为无条件正确性要求**（实例生命周期与 type 无关）；"嵌入实例集复核"（O-11）是补偿优化而非替代。完整推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。
+5. b 形态展平索引：表达式由 {+, ×（常数乘）} 组合构成，成分 ∈ {dim 直用、fold 表达式}，**不含独立常量偏置项**（`g[cell*10+5]` 不判为 pattern——对应实例偏离复核元组）；其他算子（/、`<<`、函数调用）→ 不判为 pattern（advisory warning，C21）。
+6. 取地址：`&g[...]` 元素地址在**同函数内**传递（SSA 拷贝/PHI）后解引用的 load 继续应用——JIT 编译期 direct GEP 全常量路径已支持（索引替换后全常量，`EJitStructFieldPass.cpp:230-269`），无需新机制；**跨函数调用传递 → 放弃**（O-10）。
+7. slot 值本身永不常量（spec_fold 语义）：`printf(cell, slot)` 不应用；只有 pattern 访问中的 fold 表达式固化为折叠常量。
 
 维度一致性检查（**warning**，不阻止编译；动态指针数组跳过检查）：常量数组每维尺寸 == 对应 dim 折叠值域（a/c），b 形态总槽 == Π 折叠值域；维度实现独立——period 维度由声明推导、数组维度由用户声明，检查点比对。
 
@@ -269,7 +271,7 @@ struct Data {
 | C18 | 数组每维尺寸 / 展平总槽与 period 折叠值域不一致（动态指针跳过） | **warning**（D10） |
 | C19 | 嵌套 period 超过一层（成员数组元素含 period 标记成员） | **error**（D11） |
 | C20 | 成员 period 的 dim 与外层 period 的 dim 重叠 | **error**（D11） |
-| C21 | （advisory）展平索引含 {+, ×} 之外算子 / 非 pattern 形态的 dim 访问 | warning，不阻止（保守正确） |
+| C21 | （advisory）非 pattern 形态的 period 访问：展平索引含 {+, ×} 之外算子或独立常量偏置、dim 派生变换（`g[cell+1]`）、常量下标（`g[5]`）、非 dim 下标 | warning，不阻止（保守正确）；该访问永不嵌值（§3.7 规则 2/4/5） |
 
 新增诊断命名沿用 `err_ejit_*` 风格（`err_ejit_dim_redecl` / `err_ejit_dim_missing_type` / `err_ejit_dim_dup_type` / `err_ejit_dim_missing_spec` / `err_ejit_dim_dup_spec` / `err_ejit_bad_dim_type` / `err_ejit_bad_dim_spec` / `err_ejit_fold_*` 等）。
 
@@ -310,6 +312,7 @@ struct Data {
 | icache | spec_fold dim 的 GEP 下标用折叠值（槽位自动共享）；维度尺寸改用 spec（O-1/O-9 联动） |
 | PASS2 | period 数组注册携带组合信息（来自声明元数据，按名关联） |
 | 数组编码（D10/D11） | `ejit_period_arr` 元数据扩展：完整维度列表（现状只最外层 count）+ 成员 period 描述表（类型, 成员名, 字节偏移）；`reAnnotateMayConst` 兜底匹配器升级为 pattern 判定（支持多动态索引，现状只允许一个）；JIT 期 direct GEP 全常量路径已覆盖取地址再解引用，无需新机制 |
+| 嵌值安全（v0.4.1） | pattern 判定落在**替换前**（AOT：clang 打标处收紧 + PASS1 判定，非精确访问标记为不嵌值）；JIT 消费端（StructFieldPass）增加"禁止嵌值"守卫。**现状洞**：`g[cell+1]` 类访问参数替换后 GEP 全常量即嵌值，且无版本复核跟踪——本修订同时是现状修复（§3.7 规则 3/4） |
 
 ## 7. 后续命题与开放问题
 
@@ -334,6 +337,7 @@ struct Data {
 | O-8 | ~~L3 是否扩展 AND 等 op~~ **已决（v0.3.1）**：L3 仅支持 MOD，不扩展 |
 | O-9 | ~~spec_fold dim 的缓存维度~~ **已决（v0.3.1）**：按折叠值域 `min(spec, LCM)`，见 O-1/§6 |
 | O-10 | 取地址跨函数传递（指针参数/返回值携带 period 标签）：本轮不做，函数内直接传递已支持 |
+| O-11 | （可选优化）嵌入实例集复核：把被放弃嵌值的实例集（如 `g[cell+1]` 的实例 (1)）纳入特化版本复核范围，恢复其嵌值资格——本轮不做（§3.7 规则 4 收紧为无条件正确性要求，O-11 仅为补偿优化） |
 
 ## 8. 术语对照
 
