@@ -118,3 +118,83 @@ f(dim cell) {
 | 折叠表达式 | 源码里写出来的折叠形式（`slot%10`）；只有这种形式允许嵌值 |
 | 嵌值 | 编译期读内存、把 period 数据写死进特化代码 |
 | 精确推导 | 下标由 dim 参数本身或它的折叠表达式构成，无任何额外加减 |
+
+## 9. 编译器实现路径（初稿，供讨论）
+
+### 9.0 现状链路与洞的定位
+
+现状嵌值的完整判定链（消费端只看两件事：**may_const 资格** 和 **替换后 GEP 全常量**）：
+
+| 环节 | 代码 | 行为 |
+|---|---|---|
+| clang 打标 | `CGExpr.cpp:2076-2079`（字段属性驱动） | 宽松：may_const 字段的访问一律打 `!ejit.may_const`，**不看下标** |
+| PASS1 兜底 | `EJitRegisterBitcode.cpp:135-201` reAnnotateMayConst | 恢复被优化丢弃的标记（GV 偏移表 + `ejitMayConstFieldOffset` 匹配，**只允许一个动态索引**） |
+| JIT 替换 | `EJitOptimizer.cpp:129-166` preReplacePeriodIndices | dim 形参 → `ConstantInt(cellIdx)`（全 use 替换） |
+| 消费 | `EJitStructFieldPass.cpp:137-167` isMayConstLoad + `:247-269` | may_const 资格（标记或偏移兜底）→ 根在 registry → GEP 全常量 → 版本复核 → 嵌值 |
+
+**洞的机制**：`g[cell+1]` 被 clang 宽松打标 → 替换后 GEP `(0,1)` 全常量 → 嵌值，且复核不覆盖实例 (1)。**没有任何环节检查下标是否由 dim 精确推导**——因为消费端运行时已无法区分（替换后都是常量）。修复必须发生在替换前。
+
+### 9.1 原则
+
+1. **判定在替换前（AOT）**：IR 层面可判——早期 IR 保留源码形态（`g[cell+1]` 的 index 是 `add(形参, 1)`，`slot%10` 是 `urem(形参, 10)`，展平是 add/mul 树）。
+2. **标记 = 判定的结论**：判定只在替换前做一次，结果编码进标记（有 = 精确，无 = 非精确）。**关卡（替换后）不识别 pattern**——替换后 `g[0]`/`g[1]`/`g[5]` 不可区分，关卡只查标记，无条件信任。
+3. **兜底只活在替换前**：偏移兜底在 PASS1（替换前）可用；JIT 期（替换后）**禁用**——替换后兜底无法判定精确性（全常量下标按偏移匹配会把非精确访问放行，洞复辟）。标记丢失 = 错过嵌值（保守正确，软注解语义）。
+
+### 9.2 改动清单（4 项，均为升级现有代码）
+
+**① `ejitMayConstFieldOffset` 升级（`EJitCommon.h:206-289`）—— 核心判定**
+
+现状"至多一个动态索引（元素选择器）"改为**逐个动态索引的 pattern 精确判定**，需要函数上下文（形参集合 + fold 声明表）：
+
+| 动态索引形态 | 判定 |
+|---|---|
+| 形参直用（`cell`） | 精确 ✓ |
+| `urem(形参, 常量N)` 且 N == 该 dim 的 fold operand | 精确 ✓（fold 表达式） |
+| 展平线性组合（`add/mul` 树，成分均为上述两者） | 精确 ✓（逐成分判定，**无独立常量偏置**） |
+| 其余（`add(形参,1)`、常量、非 dim 来源） | 不精确 ✗ |
+
+（signature 增加参数：函数的形参集合、dim→fold operand 映射；两者均来自现有元数据。）
+
+**② PASS1 收紧（`EJitRegisterBitcode.cpp` reAnnotateMayConst）**
+
+恢复逻辑改为"**先删后打**"：对根在 period 数组的访问——精确 → 打/保留标记；非精确 → **清除标记**（覆盖 clang 的宽松打标）。判定 = 升级后的 ①。
+
+**③ JIT 替换（`EJitOptimizer.cpp` preReplacePeriodIndices）**
+
+- spec_fold dim：**跳过形参替换**（slot 取值保持运行期）
+- 新增折叠表达式替换：对**带 `!ejit.may_const` 的 GEP**（已被 ② 认证精确），index 中 `urem(spec_fold 形参, operand)` 形态 → `ConstantInt(cellIdx)`（cellIdx 即折叠后实例值，wrapper 已传入）。替换后 GEP 全常量 → InstCombine 折叠 → 现状嵌值路径（零改动）
+- 普通 dim：现状照旧
+
+**④ 消费端（`EJitStructFieldPass.cpp` isMayConstLoad）**
+
+标记路径不变（不识别 pattern，只查标记 + GEP 全常量）。**JIT 期禁用偏移兜底**：替换后兜底无法判定精确性，会把非精确访问按字段偏移放行（洞复辟）——它是"全量标记时代洞"的组成部分，不是可保留的保护；PASS1 的 raw bitcode 标记已全量覆盖（每个 period 访问都有判定结论），JIT 期只信标记。
+
+**关于"丢失一次兜底"**：拆掉的是 JIT 期偏移恢复（替换后不可安全化），保留的是升级后的 PASS1（恢复 + 判定，覆盖范围 ≥ 现状 PASS1 + 现状 JIT 兜底中安全的部分）。JIT 期真丢标记的代价 = 错过嵌值（保持运行期读，正确性无损，软注解语义）；管线可控（preReplace → InstCombine → StructFieldPass，InstCombine 折叠 GEP 时 load 的 metadata 保留），丢标记属保险丝场景。补救预案（实现期验证项）：preReplace 入口（标记必然完整）把"精确访问集合"快照传给 StructFieldPass，不依赖优化中标记存活。
+
+### 9.3 你提醒的双重性如何落实（spec_fold dim）
+
+| slot 的位置 | 处理 | 落点 |
+|---|---|---|
+| 取值本身（`printf(slot)`、一般运算） | **不作常量**：形参不替换 | ③ 跳过替换 |
+| pattern 访问下标（`g[cell][slot%10]`） | **作常量**：`urem(slot,10)` → `ConstantInt(cellIdx)` | ③ 折叠表达式替换 |
+
+两处独立、互不冲突：跳过替换保住了"slot 不是常量"；折叠替换让精确访问的地址常量化 → mayconst 优化生效。非精确访问（`g[cell][slot%10+1]`）无标记 → 折叠替换不碰它 → 保持运行期计算 → 不嵌值。
+
+### 9.4 各形态的 IR 判定样例
+
+| 源码 | 早期 IR index（PASS1 判定时） | 替换后（JIT） | 结果 |
+|---|---|---|---|
+| `g[cell]` | `i64 %cell`（形参） | `0` | 嵌值 ✓ |
+| `g[cell+1]` | `add(i64 %cell, 1)` | `1`（无标记） | **不嵌值**，运行期读 ✓ |
+| `g[cell][slot%10]` | GEP 两级：`%cell` / `urem(%slot, 10)` | `5` / `8` | 嵌值 ✓ |
+| `g[cell*10+slot%10]` | `add(mul(%cell,10), urem(%slot,10))` | `58` | 嵌值 ✓ |
+| `g[cell*10+5]` | `add(mul(%cell,10), 5)` 常量偏置 | `5`（无标记） | **不嵌值** ✓ |
+| `g[5]` | 常量 | `5`（无标记） | **不嵌值** ✓ |
+
+### 9.5 取舍与风险
+
+1. **判定落点选 PASS1（IR）而非 clang（AST）**：PASS1 信息足够（形参集合、fold 声明、period 绑定都在元数据），一处实现同时覆盖主路径与兜底，clang 零改动；代价是早期 IR 形态必须保留（preOptimize 提取时点满足，已验证）。
+2. **标记删除方案 vs 负标记方案**：删除方案复用现有"软注解"语义——标记丢失 = 错过特化 = 保守正确。**JIT 期禁用偏移兜底**（§9.1 原则 3）：替换后兜底无法判定精确性，是全量标记时代洞的组成部分；PASS1 的 raw bitcode 标记全量覆盖后，JIT 期只信标记。
+3. **`ejitMayConstFieldOffset` 语义变化**："元素选择器"校验（stride 匹配）用于防 `((int*)&g[ci])[j]` 类指针算术误判——升级后该防护保留（形参直用仍要求匹配根数组元素 stride），同时新增 fold 形态支持。
+4. **待确认**：② "先删后打"的删除范围——仅非精确访问，还是对 period 数组访问全量重打（更干净，但需要识别"访问的是 period 数组"，靠 `TAG_EJIT_PERIOD_ARR` 元数据）。
+5. **现状洞修复**：同一条路径天然修复——现状 `g[cell+1]`（无 spec_fold）在标记收紧后不再嵌值；无需单独设计。
