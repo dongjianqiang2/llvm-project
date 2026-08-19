@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.3.1**（2026-08-19）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。
+> 状态：**讨论稿 v0.4**（2026-08-19）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -57,6 +57,8 @@ period23 的实例 = (dim2, dim3 % 10)
 | **D7 fold 缺省规则** | fold 整行可缺省（= identity）；`EJIT_FOLD_MOD` 的 operand 可缺省，缺省取值 = 该 dim 的 spec |
 | **D8 分层回退方向（应用细节暂缓）** | type（half-static/dynamic）用于分级回退：dynamic 变化导致全特化失效时，先退回"仅 half-static 视为常量"的中间 JIT 版本，再退 AOT。**应用实现为另一命题，本阶段只定语法** |
 | **D9 特化折叠（L3）** | 特化 key 折叠为 **dim 级显式声明**（`ejit_dim_spec_fold(dim, enable)`，宏 `DEFINE_DIM_SPEC_FOLD`）；折叠参数不直接声明，由 AOT 从该 dim 参与的 period fold 声明推导：**operand = LCM(各 operand)、op 仅支持 MOD**（§3.4bis）；编译期语义 = **参数不替换 + 折叠表达式替换**（落点见 §6） |
+| **D10 数组 = 实例空间容器** | period 数组的维度结构与 period 的 dim 列表对应（三种合法形态 §3.7）；各维尺寸 = 该 dim 折叠值域（`min(spec, fold operand)`，与 O-1 缓存规格一致）；数组线性下标 == 实例索引（行优先）；维度一致性为 **warning**（动态指针数组跳过检查）；维度实现独立（period 维度由声明推导、数组维度由用户声明，检查点比对） |
+| **D11 成员 period** | 结构体成员可复用 `ejit_period_arr` 标记（Subjects 扩展 FieldDecl）；成员数组 = 嵌套 period 容器（分层激活）；**嵌套限一层**，违反 → **error**；成员 period 的 dim 与外层 period 的 dim 不重叠（error）；成员不注册独立全局，绑定 = (外层类型, 成员名, 字节偏移) 编码进外层元数据 |
 
 ## 3. 语法定义（本阶段聚焦）
 
@@ -207,6 +209,42 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 - 旧代码迁移成本 = 公共头文件加声明行：`DEFINE_DIM(cell)` + `DEFINE_DIM_TYPE(cell, ?)` + `DEFINE_DIM_SPEC(cell, ?)` + `DEFINE_PERIOD(cell)`（空列表 sugar）。
 - 开放项：是否引入"同名隐式声明"让旧代码零迁移——倾向不引入，保持 D6"恰好一次"的单一规则。
 
+### 3.7 period 数组的三种形态与 pattern 判定（D10 细化）
+
+period P = (d1..dk)，各维折叠值域 **D_i = min(spec_i, fold operand_i)**（与 O-1 缓存规格一致）。三种合法容器形态：
+
+| 形态 | 声明 | 维度 | 实例索引 |
+|---|---|---|---|
+| a 逐维 | `Data g[D1][D2]...[Dk]` | 每维 = 对应 dim 折叠值域 | C 行优先线性化（天然 == 实例索引） |
+| b 展平 | `Data g[D]`，D = Π D_i | 总槽 = 实例空间 | 显式线性化表达式（如 `cell*10 + slot%10`） |
+| c 嵌套成员 | 外层 `Data g[D1]` + 成员数组 `dim2_var[D2]`（§3.8） | 每层各自 = 折叠值域 | 分层实例索引 |
+
+**pattern 判定规则**（作用于访问链的每个索引成分）：
+
+1. 索引成分 ∈ {**dim 参数直用**（1:1，如 `g[cell]`）、**dim 的 fold 表达式**（匹配该 period 的 fold 声明，如 `g[cell][slot%10]`）、常量} → 该成分应用常量假设。
+2. 任一成分非 pattern（`SomeOther()` 等非 dim 下标、dim 直用不符 fold 形态如 `g[cell][slot]`）→ **整条访问不应用**（保守正确）。
+3. b 形态展平索引：表达式由 {+, ×（常数乘）} 组合 + 常量构成（线性组合），逐成分判定；其他算子（/、`<<`、函数调用）→ 不判为 pattern（advisory warning，C21）。
+4. 取地址：`&g[...]` 元素地址在**同函数内**传递（SSA 拷贝/PHI）后解引用的 load 继续应用——JIT 编译期 direct GEP 全常量路径已支持（索引替换后全常量，`EJitStructFieldPass.cpp:230-269`），无需新机制；**跨函数调用传递 → 放弃**（O-10）。
+5. slot 值本身永不常量（spec_fold 语义）：`printf(cell, slot)` 不应用；只有 pattern 访问中的 fold 表达式固化为折叠常量。
+
+维度一致性检查（**warning**，不阻止编译；动态指针数组跳过检查）：常量数组每维尺寸 == 对应 dim 折叠值域（a/c），b 形态总槽 == Π 折叠值域；维度实现独立——period 维度由声明推导、数组维度由用户声明，检查点比对。
+
+### 3.8 成员 period（D11 细化）
+
+结构体成员复用 `ejit_period_arr`（Subjects 扩展 FieldDecl；Sema 按语境分流——成员需外层容器检查）：
+
+```c
+struct Data {
+    may_const_attr int xxx;
+    __attribute__((ejit_period_arr("period2"))) int dim2_var[D2];  /* 成员 period 容器 */
+} g[D1];   /* 外层 period1 容器（分层激活：cell 变化只失效外层，slot 变化只失效成员） */
+```
+
+- **注册**：成员不注册独立全局；绑定 = (外层数组类型, 成员名, 字节偏移) 编码进外层 `ejit_period_arr` 元数据的**成员描述表**（编译期常量偏移）。
+- **版本复核**：复合访问 `g[cell].dim2_var[slot%10].may_const` 需**双 period 版本校验**（period1(cell) + period2(slot%10)）；cache entry 版本快照含嵌套 period 实例。
+- **约束（违反 → error）**：嵌套限一层（成员数组元素不能再含 period 标记成员，C19）；成员 period 的 dim 与外层 period 的 dim 不重叠（正交性，C20）。
+- **替代方案（非侵入，备选）**：声明层绑定宏 `DEFINE_PERIOD_MEMBER(period2, Data, dim2_var)`——struct 定义不动（第三方类型），AOT 按类型名+成员名关联；当成员属性无法加在类型上时使用。
+
 ## 4. Sema 校验矩阵
 
 | # | 场景 | 结果 |
@@ -228,6 +266,10 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | C15 | 相关 period fold 的 op 非 MOD（DIV/SHR/AND） | **错误**（L3 仅支持 MOD） |
 | C16 | 推导 LCM > 256（instanceId 值域上界） | **错误** |
 | C17 | （advisory）spec_fold dim 的函数体中无匹配 (MOD, operand) 形态的访问 | warning，不阻止（保守正确） |
+| C18 | 数组每维尺寸 / 展平总槽与 period 折叠值域不一致（动态指针跳过） | **warning**（D10） |
+| C19 | 嵌套 period 超过一层（成员数组元素含 period 标记成员） | **error**（D11） |
+| C20 | 成员 period 的 dim 与外层 period 的 dim 重叠 | **error**（D11） |
+| C21 | （advisory）展平索引含 {+, ×} 之外算子 / 非 pattern 形态的 dim 访问 | warning，不阻止（保守正确） |
 
 新增诊断命名沿用 `err_ejit_*` 风格（`err_ejit_dim_redecl` / `err_ejit_dim_missing_type` / `err_ejit_dim_dup_type` / `err_ejit_dim_missing_spec` / `err_ejit_dim_dup_spec` / `err_ejit_bad_dim_type` / `err_ejit_bad_dim_spec` / `err_ejit_fold_*` 等）。
 
@@ -267,6 +309,7 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | PASS4 lc 插桩 | cellIdx 改为"组合实例"：声明元数据在同 TU 可见时内联计算（mod/div/shr 是廉价指令）；不可见时编译报错（严格模式）。`ejit_activate/deactivate` 签名保持 `(name, cellIdx)`，cellIdx 语义升级为实例索引 |
 | icache | spec_fold dim 的 GEP 下标用折叠值（槽位自动共享）；维度尺寸改用 spec（O-1/O-9 联动） |
 | PASS2 | period 数组注册携带组合信息（来自声明元数据，按名关联） |
+| 数组编码（D10/D11） | `ejit_period_arr` 元数据扩展：完整维度列表（现状只最外层 count）+ 成员 period 描述表（类型, 成员名, 字节偏移）；`reAnnotateMayConst` 兜底匹配器升级为 pattern 判定（支持多动态索引，现状只允许一个）；JIT 期 direct GEP 全常量路径已覆盖取地址再解引用，无需新机制 |
 
 ## 7. 后续命题与开放问题
 
@@ -290,6 +333,7 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | O-7 | FOR_EACH/NARG 宏机制在 clang 全版本验证；period 组成 dim 数上限（现按 8） |
 | O-8 | ~~L3 是否扩展 AND 等 op~~ **已决（v0.3.1）**：L3 仅支持 MOD，不扩展 |
 | O-9 | ~~spec_fold dim 的缓存维度~~ **已决（v0.3.1）**：按折叠值域 `min(spec, LCM)`，见 O-1/§6 |
+| O-10 | 取地址跨函数传递（指针参数/返回值携带 period 标签）：本轮不做，函数内直接传递已支持 |
 
 ## 8. 术语对照
 
@@ -299,6 +343,8 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | period（时间窗） | 由 1..N 个 dim 组成；实例空间为折叠后元组；使能/失效/版本粒度 |
 | fold / 折叠 | dim 值 → period 实例分量的多对一变换（缺省恒等；MOD operand 缺省 = dim spec） |
 | 特化折叠 spec_fold（L3） | dim 级声明（`DEFINE_DIM_SPEC_FOLD(dim, enable)`）：该 dim 不参与特化 key 的原始取值；编译期参数不替换、折叠表达式（MOD 形态）替换为折叠常量；operand = 相关 period fold 的 LCM |
+| pattern 访问 | 索引成分 ∈ {dim 直用, dim 的 fold 表达式, 常量} 的 period 数组访问；满足才应用常量假设，否则整条访问保守不应用 |
+| 实例索引 | 折叠后元组按声明顺序行优先线性化；数组线性下标 == 实例索引（D10 三种形态一致） |
 | type | dim 的稳定性分类（half-static / dynamic，预留 static）——应用语义见命题 P1 |
 | spec | dim 的值域/缓存尺寸参数：决定 icache 维度与状态表尺寸 |
 | 实例 instance | period 的一个具体取值组合；对应 period 数组的一个下标 |
