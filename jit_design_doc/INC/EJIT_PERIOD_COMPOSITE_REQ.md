@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.2**（2026-08-15）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。
+> 状态：**讨论稿 v0.3**（2026-08-19）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -34,6 +34,8 @@ period23 的实例 = (dim2, dim3 % 10)
 
 形式化：period P 由有序 dim 列表 (d1..dk) 组成，每个 di 可选一个折叠变换 ti（缺省恒等），**P 的实例 = (t1(d1), ..., tk(dk))**。使能/失效/版本状态以 period 实例为粒度；JIT 特殊化仍以原始 dim 元组为粒度。
 
+**需求 R3 —— 特殊化 key 折叠（L3）**：声明为折叠的 dim（如 `slot%10`）可进一步声明"特化折叠"——cell=0,slot=0 与 cell=0,slot=10 不仅共享 period 实例状态（R2），还**共享同一份 JIT 特化代码**。约束：slot 值本身不做常量假设（参数不替换）；但用于 period 数组下标的折叠表达式（`slot%10`）在编译期固化为折叠常量，使访问地址常量化、mayconst 优化可应用。
+
 ### 1.3 对现状实现的冲击
 
 1. **命名空间分裂**：`dimId`（参数身份 → 决定特殊化空间）与 `periodId`（使能/失效粒度）必须分离。
@@ -54,6 +56,7 @@ period23 的实例 = (dim2, dim3 % 10)
 | **D6 type/spec 恰好一次** | 每个 dim 的 type 与 spec 都**不允许缺省、不允许重复配置**；编译器强制检查 |
 | **D7 fold 缺省规则** | fold 整行可缺省（= identity）；`EJIT_FOLD_MOD` 的 operand 可缺省，缺省取值 = 该 dim 的 spec |
 | **D8 分层回退方向（应用细节暂缓）** | type（half-static/dynamic）用于分级回退：dynamic 变化导致全特化失效时，先退回"仅 half-static 视为常量"的中间 JIT 版本，再退 AOT。**应用实现为另一命题，本阶段只定语法** |
+| **D9 特化折叠（L3）** | 特化 key 折叠为 **dim 级显式声明**（`ejit_dim_spec_fold(dim, enable)`，宏 `DEFINE_DIM_SPEC_FOLD`）；折叠参数不直接声明，由 AOT 从该 dim 参与的 period fold 声明推导：**operand = LCM(各 operand)、op 仅支持 MOD**（§3.4bis）；编译期语义 = **参数不替换 + 折叠表达式替换**（落点见 §6） |
 
 ## 3. 语法定义（本阶段聚焦）
 
@@ -130,6 +133,12 @@ period23 的实例 = (dim2, dim3 % 10)
   __attribute__((ejit_period_fold(#period_name, #dim_name, fold_op, operand))) \
   static int EJIT_CAT(ejit_fold_decl_anchor_, __COUNTER__) \
       __attribute__((unused));
+
+/* ---------- 特化折叠（L3）：dim 级声明；enable 开关；折叠参数由编译器从 period fold 推导（§3.4bis） ---------- */
+#define DEFINE_DIM_SPEC_FOLD(dim_name, enable) \
+  __attribute__((ejit_dim_spec_fold(#dim_name, enable))) \
+  static int EJIT_CAT(ejit_spec_fold_anchor_, __COUNTER__) \
+      __attribute__((unused));
 ```
 
 > 实现注：`EJIT_STR_ALL_2..8`、`EJIT_PERIOD_IMPL_1..8` 为机械展开，clang 已验证 `##__VA_ARGS__`（GNU 扩展）与 `__COUNTER__`；C++20 下可改用 `__VA_OPT__`。
@@ -143,6 +152,7 @@ period23 的实例 = (dim2, dim3 % 10)
 | `ejit_dim_spec` | `StringArgument dim, IntArgument spec` | 每 dim 恰好一次；spec ∈ (0, 256] |
 | `ejit_period_decl` | `StringArgument period, VariadicStringArgument dims` | 每 period 恰好一次；dims 均已声明；空 dims = 同名 1:1 sugar |
 | `ejit_period_fold` | `StringArgument period, StringArgument dim, EnumArgument op, Optional IntArgument operand` | 每 (period, dim) 至多一条；period 必须声明且包含该 dim；operand 缺省 → Sema 填入该 dim 的 spec |
+| `ejit_dim_spec_fold` | `StringArgument dim, BoolArgument enable` | 每 dim 恰好一次（D6）；dim 必须已声明；enable=true 时该 dim 必须存在非 identity 的 MOD fold 声明（C14/C15），operand 推导见 3.4bis |
 
 折叠 op 枚举：`EJIT_FOLD_IDENTITY=0 / EJIT_FOLD_MOD=1 / EJIT_FOLD_DIV=2 / EJIT_FOLD_SHR=3 / EJIT_FOLD_AND=4`。
 
@@ -152,6 +162,14 @@ period23 的实例 = (dim2, dim3 % 10)
 2. **operand 缺省**：`DEFINE_FOLD(p, d, EJIT_FOLD_MOD)` → operand 取该 dim 的 spec。
 3. **Sema 期填实**：fold 与 dim 声明同在公共头文件、同一 TU 可见，Sema 收集后直接把缺省 operand 补成 spec 数值写入元数据，运行时零推断；spec 不可见时直接报错（与 D1 严格模式一致）。
 4. 观察：对合法值域（dim 值 < spec）而言，`v % spec ≡ v`——缺省 operand 的语义是"折叠机制统一走取模路径，不配置时退化为恒等"，行为安全。
+
+### 3.4bis 特化折叠参数推导（D9 细化）
+
+1. **operand = LCM**：AOT 收集该 dim 在所有 period 上的**非 identity** fold 声明（缺省 operand 按 3.4 填 spec 后），取各 operand 的最小公倍数作为特化 key 折叠模数。理由：entry 函数假设可能依赖**所有** period 的全局变量（不做访问闭包分析）——特化 key 折叠后相同必须蕴含**每个** period 的折叠值都相同，模数必须是各 operand 的公倍数，LCM 是最小安全值。
+2. **op 仅支持 MOD**（C15）：identity（无 fold 声明）不参与推导；DIV/SHR/AND 或 op 不一致 → 编译错误。
+3. **enable=false**：显式关闭 L3（等同无声明效果）；声明本身仍受 D6"恰好一次"约束，重复声明（无论取值）报错。
+4. **运行时零推断**：LCM 在编译期算好写入元数据（§5），wrapper 插桩与 JIT 编译期直接消费，运行时无推导。
+5. **正确性**：key 折叠相同 ⟹ instanceId 相同 ⟹ 对每个 period，替换常量 `instanceId mod operand` 相同，且等于实例真实折叠值 `slot mod operand`（因 operand | LCM）⟹ 替换常量与运行期语义一致，**无条件安全**（无需访问模式证明）。
 
 ### 3.5 端到端示例
 
@@ -167,6 +185,7 @@ DEFINE_PERIOD(period13, dim1, dim3)
 DEFINE_PERIOD(period23, dim2, dim3)
 
 DEFINE_FOLD(period23, dim3, EJIT_FOLD_MOD, 10)
+DEFINE_DIM_SPEC_FOLD(dim3, true)          /* L3：dim3 特化 key 折叠，operand 推导 = LCM(10) = 10 */
 
 /* ---- 使用处：与现状完全一致 ---- */
 __attribute__((ejit_period_arr("period1")))  struct Cfg1  g_cfg1[N1];
@@ -203,6 +222,12 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | C9 | fold 缺省 operand 时该 dim 的 spec 不可见 | **错误**（Sema 期填实，见 3.4） |
 | C10 | fold op 枚举非法 | **错误**（EnumArgument 自动） |
 | C11 | 既有检查全部保留：函数 dim 数 ≤4、整型参数、lc 必须有同名 dim 参数、period 数组大小 ≤100、数组大小 vs 实例空间一致性 | 不变 |
+| C12 | `ejit_dim_spec_fold` 的 dim 未声明 | **错误** |
+| C13 | 同一 dim 重复 spec_fold 声明（含 enable 取值不同） | **错误**（D6） |
+| C14 | spec_fold dim 在所有 period 上均无非 identity fold 声明（operand 无法推导） | **错误** |
+| C15 | 相关 period fold 的 op 非 MOD（DIV/SHR/AND） | **错误**（L3 仅支持 MOD） |
+| C16 | 推导 LCM > 256（instanceId 值域上界） | **错误** |
+| C17 | （advisory）spec_fold dim 的函数体中无匹配 (MOD, operand) 形态的访问 | warning，不阻止（保守正确） |
 
 新增诊断命名沿用 `err_ejit_*` 风格（`err_ejit_dim_redecl` / `err_ejit_dim_missing_type` / `err_ejit_dim_dup_type` / `err_ejit_dim_missing_spec` / `err_ejit_dim_dup_spec` / `err_ejit_bad_dim_type` / `err_ejit_bad_dim_spec` / `err_ejit_fold_*` 等）。
 
@@ -217,10 +242,12 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
   !{!"ejit_dim_spec",    !"dim3", i32 32},
   !{!"ejit_period_decl", !"period23", !"dim2", !"dim3"},
   !{!"ejit_period_fold", !"period23", !"dim3", i8 1, i32 10}   ; op=MOD, operand 已填实
+  !{!"ejit_dim_spec_fold", !"dim3", i1 true, i32 10}   ; enable + LCM 编译期算好
 }
 ```
 
 - 缺省 operand 在 Sema 期填实（3.4），元数据永远存实际数值，运行时零推断。
+- 特化折叠（L3）：`ejit_dim_spec_fold` 子节点存 enable 与推导好的 LCM；EJitOptimizer 从 bitcode 中的声明元数据解析替换规则（PASS1 需保留声明载体进 bitcode，见 §6）。
 - 使用处元数据**完全不变**（`ejit_period_arr_ind` / `ejit_period_arr` 等照旧）——D4 的"下游编码不改"由此成立。
 - 标签常量在 `EJitCommon.h` 增加 `TAG_EJIT_DIM_DECL` / `TAG_EJIT_DIM_TYPE` / `TAG_EJIT_DIM_SPEC` / `TAG_EJIT_PERIOD_DECL` / `TAG_EJIT_PERIOD_FOLD`。
 
@@ -235,9 +262,10 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | 缓存尺寸 | `spec` 决定 wrapper icache 数组维度（`D_i = spec_i`，替换写死的 `EJIT_ICACHE_DIM_SIZE=16`）与 SwitchController 表尺寸（替换写死的 256） |
 | SwitchController | `enabled_/version_` 粒度从 (dimType, instance) 改为 **(periodId, 实例索引)**；实例索引 = 折叠后元组按声明顺序线性化 |
 | 查找/版本复核 | wrapper 传原始 dims 不变；cache 层经运行时映射表把 dims 折叠成各 period 实例再比对版本；cache entry 存储 per-period 版本快照 |
-| 编译/JIT | 特殊化 key 仍为原始 dim 元组，`EJitOptimizer`/`EJitStructFieldPass` 零改动；折叠算术由常量折叠消化 |
+| wrapper（PASS3） | spec_fold dim 实参插入 `urem %LCM`（一处算术）：icache GEP 下标、bucket cache key、编译请求 instanceId 三处统一取折叠值；普通 dim 照旧 |
+| 编译/JIT | 非 L3 dim 照旧（参数替换，特殊化 key = 原始元组）；`EJitOptimizer` 对 spec_fold dim 改为：**参数不替换** + 模式匹配 (MOD, operand) 形态的折叠表达式并替换为 `ConstantInt(instanceId mod operand)` → InstCombine 折叠 GEP → `EJitStructFieldPass` 走全常量路径（**零改动**）；编译请求结构零改动（dims 全传，完整性校验照过） |
 | PASS4 lc 插桩 | cellIdx 改为"组合实例"：声明元数据在同 TU 可见时内联计算（mod/div/shr 是廉价指令）；不可见时编译报错（严格模式）。`ejit_activate/deactivate` 签名保持 `(name, cellIdx)`，cellIdx 语义升级为实例索引 |
-| icache | 零改动（按原始 dims 索引，维度尺寸改用 spec） |
+| icache | spec_fold dim 的 GEP 下标用折叠值（槽位自动共享）；维度尺寸改用 spec（O-1/O-9 联动） |
 | PASS2 | period 数组注册携带组合信息（来自声明元数据，按名关联） |
 
 ## 7. 后续命题与开放问题
@@ -260,6 +288,8 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | O-5 | 跨 TU 一致性：以"声明头文件 + 运行时冲突检测"为准，还是需要链接级校验 |
 | O-6 | 属性命名 `ejit_dim_decl/ejit_dim_type/ejit_dim_spec/ejit_period_decl/ejit_period_fold` 为暂定名 |
 | O-7 | FOR_EACH/NARG 宏机制在 clang 全版本验证；period 组成 dim 数上限（现按 8） |
+| O-8 | L3 仅支持 MOD；后续是否支持 AND（位掩码折叠的"公倍数"语义需另定义） |
+| O-9 | spec_fold dim 的 icache 维度：折叠后值域 ≤ LCM，与 spec 维度（O-1）的关系 |
 
 ## 8. 术语对照
 
@@ -268,6 +298,7 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 | dim（维度） | 绑定到函数参数的身份；由 name/type/spec 三条声明构成；决定特殊化空间 |
 | period（时间窗） | 由 1..N 个 dim 组成；实例空间为折叠后元组；使能/失效/版本粒度 |
 | fold / 折叠 | dim 值 → period 实例分量的多对一变换（缺省恒等；MOD operand 缺省 = dim spec） |
+| 特化折叠 spec_fold（L3） | dim 级声明（`DEFINE_DIM_SPEC_FOLD(dim, enable)`）：该 dim 不参与特化 key 的原始取值；编译期参数不替换、折叠表达式（MOD 形态）替换为折叠常量；operand = 相关 period fold 的 LCM |
 | type | dim 的稳定性分类（half-static / dynamic，预留 static）——应用语义见命题 P1 |
 | spec | dim 的值域/缓存尺寸参数：决定 icache 维度与状态表尺寸 |
 | 实例 instance | period 的一个具体取值组合；对应 period 数组的一个下标 |
