@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.3**（2026-08-19）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。
+> 状态：**讨论稿 v0.3.1**（2026-08-19）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -259,7 +259,7 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 |---|---|
 | 注册表 | 新增 `EJIT_REG_PERIOD_DEF = 8`（沿用 5/6/7 的加法模式；40B ABI 不变）。name1=period 名，ptr=dim/fold 描述表，size=表项数；跨 TU 重复条目按名去重、冲突报错 |
 | 命名空间 | `DimRegistry`（dim 名 → dimId + type 编号 + spec）与 `PeriodRegistry`（period 名 → periodId + 组成/折叠表）分离；type 字符串 → u8 编号（`static=0/half-static=1/dynamic=2`，预留）加速运行期计算 |
-| 缓存尺寸 | `spec` 决定 wrapper icache 数组维度（`D_i = spec_i`，替换写死的 `EJIT_ICACHE_DIM_SIZE=16`）与 SwitchController 表尺寸（替换写死的 256） |
+| 缓存尺寸（O-1 已决） | **spec = dim 值域大小**（取值 ∈ [0, spec)，C6 边界维持）。缓存规格：该 dim 有 L3 特化折叠 → 折叠值域 `min(spec, LCM)`（dim < spec 且折叠值 < LCM ⟹ 折叠值 < min(spec, LCM)，裸 LCM 在 spec < LCM 时浪费槽位）；无 L3 → 按 spec。替换写死的 `EJIT_ICACHE_DIM_SIZE=16` 与 SwitchController 的 256 |
 | SwitchController | `enabled_/version_` 粒度从 (dimType, instance) 改为 **(periodId, 实例索引)**；实例索引 = 折叠后元组按声明顺序线性化 |
 | 查找/版本复核 | wrapper 传原始 dims 不变；cache 层经运行时映射表把 dims 折叠成各 period 实例再比对版本；cache entry 存储 per-period 版本快照 |
 | wrapper（PASS3） | spec_fold dim 实参插入 `urem %LCM`（一处算术）：icache GEP 下标、bucket cache key、编译请求 instanceId 三处统一取折叠值；普通 dim 照旧 |
@@ -281,15 +281,15 @@ void on_period13(int cell __attribute__((ejit_dim("dim1"))),
 
 | 编号 | 问题 |
 |---|---|
-| O-1 | dim 值域与 spec 的关系：spec 是值域大小（值 < spec）还是仅缓存尺寸（值可超界、由折叠归约）——影响 icache 索引与 C6 边界语义 |
+| O-1 | ~~spec 语义~~ **已决（v0.3.1）**：spec = 值域大小；缓存规格按折叠值域（见 §6） |
 | O-2 | 隐式 1:1 声明（3.6）：倾向不引入 |
 | O-3 | 折叠算子集合 `%N /N >>S &M` 是否覆盖业务；是否需要 dim 间线性组合 |
 | O-4 | 各注册表容量：dim 数、period 数、每 period 实例空间上限 |
 | O-5 | 跨 TU 一致性：以"声明头文件 + 运行时冲突检测"为准，还是需要链接级校验 |
 | O-6 | 属性命名 `ejit_dim_decl/ejit_dim_type/ejit_dim_spec/ejit_period_decl/ejit_period_fold` 为暂定名 |
 | O-7 | FOR_EACH/NARG 宏机制在 clang 全版本验证；period 组成 dim 数上限（现按 8） |
-| O-8 | L3 仅支持 MOD；后续是否支持 AND（位掩码折叠的"公倍数"语义需另定义） |
-| O-9 | spec_fold dim 的 icache 维度：折叠后值域 ≤ LCM，与 spec 维度（O-1）的关系 |
+| O-8 | ~~L3 是否扩展 AND 等 op~~ **已决（v0.3.1）**：L3 仅支持 MOD，不扩展 |
+| O-9 | ~~spec_fold dim 的缓存维度~~ **已决（v0.3.1）**：按折叠值域 `min(spec, LCM)`，见 O-1/§6 |
 
 ## 8. 术语对照
 
