@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.4.3**（2026-08-19/20）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。
+> 状态：**讨论稿 v0.4.4**（2026-08-19/20）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。**v0.4.4 lc 形态确定 + 标记传染立项**：`ejit_period_lc` 升级为变参、**显式指定 period 列表**（不推断，部分覆盖不匹配）；cellIdx 维度偏移计算（stride = Π min(spec_j, fold_j)，与 D10 同坐标系）；缺组成 dim 参数 → error；新命题 **P2 period 数据写者纪律**（`ejit_period_writer` 属性，写检测 + 调用纪律 + 指针污点传染，未来实现，§3.3 已记录属性签名）。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -157,6 +157,8 @@ period23 的实例 = (dim2, dim3 % 10)
 | `ejit_period_decl` | `StringArgument period, VariadicStringArgument dims` | 每 period 恰好一次；dims 均已声明；空 dims = 同名 1:1 sugar |
 | `ejit_period_fold` | `StringArgument period, StringArgument dim, EnumArgument op, Optional IntArgument operand` | 每 (period, dim) 至多一条；period 必须声明且包含该 dim；operand 缺省 → Sema 填入该 dim 的 spec |
 | `ejit_dim_spec_fold` | `StringArgument dim, BoolArgument enable` | 每 dim 恰好一次（D6）；dim 必须已声明；enable=true 时该 dim 必须存在非 identity 的 MOD fold 声明（C14/C15），operand 推导见 3.4bis |
+| `ejit_period_lc`（本次升级为变参） | `VariadicStringArgument periods`（现状单参 `StringArgument`） | 函数级（生命周期控制，使用处属性）；每个 period 必须已声明；**每个 period 的全部组成 dim 必须都在该函数参数上以 `ejit_dim` 标记**，缺 → **error**；PASS4 插桩 cellIdx 按维度偏移计算（§6.2），缺组成 dim 参数 → error |
+| `ejit_period_writer`（**未来实现，见 §7 命题 P2**） | `StringArgument period`（暂定） | 函数级；声明该函数修改 period 实例数据；功能：写检测（写 mayconst 属性 / memcpy / memset / strcpy 进属性或持有属性的结构体 → 必须标记）+ 调用纪律（writer 只能被 writer/lc 函数调用，且不得进入 entry 调用图）+ 指针污点传染（writer 进入类型系统：指向 writer 的指针携带污点，保存/传递/间接调用全链传染，降级赋值与 void* 中转报错）。本轮仅记录属性名与语义，实现暂缓 |
 
 折叠 op 枚举：`EJIT_FOLD_IDENTITY=0 / EJIT_FOLD_MOD=1 / EJIT_FOLD_DIV=2 / EJIT_FOLD_SHR=3 / EJIT_FOLD_AND=4`。
 
@@ -332,7 +334,7 @@ struct Data {
 | 查找/版本复核 | wrapper 传 **specs（特化 key）+ periods（生命周期参数）** 结构体指针（D12）；缓存 key = specs 照旧；版本复核 = slot 快照（u64 = periodId\|cellIdx\|version）一次比较，**免重算**（identity 全等 ⟹ cellIdx 不变）；active 检查直接查表，接口内零算术 |
 | wrapper（PASS3） | 构建两层参数：**specs**——spec_fold dim 实参插 `urem %LCM`（现状已有，icache GEP 下标、bucket cache key、编译请求 specId 三处统一取折叠值）；**periods**——对函数相关每个 period（编译期静态推导：组成 dim ⊆ 函数参数集）插指令算 cellIdx（分量 = spec % fold_operand，operand/stride 为 AOT 立即数），栈上构建数组传入；相关 period 声明不可见 → 编译失败（D12 跨 TU） |
 | 编译/JIT | 非 L3 dim 照旧（参数替换，特殊化 key = 原始元组）；`EJitOptimizer` 对 spec_fold dim 改为：**参数不替换** + 模式匹配 (MOD, operand) 形态的折叠表达式并替换为 `ConstantInt(instanceId mod operand)` → InstCombine 折叠 GEP → `EJitStructFieldPass` 走全常量路径（**零改动**）；编译请求结构零改动（dims 全传，完整性校验照过） |
-| PASS4 lc 插桩 | cellIdx 改为"组合实例"：声明元数据在同 TU 可见时内联计算（mod/div/shr 是廉价指令）；不可见时编译报错（严格模式）。`ejit_activate/deactivate` 签名保持 `(name, cellIdx)`，cellIdx 语义升级为实例索引 |
+| PASS4 lc 插桩 | `ejit_period_lc` 升级为**变参**（`"p1","p2",...`，每 period 各插一对 activate/deactivate）；cellIdx 按**维度偏移**内联计算：`cellIdx = Σ (arg_i × stride_i)`，`stride_i = Π_{j<i} min(spec_j, fold_j)`（行优先，与 D10 数组维度、嵌值关卡 L 同一坐标系）；缺组成 dim 参数 → **error**（§3.3 lc 行）。`ejit_activate/deactivate` 签名保持 `(name, cellIdx)`，cellIdx 语义升级为实例索引 |
 | icache | spec_fold dim 的 GEP 下标用折叠值（槽位自动共享）；维度尺寸改用 spec（O-1/O-9 联动） |
 | PASS2 | period 数组注册携带组合信息（来自声明元数据，按名关联） |
 | 数组编码（D10/D11） | `ejit_period_arr` 元数据扩展：完整维度列表（现状只最外层 count）+ 成员 period 描述表（类型, 成员名, 字节偏移）；`reAnnotateMayConst` 兜底匹配器升级为 pattern 判定（支持多动态索引，现状只允许一个）；JIT 期 direct GEP 全常量路径已覆盖取地址再解引用，无需新机制 |
@@ -365,6 +367,16 @@ ejit_status_t ejit_taskpool_compile_or_get(
 
 **wrapper 侧**（AOT 生成，每次调用执行）：相关 period 集合编译期静态推导（函数 dim 集合 × 全局 period 定义，组成 ⊆ 参数集才相关）；对每个 period 插指令算 cellIdx（operand/stride 为 AOT 立即数），栈上构建 periods 数组传入。相关 period 声明不可见 → 编译失败。
 
+**PASS4 lc 插桩**（本次升级）：`ejit_period_lc` 显式指定 period（可列表），每个 period 按名查声明 → 组成 dim 列表 → 按名找 `ejit_dim` 参数 → 维度偏移计算：
+
+```
+cellIdx = Σ (arg_i × stride_i)          // stride_i = Π_{j<i} min(spec_j, fold_j)
+入口：  ejit_deactivate("p", cellIdx)   // 每个 period 各插一对
+返回前：ejit_activate("p", cellIdx)
+```
+
+stride 用 `min(spec, fold)`（非裸 fold）——与 D10 数组各维尺寸一致，保证 lc 的 cellIdx 与数组线性下标、嵌值关卡 L 三者同一坐标系。lc 函数缺任一组成 dim 参数 → 编译报错（§3.3 约束）。
+
 **运行时三条路径**：
 
 | 路径 | 频率 | 逻辑 | 新增算术 |
@@ -393,6 +405,16 @@ ejit_status_t ejit_taskpool_compile_or_get(
 - 失效钩子：dynamic 数据运行期可变 ⇒ 现状"实例数据一次性写入"假设对 dynamic 不成立，写入路径需要版本提升接口；half-static 仍近似一次写入。
 - Tier-1 是否需要独立 icache 层。
 - 是否引入第三种 `static` type（编译期恒定）。
+
+**命题 P2 —— period 数据写者纪律（标记传染，暂缓实现）**：
+
+- **动机**：period 数组（mayconst 属性）数据被 JIT 嵌值；若写者在不受控时机修改数据，特化版本与数据脱节。现状"实例数据一次性写入"（A-1）只是假设，P2 将其**静态化**：写入被编译器验证只能在受控窗口（lc 失效窗口）发生。
+- **属性 `ejit_period_writer`**（§3.3 已记录，本轮仅定名）：声明该函数修改 period 实例数据；period 由写对象的全局标记（`ejit_period_arr`）追溯。
+- **规则 ① 写者必标**：函数体写 mayconst 属性（直接写，或 memcpy/memset/strcpy 进属性或持有属性的结构体）→ 必须标 `ejit_period_writer(period)`，缺 → error。
+- **规则 ② 类型系统污点（指针传染）**：writer 是函数类型的属性；指向 writer 函数的指针（赋值/初始化/参数传递）携带污点，保存/返回/间接调用**全链自动传染**；降级赋值（污染 → 干净指针）→ error（丢属性 = 漏检）；禁止经 `void*` 中转。静态分析无法区分指针的运行期分支（`cond ? writer : normal`），保守处理：污染指针的所有间接调用点视为可能调用 writer。
+- **规则 ③ 调用纪律**：writer 函数（含被污染指针的间接调用）只能被同为 writer(period) 或 lc(period) 的函数调用（= 写入只发生在 lc 失效窗口）；writer 不能出现在任何 entry 函数的调用图（含内联）（= JIT 特化执行期间数据不变）。
+- **规则 ④ lc 完整性**：lc(period) 必须包含 period 全部组成 dim 参数，缺 → error（**本次实现**，§3.3）。
+- **与 P1 的关系**：P1 的"dynamic 数据运行期可变 → 写入路径需要版本提升接口"与 P2 的写入窗口同域，落地时可合并考虑。
 
 **开放问题**：
 
