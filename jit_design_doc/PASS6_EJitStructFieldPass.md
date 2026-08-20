@@ -1,11 +1,13 @@
 # EJitStructFieldPass 设计文档
 
-**版本**: 1.6
-**日期**: 2026-05-11
+**版本**: 1.7
+**日期**: 2026-08-19
 **关联**: SPEC4.md, PLAN4.md
 **类型**: JIT Module Pass
 **顺序**: JIT Pipeline 第 4 步 (参数预处理 → InstCombine → Inline 之后)
 
+> **v1.7 新增**: 替换验证器（`Config::verifySubstitution`）。本 Pass 冻结的值只在"内存此后不再改变"的前提下正确，而该前提无法在编译期证明。验证模式保留 may_const load 并在其后插入运行时比对，用一次真实业务运行把已标注字段按测量结果分类。详见 §11。
+>
 > **v1.6 变更**: v1.5 设计的间接指针访问路径已全部实现。支持 `ejit_period_arr` 指针型全局变量（§2.1 模式 5/5b）和 `ejit_period` 指针型静态变量。当 `findRootGV` 沿 GEP 链遇到 `LoadInst` 阻隔时，回退到间接路径：扫描 GEP 链找到 `LoadInst` → 解析其来源 GV → 通过 `resolveBase` 获取运行时地址 → 读取 `*(void**)&GV` 得到实际数据指针 → 累加字段偏移 → 读取常量值。
 >
 > **v1.5 变更**: 设计指针全局变量支持方案。当 GEP 基址是间接 load（load ptr from GV）时，PASS6 多追溯一层 —— 先从 GV 读取指针值作为真正的基地址，再加字段偏移。详见 §2.1 模式 5、§3.2。
@@ -831,6 +833,79 @@ EJitStructFieldPass 本身不受优化等级影响 — 常量替换是基础操�
 
 ---
 
-*文档版本: 1.5*
+## 11. 替换验证器 (Config::verifySubstitution) — v1.7 新增
+
+### 11.1 要解决的问题
+
+本 Pass 把一个 `ejit_may_const` load 换成它在编译时从进程内存里读到的值。只有当那块内存此后一直保持该值，替换才是正确的 —— 而 Pipeline 中没有任何环节能证明这一点：一个由实时状态写入的字段（负载统计、队列深度）和一个只在配置阶段写一次的字段，被冻结得同样干脆。失败是静默的：内存本身仍然正确，只是特化后的代码不再去读它。
+
+验证器不去猜哪个字段安全，而是**测量**：跑一遍真实业务，每一个报出 mismatch 的字段就是不该标 `ejit_may_const` 的字段。
+
+比对同时覆盖两类错误：load 走的是源码算出的地址（AOT 全局符号），冻结值来自 PASS6 经时间窗注册表推导的地址。两者不一致时（注册的 baseAddr 错误、字段偏移算错），同样表现为 mismatch。
+
+### 11.2 两级开关
+
+| 开关 | 位置 | 默认 | 作用 |
+|------|------|------|------|
+| `EJIT_VERIFY_SUBSTITUTION` | CMake（`cmake -S llvm -B <build> -DEJIT_VERIFY_SUBSTITUTION=ON`） | OFF | 是否把验证器编进运行时 |
+| `config.verifySubstitution` | `ejit_init()` 的 `ejit_config_t` | false | 本次运行是否启用 |
+
+CMake 开关 OFF 时，插桩代码、per-site 表、运行时 helper 都不进 `ejit.o`（aarch64 -Os 实测约省 6.6 KB text + 6.7 KB bss）；此时 `ejit_init()` **拒绝** `config.verifySubstitution` 并记录一条 diag，`ejit_verify_available()` 返回 0。这是刻意的：若静默降级为普通替换，所有计数器都会是 0，与"没有任何字段发生漂移"这一结论无法区分 —— 而这恰恰是本模式绝不能误报的答案。
+
+宏用 `target_compile_definitions(LLVMEJIT PRIVATE ...)` 挂在 LLVMEJIT 上（而非 `add_definitions`），切换它不会触发整棵 LLVM 树重编。
+
+### 11.3 验证模式下的 Pass 行为
+
+替换被整体让位给插桩：
+
+```llvm
+; 普通模式（替换）
+%v = <被删除>                      ; 所有使用点换成 i32 4
+
+; 验证模式（保留 + 比对）
+%2 = load i32, ptr @g_cfg, !ejit.may_const !18, !ejit.verified !18
+%3 = zext i32 %2 to i64
+call void @__ejit_verify_check(ptr @.ejit.verify.site, i64 4, i64 %3)
+```
+
+- **site 命名**: `"<函数名>:<全局变量>+<字节偏移>"`，例如 `probe:g_cfg+4`。间接指针模式没有可达的根全局变量，退化为 `"<函数名>:<indirect>+<解引用后的偏移>"`，仍能区分同一结构体的不同字段。名字在模块内按字符串去重，一个热函数对同一字段的多次访问只生成一个字符串常量。
+- **类型**: 整数/浮点/指针统一 zext 到 i64 后传给 helper。浮点走同宽 bitcast —— 比的是 bit 相等，NaN payload 和 ±0 必须保留。宽度 > 64 位的类型不插桩，与 `createConstantFromMemory` 无法materialize 的集合一致。
+- **重复插桩防护**: 插桩过的 load 打上 `!ejit.verified`。`runPipeline` 会跑两次本 Pass（阶段 1c / 1f），而验证模式下 load 不被消耗，没有这个标记第二次就会重复插桩并让所有计数翻倍。
+- **`dso_local` 清除**: 验证模式保留了 load，特化代码因此仍要在运行时够到 AOT 全局。`dso_local` 声明走直接寻址（AArch64 上 ADRP+LDR），只在 JIT 代码池落在程序数据的 PC 相对范围内才可解析；超出时**整个编译失败**，验证器一条结论都给不出来。故验证模式清除外部全局的 `dso_local`，访问改走 JITLink 就近生成的 GOT 表项。诊断模式每个全局多一次 load，替换模式不受影响（它的 load 已经没了）。
+
+### 11.4 运行时 API
+
+```c
+int    ejit_verify_available(void);                 /* 是否编进了这个 runtime */
+void   ejit_verify_get_stats(ejit_verify_stats_t *);/* sites / checks / mismatches 总计 */
+size_t ejit_verify_get_sites(ejit_verify_site_t *, size_t max);  /* 逐 site 明细 */
+void   ejit_verify_reset_stats(void);               /* 用于框定一段 workload */
+```
+
+`ejit_verify_site_t` 记录 site 名、checks、mismatches 以及最近一次 mismatch 的 frozen/actual 值。**总计数只说明"有东西漂移了"，分类要靠逐 site 明细** —— 而且在没开 `EJIT_DIAG_ENABLE` 的构建里，逐条 mismatch 的日志根本不存在，明细是唯一可读的形式。
+
+per-site 表是固定容量（64 条，名字 64 字节，超长截断）：验证模式要能在不允许诊断路径分配内存的目标上运行。超出容量的 site 仍计入总计，只是没有单独记录。
+
+### 11.5 结果判读
+
+| 观察 | 结论 |
+|------|------|
+| 某 site `mismatches > 0` | 该字段在 JIT 读过之后被改写，**不能**标 `ejit_may_const` |
+| 某 site `checks > 0, mismatches == 0` | 这次运行里该字段没漂移（覆盖范围内） |
+| `sites > 0` 但 `checks == 0` | 特化代码根本没被执行（wrapper 一直走 AOT），本次结论无效 —— 先用 `ejit_jit_verify_test` 确认运行时确实在派发 JIT 代码 |
+
+### 11.6 限制
+
+1. **只是诊断**: load 保留 ⇒ 常量不折叠、分支不消除，特化收益为零。验证模式用来判定标注是否正确，不产出快代码，不应进生产镜像。
+2. **覆盖率等于执行率**: 没被执行到的 site 什么也证明不了；LICM 把 load 提出循环时，检查次数会少于迭代次数。
+3. **只覆盖能被替换的 load**: 未能 materialize 成常量的 load 本来就不会被替换，也就不插桩。
+
+### 11.7 测试
+
+`ejit_test/ejit_verify_subst_test.c`：一个 `stableField`（配置期写一次）和一个 `volatileField`（JIT 读过之后被改写），断言验证器对前者保持沉默、对后者报警，并且断言到 **site 粒度** —— 总计数无法区分"一个字段在动"和"一批字段在动"。同时断言验证模式的行为透明性（load 还在，每次调用返回内存当前值），以及关闭验证时同一字段确实被冻结（`… o` 参数）。
+
+---
+
+*文档版本: 1.7*
 *创建日期: 2026-04-26*
-*最后更新: 2026-04-29*
+*最后更新: 2026-08-19*

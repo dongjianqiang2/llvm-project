@@ -111,6 +111,9 @@ typedef struct {
   bool forceStaticRegistry;
   /// If non-NULL, dump JIT-optimized LLVM IR (.ll) to this directory.
   const char *dumpJITDir;
+  /// Diagnostic: check ejit_may_const values at run time instead of freezing
+  /// them (EJitVerify.h). Disables specialization while on.
+  bool verifySubstitution;
 } ejit_config_t;
 
 typedef struct {
@@ -142,6 +145,48 @@ typedef struct {
   char message[256];
   char funcName[128];
 } ejit_error_t;
+
+/// Substitution-verifier counters (config.verifySubstitution). A non-zero
+/// `mismatches` means at least one ejit_may_const field changed after the
+/// JIT read it — that field is not safe to freeze.
+typedef struct {
+  uint64_t sites;      ///< instrumented may_const load sites emitted
+  uint64_t checks;     ///< instrumented loads executed
+  uint64_t mismatches; ///< executions where memory != the frozen value
+} ejit_verify_stats_t;
+
+/// Longest site name kept per record, including the terminator. Must match
+/// llvm::ejit::kVerifySiteNameMax.
+#define EJIT_VERIFY_SITE_NAME_MAX 64
+
+/// One instrumented may_const access, named "<func>:<global>+<byteOffset>".
+/// The totals say something diverged; this says which field did — and without
+/// EJIT_DIAG_ENABLE it is the only form that says so.
+typedef struct {
+  char site[EJIT_VERIFY_SITE_NAME_MAX];
+  uint64_t checks;      ///< executions of this site
+  uint64_t mismatches;  ///< executions where memory != the frozen value
+  uint64_t lastFrozen;  ///< frozen value at the most recent mismatch
+  uint64_t lastActual;  ///< memory value at the most recent mismatch
+} ejit_verify_site_t;
+
+/// The four entry points below are DEFINED only under EJIT_VERIFY_SUBSTITUTION;
+/// linking them otherwise is an undefined reference. They are declared
+/// unconditionally because a caller cannot see the runtime's build flags —
+/// test for the symbol at build time (ejit_test/build.sh reads CMakeCache)
+/// rather than calling one to find out.
+
+/// Always 1 where defined at all.
+int ejit_verify_available(void);
+
+void ejit_verify_get_stats(ejit_verify_stats_t *out);
+
+/// Copy up to \p max per-site records into \p out, returning the number
+/// written (ordered by first execution). Sites past the runtime's fixed table
+/// capacity are counted in the totals but have no record.
+size_t ejit_verify_get_sites(ejit_verify_site_t *out, size_t max);
+
+void ejit_verify_reset_stats(void);
 
 // Initialization
 ejit_status_t ejit_init(const ejit_config_t *config);

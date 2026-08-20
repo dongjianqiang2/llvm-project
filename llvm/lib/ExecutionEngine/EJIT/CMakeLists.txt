@@ -109,6 +109,7 @@ set(EJIT_SOURCES
   EJitModuleLoader.cpp
   EJitRegistrationStore.cpp
   EJitStructFieldPass.cpp
+  EJitVerify.cpp
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
   EJitProfileMerge.cpp
@@ -202,6 +203,17 @@ if(EJIT_SRE_TASKPOOL_NO_RECLAIM)
     EJIT_SRE_TASKPOOL_NO_RECLAIM)
   message(STATUS
     "EmbeddedJIT: NO_RECLAIM shared-cache hot path enabled (JIT code must never be physically reclaimed)")
+endif()
+
+# may_const substitution verifier (option declared in llvm/CMakeLists.txt). The
+# users of this macro are the JIT-side pass, the runtime helper, and the libcall
+# table — all inside LLVMEJIT — so scope it to the target instead of a global
+# add_definitions, like EJIT_CODE_POOL_4K_SEAL above.
+if(EJIT_VERIFY_SUBSTITUTION)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_VERIFY_SUBSTITUTION)
+  message(STATUS
+    "EmbeddedJIT: may_const substitution verifier built in (diagnostic; "
+    "enable per run with config.verifySubstitution)")
 endif()
 
 # Propagate the target triple setting to the C++ code

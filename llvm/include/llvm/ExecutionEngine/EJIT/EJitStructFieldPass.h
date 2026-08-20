@@ -38,11 +38,14 @@ using MayConstOffsetMap =
 /// constants.
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
+  /// \p verify selects the diagnostic mode described in EJitVerify.h: keep
+  /// each may_const load and check it at run time instead of substituting it.
   EJitStructFieldPass(PeriodArrayRegistry &reg,
                       const uint8_t *boundData = nullptr,
-                      uint32_t boundSize = 0, uint32_t boundArgIndex = 0)
+                      uint32_t boundSize = 0, uint32_t boundArgIndex = 0,
+                      bool verify = false)
       : registry_(reg), boundData_(boundData), boundSize_(boundSize),
-        boundArgIndex_(boundArgIndex) {}
+        boundArgIndex_(boundArgIndex), verify_(verify) {}
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
@@ -74,6 +77,9 @@ private:
   const uint8_t *boundData_ = nullptr;
   uint32_t boundSize_ = 0;
   uint32_t boundArgIndex_ = 0;
+  /// Unread without EJIT_VERIFY_SUBSTITUTION; kept in the interface so callers
+  /// need no #ifdef.
+  [[maybe_unused]] bool verify_ = false;
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;

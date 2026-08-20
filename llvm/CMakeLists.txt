@@ -598,6 +598,12 @@ if(EJIT_STATS_ENABLE)
   add_definitions(-DEJIT_STATS_ENABLE)
 endif()
 
+# Bring-up diagnostic, never wanted in a shipping image: see EJitVerify.h. OFF
+# keeps all of it out of ejit.o. Defined on the LLVMEJIT target (see the EJIT
+# CMakeLists) rather than via add_definitions, so toggling it does not recompile
+# the whole LLVM tree.
+option(EJIT_VERIFY_SUBSTITUTION "Build the EJIT may_const substitution verifier (diagnostic; default OFF)" OFF)
+
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)

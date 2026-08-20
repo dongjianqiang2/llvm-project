@@ -28,6 +28,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/ExecutionEngine/EJIT/EJitVerify.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -89,6 +90,11 @@ ArrayRef<LibcallSymbol> getLibcallSymbols() {
 #endif
       {"__llvm_profile_instrument_target",
        reinterpret_cast<void *>(&__llvm_profile_instrument_target)},
+#ifdef EJIT_VERIFY_SUBSTITUTION
+      // Only a verifier build's pass emits calls to this, and only that build
+      // defines it.
+      {"__ejit_verify_check", reinterpret_cast<void *>(&__ejit_verify_check)},
+#endif
 #if defined(_WIN32)
       {"__stack_chk_guard", reinterpret_cast<void *>(&HostStackChkGuard)},
 #else

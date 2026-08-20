@@ -15,6 +15,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitDimPair layout
+#include "llvm/ExecutionEngine/EJIT/EJitVerify.h"
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
@@ -331,6 +332,17 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
     dst.maxCacheSize = src->maxCacheSize;
   dst.enableLogger = src->enableLogger;
   dst.forceStaticRegistry = src->forceStaticRegistry;
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  dst.verifySubstitution = src->verifySubstitution;
+#else
+  // Refused rather than honoured: the pass would substitute as usual and every
+  // counter would read zero, which is indistinguishable from "nothing
+  // diverged" — the one answer this mode must never give by accident.
+  dst.verifySubstitution = false;
+  if (src->verifySubstitution)
+    EJIT_DIAG("verifySubstitution requested but this runtime was built "
+              "without EJIT_VERIFY_SUBSTITUTION: ignored");
+#endif
   if (src->dumpJITDir && src->dumpJITDir[0])
     dst.dumpJITDir = src->dumpJITDir;
   // NOTE: online PGO is NOT read from ejit_config_t. The public struct keeps
@@ -343,17 +355,27 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
 #endif
 }
 
-// Compile-time regression guard: the public ejit_config_t layout MUST stay
-// exactly as originally released (no new tail field), so ejit_init() never
-// over-reads an old caller's smaller struct. Online PGO is exposed additively
-// via ejit_init_pgo(), never by growing this struct. If a field is added,
-// these asserts fire and force an explicit, versioned ABI decision.
+// Compile-time regression guard: the public ejit_config_t layout is part of
+// the C ABI. The original layout ended at dumpJITDir, and online PGO is
+// exposed additively via ejit_init_pgo(), never by growing this struct, so
+// ejit_init() never over-reads an old caller's smaller struct. The one
+// accepted tail addition since is verifySubstitution (EJitVerify.h):
+// diagnostic-only, and callers compile against this tree's headers together
+// with the static runtime, so no version skew exists in practice. Anything
+// further must go through a dedicated entry point, as ejit_init_pgo did. If
+// a field is added anyway, these asserts fire and force an explicit,
+// versioned ABI decision.
 static_assert(offsetof(ejit_config_t, compileMode) == 0,
               "ejit_config_t.compileMode must stay first (ABI)");
+// verifySubstitution is a bool, so the struct legitimately carries tail
+// padding after it; the assert pins the size to the alignment-rounded end of
+// the field, which still trips on any pointer/size_t-sized append.
 static_assert(sizeof(ejit_config_t) ==
-                  offsetof(ejit_config_t, dumpJITDir) + sizeof(const char *),
-              "ejit_config_t must end at dumpJITDir (no online-PGO tail field "
-              "may be appended; use ejit_init_pgo instead)");
+                  (offsetof(ejit_config_t, verifySubstitution) + sizeof(bool) +
+                   alignof(ejit_config_t) - 1) /
+                      alignof(ejit_config_t) * alignof(ejit_config_t),
+              "ejit_config_t must end at verifySubstitution; new options "
+              "belong in dedicated entry points (see ejit_init_pgo)");
 static_assert(std::is_standard_layout<ejit_config_t>::value,
               "ejit_config_t must be standard-layout for a stable C ABI");
 
@@ -411,6 +433,18 @@ ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
 
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  {
+    // The totals are the whole point of the run, and a caller that forgets to
+    // read them would otherwise get nothing.
+    llvm::ejit::VerifyStats vs;
+    llvm::ejit::ejitVerifyGetStats(&vs);
+    if (vs.sites || vs.checks)
+      EJIT_DIAG("verify totals: sites=%llu checks=%llu mismatches=%llu",
+                (unsigned long long)vs.sites, (unsigned long long)vs.checks,
+                (unsigned long long)vs.mismatches);
+  }
+#endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   setDumpSharedState(nullptr);
 #endif
@@ -712,6 +746,51 @@ void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
   EJIT_DIAG("compile_or_get(key=0x%016lx): retired, use taskpool API", cacheKey);
   return nullptr;
 }
+
+#ifdef EJIT_VERIFY_SUBSTITUTION
+
+void ejit_verify_get_stats(ejit_verify_stats_t *out) {
+  if (!out)
+    return;
+  // Deliberately NOT gated on gEJIT: the counters live in the verifier's own
+  // storage, so a caller can still read a completed run after ejit_shutdown.
+  llvm::ejit::VerifyStats st;
+  llvm::ejit::ejitVerifyGetStats(&st);
+  out->sites = st.sites;
+  out->checks = st.checks;
+  out->mismatches = st.mismatches;
+}
+
+int ejit_verify_available(void) { return 1; }
+
+size_t ejit_verify_get_sites(ejit_verify_site_t *out, size_t max) {
+  if (!out || max == 0)
+    return 0;
+  static_assert(sizeof(out->site) == llvm::ejit::kVerifySiteNameMax,
+                "EJIT_VERIFY_SITE_NAME_MAX must match kVerifySiteNameMax");
+
+  // Copied field by field rather than reinterpreted: the C struct is an ABI
+  // the caller compiles against, not the runtime's internal record.
+  const size_t have = llvm::ejit::ejitVerifySiteCount();
+  size_t n = 0;
+  for (size_t i = 0; i < have && n < max; ++i) {
+    llvm::ejit::VerifySite tmp;
+    if (!llvm::ejit::ejitVerifyGetSite(i, &tmp))
+      continue;
+    std::memcpy(out[n].site, tmp.site, sizeof(out[n].site));
+    out[n].site[sizeof(out[n].site) - 1] = '\0';
+    out[n].checks = tmp.checks;
+    out[n].mismatches = tmp.mismatches;
+    out[n].lastFrozen = tmp.lastFrozen;
+    out[n].lastActual = tmp.lastActual;
+    ++n;
+  }
+  return n;
+}
+
+void ejit_verify_reset_stats(void) { llvm::ejit::ejitVerifyResetStats(); }
+
+#endif // EJIT_VERIFY_SUBSTITUTION
 
 void ejit_clear_cache(void) {
   EJIT_DIAG("clear_cache");
