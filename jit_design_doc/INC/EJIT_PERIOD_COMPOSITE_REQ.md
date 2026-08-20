@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.4.4**（2026-08-19/20）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。**v0.4.4 lc 形态确定 + 标记传染立项**：`ejit_period_lc` 升级为变参、**显式指定 period 列表**（不推断，部分覆盖不匹配）；cellIdx 维度偏移计算（stride = Π min(spec_j, fold_j)，与 D10 同坐标系）；缺组成 dim 参数 → error；新命题 **P2 period 数据写者纪律**（`ejit_period_writer` 属性，写检测 + 调用纪律 + 指针污点传染，未来实现，§3.3 已记录属性签名）。**v0.4.5 收尾：O-5 已决**（跨 TU 一致性基于编译期检查，运行时冲突检测不需要）+ **实现待办清单**（§7.2，3 类 21 项）。
+> 状态：**讨论稿 v0.4.4**（2026-08-19/20）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。**v0.4.4 lc 形态确定 + 标记传染立项**：`ejit_period_lc` 升级为变参、**显式指定 period 列表**（不推断，部分覆盖不匹配）；cellIdx 维度偏移计算（stride = Π min(spec_j, fold_j)，与 D10 同坐标系）；缺组成 dim 参数 → error；新命题 **P2 period 数据写者纪律**（`ejit_period_writer` 属性，写检测 + 调用纪律 + 指针污点传染，未来实现，§3.3 已记录属性签名）。**v0.4.5 收尾：O-5 已决**（跨 TU 一致性基于编译期检查，运行时冲突检测不需要）+ **实现待办清单**（§7.2，3 类 21 项）。**v0.4.6 分层回退定案（D14/§6.3）**：type（half-static/dynamic）**标在 dim 上**（粒度匹配：特化状态 per-dim，IR 层面无 period 概念）；wrapper **两级降级链**（轮1 全 specs+periods → 拿不到指针轮2 去 dynamic dim 再调 → AOT 兜底，失败原因不区分）；**dim 处理三场景**（① 无 spec-fold+指定优化：参数替换；② 有 spec-fold+指定优化：参数不替换、折叠表达式替换为 `spec % N`；③ 未指定优化 dynamic：全不替换查表）——替换集合 per 请求，**折叠表达式替换发生在 JIT 编译期**（AOT 阶段 dim 非常量，AOT 只收集折叠表达式位置）。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -56,11 +56,12 @@ period23 的实例 = (dim2, dim3 % 10)
 | **D6 type/spec 恰好一次** | 每个 dim 的 type 与 spec 都**不允许缺省、不允许重复配置**；编译器强制检查 |
 | **D7 fold 缺省规则** | fold 整行可缺省（= identity）；`EJIT_FOLD_MOD` 的 operand 可缺省，缺省取值 = 该 dim 的 spec |
 | **D8 分层回退方向（应用细节暂缓）** | type（half-static/dynamic）用于分级回退：dynamic 变化导致全特化失效时，先退回"仅 half-static 视为常量"的中间 JIT 版本，再退 AOT。**应用实现为另一命题，本阶段只定语法** |
-| **D9 特化折叠（L3）** | 特化 key 折叠为 **dim 级显式声明**（`ejit_dim_spec_fold(dim, enable)`，宏 `DEFINE_DIM_SPEC_FOLD`）；折叠参数不直接声明，由 AOT 从该 dim 参与的 period fold 声明推导：**operand = LCM(各 operand)、op 仅支持 MOD**（§3.4bis）；编译期语义 = **参数不替换 + 折叠表达式替换**（落点见 §6） |
+| **D9 特化折叠（L3）** | 特化 key 折叠为 **dim 级显式声明**（`ejit_dim_spec_fold(dim, enable)`，宏 `DEFINE_DIM_SPEC_FOLD`）；折叠参数不直接声明，由 AOT 从该 dim 参与的 period fold 声明推导：**operand = LCM(各 operand)、op 仅支持 MOD**（§3.4bis）；**JIT 编译期**语义 = **参数不替换 + 折叠表达式替换**（AOT 阶段 dim 非常量无法替换，AOT 只收集折叠表达式位置；落点见 §6.3） |
 | **D10 数组 = 实例空间容器** | period 数组的维度结构与 period 的 dim 列表对应（三种合法形态 §3.7）；各维尺寸 = 该 dim 折叠值域（`min(spec, fold operand)`，与 O-1 缓存规格一致）；数组线性下标 == 实例索引（行优先）；维度一致性为 **warning**（动态指针数组跳过检查）；维度实现独立（period 维度由声明推导、数组维度由用户声明，检查点比对） |
 | **D11 成员 period** | 结构体成员可复用 `ejit_period_arr` 标记（Subjects 扩展 FieldDecl）；成员数组 = 嵌套 period 容器（分层激活）；**嵌套限一层**，违反 → **error**；成员 period 的 dim 与外层 period 的 dim 不重叠（error）；成员不注册独立全局，绑定 = (外层类型, 成员名, 字节偏移) 编码进外层元数据 |
 | **D12 生命周期管理（运行时方案 3：wrapper 全量构建 + 结构体传递）** | **只有 period 才有版本号和生效时间窗**（dim 只有特化语义）。wrapper 每次调用构建两层参数：**特化参数** `specs = {dimType, specId}[]`（specId = dim_value % min(spec, LCM)，即现状折叠值）与**生命周期参数** `periods = {periodId, cellIdx}[]`（cellIdx = 折叠元组行优先线性化实例号，由 spec % fold_operand 推导——性质：`spec % fold == dim_value % fold`，operand 缺省 = dim_spec 时恒等 fold 自动成立）。结构体指针传入 `ejit_taskpool_compile_or_get`（通用入口 + `_0d.._4d` 快速入口统一扩展签名）。**接口内零算术**：active 检查/版本复核直接查表，复核免重算（identity 全等 ⟹ cellIdx 不变）。命名体系重命名：dims→specs、instanceId→specId、新增 `ejit_period_pair_t{periodId, cellIdx}`、`Slot.versions`→`periodVersions`、`version_[dimType][instanceId]`→`versionByPeriod[periodId][cellIdx]`。跨 TU：函数相关 period 声明在本编译单元不可见 → **编译失败**（D1 严格模式应用）。细目见 §6.2 |
 | **D13 规格上限矩阵（编译期约束，声明解析时拦截）** | ① dim 数（函数）≤ 4（**硬**：cacheKey 打包 + icache 指数）；② 每 dim 特化规格 `min(spec, LCM)` ≤ 256；③ period 组成 dim ≤ 4（**硬**：cellIdx 位域）；④ 每 period 分量 `min(spec, fold)` ≤ 256；⑤ **period 实例空间 Π min(spec, fold) ≤ 2^16**（cellIdx 编码 u16；slot 快照 u64 = periodId(u8) \| cellIdx(u16) \| version(u32)，一次比较完成复核）；⑥ 单函数相关 period ≤ 8（**软**：slot 预留 + 版本表行数，线性内存代价）。编译期保证后运行期校验降级为防御（保留） |
+| **D14 分层回退（P1 应用细化：降级链 + dim 处理三场景）** | **type（half-static/dynamic）标在 dim 上**——粒度匹配论证：特化状态是 per-dim 的（一个参数只有替换/保留一种处理），period 级 dynamic 与 per-dim 粒度不匹配（dim 同时属于 static period 与 dynamic period 时无法两全）；且 IR 优化层面已无 period 概念（只剩标记与全局偏移访问），嵌值资格由参数替换状态唯一决定（§6.3）。**wrapper 两级降级链**（简单模型，失败原因不区分）：轮1 带**全部** dim 的 specs + periods（含 dynamic dim，正常查缓存/miss 编译语义）→ 拿不到可用指针则轮2 去掉**全部** dynamic dim 及其相关 periods 再调用（半特化：key 仅 static dim、dynamic period 数据查表，版本不再牵连）→ 仍失败则 AOT 兜底。**dim 处理三场景**（替换集合 per 请求，同一 AOT bitcode 三形态）：① 无 spec-fold + 指定优化 → 参数替换为 dim_value（PASS1 现状）；② 有 spec-fold + 指定优化 → 参数不替换、折叠表达式 `urem %arg, N` 替换为立即数 `spec % N`（N \| LCM 数学性质，替换值可由 spec 推出）→ 两场景共同效果：**寻址全常量 → 嵌值**；③ 未指定优化（dynamic）→ 全不替换，运行期算 cellIdx 查表。**折叠表达式替换发生在 JIT 编译期**（EJitOptimizer）——AOT 阶段 dim 非常量无法替换，AOT 只收集折叠表达式位置。细目见 §6.3 |
 
 ## 3. 语法定义（本阶段聚焦）
 
@@ -152,7 +153,7 @@ period23 的实例 = (dim2, dim3 % 10)
 | 属性 | 参数 | 约束（Sema 强制） |
 |---|---|---|
 | `ejit_dim_decl` | `StringArgument dim` | 每 dim 恰好一次 |
-| `ejit_dim_type` | `StringArgument dim, StringArgument type` | 每 dim 恰好一次；type ∈ 白名单 `{half-static, dynamic}`（预留 `static`） |
+| `ejit_dim_type` | `StringArgument dim, StringArgument type` | 每 dim 恰好一次；type ∈ 白名单 `{half-static, dynamic}`（预留 `static`）；**语义（D14）**：dynamic = 降级候选——wrapper 降级链轮2 去掉该 dim（不特化、数据查表），轮1 仍正常参与全特化（§6.3） |
 | `ejit_dim_spec` | `StringArgument dim, IntArgument spec` | 每 dim 恰好一次；spec ∈ (0, 256] |
 | `ejit_period_decl` | `StringArgument period, VariadicStringArgument dims` | 每 period 恰好一次；dims 均已声明；空 dims = 同名 1:1 sugar |
 | `ejit_period_fold` | `StringArgument period, StringArgument dim, EnumArgument op, Optional IntArgument operand` | 每 (period, dim) 至多一条；period 必须声明且包含该 dim；operand 缺省 → Sema 填入该 dim 的 spec |
@@ -397,14 +398,66 @@ stride 用 `min(spec, fold)`（非裸 fold）——与 D10 数组各维尺寸一
 | Sema / 注册表解析 | D13 编译期约束检查 |
 | 命名 | dims→specs、instanceId→specId、packedDims→packedSpecs、versions→periodVersions、version_[dimType][instanceId]→versionByPeriod[periodId][cellIdx] |
 
+### 6.3 分层回退（D14 细化，v0.4.6）
+
+**type（half-static/dynamic）为什么标在 dim 上**：
+
+- **粒度匹配**：特化状态是 per-dim 的——一个参数只有"替换为常量 / 保留实参"一种处理，不存在 per-period 的中间态。若 dynamic 标在 period 上，dim1 同时属于 period1（static）与 period12（dynamic）时：选特化 → period12 失效牵连整个特化版本，period1 的嵌值白嵌；选不特化 → period1 嵌值收益白丢——**无法两全**。
+- **IR 层面无 period 概念**：优化管线里只剩标记与全局偏移访问，嵌值资格由**参数替换状态**唯一决定（替换后 cellIdx 常量 ⟹ 嵌值关卡 `L == cellIdx` 成立）。判定点是 per-dim 的、机械的；period 级 dynamic 需要把 per-period 信息穿透优化管线、在每个数据访问点做额外决策，制造新的不一致面。
+- **一致性自动成立**：type 标 dim ⟹ dynamic dim 不特化 ⟹ 其所有相关 period 的数据访问统一查表（L 非常量，天然不嵌值），不存在"保证 period1 保持不可变假设"的问题——因为对 dynamic dim 相关数据根本不假设。
+
+**降级链（wrapper 侧生成，简单模型）**：
+
+```
+轮1: ptr = compile_or_get(全部 specs【dim1, dim2】 + 全部 periods【period1, period12】)
+轮2: ptr = compile_or_get(去 dynamic 的 specs【dim1】 + 去 dynamic 相关 periods【period1】)
+轮3: ptr = AOT 兜底
+```
+
+- 每轮内部走完整语义：查缓存 → miss 则编译 → 版本复核 → **拿到可用指针才返回**；失败原因不区分（复核失败 / 编译失败 / 缓存不可用统一降级）
+- dynamic dim **一次性全部去掉**（非逐维降级）；其相关 periods 一并去掉（period 由组成 dim 定位实例，缺 dim 无法算 cellIdx）
+- 轮1 是完整尝试：dynamic dim 也参与特化（业务平时快）；**复核失败即降级，不反复重编译**（dynamic 的语义就是"失效即降级"）
+- 轮2 的缓存 key 仅含 static dim，有效性仅受 static 相关 periods 影响；dynamic 相关 period 数据运行期查表（实参算 cellIdx）→ 版本变化不牵连轮2 版本
+- D13 上限矩阵：dynamic dim 参与轮1 特化与校验；轮1 编译失败（如超限）自然落入降级链
+
+**dim 处理三场景（JIT 编译期按请求的特化集合做替换，同一 AOT bitcode 三形态）**：
+
+| 场景 | 判定 | 参数（dim） | 折叠表达式 `urem %arg, N` | 寻址/数据 | 对应轮次 |
+|---|---|---|---|---|---|
+| 1 | 无 spec-fold + 指定优化 | **替换为 dim_value**（PASS1 现状） | —（无折叠） | cellIdx 全常量 → **嵌值** | 轮1/轮2 的 static dim |
+| 2 | 有 spec-fold + 指定优化 | **不替换**（保留实参） | **替换为立即数 `spec % N`** | cellIdx 全常量 → **嵌值** | 轮1/轮2 的 static dim |
+| 3 | 未指定优化（dynamic） | **不替换**（保留实参） | **保留**（运行期 % 指令） | cellIdx 运行期计算 → **查表** | 轮2 的 dynamic dim；AOT 全部 |
+
+- **场景 1 与场景 2 殊途同归**：替换对象不同（参数 vs 折叠表达式），共同效果是**寻址全常量 → 拿到嵌值资格**；fold = identity（无 spec-fold）时场景 1 是场景 2 的特例
+- 替换集合由请求决定：轮1 = 全部 dim 按场景 1/2；轮2 = static dim 按场景 1/2 + dynamic dim 按场景 3；轮3 = 全部场景 3
+- **AOT 只收集折叠表达式位置（标记），不做替换**——AOT 阶段 dim 是非常量，替换无从发生；折叠替换发生在 JIT 编译期（EJitOptimizer，D9 落点）
+
+**数学性质（场景 2 替换值的可计算性）**：
+
+spec = dim % LCM（请求携带，无需 dim_value）。对 period fold operand N（N \| LCM，D9 约束）：
+
+```
+dim % N = (q·LCM + spec) % N = spec % N      （q·LCM % N = 0 ⟺ N | LCM）
+```
+
+JIT 编译期只凭 spec 即可把 `urem %arg, N` 替换为立即数 `spec % N`。该性质同时保证 key 折叠正确性（§3.4bis 第 5 条：spec 确定后各 period 替换常量均确定）。替换后参数若无其他使用被 DCE，语义一致。
+
+**落点**：
+
+| 组件 | 改动 |
+|------|------|
+| EJitWrapperGen.cpp | 多段 compile_or_get 调用 + 失败分支；轮2 的 specs/periods 集合静态推导（去 dynamic dim 及其相关 period）；AOT 兜底调用 |
+| 接口（C ABI） | compile_or_get 失败通道语义：拿不到可用指针 → 返回非 OK，wrapper 据此降级 |
+| JIT 编译管线 | 按请求特化集合替换：场景 1 = PASS1 参数替换（现状）；场景 2 = 折叠表达式替换（EJitOptimizer，D9 落点）；场景 3 = 跳过替换 |
+| Sema | type 白名单 + dynamic 语义（§3.3）；AOT 收集折叠表达式位置标记 |
+
 ## 7. 后续命题与开放问题
 
-**命题 P1 —— type 的应用语义（D8 细化，暂缓）**：
+**命题 P1 —— type 的应用语义（D8/D14 已细化，方向定案；余项暂缓）**：
 
-- 分层回退模型：Tier-2 全特化（所有 dim 常量化）→ Tier-1 半特化（仅 half-static 常量化，dynamic 保留运行期实参）→ AOT。Tier-1 复用同一编译管线，仅配置"替换哪些参数"。
-- 失效钩子：dynamic 数据运行期可变 ⇒ 现状"实例数据一次性写入"假设对 dynamic 不成立，写入路径需要版本提升接口；half-static 仍近似一次写入。
-- Tier-1 是否需要独立 icache 层。
-- 是否引入第三种 `static` type（编译期恒定）。
+- **应用模型已定型（D14/§6.3）**：type 标在 dim 上；wrapper 两级降级链（轮1 全特化 → 轮2 去 dynamic 半特化 → AOT 兜底）；dim 处理三场景（参数替换 / 折叠表达式替换 / 全不替换），替换集合 per 请求。
+- 失效钩子：dynamic period 数据变化 → 版本 bump → 轮1 嵌值版本复核失败 → **wrapper 降级轮2**（不反复重编译）；half-static 仍近似一次写入。"写入路径需要版本提升接口"与 P2 的写入窗口同域，落地时合并考虑（P2 未来实现）。
+- 余项暂缓：Tier-1（轮2）是否需要独立 icache 层；是否引入第三种 `static` type（编译期恒定，§3.3 白名单已预留）。
 
 **命题 P2 —— period 数据写者纪律（标记传染，暂缓实现）**：
 
