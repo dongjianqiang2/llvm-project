@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.4.4**（2026-08-19/20）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。**v0.4.4 lc 形态确定 + 标记传染立项**：`ejit_period_lc` 升级为变参、**显式指定 period 列表**（不推断，部分覆盖不匹配）；cellIdx 维度偏移计算（stride = Π min(spec_j, fold_j)，与 D10 同坐标系）；缺组成 dim 参数 → error；新命题 **P2 period 数据写者纪律**（`ejit_period_writer` 属性，写检测 + 调用纪律 + 指针污点传染，未来实现，§3.3 已记录属性签名）。
+> 状态：**讨论稿 v0.4.4**（2026-08-19/20）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。**v0.4.4 lc 形态确定 + 标记传染立项**：`ejit_period_lc` 升级为变参、**显式指定 period 列表**（不推断，部分覆盖不匹配）；cellIdx 维度偏移计算（stride = Π min(spec_j, fold_j)，与 D10 同坐标系）；缺组成 dim 参数 → error；新命题 **P2 period 数据写者纪律**（`ejit_period_writer` 属性，写检测 + 调用纪律 + 指针污点传染，未来实现，§3.3 已记录属性签名）。**v0.4.5 收尾：O-5 已决**（跨 TU 一致性基于编译期检查，运行时冲突检测不需要）+ **实现待办清单**（§7.2，3 类 21 项）。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -424,13 +424,80 @@ stride 用 `min(spec, fold)`（非裸 fold）——与 D10 数组各维尺寸一
 | O-2 | 隐式 1:1 声明（3.6）：倾向不引入 |
 | O-3 | 折叠算子集合 `%N /N >>S &M` 是否覆盖业务；是否需要 dim 间线性组合 |
 | O-4 | 各注册表容量：dim 数、period 数、每 period 实例空间上限 |
-| O-5 | 跨 TU 一致性：以"声明头文件 + 运行时冲突检测"为准，还是需要链接级校验 |
+| O-5 | ~~跨 TU 一致性~~ **已决（v0.4.5）**：基于编译期检查——相关 period 声明在本编译单元不可见 → 编译失败（D12 严格模式）；运行时冲突检测不需要 |
 | O-6 | 属性命名 `ejit_dim_decl/ejit_dim_type/ejit_dim_spec/ejit_period_decl/ejit_period_fold` 为暂定名 |
 | O-7 | FOR_EACH/NARG 宏机制在 clang 全版本验证；period 组成 dim 数上限（现按 8） |
 | O-8 | ~~L3 是否扩展 AND 等 op~~ **已决（v0.3.1）**：L3 仅支持 MOD，不扩展 |
 | O-9 | ~~spec_fold dim 的缓存维度~~ **已决（v0.3.1）**：按折叠值域 `min(spec, LCM)`，见 O-1/§6 |
 | O-10 | 取地址跨函数传递（指针参数/返回值携带 period 标签）：本轮不做，函数内直接传递已支持 |
 | O-11 | （可选优化）嵌入实例集复核：把被放弃嵌值的实例集（如 `g[cell+1]` 的实例 (1)）纳入特化版本复核范围，恢复其嵌值资格——本轮不做（§3.7 规则 4 的关卡检查为无条件正确性要求，O-11 仅为补偿优化） |
+| O-12 候选 | 维度级生命周期：lc 部分覆盖（只含 period 部分组成 dim）时无法定位完整实例——本轮不匹配（lc 缺组成 dim 参数 → error，见 §3.3）；若未来需要"period 下各 dim 独立激活"，另行立项 |
+
+### 7.1 决策编号速查（D1–D13）
+
+| 编号 | 一句话 |
+|---|---|
+| D1 | 先声明后使用：使用处找不到声明 → 编译失败（严格模式也管跨 TU） |
+| D2 | 使用处语法不变：ejit_dim / ejit_period_arr / ejit_period_lc 写法照旧 |
+| D3 | 折叠走独立属性，不内嵌进名字字符串 |
+| D4 | 同名 1:1 声明合法，与现状语义等价、下游机制不改 |
+| D5 | 声明逐条成行、属性增量追加（宏载体，__COUNTER__ 编号） |
+| D6 | type/spec 恰好一次，不允许缺省、不允许重复 |
+| D7 | fold 缺省规则：整行缺省 = identity；operand 缺省 = 该 dim 的 spec |
+| D8 | 分层回退方向（half-static/dynamic → Tier-2/Tier-1/AOT）——应用细节暂缓（命题 P1） |
+| D9 | 特化折叠（L3）：dim 级声明，operand = 相关 period fold 的 LCM、op 仅 MOD；参数不替换 + 折叠表达式替换 |
+| D10 | 数组 = 实例空间容器：维度与 period dim 列表对应，各维 = min(spec, fold operand)，线性下标 == 实例索引 |
+| D11 | 成员 period：结构体成员复用 ejit_period_arr，嵌套限一层，绑定 = (类型, 成员, 字节偏移) |
+| D12 | 生命周期管理（方案 3）：只有 period 有版本号与生效时间窗；wrapper 全量构建 specs + periods 结构体传入；接口内零算术；命名重命名；跨 TU 编译失败 |
+| D13 | 规格上限矩阵（编译期拦截）：dim ≤ 4 硬、min(spec,LCM) ≤ 256、period 组成 ≤ 4 硬、分量 ≤ 256、实例空间 Π ≤ 2^16（cellIdx u16）、period ≤ 8 软 |
+
+### 7.2 实现待办清单
+
+按组件分三类，共 21 项。状态列：**待办** = 未开工；**本次方案范围** = v0.4.x 复合 period 方案的直接改动；**未来命题** = 与 P1/P2/O 编号关联的延后项。
+
+**A. clang 前端（4 项）**
+
+| # | 事项 | 细节 / 关联 | 状态 |
+|---|---|---|---|
+| 1.1 | 新增声明属性 6 个 | `ejit_dim_decl` / `ejit_dim_type` / `ejit_dim_spec` / `ejit_period_decl` / `ejit_period_fold` / `ejit_dim_spec_fold`（§3.1/§3.3，D5）；`ejit_period_writer` 已记录签名但**未来实现**（P2） | 待办（本次方案范围） |
+| 1.2 | `ejit_period_lc` 升级变参 | 显式 period 列表（不推断）；缺组成 dim 参数 → error（P2 规则 ④，本轮实现） | 待办（本次方案范围） |
+| 1.3 | D13 规格上限矩阵编译期检查 | 声明解析时拦截：dim ≤ 4（硬）、min(spec,LCM) ≤ 256、period 组成 ≤ 4（硬）、分量 min(spec,fold) ≤ 256、实例空间 Π ≤ 2^16、单函数 period ≤ 8（软） | 待办（本次方案范围） |
+| 1.4 | D1 严格模式 | 相关 period 声明在本编译单元不可见 → 编译失败（O-5 已决：跨 TU 靠编译期，不做运行时冲突检测） | 待办（本次方案范围） |
+
+**B. AOT passes（8 项）**
+
+| # | 事项 | 细节 / 关联 | 状态 |
+|---|---|---|---|
+| 2.1 | PASS1 多动态索引 + 折叠表达式替换 | 替换落点 = 折叠表达式（MOD 形态）→ 折叠常量（D9/L3，§3.4bis）；operand = LCM 推导 | 待办（本次方案范围） |
+| 2.2 | wrapper 构建 periods | specs 构建现状已有；新增 periods = {periodId, cellIdx}[]，cellIdx = spec % fold_operand 推导（性质 `spec % fold == dim_value % fold`）；结构体指针传入（D12 方案 3） | 待办（本次方案范围） |
+| 2.3 | PASS4 变参插桩 | 显式 period 列表；cellIdx = Σ(arg_i × stride_i)，stride_i = Π min(spec_j, fold_j)（§3.3，与 D10 同坐标系） | 待办（本次方案范围） |
+| 2.4 | PeriodRegistry 生成 | 声明 → 注册表行：periodId、声明实例空间（Π min(spec,fold)）、cellIdx 映射 | 待办（本次方案范围） |
+| 2.5 | PASS2 组合信息编码 | dim→period 关联表、D11 成员 period 绑定（类型, 成员, 字节偏移） | 待办（本次方案范围） |
+| 2.6 | L3 折叠替换落点 | EJitOptimizer 唯一行为改动点；PASS6 / 编译请求 / 注册表零改动（D9） | 待办（本次方案范围） |
+| 2.7 | 嵌值关卡 `L == cellIdx` | 值级判定（v0.4.2）；StructFieldPass 新增 per-period cellIdx 表（按 ctx 匹配） | 待办（本次方案范围） |
+| 2.8 | 命名改名 | dims→specs、instanceId→specId、packedDims→packedSpecs（D12 命名体系） | 待办（本次方案范围） |
+
+**C. 运行时（9 项）**
+
+| # | 事项 | 细节 / 关联 | 状态 |
+|---|---|---|---|
+| 3.1 | 接口签名扩展 | `ejit_taskpool_compile_or_get` 通用入口 + `_0d.._4d` 快速入口统一扩展：specs + periods 结构体指针传入（D12） | 待办（本次方案范围） |
+| 3.2 | `ejit_activate`/`ejit_deactivate` cellIdx 改 u16 | C ABI 现为 `uint8_t cellIdx`（EJitRuntime.cpp:389/403），D13 实例空间 ≤ 2^16 下截断；PASS4 IR 已是 i32，只改 C ABI 声明 | 待办（本次方案范围） |
+| 3.3 | 版本表重构 | `enabled_[8][256]` / `version_[8][256]` 裸数组 → `enabledByPeriod` / `versionByPeriod`：每 period 一行，按声明实例空间分配（D12） | 待办（本次方案范围） |
+| 3.4 | slot 快照 u64 | periodId(u8) \| cellIdx(u16) \| version(u32) 一次比较完成复核（D13；放宽 2^32 的路径 = 两 u64） | 待办（本次方案范围） |
+| 3.5 | 复核逻辑 | identity 全等 ⟹ cellIdx 不变免重算；版本复核走快照（§6.2） | 待办（本次方案范围） |
+| 3.6 | name→periodId 解析 | wrapper 传入字符串名 → 注册表查 periodId（替换现状 dimType 直用） | 待办（本次方案范围） |
+| 3.7 | compileNow packedSpecs 打包 | cacheKey u64 = funcIndex<<32 \| p0 \| p1<<8 \| p2<<16 \| p3<<24 保留（每 dim 8 位，specId ≤ 255） | 待办（本次方案范围） |
+| 3.8 | 命名改名 | `Slot.versions`→`periodVersions`、`version_[dimType][instanceId]`→`versionByPeriod[periodId][cellIdx]`（D12） | 待办（本次方案范围） |
+| 3.9 | icache 折叠值下标 | icache 以折叠值（folded instance）为下标存储（D9 替换后语义） | 待办（本次方案范围） |
+
+**命题与开放问题状态**：
+
+- **P1**（type 应用语义 / 分层回退）：暂缓，不排期（D8 仅定方向）。
+- **P2**（period 数据写者纪律）：未来实现；规则 ④ lc 完整性已并入 1.2 本轮做。
+- **O-2 / O-3 / O-4 / O-6 / O-7**：待定，不影响主线实现（其中 O-4 注册表容量与 D13 关联，落地时以 D13 为准）。
+- **O-5**：已决（编译期检查）。**O-10 / O-11**：本轮不做。
+- **O-12 候选**（维度级生命周期）：如需"period 下各 dim 独立激活"另行立项，与 P1 的 dynamic 维度相关。
 
 ## 8. 术语对照
 
