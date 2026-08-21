@@ -86,6 +86,30 @@ static void collectReferencedExternalDecls(
   }
 }
 
+static void isolateSpecializationEntry(Module &M, StringRef EntryName) {
+  for (Function &F : M.functions()) {
+    if (F.getName() == EntryName || F.isDeclaration() ||
+        !hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+      continue;
+
+    // A shared TU bitcode payload can contain several ejit_entry definitions.
+    // Keeping them would let A's specialization context rewrite B's body and
+    // bind A -> B directly inside the specialization module. Make every other
+    // entry an external call instead; its registered AOT wrapper performs B's
+    // own specialization lookup.
+    Attribute WrapperSymbol = F.getFnAttribute(ATTR_EJIT_WRAPPER_SYMBOL);
+    std::string WrapperName = WrapperSymbol.isValid()
+                                  ? WrapperSymbol.getValueAsString().str()
+                                  : std::string();
+    F.deleteBody();
+    F.setVisibility(GlobalValue::DefaultVisibility);
+    F.setLinkage(GlobalValue::ExternalLinkage);
+    F.setDSOLocal(false);
+    if (!WrapperName.empty())
+      F.setName(WrapperName);
+  }
+}
+
 struct EJitOrcEngine::Impl {
 #ifdef EJIT_SRE_CODE_POOL
   /// Dedicated 2MiB code pools backing all JIT machine code. Declared before
@@ -872,6 +896,10 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
     return ModuleOrErr.takeError();
   }
+
+  // Do this before addIRModule so ORC's materialization-unit symbol claims
+  // match the definitions that codegen will actually emit.
+  isolateSpecializationEntry(**ModuleOrErr, origFnName);
 
   Triple TT((*ModuleOrErr)->getTargetTriple());
   if (TT.isAArch64() && TT.isOSBinFormatELF()) {

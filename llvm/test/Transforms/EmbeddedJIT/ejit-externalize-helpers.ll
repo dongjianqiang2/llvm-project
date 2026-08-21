@@ -178,7 +178,7 @@ entry:
 }
 
 ; an entry above the threshold must never be externalized
-define i32 @entry_big(i32 %idx) !ejit.metadata !21 {
+define internal i32 @entry_big(i32 %idx) !ejit.metadata !21 {
 entry:
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %idx
   %v = load i32, ptr %p, !ejit.may_const !{}
@@ -219,6 +219,7 @@ attributes #1 = { inlinehint }
 ; MOD: [48 x i8] c"ejit_static._stdin_.{{0x[0-9a-f]+}}.hint_big\00"
 ; MOD: c"ext_helper_big\00"
 ; MOD: [53 x i8] c"ejit_static._stdin_.{{0x[0-9a-f]+}}.st_helper_big\00"
+; MOD: c"ejit_static._stdin_.{{0x[0-9a-f]+}}.entry_big\00"
 ; MOD: { i32 3, ptr @{{.*}}, ptr null, ptr @boundary_helper, i64 0 }
 ; MOD: { i32 3, ptr @{{.*}}, ptr null, ptr @hint_big, i64 0 }
 ; MOD: { i32 3, ptr @{{.*}}, ptr null, ptr @ext_helper_big, i64 0 }
@@ -227,6 +228,8 @@ attributes #1 = { inlinehint }
 ; MOD-NOT: ptr @ext_helper_small
 ; MOD-NOT: ptr @kept_15inst
 ; MOD: define internal void @ejit_auto_register() {
+; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @entry)
+; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @entry_big)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @st_helper_big)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @ext_helper_big)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @hint_big)
@@ -234,7 +237,6 @@ attributes #1 = { inlinehint }
 ; MOD-NOT: @st_helper_small
 ; MOD-NOT: @ext_helper_small
 ; MOD-NOT: @kept_15inst
-; MOD-NOT: @entry_big
 ; MOD: }
 
 ; EXT side: the extracted bitcode. Big helpers are declarations (the static
@@ -253,7 +255,8 @@ attributes #1 = { inlinehint }
 ; EXT: tail call i32 @ext_helper_small(i32 %r3)
 ; EXT: tail call i32 @boundary_helper(i32 {{.*}})
 ; EXT: tail call i32 @kept_15inst(i32 {{.*}})
-; EXT: define i32 @entry_big(i32 %idx) {{.*}} {
+; EXT: define internal i32 @entry_big(i32 %idx) #[[ENTRY_ATTR:[0-9]+]] {{.*}} {
+; EXT: attributes #[[ENTRY_ATTR]] = { {{.*}}"ejit.wrapper_symbol"="ejit_static._stdin_.{{0x[0-9a-f]+}}.entry_big"{{.*}} }
 ; EXT-NOT: @st_helper_big
 ; EXT-NOT: @hint_big
 

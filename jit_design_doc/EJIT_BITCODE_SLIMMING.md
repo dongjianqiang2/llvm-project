@@ -83,6 +83,19 @@ inliner 的 cost 分析就是"哪些函数值得保留函数体"的决策;内联
 - static 的 entry 也能被 JIT 强制外链(EJitOrcEngine.cpp:903-905)
 - 多 entry 闭包并集提取、嵌套特化(E 的 JIT 代码调 AOT 的 H,H 的 wrapper 分派到自己的 JIT 版本)
 
+多 entry 仍共用一份 bitcode，但每次加载 specialization 时只保留当前
+entry 的 definition；同一 TU 中的其他 entry 会在 ORC 建立符号声明前转为
+declaration，并解析到 PASS1 登记的最终 AOT wrapper 地址。因此 A 的特化上下文
+不会顺带改写 B 的 body，调用路径固定为 `A_JIT -> B_wrapper -> B_JIT/AOT`。
+这个裁剪必须发生在 `addIRModule` 之前，否则 ORC 的 symbol claim 会与最终
+codegen 输出不一致。
+
+local-linkage entry 的自身 bitcode/funcIndex lookup 仍使用源码函数名；PASS1 另外
+生成 `ejit_static.<module>.<hash>.<name>` wrapper key，并作为 function attribute
+写进 embedded bitcode。只有当该 entry 作为 nested callee 被转成 declaration 时，
+ORC 才把声明改成这个唯一 key，避免不同 TU 的同名 static entry 在进程级
+`userSymbols` 表中互相覆盖。
+
 ### 4.3 注册机制:确定性改名 key
 
 spec JITDylib 隔离(见 §1)意味着**每个外链化的 helper(static 或 external、host 或 bare-metal)都必须显式注册**。而 `userSymbols` 是进程级扁平表(EJitOrcEngine.cpp:106),static 函数名只在模块内唯一——两个 TU 的同名 `static helper` 注册会互相覆盖,静默错绑。

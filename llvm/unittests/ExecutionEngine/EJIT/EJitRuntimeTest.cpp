@@ -123,6 +123,82 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
   }
 }
 
+static int nestedEntryWrapper(int X) { return X + 100; }
+static int wrongNestedEntryWrapper(int X) { return X + 1000; }
+
+TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
+  std::string Bitcode;
+  {
+    LLVMContext Ctx;
+    Module M("nested_entries", Ctx);
+    M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *FT = FunctionType::get(I32, {I32}, false);
+    auto EntryMD = [&]() {
+      Metadata *Entry =
+          MDNode::get(Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY));
+      return MDNode::getDistinct(Ctx, {Entry});
+    };
+
+    auto *Nested = Function::Create(FT, Function::InternalLinkage,
+                                    "nested_entry_b", &M);
+    Nested->setMetadata(MD_EJIT_METADATA, EntryMD());
+    Nested->addFnAttr(ATTR_EJIT_WRAPPER_SYMBOL,
+                      "ejit_static.nested_entries.test.nested_entry_b");
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Nested));
+    B.CreateRet(B.CreateAdd(Nested->getArg(0), B.getInt32(1)));
+
+    auto *Root = Function::Create(FT, Function::ExternalLinkage,
+                                  "nested_entry_a", &M);
+    Root->setMetadata(MD_EJIT_METADATA, EntryMD());
+    B.SetInsertPoint(BasicBlock::Create(Ctx, "entry", Root));
+    B.CreateRet(B.CreateCall(Nested, {Root->getArg(0)}));
+
+    raw_string_ostream OS(Bitcode);
+    WriteBitcodeToFile(M, OS);
+    OS.flush();
+  }
+
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  EJitRuntimeState State;
+  Config Cfg;
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+  Engine->addUserSymbol("nested_entry_b",
+                        reinterpret_cast<void *>(&wrongNestedEntryWrapper));
+  Engine->addUserSymbol("ejit_static.nested_entries.test.nested_entry_b",
+                        reinterpret_cast<void *>(&nestedEntryWrapper));
+
+  SpecializationContext Ctx;
+  Ctx.fnName = "nested_entry_a";
+  Ctx.cacheKey = 0xea01;
+  Engine->setActiveContext(&Ctx);
+  ASSERT_FALSE(errorToBool(
+      Engine->loadBitcodeModule(Bitcode, Ctx.cacheKey, Ctx.fnName)));
+  auto FnOrErr = Engine->lookup(Ctx.cacheKey, Ctx.fnName);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr));
+  Engine->setActiveContext(nullptr);
+
+  using FnTy = int (*)(int);
+  auto Fn = reinterpret_cast<FnTy>(*FnOrErr);
+  EXPECT_EQ(Fn(5), 105);
+
+  // B remains a normal specialization target when B itself is compiled; its
+  // own body must win over the registered wrapper symbol.
+  Ctx.fnName = "nested_entry_b";
+  Ctx.cacheKey = 0xeb01;
+  Engine->setActiveContext(&Ctx);
+  ASSERT_FALSE(errorToBool(
+      Engine->loadBitcodeModule(Bitcode, Ctx.cacheKey, Ctx.fnName)));
+  FnOrErr = Engine->lookup(Ctx.cacheKey, Ctx.fnName);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr));
+  Engine->setActiveContext(nullptr);
+  Fn = reinterpret_cast<FnTy>(*FnOrErr);
+  EXPECT_EQ(Fn(5), 6);
+}
+
 namespace llvm {
 namespace ejit {
 // Test-only accessor. EJitOptimizer deliberately keeps its individual pipeline
