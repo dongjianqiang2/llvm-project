@@ -206,6 +206,8 @@ EJitOrcEngine::Create(const EJitConfig& config) {
                 //        + 二次 StructFieldPass + cleanup(InstCombine/SCCP/SimplifyCFG/ADCE)
                 //   5   向量化（仅 L2/L3，见 §2.4.3）：L2 = SLP + 部分展开；
                 //        L3 加 LoopVectorize + LoopLoadElimination
+                //   6   最终 GlobalDCE：2-5 阶段折叠 expect 守卫、删除调用点后
+                //        清扫失去引用者的 callee（1g 时这些调用点尚未死）
                 engine->P->optimizer->runPipeline(M, *ctx);
 
                 return Error::success();
@@ -805,7 +807,7 @@ void runInstCombine(Module& M) {
 
 **`runInterproceduralPropagation`** — 内部化所有非 `ejit_entry` 定义后运行 IPSCCP，把 1a–1c 在每个调用点变成常量的实参推进 callee 函数体（并把常量返回值推回调用点）。JIT 侧**不再单独运行 Inline**：callee 已在 AOT 预优化（`EJitRegisterBitcodePass`：AlwaysInline + ModuleInliner(O2)）内联。
 
-**`runModuleCleanup`** — 特化后的模块级清理（Phase 1g，所有档位都跑）：`ReversePostOrderFunctionAttrsPass` 推断函数属性供下游折叠，`DeadArgumentEliminationPass` 删除被 IPSCCP 常量化的参数（只改写 local-linkage 函数，外部 `ejit_entry` 不受影响），`GlobalDCEPass` 删除守卫折叠后失去调用点的函数——缩小 JIT 后端需编译的代码量。
+**`runModuleCleanup`** — 特化后的模块级清理（Phase 1g，所有档位都跑）：`ReversePostOrderFunctionAttrsPass` 推断函数属性供下游折叠，`DeadArgumentEliminationPass` 删除被 IPSCCP 常量化的参数（只改写 local-linkage 函数，外部 `ejit_entry` 不受影响），`GlobalDCEPass` 删除失去调用点的函数——缩小 JIT 后端需编译的代码量。注意：此轮 DCE 看不到 expect 守卫（`__builtin_expect`）的死半边——守卫要到 Phase 2（LowerExpect）才折叠；那些调用点在 Phase 2-5 才死掉的 callee 由 Phase 6 的最终 GlobalDCE 清扫（见 §2.4.3）。
 
 ```cpp
 void EJitOptimizer::runInterproceduralPropagation(Module& M) {
@@ -849,6 +851,7 @@ cleanupMPM_.addPass(DeadArgumentEliminationPass());
 cleanupMPM_.addPass(GlobalDCEPass());
 vectorizeL2_ = buildVectorizeFPM(PTO, /*SpeedupLevel=*/2, /*EnableLoopVectorize=*/false); // Phase 5
 vectorizeL3_ = buildVectorizeFPM(PTO, /*SpeedupLevel=*/3, /*EnableLoopVectorize=*/true);
+finalDCEMPM_.addPass(GlobalDCEPass());  // Phase 6: 最终死代码清扫
 
 void EJitOptimizer::runOptimizationPipeline(Module& M, ejit::OptimizationLevel level) {
     FunctionPassManager& simplifyFPM = simplifyFPMForLevel(level); // L1→O1 / L2→O2 / L3→O3
@@ -866,10 +869,12 @@ void EJitOptimizer::runOptimizationPipeline(Module& M, ejit::OptimizationLevel l
     // 在最终 StructFieldPass 之后运行，向量化器看到的是完全特化的循环。
     if (level >= L2)
         runVectorization(M, level);
+    // Phase 6 在 runPipeline 中：runOptimizationPipeline 之后对模块跑一次
+    // 最终 GlobalDCE（finalDCEMPM_）。
 }
 ```
 
-> **注**：`buildFunctionSimplificationPipeline` 包含 SROA、InstCombine、SCCP、GVN、CorrelatedValuePropagation、BDCE、DSE、loop-rotate、LICM、loop-unroll 等，但**不含向量化**——向量化由 Phase 5 在最终 StructFieldPass 之后按档位追加（L1 跳过，对齐 `clang -O1`）。Phase 5 的 SLP 在 L2+ 无条件运行（宿主侧由 cl::opt 门控，嵌入式运行时无此概念）——以 JIT 编译时延换代码质量，属有意取舍，实测编译时延应顺带评估。首次 Inline 由 AOT 预优化完成；JIT 侧不再做二次 Inline。
+> **注**：`buildFunctionSimplificationPipeline` 包含 SROA、InstCombine、SCCP、GVN、CorrelatedValuePropagation、BDCE、DSE、loop-rotate、LICM、loop-unroll 等，但**不含向量化**——向量化由 Phase 5 在最终 StructFieldPass 之后按档位追加（L1 跳过，对齐 `clang -O1`）。Phase 5 的 SLP 在 L2+ 无条件运行（宿主侧由 cl::opt 门控，嵌入式运行时无此概念）——以 JIT 编译时延换代码质量，属有意取舍，实测编译时延应顺带评估。UnrollAndJam 则**不启用**：宿主把它挂在 `-enable-unroll-and-jam`（cl::opt，默认 OFF）后面，L2/L3 都跑它会使 JIT 比对应的 AOT O2/O3 更激进，代码体积也不利嵌入式缓存。Phase 6 的最终 GlobalDCE 有必要性：expect 守卫（`__builtin_expect`）要到 Phase 2（LowerExpect）折叠后才能删掉守卫死半边的调用，而 Phase 1g 的 DCE 在此之前已运行——Phase 2-5 新死掉的 callee 只有靠这最后一扫才不会被 JIT 后端编译。首次 Inline 由 AOT 预优化完成；JIT 侧不再做二次 Inline。
 
 ---
 

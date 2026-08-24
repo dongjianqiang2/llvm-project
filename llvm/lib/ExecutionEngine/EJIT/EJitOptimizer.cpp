@@ -12,8 +12,9 @@
 // The post-specialization cleanup is the real LLVM -O2 function-simplification
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); hand-added on
 // top of it are the LowerExpect prefix, the light cleanupFPM_, the Phase 1g
-// module cleanup (RPO attrs + DAE + GlobalDCE), and the Phase 5 vectorization
-// FPMs (SLP + partial unroll at L2, loop vectorizer at L3).
+// module cleanup (RPO attrs + DAE + GlobalDCE), the Phase 5 vectorization FPMs
+// (SLP + partial unroll at L2, loop vectorizer at L3), and the Phase 6 final
+// GlobalDCE sweep.
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/IPO/DeadArgumentElimination.h"
 #include "llvm/Transforms/IPO/FunctionAttrs.h"
@@ -25,7 +26,6 @@
 #include "llvm/Transforms/Scalar/LICM.h"
 #include "llvm/Transforms/Scalar/LoopLoadElimination.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
-#include "llvm/Transforms/Scalar/LoopUnrollAndJamPass.h"
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
@@ -43,18 +43,22 @@ using namespace llvm::ejit;
 /// Build the post-specialization vectorization FPM. Mirrors the non-LTO path
 /// of PassBuilder::addVectorPasses (PassBuilderPipelines.cpp): loop
 /// vectorization (L3 only), SLP for parallel scalar chains, trip-count-based
-/// partial unrolling + unroll-and-jam to hide backedge latency, and a late
-/// LICM. SpeedupLevel feeds the unroll cost model (2 = O2, 3 = O3).
+/// partial unrolling to hide backedge latency, and a late LICM. SpeedupLevel
+/// feeds the unroll cost model (2 = O2, 3 = O3).
 ///
 /// Deliberate deviations from the host path, all compile-time tradeoffs:
 /// SLP runs unconditionally at L2+ (the host gates it on a cl::opt that has
-/// no meaning for an embedded runtime); the aggressive SimplifyCFG before
-/// SLP, WarnMissedTransformations, InferAlignment, AlignmentFromAssumptions
-/// and the unswitch/LICM part of the ExtraVectorizerPasses block are skipped
-/// (LICM still runs at the end of this FPM).
-static FunctionPassManager
-buildVectorizeFPM(const PipelineTuningOptions &PTO, unsigned SpeedupLevel,
-                  bool EnableLoopVectorize) {
+/// no meaning for an embedded runtime); UnrollAndJam is skipped (the host
+/// gates it on -enable-unroll-and-jam, cl::opt default OFF, so running it
+/// would make the JIT more aggressive than the AOT O2/O3 it matches, at code
+/// size that matters for an embedded cache); the aggressive SimplifyCFG
+/// before SLP, WarnMissedTransformations, InferAlignment,
+/// AlignmentFromAssumptions and the unswitch/LICM part of the
+/// ExtraVectorizerPasses block are skipped (LICM still runs at the end of
+/// this FPM).
+static FunctionPassManager buildVectorizeFPM(const PipelineTuningOptions &PTO,
+                                             unsigned SpeedupLevel,
+                                             bool EnableLoopVectorize) {
   FunctionPassManager FPM;
   if (EnableLoopVectorize) {
     FPM.addPass(LoopVectorizePass(LoopVectorizeOptions()));
@@ -73,9 +77,10 @@ buildVectorizeFPM(const PipelineTuningOptions &PTO, unsigned SpeedupLevel,
   FPM.addPass(InstCombinePass());
   // Partial unrolling: LoopFullUnroll (inside the simplification pipeline)
   // only fully unrolls; partial trip-count unrolling hides backedge latency.
-  // UnrollAndJam first, as in the host pipeline.
-  FPM.addPass(createFunctionToLoopPassAdaptor(
-      LoopUnrollAndJamPass(static_cast<int>(SpeedupLevel))));
+  // The host would insert UnrollAndJam before this, but it gates it on
+  // -enable-unroll-and-jam (default OFF), so we skip it: running it would
+  // make the JIT more aggressive than the AOT O2/O3 it matches, at code-size
+  // cost that matters for an embedded cache.
   FPM.addPass(LoopUnrollPass(LoopUnrollOptions(static_cast<int>(SpeedupLevel),
                                                /*OnlyWhenForced=*/false,
                                                /*ForgetSCEV=*/false)));
@@ -167,6 +172,15 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
                                    /*EnableLoopVectorize=*/false);
   vectorizeL3_ = buildVectorizeFPM(PTO, /*SpeedupLevel=*/3,
                                    /*EnableLoopVectorize=*/true);
+
+  // finalDCEMPM_ — Phase 6, final module-level dead-code sweep. Phase 1g's
+  // GlobalDCE runs before the expect guards fold: a may_const load feeding an
+  // llvm.expect condition only becomes a constant-foldable branch after
+  // Phase 2 (LowerExpect), so callees called only from the guard's dead half
+  // survive 1g with a live call site. Phases 2-5 then delete those call sites;
+  // this last sweep drops the now-unreferenced callees so the JIT backend
+  // never compiles them.
+  finalDCEMPM_.addPass(GlobalDCEPass());
 }
 
 void EJitOptimizer::clearAnalyses() {
@@ -224,6 +238,14 @@ void EJitOptimizer::runPipeline(Module &M,
   // re-specialize → cleanup → vectorize). ctx.optLevel selects the
   // function-simplification tier and gates Phase 5 vectorization (L2+).
   runOptimizationPipeline(M, ctx.optLevel);
+
+  // Phase 6 — final GlobalDCE. Phases 2-5 folded expect-guarded branches and
+  // deleted call sites (and unrolled-loop leftovers) that phase 1g's DCE
+  // could not see as dead; sweep the now-unreferenced callees before the JIT
+  // backend compiles them.
+  finalDCEMPM_.run(M, MAM_);
+  EJIT_DIAG_DEBUG("pipeline phase6 done: final GlobalDCE");
+
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
 }

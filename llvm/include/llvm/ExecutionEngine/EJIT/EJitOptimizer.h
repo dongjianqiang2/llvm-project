@@ -45,6 +45,7 @@ public:
   ///   4. IPSCCP (push constants across call edges) + re-substitution
   ///   5. Module cleanup (RPO attrs + dead-arg elimination + GlobalDCE)
   ///   6. Core optimization pipeline (L1/L2/L3) + vectorization (L2+)
+  ///      + final GlobalDCE sweep (callees freed by phases 2-5)
   void runPipeline(Module &M, const SpecializationContext &ctx);
 
   /// Clear all cached analysis results. Must be called between compilations
@@ -117,6 +118,10 @@ private:
   //   cleanupMPM_     RPO attrs + DAE + GlobalDCE module cleanup (Phase 1g).
   //   vectorizeL2/3_  post-specialization vectorization (Phase 5); L2 has SLP +
   //                   partial unrolling, L3 adds the loop vectorizer.
+  //   finalDCEMPM_    final GlobalDCE (Phase 6): phases 2-5 delete call sites
+  //                   (expect-guard folding, unrolled-loop leftovers) that
+  //                   phase 1g's DCE could not yet see as dead, so sweep the
+  //                   now-unreferenced callees before the backend compiles.
   FunctionPassManager lowerExpectFPM_;
   FunctionPassManager simplifyO1_;
   FunctionPassManager simplifyO2_;
@@ -125,6 +130,7 @@ private:
   ModulePassManager cleanupMPM_;
   FunctionPassManager vectorizeL2_;
   FunctionPassManager vectorizeL3_;
+  ModulePassManager finalDCEMPM_;
 
   // Grant the unit-test accessor visibility into the private pipeline steps.
   // runPipeline() remains the only production entry point; this friend keeps
