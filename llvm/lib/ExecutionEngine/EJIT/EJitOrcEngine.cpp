@@ -106,6 +106,10 @@ struct EJitOrcEngine::Impl {
   std::map<std::string, void *> userSymbols;
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
+  /// TargetMachine feeding the optimizer's TargetIRAnalysis. Declared BEFORE
+  /// the optimizer so it is destroyed AFTER it (reverse declaration order).
+  /// Created from the same JITTargetMachineBuilder the JIT compiles with.
+  std::unique_ptr<TargetMachine> optimizerTM;
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
@@ -708,8 +712,18 @@ EJitOrcEngine::Create(const Config &config,
       });
 
   // Create persistent optimizer — analysis managers are registered once here
-  // and reused across compilations (cleared between runs).
-  engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  // and reused across compilations (cleared between runs). Give it a real
+  // TargetMachine (same JTMB the JIT compiles with) so its TargetIRAnalysis is
+  // backend-accurate: without one, TTI falls back to a 32-bit baseline in
+  // which the vectorizers see no vector registers and never fire.
+  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
+    engine->P->optimizerTM = std::move(*TMOrErr);
+  else
+    EJIT_DIAG("optimizer: createTargetMachine failed (%s); TTI falls back to "
+              "the 32-bit baseline and vectorization is disabled",
+              toString(TMOrErr.takeError()).c_str());
+  engine->P->optimizer =
+      std::make_unique<EJitOptimizer>(periodReg, engine->P->optimizerTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve

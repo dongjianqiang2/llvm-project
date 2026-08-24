@@ -177,7 +177,7 @@ EJitOrcEngine::Create(const EJitConfig& config) {
 
     // 步骤 3: 注册 IRTransformLayer 回调
     // 完整的 JIT Pipeline: 参数替换 → InstCombine → StructFieldPass → IPSCCP →
-    //   InstCombine → StructFieldPass → 标准优化 (详见 §2.4)
+    //   InstCombine → StructFieldPass → 模块清理 → 标准优化 → 向量化 (详见 §2.4)
     // 注意: IRTransformLayer::TransformFunction 签名为
     //   Expected<ThreadSafeModule>(ThreadSafeModule, MaterializationResponsibility&)
     // withModuleDo 的回调签名为 Expected<Error>(Module&)，原地修改 Module
@@ -201,8 +201,11 @@ EJitOrcEngine::Create(const EJitConfig& config) {
                 //   1c EJitStructFieldPass      —— may_const load → 常量
                 //   1d runInterproceduralPropagation —— 内部化非 entry 定义 + IPSCCP
                 //   1e/1f runInstCombine + EJitStructFieldPass（对 callee 再做一轮）
+                //   1g runModuleCleanup —— RPO attrs + DAE + GlobalDCE（模块级清理）
                 //   2-4 LowerExpect + buildFunctionSimplificationPipeline(O1/O2/O3)
                 //        + 二次 StructFieldPass + cleanup(InstCombine/SCCP/SimplifyCFG/ADCE)
+                //   5   向量化（仅 L2/L3，见 §2.4.3）：L2 = SLP + 部分展开；
+                //        L3 加 LoopVectorize + LoopLoadElimination
                 engine->P->optimizer->runPipeline(M, *ctx);
 
                 return Error::success();
@@ -802,6 +805,8 @@ void runInstCombine(Module& M) {
 
 **`runInterproceduralPropagation`** — 内部化所有非 `ejit_entry` 定义后运行 IPSCCP，把 1a–1c 在每个调用点变成常量的实参推进 callee 函数体（并把常量返回值推回调用点）。JIT 侧**不再单独运行 Inline**：callee 已在 AOT 预优化（`EJitRegisterBitcodePass`：AlwaysInline + ModuleInliner(O2)）内联。
 
+**`runModuleCleanup`** — 特化后的模块级清理（Phase 1g，所有档位都跑）：`ReversePostOrderFunctionAttrsPass` 推断函数属性供下游折叠，`DeadArgumentEliminationPass` 删除被 IPSCCP 常量化的参数（只改写 local-linkage 函数，外部 `ejit_entry` 不受影响），`GlobalDCEPass` 删除守卫折叠后失去调用点的函数——缩小 JIT 后端需编译的代码量。
+
 ```cpp
 void EJitOptimizer::runInterproceduralPropagation(Module& M) {
     // IPSCCP 仅能推理 local linkage 且未被取地址函数的实参；
@@ -823,11 +828,13 @@ void EJitOptimizer::runInterproceduralPropagation(Module& M) {
 
 ### 2.4.3 优化 Pipeline (L1/L2/L3) — 第二次 StructFieldPass 之后
 
-后特化清理直接复用 **真实的 LLVM 函数级简化流水线** `PassBuilder::buildFunctionSimplificationPipeline`（O1/O2/O3 各预建一份并缓存），而不是手工拼装的 pass 序列。`ctx.optLevel`（L1→O1、L2→O2、L3→O3）只选择这三条已缓存的 FPM 之一；它**不改变**流水线其余部分。注意这是**函数级**简化流水线，并非完整的 `clang -O2` module 流水线——除 phase 1d 的 IPSCCP 外，不含 GlobalOpt、CalledValuePropagation、ArgumentPromotion 等 module/CGSCC pass。
+后特化清理直接复用 **真实的 LLVM 函数级简化流水线** `PassBuilder::buildFunctionSimplificationPipeline`（O1/O2/O3 各预建一份并缓存），而不是手工拼装的 pass 序列。`ctx.optLevel`（L1→O1、L2→O2、L3→O3）选择这三条已缓存的 FPM 之一，并**门控 Phase 5 向量化**（L2/L3 运行、L1 跳过）；Phase 1a–1g 与 Phase 2/4 对所有档位一致。注意这是**函数级**简化流水线，并非完整的 `clang -O2` module 流水线——除 phase 1d 的 IPSCCP 和 phase 1g 的模块清理（RPO attrs + DAE + GlobalDCE）外，不含 GlobalOpt、CalledValuePropagation、ArgumentPromotion 等 module/CGSCC pass。
 
 ```cpp
 // 构造时预建（EJitOptimizer 构造函数）
-PassBuilder PB;
+// TM 由引擎用同一个 JTMB createTargetMachine 后传入（EJitOrcEngine::Create）；
+// 无 TM 时 TTI 退化为 32-bit 基线，向量化永不触发（见本节约末的注）。
+PassBuilder PB(TM);
 PB.registerModuleAnalyses(MAM_);   PB.registerCGSCCAnalyses(CGAM_);
 PB.registerFunctionAnalyses(FAM_); PB.registerLoopAnalyses(LAM_);
 PB.crossRegisterProxies(LAM_, FAM_, CGAM_, MAM_);
@@ -837,6 +844,11 @@ simplifyO2_ = PB.buildFunctionSimplificationPipeline(O2, ThinOrFullLTOPhase::Non
 simplifyO3_ = PB.buildFunctionSimplificationPipeline(O3, ThinOrFullLTOPhase::None);
 cleanupFPM_.addPass(InstCombinePass());  cleanupFPM_.addPass(SCCPPass());
 cleanupFPM_.addPass(SimplifyCFGPass());  cleanupFPM_.addPass(ADCEPass());
+cleanupMPM_.addPass(ReversePostOrderFunctionAttrsPass());   // Phase 1g
+cleanupMPM_.addPass(DeadArgumentEliminationPass());
+cleanupMPM_.addPass(GlobalDCEPass());
+vectorizeL2_ = buildVectorizeFPM(PTO, /*SpeedupLevel=*/2, /*EnableLoopVectorize=*/false); // Phase 5
+vectorizeL3_ = buildVectorizeFPM(PTO, /*SpeedupLevel=*/3, /*EnableLoopVectorize=*/true);
 
 void EJitOptimizer::runOptimizationPipeline(Module& M, ejit::OptimizationLevel level) {
     FunctionPassManager& simplifyFPM = simplifyFPMForLevel(level); // L1→O1 / L2→O2 / L3→O3
@@ -850,10 +862,14 @@ void EJitOptimizer::runOptimizationPipeline(Module& M, ejit::OptimizationLevel l
     for (Function& F : M.functions())
         if (!F.isDeclaration())
             cleanupFPM_.run(F, FAM_);
+    // Phase 5: 特化后向量化（仅 L2/L3）。L2 = SLP + 部分展开；L3 加 LoopVectorize。
+    // 在最终 StructFieldPass 之后运行，向量化器看到的是完全特化的循环。
+    if (level >= L2)
+        runVectorization(M, level);
 }
 ```
 
-> **注**：`buildFunctionSimplificationPipeline` 包含 SROA、InstCombine、SCCP、GVN、CorrelatedValuePropagation、BDCE、DSE、loop-rotate、LICM、loop-unroll 等，但**不含向量化**。首次 Inline 由 AOT 预优化完成；JIT 侧不再做二次 Inline。
+> **注**：`buildFunctionSimplificationPipeline` 包含 SROA、InstCombine、SCCP、GVN、CorrelatedValuePropagation、BDCE、DSE、loop-rotate、LICM、loop-unroll 等，但**不含向量化**——向量化由 Phase 5 在最终 StructFieldPass 之后按档位追加（L1 跳过，对齐 `clang -O1`）。Phase 5 的 SLP 在 L2+ 无条件运行（宿主侧由 cl::opt 门控，嵌入式运行时无此概念）——以 JIT 编译时延换代码质量，属有意取舍，实测编译时延应顺带评估。首次 Inline 由 AOT 预优化完成；JIT 侧不再做二次 Inline。
 
 ---
 

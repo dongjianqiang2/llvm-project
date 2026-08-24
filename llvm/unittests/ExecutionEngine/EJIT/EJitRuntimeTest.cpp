@@ -36,11 +36,16 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Host.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
 #include <thread>
@@ -86,6 +91,15 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     auto *FT = FunctionType::get(I32, {I32}, false);
     for (StringRef Name : {"dump_a", "dump_b", "dump_c"}) {
       auto *F = Function::Create(FT, Function::ExternalLinkage, Name, &M);
+      // Tag as an ejit_entry, as the AOT pass does for every looked-up
+      // function. The pipeline keeps tagged entries external; an untagged
+      // defined function is internalized in phase 1d (IPSCCP preparation) and
+      // phase 1g's GlobalDCE then deletes it as unreferenced — removing an
+      // independently-compiled entry that the lookup expects to find.
+      F->setMetadata(
+          MD_EJIT_METADATA,
+          MDNode::get(
+              Ctx, {MDNode::get(Ctx, {MDString::get(Ctx, TAG_EJIT_ENTRY)})}));
       IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
       B.CreateRet(B.CreateAdd(F->getArg(0), B.getInt32(Name.back())));
     }
@@ -136,8 +150,10 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::preReplacePeriodIndices;
   using EJitOptimizer::runInstCombine;
   using EJitOptimizer::runInterproceduralPropagation;
+  using EJitOptimizer::runModuleCleanup;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
+  using EJitOptimizer::runVectorization;
 };
 } // namespace ejit
 } // namespace llvm
@@ -1155,6 +1171,27 @@ static std::unique_ptr<Module> createTestModule(LLVMContext &Ctx,
   return M;
 }
 
+/// Create a TargetMachine for the host target so the optimizer's
+/// TargetIRAnalysis is backend-accurate (real vector register widths). Without
+/// a TM the default TTI reports no vector registers and the vectorizers never
+/// fire. Uses the host's default triple — not a hardcoded x86-64 one — so the
+/// tests run on whatever native target this build registers (x86-64 SSE2,
+/// AArch64 NEON, ...); returns nullptr if the host target is not registered.
+static std::unique_ptr<TargetMachine> createNativeTargetMachine() {
+  // Register the native target (idempotent); there is no global fixture for
+  // this in EJITTests, individual tests call it themselves.
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  Triple HostTriple(sys::getDefaultTargetTriple());
+  std::string Err;
+  const Target *T = TargetRegistry::lookupTarget(HostTriple, Err);
+  if (!T)
+    return nullptr;
+  TargetOptions Options;
+  return std::unique_ptr<TargetMachine>(T->createTargetMachine(
+      HostTriple, "generic", "", Options, Reloc::PIC_));
+}
+
 /// Create a simple function with a period-array-index argument metadata.
 static Function *createPeriodIndFunc(LLVMContext &Ctx, Module &M,
                                      const std::string &name) {
@@ -1340,6 +1377,188 @@ TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
   auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
   ASSERT_NE(RetVal, nullptr);
   EXPECT_EQ(RetVal->getZExtValue(), 0u);
+}
+
+/// Create an internal callee whose body ignores its i32 argument — the state
+/// IPSCCP leaves behind after replacing a callee's parameter uses with a
+/// constant. DAE should drop the parameter; GlobalDCE should delete the
+/// function if it has no callers.
+static Function *createDeadArgCallee(LLVMContext &Ctx, Module &M,
+                                     const std::string &Name) {
+  IRBuilder<> B(Ctx);
+  auto *F = Function::Create(
+      FunctionType::get(B.getInt32Ty(), {B.getInt32Ty()}, false),
+      GlobalValue::InternalLinkage, Name, &M);
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  B.SetInsertPoint(BB);
+  B.CreateRet(B.getInt32(1));
+  return F;
+}
+
+TEST(EJitOptimizer, ModuleCleanupDropsDeadArgAndDeadCallee) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "moduleCleanup");
+
+  // A callee whose argument specialization made dead, called by the entry.
+  Function *Callee = createDeadArgCallee(Ctx, *M, "dead_arg_callee");
+
+  // A defined-but-unreferenced callee: guard folding deleted its last call
+  // site, leaving it dead.
+  createDeadArgCallee(Ctx, *M, "dead_callee");
+
+  IRBuilder<> B(Ctx);
+  auto *Entry =
+      Function::Create(FunctionType::get(B.getInt32Ty(), {}, false),
+                       GlobalValue::ExternalLinkage, "entry", M.get());
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Entry);
+  B.SetInsertPoint(BB);
+  B.CreateRet(B.CreateCall(Callee, {B.getInt32(7)}));
+
+  PeriodArrayRegistry reg;
+  EJitOptimizerTestAccess opt(reg);
+  opt.runModuleCleanup(*M);
+
+  // DAE removed the dead parameter from the callee and rewrote the call site.
+  EXPECT_EQ(Callee->arg_size(), 0u);
+  CallInst *CI = nullptr;
+  for (BasicBlock &BB : *Entry)
+    for (Instruction &I : BB)
+      if (auto *C = dyn_cast<CallInst>(&I)) {
+        CI = C;
+        break;
+      }
+  ASSERT_NE(CI, nullptr);
+  EXPECT_EQ(CI->arg_size(), 0u);
+
+  // GlobalDCE deleted the unreferenced callee.
+  EXPECT_EQ(M->getFunction("dead_callee"), nullptr);
+}
+
+/// Create a function storing four i32 constants to consecutive elements of an
+/// internal global array — the classic SLP pattern (parallel scalar stores).
+static Function *createSLPStoreFunc(LLVMContext &Ctx, Module &M,
+                                    const std::string &Name) {
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  auto *F = Function::Create(FunctionType::get(B.getVoidTy(), {}, false),
+                             GlobalValue::ExternalLinkage, Name, &M);
+  auto *Arr = new GlobalVariable(
+      M, ArrayType::get(I32Ty, 4), /*isConstant=*/false,
+      GlobalValue::InternalLinkage,
+      Constant::getNullValue(ArrayType::get(I32Ty, 4)), "arr");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  B.SetInsertPoint(BB);
+  for (unsigned I = 0; I < 4; ++I) {
+    Value *GEP = B.CreateConstGEP2_64(ArrayType::get(I32Ty, 4), Arr, 0, I);
+    B.CreateStore(B.getInt32(I * 3 + 1), GEP);
+  }
+  B.CreateRetVoid();
+  return F;
+}
+
+/// Scan a function for any vector-typed value (instruction result or operand).
+static bool hasVectorType(const Function &F) {
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB) {
+      if (I.getType()->isVectorTy())
+        return true;
+      for (const Use &U : I.operands())
+        if (U->getType()->isVectorTy())
+          return true;
+    }
+  return false;
+}
+
+TEST(EJitOptimizer, L2SlpVectorizesStoresButL1DoesNot) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "slpTier");
+  Function *F = createSLPStoreFunc(Ctx, *M, "store4");
+
+  auto TM = createNativeTargetMachine();
+  if (!TM)
+    GTEST_SKIP() << "host target not registered in this build";
+  PeriodArrayRegistry reg;
+  EJitOptimizerTestAccess opt(reg, TM.get());
+
+  // L1: no vectorization passes run — the four stores stay scalar.
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L1);
+  EXPECT_FALSE(hasVectorType(*F)) << "L1 must not vectorize";
+
+  // Rebuild with a fresh module and clear the cached analyses, mirroring the
+  // production clearAnalyses() between compilations.
+  opt.clearAnalyses();
+  M = createTestModule(Ctx, "slpTier2");
+  F = createSLPStoreFunc(Ctx, *M, "store4");
+
+  // L2: SLP fuses the four scalar stores into one <4 x i32> store.
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  EXPECT_TRUE(hasVectorType(*F)) << "L2 SLP did not vectorize the stores";
+}
+
+/// Create a function with a runtime-trip-count reduction loop:
+///   int sum(ptr %a, i32 %n) { int acc = 0; for (i = 0; i < n; ++i) acc +=
+///   a[i]; }
+/// Runtime bounds keep the loop alive through full unrolling, so only the loop
+/// vectorizer (L3) can turn it into SIMD.
+static Function *createLoopSumFunc(LLVMContext &Ctx, Module &M,
+                                   const std::string &Name) {
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  auto *F =
+      Function::Create(FunctionType::get(I32Ty, {B.getPtrTy(), I32Ty}, false),
+                       GlobalValue::ExternalLinkage, Name, &M);
+  auto &Ptr = *F->arg_begin();
+  auto &N = *F->getArg(1);
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "loop", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+  B.SetInsertPoint(Entry);
+  B.CreateBr(Loop);
+
+  B.SetInsertPoint(Loop);
+  PHINode *I = B.CreatePHI(I32Ty, 2, "i");
+  PHINode *Acc = B.CreatePHI(I32Ty, 2, "acc");
+  I->addIncoming(B.getInt32(0), Entry);
+  Acc->addIncoming(B.getInt32(0), Entry);
+  Value *GEP = B.CreateGEP(I32Ty, &Ptr, I);
+  Value *V = B.CreateLoad(I32Ty, GEP, "v");
+  Value *AccNext = B.CreateAdd(Acc, V, "acc.next");
+  Value *INext = B.CreateAdd(I, B.getInt32(1), "i.next");
+  Value *Cmp = B.CreateICmpULT(INext, &N, "cmp");
+  I->addIncoming(INext, Loop);
+  Acc->addIncoming(AccNext, Loop);
+  B.CreateCondBr(Cmp, Loop, Exit);
+
+  B.SetInsertPoint(Exit);
+  B.CreateRet(AccNext);
+  return F;
+}
+
+TEST(EJitOptimizer, L3LoopVectorizesButL2DoesNot) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "loopVecTier");
+  Function *F = createLoopSumFunc(Ctx, *M, "sum");
+
+  auto TM = createNativeTargetMachine();
+  if (!TM)
+    GTEST_SKIP() << "host target not registered in this build";
+  PeriodArrayRegistry reg;
+  EJitOptimizerTestAccess opt(reg, TM.get());
+
+  // L2: partial unrolling only — the loop stays scalar.
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2);
+  EXPECT_FALSE(hasVectorType(*F)) << "L2 must not loop-vectorize";
+
+  // Rebuild with a fresh module and clear the cached analyses, mirroring the
+  // production clearAnalyses() between compilations.
+  opt.clearAnalyses();
+  M = createTestModule(Ctx, "loopVecTier2");
+  F = createLoopSumFunc(Ctx, *M, "sum");
+
+  // L3: the loop vectorizer turns the reduction into SIMD.
+  opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3);
+  EXPECT_TRUE(hasVectorType(*F)) << "L3 loop vectorizer did not fire";
 }
 
 //===----------------------------------------------------------------------===//

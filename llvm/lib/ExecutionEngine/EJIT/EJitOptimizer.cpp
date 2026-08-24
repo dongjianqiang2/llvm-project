@@ -10,26 +10,99 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
 // The post-specialization cleanup is the real LLVM -O2 function-simplification
-// pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
-// cleanupFPM_ and the LowerExpect prefix are hand-added below.
+// pipeline (PassBuilder::buildFunctionSimplificationPipeline); hand-added on
+// top of it are the LowerExpect prefix, the light cleanupFPM_, the Phase 1g
+// module cleanup (RPO attrs + DAE + GlobalDCE), and the Phase 5 vectorization
+// FPMs (SLP + partial unroll at L2, loop vectorizer at L3).
 #include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/IPO/DeadArgumentElimination.h"
+#include "llvm/Transforms/IPO/FunctionAttrs.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/CorrelatedValuePropagation.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/LICM.h"
+#include "llvm/Transforms/Scalar/LoopLoadElimination.h"
+#include "llvm/Transforms/Scalar/LoopPassManager.h"
+#include "llvm/Transforms/Scalar/LoopUnrollAndJamPass.h"
+#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Scalar/SROA.h"
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
+#include "llvm/Transforms/Vectorize/SLPVectorizer.h"
+#include "llvm/Transforms/Vectorize/VectorCombine.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-optimizer"
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
+/// Build the post-specialization vectorization FPM. Mirrors the non-LTO path
+/// of PassBuilder::addVectorPasses (PassBuilderPipelines.cpp): loop
+/// vectorization (L3 only), SLP for parallel scalar chains, trip-count-based
+/// partial unrolling + unroll-and-jam to hide backedge latency, and a late
+/// LICM. SpeedupLevel feeds the unroll cost model (2 = O2, 3 = O3).
+///
+/// Deliberate deviations from the host path, all compile-time tradeoffs:
+/// SLP runs unconditionally at L2+ (the host gates it on a cl::opt that has
+/// no meaning for an embedded runtime); the aggressive SimplifyCFG before
+/// SLP, WarnMissedTransformations, InferAlignment, AlignmentFromAssumptions
+/// and the unswitch/LICM part of the ExtraVectorizerPasses block are skipped
+/// (LICM still runs at the end of this FPM).
+static FunctionPassManager
+buildVectorizeFPM(const PipelineTuningOptions &PTO, unsigned SpeedupLevel,
+                  bool EnableLoopVectorize) {
+  FunctionPassManager FPM;
+  if (EnableLoopVectorize) {
+    FPM.addPass(LoopVectorizePass(LoopVectorizeOptions()));
+    // Eliminate loads by forwarding stores from the previous iteration.
+    FPM.addPass(LoopLoadEliminationPass());
+    FPM.addPass(InstCombinePass());
+    // Scalar part of the host's ExtraVectorizerPasses block: fold and hoist
+    // the runtime alignment/overlap checks the vectorizer inserted.
+    FPM.addPass(EarlyCSEPass());
+    FPM.addPass(CorrelatedValuePropagationPass());
+    FPM.addPass(InstCombinePass());
+  }
+  // Optimize parallel scalar instruction chains into SIMD instructions.
+  FPM.addPass(SLPVectorizerPass());
+  FPM.addPass(VectorCombinePass());
+  FPM.addPass(InstCombinePass());
+  // Partial unrolling: LoopFullUnroll (inside the simplification pipeline)
+  // only fully unrolls; partial trip-count unrolling hides backedge latency.
+  // UnrollAndJam first, as in the host pipeline.
+  FPM.addPass(createFunctionToLoopPassAdaptor(
+      LoopUnrollAndJamPass(static_cast<int>(SpeedupLevel))));
+  FPM.addPass(LoopUnrollPass(LoopUnrollOptions(static_cast<int>(SpeedupLevel),
+                                               /*OnlyWhenForced=*/false,
+                                               /*ForgetSCEV=*/false)));
+  // Unrolling can turn variable-offset GEPs into alloca into constant-offset
+  // ones; promote them. PreserveCFG: no CFG cleanup is scheduled after us.
+  FPM.addPass(SROAPass(SROAOptions::PreserveCFG));
+  FPM.addPass(InstCombinePass());
+  // Late LICM after the unroll/vectorize cleanup, as in the host pipeline.
+  // Caps come from PipelineTuningOptions, exactly as the host uses them.
+  FPM.addPass(createFunctionToLoopPassAdaptor(
+      LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,
+               /*AllowSpeculation=*/true),
+      /*UseMemorySSA=*/true, /*UseBlockFrequencyInfo=*/false));
+  return FPM;
+}
+
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
     : registry_(reg) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
-  PassBuilder PB;
+  // With a TargetMachine (the engine passes the same JTMB-derived TM the JIT
+  // compiles with), TargetIRAnalysis is backend-accurate — real vector
+  // register widths, so Phase 5 vectorization can fire. Without one it falls
+  // back to the 32-bit baseline TTI, which disables the vectorizers (and
+  // skews the loop-unroll cost models).
+  PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
   PB.registerCGSCCAnalyses(CGAM_);
@@ -70,6 +143,30 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   cleanupFPM_.addPass(SCCPPass());
   cleanupFPM_.addPass(SimplifyCFGPass());
   cleanupFPM_.addPass(ADCEPass());
+
+  // cleanupMPM_ — Phase 1g, module-level cleanup of the specialized IR, run on
+  // every tier. RPO attribute inference feeds downstream folds, DAE drops
+  // parameters IPSCCP replaced with constants (DAE only rewrites
+  // local-linkage functions, so the external ejit_entry is untouched), and
+  // GlobalDCE deletes callees whose call sites the folded guards deleted —
+  // shrinking what the JIT backend must compile.
+  cleanupMPM_.addPass(ReversePostOrderFunctionAttrsPass());
+  cleanupMPM_.addPass(DeadArgumentEliminationPass());
+  cleanupMPM_.addPass(GlobalDCEPass());
+
+  // vectorizeL2/L3_ — Phase 5, post-specialization vectorization. Runs after
+  // the final StructFieldPass so the vectorizers see the fully-specialized
+  // loops (Phase 3 unrolling exposed constant-index accesses that Phase 4
+  // substituted). L2: SLP + partial unrolling; L3 adds the loop vectorizer.
+  // The Phase 5 unrolling itself runs after that last substitution: safe,
+  // because it only creates variable-index GEPs for runtime-trip-count loops
+  // (constant-trip loops were already fully unrolled in Phase 3), and
+  // vectorizer-synthesized loads never carry !ejit.may_const.
+  PipelineTuningOptions PTO;
+  vectorizeL2_ = buildVectorizeFPM(PTO, /*SpeedupLevel=*/2,
+                                   /*EnableLoopVectorize=*/false);
+  vectorizeL3_ = buildVectorizeFPM(PTO, /*SpeedupLevel=*/3,
+                                   /*EnableLoopVectorize=*/true);
 }
 
 void EJitOptimizer::clearAnalyses() {
@@ -117,10 +214,15 @@ void EJitOptimizer::runPipeline(Module &M,
   runInstCombine(M);
   runStructFieldPass(M);
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
+  //   (g) Module-level cleanup: RPO attrs, dead-argument elimination, and
+  //       GlobalDCE shrink the specialized module before the expensive
+  //       per-function phases run on it.
+  runModuleCleanup(M);
+  EJIT_DIAG_DEBUG("pipeline phase1g done: module cleanup (RPO attrs + DAE + GlobalDCE)");
 
-  // Phases 2-4 — exploit those constants (scalar fixed point → loops →
-  // re-specialize → cleanup). ctx.optLevel is accepted for ABI compatibility
-  // and does not affect the pipeline.
+  // Phases 2-5 — exploit those constants (scalar fixed point → loops →
+  // re-specialize → cleanup → vectorize). ctx.optLevel selects the
+  // function-simplification tier and gates Phase 5 vectorization (L2+).
   runOptimizationPipeline(M, ctx.optLevel);
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
@@ -243,5 +345,27 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);
+
+  // Phase 5: vectorization + partial unrolling, L2+. Runs after the final
+  // StructFieldPass so the vectorizers see the fully-specialized loops. L1
+  // skips vectorization entirely (matching clang -O1).
+  if (static_cast<int>(level) >=
+      static_cast<int>(ejit::OptimizationLevel::L2)) {
+    runVectorization(M, level);
+    EJIT_DIAG_DEBUG("pipeline phase5 done: vectorization opt=%d",
+                    static_cast<int>(level));
+  }
+}
+
+void EJitOptimizer::runModuleCleanup(Module &M) {
+  cleanupMPM_.run(M, MAM_);
+}
+
+void EJitOptimizer::runVectorization(Module &M, ejit::OptimizationLevel level) {
+  FunctionPassManager &FPM =
+      (level == ejit::OptimizationLevel::L3) ? vectorizeL3_ : vectorizeL2_;
+  for (Function &F : M.functions())
+    if (!F.isDeclaration())
+      FPM.run(F, FAM_);
 }
 
