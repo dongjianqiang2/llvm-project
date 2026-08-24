@@ -1142,39 +1142,50 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
 
 #ifdef EJIT_DIAG_ENABLE
 /// Classify why a may_const load was NOT replaced by any pattern, for
-/// diagnostics. One EJIT_DIAG line per failed load. Reasons:
+/// diagnostics. One line per failed load: INFO in the final pipeline round
+/// (failure is final there - no later round retries the load), VERBOSE in
+/// earlier rounds (a later round may still replace it). Reasons:
 ///   no-root-gv        — pointer not rooted at a GlobalVariable (opaque/indirect)
 ///   gv-not-in-map     — root GV has no ejit.metadata (not a period var)
 ///   base-unresolved   — GV is a period var but not registered at runtime
 ///   non-const-offset  — GEP index not folded to a constant
 ///   unsupported-type  — createConstantFromMemory cannot build the load type
 static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
-                              PeriodArrayRegistry &reg,
-                              const DataLayout &DL) {
+                              PeriodArrayRegistry &reg, const DataLayout &DL,
+                              bool AtInfo) {
+#define REPLACE_FAIL(fmt, ...)                                                 \
+  do {                                                                         \
+    if (AtInfo)                                                                \
+      EJIT_DIAG(fmt, ##__VA_ARGS__);                                           \
+    else                                                                       \
+      EJIT_DIAG_VERBOSE(fmt, ##__VA_ARGS__);                                   \
+  } while (0)
+  std::string Fn = LI->getFunction()->getName().str();
   Value *Ptr = LI->getPointerOperand();
   const GlobalVariable *GV = findRootGV(Ptr);
   if (!GV) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: no-root-gv");
+    REPLACE_FAIL("may_const load NOT replaced: no-root-gv func=%s", Fn.c_str());
     return;
   }
   auto it = gvMap.find(GV);
   if (it == gvMap.end()) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: gv-not-in-map gv=%s",
-                      GV->getName().str().c_str());
+    REPLACE_FAIL("may_const load NOT replaced: gv-not-in-map gv=%s func=%s",
+                 GV->getName().str().c_str(), Fn.c_str());
     return;
   }
   if (!resolveBase(GV, it->second, reg)) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: base-unresolved gv=%s",
-                      GV->getName().str().c_str());
+    REPLACE_FAIL("may_const load NOT replaced: base-unresolved gv=%s func=%s",
+                 GV->getName().str().c_str(), Fn.c_str());
     return;
   }
   if (!accumulateFullOffset(DL, Ptr)) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: non-const-offset gv=%s",
-                      GV->getName().str().c_str());
+    REPLACE_FAIL("may_const load NOT replaced: non-const-offset gv=%s func=%s",
+                 GV->getName().str().c_str(), Fn.c_str());
     return;
   }
-  EJIT_DIAG_VERBOSE("  may_const load NOT replaced: unsupported-type gv=%s",
-                    GV->getName().str().c_str());
+  REPLACE_FAIL("may_const load NOT replaced: unsupported-type gv=%s func=%s",
+               GV->getName().str().c_str(), Fn.c_str());
+#undef REPLACE_FAIL
 }
 #endif
 
@@ -1201,8 +1212,9 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // apart rather than by re-testing the load later.
   struct Replacement { LoadInst *LI; Constant *ConstVal; bool IsMayConst; };
   SmallVector<Replacement, 16> replacements;
+  lastStats_ = RunStats{};
 #ifdef EJIT_DIAG_ENABLE
-  size_t totalLoads = 0, mayConstLoads = 0;
+  size_t totalLoads = 0;
   // Only the ejit_entry function (or any function that actually has may_const
   // activity / replacements) is worth a per-function diagnostic block. Silent
   // for the common case of an auxiliary callee with no may_const loads, which
@@ -1228,6 +1240,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (Constant *C = tryReplacePeriodPointerBase(
               LI, gvPeriodMap_, registry_, DL)) {
         replacements.push_back({LI, C, /*IsMayConst=*/false});
+        ++lastStats_.PtrBaseReplaced;
         continue;
       }
 
@@ -1237,9 +1250,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
                                              State.mayConstFields, DL);
       if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
-#ifdef EJIT_DIAG_ENABLE
-      ++mayConstLoads;
-#endif
+      ++lastStats_.MayConstLoads;
 
 #ifdef EJIT_VERIFY_SUBSTITUTION
       // Verify mode leaves the load in place, so the pass's second run in
@@ -1280,11 +1291,13 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (!C)
         C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
 
-      if (C)
+      if (C) {
         replacements.push_back({LI, C, /*IsMayConst=*/true});
+        ++lastStats_.MayConstReplaced;
+      }
 #ifdef EJIT_DIAG_ENABLE
       else
-        logReplaceFailure(LI, gvPeriodMap_, registry_, DL);
+        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, finalRound_);
 #endif
     }
   }
@@ -1334,12 +1347,12 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // callees with no may_const activity stay silent, eliminating the bulk of
   // the struct-field log volume while preserving locatability for the
   // functions that matter. Raise the log level to VERBOSE to see this detail.
-  if (isEjitEntry || mayConstLoads > 0 || !replacements.empty()) {
+  if (isEjitEntry || lastStats_.MayConstLoads > 0 || !replacements.empty()) {
     EJIT_DIAG_VERBOSE("struct-field run func=%s entry=%d replaced=%zu",
                       F.getName().str().c_str(), isEjitEntry ? 1 : 0,
                       replacements.size());
     EJIT_DIAG_VERBOSE("  loads total=%zu may_const=%zu replaced=%zu",
-                      totalLoads, mayConstLoads, replacements.size());
+                      totalLoads, lastStats_.MayConstLoads, replacements.size());
   }
 #endif
   LLVM_DEBUG(if (changed) dbgs() << "ejit-struct-field: replaced "

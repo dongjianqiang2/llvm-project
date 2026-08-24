@@ -3870,6 +3870,52 @@ TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
   EXPECT_EQ(RetVal->getSExtValue(), 100); // mock[2].b == 7 → then-branch
 }
 
+// runPipeline() is the production entry point (the ORC transform layer is its
+// only caller), yet no test drove it directly - phases were replayed by hand.
+// Cover it end-to-end on the interproc module: with the period array
+// registered the callee's may_const load folds exactly as the hand-replayed
+// pipeline above; with the registry empty the load cannot resolve and must
+// survive (the per-load INFO failure line and the per-function spec summary
+// line print from this path, but the assertions stay on the IR).
+TEST(EJitInterprocedural, RunPipelineEndToEnd) {
+  // Registered: cell 2's field 1 == 7 -> callee returns 100, load folded.
+  {
+    LLVMContext Ctx;
+    auto M = parseInterprocModule(Ctx);
+    ASSERT_NE(M, nullptr);
+    IpMockElem mock[4] = {{0, 1}, {0, 3}, {0, 7}, {0, 9}};
+    PeriodArrayRegistry reg;
+    reg.registerArray("cell", "g_ipcfg", mock, 4);
+    SpecializationContext ctx;
+    ctx.fnName = "ip_entry";
+    ctx.dimensions.push_back({"cell", 2});
+    EJitOptimizerTestAccess opt(reg);
+    opt.runPipeline(*M, ctx);
+    Function *Callee = M->getFunction("ip_callee");
+    ASSERT_NE(Callee, nullptr);
+    EXPECT_EQ(countLoadsIn(*Callee), 0u) << "callee may_const load survived";
+  }
+
+  // Registry empty: the may_const load has no resolvable base and must
+  // survive every round of the pipeline (final-round failure is expected,
+  // not fatal).
+  {
+    LLVMContext Ctx;
+    auto M = parseInterprocModule(Ctx);
+    ASSERT_NE(M, nullptr);
+    PeriodArrayRegistry reg;
+    SpecializationContext ctx;
+    ctx.fnName = "ip_entry";
+    ctx.dimensions.push_back({"cell", 2});
+    EJitOptimizerTestAccess opt(reg);
+    opt.runPipeline(*M, ctx);
+    Function *Callee = M->getFunction("ip_callee");
+    ASSERT_NE(Callee, nullptr);
+    EXPECT_GT(countLoadsIn(*Callee), 0u)
+        << "may_const load vanished without a registered period array";
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // EJit end-to-end MultiPeriod specialization test
 //===----------------------------------------------------------------------===//

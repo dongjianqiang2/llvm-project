@@ -9,6 +9,7 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITOPTIMIZER_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITOPTIMIZER_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
@@ -41,6 +42,23 @@ struct EJitVpFunctionInfo {
   uint32_t numScalarSites = 0;
 };
 
+/// Per-function specialization statistics collected over one runPipeline()
+/// call, printed as one INFO "spec summary" line per active function at the
+/// end of the pipeline. Counts are exact by construction:
+///   - a replaced load is erased immediately, so cumulative replacement
+///     events never double-count the same load;
+///   - McFailedFinal is measured in the final StructFieldPass round, after
+///     which no further substitution happens, so it equals the number of
+///     may_const loads that stayed unreplaced (each also logged there).
+struct FuncSpecStats {
+  unsigned PindOk = 0;        // ejit_period_arr_ind args substituted
+  unsigned PindFail = 0;      // ejit_period_arr_ind entries that failed
+  size_t McReplaced = 0;      // may_const loads replaced (all rounds)
+  size_t PtrBaseReplaced = 0; // pointer-form period roots replaced (all rounds)
+  size_t McFailedFinal = 0;   // may_const loads unreplaced in the final round
+};
+
+using SpecStatsMap = DenseMap<Function *, FuncSpecStats>;
 /// JIT optimization pipeline. Runs on the extracted bitcode module during
 /// JIT compilation to specialize the code for the current time-window values.
 /// Holds persistent AnalysisManagers to avoid re-registering analyses on
@@ -109,14 +127,26 @@ public:
 
 private:
   /// Replace ejit_period_arr_ind parameters with their runtime constants.
-  void preReplacePeriodIndices(Module &M, const SpecializationContext &ctx);
+  /// Every entry that fails to substitute logs at INFO (malformed entry, arg
+  /// index out of range, period missing from the compile context) and counts
+  /// into \p Stats when non-null.
+  void preReplacePeriodIndices(Module &M, const SpecializationContext &ctx,
+                               SpecStatsMap *Stats = nullptr);
 
   /// Run InstCombine on all functions (single pass).
   void runInstCombine(Module &M);
 
-  /// Run EJitStructFieldPass on all functions.
+  /// Run EJitStructFieldPass on all functions, using \p ctx's bound pointers
+  /// and verify mode. \p FinalRound marks the last invocation of a compile
+  /// (Phase 4): per-load replace failures log at INFO there instead of
+  /// VERBOSE, and the final-round may_const failure count is recorded into
+  /// \p Stats. Replacement counts accumulate on every call.
+  void runStructFieldPass(Module &M, const SpecializationContext &ctx,
+                          bool FinalRound = false,
+                          SpecStatsMap *Stats = nullptr);
+  /// Compatibility overload for direct pass users (gtest); runs without
+  /// bound pointers or verify mode.
   void runStructFieldPass(Module &M);
-  void runStructFieldPass(Module &M, const SpecializationContext &ctx);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call
@@ -145,9 +175,11 @@ private:
   /// point (scalar fold/propagate/simplify), folds loops whose bounds became
   /// constant, re-specializes the array accesses that unrolling turns into
   /// constant-index GEPs, then does a final cleanup. `level` is accepted for
-  /// ABI compatibility and does not affect the pipeline.
+  /// ABI compatibility and does not affect the pipeline. \p Stats receives the
+  /// Phase-4 (final-round) StructFieldPass counts when non-null.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
-                               CompileTier tier);
+                               CompileTier tier,
+                               SpecStatsMap *Stats = nullptr);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,

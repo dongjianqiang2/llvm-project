@@ -173,9 +173,15 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #endif
 
+  // Per-function specialization accounting for the INFO summary printed at
+  // the end of runPipeline.
+  SpecStatsMap Stats;
+
   // Phase 1 - specialize (common to all tiers): turn the period index and
   // every may_const field into a compile-time constant.
-  preReplacePeriodIndices(M, ctx);
+  //   (a) Substitute the ejit_period_arr_ind argument with its constant index.
+  preReplacePeriodIndices(M, ctx, &Stats);
+  EJIT_DIAG_DEBUG("pipeline phase1a done: preReplacePeriodIndices");
   runInstCombine(M);
   EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
   // Inlining is intentionally not run here: the AOT pre-optimization
@@ -183,7 +189,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   // callee bodies in the embedded bitcode, so their may_const GEP chains are
   // already traceable to the global.
   //   (c) Replace the may_const loads with their runtime constant values.
-  runStructFieldPass(M, ctx);
+  runStructFieldPass(M, ctx, /*FinalRound=*/false, &Stats);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
   //   (d) Push the constants across call edges. Wherever the AOT inliner kept
   //       a call, the callee still re-derives cell addressing and re-tests
@@ -197,7 +203,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   //       loads they root, so phases 2-4 exploit the constants in every
   //       function, not just the entry.
   runInstCombine(M);
-  runStructFieldPass(M, ctx);
+  runStructFieldPass(M, ctx, /*FinalRound=*/false, &Stats);
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -420,12 +426,33 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier, &Stats);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
                         FinalSites, AuditSampledEntries);
 #endif
+  // INFO: one summary line per function with specialization activity (or the
+  // ejit_entry target). key=/func= join with the compile begin/OK/FAIL lines;
+  // field semantics are documented on FuncSpecStats. Inactive auxiliary
+  // callees are skipped - their all-zero lines would bury the interesting
+  // functions in log noise on SRE's small ring buffer.
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration())
+      continue;
+    bool IsEntry =
+        hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY);
+    auto It = Stats.find(&F);
+    if (It == Stats.end() && !IsEntry)
+      continue;
+    // Stats entries are only created together with a non-zero counter, so
+    // every non-entry function in the map is active by construction.
+    const FuncSpecStats &S = It != Stats.end() ? It->second : FuncSpecStats();
+    EJIT_DIAG("spec summary key=0x%016lx func=%s pind_ok=%u pind_fail=%u "
+              "pb_repl=%zu mc_repl=%zu mc_failed=%zu",
+              ctx.cacheKey, F.getName().str().c_str(), S.PindOk, S.PindFail,
+              S.PtrBaseReplaced, S.McReplaced, S.McFailedFinal);
+  }
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
 }
@@ -755,8 +782,8 @@ void EJitOptimizer::captureCounterGlobals(Module &M) {
 #endif
 }
 
-void EJitOptimizer::preReplacePeriodIndices(Module &M,
-                                            const SpecializationContext &ctx) {
+void EJitOptimizer::preReplacePeriodIndices(
+    Module &M, const SpecializationContext &ctx, SpecStatsMap *Stats) {
   LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
   for (Function &F : M.functions()) {
@@ -766,30 +793,66 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
 
     for (const MDOperand &Op : MD->operands()) {
       auto *Sub = dyn_cast<MDNode>(Op.get());
-      if (!Sub || Sub->getNumOperands() < 3)
+      if (!Sub || Sub->getNumOperands() < 1)
         continue;
 
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
       if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
         continue;
 
+      // From here on the entry is a period-index substitution candidate. A
+      // failure means the argument stays a runtime value - specialization
+      // silently lost - so every failure path (including a tagged entry
+      // truncated below three operands) logs at INFO.
+      FuncSpecStats *FS = Stats ? &(*Stats)[&F] : nullptr;
+      if (Sub->getNumOperands() < 3) {
+        if (FS)
+          ++FS->PindFail;
+        EJIT_DIAG("period_arr_ind replace FAIL func=%s: malformed metadata "
+                  "entry",
+                  F.getName().str().c_str());
+        continue;
+      }
       auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
       auto *IdxC = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
-      if (!PN || !IdxC)
+      if (!PN || !IdxC) {
+        if (FS)
+          ++FS->PindFail;
+        EJIT_DIAG("period_arr_ind replace FAIL func=%s: malformed metadata "
+                  "entry",
+                  F.getName().str().c_str());
         continue;
+      }
 
       unsigned argIdx = static_cast<unsigned>(IdxC->getZExtValue());
-      if (argIdx >= F.arg_size())
+      if (argIdx >= F.arg_size()) {
+        if (FS)
+          ++FS->PindFail;
+        EJIT_DIAG("period_arr_ind replace FAIL func=%s: arg index %u out of "
+                  "range (nargs=%u)",
+                  F.getName().str().c_str(), argIdx,
+                  static_cast<unsigned>(F.arg_size()));
         continue;
+      }
 
-      for (auto &dim : ctx.dimensions) {
+      const SpecializationContext::DimInfo *Match = nullptr;
+      for (const auto &dim : ctx.dimensions)
         if (dim.periodName == PN->getString()) {
-          Argument *arg = F.getArg(argIdx);
-          arg->replaceAllUsesWith(
-              ConstantInt::get(arg->getType(), dim.cellIdx));
+          Match = &dim;
           break;
         }
+      if (!Match) {
+        if (FS)
+          ++FS->PindFail;
+        EJIT_DIAG("period_arr_ind replace FAIL func=%s: period '%s' not in "
+                  "compile context",
+                  F.getName().str().c_str(), PN->getString().str().c_str());
+        continue;
       }
+      if (FS)
+        ++FS->PindOk;
+      Argument *arg = F.getArg(argIdx);
+      arg->replaceAllUsesWith(ConstantInt::get(arg->getType(), Match->cellIdx));
     }
   }
 }
@@ -828,7 +891,8 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
 }
 
 void EJitOptimizer::runStructFieldPass(Module &M,
-                                       const SpecializationContext &ctx) {
+                                       const SpecializationContext &ctx,
+                                       bool FinalRound, SpecStatsMap *Stats) {
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
       ctx.boundPointers;
   if (!BoundPointers.empty()) {
@@ -861,11 +925,24 @@ void EJitOptimizer::runStructFieldPass(Module &M,
     }
   }
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName,
-                                  verifySubstitution_);
+                                  verifySubstitution_, FinalRound);
   structField.initFromModule(M);
-  for (Function &F : M.functions())
-    if (!F.isDeclaration())
-      structField.run(F, FAM_);
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration())
+      continue;
+    structField.run(F, FAM_);
+    if (!Stats)
+      continue;
+    const EJitStructFieldPass::RunStats &RS = structField.lastStats();
+    if (!RS.MayConstReplaced && !RS.PtrBaseReplaced &&
+        !(FinalRound && RS.MayConstLoads))
+      continue;
+    FuncSpecStats &S = (*Stats)[&F];
+    S.McReplaced += RS.MayConstReplaced;
+    S.PtrBaseReplaced += RS.PtrBaseReplaced;
+    if (FinalRound)
+      S.McFailedFinal = RS.MayConstLoads - RS.MayConstReplaced;
+  }
 }
 
 void EJitOptimizer::runStructFieldPass(Module &M) {
@@ -888,7 +965,8 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             ejit::OptimizationLevel level,
-                                            CompileTier tier) {
+                                            CompileTier tier,
+                                            SpecStatsMap *Stats) {
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -909,7 +987,9 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M);
+  // Final StructFieldPass round: whatever this round cannot replace is a
+  // final specialization loss, so per-load failures log at INFO from here.
+  runStructFieldPass(M, SpecializationContext(), /*FinalRound=*/true, Stats);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);

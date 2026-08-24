@@ -20,11 +20,15 @@
 // Runtime log levels (gEJitDiagLevel, default INFO):
 //   OFF(0)    — no output
 //   INFO(1)   — key events: init/shutdown, compile begin/OK/FAIL, cache
-//               HIT/MISS, activation, errors, registration consume summary
+//               HIT/MISS, activation, errors, registration consume summary,
+//               specialization replacement failures (period-index arg
+//               substitution; final-round may_const loads, one line each)
+//               and the per-function "spec summary" totals line
 //   VERBOSE(2)— per-item detail: each first-time registration, per-function
-//               struct-field stats, per-call compile_or_get, taskpool requests
-//   DEBUG(3)  — internals: idempotent registration skips, per-load replace
-//               failures, staging internals, funcMeta caching
+//               struct-field stats, per-call compile_or_get, taskpool
+//               requests, mid-pipeline-round may_const replace failures
+//   DEBUG(3)  — internals: idempotent registration skips, staging internals,
+//               funcMeta caching
 //
 // The level mirrors enum ejit_log_level in EJitRuntime.h; raise it at runtime
 // via ejit_set_log_level() to recover full detail without recompiling.  All
