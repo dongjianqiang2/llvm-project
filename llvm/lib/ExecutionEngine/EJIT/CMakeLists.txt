@@ -170,6 +170,11 @@ if(EJIT_SRE_SHARED_TASKPOOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
 endif()
 
+if(EJIT_ICACHE_DIRECT_DISPATCH_PADS)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_ICACHE_DIRECT_DISPATCH_PADS=1)
+endif()
+
 # EJIT_FREESTANDING must be visible in LLVMJITLink headers so that
 # std::promise / std::future usage is guarded (bare-metal has no <future>).
 if(EJIT_FREESTANDING)

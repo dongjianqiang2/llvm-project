@@ -511,6 +511,37 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
   }
 }
 
+void ejit_register_icache_pads(const char *funcName, const void *table,
+                               uint32_t padCount) {
+  if (!funcName || !table) {
+    EJIT_DIAG("register_icache_pads reject: name=%p table=%p",
+              (const void *)funcName, table);
+    return;
+  }
+  uint32_t idx = EJitFuncRegistry::instance().resolveAssign(funcName);
+  if (idx == kEJitInvalidFuncIndex) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_CACHE_FULL, "funcIndex capacity exhausted for icache pads",
+        funcName);
+    return;
+  }
+  switch (ejitIcacheRegisterPads(idx, table, padCount)) {
+  case EJitIcacheRegResult::Ok:
+    EJIT_DIAG_VERBOSE("register_icache_pads OK name=%s idx=%u count=%u",
+                      funcName, idx, padCount);
+    break;
+  case EJitIcacheRegResult::CapacityMiss:
+    EJIT_DIAG("register_icache_pads name=%s: idx=%u exceeds pad capacity %u; "
+              "pads remain on miss",
+              funcName, idx, EJIT_ICACHE_FUNC_SLOTS);
+    break;
+  case EJitIcacheRegResult::Invalid:
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_INVALID_PARAM, "invalid icache direct-pad table", funcName);
+    break;
+  }
+}
+
 ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("activate(%s,%u) failed: not initialized", periodName, cellIdx);

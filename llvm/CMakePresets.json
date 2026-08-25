@@ -91,7 +91,9 @@
         "EJIT_SRE_DIAG": "ON",
         "EJIT_DUMP_ASM": "ON",
         "EJIT_STATS_ENABLE": "ON",
-        "EJIT_ICACHE_DIM_SIZE": "16"
+        "EJIT_ICACHE_DIM_SIZE": "16",
+        "EJIT_ICACHE_SPLIT_DISPATCH_1D": "ON",
+        "EJIT_ICACHE_DIRECT_DISPATCH_PADS": "ON"
       }
     },
     {

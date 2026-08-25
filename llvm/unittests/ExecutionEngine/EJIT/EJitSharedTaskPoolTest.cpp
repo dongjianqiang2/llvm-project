@@ -15,6 +15,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
+#include "llvm/ExecutionEngine/EJIT/EJitDirectPad.h"
 #include "gtest/gtest.h"
 #include <algorithm>
 #include <atomic>
@@ -71,6 +73,23 @@ struct PrepareLog {
 bool mockPrepareCode(void *ctx, const void * /*fnPtr*/) {
   auto *log = static_cast<PrepareLog *>(ctx);
   log->cores.push_back(EJitCoreId::current());
+  return log->succeed;
+}
+
+struct PadPatchLog {
+  std::vector<std::pair<void *, const void *>> patches;
+  EJitSharedTaskPoolState *raceState = nullptr;
+  const void *missTarget = nullptr;
+  bool raceOnBody = false;
+  bool succeed = true;
+};
+bool mockPatchPad(void *ctx, void *pad, const void *target) {
+  auto *log = static_cast<PadPatchLog *>(ctx);
+  log->patches.push_back({pad, target});
+  if (log->raceOnBody && target != log->missTarget && log->raceState) {
+    log->raceOnBody = false;
+    log->raceState->icacheDrainSeq.fetchAdd(1);
+  }
   return log->succeed;
 }
 
@@ -2917,6 +2936,106 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainReachesEveryCorePartition) {
   ASSERT_TRUE(pool.setInstanceEnabled(0, 7, true));
   EXPECT_EQ(cells[1], 0u);
   EXPECT_EQ(cells[2], 0u);
+}
+
+TEST_F(SharedTaskPoolTest, DirectPadsPublishAndDrainWithTheirCell) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  constexpr uint32_t kInst = 5;
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
+  uintptr_t pads[kEJitIcacheDirectPadCount + 1] = {};
+  for (uint32_t i = 0; i < kEJitIcacheDirectPadCount; ++i)
+    pads[i] = 0x200000u + i * 4u;
+  pads[kEJitIcacheDirectPadCount] = 0x300000u;
+  registerSlot(kFunc, cells, 1);
+  ASSERT_EQ(ejitIcacheRegisterPads(kFunc, pads, kEJitIcacheDirectPadCount),
+            EJitIcacheRegResult::Ok);
+
+  PadPatchLog log;
+  log.missTarget = reinterpret_cast<void *>(pads[kEJitIcacheDirectPadCount]);
+  pool.setIcachePadPatchCallback(&mockPatchPad, &log);
+  const EJitDimPair d[1] = {{0, kInst}};
+  void *fn = codeFor(kFunc);
+  pool.icacheFill(kFunc, fn, d, 1, pool.icacheBeginResolve());
+
+  ASSERT_EQ(log.patches.size(), 1u);
+  EXPECT_EQ(log.patches[0].first, reinterpret_cast<void *>(pads[kInst]));
+  EXPECT_EQ(log.patches[0].second, fn);
+  EXPECT_EQ(cells[kInst], reinterpret_cast<uintptr_t>(fn));
+
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 7, true));
+  ASSERT_EQ(log.patches.size(), 2u);
+  EXPECT_EQ(log.patches[1].first, reinterpret_cast<void *>(pads[kInst]));
+  EXPECT_EQ(log.patches[1].second, log.missTarget);
+  EXPECT_EQ(cells[kInst], 0u);
+}
+
+TEST_F(SharedTaskPoolTest, DirectPadsStayOnMissWithPerCorePrepare) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
+  uintptr_t pads[kEJitIcacheDirectPadCount + 1] = {};
+  for (uint32_t i = 0; i < kEJitIcacheDirectPadCount; ++i)
+    pads[i] = 0x200000u + i * 4u;
+  pads[kEJitIcacheDirectPadCount] = 0x300000u;
+  registerSlot(kFunc, cells, 1);
+  ASSERT_EQ(ejitIcacheRegisterPads(kFunc, pads, kEJitIcacheDirectPadCount),
+            EJitIcacheRegResult::Ok);
+  PrepareLog prepare;
+  pool.setPrepareCodeCallback(&mockPrepareCode, &prepare);
+  PadPatchLog log;
+  pool.setIcachePadPatchCallback(&mockPatchPad, &log);
+  const EJitDimPair d[1] = {{0, 2}};
+
+  pool.icacheFill(kFunc, codeFor(kFunc), d, 1, pool.icacheBeginResolve());
+  EXPECT_TRUE(log.patches.empty());
+  EXPECT_NE(cells[2], 0u)
+      << "the ordinary pointer cache keeps its existing dimensioned behavior";
+}
+
+TEST_F(SharedTaskPoolTest, DirectPadFillRetractsAfterRacingDrain) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  constexpr uint32_t kInst = 4;
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
+  uintptr_t pads[kEJitIcacheDirectPadCount + 1] = {};
+  for (uint32_t i = 0; i < kEJitIcacheDirectPadCount; ++i)
+    pads[i] = 0x200000u + i * 4u;
+  pads[kEJitIcacheDirectPadCount] = 0x300000u;
+  registerSlot(kFunc, cells, 1);
+  ASSERT_EQ(ejitIcacheRegisterPads(kFunc, pads, kEJitIcacheDirectPadCount),
+            EJitIcacheRegResult::Ok);
+  PadPatchLog log;
+  log.raceState = state_.get();
+  log.missTarget = reinterpret_cast<void *>(pads[kEJitIcacheDirectPadCount]);
+  log.raceOnBody = true;
+  pool.setIcachePadPatchCallback(&mockPatchPad, &log);
+  const EJitDimPair d[1] = {{0, kInst}};
+
+  pool.icacheFill(kFunc, codeFor(kFunc), d, 1, pool.icacheBeginResolve());
+  ASSERT_EQ(log.patches.size(), 2u);
+  EXPECT_EQ(log.patches[0].second, codeFor(kFunc));
+  EXPECT_EQ(log.patches[1].second, log.missTarget);
+  EXPECT_EQ(cells[kInst], 0u);
+}
+
+TEST(EJitDirectPadEncodingTest, EncodesRangeAndBigEndianStoreWord) {
+  uint32_t instruction = 0;
+  EXPECT_TRUE(ejitEncodeAArch64DirectBranch(0x1000, 0x1004, instruction));
+  EXPECT_EQ(instruction, 0x14000001u);
+  EXPECT_EQ(ejitAArch64InstructionStoreWord(instruction, false), 0x14000001u);
+  EXPECT_EQ(ejitAArch64InstructionStoreWord(instruction, true), 0x01000014u);
+
+  EXPECT_TRUE(ejitEncodeAArch64DirectBranch(0x1004, 0x1000, instruction));
+  EXPECT_EQ(instruction, 0x17ffffffu);
+  EXPECT_TRUE(ejitEncodeAArch64DirectBranch(
+      0x10000000u, 0x10000000u + (uintptr_t{1} << 27) - 4, instruction));
+  EXPECT_FALSE(ejitEncodeAArch64DirectBranch(
+      0x10000000u, 0x10000000u + (uintptr_t{1} << 27), instruction));
+  EXPECT_FALSE(ejitEncodeAArch64DirectBranch(0x1001, 0x1004, instruction));
 }
 
 // The drain runs on EVERY setInstanceEnabled call, not only the one that moves

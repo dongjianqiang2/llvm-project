@@ -52,6 +52,12 @@ bool ejitSreSplitPoolForCurrentCore(uintptr_t PoolBase, uint64_t PoolSize);
 /// success. A no-op returning false when the platform seal symbol is not built.
 bool ejitSreSealPageForCurrentCore(uintptr_t PageVA);
 
+/// Atomically replace the one-instruction AOT pad at p Pad with `b Target`,
+/// preserving W^X and synchronizing instruction caches. Returns false without
+/// modifying the pad when either address is invalid/out of range or the pad
+/// section cannot be made writable.
+bool ejitSrePatchDirectBranch(void *Pad, const void *Target);
+
 } // namespace ejit
 } // namespace llvm
 

@@ -804,6 +804,22 @@ set(EJIT_ICACHE_SECTION ".mc_shared" CACHE STRING
   "Section for the EJIT inline-cache cell table; must be inter-core shared on a multi-core target")
 message(STATUS "EmbeddedJIT: inline-cache cell table section=${EJIT_ICACHE_SECTION}")
 
+# Optional experiment for one-dimensional cell/trp entries. Instead of one
+# indirect JIT callsite serving every instance, emit a direct conditional branch
+# tree with one indirect callsite per instance [0, 15]. This trades a larger AOT
+# dispatcher for a monomorphic indirect-branch PC per active instance.
+option(EJIT_ICACHE_SPLIT_DISPATCH_1D
+  "Split 1D cell/trp inline-cache dispatch into 16 instance-specific callsites" OFF)
+message(STATUS "EmbeddedJIT: split 1D cell/trp dispatch=${EJIT_ICACHE_SPLIT_DISPATCH_1D}")
+
+# Optional second-stage experiment for the split dispatcher above. Each leaf
+# tail-branches to an AOT pad whose single AArch64 B instruction is patched to
+# the JIT body after publication. The split option remains independently useful
+# as the lower-risk indirect-branch A/B baseline.
+option(EJIT_ICACHE_DIRECT_DISPATCH_PADS
+  "Patch split 1D cell/trp dispatch pads to JIT bodies with direct branches" OFF)
+message(STATUS "EmbeddedJIT: direct 1D cell/trp pads=${EJIT_ICACHE_DIRECT_DISPATCH_PADS}")
+
 #===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
 # Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
 # instead of calling the synchronous compile driver directly. Sync and async

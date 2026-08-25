@@ -120,6 +120,17 @@ bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
   return false;
 #endif
 }
+
+[[maybe_unused]] bool sharedPatchDirectPadThunk(void * /*ctx*/, void *pad,
+                                                const void *target) {
+#ifdef EJIT_SRE_CODE_POOL
+  return ejitSrePatchDirectBranch(pad, target);
+#else
+  (void)pad;
+  (void)target;
+  return false;
+#endif
+}
 #endif
 } // namespace
 #endif
@@ -196,6 +207,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // Mirror the owner-core code-pool stats into the shared state so every core's
   // ejit_print_code_pool_stats is consistent (the pools are owner-private).
   sharedPool_.setCodePoolStatsProvider(&sharedCodePoolStatsThunk, this);
+#ifdef EJIT_ICACHE_DIRECT_DISPATCH_PADS
+  sharedPool_.setIcachePadPatchCallback(&sharedPatchDirectPadThunk, this);
+#endif
 #endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
   sharedPool_.setCodeSharingEnabled(true);

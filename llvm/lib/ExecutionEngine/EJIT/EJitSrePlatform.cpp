@@ -26,6 +26,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitDirectPad.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h" // seal/split granule contract
 
 #include <cstdint>
@@ -127,6 +128,13 @@ extern const unsigned char __ejit_code_end[] __attribute__((weak));
 extern const unsigned char __ejit_code_start[];
 extern const unsigned char __ejit_code_end[];
 #endif
+}
+#endif
+
+#if defined(EJIT_ICACHE_DIRECT_DISPATCH_PADS)
+extern "C" {
+extern const unsigned char __ejit_pads_start[];
+extern const unsigned char __ejit_pads_end[];
 }
 #endif
 
@@ -386,6 +394,55 @@ bool llvm::ejit::ejitSreSealPageForCurrentCore(uintptr_t PageVA) {
   EJIT_DIAG("sealPageForCurrentCore unsupported config: pageVA=0x%llx",
             static_cast<unsigned long long>(PageVA));
   (void)PageVA;
+  return false;
+#endif
+}
+
+bool llvm::ejit::ejitSrePatchDirectBranch(void *Pad, const void *Target) {
+#if defined(EJIT_FIXED_CODE_POOL) && defined(EJIT_ICACHE_DIRECT_DISPATCH_PADS)
+  if (!Pad || !Target)
+    return false;
+  const uintptr_t Site = reinterpret_cast<uintptr_t>(Pad);
+  const uintptr_t Dest = reinterpret_cast<uintptr_t>(Target);
+  const uintptr_t PadsBegin = reinterpret_cast<uintptr_t>(__ejit_pads_start);
+  const uintptr_t PadsEnd = reinterpret_cast<uintptr_t>(__ejit_pads_end);
+  if (Site < PadsBegin || Site + sizeof(uint32_t) > PadsEnd)
+    return false;
+
+  uint32_t Instruction;
+  if (!ejitEncodeAArch64DirectBranch(Site, Dest, Instruction)) {
+    EJIT_DIAG("patchDirectBranch range FAIL: pad=%p target=%p delta=%lld", Pad,
+              Target, static_cast<long long>(Dest - Site));
+    return false;
+  }
+
+  const uintptr_t Page = Site & ~static_cast<uintptr_t>(k4KiB - 1);
+  const uint32_t OldWord =
+      __atomic_load_n(static_cast<uint32_t *>(Pad), __ATOMIC_RELAXED);
+  if (ejit_sre_enable_rw(1, static_cast<unsigned long long>(Page)) != 0) {
+    EJIT_DIAG("patchDirectBranch enable_rw FAIL: pad=%p page=0x%llx", Pad,
+              static_cast<unsigned long long>(Page));
+    return false;
+  }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  constexpr bool DataBigEndian = true;
+#else
+  constexpr bool DataBigEndian = false;
+#endif
+  const uint32_t StoreWord =
+      ejitAArch64InstructionStoreWord(Instruction, DataBigEndian);
+  __atomic_store_n(static_cast<uint32_t *>(Pad), StoreWord, __ATOMIC_RELEASE);
+  if (sealAndSyncCache(Page, k4KiB) != 0) {
+    EJIT_DIAG("patchDirectBranch enable_ex FAIL: pad=%p page=0x%llx", Pad,
+              static_cast<unsigned long long>(Page));
+    __atomic_store_n(static_cast<uint32_t *>(Pad), OldWord, __ATOMIC_RELEASE);
+    (void)sealAndSyncCache(Page, k4KiB);
+    return false;
+  }
+  return true;
+#else
+  (void)Pad;
+  (void)Target;
   return false;
 #endif
 }

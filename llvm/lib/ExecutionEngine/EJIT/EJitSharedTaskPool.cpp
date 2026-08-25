@@ -17,11 +17,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#include <atomic>
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
-#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
+#include <atomic>
 
 // Compile-time guard: if EJIT_ICACHE_FUNC_SLOTS ever falls below
 // EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX (defined in EJitSharedTaskPoolState.h,
@@ -177,6 +178,34 @@ struct EJitIcacheSlotReg {
 };
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
 
+// Optional direct-dispatch companions for one-dimensional cell/trp slots.
+// table[0..count) are AOT pad entry addresses; table[count] is the common miss
+// target each pad contains at link time and is restored to on every drain.
+struct EJitIcachePadReg {
+  const void *table;
+  uint32_t count;
+};
+EJitIcachePadReg gIcachePads[EJIT_ICACHE_FUNC_SLOTS];
+
+inline uintptr_t icachePadWord(const EJitIcachePadReg &reg, uintptr_t idx) {
+  uintptr_t word;
+  const auto *entry = static_cast<const unsigned char *>(reg.table) +
+                      idx * sizeof(uintptr_t);
+  // The AOT object is an LLVM pointer array, not a C++ uintptr_t array. A
+  // fixed-size builtin copy preserves the representation without type-punning
+  // and lowers to one native pointer load on the supported targets.
+  __builtin_memcpy(&word, entry, sizeof(word));
+  return word;
+}
+
+inline void *icachePad(const EJitIcachePadReg &reg, uintptr_t idx) {
+  return reinterpret_cast<void *>(icachePadWord(reg, idx));
+}
+
+inline const void *icachePadMiss(const EJitIcachePadReg &reg) {
+  return reinterpret_cast<const void *>(icachePadWord(reg, reg.count));
+}
+
 // A cell viewed as the atomic it is: EJitAtomic<uintptr_t> is a standard-layout
 // wrapper over exactly one pointer-sized word, so this overlay on the AOT array
 // is layout-identical and only changes which builtin performs the access.
@@ -246,6 +275,18 @@ EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex,
   return EJitIcacheRegResult::Ok;
 }
 
+EJitIcacheRegResult llvm::ejit::ejitIcacheRegisterPads(uint32_t funcIndex,
+                                                       const void *table,
+                                                       uint32_t padCount) {
+  if (!table || padCount != kEJitIcacheDirectPadCount)
+    return EJitIcacheRegResult::Invalid;
+  if (funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+    return EJitIcacheRegResult::CapacityMiss;
+  gIcachePads[funcIndex].table = table;
+  gIcachePads[funcIndex].count = padCount;
+  return EJitIcacheRegResult::Ok;
+}
+
 void llvm::ejit::ejitIcacheClearAll() {
   // Unregister every slot: nulling base makes all probes miss (icacheTry/icacheFill
   // see no base and bail), which is the "empty" state. We do NOT dereference the
@@ -257,6 +298,8 @@ void llvm::ejit::ejitIcacheClearAll() {
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
     gIcacheSlots[f].base = nullptr;
     gIcacheSlots[f].numDims = 0;
+    gIcachePads[f].table = nullptr;
+    gIcachePads[f].count = 0;
   }
 }
 
@@ -348,10 +391,19 @@ void EJitSharedTaskPool::icacheDrainAll(const char *reason) {
     ++walkedSlots;
 #endif
     for (uintptr_t c = 0; c < cells; ++c) {
+      const uintptr_t oldFn = icacheCell(reg.base, c).loadRelaxed();
 #ifdef EJIT_DIAG_ENABLE
-      if (icacheCell(reg.base, c).loadRelaxed() != 0)
+      if (oldFn != 0)
         ++clearedCells;
 #endif
+      const EJitIcachePadReg &pads = gIcachePads[f];
+      if (oldFn != 0 && pads.table && c < pads.count && icachePadPatchFn_ &&
+          icacheCrossCoreExecutable()) {
+        if (!icachePadPatchFn_(icachePadPatchCtx_, icachePad(pads, c),
+                               icachePadMiss(pads)))
+          EJIT_DIAG("icacheDrain pad restore FAIL: func=%u idx=%llu pad=%p", f,
+                    static_cast<unsigned long long>(c), icachePad(pads, c));
+      }
       icacheCell(reg.base, c).storeRelaxed(0);
     }
   }
@@ -720,6 +772,12 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   const uintptr_t idx = icacheLinearize(dims, numDims);
   EJitAtomicUPtr &cell = icacheCell(reg.base, idx);
   cell.storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
+  const EJitIcachePadReg &pads = gIcachePads[funcIndex];
+  bool padPublished = false;
+  if (numDims == 1 && pads.table && idx < pads.count && icachePadPatchFn_ &&
+      icacheCrossCoreExecutable())
+    padPublished =
+        icachePadPatchFn_(icachePadPatchCtx_, icachePad(pads, idx), fnPtr);
 
   // Re-validate AFTER the store and retract on conflict. The checks above only
   // PRECEDE the store: a drain can begin after they pass, zero this cell, and
@@ -730,6 +788,12 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // fill (disjointness), and a null cell is always safe.
   if (state_->icacheDrainsInFlight.loadAcquire() != 0 ||
       static_cast<uint32_t>(token) != state_->icacheDrainSeq.loadAcquire()) {
+    if (padPublished &&
+        !icachePadPatchFn_(icachePadPatchCtx_, icachePad(pads, idx),
+                           icachePadMiss(pads)))
+      EJIT_DIAG("icacheFill pad retract FAIL: func=%u idx=%llu pad=%p",
+                funcIndex, static_cast<unsigned long long>(idx),
+                icachePad(pads, idx));
     cell.storeRelaxed(0);
     if (!gIcacheFillRejectLogged[kFillRejectRetracted]) {
       gIcacheFillRejectLogged[kFillRejectRetracted] = true;

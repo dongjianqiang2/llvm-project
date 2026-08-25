@@ -247,6 +247,36 @@ EJit::EJit(const Config &config) : config_(config) {
           }
           break;
         }
+        case EJIT_REG_ICACHE_PADS: {
+          if (!e->name1 || !e->ptr) {
+            recordInitError(EJIT_ERR_INVALID_PARAM,
+                            "icache pad registration has a null table",
+                            e->name1 ? e->name1 : "");
+            break;
+          }
+          uint32_t idx = EJitFuncRegistry::instance().resolveAssign(e->name1);
+          if (idx == kEJitInvalidFuncIndex) {
+            recordInitError(EJIT_ERR_CACHE_FULL,
+                            "funcIndex capacity exhausted for icache pads",
+                            e->name1);
+            break;
+          }
+          switch (ejitIcacheRegisterPads(idx, e->ptr,
+                                         static_cast<uint32_t>(e->size))) {
+          case EJitIcacheRegResult::Ok:
+            break;
+          case EJitIcacheRegResult::CapacityMiss:
+            EJIT_DIAG("register_icache_pads name=%s: idx=%u exceeds pad "
+                      "capacity %u; pads remain on miss",
+                      e->name1, idx, EJIT_ICACHE_FUNC_SLOTS);
+            break;
+          case EJitIcacheRegResult::Invalid:
+            recordInitError(EJIT_ERR_INVALID_PARAM,
+                            "invalid icache direct-pad table", e->name1);
+            break;
+          }
+          break;
+        }
         default:
           break;
         }

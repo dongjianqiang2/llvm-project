@@ -108,6 +108,19 @@ SECTIONS
    * AOT code. REQUIRES the platform to supply enable_rw (symmetric to
    * enable_ex); a missing enable_rw is a hard link error.
    */
+  /* --- EmbeddedJIT patchable direct-dispatch pads ---
+   * Keep these instructions on dedicated 4KiB pages: runtime publication flips
+   * a pad page RX->RW->RX, so sharing it with ordinary AOT text would create an
+   * avoidable execute-permission window. The strong bounds also make a missing
+   * product-linker integration fail at link time when direct pads are enabled. */
+  .text.ejit_pads : ALIGN(4096)
+  {
+    __ejit_pads_start = .;
+    KEEP(*(.text.ejit_pads))
+    . = ALIGN(4096);
+    __ejit_pads_end = .;
+  } > CODE
+
   /* --- EmbeddedJIT frame-less dispatcher clustering ---
    * Tiny (~16-48 bytes each) icache dispatchers grouped together so they share
    * cache lines (spatial locality across ejit_entry switches) and reduce iTLB
@@ -159,6 +172,17 @@ SECTIONS
  *
  * EJIT_FIXED_CODE_POOL also needs a fixed-region INSERT fragment at the FINAL
  * executable link (not merely at an intermediate `clang -r` link):
+ *
+ *   SECTIONS
+ *   {
+ *     .text.ejit_pads : ALIGN(4096)
+ *     {
+ *       __ejit_pads_start = .;
+ *       KEEP(*(.text.ejit_pads))
+ *       . = ALIGN(4096);
+ *       __ejit_pads_end = .;
+ *     }
+ *   } INSERT AFTER .text;
  *
  *   SECTIONS
  *   {

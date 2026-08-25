@@ -75,6 +75,7 @@ constexpr const char *GV_EJIT_BITCODE = "__ejit_bitcode";
 // diagnostic. Keep these constants as the single source for the AOT side.
 constexpr const char *SECT_EJIT_BITCODE = ".ejit_bitcode";
 constexpr const char *SECT_EJIT_PERIOD = ".ejit_period";
+constexpr const char *SECT_EJIT_DIRECT_PADS = ".text.ejit_pads";
 constexpr const char *FN_AUTO_REGISTER = "ejit_auto_register";
 constexpr const char *CTORS_GLOBAL = "llvm.global_ctors";
 
@@ -96,6 +97,8 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 // ejit_icache_try call - so the hit path is one load + null-check + indirect
 // call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
+constexpr const char *FN_REGISTER_ICACHE_PADS = "ejit_register_icache_pads";
+constexpr uint32_t kEJitIcacheDirectPadCount = 16;
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper

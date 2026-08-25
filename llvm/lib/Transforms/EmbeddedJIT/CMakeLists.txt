@@ -27,3 +27,13 @@ add_llvm_component_library(LLVMEmbeddedJIT
 target_compile_definitions(LLVMEmbeddedJIT PRIVATE
   EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
   EJIT_ICACHE_SECTION="${EJIT_ICACHE_SECTION}")
+
+if(EJIT_ICACHE_SPLIT_DISPATCH_1D)
+  target_compile_definitions(LLVMEmbeddedJIT PRIVATE
+    EJIT_ICACHE_SPLIT_DISPATCH_1D=1)
+endif()
+
+if(EJIT_ICACHE_DIRECT_DISPATCH_PADS)
+  target_compile_definitions(LLVMEmbeddedJIT PRIVATE
+    EJIT_ICACHE_DIRECT_DISPATCH_PADS=1)
+endif()

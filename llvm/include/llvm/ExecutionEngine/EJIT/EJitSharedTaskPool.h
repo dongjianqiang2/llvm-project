@@ -227,6 +227,13 @@ enum class EJitIcacheRegResult { Ok, CapacityMiss, Invalid };
 EJitIcacheRegResult ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                            uint32_t numDims);
 
+// Register padCount direct-dispatch pad entry addresses followed by one miss
+// target pointer. Direct pads are only emitted for one-dimensional cell/trp
+// wrappers and currently have a fixed count of 16.
+EJitIcacheRegResult ejitIcacheRegisterPads(uint32_t funcIndex,
+                                           const void *table,
+                                           uint32_t padCount);
+
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
 /// Shows funcIndex, base pointer, numDims, the per-slot cell capacity
 /// (16^numDims), and cell[0] (the scalar or [0]...[0] cell) so the caller
@@ -335,6 +342,11 @@ public:
   /// Per-core platform primitive: seal one 4KiB page at \p pageVA to RX in the
   /// CALLING core's translation context (enable_ex). Returns true on success.
   using SealPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
+  /// Patch one AOT direct-dispatch pad to p target and publish the instruction
+  /// to every core. The callback must fail without modifying the pad when the
+  /// target is outside AArch64 B's range or the page cannot be made writable.
+  using IcachePadPatchCallback = bool (*)(void *ctx, void *pad,
+                                          const void *target);
 
   /// Worker loop entry (provided by this class, run on the injected task).
   using WorkerEntryFn = void (*)(void *ctx);
@@ -563,6 +575,10 @@ public:
   void setSealPageCallback(SealPageCallback fn, void *ctx) {
     sealPageFn_ = fn;
     sealPageCtx_ = ctx;
+  }
+  void setIcachePadPatchCallback(IcachePadPatchCallback fn, void *ctx) {
+    icachePadPatchFn_ = fn;
+    icachePadPatchCtx_ = ctx;
   }
   void setWorkerHooks(WorkerStartFn start, WorkerStopFn stop, void *ctx) {
     workerStart_ = start;
@@ -1110,6 +1126,8 @@ private:
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;
   void *sealPageCtx_ = nullptr;
+  IcachePadPatchCallback icachePadPatchFn_ = nullptr;
+  void *icachePadPatchCtx_ = nullptr;
   bool fourKSeal_ = false;
   WorkerStartFn workerStart_ = nullptr;
   WorkerStopFn workerStop_ = nullptr;

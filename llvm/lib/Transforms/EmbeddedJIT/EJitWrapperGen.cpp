@@ -88,6 +88,24 @@ static cl::opt<bool> EJitInlineCache(
              "cached specialization pointer) before the taskpool "
              "compile_or_get call in ejit_entry wrappers"));
 
+#ifndef EJIT_ICACHE_SPLIT_DISPATCH_1D
+#define EJIT_ICACHE_SPLIT_DISPATCH_1D 0
+#endif
+static cl::opt<bool> EJitIcacheSplitDispatch1D(
+    "ejit-icache-split-dispatch-1d",
+    cl::init(EJIT_ICACHE_SPLIT_DISPATCH_1D != 0), cl::Hidden,
+    cl::desc("Split eligible one-dimensional cell/trp inline-cache dispatch "
+             "into 16 instance-specific indirect callsites"));
+
+#ifndef EJIT_ICACHE_DIRECT_DISPATCH_PADS
+#define EJIT_ICACHE_DIRECT_DISPATCH_PADS 0
+#endif
+static cl::opt<bool> EJitIcacheDirectDispatchPads(
+    "ejit-icache-direct-dispatch-pads",
+    cl::init(EJIT_ICACHE_DIRECT_DISPATCH_PADS != 0), cl::Hidden,
+    cl::desc("Tail-branch split 1D cell/trp leaves through patchable AOT "
+             "direct-branch pads"));
+
 // Section for the per-function @__ejit_icache_fn_<name> cell table. In the
 // inter-core SHARED section (.mc_shared, where the taskpool state blob also
 // lives) the table is ONE object every core reads, so a deactivate zeroes a
@@ -472,6 +490,63 @@ emitIcacheSlotRegistration(Module &M,
   appendToUsed(M, {GV});
 }
 
+static void emitIcachePadRegistration(
+    Module &M, const std::map<std::string, GlobalVariable *> &Tables) {
+  if (Tables.empty() || M.getGlobalVariable(".ejit.registry.icache_pads"))
+    return;
+  LLVMContext &Ctx = M.getContext();
+  auto *PtrTy = PointerType::getUnqual(Ctx);
+  auto *I32Ty = Type::getInt32Ty(Ctx);
+  auto *I64Ty = Type::getInt64Ty(Ctx);
+  M.getOrInsertFunction(
+      FN_REGISTER_ICACHE_PADS,
+      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy, I32Ty}, false));
+
+  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
+  if (!AutoReg) {
+    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
+                               FN_AUTO_REGISTER, &M);
+    BasicBlock::Create(Ctx, "entry", AutoReg);
+    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
+    if (EnableEJitGlobalCtors)
+      appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
+  }
+  Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
+  FunctionCallee Register = M.getFunction(FN_REGISTER_ICACHE_PADS);
+  for (auto &KV : Tables) {
+    IRBuilder<> Builder(Ret);
+    Value *Name = Builder.CreateGlobalString(KV.first);
+    Builder.CreateCall(Register,
+                       {Name, Builder.CreateBitCast(KV.second, PtrTy),
+                        ConstantInt::get(I32Ty, kEJitIcacheDirectPadCount)});
+  }
+
+  StructType *EntryTy = StructType::get(
+      Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
+  auto makeStrGV = [&](const std::string &S) -> Constant * {
+    Constant *Str = ConstantDataArray::getString(Ctx, S, true);
+    auto *GV =
+        new GlobalVariable(M, Str->getType(), true, GlobalValue::PrivateLinkage,
+                           Str, ".ejit.str.");
+    return ConstantExpr::getBitCast(GV, PtrTy);
+  };
+  SmallVector<Constant *, 16> Entries;
+  for (auto &KV : Tables)
+    Entries.push_back(ConstantStruct::get(
+        EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_ICACHE_PADS),
+                  makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
+                  ConstantExpr::getBitCast(KV.second, PtrTy),
+                  ConstantInt::get(I64Ty, kEJitIcacheDirectPadCount)}));
+  ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
+  auto *GV = new GlobalVariable(
+      M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+      ConstantArray::get(ArrayTy, Entries), ".ejit.registry.icache_pads");
+  GV->setSection(SECT_EJIT_PERIOD);
+  GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
+  appendToUsed(M, {GV});
+}
+
 } // anonymous namespace
 
 PreservedAnalyses EJitWrapperGenPass::run(Module &M,
@@ -603,6 +678,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
   LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: " << EntryFuncs.size()
                     << " entry function(s)\n");
+  std::map<std::string, GlobalVariable *> DirectPadTables;
   bool Changed = false;
   for (Function *F : EntryFuncs) {
     LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: wrapping " << F->getName() << "\n");
@@ -704,6 +780,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           FN_TASKPOOL_TRACE_WRAPPER,
           FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
     }
+
+    auto applyEntryCallABI = [&](CallInst *CI) {
+      CI->setCallingConv(F->getCallingConv());
+      CI->setAttributes(F->getAttributes());
+    };
 
     // emitSlowPath: emit the funcIndex guard (EntryBB) + compile_or_get
     // (CallBB) + dispatch (DispatchBB) into Fn, using Fn's args. FallbackBB
@@ -810,13 +891,15 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         }
       };
       if (F->getReturnType()->isVoidTy()) {
-        B.CreateCall(F->getFunctionType(), OutFn, Args);
+        CallInst *CI = B.CreateCall(F->getFunctionType(), OutFn, Args);
+        applyEntryCallABI(CI);
         releaseAndTrace();
         B.CreateRetVoid();
       } else {
-        Value *RetVal = B.CreateCall(F->getFunctionType(), OutFn, Args);
+        CallInst *CI = B.CreateCall(F->getFunctionType(), OutFn, Args);
+        applyEntryCallABI(CI);
         releaseAndTrace();
-        B.CreateRet(RetVal);
+        B.CreateRet(CI);
       }
     };
 
@@ -888,8 +971,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       // Wrapper (F): frame-less probe + tail calls.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
-      auto *JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
-      auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
       IRBuilder<> B(JitEntry);
       Value *TBeforeIcache = nullptr, *FuncIdxForTiming = nullptr;
       if (EJitWrapperTiming) {
@@ -900,69 +981,201 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       }
       GlobalVariable *IcacheSlot = IcacheIt->second.GV;
       unsigned NumDims = IcacheIt->second.NumDims;
-      Value *SlotPtr = IcacheSlot;
-      if (NumDims > 0) {
-        SmallVector<Value *, 5> Indices;
-        Indices.push_back(ConstantInt::get(I32Ty, 0));
-        for (unsigned I = 0; I < NumDims; ++I) {
-          Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
-          unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-          Value *Idx = ArgVal;
-          if (BW > 32) Idx = B.CreateTrunc(ArgVal, I32Ty);
-          else if (BW < 32) Idx = B.CreateZExt(ArgVal, I32Ty);
-          Indices.push_back(Idx);
-        }
-        SlotPtr = B.CreateInBoundsGEP(IcacheSlot->getValueType(), IcacheSlot,
-                                      Indices, "ejit_ic_slot");
-      }
-      LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
-      ICSlotLoad->setAlignment(Align(8));
-      // Monotonic, nothing stronger: the cell is shared, so a peer's drain can
-      // store 0 concurrently and the atomic makes that a defined race (old
-      // pointer or 0) instead of UB. The value is self-contained and the call
-      // below carries a data dependency on it, so acquire would buy nothing and
-      // cost an LDAR per hit. Lowers to the same LDR on AArch64.
-      ICSlotLoad->setAtomic(AtomicOrdering::Monotonic);
-      Value *TAfterIcache = nullptr;
-      if (EJitWrapperTiming)
-        TAfterIcache = B.CreateCall(TraceNow, {}, "ejit_t_after_icache");
-      Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
-      IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
-                               {IHit, ConstantInt::getTrue(Ctx)});
-      B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
-
-      // Hit: tail-call the cached specialization directly (no release_read).
-      // With -ejit-wrapper-timing the wrapper is NOT frame-less (JitEntry emits
-      // bl @ejit_taskpool_trace_now), so the hit path cannot be a musttail tail
-      // call: emitHitTiming() inserts calls BETWEEN the call and the ret, which
-      // would violate the musttail rule ("musttail call must precede a ret") and
-      // yield broken IR -> codegen silently drops the function -> boot
-      // translation fault. Use a plain (framed) call + trace + ret instead; the
-      // frame-less musttail fast path is reserved for the no-timing case.
-      B.SetInsertPoint(JitIcacheDispatch);
       SmallVector<Value *, 8> ICArgs;
       for (auto &A : F->args()) ICArgs.push_back(&A);
-      auto emitHitTiming = [&]() {
-        if (!EJitWrapperTiming) return;
-        Value *TAfterFn = B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-        B.CreateCall(TraceWrapper,
-                     {FuncIdxForTiming,
-                      ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
-                      ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
-                      TAfterIcache, TAfterFn, TAfterFn});
+      auto emitIcacheDispatch = [&](IRBuilder<> &DB, Value *FnPtr,
+                                    Value *TAfterIcache) {
+        // Hit: tail-call the cached specialization directly (no release_read).
+        // Timing inserts calls between the indirect call and return, so only
+        // the uninstrumented path may use musttail.
+        CallInst *CI = DB.CreateCall(F->getFunctionType(), FnPtr, ICArgs);
+        applyEntryCallABI(CI);
+        if (!EJitWrapperTiming)
+          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+        if (EJitWrapperTiming) {
+          Value *TAfterFn = DB.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+          DB.CreateCall(TraceWrapper,
+                        {FuncIdxForTiming,
+                         ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
+                         FnPtr, ConstantInt::get(I32Ty, 0), TBeforeIcache,
+                         TAfterIcache, TAfterFn, TAfterFn});
+        }
+        if (F->getReturnType()->isVoidTy())
+          DB.CreateRetVoid();
+        else
+          DB.CreateRet(CI);
       };
-      if (F->getReturnType()->isVoidTy()) {
-        CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (!EJitWrapperTiming)
-          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-        emitHitTiming();
-        B.CreateRetVoid();
+
+      const bool IsSplitLifecycle =
+          NumDims == 1 && (PeriodInds[0].PeriodName == "cell" ||
+                           PeriodInds[0].PeriodName == "trp");
+      const bool UseSplitDispatch = EJitIcacheSplitDispatch1D &&
+                                    IsSplitLifecycle &&
+                                    EJIT_ICACHE_DIM_SIZE >= 16;
+      const bool UseDirectPads = UseSplitDispatch &&
+                                 EJitIcacheDirectDispatchPads &&
+                                 !EJitWrapperTiming;
+      BasicBlock *JitIcacheDispatch = nullptr;
+      if (!UseSplitDispatch)
+        JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
+      auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
+
+      if (UseSplitDispatch) {
+        constexpr unsigned SplitInstances = kEJitIcacheDirectPadCount;
+        static_assert((SplitInstances & (SplitInstances - 1)) == 0,
+                      "bit-test dispatch requires a power-of-two "
+                      "instance count");
+        Value *ArgVal = F->getArg(PeriodInds[0].ArgIndex);
+        unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
+        Value *Instance = ArgVal;
+        if (BW > 32)
+          Instance = B.CreateTrunc(ArgVal, I32Ty, "ejit_split_instance");
+        else if (BW < 32)
+          Instance = B.CreateZExt(ArgVal, I32Ty, "ejit_split_instance");
+
+        SmallVector<Function *, SplitInstances> PadFunctions;
+        if (UseDirectPads) {
+          SmallVector<Constant *, SplitInstances + 1> PadTable;
+          for (unsigned I = 0; I < SplitInstances; ++I) {
+            Function *Pad = Function::Create(
+                F->getFunctionType(), GlobalValue::InternalLinkage,
+                "__ejit_icache_pad_" + F->getName() + "_" + Twine(I), &M);
+            Pad->setCallingConv(F->getCallingConv());
+            Pad->setAttributes(F->getAttributes());
+            Pad->addFnAttr(Attribute::NoInline);
+            Pad->setSection(SECT_EJIT_DIRECT_PADS);
+            Pad->setAlignment(Align(4));
+            BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Pad);
+            IRBuilder<> PB(Entry);
+            SmallVector<Value *, 8> Args;
+            for (Argument &A : Pad->args())
+              Args.push_back(&A);
+            CallInst *CI =
+                PB.CreateCall(MissFn->getFunctionType(), MissFn, Args);
+            applyEntryCallABI(CI);
+            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+            if (F->getReturnType()->isVoidTy())
+              PB.CreateRetVoid();
+            else
+              PB.CreateRet(CI);
+            PadFunctions.push_back(Pad);
+            PadTable.push_back(ConstantExpr::getBitCast(Pad, PtrTy));
+          }
+          PadTable.push_back(ConstantExpr::getBitCast(MissFn, PtrTy));
+          ArrayType *TableTy = ArrayType::get(PtrTy, PadTable.size());
+          auto *Table = new GlobalVariable(
+              M, TableTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+              ConstantArray::get(TableTy, PadTable),
+              "__ejit_icache_pad_table_" + F->getName());
+          Table->setAlignment(Align(8));
+          DirectPadTables.emplace(F->getName().str(), Table);
+        }
+
+        SmallVector<BasicBlock *, SplitInstances> LeafBlocks;
+        SmallVector<BasicBlock *, SplitInstances> ProbeBlocks;
+        SmallVector<BasicBlock *, SplitInstances> DispatchBlocks;
+        for (unsigned I = 0; I < SplitInstances; ++I) {
+          if (UseDirectPads) {
+            DispatchBlocks.push_back(
+                BasicBlock::Create(Ctx, "jit_icache_dispatch_" + Twine(I), F));
+            LeafBlocks.push_back(DispatchBlocks.back());
+          } else {
+            ProbeBlocks.push_back(
+                BasicBlock::Create(Ctx, "jit_icache_probe_" + Twine(I), F));
+            DispatchBlocks.push_back(
+                BasicBlock::Create(Ctx, "jit_icache_dispatch_" + Twine(I), F));
+            LeafBlocks.push_back(ProbeBlocks.back());
+          }
+        }
+
+        for (unsigned I = 0; I < SplitInstances; ++I) {
+          if (UseDirectPads) {
+            IRBuilder<> DB(DispatchBlocks[I]);
+            emitIcacheDispatch(DB, PadFunctions[I], nullptr);
+            continue;
+          }
+          IRBuilder<> PB(ProbeBlocks[I]);
+          Value *SlotPtr = PB.CreateInBoundsGEP(
+              IcacheSlot->getValueType(), IcacheSlot,
+              {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, I)},
+              "ejit_ic_slot_" + Twine(I));
+          LoadInst *FnPtr =
+              PB.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn_" + Twine(I));
+          FnPtr->setAlignment(Align(8));
+          FnPtr->setAtomic(AtomicOrdering::Monotonic);
+          Value *TAfterIcache = nullptr;
+          if (EJitWrapperTiming)
+            TAfterIcache = PB.CreateCall(TraceNow, {}, "ejit_t_after_icache");
+          Value *IHit = PB.CreateIsNotNull(FnPtr, "ejit_icache_hit");
+          IHit = PB.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
+                                    {IHit, ConstantInt::getTrue(Ctx)});
+          PB.CreateCondBr(IHit, DispatchBlocks[I], JitMiss);
+
+          IRBuilder<> DB(DispatchBlocks[I]);
+          emitIcacheDispatch(DB, FnPtr, TAfterIcache);
+        }
+
+        auto BuildTree = [&](auto &&Self, unsigned Lo,
+                             unsigned Hi) -> BasicBlock * {
+          if (Hi - Lo == 1)
+            return LeafBlocks[Lo];
+          unsigned Mid = Lo + (Hi - Lo) / 2;
+          BasicBlock *Left = Self(Self, Lo, Mid);
+          BasicBlock *Right = Self(Self, Mid, Hi);
+          BasicBlock *Node = BasicBlock::Create(
+              Ctx, "jit_icache_select_" + Twine(Lo) + "_" + Twine(Hi), F);
+          IRBuilder<> NB(Node);
+          // The entry range guard makes these low bits a complete instance
+          // key. AArch64 lowers the lower levels to single-instruction TBNZ
+          // branches instead of a CMP plus a conditional branch at each node.
+          unsigned Bit = 0;
+          for (unsigned Width = Hi - Lo; Width > 2; Width >>= 1)
+            ++Bit;
+          Value *SelectedBit = NB.CreateAnd(
+              Instance, ConstantInt::get(I32Ty, 1u << Bit),
+              "ejit_split_bit");
+          Value *GoRight = NB.CreateICmpNE(
+              SelectedBit, ConstantInt::get(I32Ty, 0), "ejit_split_right");
+          NB.CreateCondBr(GoRight, Right, Left);
+          return Node;
+        };
+        BasicBlock *TreeRoot = BuildTree(BuildTree, 0, SplitInstances);
+        Value *InRange =
+            B.CreateICmpULT(Instance, ConstantInt::get(I32Ty, SplitInstances),
+                            "ejit_split_in_range");
+        B.CreateCondBr(InRange, TreeRoot, JitMiss);
       } else {
-        CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (!EJitWrapperTiming)
-          CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-        emitHitTiming();
-        B.CreateRet(CI);
+        Value *SlotPtr = IcacheSlot;
+        if (NumDims > 0) {
+          SmallVector<Value *, 5> Indices;
+          Indices.push_back(ConstantInt::get(I32Ty, 0));
+          for (unsigned I = 0; I < NumDims; ++I) {
+            Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
+            unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
+            Value *Idx = ArgVal;
+            if (BW > 32)
+              Idx = B.CreateTrunc(ArgVal, I32Ty);
+            else if (BW < 32)
+              Idx = B.CreateZExt(ArgVal, I32Ty);
+            Indices.push_back(Idx);
+          }
+          SlotPtr = B.CreateInBoundsGEP(IcacheSlot->getValueType(), IcacheSlot,
+                                        Indices, "ejit_ic_slot");
+        }
+        LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
+        ICSlotLoad->setAlignment(Align(8));
+        // Monotonic lowers to the same LDR on AArch64 while making a concurrent
+        // shared-table drain a defined race.
+        ICSlotLoad->setAtomic(AtomicOrdering::Monotonic);
+        Value *TAfterIcache = nullptr;
+        if (EJitWrapperTiming)
+          TAfterIcache = B.CreateCall(TraceNow, {}, "ejit_t_after_icache");
+        Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
+        IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
+                                 {IHit, ConstantInt::getTrue(Ctx)});
+        B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
+        B.SetInsertPoint(JitIcacheDispatch);
+        emitIcacheDispatch(B, ICSlotLoad, TAfterIcache);
       }
 
       // Miss: tail-call MissFn (which does compile_or_get + dispatch/fallback).
@@ -971,10 +1184,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       for (auto &A : F->args()) MissArgs.push_back(&A);
       if (F->getReturnType()->isVoidTy()) {
         CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+        applyEntryCallABI(CI);
         CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         B.CreateRetVoid();
       } else {
         CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+        applyEntryCallABI(CI);
         CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         B.CreateRet(CI);
       }
@@ -1003,6 +1218,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     Changed = true;
   }
+
+  emitIcachePadRegistration(M, DirectPadTables);
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

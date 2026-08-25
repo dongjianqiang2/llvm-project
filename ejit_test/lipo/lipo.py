@@ -390,6 +390,7 @@ def doit_gc_merge(args):
         # reachable from this root + ejit_init's .ejit_period walk, no explicit
         # root needed.
         "ejit_register_icache_slot",
+        "ejit_register_icache_pads",
     ]
 
     defined = set()

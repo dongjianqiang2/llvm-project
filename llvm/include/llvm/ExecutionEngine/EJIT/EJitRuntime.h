@@ -176,6 +176,13 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 void ejit_register_icache_slot(const char *funcName, void *slot,
                                uint32_t numDims);
 
+// Register an AOT direct-dispatch pad table. table points at padCount+1
+// pointers: pad entry addresses [0, padCount), followed by the shared miss
+// target. Unsupported platforms leave the pads targeting miss, so registration
+// is always fail-safe.
+void ejit_register_icache_pads(const char *funcName, const void *table,
+                               uint32_t padCount);
+
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
 // with multiple arrays is activated as a whole for that instance).

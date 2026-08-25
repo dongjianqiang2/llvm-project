@@ -28,10 +28,11 @@ typedef enum {
   EJIT_REG_PERIOD_ARRAY = 1,
   EJIT_REG_STATIC_VAR = 2,
   EJIT_REG_SYMBOL = 3,
-  EJIT_REG_NONE = 4,      // sentinel (kept at 4 for table ABI stability)
-  EJIT_REG_LIFECYCLE = 5, // lifecycle dimType-slot fixup (additive)
-  EJIT_REG_FUNCINDEX = 6, // function dense-funcIndex fixup (additive)
-  EJIT_REG_ICACHE_SLOT = 7 // function inline-cache slot-pointer fixup (additive)
+  EJIT_REG_NONE = 4,        // sentinel (kept at 4 for table ABI stability)
+  EJIT_REG_LIFECYCLE = 5,   // lifecycle dimType-slot fixup (additive)
+  EJIT_REG_FUNCINDEX = 6,   // function dense-funcIndex fixup (additive)
+  EJIT_REG_ICACHE_SLOT = 7, // inline-cache slot-pointer fixup (additive)
+  EJIT_REG_ICACHE_PADS = 8  // direct-dispatch pad table (additive)
 } ejit_reg_type_t;
 
 typedef struct {
@@ -40,8 +41,10 @@ typedef struct {
       *name1; // funcName / periodName / varName / symbolName / lifecycleName
   const char *name2; // varName (period/static), NULL otherwise
   const void *ptr;   // bitcode data / baseAddr / symbol addr / &i32 slot /
-                     //   &ptr icache slot base (EJIT_REG_ICACHE_SLOT)
-  uint64_t size;     // bitcode size / array size / numDims (EJIT_REG_ICACHE_SLOT)
+                     //   &ptr icache slot base (EJIT_REG_ICACHE_SLOT) /
+                     //   direct-pad pointer table (EJIT_REG_ICACHE_PADS)
+  uint64_t size;     // bitcode size / array size / numDims (ICACHE_SLOT) /
+                     //   pad count (ICACHE_PADS)
                      //   / 0
 } ejit_reg_entry_t;
 
