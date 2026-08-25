@@ -1,6 +1,6 @@
 # EJIT 增量需求：复合 period 与实例折叠 —— 标记方案设计讨论稿
 
-> 状态：**讨论稿 v0.4.9**（2026-08-24/25）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。**v0.4.4 lc 形态确定 + 标记传染立项**：`ejit_period_lc` 升级为变参、**显式指定 period 列表**（不推断，部分覆盖不匹配）；cellIdx 维度偏移计算（stride = Π min(spec_j, fold_j)，与 D10 同坐标系）；缺组成 dim 参数 → error；新命题 **P2 period 数据写者纪律**（`ejit_period_writer` 属性，写检测 + 调用纪律 + 指针污点传染，未来实现，§3.3 已记录属性签名）。**v0.4.5 收尾：O-5 已决**（跨 TU 一致性基于编译期检查，运行时冲突检测不需要）+ **实现待办清单**（§7.2，3 类 21 项）。**v0.4.6 分层回退定案（D14/§6.3）**：type（half-static/dynamic）**标在 dim 上**（粒度匹配：特化状态 per-dim，IR 层面无 period 概念）；wrapper **两级降级链**（轮1 全 specs+periods → 拿不到指针轮2 去 dynamic dim 再调 → AOT 兜底，失败原因不区分）；**dim 处理三场景**（① 无 spec-fold+指定优化：参数替换；② 有 spec-fold+指定优化：参数不替换、折叠表达式替换为 `spec % N`；③ 未指定优化 dynamic：全不替换查表）——替换集合 per 请求，**折叠表达式替换发生在 JIT 编译期**（AOT 阶段 dim 非常量，AOT 只收集折叠表达式位置）。**v0.4.7 D13 补 spec 实例空间约束**：spec 实例空间 `Π min(spec, LCM) ≤ 2^16`（icache 直接索引数组容量 ≤ 512KB/函数，与 period 实例空间双约束；LCM ≥ fold ⟹ spec 空间 ≥ period 空间，需分别满足）；icache 每维尺寸不再固定 16，按函数声明维度对齐 2 的幂分配（wrapper 移位常数 AOT 内嵌，快路径零调用不变）。**v0.4.8 指针生命周期与双位发布协议（§6.4）**：解决 fnPtr 替换/销毁与正在执行的调用之间的 TOCTOU（现状 releaser 覆盖即释放有洞）；slot 固定双位 `ptr[2]` + u32 标签（主位指示，切换 = 翻转标签不移动指针）；**先写指针、后切标签**（release/acquire）；最小原子（relaxed/acquire/release ≈ 普通指令，零锁零 RMW）；tick 懒释放（无计时系统：副位 tick 戳 + 编译前差检查，阈值 1s 可放大）；副满延迟编译 = 天然编译节流（防 dynamic 编译风暴）；与版本失效正交（指针失效=双位协议，版本失效=慢路径复核）。**v0.4.9 应用规格与坐标系定案（§6.2/§3.7/§3.4bis/§6.3）**：确立**两个应用规格**——impl_spec_p = min(dim_spec, period_fold)（生命周期侧：active 检查/版本复核/slot 入库校验/编译触发）与 impl_spec_d = min(dim_spec, LCM)（版本特化侧：specId/缓存 key/slot 位置）；**数学性质** `dim_v % impl_spec_d % impl_spec_p === dim_v % impl_spec_p`（两情形论证：dim_spec ≥ LCM 时 LCM 为 fold 整数倍；dim_spec < LCM 时值域内平凡成立）——目的 = 向 `ejit_compile_or_get` 只传 specId 不丢信息，生命周期分量可由 `specId % impl_spec_p` 推出（生命周期一律 % impl_spec_p，版本特化一律 % impl_spec_d）；**pattern 形态规则**（无 fold：`g[dim]` 或 `g[dim % XX]`（XX ≥ spec，值域内恒等）均可；有 fold：必须 `%` 模数 == impl_spec_p；形态不匹配 → 不替换 → 运行期计算）；**cellIdx 坐标系统一 C 行优先（套 B）**：cellIdx = Σ((dim_v % impl_spec_p) × Π_{j>i} D_j)，与 D10 数组线性下标、嵌值关卡 L 同一坐标系，旧式（左维最次）废弃；D13⑤ 约束修正为**分配后**尺寸 Π 2^⌈log2 impl_spec_d⌉ ≤ 2^16（对齐放大 ≤ 2^d，(129,129,3) 折叠后 49923 通过但分配 2MB 超限反例）。
+> 状态：**讨论稿 v0.4.10**（2026-08-25）。§1/§2 为已确认的需求与决策；§3/§4 为语法与校验定义（本阶段聚焦对象）；§6/§7 为影响面预览与后续命题。v0.3 新增 **L3 特化折叠（D9）**：dim 级声明 + LCM 推导 + 折叠表达式替换。v0.3.1：**O-1 已决**（spec = 值域大小；缓存规格按折叠值域，见 §6），O-8/O-9 关闭。v0.4 新增 **D10 数组形态与维度规则、D11 成员 period**：数组 = 实例空间容器、pattern 判定规则（§3.7/§3.8）、C18-C21。v0.4.1 修正 §3.7 pattern 判定（嵌值安全模型）：剔除"常量"成分、嵌值资格 ⟺ 下标精确等于复核实例元组、现状 `g[cell+1]` 类嵌值无复核跟踪为洞；新增 O-11。**v0.4.2 修正判定时机（值级判定）**：嵌值资格不依赖下标"来源"、依赖"值"——替换后格子坐标与复核实例坐标都是常量，关卡直接比较 `L == cellIdx`（v0.4.1"判定必须在替换前"推翻）；clang/PASS1/偏移兜底零改动，关卡新增检查。自包含推演见 [EJIT_PATTERN_CONSTANT_MODEL.md](EJIT_PATTERN_CONSTANT_MODEL.md)。**v0.4.3 生命周期管理方案定型（D12/D13）**：只有 period 才有版本号和生效时间窗；运行时方案 3（wrapper 全量构建 specs + periods，结构体指针传入 `ejit_taskpool_compile_or_get`，接口内零算术）；命名体系重命名；D13 规格上限矩阵（含实例空间 ≤ 2^16、cellIdx u16、快照 u64）。现状核实见 §6.1，方案细目见 §6.2。**v0.4.4 lc 形态确定 + 标记传染立项**：`ejit_period_lc` 升级为变参、**显式指定 period 列表**（不推断，部分覆盖不匹配）；cellIdx 维度偏移计算（stride = Π min(spec_j, fold_j)，与 D10 同坐标系）；缺组成 dim 参数 → error；新命题 **P2 period 数据写者纪律**（`ejit_period_writer` 属性，写检测 + 调用纪律 + 指针污点传染，未来实现，§3.3 已记录属性签名）。**v0.4.5 收尾：O-5 已决**（跨 TU 一致性基于编译期检查，运行时冲突检测不需要）+ **实现待办清单**（§7.2，3 类 21 项）。**v0.4.6 分层回退定案（D14/§6.3）**：type（half-static/dynamic）**标在 dim 上**（粒度匹配：特化状态 per-dim，IR 层面无 period 概念）；wrapper **两级降级链**（轮1 全 specs+periods → 拿不到指针轮2 去 dynamic dim 再调 → AOT 兜底，失败原因不区分）；**dim 处理三场景**（① 无 spec-fold+指定优化：参数替换；② 有 spec-fold+指定优化：参数不替换、折叠表达式替换为 `spec % N`；③ 未指定优化 dynamic：全不替换查表）——替换集合 per 请求，**折叠表达式替换发生在 JIT 编译期**（AOT 阶段 dim 非常量，AOT 只收集折叠表达式位置）。**v0.4.7 D13 补 spec 实例空间约束**：spec 实例空间 `Π min(spec, LCM) ≤ 2^16`（icache 直接索引数组容量 ≤ 512KB/函数，与 period 实例空间双约束；LCM ≥ fold ⟹ spec 空间 ≥ period 空间，需分别满足）；icache 每维尺寸不再固定 16，按函数声明维度对齐 2 的幂分配（wrapper 移位常数 AOT 内嵌，快路径零调用不变）。**v0.4.8 指针生命周期与双位发布协议（§6.4）**：解决 fnPtr 替换/销毁与正在执行的调用之间的 TOCTOU（现状 releaser 覆盖即释放有洞）；slot 固定双位 `ptr[2]` + u32 标签（主位指示，切换 = 翻转标签不移动指针）；**先写指针、后切标签**（release/acquire）；最小原子（relaxed/acquire/release ≈ 普通指令，零锁零 RMW）；tick 懒释放（无计时系统：副位 tick 戳 + 编译前差检查，阈值 1s 可放大）；副满延迟编译 = 天然编译节流（防 dynamic 编译风暴）；与版本失效正交（指针失效=双位协议，版本失效=慢路径复核）。**v0.4.9 应用规格与坐标系定案（§6.2/§3.7/§3.4bis/§6.3）**：确立**两个应用规格**——impl_spec_p = min(dim_spec, period_fold)（生命周期侧：active 检查/版本复核/slot 入库校验/编译触发）与 impl_spec_d = min(dim_spec, LCM)（版本特化侧：specId/缓存 key/slot 位置）；**数学性质** `dim_v % impl_spec_d % impl_spec_p === dim_v % impl_spec_p`（两情形论证：dim_spec ≥ LCM 时 LCM 为 fold 整数倍；dim_spec < LCM 时值域内平凡成立）——目的 = 向 `ejit_compile_or_get` 只传 specId 不丢信息，生命周期分量可由 `specId % impl_spec_p` 推出（生命周期一律 % impl_spec_p，版本特化一律 % impl_spec_d）；**pattern 形态规则**（无 fold：`g[dim]` 或 `g[dim % XX]`（XX ≥ spec，值域内恒等）均可；有 fold：必须 `%` 模数 == impl_spec_p；形态不匹配 → 不替换 → 运行期计算）；**cellIdx 坐标系统一 C 行优先（套 B）**：cellIdx = Σ((dim_v % impl_spec_p) × Π_{j>i} D_j)，与 D10 数组线性下标、嵌值关卡 L 同一坐标系，旧式（左维最次）废弃；D13⑤ 约束修正为**分配后**尺寸 Π 2^⌈log2 impl_spec_d⌉ ≤ 2^16（对齐放大 ≤ 2^d，(129,129,3) 折叠后 49923 通过但分配 2MB 超限反例）。**v0.4.10 双位协议三态 tag + 版本失效合流（§6.4，A3/A4 定案）**：tag 从二态升**三态 {0, 1, INVALID}**——deactivate(period, cellIdx) = 版本表失效 + 遍历 slot 匹配置 `tag = INVALID`（两个槽位均成副位，主路径视为空指针），快路径读 INVALID → 落慢路径复核 → 重编译发布新 fnPtr → 置主位自动恢复，activate 无需发布；竞态无害（deactivate→数据写入窗口内旧代码配旧数据一致）。**A4 释放时点与编译触发分离**：编译触发条件 = 副位有指针且 tick 差 ≤ 门限则不编译（节流），超门限才编译；释放时点 = **写入时**遍历释放超门限副位 → 空位写新指针 → 置主位；无空位丢弃编译结果（正确性防护，实际不发生——触发编译的前提即副位超门限，写者互斥下状态不变）。前提显式化：写者互斥（同槽写入仅编译线程串行）+ 在途调用时长上界 < tick 门限（WCET 声明，1s 起步可调 5s）。新增待办 3.10-3.12。
 > 前置阅读：[EJIT_IMPL_OVERVIEW.md](EJIT_IMPL_OVERVIEW.md)（现状实现整理）。
 > 代码基线：branch `ejit_dev_spec4` @ `52040abd0c75`。
 
@@ -486,31 +486,41 @@ dim_v % impl_spec_d % impl_spec_p === dim_v % impl_spec_p
 
 **问题**：所有特化版本（轮1 嵌值 + 轮2 查表）的 fnPtr 都会遇到替换/回收——替换时若立即销毁旧指针，**正在执行旧版本的调用悬空**（TOCTOU：load 指针与 call 之间无屏障，清理关不掉这个窗口）。现状 releaser 机制（publish 覆盖即释放）有此洞。同步语义（调用计数/锁）引入每次调用开销，不可取。
 
-**双位 + 标签协议**（固定双位，切换 = 翻转标签，指针不移动）：
+**双位 + 标签协议**（固定双位，切换 = 置标签，指针不移动；**tag 三态** {0, 1, INVALID}）：
 
 ```
-slot 布局:  ptr[2]（指针位）+ tag: u32（当前主位指示）
+slot 布局:  ptr[2]（指针位）+ tag: u32（0/1 = 主位指示；INVALID = 全失效）
 读者（wrapper 快路径，每次调用）:
     t  = tag.load(acquire)             // u32 原子，不撕裂
+    if (t == INVALID) → 走慢路径      // 视为空（deactivate 后立即对快路径生效）
     p  = ptr[t].load(relaxed)          // 编译成普通 load
     if (p) call p
-写者（替换，低频）:
-    ptr[空闲位].store(新指针, relaxed)  // 先写指针
-    tag.store(t ^ 1, release)          // 后切标签（发布）
-    旧主位成为副位 → tick 懒释放
+写者（替换/首次发布，低频）:
+    释放超门限副位（见 tick 管理段）    // 腾空位
+    ptr[空位].store(新指针, relaxed)   // 先写指针
+    tag.store(空位, release)          // 后置主位（发布）
 ```
+
+**INVALID 态**：`tag = INVALID` 时两个槽位都是副位（主路径视为空指针）。由 deactivate 置入（见"与版本失效"段），新编译发布时退出。
 
 **顺序要求（关键）**：**必须先写指针、后切标签**（release/acquire 发布语义）；反过来读者会读到"新标签 + 未写入位"。读者两个方向都安全：读旧标签 → 旧位（现在是副位）→ 延迟释放中，安全；读新标签 → acquire 同步保证新位指针完整可见。
 
 **最小原子语义（≈ 普通指令）**：relaxed/acquire/release 的 load/store **无锁前缀**（x86：mov + 编译屏障，TSO 下 mov 本身有序；ARM：ldar/stlr 单指令自带屏障）——不需要显式 fence。**不能完全不用原子**：编译器可能把指针 store 移到 release 标签之后（读者读新标签 + 未写位 → 错）。RMW / 锁协议在整个协议中不存在。缓存可见性延迟 → 读者短暂滞后（读旧位，安全）。
 
-**tick 懒释放（无计时系统的嵌入式）**：副位记 tick 戳；编译/替换前检查 tick 差 > 阈值（1s 起步——热点函数调用 ms 级，可放大到 10s）→ 释放副位再编译；未到期 → 延迟编译（副满不落位）。超期不删仅内存代价（代码池多驻留一份），安全。**副位仅编译线程访问**（wrapper 永远读主位）→ 无并发、无锁。
+**副位 tick 门限管理（无计时系统的嵌入式；A4 定案）**：每个槽位记 tick 戳；门限 = 1s 起步（热点函数调用 ms 级，可调整 5s）。
 
-**编译节流（意外收益）**：副满时编译推迟 ≥ 阈值 → dynamic 频繁变化时编译率被自动封顶，**防编译风暴**。
+- **编译触发条件**：编译前检查——副位有指针且 tick 差 ≤ 门限 → **不触发编译**（延迟）；副位无指针或 tick 差 > 门限 → 触发编译。
+- **释放时点（写入时）**：编译完成后写入流程——遍历副槽位，**释放 tick 差 > 门限的槽位指针**（变空位）；新结果写入任意空位并置为主位。
+- **无空位兜底**：无空槽位 → **丢弃本次编译结果**（正确性防护；实际不会发生——触发编译的前提即副位超门限，且同槽写者互斥下状态不会在编译期间变化）。
+- 未超门限不删仅内存代价（代码池多驻留一份），安全。**副位仅编译线程访问**（wrapper 永远读主位）→ 无并发、无锁。
 
-**与版本失效正交**：双位协议解决**指针失效**（替换/销毁同步）；**版本失效**（嵌值数据过期）仍由慢路径版本复核解决（轮1 嵌值走慢路径复核、轮2 查表永远新鲜）——两个维度，组合使用。
+**编译节流（意外收益）**：副位未超门限 → 编译推迟 → dynamic 频繁变化时编译率被自动封顶，**防编译风暴**。
 
-**开销账**：快路径 = 1 次 u32 acquire load + 1 次 relaxed 指针 load（≈2 条普通指令，零锁、零 RMW、零版本校验）；写侧 = relaxed store + release store。
+**与版本失效合流（A3 定案）**：版本失效不再只靠慢路径复核——**deactivate(period, cellIdx) = 版本表失效 + 遍历 slot 匹配 (periodId, cellIdx) 置 `tag = INVALID`**（512 槽遍历，数据切换低频可接受；同时 bump L0 epoch 粗失效）。此后快路径读 INVALID → 视为空 → 落慢路径复核 → 版本不匹配 → 触发编译 → 新 fnPtr 发布（置主位）→ 快路径自动恢复，**activate 无需发布任何东西**（版本表 bump 即驱动重编译）。竞态无害性：deactivate 遍历的微秒级窗口内旧代码仍执行——但此刻数据尚未写入，旧代码配旧数据**一致无害**；数据写入后任何路径（快/慢）都拿不到旧指针。INVALID 且副位未超门限的延迟编译期间，调用走降级链（轮2 查表永远新鲜）——正确性不受影响。与**指针失效**（替换/销毁，标签翻转）两个维度，组合使用。
+
+**前提声明（显式）**：① **写者互斥**——同一 slot 的写入仅编译线程串行发生（副位仅编译线程访问，天然成立，无需锁）；② **在途调用时长上界**——读者从 load 到 call 返回的存活期 < tick 门限（嵌入式 WCET 分析可得），保证释放副位时无在途读者持有该指针。
+
+**开销账**：快路径 = 1 次 u32 acquire load + 1 次 INVALID 比较 + 1 次 relaxed 指针 load（≈3 条普通指令，零锁、零 RMW、零版本校验）；写侧 = relaxed store + release store。
 
 ## 7. 后续命题与开放问题
 
@@ -604,6 +614,9 @@ slot 布局:  ptr[2]（指针位）+ tag: u32（当前主位指示）
 | 3.7 | compileNow packedSpecs 打包 | cacheKey u64 = funcIndex<<32 \| p0 \| p1<<8 \| p2<<16 \| p3<<24 保留（每 dim 8 位，specId ≤ 255） | 待办（本次方案范围） |
 | 3.8 | 命名改名 | `Slot.versions`→`periodVersions`、`version_[dimType][instanceId]`→`versionByPeriod[periodId][cellIdx]`（D12） | 待办（本次方案范围） |
 | 3.9 | icache 折叠值下标 | icache 以 specId = dim_v % impl_spec_d 为下标存储（D9 替换后语义）；每维尺寸按 2^⌈log2 impl_spec_d⌉ 对齐分配，AOT 内嵌移位常数（v0.4.7） | 待办（本次方案范围） |
+| 3.10 | 双位协议落地 | slot 双位 ptr[2] + tag 三态（0/1/INVALID）；快路径 tag.load(acquire) → INVALID 走慢路径 → ptr[t].load(relaxed) → call；写入流程 = 释放超门限副位 → 空位写新指针 → 置主位（§6.4） | 待办（本次方案范围） |
+| 3.11 | deactivate 置 INVALID | deactivate(period, cellIdx) = 版本表失效 + 遍历 slot 匹配置 tag=INVALID + bump L0 epoch（A3，§6.4） | 待办（本次方案范围） |
+| 3.12 | tick 门限管理 | 编译触发条件（副位 tick 差 > 门限才编译）+ 写入时释放超门限副位 + 无空位丢弃兜底；门限 1s 起可调 5s（A4，§6.4） | 待办（本次方案范围） |
 
 **命题与开放问题状态**：
 
