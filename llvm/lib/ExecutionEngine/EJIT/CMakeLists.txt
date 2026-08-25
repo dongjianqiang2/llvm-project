@@ -49,8 +49,10 @@ endif()
 set(EJIT_TARGET_COMPONENTS "")
 foreach(_t ${LLVM_TARGETS_TO_BUILD})
   list(APPEND EJIT_TARGET_COMPONENTS ${_t}CodeGen ${_t}Desc ${_t}Info)
-  if(_t STREQUAL "AArch64")
-    list(APPEND EJIT_TARGET_COMPONENTS AArch64AsmParser)
+  # InitializeAllAsmParsers() (EJit.cpp host init) references every built
+  # target's AsmParser unconditionally, so every LLVMEJIT consumer needs it.
+  if(_t STREQUAL "AArch64" OR _t STREQUAL "X86")
+    list(APPEND EJIT_TARGET_COMPONENTS ${_t}AsmParser)
   endif()
 endforeach()
 
@@ -58,6 +60,7 @@ set(EJIT_SOURCES
   EJit.cpp
   EJitRuntime.cpp
   EJitRegistryTable.c
+  EJitDedupIndex.cpp
   EJitOrcEngine.cpp
   EJitLinkDiagPlugin.cpp
   EJitLinkOptimizationPlugin.cpp

@@ -250,6 +250,10 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
   dst.forceStaticRegistry = src->forceStaticRegistry;
   if (src->dumpJITDir && src->dumpJITDir[0])
     dst.dumpJITDir = src->dumpJITDir;
+  // Dedup mode: clamp anything unexpected to Off (zero-init = Off).
+  dst.dedupMode = (src->dedupMode == 1 || src->dedupMode == 2)
+                      ? static_cast<DedupMode>(src->dedupMode)
+                      : DedupMode::Off;
 #ifdef EJIT_FREESTANDING
   dst.enableLogger = false;
 #endif

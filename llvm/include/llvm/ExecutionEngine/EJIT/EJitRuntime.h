@@ -109,6 +109,13 @@ typedef struct {
   bool forceStaticRegistry;
   /// If non-NULL, dump JIT-optimized LLVM IR (.ll) to this directory.
   const char *dumpJITDir;
+  /// Specialization dedup (EJIT_SPECIALIZATION_DEDUP.md): 0 = off (default,
+  /// zero-init keeps today's behavior), 1 = dry-run (fingerprint + count
+  /// would-be merges, still compile - measurement only), 2 = on (reuse the
+  /// canonical fnPtr for an equal-fingerprint compile; no second code copy).
+  /// Additive tail field: recompile callers with the updated header; a
+  /// zero-initialized struct selects "off".
+  int dedupMode;
 } ejit_config_t;
 
 typedef struct {

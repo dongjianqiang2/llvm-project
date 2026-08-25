@@ -113,6 +113,14 @@ struct EJitOrcEngine::Impl {
   /// emitted assembly matches the real JIT output). Null if creation failed.
   std::unique_ptr<TargetMachine> dumpFunctionTM;
   std::unique_ptr<TargetMachine> dumpModuleTM;
+  /// Specialization dedup index (owner-private; EJIT_SPECIALIZATION_DEDUP.md
+  /// §5.5). All compilation is serialized on the owner thread, so no lock.
+  EJitDedupIndex dedupIndex;
+  /// True across the emit+lookup window of specializeAndResolve(): the
+  /// module it adds is already specialized, so the IR transform layer must
+  /// pass it through unchanged. Compile serialization makes a plain bool
+  /// safe; set/clear are asserted non-nested.
+  bool preSpecialized = false;
 };
 
 namespace llvm {
@@ -742,115 +750,21 @@ EJitOrcEngine::Create(const Config &config,
           const orc::MaterializationResponsibility &R)
           -> Expected<orc::ThreadSafeModule> {
         TSM.withModuleDo([engine](Module &M) {
+          // specializeAndResolve() runs the pipeline EAGERLY (pre-codegen, so
+          // the specialized IR can be fingerprinted for dedup) and brackets
+          // its emit+lookup window with P->preSpecialized; a module arriving
+          // here inside that window is already specialized and must pass
+          // through unchanged. The legacy lazy path (loadBitcodeModule
+          // callers) still specializes here. Compilation is serialized on the
+          // owner thread, so the plain bool cannot be observed half-set.
+          if (engine->P->preSpecialized)
+            return;
           LLVM_DEBUG(dbgs() << "ejit-orc-engine: JIT transform on "
                             << M.getName() << "\n");
           const SpecializationContext *ctx = engine->P->activeCtx;
           if (!ctx)
             return;
-
-          // Clear stale analysis results from previous compilations
-          // (each compilation uses a fresh Module with new IR unit pointers).
-          engine->P->optimizer->clearAnalyses();
-
-          // Dump pre-optimization IR (before the JIT pipeline runs).
-          if (!engine->P->dumpJITDir.empty()) {
-            std::string prePath = engine->P->dumpJITDir + "/" +
-                                  ctx->fnName + "_" +
-                                  std::to_string(ctx->cacheKey) + "_pre.ll";
-            std::error_code EC;
-            llvm::raw_fd_ostream preOS(prePath, EC);
-            if (!EC)
-              M.print(preOS, nullptr);
-          }
-
-          engine->P->optimizer->runPipeline(M, *ctx);
-
-          // Dump post-optimization IR.
-          if (!engine->P->dumpJITDir.empty()) {
-            std::string path = engine->P->dumpJITDir + "/" +
-                               ctx->fnName + "_" +
-                               std::to_string(ctx->cacheKey) + "_opt.ll";
-            std::error_code EC;
-            llvm::raw_fd_ostream OS(path, EC);
-            if (!EC)
-              M.print(OS, nullptr);
-          }
-
-          // Name-filtered IR+ASM capture for later selective printing. Filter
-          // set via ejit_dump_func(); captured entries printed on demand via
-          // ejit_print_dumped(). Bare-metal-safe (strings only, no
-          // raw_fd_ostream). Captures the post-optimization IR and the emitted
-          // assembly (from the same TargetMachine the JIT compiles with).
-          // Capture is exact-name only. The local gDumpStore keeps one dynamic
-          // IR/ASM payload per captured function name (overwritten on
-          // re-compile); the shared dump table keeps cross-core visible dynamic
-          // payloads for recent captures.
-          {
-            std::string DumpFilter;
-            bool hasFilter = getActiveDumpFilter(DumpFilter);
-            bool match =
-                hasFilter && (DumpFilter == "*" || ctx->fnName == DumpFilter);
-            EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
-                            "key_lo=0x%08x match=%d &filter=%p",
-                            hasFilter ? DumpFilter.c_str() : "(off)",
-                            ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
-                            (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
-                            (void *)&gDumpFuncFilter);
-            if (match) {
-              // IR capture always runs first so it succeeds even if the ASM
-              // diagnostic path is disabled or fails. Capture only the entry
-              // definition: M also contains its full direct-call closure.
-              std::string FunctionIR;
-              if (!detail::renderDumpFunctionIR(M, ctx->fnName, FunctionIR))
-                EJIT_DIAG("dump capture: function not found fn=%s",
-                          ctx->fnName.c_str());
-              std::string ModuleIR;
-              detail::renderDumpModuleIR(M, ModuleIR);
-
-              std::string FunctionAsm;
-              std::string ModuleAsm;
-              // Textual ASM emit goes through addPassesToEmitFile ->
-              // addAsmPrinter -> createMCStreamer(AssemblyFile). Under
-              // EJIT_TRIM_LLVM_BACKEND that path is compile-time removed and
-              // createMCStreamer returns "textual assembly output unavailable";
-              // addAsmPrinter reports it via MCContext::reportError ->
-              // llvm::errs() (raw_fd_ostream fd 2), whose constructor is
-              // unmapped on bare-metal/SRE and crashes. So under trim we skip
-              // ASM (IR is still captured — M.print to a string stream is
-              // SRE-safe). To get ASM on target, build with EJIT_DUMP_ASM=ON
-              // (re-enables the textual asm backend under trim). The ASM emit's
-              // InstPrinter needs snprintf/vsnprintf: link a libc that provides
-              // them, OR ejit_test/stubs/ejit_sre_format_stubs.cpp if the SRE
-              // libc lacks them (not both — strong-symbol conflict). The success
-              // path of the emit does not call errs(), so once the path is
-              // compiled in it is SRE-safe.
-#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
-              if (engine->P->dumpFunctionTM && engine->P->dumpModuleTM) {
-                EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
-                bool FunctionOK = renderDumpAssembly(
-                    *engine->P->dumpFunctionTM,
-                    cloneDumpFunctionModule(M, ctx->fnName), FunctionAsm);
-                bool ModuleOK = renderDumpAssembly(
-                    *engine->P->dumpModuleTM, CloneModule(M), ModuleAsm);
-                if (!FunctionOK || !ModuleOK) {
-                  EJIT_DIAG_DEBUG("dump asm addPassesToEmitFile failed fn=%s",
-                                  ctx->fnName.c_str());
-                }
-                EJIT_DIAG_DEBUG(
-                    "dump asm sizes function=%u module=%u fn=%s",
-                    (unsigned)FunctionAsm.size(), (unsigned)ModuleAsm.size(),
-                    ctx->fnName.c_str());
-              }
-#else
-              EJIT_DIAG_DEBUG("dump asm skipped (EJIT_TRIM_LLVM_BACKEND, "
-                              "EJIT_DUMP_ASM off) fn=%s; IR captured",
-                              ctx->fnName.c_str());
-#endif
-              captureDump(ctx->fnName, ctx->cacheKey,
-                          std::move(FunctionIR), std::move(FunctionAsm),
-                          std::move(ModuleIR), std::move(ModuleAsm));
-            }
-          }
+          engine->specializeModuleEagerly(M, *ctx);
         });
         return std::move(TSM);
       });
@@ -859,17 +773,32 @@ EJitOrcEngine::Create(const Config &config,
   return engine;
 }
 
-Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
-                                       uint64_t cacheKey,
-                                       const std::string &origFnName) {
-  EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
-                    origFnName.c_str(), bitcodeData.size());
+//===----------------------------------------------------------------------===//
+// One-shot specialization compile with dedup (EJIT_SPECIALIZATION_DEDUP.md).
+//
+// Phase 1 parse+fixup and phase 3 emit are shared with the legacy
+// loadBitcodeModule path; phase 2 (the specialization pipeline) runs EAGERLY
+// here instead of inside the IR transform layer so the specialized IR can be
+// fingerprinted BEFORE any machine code is emitted.
+//===----------------------------------------------------------------------===//
+struct EJitOrcEngine::ParsedSpecModule {
+  // Declaration order is load-bearing: members destroy in reverse order, so
+  // the Module must be declared LAST - it dereferences the context in its
+  // destructor (LLVMContext::removeModule) and must die while Ctx is alive
+  // (the dedup-hit early return destroys an owning ParsedSpecModule).
+  std::unique_ptr<LLVMContext> Ctx;
+  std::unique_ptr<Module> M;
+};
+
+Expected<EJitOrcEngine::ParsedSpecModule>
+EJitOrcEngine::parseSpecModule(StringRef bitcodeData, uint64_t cacheKey,
+                               const std::string &origFnName) {
   auto Ctx = std::make_unique<LLVMContext>();
   auto Buf = MemoryBuffer::getMemBuffer(
       bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"));
   auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!ModuleOrErr) {
-    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
+    EJIT_DIAG("parseSpec FAIL key=0x%016lx: parse bitcode error", cacheKey);
     return ModuleOrErr.takeError();
   }
 
@@ -904,10 +833,18 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
+  ParsedSpecModule PM;
+  PM.M = std::move(*ModuleOrErr);
+  PM.Ctx = std::move(Ctx);
+  return PM;
+}
+
+Error EJitOrcEngine::emitSpecModule(ParsedSpecModule PM, uint64_t cacheKey) {
+  Module *M = PM.M.get();
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
   orc::SymbolMap globalSymbols;
-  for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
+  for (GlobalVariable &GV : M->globals()) {
     if (!GV.isDeclaration() || GV.getName().empty())
       continue;
     void *addr = nullptr;
@@ -951,9 +888,9 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   static constexpr size_t kMaxUnresolvedNames = 32;
   SmallPtrSet<const Function *, 16> ReferencedExternalFuncs;
   SmallPtrSet<const GlobalVariable *, 16> ReferencedExternalGlobals;
-  collectReferencedExternalDecls(**ModuleOrErr, ReferencedExternalFuncs,
+  collectReferencedExternalDecls(*M, ReferencedExternalFuncs,
                                  ReferencedExternalGlobals);
-  for (Function &F : (*ModuleOrErr)->functions()) {
+  for (Function &F : M->functions()) {
     if (!F.isDeclaration() || F.getName().empty())
       continue;
     std::string name = F.getName().str();
@@ -972,7 +909,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
         orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(it->second),
                                JITSymbolFlags::Exported);
   }
-  for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
+  for (GlobalVariable &GV : M->globals()) {
     if (!GV.isDeclaration() || GV.getName().empty())
       continue;
     std::string name = GV.getName().str();
@@ -1027,7 +964,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
   }
 
   if (auto Err = P->J->addIRModule(*JDOrErr,
-      orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(Ctx)))) {
+      orc::ThreadSafeModule(std::move(PM.M), std::move(PM.Ctx)))) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error", cacheKey);
     return Err;
   }
@@ -1037,6 +974,202 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
                     origFnName.c_str());
   return Error::success();
 }
+
+Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
+                                       uint64_t cacheKey,
+                                       const std::string &origFnName) {
+  EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
+                    origFnName.c_str(), bitcodeData.size());
+  auto PMOrErr = parseSpecModule(bitcodeData, cacheKey, origFnName);
+  if (!PMOrErr)
+    return PMOrErr.takeError();
+  return emitSpecModule(std::move(*PMOrErr), cacheKey);
+}
+
+void EJitOrcEngine::specializeModuleEagerly(Module &M,
+                                            const SpecializationContext &ctx) {
+  LLVM_DEBUG(dbgs() << "ejit-orc-engine: specialize (eager) on "
+                    << M.getName() << "\n");
+  // Clear stale analysis results from previous compilations
+  // (each compilation uses a fresh Module with new IR unit pointers).
+  P->optimizer->clearAnalyses();
+
+  // Dump pre-optimization IR (before the JIT pipeline runs).
+  if (!P->dumpJITDir.empty()) {
+    std::string prePath = P->dumpJITDir + "/" +
+                          ctx.fnName + "_" +
+                          std::to_string(ctx.cacheKey) + "_pre.ll";
+    std::error_code EC;
+    llvm::raw_fd_ostream preOS(prePath, EC);
+    if (!EC)
+      M.print(preOS, nullptr);
+  }
+
+  P->optimizer->runPipeline(M, ctx);
+
+  // Dump post-optimization IR.
+  if (!P->dumpJITDir.empty()) {
+    std::string path = P->dumpJITDir + "/" +
+                       ctx.fnName + "_" +
+                       std::to_string(ctx.cacheKey) + "_opt.ll";
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(path, EC);
+    if (!EC)
+      M.print(OS, nullptr);
+  }
+
+  // Name-filtered IR+ASM capture for later selective printing. Filter
+  // set via ejit_dump_func(); captured entries printed on demand via
+  // ejit_print_dumped(). Bare-metal-safe (strings only, no
+  // raw_fd_ostream). Captures the post-optimization IR and the emitted
+  // assembly (from the same TargetMachine the JIT compiles with).
+  // Capture is exact-name only. The local gDumpStore keeps one dynamic
+  // IR/ASM payload per captured function name (overwritten on
+  // re-compile); the shared dump table keeps cross-core visible dynamic
+  // payloads for recent captures.
+  {
+    std::string DumpFilter;
+    bool hasFilter = getActiveDumpFilter(DumpFilter);
+    bool match =
+        hasFilter && (DumpFilter == "*" || ctx.fnName == DumpFilter);
+    EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
+                    "key_lo=0x%08x match=%d &filter=%p",
+                    hasFilter ? DumpFilter.c_str() : "(off)",
+                    ctx.fnName.c_str(), (uint32_t)(ctx.cacheKey >> 32),
+                    (uint32_t)(ctx.cacheKey & 0xffffffffu), match ? 1 : 0,
+                    (void *)&gDumpFuncFilter);
+    if (match) {
+      // IR capture always runs first so it succeeds even if the ASM
+      // diagnostic path is disabled or fails. Capture only the entry
+      // definition: M also contains its full direct-call closure.
+      std::string FunctionIR;
+      if (!detail::renderDumpFunctionIR(M, ctx.fnName, FunctionIR))
+        EJIT_DIAG("dump capture: function not found fn=%s",
+                  ctx.fnName.c_str());
+      std::string ModuleIR;
+      detail::renderDumpModuleIR(M, ModuleIR);
+
+      std::string FunctionAsm;
+      std::string ModuleAsm;
+      // Textual ASM emit goes through addPassesToEmitFile ->
+      // addAsmPrinter -> createMCStreamer(AssemblyFile). Under
+      // EJIT_TRIM_LLVM_BACKEND that path is compile-time removed and
+      // createMCStreamer returns "textual assembly output unavailable";
+      // addAsmPrinter reports it via MCContext::reportError ->
+      // llvm::errs() (raw_fd_ostream fd 2), whose constructor is
+      // unmapped on bare-metal/SRE and crashes. So under trim we skip
+      // ASM (IR is still captured — M.print to a string stream is
+      // SRE-safe). To get ASM on target, build with EJIT_DUMP_ASM=ON
+      // (re-enables the textual asm backend under trim). The ASM emit's
+      // InstPrinter needs snprintf/vsnprintf: link a libc that provides
+      // them, OR ejit_test/stubs/ejit_sre_format_stubs.cpp if the SRE
+      // libc lacks them (not both — strong-symbol conflict). The success
+      // path of the emit does not call errs(), so once the path is
+      // compiled in it is SRE-safe.
+#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
+      if (P->dumpFunctionTM && P->dumpModuleTM) {
+        EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx.fnName.c_str());
+        bool FunctionOK = renderDumpAssembly(
+            *P->dumpFunctionTM,
+            cloneDumpFunctionModule(M, ctx.fnName), FunctionAsm);
+        bool ModuleOK = renderDumpAssembly(
+            *P->dumpModuleTM, CloneModule(M), ModuleAsm);
+        if (!FunctionOK || !ModuleOK) {
+          EJIT_DIAG_DEBUG("dump asm addPassesToEmitFile failed fn=%s",
+                          ctx.fnName.c_str());
+        }
+        EJIT_DIAG_DEBUG(
+            "dump asm sizes function=%u module=%u fn=%s",
+            (unsigned)FunctionAsm.size(), (unsigned)ModuleAsm.size(),
+            ctx.fnName.c_str());
+      }
+#else
+      EJIT_DIAG_DEBUG("dump asm skipped (EJIT_TRIM_LLVM_BACKEND, "
+                      "EJIT_DUMP_ASM off) fn=%s; IR captured",
+                      ctx.fnName.c_str());
+#endif
+      captureDump(ctx.fnName, ctx.cacheKey,
+                  std::move(FunctionIR), std::move(FunctionAsm),
+                  std::move(ModuleIR), std::move(ModuleAsm));
+    }
+  }
+}
+
+Expected<EJitOrcEngine::SpecializeResult>
+EJitOrcEngine::specializeAndResolve(StringRef bitcodeData, uint64_t cacheKey,
+                                    uint32_t funcIndex,
+                                    const std::string &origFnName,
+                                    DedupMode dedupMode) {
+  EJIT_DIAG_VERBOSE("specialize key=0x%016lx func=%s size=%zu dedup=%u",
+                    cacheKey, origFnName.c_str(), bitcodeData.size(),
+                    static_cast<unsigned>(dedupMode));
+
+  // Phase 1: parse + pre-pipeline fixups.
+  auto PMOrErr = parseSpecModule(bitcodeData, cacheKey, origFnName);
+  if (!PMOrErr)
+    return PMOrErr.takeError();
+  ParsedSpecModule PM = std::move(*PMOrErr);
+
+  // Phase 2: eager specialization + fingerprint + dedup check. Must run
+  // before codegen: an On-mode hit returns here having consumed no JITDylib,
+  // no code-pool bytes and no link time. Without an active context nothing
+  // was specialized, so the fingerprint is meaningless - skip dedup.
+  const SpecializationContext *ctx = P->activeCtx;
+  DedupFingerprint FP;
+  bool HaveFP = false;
+  if (ctx) {
+    specializeModuleEagerly(*PM.M, *ctx);
+    if (dedupMode != DedupMode::Off) {
+      FP = computeModuleFingerprint(*PM.M);
+      HaveFP = true;
+      if (void *Canonical = P->dedupIndex.find(funcIndex, FP)) {
+        if (dedupMode == DedupMode::On) {
+          P->dedupIndex.noteMerge();
+          EJIT_DIAG("dedup MERGE func=%u key=0x%016lx -> fn=%p fp1=0x%016llx",
+                    funcIndex, cacheKey, Canonical,
+                    (unsigned long long)FP.fp1);
+          return SpecializeResult{Canonical, true};
+        }
+        P->dedupIndex.noteWouldMerge();
+        EJIT_DIAG("dedup WOULD-MERGE (dry-run) func=%u key=0x%016lx "
+                  "fp1=0x%016llx",
+                  funcIndex, cacheKey, (unsigned long long)FP.fp1);
+      }
+    }
+  }
+
+  // Phase 3: emit + resolve (today's path). The pass-through flag keeps the
+  // IR transform layer from re-specializing the finished module; it brackets
+  // emit+lookup because materialization runs inside lookup. Compilation is
+  // serialized on the owner thread (asserted), so a plain bool is safe.
+  assert(!P->preSpecialized && "nested specializeAndResolve");
+  P->preSpecialized = true;
+  Error EmitErr = emitSpecModule(std::move(PM), cacheKey);
+  if (EmitErr) {
+    P->preSpecialized = false;
+    return std::move(EmitErr);
+  }
+  auto FnOrErr = lookup(cacheKey, origFnName);
+  P->preSpecialized = false;
+  if (!FnOrErr)
+    return FnOrErr.takeError();
+
+  // Phase 4: publish the fingerprint for later equal-input compiles. A full
+  // index is a clean degrade (logged once per failed insert).
+  if (HaveFP && !P->dedupIndex.insert(funcIndex, FP, *FnOrErr))
+    EJIT_DIAG("dedup INDEX FULL func=%u: merging degraded for new entries",
+              funcIndex);
+
+  EJIT_DIAG_VERBOSE("specialize OK key=0x%016lx func=%s ptr=%p deduped=0",
+                    cacheKey, origFnName.c_str(), *FnOrErr);
+  return SpecializeResult{*FnOrErr, false};
+}
+
+const EJitDedupIndex &EJitOrcEngine::dedupIndex() const {
+  return P->dedupIndex;
+}
+
+void EJitOrcEngine::clearDedupIndex() { P->dedupIndex.clear(); }
 
 Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
                                        const std::string &name) {

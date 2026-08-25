@@ -455,6 +455,15 @@ public:
     compileFn_ = fn;
     compileCtx_ = ctx;
   }
+
+  /// True when ANY facade (this core or a peer) has a physical-code releaser
+  /// wired: the shared icacheReleasersWired count is non-zero. Consumers that
+  /// alias fnPtrs across identities (specialization dedup) must disable
+  /// themselves while this is true - the release paths would otherwise free a
+  /// pointer other identities still dispatch through.
+  bool hasReleaser() const {
+    return state_ && state_->icacheReleasersWired.loadAcquire() != 0;
+  }
   void setReleaser(ReleaseCallback fn, void *ctx) {
     const bool had = (releaseFn_ != nullptr);
     releaseFn_ = fn;

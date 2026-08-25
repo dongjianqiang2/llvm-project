@@ -24,6 +24,13 @@ namespace ejit {
 enum class CompileMode { Off, Sync, Async };
 enum class OptimizationLevel { L1 = 1, L2 = 2, L3 = 3 };
 
+/// Specialization-dedup mode (EJIT_SPECIALIZATION_DEDUP.md). Off = today's
+/// behavior exactly (no fingerprint cost). DryRun = fingerprint + count
+/// would-be merges, still compile (measurement, behavior-identical). On =
+/// reuse the canonical fnPtr for an equal-fingerprint compile instead of
+/// consuming another code-pool allocation.
+enum class DedupMode : uint8_t { Off = 0, DryRun = 1, On = 2 };
+
 struct Config {
   CompileMode compileMode = CompileMode::Async;
   OptimizationLevel optLevel = OptimizationLevel::L2;
@@ -40,6 +47,11 @@ struct Config {
   /// If non-empty, dump JIT-optimized LLVM IR (.ll) to this directory.
   /// One file per specialization, named <funcName>_<cacheKey>.ll.
   std::string dumpJITDir;
+  /// Specialization dedup (EJIT_SPECIALIZATION_DEDUP.md). The compile driver
+  /// force-lowers this to Off whenever a releaser is wired on a taskpool:
+  /// a dedup hit returns a fnPtr shared with other identities, which the
+  /// version-mismatch/eviction release paths must never free.
+  DedupMode dedupMode = DedupMode::Off;
 };
 
 } // namespace ejit
