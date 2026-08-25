@@ -371,8 +371,7 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 5: vectorization + partial unrolling, L2+. Runs after the final
   // StructFieldPass so the vectorizers see the fully-specialized loops. L1
   // skips vectorization entirely (matching clang -O1).
-  if (static_cast<int>(level) >=
-      static_cast<int>(ejit::OptimizationLevel::L2)) {
+  if (level >= ejit::OptimizationLevel::L2) {
     runVectorization(M, level);
     EJIT_DIAG_DEBUG("pipeline phase5 done: vectorization opt=%d",
                     static_cast<int>(level));

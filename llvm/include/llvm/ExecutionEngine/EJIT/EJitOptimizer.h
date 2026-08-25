@@ -39,13 +39,15 @@ public:
   EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM = nullptr);
 
   /// Run the full JIT specialization pipeline:
-  ///   1. Parameter substitution (ejit_period_arr_ind → constants)
-  ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. StructFieldPass (may_const loads → runtime constants)
-  ///   4. IPSCCP (push constants across call edges) + re-substitution
-  ///   5. Module cleanup (RPO attrs + dead-arg elimination + GlobalDCE)
-  ///   6. Core optimization pipeline (L1/L2/L3) + vectorization (L2+)
-  ///      + final GlobalDCE sweep (callees freed by phases 2-5)
+  ///   1a. Parameter substitution (ejit_period_arr_ind → constants)
+  ///   1b. InstCombine (fold GEP chains from substituted params)
+  ///   1c. StructFieldPass (may_const loads → runtime constants)
+  ///   1d. IPSCCP (push constants across call edges)
+  ///   1e/1f. InstCombine + StructFieldPass for callees
+  ///   1g. Module cleanup (RPO attrs + dead-arg elimination + GlobalDCE)
+  ///   2-4. LowerExpect → O1/O2/O3 simplification → re-substitution + cleanup
+  ///   5. Vectorization (L2+)
+  ///   6. Final GlobalDCE sweep (callees freed by phases 2-5)
   void runPipeline(Module &M, const SpecializationContext &ctx);
 
   /// Clear all cached analysis results. Must be called between compilations

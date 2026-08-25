@@ -1650,25 +1650,38 @@ static void createExpectGuardDeadCalleeFunc(LLVMContext &Ctx, Module &M) {
 
 TEST(EJitOptimizer, FinalGlobalDceDropsExpectGuardFreedHelper) {
   LLVMContext Ctx;
-  auto M = createTestModule(Ctx, "finalDce");
-
   // Runtime value for the may_const load: g_cfg[2] = 42.
   int32_t cfg[4] = {0, 0, 42, 0};
   PeriodArrayRegistry reg;
   reg.registerArray("cell", "g_cfg", cfg, 4);
-  createExpectGuardDeadCalleeFunc(Ctx, *M);
 
   SpecializationContext ctx;
   ctx.fnName = "entry";
   ctx.dimensions.push_back({"cell", 2});
   ctx.optLevel = llvm::ejit::OptimizationLevel::L3;
 
+  // Pin the phase-6 necessity premise: phase 1g's GlobalDCE runs while the
+  // helper's only call is still live behind the expect guard (which folds
+  // only in phase 2) — so the helper must survive 1g. If this assertion ever
+  // fails, the guard folded earlier than the pipeline claims and the final
+  // sweep below would be dead code.
+  {
+    auto M = createTestModule(Ctx, "finalDce");
+    createExpectGuardDeadCalleeFunc(Ctx, *M);
+    EJitOptimizerTestAccess opt(reg);
+    opt.runModuleCleanup(*M);
+    EXPECT_NE(M->getFunction("dead_helper"), nullptr)
+        << "guard-held call must keep the helper alive at phase 1g";
+  }
+
+  // The full pipeline then folds the guard (phases 2-3, after LowerExpect)
+  // and deletes its dead half — and with it the call to dead_helper — only
+  // AFTER phase 1g's GlobalDCE ran. The final sweep must delete the helper
+  // so the backend never compiles it.
+  auto M = createTestModule(Ctx, "finalDce");
+  createExpectGuardDeadCalleeFunc(Ctx, *M);
   EJitOptimizerTestAccess opt(reg);
   opt.runPipeline(*M, ctx);
-
-  // Phases 2-3 folded the guard and deleted its dead half — and with it the
-  // call to dead_helper — only AFTER phase 1g's GlobalDCE ran. The final
-  // sweep must delete the helper so the backend never compiles it.
   EXPECT_EQ(M->getFunction("dead_helper"), nullptr)
       << "helper whose only call site died in phases 2-3 survived the pipeline";
 }
