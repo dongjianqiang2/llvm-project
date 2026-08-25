@@ -86,6 +86,12 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     auto *FT = FunctionType::get(I32, {I32}, false);
     for (StringRef Name : {"dump_a", "dump_b", "dump_c"}) {
       auto *F = Function::Create(FT, Function::ExternalLinkage, Name, &M);
+      // The entry tag is required: the JIT pipeline internalizes every
+      // non-entry definition and ORC never registers local-linkage symbols,
+      // so an untagged function fails lookup ("Symbols not found").
+      Metadata *EntryMDOps[] = {MDString::get(Ctx, TAG_EJIT_ENTRY)};
+      F->setMetadata(MD_EJIT_METADATA,
+                     MDNode::get(Ctx, {MDNode::get(Ctx, EntryMDOps)}));
       IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
       B.CreateRet(B.CreateAdd(F->getArg(0), B.getInt32(Name.back())));
     }

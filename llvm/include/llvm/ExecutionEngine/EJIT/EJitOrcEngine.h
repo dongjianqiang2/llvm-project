@@ -10,6 +10,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITORCENGINE_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ExecutionEngine/EJIT/EJitDedupIndex.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
@@ -92,9 +93,33 @@ public:
   /// Load a bitcode module into a per-specialization JITDylib identified
   /// by cacheKey. Each specialization gets its own JITDylib so symbols
   /// from the same TU bitcode can be defined multiple times without conflict.
+  /// The specialization pipeline runs lazily in the IR transform layer at
+  /// lookup time (legacy path; kept for direct/test callers).
   Error loadBitcodeModule(StringRef bitcodeData,
                           uint64_t cacheKey,
                           const std::string &origFnName);
+
+  /// Result of the one-shot compile entry point below.
+  struct SpecializeResult {
+    /// The compiled entry pointer - or, on a dedup hit, the canonical pointer
+    /// of an earlier equal-fingerprint compile (no new code was emitted and
+    /// no code-pool bytes were consumed).
+    void *fnPtr = nullptr;
+    /// True when fnPtr was reused from the dedup index.
+    bool deduped = false;
+  };
+
+  /// One-shot specialization compile (EJIT_SPECIALIZATION_DEDUP.md §5.3):
+  /// parse -> run the specialization pipeline EAGERLY (pre-materialization)
+  /// -> fingerprint the specialized IR -> dedup check -> on miss emit into a
+  /// per-cacheKey JITDylib and look the entry up. On a dedup hit in On mode
+  /// no JITDylib is created and no machine code is generated. Must be called
+  /// on the owner compile thread with setActiveContext() set (compilation is
+  /// serialized there; asserted via the pass-through flag).
+  Expected<SpecializeResult>
+  specializeAndResolve(StringRef bitcodeData, uint64_t cacheKey,
+                       uint32_t funcIndex, const std::string &origFnName,
+                       DedupMode dedupMode);
 
   /// Look up a compiled function symbol in the specialization JITDylib
   /// identified by cacheKey.
@@ -123,7 +148,32 @@ public:
   bool findCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
 #endif
 
+  /// Owner-private dedup index state (test/diagnostic read access).
+  const EJitDedupIndex &dedupIndex() const;
+
+  /// Drop every dedup index entry (used when a releaser is wired while dedup
+  /// is configured on, so aliases to potentially-freed code disappear).
+  void clearDedupIndex();
+
 private:
+  /// Parsed specialization bitcode: module + its owning context (both move
+  /// together into the ThreadSafeModule at emit time).
+  struct ParsedSpecModule;
+  /// Parse the bitcode and apply the pre-pipeline fixups (module name,
+  /// dso_local on AArch64 ELF declarations, external-linkage promotion of a
+  /// static entry). Steps 1-3 shared by loadBitcodeModule and
+  /// specializeAndResolve.
+  Expected<ParsedSpecModule> parseSpecModule(StringRef bitcodeData,
+                                             uint64_t cacheKey,
+                                             const std::string &origFnName);
+  /// Collect external symbols, create/populate the per-cacheKey JITDylib and
+  /// add the module. Steps 4-10 shared by both paths.
+  Error emitSpecModule(ParsedSpecModule PM, uint64_t cacheKey);
+  /// Run the specialization pipeline + IR/ASM dumps + diagnostic capture on
+  /// \p M. Shared by the eager path (specializeAndResolve, before codegen)
+  /// and the legacy lazy path (IR transform layer during materialization).
+  void specializeModuleEagerly(Module &M, const SpecializationContext &ctx);
+
   struct Impl;
   std::unique_ptr<Impl> P;
 };

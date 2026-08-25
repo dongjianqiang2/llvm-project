@@ -13,8 +13,12 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
+  EJitDedupTest.cpp
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp
+  # __stack_chk_guard/__stack_chk_fail definitions for host linking (see the
+  # file header); production binaries never compile this TU in.
+  EJitTestHostStubs.cpp
 
   PARTIAL_SOURCES_INTENDED
   )

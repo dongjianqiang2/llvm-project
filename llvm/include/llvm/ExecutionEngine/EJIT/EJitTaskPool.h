@@ -190,6 +190,11 @@ public:
     releaseCtx_ = ctx;
   }
 
+  /// True when a physical-code releaser is wired: published fnPtrs may be
+  /// freed. Consumers that alias fnPtrs across identities (specialization
+  /// dedup) must disable themselves while this is true.
+  bool hasReleaser() const { return releaseFn_ != nullptr; }
+
   EJitCacheLookupResult lookup(uint32_t funcIndex, const EJitDimPair *dims,
                                uint32_t numDims);
 
@@ -312,6 +317,9 @@ public:
   void setReleaser(EJitTaskPoolCache::ReleaseCallback fn, void *ctx) {
     cache_.setReleaser(fn, ctx);
   }
+
+  /// True when a physical-code releaser is wired on this taskpool's cache.
+  bool hasReleaser() const { return cache_.hasReleaser(); }
 
   EJitSwitchController &switchController() { return switch_; }
   EJitTaskPoolCache &cache() { return cache_; }

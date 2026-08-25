@@ -94,6 +94,13 @@ public:
   void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
 #endif
 
+  /// The dedup mode actually in effect for the next compile: the configured
+  /// mode, force-lowered to Off whenever a physical-code releaser is wired on
+  /// any taskpool (a dedup hit hands the release paths a fnPtr shared with
+  /// other identities - EJIT_SPECIALIZATION_DEDUP.md §5.5 hard gate). Also
+  /// clears the engine's dedup index so no stale aliases survive the wiring.
+  DedupMode effectiveDedupMode();
+
   EJitRuntimeState &getRuntimeState() { return runtimeState_; }
   EJitModuleLoader &getLoader() { return loader_; }
   const Config &getConfig() { return config_; }

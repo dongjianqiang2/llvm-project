@@ -348,6 +348,38 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
     jitEngine_->addUserSymbol(name, addr);
 }
 
+DedupMode EJitCompileDriver::effectiveDedupMode() {
+  if (config_.dedupMode == DedupMode::Off)
+    return DedupMode::Off;
+
+  // Hard gate (EJIT_SPECIALIZATION_DEDUP.md 5.5): a wired releaser frees code
+  // through the version-mismatch / eviction release paths, and a dedup hit
+  // returns a fnPtr shared with other identities. Degrade to Off and drop the
+  // existing aliases so no release path can free shared code.
+  bool ReleaserWired = false;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ReleaserWired = ReleaserWired || sharedPool_.hasReleaser();
+#endif
+#ifdef EJIT_SRE_TASKPOOL
+  ReleaserWired = ReleaserWired || (taskPool_ && taskPool_->hasReleaser());
+#endif
+  if (!ReleaserWired)
+    return config_.dedupMode;
+
+  // One-shot warn: this runs per compile, and while a releaser stays wired
+  // every compile takes this branch.
+  static bool Warned = false;
+  if (!Warned) {
+    Warned = true;
+    EJIT_DIAG("dedup DISABLED: a releaser is wired on a taskpool "
+              "(configured mode=%u)",
+              static_cast<unsigned>(config_.dedupMode));
+  }
+  if (jitEngine_)
+    jitEngine_->clearDedupIndex();
+  return DedupMode::Off;
+}
+
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
@@ -439,43 +471,33 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
     return nullptr;
   }
 
+  // One-shot compile: parse -> EAGER specialization pipeline -> dedup
+  // fingerprint check (reuse an equal-fingerprint fnPtr when enabled and one
+  // exists) -> emit + resolve. See EJIT_SPECIALIZATION_DEDUP.md 5.3.
   jitEngine_->setActiveContext(&ctx);
-
-  if (auto Err = jitEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
-    jitEngine_->setActiveContext(nullptr);
-    EJIT_DIAG("compile FAIL key=0x%016lx func=%s: load bitcode module failed",
-              cacheKey, funcName.c_str());
-#ifndef EJIT_FREESTANDING
-    if (logger_)
-      logger_->log(EJIT_ERR_COMPILE_FAILED, "Failed to load bitcode module",
-                   funcName, std::to_string(cacheKey));
-#else
-    consumeError(std::move(Err));
-#endif
-    return nullptr;
-  }
-
-  auto addrOrErr = jitEngine_->lookup(cacheKey, funcName);
+  auto ResOrErr = jitEngine_->specializeAndResolve(bitcode, cacheKey, funcIdx,
+                                                   funcName,
+                                                   effectiveDedupMode());
   jitEngine_->setActiveContext(nullptr);
 
-  if (!addrOrErr) {
-    EJIT_DIAG("compile FAIL key=0x%016lx func=%s: lookup after compile failed",
+  if (!ResOrErr) {
+    Error E = ResOrErr.takeError();
+    EJIT_DIAG("compile FAIL key=0x%016lx func=%s: specialize/resolve failed",
               cacheKey, funcName.c_str());
 #ifndef EJIT_FREESTANDING
     if (logger_)
       logger_->log(EJIT_ERR_COMPILE_FAILED,
-                   "Failed to look up compiled function", funcName,
+                   "Failed to compile specialization", funcName,
                    std::to_string(cacheKey));
-#else
-    consumeError(addrOrErr.takeError());
 #endif
+    consumeError(std::move(E));
     return nullptr;
   }
 
-  void *funcPtr = *addrOrErr;
+  void *funcPtr = ResOrErr->fnPtr;
 
-  EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
-            funcName.c_str(), funcPtr);
+  EJIT_DIAG("compile OK key=0x%016lx func=%s -> pfn=%p deduped=%u", cacheKey,
+            funcName.c_str(), funcPtr, ResOrErr->deduped ? 1u : 0u);
   return funcPtr;
 }
 
