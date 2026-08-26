@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>EJIT 演示页 · 风格索引</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>"/>
+<style>
+:root{--bg:#070b14;--line:#1d2a42;--line2:#28395a;--text:#e8eef8;--muted:#8fa0bb;--dim:#5b6b87;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,#070b14,#0a101d);color:var(--text);font-family:var(--sans);line-height:1.7;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:60px 24px 40px}
+h1{margin:0;font-size:clamp(30px,5vw,48px);font-weight:900;background:linear-gradient(90deg,#ff6b6b,#f5c542);-webkit-background-clip:text;background-clip:text;color:transparent}
+p.lead{color:var(--muted);max-width:640px;text-align:center;margin:12px 0 40px}
+a.back{color:var(--dim);text-decoration:none;font-size:14px;margin-bottom:26px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px;max-width:1180px;width:100%}
+.card{display:block;text-decoration:none;border:1px solid var(--line);border-radius:18px;padding:24px;background:linear-gradient(180deg,#111b2e,#0d1524);transition:transform .22s,border-color .22s;position:relative;overflow:hidden}
+.card:hover{transform:translateY(-5px);border-color:#3a548a}
+.card .name{font-size:20px;font-weight:800;margin-bottom:2px}
+.card .file{font-family:var(--mono);font-size:12px;color:var(--dim);margin-bottom:10px}
+.card .desc{font-size:13.5px;color:var(--muted)}
+.swatch{display:flex;gap:6px;margin-top:16px}
+.swatch i{width:34px;height:8px;border-radius:4px;display:block}
+.sw-light i:nth-child(1){background:#d92637}.sw-light i:nth-child(2){background:#0e7490}.sw-light i:nth-child(3){background:#ffffff;border:1px solid #cbd5e3}
+.sw-huawei i:nth-child(1){background:#c7000b}.sw-huawei i:nth-child(2){background:#151210}.sw-huawei i:nth-child(3){background:#ffffff;border:1px solid #d4c6c0}
+.sw-terminal i:nth-child(1){background:#3dfc8a}.sw-terminal i:nth-child(2){background:#ffb000}.sw-terminal i:nth-child(3){background:#0a120b;border:1px solid #2a4d36}
+.sw-ocean i:nth-child(1){background:#5eead4}.sw-ocean i:nth-child(2){background:#4ade80}.sw-ocean i:nth-child(3){background:#0a1230;border:1px solid #28395a}
+.sw-paper i:nth-child(1){background:#9c2b1f}.sw-paper i:nth-child(2){background:#2b2520}.sw-paper i:nth-child(3){background:#f6f1e7;border:1px solid #b8ab93}
+footer{margin-top:48px;color:var(--dim);font-size:13px}
+</style>
+</head>
+<body>
+<h1>⚡ EJIT 演示页 · 风格索引</h1>
+<p class="lead">五个风格版本，内容与交互完全一致（含可交互特化实验室），仅视觉皮肤不同。均为单文件、零外部依赖、离线可用。</p>
+<a class="back" href="EJIT_ONEPAGE.html">← 返回默认暗夜红金版 EJIT_ONEPAGE.html</a>
+<div class="grid">
+    <a class="card" href="EJIT_LIGHT.html">
+      <div class="name">亮色商务版</div>
+      <div class="file">EJIT_LIGHT.html</div>
+      <div class="desc">亮色商务 · 白底蓝红 · 适合明亮会议室与打印</div>
+      <div class="swatch sw-light"><i></i><i></i><i></i></div>
+    </a>
+    <a class="card" href="EJIT_HUAWEI.html">
+      <div class="name">华为红正式版</div>
+      <div class="file">EJIT_HUAWEI.html</div>
+      <div class="desc">华为红 · 黑红白企业风 · 正式汇报场合</div>
+      <div class="swatch sw-huawei"><i></i><i></i><i></i></div>
+    </a>
+    <a class="card" href="EJIT_TERMINAL.html">
+      <div class="name">终端极客版</div>
+      <div class="file">EJIT_TERMINAL.html</div>
+      <div class="desc">终端绿 · 等宽字体 · 扫描线 · 工程师审美</div>
+      <div class="swatch sw-terminal"><i></i><i></i><i></i></div>
+    </a>
+    <a class="card" href="EJIT_OCEAN.html">
+      <div class="name">深蓝玻璃版</div>
+      <div class="file">EJIT_OCEAN.html</div>
+      <div class="desc">深蓝渐变 · 玻璃拟态 · 青绿霓虹 · 科技 Keynote</div>
+      <div class="swatch sw-ocean"><i></i><i></i><i></i></div>
+    </a>
+    <a class="card" href="EJIT_PAPER.html">
+      <div class="name">杂志印刷版</div>
+      <div class="file">EJIT_PAPER.html</div>
+      <div class="desc">纸面衬线 · 编辑排版 · 双线装饰 · 沉稳雅致</div>
+      <div class="swatch sw-paper"><i></i><i></i><i></i></div>
+    </a>
+</div>
+<footer>同一份内容 · 五种表达 · 点击任意卡片进入</footer>
+</body>
+</html>
