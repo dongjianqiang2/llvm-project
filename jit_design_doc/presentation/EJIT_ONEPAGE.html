@@ -44,7 +44,7 @@ h1{margin:0;font-size:clamp(72px,12vw,150px);font-weight:900;letter-spacing:2px;
 .tagline .line2{display:block;margin-top:10px;color:var(--muted);font-size:.86em}
 .chips{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;margin:38px 0 30px}
 .chip{border:1px solid var(--line2);background:linear-gradient(180deg,rgba(17,27,46,.9),rgba(13,21,36,.9));border-radius:16px;padding:14px 26px;min-width:220px}
-.chip b{display:block;font-size:34px;font-weight:900;background:linear-gradient(90deg,#4cc9f0,#34d399);-webkit-background-clip:text;background-clip:text;color:transparent}
+.chip b{display:block;font-size:34px;font-weight:900;font-family:var(--mono);background:linear-gradient(90deg,#4cc9f0,#34d399);-webkit-background-clip:text;background-clip:text;color:transparent}
 .chip b .u{font-size:16px;color:var(--muted);-webkit-text-fill-color:var(--muted)}
 .chip span{font-size:12.5px;color:var(--muted)}
 .cta{display:inline-block;margin-top:6px;padding:13px 34px;border-radius:12px;font-size:16px;font-weight:800;color:#fff;text-decoration:none;background:linear-gradient(90deg,var(--red2),#ff6b3d);box-shadow:0 10px 34px rgba(230,33,41,.4);transition:transform .18s,box-shadow .18s;animation:pulse 2.4s infinite}
@@ -218,7 +218,7 @@ kbd.code-tag{font-family:var(--mono);font-size:.9em;background:rgba(245,197,66,.
 .pipe-note b{color:var(--muted)}
 
 /* ---------- numbers ---------- */
-.num-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.num-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
 .ncard{border:1px solid var(--line);border-radius:16px;padding:22px 20px 18px;background:linear-gradient(180deg,var(--panel2),var(--panel));position:relative;overflow:hidden;transition:transform .22s,border-color .22s}
 .ncard:hover{transform:translateY(-4px);border-color:var(--line2)}
 .ncard .big{font-size:37px;font-weight:900;font-family:var(--mono);line-height:1.15;background:linear-gradient(90deg,#4cc9f0,#34d399);-webkit-background-clip:text;background-clip:text;color:transparent}
@@ -289,9 +289,9 @@ footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#
       <span class="line2">同一份代码，在设备上自动进化为当前配置下的最优形态 —— 分支消失 · 访存归零 · 越用越快</span>
     </p>
     <div class="chips">
-      <div class="chip"><b>&lt; <span data-count="10">0</span><span class="u"> cycles</span></b><span>热路径缓存命中 · AArch64 实测</span></div>
+      <div class="chip"><b>&lt;<span data-count="10">0</span><span class="u"> cycles</span></b><span>热路径缓存命中 · AArch64 实测</span></div>
       <div class="chip"><b><span data-count="0">0</span><span class="u"> 崩溃</span></b><span>所有 JIT 失败 100% 回退 AOT</span></div>
-      <div class="chip"><b>&lt;<span data-count="100">0</span><span class="u">ms</span></b><span>首次 JIT 编译延迟 · 软实时可容忍；异步模式完全无感</span></div>
+      <div class="chip"><b>&lt;<span data-count="100">0</span><span class="u">ms</span></b><span>首次JIT编译延迟 · 异步模式完全无感</span></div>
     </div>
     <a class="cta" href="#demo">▶ 现场演示 · 亲眼看分支消失</a>
     <div class="scroll-hint">▼ 向下滚动</div>
@@ -525,7 +525,6 @@ footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#
     <div class="ncard redg"><div class="big">0</div><h4>因 JIT 失败导致的崩溃</h4><p>所有异常路径 100% 回退 AOT —— 原则写进 SPEC 第 8 章</p></div>
     <div class="ncard"><div class="big">6</div><h4>用户注解属性</h4><p>may_const / period / period_arr / entry / arr_ind / period_lc，零 DSL 零代码重写</p></div>
     <div class="ncard"><div class="big">5+1</div><h4>自研编译 Pass</h4><p>5 个 AOT Pass + 1 个 JIT 特化 Pass；在线 PGO / 值画像持续演进中</p></div>
-    <div class="ncard"><div class="big">100KB<span class="u">–2MB</span></div><h4>目标设备 RAM</h4><p>SRE 裸核可部署 · 无文件系统 · BiSheng Embedded CPU</p></div>
   </div>
 </section>
 
