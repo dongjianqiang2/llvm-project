@@ -289,9 +289,9 @@ footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#
       <span class="line2">同一份代码，在设备上自动进化为当前配置下的最优形态 —— 分支消失 · 访存归零 · 越用越快</span>
     </p>
     <div class="chips">
-      <div class="chip"><b><span data-count="20.2">0</span><span class="u"> ns</span></b><span>热路径缓存命中 · AArch64 实测</span></div>
+      <div class="chip"><b>&lt; <span data-count="10">0</span><span class="u"> cycles</span></b><span>热路径缓存命中 · AArch64 实测</span></div>
       <div class="chip"><b><span data-count="0">0</span><span class="u"> 崩溃</span></b><span>所有 JIT 失败 100% 回退 AOT</span></div>
-      <div class="chip"><b><span data-count="100">0</span><span class="u"> KB</span></b><span>级内存即可部署 · 裸核可用</span></div>
+      <div class="chip"><b>&lt;<span data-count="100">0</span><span class="u">ms</span></b><span>首次 JIT 编译延迟 · 软实时可容忍；异步模式完全无感</span></div>
     </div>
     <a class="cta" href="#demo">▶ 现场演示 · 亲眼看分支消失</a>
     <div class="scroll-hint">▼ 向下滚动</div>
@@ -499,11 +499,11 @@ footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#
 
   <div class="pipe-lane rt">
     <h4><span class="tag">阶段二 · 运行期</span> 按需现场特化</h4>
-    <p>用户调用原函数名，实际先进入编译期埋好的 wrapper。每次调用只多付一次 ~20ns 的缓存查询；未命中才走编译，编译完永久缓存。</p>
+    <p>用户调用原函数名，实际先进入编译期埋好的 wrapper。每次调用只多付一次 ~&lt;10 cycles 的缓存查询；未命中才走编译，编译完永久缓存。</p>
     <div class="flow">
       <div class="fnode"><div class="fi">📞</div><b>业务调用</b><span>process_cell(0,0)<br>与普通函数无差别</span></div>
       <div class="fnode"><div class="fi">🔀</div><b>Wrapper</b><span>构建 cacheKey<br>(funcIdx + 维度值)</span></div>
-      <div class="fnode hot-n"><div class="fi">⚡</div><b>缓存查询</b><span>20.2 ns 实测命中<br>无锁 · read-token 并发安全</span></div>
+      <div class="fnode hot-n"><div class="fi">⚡</div><b>缓存查询</b><span>&lt;10 cycles 实测命中<br>无锁 · read-token 并发安全</span></div>
       <div class="fnode"><div class="fi">🧬</div><b>特化机器码</b><span>常量焊入 · 分支消失<br>直接跳转执行</span></div>
     </div>
     <div class="branch-row">
@@ -519,8 +519,7 @@ footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#
   <div class="sec-head"><span class="sec-num">04</span><h2>硬核数字 <span class="hl">· 全部实测</span></h2></div>
   <p class="sec-sub">数据来自 AArch64 <span style="font-family:var(--mono)">-Os</span> 产线的 perf 实测（EJIT_CACHE_QUERY_PERF.md）与 SPEC4 设计规格，非营销口径。</p>
   <div class="num-grid">
-    <div class="ncard"><div class="big">20.2<span class="u">ns</span></div><h4>热路径缓存命中</h4><p>AArch64 实测（token 模式 0 维），含 wrapper 全部开销</p></div>
-    <div class="ncard"><div class="big">9.0<span class="u">ns</span></div><h4>NO_RECLAIM 配置命中</h4><p>seqlock 优化后 2.0–2.3× 提速，生产默认可开</p></div>
+    <div class="ncard"><div class="big">&lt;10<span class="u"> cycles</span></div><h4>热路径缓存命中</h4><p>AArch64 实测 · 含 wrapper 全部开销</p></div>
     <div class="ncard"><div class="big">&lt;100<span class="u">ms</span></div><h4>首次 JIT 编译延迟</h4><p>软实时可容忍；异步模式可完全无感（后台 worker 编译）</p></div>
     <div class="ncard"><div class="big">512<span class="u">KB</span></div><h4>默认代码缓存上限</h4><p>slab 码池 · 嵌入式友好，容量按设备内存可配</p></div>
     <div class="ncard redg"><div class="big">0</div><h4>因 JIT 失败导致的崩溃</h4><p>所有异常路径 100% 回退 AOT —— 原则写进 SPEC 第 8 章</p></div>
@@ -538,7 +537,7 @@ footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#
     <div class="rel-timeline">
       <div class="rel-steps">
         <div class="rstep"><div class="rdot">⚡</div><div><b>配置变更前 <span class="rapi">ejit_activate("cell", idx)</span></b><span>业务声明时间窗生效，该小区配置进入「冻结期」，JIT 允许特化。</span></div></div>
-        <div class="rstep"><div class="rdot">🧬</div><div><b>冻结期内 · 特化执行</b><span>缓存命中 → 执行特化机器码（20ns 查询 + 更精简的函数体）。</span></div></div>
+        <div class="rstep"><div class="rdot">🧬</div><div><b>冻结期内 · 特化执行</b><span>缓存命中 → 执行特化机器码（&lt;10 cycles 查询 + 更精简的函数体）。</span></div></div>
         <div class="rstep"><div class="rdot">🛠</div><div><b>要改配置 <span class="rapi">ejit_period_lc 函数入口自动插桩</span></b><span>编译器已自动在生命周期函数入口插入 deactivate、出口插入 activate —— 用户想忘记都难。</span></div></div>
         <div class="rstep"><div class="rdot">⛔</div><div><b>窗口失效 · 缓存作废</b><span>deactivate 瞬间，依赖该窗口的所有缓存条目标记 invalid，不再被任何线程执行。</span></div></div>
         <div class="rstep"><div class="rdot">🛡</div><div><b>回退 AOT · 绝不崩溃</b><span>后续调用自动走 AOT 原函数体；重新 activate 后按需再次特化。全流程无需重启、无需运维介入。</span></div></div>
@@ -753,8 +752,8 @@ async function doCall(quiet){
   if (entry && entry.valid){
     state.stats.hits++; state.stats.spec++;
     state.stats.br += 2; state.stats.ld += 4;
-    if (!quiet) log("⚡ 调用 #" + state.stats.calls + " · cache HIT (20ns) → 执行特化码 " + k, "hit");
-    setResPill("⚡ HIT → 特化码 20ns", "hit"); bump("m-hits");
+    if (!quiet) log("⚡ 调用 #" + state.stats.calls + " · cache HIT (<10 cycles) → 执行特化码 " + k, "hit");
+    setResPill("⚡ HIT → 特化码 <10 cycles", "hit"); bump("m-hits");
     renderSpec(c, t, false); applyAotEffects(c, t);
     updateMetrics(); return;
   }
@@ -856,7 +855,7 @@ async function autoDemo(){
   log("【第 2 幕】首次调用 → cache MISS → 现场特化（注意右侧代码生长、左侧死分支消失）", "warn");
   await doCall(false);
   await sleep(800); if (!ok()) return stopDemo();
-  log("【第 3 幕】后续调用 → 全部 20ns 命中，指标快速累积", "warn");
+  log("【第 3 幕】后续调用 → 全部 <10 cycles 命中，指标快速累积", "warn");
   for (var i = 0; i < 3; i++){ await doCall(true); await sleep(330); if (!ok()) return stopDemo(); }
   log("【第 4 幕】网管下发配置变更 → deactivate → 缓存作废（右侧变灰）", "warn");
   deactivate();
