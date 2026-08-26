@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>EJIT · 时间窗特化编译 — 让嵌入式代码越跑越快</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>"/>
+<style>
+:root{
+  --bg:#070b14; --bg2:#0a101d; --panel:#0d1524; --panel2:#111b2e; --line:#1d2a42; --line2:#28395a;
+  --text:#e8eef8; --muted:#8fa0bb; --dim:#5b6b87;
+  --red:#ff4d55; --red2:#e62129; --amber:#fbbf24; --cyan:#4cc9f0; --green:#34d399; --purple:#a78bfa; --gold:#f5c542;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.7;overflow-x:hidden}
+::selection{background:rgba(255,77,85,.35)}
+
+/* ---------- background ---------- */
+.bg-grid{position:fixed;inset:0;z-index:-2;background-image:linear-gradient(rgba(76,201,240,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(76,201,240,.05) 1px,transparent 1px);background-size:44px 44px;mask-image:radial-gradient(ellipse 90% 65% at 50% 0%,#000 30%,transparent 75%)}
+.orb{position:fixed;border-radius:50%;filter:blur(110px);opacity:.5;z-index:-1;pointer-events:none}
+.orb.a{width:640px;height:640px;background:#5a0e18;top:-280px;left:-180px;animation:drift 16s ease-in-out infinite alternate}
+.orb.b{width:520px;height:520px;background:#0e2f4a;top:-160px;right:-140px;animation:drift 20s ease-in-out infinite alternate-reverse}
+@keyframes drift{from{transform:translate(0,0)}to{transform:translate(60px,50px)}}
+
+/* ---------- nav ---------- */
+nav{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:10px 28px;background:rgba(7,11,20,.72);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+nav .logo{font-weight:900;font-size:19px;letter-spacing:.5px;background:linear-gradient(90deg,#ff6b6b,#f5c542);-webkit-background-clip:text;background-clip:text;color:transparent}
+nav .links{display:flex;gap:22px}
+nav a{color:var(--muted);text-decoration:none;font-size:14px;transition:color .2s}
+nav a:hover{color:var(--text)}
+
+/* ---------- hero ---------- */
+.hero{min-height:96vh;display:flex;align-items:center;justify-content:center;text-align:center;padding:110px 24px 60px;position:relative}
+.hero-inner{max-width:1060px}
+.badge{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line2);background:rgba(17,27,46,.7);color:var(--muted);font-size:13.5px;padding:7px 16px;border-radius:999px;margin-bottom:26px;letter-spacing:1px}
+.badge b{color:var(--gold);font-weight:700}
+h1{margin:0;font-size:clamp(72px,12vw,150px);font-weight:900;letter-spacing:2px;line-height:1;background:linear-gradient(100deg,#ff4d55 10%,#ff8a5c 40%,#f5c542 75%,#ffe9a8);-webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 0 34px rgba(255,77,85,.28))}
+.sub{margin:14px 0 8px;font-size:clamp(18px,2.4vw,26px);color:var(--cyan);font-weight:700;letter-spacing:6px}
+.tagline{margin:16px auto 0;max-width:760px;font-size:clamp(16px,1.9vw,21px);color:var(--text)}
+.tagline b{color:var(--gold);border-bottom:2px solid rgba(245,197,66,.5);padding-bottom:1px}
+.tagline .line2{display:block;margin-top:10px;color:var(--muted);font-size:.86em}
+.chips{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;margin:38px 0 30px}
+.chip{border:1px solid var(--line2);background:linear-gradient(180deg,rgba(17,27,46,.9),rgba(13,21,36,.9));border-radius:16px;padding:14px 26px;min-width:220px}
+.chip b{display:block;font-size:34px;font-weight:900;background:linear-gradient(90deg,#4cc9f0,#34d399);-webkit-background-clip:text;background-clip:text;color:transparent}
+.chip b .u{font-size:16px;color:var(--muted);-webkit-text-fill-color:var(--muted)}
+.chip span{font-size:12.5px;color:var(--muted)}
+.cta{display:inline-block;margin-top:6px;padding:13px 34px;border-radius:12px;font-size:16px;font-weight:800;color:#fff;text-decoration:none;background:linear-gradient(90deg,var(--red2),#ff6b3d);box-shadow:0 10px 34px rgba(230,33,41,.4);transition:transform .18s,box-shadow .18s;animation:pulse 2.4s infinite}
+.cta:hover{transform:translateY(-3px);box-shadow:0 16px 44px rgba(230,33,41,.55)}
+@keyframes pulse{0%,100%{box-shadow:0 10px 34px rgba(230,33,41,.4)}50%{box-shadow:0 10px 44px rgba(230,33,41,.62)}}
+.scroll-hint{margin-top:44px;color:var(--dim);font-size:13px;letter-spacing:3px;animation:bob 2s infinite}
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(8px)}}
+
+/* ---------- sections ---------- */
+section{max-width:1280px;margin:0 auto;padding:78px 26px 20px}
+.sec-head{display:flex;align-items:baseline;gap:16px;margin-bottom:8px}
+.sec-num{font-family:var(--mono);font-size:15px;color:var(--red);font-weight:700;letter-spacing:2px}
+h2{margin:0;font-size:clamp(26px,3.4vw,38px);font-weight:900}
+h2 .hl{background:linear-gradient(90deg,#ff6b6b,#f5c542);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sec-sub{color:var(--muted);margin:6px 0 34px;font-size:15.5px;max-width:900px}
+
+/* ---------- story cards ---------- */
+.story-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.scard{position:relative;border:1px solid var(--line);border-radius:18px;padding:26px 24px 22px;background:linear-gradient(180deg,var(--panel2),var(--panel));overflow:hidden;transition:transform .25s,border-color .25s}
+.scard:hover{transform:translateY(-5px);border-color:var(--line2)}
+.scard .icon{font-size:34px;margin-bottom:12px}
+.scard h3{margin:0 0 10px;font-size:19px}
+.scard p{margin:0;color:var(--muted);font-size:14.5px}
+.scard .foot{margin-top:14px;font-size:13px;font-weight:700}
+.scard.s1{border-top:3px solid var(--red)} .scard.s1 .foot{color:var(--red)}
+.scard.s2{border-top:3px solid var(--cyan)} .scard.s2 .foot{color:var(--cyan)}
+.scard.s3{border-top:3px solid var(--gold)} .scard.s3 .foot{color:var(--gold)}
+.scard .ghost{position:absolute;right:-8px;bottom:-26px;font-size:110px;opacity:.05;font-weight:900;font-family:var(--mono)}
+kbd.code-tag{font-family:var(--mono);font-size:.9em;background:rgba(245,197,66,.13);color:var(--gold);padding:1px 6px;border-radius:5px;border:1px solid rgba(245,197,66,.25)}
+
+/* timeline strip */
+.tl-wrap{margin-top:26px;border:1px solid var(--line);border-radius:18px;padding:24px 26px;background:var(--panel)}
+.tl-title{font-size:14px;color:var(--muted);margin-bottom:16px;font-weight:700;letter-spacing:1px}
+.timeline{position:relative;height:64px}
+.timeline .bar{position:absolute;top:26px;left:0;right:0;height:12px;border-radius:8px;background:linear-gradient(90deg,#2a1116 0%,#3d1c22 8%,#12303f 12%,#134152 45%,#3d1c22 62%,#12303f 66%,#134152 100%)}
+.timeline .evt{position:absolute;top:0;width:20px;height:64px;display:flex;flex-direction:column;align-items:center}
+.timeline .evt i{width:2px;flex:1;background:linear-gradient(180deg,transparent,var(--red),transparent)}
+.timeline .evt span{position:absolute;top:46px;font-size:12px;color:var(--red);white-space:nowrap;font-weight:700}
+.timeline .evt.ok i{background:linear-gradient(180deg,transparent,var(--cyan),transparent)} .timeline .evt.ok span{color:var(--cyan)}
+.timeline .frozen{position:absolute;top:8px;font-size:20px;filter:drop-shadow(0 0 8px rgba(76,201,240,.8));animation:twinkle 2.2s infinite}
+@keyframes twinkle{0%,100%{opacity:.55}50%{opacity:1}}
+.timeline .flabel{position:absolute;top:34px;font-size:12px;color:var(--cyan);font-weight:700;white-space:nowrap}
+
+/* ---------- demo ---------- */
+.demo-shell{border:1px solid var(--line2);border-radius:22px;background:linear-gradient(180deg,#0e1626,#0b1120);overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.5)}
+.demo-bar{display:flex;flex-wrap:wrap;align-items:center;gap:12px 18px;padding:16px 22px;border-bottom:1px solid var(--line);background:rgba(17,27,46,.6)}
+.ctl-group{display:flex;align-items:center;gap:8px}
+.ctl-label{font-size:12.5px;color:var(--muted);font-weight:700;letter-spacing:.5px}
+.seg{display:flex;border:1px solid var(--line2);border-radius:10px;overflow:hidden}
+.seg button{border:0;background:transparent;color:var(--muted);padding:7px 13px;font-size:13px;font-weight:700;cursor:pointer;font-family:var(--sans);transition:all .18s;border-right:1px solid var(--line)}
+.seg button:last-child{border-right:0}
+.seg button:hover{color:var(--text);background:rgba(76,201,240,.08)}
+.seg button.on{background:linear-gradient(90deg,rgba(76,201,240,.25),rgba(76,201,240,.12));color:#bfeaff}
+.seg button small{display:block;font-size:10px;font-weight:600;opacity:.75}
+.btn{border:0;border-radius:10px;padding:9px 16px;font-size:13.5px;font-weight:800;cursor:pointer;font-family:var(--sans);color:#fff;transition:transform .15s,filter .15s;white-space:nowrap}
+.btn:hover{transform:translateY(-1px);filter:brightness(1.12)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.btn.act{background:linear-gradient(90deg,#0e8f6a,#10b981);box-shadow:0 6px 18px rgba(16,185,129,.3)}
+.btn.deact{background:linear-gradient(90deg,#8f2430,#c53030);box-shadow:0 6px 18px rgba(197,48,48,.3)}
+.btn.call{background:linear-gradient(90deg,var(--red2),#ff7a45);box-shadow:0 6px 18px rgba(230,33,41,.35);padding:9px 22px}
+.btn.auto{background:linear-gradient(90deg,#7c3aed,#a78bfa);box-shadow:0 6px 18px rgba(167,139,250,.3)}
+.btn.ghostb{background:transparent;border:1px solid var(--line2);color:var(--muted)}
+.status-pills{display:flex;gap:10px;margin-left:auto;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:800;padding:6px 13px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);background:rgba(7,11,20,.5)}
+.pill .dot{width:9px;height:9px;border-radius:50%;background:#5b6b87}
+.pill.on{border-color:rgba(16,185,129,.5);color:#6ee7b7}.pill.on .dot{background:#10b981;box-shadow:0 0 10px #10b981}
+.pill.off{border-color:rgba(197,48,48,.5);color:#fca5a5}.pill.off .dot{background:#c53030}
+.pill.res{border-color:rgba(76,201,240,.4);color:#9ddcf7;min-width:170px}
+
+.demo-grid{display:grid;grid-template-columns:1fr 1fr;gap:0}
+.pane{position:relative;border-right:1px solid var(--line);min-height:520px;display:flex;flex-direction:column}
+.pane:last-child{border-right:0}
+.pane-head{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--line);font-size:13.5px;font-weight:800;letter-spacing:.5px}
+.pane-head .t1{color:var(--muted)}
+.pane-head .t2{font-size:11.5px;font-weight:700;padding:3px 10px;border-radius:999px}
+.pane.aot .t2{background:rgba(197,48,48,.15);color:#fca5a5}
+.pane.jit .t2{background:rgba(16,185,129,.15);color:#6ee7b7}
+.pane-body{flex:1;padding:14px 0;overflow:auto;font-family:var(--mono);font-size:12.8px;line-height:1.75}
+.cl{padding:0 18px 0 0;white-space:pre;display:flex}
+.cl .ln{width:44px;flex:none;text-align:right;padding-right:14px;color:#3d4d68;user-select:none;font-size:11px;line-height:inherit}
+.cl .cd{flex:1}
+.cl .note{float:right;font-size:11px;color:var(--gold);font-weight:700;opacity:.9;font-family:var(--sans)}
+.cl.dead{background:rgba(197,48,48,.07)}
+.cl.dead .cd{opacity:.32;text-decoration:line-through;text-decoration-color:rgba(255,90,90,.8);text-decoration-thickness:1.5px}
+.cl.hot{background:rgba(16,185,129,.09);box-shadow:inset 3px 0 0 var(--green)}
+.cl.folded{background:rgba(245,197,66,.08);box-shadow:inset 3px 0 0 var(--gold)}
+.cl.folded .note{opacity:1}
+.cl.newln{animation:linein .5s both}
+@keyframes linein{from{opacity:0;transform:translateX(14px)}to{opacity:1;transform:none}}
+/* code syntax */
+.kw{color:#c792ea}.ty{color:#7fdbff}.fn{color:#82aaff}.num{color:#f78c6c}.str{color:#c3e88d}.cmt{color:#546a8a;font-style:italic}.attr{color:#f5c542;font-weight:700}.op{color:#89ddff}.punc{color:#b2c2d9}
+.pane .empty{color:#3d4d68;padding:40px 30px;text-align:center;font-size:13px;font-family:var(--sans)}
+.pane .empty .big{font-size:34px;margin-bottom:10px;filter:grayscale(.4)}
+
+/* compile overlay */
+.ovl{position:absolute;inset:0;background:rgba(7,11,20,.94);backdrop-filter:blur(3px);display:none;flex-direction:column;justify-content:center;padding:28px 40px;z-index:5}
+.ovl.show{display:flex}
+.ovl h4{margin:0 0 4px;font-size:16px;color:var(--gold);letter-spacing:1px}
+.ovl .subt{font-size:12px;color:var(--muted);margin-bottom:18px;font-family:var(--mono)}
+.steps{display:flex;flex-direction:column;gap:9px}
+.step{display:flex;align-items:center;gap:11px;font-size:13.5px;color:var(--dim);transition:color .3s}
+.step .box{width:19px;height:19px;border:1.6px solid var(--line2);border-radius:5px;flex:none;display:flex;align-items:center;justify-content:center;font-size:12px;transition:all .3s}
+.step.doing{color:var(--cyan)} .step.doing .box{border-color:var(--cyan);box-shadow:0 0 10px rgba(76,201,240,.5)}
+.step.done{color:var(--text)} .step.done .box{border-color:var(--green);background:rgba(16,185,129,.15);color:var(--green)}
+.step.done .box::after{content:"✓"}
+.progbar{margin-top:20px;height:6px;border-radius:4px;background:#16213a;overflow:hidden}
+.progbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--red),var(--amber));transition:width .28s;border-radius:4px}
+
+/* stale ribbon */
+.stale-note{display:none;margin:10px 16px 0;padding:9px 14px;border:1px dashed rgba(197,48,48,.55);border-radius:10px;background:rgba(197,48,48,.09);color:#fca5a5;font-size:12.5px;font-weight:700;font-family:var(--sans)}
+.pane.jit.stale .stale-note{display:block}
+.pane.jit.stale .pane-body{opacity:.45}
+
+/* lower deck: metrics / cache / log */
+.deck{display:grid;grid-template-columns:1.25fr .8fr 1.1fr;gap:0;border-top:1px solid var(--line)}
+.deck>div{padding:16px 20px;border-right:1px solid var(--line)}
+.deck>div:last-child{border-right:0}
+.deck h5{margin:0 0 12px;font-size:12.5px;letter-spacing:2px;color:var(--dim);font-weight:800}
+.mgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
+.metric{border:1px solid var(--line);border-radius:11px;padding:9px 12px;background:rgba(13,21,36,.7);transition:all .25s}
+.metric b{display:block;font-size:21px;font-family:var(--mono);color:var(--cyan);line-height:1.25}
+.metric b.red{color:var(--red)} .metric b.green{color:var(--green)} .metric b.gold{color:var(--gold)}
+.metric span{font-size:11px;color:var(--muted)}
+.metric.bump{transform:scale(1.06);border-color:var(--cyan);box-shadow:0 0 18px rgba(76,201,240,.25)}
+.ibars{margin-top:14px}
+.ibar{margin-bottom:10px}
+.ibar .lab{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted);margin-bottom:4px}
+.ibar .lab b{font-family:var(--mono);color:var(--text)}
+.ibar .rail{height:14px;border-radius:7px;background:#121c30;overflow:hidden}
+.ibar .fill{height:100%;border-radius:7px;transition:width .6s cubic-bezier(.2,.8,.3,1)}
+.ibar.aot .fill{background:linear-gradient(90deg,#8f2430,#e05260);width:100%}
+.ibar.jit .fill{background:linear-gradient(90deg,#0e8f6a,#34d399)}
+.ibar .fill.none{width:0}
+.itable{width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono)}
+.itable th{color:var(--dim);text-align:left;font-weight:700;padding:4px 6px;border-bottom:1px solid var(--line);font-size:11px}
+.itable td{padding:5px 6px;border-bottom:1px solid rgba(29,42,66,.5);color:var(--muted)}
+.itable td.ok{color:#6ee7b7} .itable td.bad{color:#fca5a5;text-decoration:line-through}
+.itable .empty-row td{color:#3d4d68;font-style:italic;border:0}
+.logbox{height:218px;overflow-y:auto;background:#060a12;border:1px solid var(--line);border-radius:11px;padding:10px 13px;font-family:var(--mono);font-size:11.8px;line-height:1.8}
+.logbox div{white-space:pre-wrap;word-break:break-all}
+.l-hit{color:#6ee7b7}.l-miss{color:#fbbf24}.l-fb{color:#f87171}.l-ok{color:#4cc9f0}.l-info{color:#7a8db0}.l-warn{color:#fb923c}
+.logbox::-webkit-scrollbar,.pane-body::-webkit-scrollbar{width:8px}
+.logbox::-webkit-scrollbar-thumb,.pane-body::-webkit-scrollbar-thumb{background:#1d2a42;border-radius:4px}
+
+/* ---------- pipeline ---------- */
+.pipe-lane{border:1px solid var(--line);border-radius:18px;padding:24px 26px;background:var(--panel);margin-bottom:20px}
+.pipe-lane h4{margin:0 0 6px;font-size:17px;display:flex;align-items:center;gap:10px}
+.pipe-lane h4 .tag{font-size:11px;padding:3px 10px;border-radius:999px;font-weight:800;letter-spacing:1px}
+.pipe-lane.aot h4 .tag{background:rgba(197,48,48,.15);color:#fca5a5}
+.pipe-lane.rt h4 .tag{background:rgba(76,201,240,.15);color:#9ddcf7}
+.pipe-lane p{margin:0 0 18px;color:var(--muted);font-size:13.5px}
+.flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:0}
+.fnode{position:relative;flex:1;min-width:128px;border:1px solid var(--line2);border-radius:13px;background:linear-gradient(180deg,var(--panel2),#0c1322);padding:12px 12px 10px;text-align:center;margin-right:34px;transition:transform .2s,border-color .2s}
+.fnode:last-child{margin-right:0}
+.fnode:hover{transform:translateY(-4px);border-color:var(--cyan)}
+.fnode .fi{font-size:23px;margin-bottom:5px}
+.fnode b{display:block;font-size:13.5px;margin-bottom:3px}
+.fnode span{font-size:11px;color:var(--muted);line-height:1.5;display:block}
+.fnode:not(:last-child)::after{content:"➜";position:absolute;right:-27px;top:50%;transform:translateY(-50%);color:var(--red);font-size:16px;font-weight:900}
+.fnode.hot-n{border-color:rgba(245,197,66,.45)} .fnode.hot-n b{color:var(--gold)}
+.fnode::after{z-index:2}
+.branch-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+.branch-box{border-radius:13px;padding:13px 16px;font-size:12.8px;line-height:1.75}
+.branch-box.hit{border:1px solid rgba(16,185,129,.45);background:rgba(16,185,129,.07)}
+.branch-box.hit b{color:#6ee7b7}
+.branch-box.miss{border:1px solid rgba(251,191,36,.4);background:rgba(251,191,36,.06)}
+.branch-box.miss b{color:var(--amber)}
+.branch-box code{font-family:var(--mono);font-size:11.5px;color:var(--cyan)}
+.pipe-note{margin-top:14px;font-size:12.5px;color:var(--dim);border-top:1px dashed var(--line);padding-top:12px}
+.pipe-note b{color:var(--muted)}
+
+/* ---------- numbers ---------- */
+.num-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.ncard{border:1px solid var(--line);border-radius:16px;padding:22px 20px 18px;background:linear-gradient(180deg,var(--panel2),var(--panel));position:relative;overflow:hidden;transition:transform .22s,border-color .22s}
+.ncard:hover{transform:translateY(-4px);border-color:var(--line2)}
+.ncard .big{font-size:37px;font-weight:900;font-family:var(--mono);line-height:1.15;background:linear-gradient(90deg,#4cc9f0,#34d399);-webkit-background-clip:text;background-clip:text;color:transparent}
+.ncard .big .u{font-size:17px}
+.ncard.redg .big{background:linear-gradient(90deg,#ff6b6b,#f5c542);-webkit-background-clip:text;background-clip:text}
+.ncard h4{margin:7px 0 5px;font-size:14.5px}
+.ncard p{margin:0;font-size:12px;color:var(--muted);line-height:1.6}
+
+/* ---------- reliability ---------- */
+.rel-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px;align-items:stretch}
+.rel-timeline{border:1px solid var(--line);border-radius:18px;padding:26px;background:var(--panel)}
+.rel-steps{display:flex;flex-direction:column;gap:0}
+.rstep{display:flex;gap:16px;align-items:flex-start;position:relative;padding-bottom:22px}
+.rstep:last-child{padding-bottom:0}
+.rstep::before{content:"";position:absolute;left:15px;top:34px;bottom:2px;width:2px;background:linear-gradient(180deg,var(--line2),transparent)}
+.rstep:last-child::before{display:none}
+.rdot{width:32px;height:32px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-size:15px;border:1.6px solid var(--line2);background:var(--panel2);z-index:1}
+.rstep b{display:block;font-size:14.5px;margin-bottom:2px}
+.rstep span{font-size:12.5px;color:var(--muted)}
+.rstep .rapi{font-family:var(--mono);font-size:11.5px;color:var(--cyan);background:rgba(76,201,240,.08);padding:1px 7px;border-radius:5px;margin-left:6px}
+.rel-cards{display:flex;flex-direction:column;gap:14px}
+.rcard{border:1px solid var(--line);border-left:4px solid var(--green);border-radius:13px;padding:16px 18px;background:linear-gradient(180deg,var(--panel2),var(--panel));flex:1}
+.rcard b{font-size:15px;display:flex;align-items:center;gap:8px}
+.rcard p{margin:6px 0 0;font-size:13px;color:var(--muted)}
+.rcard.a{border-left-color:var(--amber)} .rcard.b{border-left-color:var(--cyan)} .rcard.c{border-left-color:var(--purple)}
+
+/* ---------- footer ---------- */
+footer{margin-top:80px;border-top:1px solid var(--line);padding:36px 26px 44px;text-align:center;color:var(--dim);font-size:13px;background:rgba(7,11,20,.6)}
+footer .fline{max-width:900px;margin:0 auto 10px;line-height:1.9}
+footer b{color:var(--muted)}
+footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#ff6b6b,#f5c542);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:10px;letter-spacing:2px}
+
+@media(max-width:1080px){
+  .story-grid,.num-grid{grid-template-columns:repeat(2,1fr)}
+  .demo-grid{grid-template-columns:1fr}
+  .pane{border-right:0;border-bottom:1px solid var(--line)}
+  .deck{grid-template-columns:1fr}
+  .deck>div{border-right:0;border-bottom:1px solid var(--line)}
+  .rel-grid{grid-template-columns:1fr}
+  nav .links{display:none}
+}
+@media(max-width:640px){.story-grid,.num-grid{grid-template-columns:1fr}.branch-row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="orb a"></div><div class="orb b"></div>
+
+<nav>
+  <div class="logo">⚡ EJIT</div>
+  <div class="links">
+    <a href="#story">三分钟看懂</a>
+    <a href="#demo">现场演示</a>
+    <a href="#how">工作原理</a>
+    <a href="#numbers">硬核数字</a>
+    <a href="#safety">安全可靠</a>
+  </div>
+</nav>
+
+<!-- ================= HERO ================= -->
+<header class="hero" id="top">
+  <div class="hero-inner">
+    <div class="badge">基于 <b>LLVM / Clang / OrcJIT</b> 全栈深度定制 · 面向 BiSheng Embedded CPU</div>
+    <h1>EJIT</h1>
+    <p class="sub">EmbeddedJIT · 时间窗特化编译</p>
+    <p class="tagline">
+      把<b>「运行期才确定」的设备配置</b>，变成<b>「编译期」的机器码常量</b>
+      <span class="line2">同一份代码，在设备上自动进化为当前配置下的最优形态 —— 分支消失 · 访存归零 · 越用越快</span>
+    </p>
+    <div class="chips">
+      <div class="chip"><b><span data-count="20.2">0</span><span class="u"> ns</span></b><span>热路径缓存命中 · AArch64 实测</span></div>
+      <div class="chip"><b><span data-count="0">0</span><span class="u"> 崩溃</span></b><span>所有 JIT 失败 100% 回退 AOT</span></div>
+      <div class="chip"><b><span data-count="100">0</span><span class="u"> KB</span></b><span>级内存即可部署 · 裸核可用</span></div>
+    </div>
+    <a class="cta" href="#demo">▶ 现场演示 · 亲眼看分支消失</a>
+    <div class="scroll-hint">▼ 向下滚动</div>
+  </div>
+</header>
+
+<!-- ================= STORY ================= -->
+<section id="story">
+  <div class="sec-head"><span class="sec-num">01</span><h2>三分钟看懂 <span class="hl">EJIT</span></h2></div>
+  <p class="sec-sub">嵌入式性能优化的经典困局、一个被忽视的洞察、以及它的工程化解法。</p>
+  <div class="story-grid">
+    <div class="scard s1">
+      <div class="ghost">?</div>
+      <div class="icon">🧱</div>
+      <h3>困局：AOT 只能「面向所有可能」编译</h3>
+      <p>小区制式、波束数、切片类型……这些配置要到<b>运行期</b>才确定。AOT 编译器只能假设一切都会变：全部分支保留、全部配置访存保留、全部循环按最坏情况生成。通用代码被迫背着「所有可能性」在跑。</p>
+      <div class="foot">→ 热点函数里大量指令在做「永远不会有答案的判断」</div>
+    </div>
+    <div class="scard s2">
+      <div class="ghost">❄</div>
+      <div class="icon">💡</div>
+      <h3>洞察：配置在「时间窗」内不变</h3>
+      <p>业务逻辑天然保证：两次配置变更之间，<kbd class="code-tag">cellType</kbd>、<kbd class="code-tag">beamCount</kbd> 等参数<b>长期稳定</b>。这段稳定期，就是可以把运行时数据当作编译期常量的<b>黄金窗口</b>。</p>
+      <div class="foot">→ 业务保证的不变性 = 编译器拿不到的免费信息</div>
+    </div>
+    <div class="scard s3">
+      <div class="ghost">⚡</div>
+      <div class="icon">⚡</div>
+      <h3>方案：窗口内 JIT 特化，窗口外安全回退</h3>
+      <p>用户用 3 个注解声明「谁是窗口常量」。EJIT 在运行时把窗口常量<b>焊进机器码</b>：常量折叠、死分支消除、访存变立即数、内联展开。窗口失效自动作废缓存、回退 AOT，<b>绝不崩溃</b>。</p>
+      <div class="foot">→ 语义 100% 等价，只是把「不可能的路径」物理删除</div>
+    </div>
+  </div>
+
+  <div class="tl-wrap">
+    <div class="tl-title">时间窗示意 —— 业务时间轴上的「常量冻结期」</div>
+    <div class="timeline">
+      <div class="bar"></div>
+      <div class="evt" style="left:8%"><i></i><span>配置变更</span></div>
+      <div class="frozen" style="left:20%">❄</div><div class="frozen" style="left:38%">❄</div><div class="frozen" style="left:52%">❄</div>
+      <div class="flabel" style="left:22%;top:-14px">时间窗内：数据即常量 → JIT 特化</div>
+      <div class="flabel" style="left:22%">分支消失 · 访存归零 · 代码贴着业务长</div>
+      <div class="evt ok" style="left:60%"><i></i><span>配置变更</span></div>
+      <div class="frozen" style="left:70%">❄</div><div class="frozen" style="left:86%">❄</div>
+      <div class="flabel" style="left:72%;top:-14px">新窗口 → 重新特化</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= DEMO ================= -->
+<section id="demo">
+  <div class="sec-head"><span class="sec-num">02</span><h2>现场演示 · <span class="hl">亲眼看分支消失</span></h2></div>
+  <p class="sec-sub">下面是真实的基站场景（取自 EJIT 集成测试 <b>ejit_complex_test.c</b> 的简化版）。左侧是 AOT 编译出的通用代码；右侧会随你的操作<b>实时长出 JIT 特化代码</b>。点击「一键演示」可自动播放完整生命周期。</p>
+
+  <div class="demo-shell">
+    <!-- control bar -->
+    <div class="demo-bar">
+      <div class="ctl-group">
+        <span class="ctl-label">小区</span>
+        <div class="seg" id="segCell">
+          <button data-c="0" class="on">Cell 0<small>FDD n78</small></button>
+          <button data-c="1">Cell 1<small>TDD n41</small></button>
+          <button data-c="2">Cell 2<small>FDD n3</small></button>
+          <button data-c="3">Cell 3<small>TDD n28</small></button>
+        </div>
+      </div>
+      <div class="ctl-group">
+        <span class="ctl-label">TRP</span>
+        <div class="seg" id="segTrp">
+          <button data-t="0" class="on">TRP 0<small>BF · 64波束</small></button>
+          <button data-t="1">TRP 1<small>传统 · 32波束</small></button>
+        </div>
+      </div>
+      <div class="ctl-group">
+        <span class="ctl-label">编译</span>
+        <div class="seg" id="segMode">
+          <button data-m="sync" class="on">同步</button>
+          <button data-m="async">异步</button>
+        </div>
+      </div>
+      <div class="ctl-group">
+        <button class="btn act" id="btnAct">⚡ activate 时间窗</button>
+        <button class="btn deact" id="btnDeact">⛔ deactivate</button>
+      </div>
+      <div class="ctl-group">
+        <button class="btn call" id="btnCall">▶ 调用 process_cell</button>
+        <button class="btn ghostb" id="btnCall50">×50 连发</button>
+      </div>
+      <div class="ctl-group">
+        <button class="btn auto" id="btnAuto">🎬 一键演示</button>
+        <button class="btn ghostb" id="btnReset">重置</button>
+      </div>
+      <div class="status-pills">
+        <span class="pill off" id="pillPeriod"><span class="dot"></span>时间窗未激活</span>
+        <span class="pill res" id="pillRes">上次调用：—</span>
+      </div>
+    </div>
+
+    <!-- code panes -->
+    <div class="demo-grid">
+      <div class="pane aot">
+        <div class="pane-head"><span class="t1">📘 AOT 通用代码（编译期产物）</span><span class="t2">所有分支都保留</span></div>
+        <div class="pane-body" id="aotBody">
+<div class="cl"><span class="ln">1</span><span class="cd"><span class="kw">struct</span> <span class="ty">CellConfig</span> <span class="punc">{</span></span></div>
+<div class="cl"><span class="ln">2</span><span class="cd">    <span class="attr">ejit_may_const</span> <span class="ty">uint32_t</span> cellType<span class="punc">;</span>   <span class="cmt">// ← 时间窗内可视为常量</span></span></div>
+<div class="cl"><span class="ln">3</span><span class="cd">    <span class="attr">ejit_may_const</span> <span class="ty">uint32_t</span> freqBand<span class="punc">;</span></span></div>
+<div class="cl"><span class="ln">4</span><span class="cd">    <span class="ty">uint32_t</span> trafficLoad<span class="punc">;</span>              <span class="cmt">// 普通可变字段，不特化</span></span></div>
+<div class="cl"><span class="ln">5</span><span class="cd"><span class="punc">}</span><span class="punc">;</span></span></div>
+<div class="cl"><span class="ln">6</span><span class="cd"> </span></div>
+<div class="cl"><span class="ln">7</span><span class="cd"><span class="attr">ejit_period_arr(cell)</span> <span class="kw">struct</span> <span class="ty">CellConfig</span> g_cellCfg<span class="punc">[</span><span class="num">4</span><span class="punc">]</span><span class="punc">;</span>  <span class="cmt">// ← 声明时间窗</span></span></div>
+<div class="cl"><span class="ln">8</span><span class="cd"><span class="attr">ejit_period_arr(trp)</span>  <span class="kw">struct</span> <span class="ty">TrpConfig</span>  g_trpCfg<span class="punc">[</span><span class="num">2</span><span class="punc">]</span><span class="punc">;</span></span></div>
+<div class="cl"><span class="ln">9</span><span class="cd"> </span></div>
+<div class="cl"><span class="ln">10</span><span class="cd"><span class="attr">ejit_entry</span>                                   <span class="cmt">// ← 标记 JIT 热点函数</span></span></div>
+<div class="cl"><span class="ln">11</span><span class="cd"><span class="ty">int</span> <span class="fn">process_cell</span><span class="punc">(</span><span class="attr">ejit_period_arr_ind(cell)</span> <span class="ty">uint8_t</span> cellIdx<span class="punc">,</span></span></div>
+<div class="cl"><span class="ln">12</span><span class="cd">                 <span class="attr">ejit_period_arr_ind(trp)</span>  <span class="ty">uint8_t</span> trpIdx<span class="punc">)</span></span></div>
+<div class="cl"><span class="ln">13</span><span class="cd"><span class="punc">{</span></span></div>
+<div class="cl"><span class="ln">14</span><span class="cd">    <span class="ty">int</span> r <span class="op">=</span> <span class="num">0</span><span class="punc">;</span></span></div>
+<div class="cl"><span class="ln">15</span><span class="cd"> </span></div>
+<div class="cl" id="br1"><span class="ln">16</span><span class="cd">    <span class="kw">if</span> <span class="punc">(</span>g_cellCfg<span class="punc">[</span>cellIdx<span class="punc">]</span><span class="punc">.</span>cellType <span class="op">==</span> <span class="num">0xFD</span><span class="punc">)</span>      <span class="cmt">// FDD 小区？</span><span class="note"></span></span></div>
+<div class="cl" id="p-fdd"><span class="ln">17</span><span class="cd">        r <span class="op">+=</span> <span class="fn">fdd_proc</span><span class="punc">(</span>g_cellCfg<span class="punc">[</span>cellIdx<span class="punc">]</span><span class="punc">.</span>freqBand<span class="punc">)</span><span class="punc">;</span></span></div>
+<div class="cl" id="p-tdd"><span class="ln">18</span><span class="cd">    <span class="kw">else</span>                                          <span class="cmt">// TDD 小区</span></span></div>
+<div class="cl" id="p-tdd2"><span class="ln">19</span><span class="cd">        r <span class="op">+=</span> <span class="fn">tdd_proc</span><span class="punc">(</span>g_cellCfg<span class="punc">[</span>cellIdx<span class="punc">]</span><span class="punc">.</span>freqBand<span class="punc">)</span><span class="punc">;</span></span></div>
+<div class="cl"><span class="ln">20</span><span class="cd"> </span></div>
+<div class="cl" id="br2"><span class="ln">21</span><span class="cd">    <span class="kw">if</span> <span class="punc">(</span>g_trpCfg<span class="punc">[</span>trpIdx<span class="punc">]</span><span class="punc">.</span>trpType <span class="op">==</span> <span class="num">1</span><span class="punc">)</span>            <span class="cmt">// Massive MIMO？</span><span class="note"></span></span></div>
+<div class="cl" id="p-bf"><span class="ln">22</span><span class="cd">        r <span class="op">+=</span> <span class="fn">bf_proc</span><span class="punc">(</span>g_trpCfg<span class="punc">[</span>trpIdx<span class="punc">]</span><span class="punc">.</span>beamCount<span class="punc">)</span><span class="punc">;</span></span></div>
+<div class="cl" id="p-leg"><span class="ln">23</span><span class="cd">    <span class="kw">else</span></span></div>
+<div class="cl" id="p-leg2"><span class="ln">24</span><span class="cd">        r <span class="op">+=</span> <span class="fn">legacy_proc</span><span class="punc">(</span><span class="punc">)</span><span class="punc">;</span></span></div>
+<div class="cl"><span class="ln">25</span><span class="cd"> </span></div>
+<div class="cl"><span class="ln">26</span><span class="cd">    <span class="kw">return</span> r<span class="punc">;</span></span></div>
+<div class="cl"><span class="ln">27</span><span class="cd"><span class="punc">}</span></span></div>
+        </div>
+      </div>
+
+      <div class="pane jit" id="jitPane">
+        <div class="pane-head"><span class="t1">🔥 JIT 特化代码（运行时生成）</span><span class="t2">窗口常量已焊入</span></div>
+        <div class="stale-note">⛔ 时间窗已失效 · 缓存作废 —— 此特化代码不再被执行，安全回退 AOT</div>
+        <div class="pane-body" id="jitBody">
+          <div class="empty"><div class="big">🧬</div>激活时间窗并调用一次后<br>这里会长出该配置组合专属的特化机器码</div>
+        </div>
+        <div class="ovl" id="ovl">
+          <h4>⚙ JIT 编译中 …</h4>
+          <div class="subt" id="ovlKey">key = (process_cell, cell=0, trp=0)</div>
+          <div class="steps" id="steps">
+            <div class="step"><span class="box"></span>加载嵌入的 bitcode（按需，首个调用触发）</div>
+            <div class="step"><span class="box"></span>维度参数常量化：cellIdx=0, trpIdx=0</div>
+            <div class="step"><span class="box"></span>InstCombine · 常量链折叠</div>
+            <div class="step"><span class="box"></span>Inline · 展开被调函数</div>
+            <div class="step"><span class="box"></span>EJitStructFieldPass · may_const 访存 → 常量</div>
+            <div class="step"><span class="box"></span>SCCP / DCE / CFG 简化 · 死分支物理删除</div>
+            <div class="step"><span class="box"></span>JITLink 生成机器码 → 发布缓存</div>
+          </div>
+          <div class="progbar"><i id="progFill"></i></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- deck -->
+    <div class="deck">
+      <div>
+        <h5>运行指标</h5>
+        <div class="mgrid">
+          <div class="metric" id="m-calls-b"><b id="m-calls">0</b><span>总调用</span></div>
+          <div class="metric" id="m-hits-b"><b id="m-hits" class="green">0</b><span>缓存命中</span></div>
+          <div class="metric" id="m-fb-b"><b id="m-fb" class="red">0</b><span>AOT fallback</span></div>
+          <div class="metric"><b id="m-spec" class="cyan">0</b><span>特化执行</span></div>
+          <div class="metric"><b id="m-br" class="gold">0</b><span>累计消除分支</span></div>
+          <div class="metric"><b id="m-ld" class="gold">0</b><span>累计消除访存</span></div>
+        </div>
+        <div class="ibars">
+          <div class="ibar aot"><div class="lab"><span>AOT 通用路径（示意）</span><b>~24 条指令/次</b></div><div class="rail"><div class="fill" id="barAot"></div></div></div>
+          <div class="ibar jit"><div class="lab"><span>JIT 特化路径（示意）</span><b id="barJitLab">— 条指令/次</b></div><div class="rail"><div class="fill none" id="barJit"></div></div></div>
+        </div>
+      </div>
+      <div>
+        <h5>代码缓存（taskpool bucket cache）</h5>
+        <table class="itable">
+          <thead><tr><th>cacheKey</th><th>函数指针</th><th>状态</th></tr></thead>
+          <tbody id="cacheBody"><tr class="empty-row"><td colspan="3">empty — 尚无特化版本</td></tr></tbody>
+        </table>
+      </div>
+      <div>
+        <h5>运行日志</h5>
+        <div class="logbox" id="log"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= HOW ================= -->
+<section id="how">
+  <div class="sec-head"><span class="sec-num">03</span><h2>工作原理 · <span class="hl">从源码到特化机器码</span></h2></div>
+  <p class="sec-sub">两个阶段：编译期把「特化所需的原料」提前埋进固件；运行期按需现场制造。全程复用 LLVM 成熟基础设施，自研部分精准聚焦在时间窗语义。</p>
+
+  <div class="pipe-lane aot">
+    <h4><span class="tag">阶段一 · AOT 编译期</span> 提前埋好原料</h4>
+    <p>Clang 属性 → IR 元数据，5 个自研 Pass 在标准优化前后完成 bitcode 提取与 wrapper 插桩，产物与普通固件完全兼容。</p>
+    <div class="flow">
+      <div class="fnode"><div class="fi">📝</div><b>用户代码</b><span>6 个 ejit_* 注解<br>声明时间窗与常量</span></div>
+      <div class="fnode"><div class="fi">clang</div><b>Clang 前端</b><span>属性 → IR 元数据<br>!ejit.may_const 等</span></div>
+      <div class="fnode"><div class="fi">🧩</div><b>PASS 1–5</b><span>提取原始 bitcode<br>生成 wrapper 插桩<br>注册时间窗符号</span></div>
+      <div class="fnode"><div class="fi">🚀</div><b>O2 / O3</b><span>标准优化管线<br>（fallback 路径同样受益）</span></div>
+      <div class="fnode hot-n"><div class="fi">📦</div><b>固件产物</b><span>AOT 机器码<br>+ 嵌入 bitcode<br>+ wrapper 入口</span></div>
+    </div>
+  </div>
+
+  <div class="pipe-lane rt">
+    <h4><span class="tag">阶段二 · 运行期</span> 按需现场特化</h4>
+    <p>用户调用原函数名，实际先进入编译期埋好的 wrapper。每次调用只多付一次 ~20ns 的缓存查询；未命中才走编译，编译完永久缓存。</p>
+    <div class="flow">
+      <div class="fnode"><div class="fi">📞</div><b>业务调用</b><span>process_cell(0,0)<br>与普通函数无差别</span></div>
+      <div class="fnode"><div class="fi">🔀</div><b>Wrapper</b><span>构建 cacheKey<br>(funcIdx + 维度值)</span></div>
+      <div class="fnode hot-n"><div class="fi">⚡</div><b>缓存查询</b><span>20.2 ns 实测命中<br>无锁 · read-token 并发安全</span></div>
+      <div class="fnode"><div class="fi">🧬</div><b>特化机器码</b><span>常量焊入 · 分支消失<br>直接跳转执行</span></div>
+    </div>
+    <div class="branch-row">
+      <div class="branch-box miss"><b>✗ 缓存未命中 → JIT 编译（同步阻塞 / 异步后台 worker）</b><br>加载 bitcode → 维度常量化 → InstCombine → Inline → <code>EJitStructFieldPass</code>（访存→常量）→ SCCP/DCE/CFG → JITLink → 发布缓存。首次延迟 &lt; 100ms，L1/L2/L3 优化等级可配。</div>
+      <div class="branch-box hit"><b>✓ 任一环节失败 → AOT 原函数兜底</b><br>bitcode 损坏 / 内存不足 / 越界 / 编译异常……全部记录日志后回退 AOT 原函数体。<b>零崩溃，语义与原代码 100% 一致。</b></div>
+    </div>
+    <div class="pipe-note">💡 <b>规模上限（SPEC 约束）：</b>单函数最多 4 个特化维度 · 全局最多 1024 个时间窗数组 · 同/异步编译模式与优化等级均运行时可配；另支持 wrapper 内联缓存进一步摊薄查询开销。</div>
+  </div>
+</section>
+
+<!-- ================= NUMBERS ================= -->
+<section id="numbers">
+  <div class="sec-head"><span class="sec-num">04</span><h2>硬核数字 <span class="hl">· 全部实测</span></h2></div>
+  <p class="sec-sub">数据来自 AArch64 <span style="font-family:var(--mono)">-Os</span> 产线的 perf 实测（EJIT_CACHE_QUERY_PERF.md）与 SPEC4 设计规格，非营销口径。</p>
+  <div class="num-grid">
+    <div class="ncard"><div class="big">20.2<span class="u">ns</span></div><h4>热路径缓存命中</h4><p>AArch64 实测（token 模式 0 维），含 wrapper 全部开销</p></div>
+    <div class="ncard"><div class="big">9.0<span class="u">ns</span></div><h4>NO_RECLAIM 配置命中</h4><p>seqlock 优化后 2.0–2.3× 提速，生产默认可开</p></div>
+    <div class="ncard"><div class="big">&lt;100<span class="u">ms</span></div><h4>首次 JIT 编译延迟</h4><p>软实时可容忍；异步模式可完全无感（后台 worker 编译）</p></div>
+    <div class="ncard"><div class="big">512<span class="u">KB</span></div><h4>默认代码缓存上限</h4><p>slab 码池 · 嵌入式友好，容量按设备内存可配</p></div>
+    <div class="ncard redg"><div class="big">0</div><h4>因 JIT 失败导致的崩溃</h4><p>所有异常路径 100% 回退 AOT —— 原则写进 SPEC 第 8 章</p></div>
+    <div class="ncard"><div class="big">6</div><h4>用户注解属性</h4><p>may_const / period / period_arr / entry / arr_ind / period_lc，零 DSL 零代码重写</p></div>
+    <div class="ncard"><div class="big">5+1</div><h4>自研编译 Pass</h4><p>5 个 AOT Pass + 1 个 JIT 特化 Pass；在线 PGO / 值画像持续演进中</p></div>
+    <div class="ncard"><div class="big">100KB<span class="u">–2MB</span></div><h4>目标设备 RAM</h4><p>SRE 裸核可部署 · 无文件系统 · BiSheng Embedded CPU</p></div>
+  </div>
+</section>
+
+<!-- ================= SAFETY ================= -->
+<section id="safety">
+  <div class="sec-head"><span class="sec-num">05</span><h2>安全可靠 · <span class="hl">永远有退路</span></h2></div>
+  <p class="sec-sub">给生产网元上 JIT，第一问永远是「出错怎么办」。EJIT 的答案：每一步都有退路，且退路就是原代码。</p>
+  <div class="rel-grid">
+    <div class="rel-timeline">
+      <div class="rel-steps">
+        <div class="rstep"><div class="rdot">⚡</div><div><b>配置变更前 <span class="rapi">ejit_activate("cell", idx)</span></b><span>业务声明时间窗生效，该小区配置进入「冻结期」，JIT 允许特化。</span></div></div>
+        <div class="rstep"><div class="rdot">🧬</div><div><b>冻结期内 · 特化执行</b><span>缓存命中 → 执行特化机器码（20ns 查询 + 更精简的函数体）。</span></div></div>
+        <div class="rstep"><div class="rdot">🛠</div><div><b>要改配置 <span class="rapi">ejit_period_lc 函数入口自动插桩</span></b><span>编译器已自动在生命周期函数入口插入 deactivate、出口插入 activate —— 用户想忘记都难。</span></div></div>
+        <div class="rstep"><div class="rdot">⛔</div><div><b>窗口失效 · 缓存作废</b><span>deactivate 瞬间，依赖该窗口的所有缓存条目标记 invalid，不再被任何线程执行。</span></div></div>
+        <div class="rstep"><div class="rdot">🛡</div><div><b>回退 AOT · 绝不崩溃</b><span>后续调用自动走 AOT 原函数体；重新 activate 后按需再次特化。全流程无需重启、无需运维介入。</span></div></div>
+      </div>
+    </div>
+    <div class="rel-cards">
+      <div class="rcard a"><b>🧷 软标注设计</b><p><kbd class="code-tag">!ejit.may_const</kbd> 是「优化机会」而非「正确性依赖」—— 元数据意外丢失时，EJIT 只放弃一次特化，代码结果不变。</p></div>
+      <div class="rcard b"><b>🧵 并发安全</b><p>taskpool 固定 bucket + read-token 协议 + 无锁共享缓存，多核并发调用已验证；被作废的特化码等所有在执行线程退出后自动回收。</p></div>
+      <div class="rcard c"><b>🧪 防呆体系</b><p>归属冲突（错误级阻断）、未声明生命周期的配置修改（警告）、依赖与实际使用交叉校验 —— 把误用拦在编译期。</p></div>
+      <div class="rcard"><b>✅ 回归一致</b><p>30+ 集成测试覆盖多维/多数组/嵌套结构体/多生命周期场景，全部断言 JIT 结果与 AOT 参考逐位一致。</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="fbrand">⚡ EJIT · EmbeddedJIT</div>
+  <div class="fline"><b>技术底座</b>：LLVM monorepo 深度定制 —— Clang 属性（6）· AOT Pass（5）· OrcJIT + JITLink 运行时 · EJitStructFieldPass 特化引擎<br>
+  <b>目标平台</b>：BiSheng Embedded CPU（AArch64）· SRE 裸核 · RAM 100KB–2MB &nbsp;&nbsp;|&nbsp;&nbsp; <b>分支</b>：ejit_dev_spec4</div>
+  <div class="fline" style="opacity:.65">单文件离线演示页 · 数据来源：SPEC4.md / PLAN4.md / EJIT_CACHE_QUERY_PERF.md（AArch64 实测）· 生成于 2026-08</div>
+</footer>
+
+<script>
+"use strict";
+/* ================= data ================= */
+var CFG = {
+  cells: [
+    {cellType: 0xFD, freqBand: 78},
+    {cellType: 0xEC, freqBand: 41},
+    {cellType: 0xFD, freqBand: 3},
+    {cellType: 0xEC, freqBand: 28}
+  ],
+  trps: [
+    {trpType: 1, beamCount: 64},
+    {trpType: 2, beamCount: 32}
+  ]
+};
+var AOT_INSNS = 24, JIT_INSNS = 10;   /* 示意口径：含寻址与调用开销 */
+
+var state = {
+  cellIdx: 0, trpIdx: 0, mode: "sync",
+  active: false, busy: false, autoRunning: false,
+  cache: new Map(), addrSeq: 0,
+  stats: {calls:0, hits:0, miss:0, spec:0, fb:0, br:0, ld:0}
+};
+
+/* ================= helpers ================= */
+function $(id){ return document.getElementById(id); }
+function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function key(c, t){ return "cell="+c+",trp="+t; }
+function nextAddr(){ state.addrSeq++; return "0x2A1" + (0x000 + state.addrSeq*0x40).toString(16).toUpperCase().padStart(4,"0"); }
+
+function log(msg, cls){
+  var box = $("log");
+  var d = document.createElement("div");
+  d.className = "l-" + (cls || "info");
+  d.textContent = msg;
+  box.appendChild(d);
+  while (box.children.length > 60) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+function setResPill(text, cls){
+  var p = $("pillRes");
+  p.textContent = "上次调用：" + text;
+  p.style.borderColor = cls === "hit" ? "rgba(16,185,129,.5)" : cls === "fb" ? "rgba(197,48,48,.5)" : "rgba(251,191,36,.5)";
+  p.style.color = cls === "hit" ? "#6ee7b7" : cls === "fb" ? "#fca5a5" : "#fcd34d";
+}
+
+function bump(id){
+  var el = $(id).parentElement;
+  el.classList.add("bump");
+  setTimeout(function(){ el.classList.remove("bump"); }, 320);
+}
+
+function updateMetrics(){
+  $("m-calls").textContent = state.stats.calls;
+  $("m-hits").textContent  = state.stats.hits;
+  $("m-fb").textContent    = state.stats.fb;
+  $("m-spec").textContent  = state.stats.spec;
+  $("m-br").textContent    = state.stats.br;
+  $("m-ld").textContent    = state.stats.ld;
+  if (state.stats.spec > 0){
+    $("barJit").classList.remove("none");
+    $("barJit").style.width = (JIT_INSNS / AOT_INSNS * 100) + "%";
+    $("barJitLab").textContent = "~" + JIT_INSNS + " 条指令/次";
+    $("barAot").style.width = "100%";
+  }
+}
+
+function updatePeriodPill(){
+  var p = $("pillPeriod");
+  if (state.active){ p.className = "pill on"; p.innerHTML = '<span class="dot"></span>时间窗 ACTIVE'; }
+  else { p.className = "pill off"; p.innerHTML = '<span class="dot"></span>时间窗未激活'; }
+}
+
+/* ================= AOT pane effects ================= */
+function clearCodeEffects(){
+  ["br1","br2","p-fdd","p-tdd","p-tdd2","p-bf","p-leg","p-leg2"].forEach(function(id){
+    var el = $(id); if (!el) return;
+    el.classList.remove("dead","hot","folded");
+    var n = el.querySelector(".note"); if (n) n.textContent = "";
+  });
+}
+function applyAotEffects(c, t){
+  clearCodeEffects();
+  var cell = CFG.cells[c], trp = CFG.trps[t];
+  var fdd = cell.cellType === 0xFD;
+  $("br1").classList.add("folded");
+  $("br1").querySelector(".note").textContent = "⟶ 0x" + cell.cellType.toString(16).toUpperCase() + " 已知 → " + (fdd ? "true" : "false");
+  (fdd ? $("p-fdd") : $("p-tdd2")).classList.add("hot");
+  (fdd ? $("p-tdd2") : $("p-fdd")).classList.add("dead");
+  $("p-tdd").classList.toggle("dead", fdd);
+  $("p-tdd").classList.toggle("hot", !fdd);
+
+  var bf = trp.trpType === 1;
+  $("br2").classList.add("folded");
+  $("br2").querySelector(".note").textContent = "⟶ trpType=" + trp.trpType + " 已知 → " + (bf ? "true" : "false");
+  (bf ? $("p-bf") : $("p-leg2")).classList.add("hot");
+  (bf ? $("p-leg2") : $("p-bf")).classList.add("dead");
+  $("p-leg").classList.toggle("dead", bf);
+  $("p-leg").classList.toggle("hot", !bf);
+}
+
+/* ================= JIT pane ================= */
+function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+function renderSpec(c, t, animate){
+  var cell = CFG.cells[c], trp = CFG.trps[t];
+  var fdd = cell.cellType === 0xFD, bf = trp.trpType === 1;
+  var body = $("jitBody");
+  var lines = [];
+  function L(html, cls){ lines.push('<div class="cl' + (animate ? ' newln' : '') + '"><span class="ln"></span><span class="cd" style="padding-left:2px">' + html + '</span></div>'); }
+  L('<span class="cmt">// process_cell 特化版 · cacheKey = (cell=' + c + ', trp=' + t + ')</span>');
+  L('<span class="cmt">// 窗口常量已焊入：cellType=0x' + cell.cellType.toString(16).toUpperCase() +
+    ' freqBand=' + cell.freqBand + ' · trpType=' + trp.trpType + ' beamCount=' + trp.beamCount + '</span>');
+  L(' ');
+  L('<span class="cmt">// ✂ 2 个分支消失 · 4 次配置访存 → 立即数</span>');
+  L('<span class="kw">int</span> <span class="fn">process_cell$' + c + '_' + t + '</span><span class="punc">(</span><span class="ty">uint8_t</span> cellIdx<span class="punc">,</span> <span class="ty">uint8_t</span> trpIdx<span class="punc">)</span>');
+  L('<span class="punc">{</span>');
+  L('    <span class="kw">return</span> <span class="fn">' + (fdd ? "fdd_proc" : "tdd_proc") + '</span><span class="punc">(</span><span class="num">' + cell.freqBand + '</span><span class="punc">)</span>' +
+    ' <span class="op">+</span> <span class="fn">' + (bf ? "bf_proc" : "legacy_proc") + '</span><span class="punc">(</span>' +
+    (bf ? '<span class="num">' + trp.beamCount + '</span>' : '') + '<span class="punc">)</span><span class="punc">;</span>');
+  L('<span class="punc">}</span>');
+  L(' ');
+  L('<span class="cmt">// 同一函数，按 (小区, TRP) 组合各存一份 —— 最多 4 维 × 1024 实例</span>');
+  body.innerHTML = lines.join("");
+  if (animate){
+    var rows = body.querySelectorAll(".cl");
+    rows.forEach(function(r, i){ r.style.animationDelay = (i * 90) + "ms"; });
+  }
+  $("jitPane").classList.remove("stale");
+}
+
+/* ================= cache table ================= */
+function renderCache(){
+  var tb = $("cacheBody");
+  if (state.cache.size === 0){
+    tb.innerHTML = '<tr class="empty-row"><td colspan="3">empty — 尚无特化版本</td></tr>';
+    return;
+  }
+  var html = "";
+  state.cache.forEach(function(e, k){
+    html += "<tr><td>" + k + "</td><td>" + e.addr + "</td>" +
+      '<td class="' + (e.valid ? "ok" : "bad") + '">' + (e.valid ? "有效" : "已作废") + "</td></tr>";
+  });
+  tb.innerHTML = html;
+}
+
+/* ================= compile ================= */
+function setBusy(b){
+  state.busy = b;
+  ["btnCall","btnCall50","btnAuto","btnAct","btnDeact","btnReset"].forEach(function(id){ $(id).disabled = b; });
+}
+async function compile(c, t){
+  setBusy(true);
+  $("ovlKey").textContent = "cacheKey = (process_cell, cell=" + c + ", trp=" + t + ")";
+  var ovl = $("ovl"); ovl.classList.add("show");
+  var steps = $("steps").children;
+  for (var i = 0; i < steps.length; i++) steps[i].className = "step";
+  $("progFill").style.width = "0%";
+  await sleep(250);
+  for (var j = 0; j < steps.length; j++){
+    steps[j].classList.add("doing");
+    $("progFill").style.width = Math.round((j + 1) / steps.length * 100) + "%";
+    await sleep(300);
+    steps[j].classList.remove("doing");
+    steps[j].classList.add("done");
+  }
+  await sleep(180);
+  var k = key(c, t);
+  state.cache.set(k, {addr: nextAddr(), valid: true});
+  renderCache();
+  renderSpec(c, t, true);
+  applyAotEffects(c, t);
+  ovl.classList.remove("show");
+  setBusy(false);
+  return k;
+}
+
+/* ================= core call ================= */
+async function doCall(quiet){
+  if (state.busy) return;
+  state.stats.calls++;
+  var c = state.cellIdx, t = state.trpIdx, k = key(c, t);
+  var entry = state.cache.get(k);
+
+  if (!state.active){
+    state.stats.fb++;
+    if (!quiet) log("✗ 调用 #" + state.stats.calls + " · 时间窗未激活 → wrapper 返回 NULL → AOT 原函数兜底", "fb");
+    setResPill("⛔ FALLBACK → AOT", "fb"); bump("m-fb");
+    updateMetrics(); return;
+  }
+  if (entry && entry.valid){
+    state.stats.hits++; state.stats.spec++;
+    state.stats.br += 2; state.stats.ld += 4;
+    if (!quiet) log("⚡ 调用 #" + state.stats.calls + " · cache HIT (20ns) → 执行特化码 " + k, "hit");
+    setResPill("⚡ HIT → 特化码 20ns", "hit"); bump("m-hits");
+    renderSpec(c, t, false); applyAotEffects(c, t);
+    updateMetrics(); return;
+  }
+  /* miss */
+  state.stats.miss++;
+  if (state.mode === "sync"){
+    if (!quiet) log("… 调用 #" + state.stats.calls + " · cache MISS → 同步 JIT 编译 " + k + "（<100ms）", "miss");
+    setResPill("… MISS → 同步编译中", "miss");
+    await compile(c, t);
+    state.stats.hits++; state.stats.spec++; state.stats.br += 2; state.stats.ld += 4;
+    if (!quiet) log("✓ 编译完成并发布缓存 → 本次调用即执行特化码", "ok");
+    setResPill("⚡ 编译完成 → 特化码", "hit"); bump("m-hits");
+    updateMetrics();
+  } else {
+    state.stats.fb++;
+    if (!quiet) log("… 调用 #" + state.stats.calls + " · cache MISS → 异步入队(EJIT_PENDING) → 本次 AOT 兜底", "miss");
+    setResPill("… PENDING → 后台编译", "miss");
+    updateMetrics();
+    setTimeout(function(){
+      compile(c, t).then(function(kk){
+        log("✓ worker 后台编译完成 → 缓存已发布 " + kk + "，下次调用即命中", "ok");
+      });
+    }, 350);
+  }
+}
+
+/* ================= actions ================= */
+function activate(){
+  state.active = true;
+  updatePeriodPill();
+  log("⚡ ejit_activate(\"cell\", idx) → 时间窗生效，进入常量冻结期，允许 JIT 特化", "ok");
+}
+function deactivate(){
+  state.active = false;
+  state.cache.forEach(function(e){ e.valid = false; });
+  renderCache();
+  updatePeriodPill();
+  clearCodeEffects();
+  $("jitPane").classList.add("stale");
+  log("⛔ ejit_deactivate(\"cell\", idx) → 时间窗失效，依赖缓存全部作废，回退 AOT", "fb");
+}
+function resetAll(){
+  state.cache.clear(); state.addrSeq = 0;
+  state.stats = {calls:0, hits:0, miss:0, spec:0, fb:0, br:0, ld:0};
+  state.active = false;
+  $("jitBody").innerHTML = '<div class="empty"><div class="big">🧬</div>激活时间窗并调用一次后<br>这里会长出该配置组合专属的特化机器码</div>';
+  $("jitPane").classList.remove("stale");
+  clearCodeEffects(); renderCache(); updateMetrics(); updatePeriodPill();
+  $("barJit").classList.add("none"); $("barJit").style.width = "0";
+  $("barAot").style.width = "0"; $("barJitLab").textContent = "— 条指令/次";
+  setResPill("—", null); $("pillRes").style.borderColor = ""; $("pillRes").style.color = "";
+  $("log").innerHTML = "";
+  log("已重置 —— 点击「一键演示」或手动操作", "info");
+}
+
+/* ================= bindings ================= */
+$("segCell").addEventListener("click", function(e){
+  var b = e.target.closest("button"); if (!b) return;
+  state.cellIdx = +b.dataset.c;
+  this.querySelectorAll("button").forEach(function(x){ x.classList.remove("on"); });
+  b.classList.add("on");
+});
+$("segTrp").addEventListener("click", function(e){
+  var b = e.target.closest("button"); if (!b) return;
+  state.trpIdx = +b.dataset.t;
+  this.querySelectorAll("button").forEach(function(x){ x.classList.remove("on"); });
+  b.classList.add("on");
+});
+$("segMode").addEventListener("click", function(e){
+  var b = e.target.closest("button"); if (!b) return;
+  state.mode = b.dataset.m;
+  this.querySelectorAll("button").forEach(function(x){ x.classList.remove("on"); });
+  b.classList.add("on");
+  log("模式切换 → " + (state.mode === "sync" ? "同步编译（首调阻塞 <100ms）" : "异步编译（首调 AOT 兜底，worker 后台编译）"), "info");
+});
+$("btnAct").addEventListener("click", activate);
+$("btnDeact").addEventListener("click", deactivate);
+$("btnCall").addEventListener("click", function(){ doCall(false); });
+$("btnCall50").addEventListener("click", async function(){
+  if (state.busy) return;
+  log("—— ×50 连发开始 ——", "info");
+  for (var i = 0; i < 50; i++){ await doCall(true); await sleep(26); }
+  log("—— ×50 完成：命中 " + (state.stats.hits) + " · 特化执行 " + state.stats.spec + " · fallback " + state.stats.fb + " ——", "info");
+});
+$("btnReset").addEventListener("click", function(){ if (!state.busy) resetAll(); });
+
+$("btnAuto").addEventListener("click", autoDemo);
+var autoStop = false;
+async function autoDemo(){
+  if (state.autoRunning){ autoStop = true; return; }
+  state.autoRunning = true; autoStop = false;
+  var btn = $("btnAuto"); btn.textContent = "⏸ 停止演示";
+  resetAll();
+  var ok = function(){ return !autoStop; };
+  log("════ 一键演示：一个时间窗的完整生命周期 ════", "info");
+  await sleep(600); if (!ok()) return stopDemo();
+  log("【第 1 幕】业务配置完成，激活时间窗", "warn"); activate();
+  await sleep(900); if (!ok()) return stopDemo();
+  log("【第 2 幕】首次调用 → cache MISS → 现场特化（注意右侧代码生长、左侧死分支消失）", "warn");
+  await doCall(false);
+  await sleep(800); if (!ok()) return stopDemo();
+  log("【第 3 幕】后续调用 → 全部 20ns 命中，指标快速累积", "warn");
+  for (var i = 0; i < 3; i++){ await doCall(true); await sleep(330); if (!ok()) return stopDemo(); }
+  log("【第 4 幕】网管下发配置变更 → deactivate → 缓存作废（右侧变灰）", "warn");
+  deactivate();
+  await sleep(1000); if (!ok()) return stopDemo();
+  log("【第 5 幕】变更期间的调用 → 安全回退 AOT，业务零感知", "warn");
+  await doCall(false);
+  await sleep(800); if (!ok()) return stopDemo();
+  log("【第 6 幕】新配置生效 → activate → 按需重新特化", "warn");
+  activate();
+  await sleep(700); if (!ok()) return stopDemo();
+  await doCall(false);
+  await sleep(600); if (!ok()) return stopDemo();
+  log("════ 演示结束：同一份代码 · 未激活=AOT兜底 · 激活=特化加速 · 永不崩溃 ════", "info");
+  stopDemo();
+}
+function stopDemo(){
+  state.autoRunning = false; autoStop = false;
+  $("btnAuto").textContent = "🎬 一键演示";
+}
+
+/* ================= hero count-up ================= */
+var io = new IntersectionObserver(function(es){
+  es.forEach(function(e){
+    if (!e.isIntersecting) return;
+    var el = e.target, target = parseFloat(el.dataset.count), dec = el.dataset.count.indexOf(".") >= 0 ? 1 : 0;
+    var t0 = performance.now(), dur = 1500;
+    (function tick(t){
+      var p = Math.min(1, (t - t0) / dur);
+      el.textContent = (target * (1 - Math.pow(1 - p, 3))).toFixed(dec);
+      if (p < 1) requestAnimationFrame(tick);
+    })(t0);
+    io.unobserve(el);
+  });
+}, {threshold: .5});
+document.querySelectorAll("[data-count]").forEach(function(el){ io.observe(el); });
+
+/* init */
+updatePeriodPill();
+log("欢迎来到 EJIT 特化实验室 —— 点击「一键演示」开始", "info");
+</script>
+</body>
+</html>
