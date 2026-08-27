@@ -115,6 +115,8 @@ public:
   using EnableRwFn = std::function<unsigned(void *va)>;
 
   struct Options {
+    /// Diagnostic placement class propagated with finalized code ranges.
+    EJitCodePoolKind kind = EJitCodePoolKind::Unknown;
     /// Usable bytes per pool (EJIT_SRE_CODE_POOL_SIZE). Default 2MiB. In 4K
     /// seal mode this is rounded up to a multiple of poolAlign.
     size_t poolSize = static_cast<size_t>(2) * 1024 * 1024;

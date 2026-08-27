@@ -24,11 +24,14 @@
 namespace llvm {
 namespace ejit {
 
+enum class EJitCodePoolPlacement { NearFixed, ColdFixed, FarDynamic };
+
 /// Construct an EJitCodePoolManager wired to the SRE platform: raw memory from
 /// SRE_MemDbgAlloc (partition EJIT_SRE_CODE_POOL_PTNO) and sealing via
 /// enable_ex. On a host without real SRE symbols, weak fallbacks make this a
 /// link-safe no-op-seal / aligned-host-alloc manager (see EJitSrePlatform.cpp).
-std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager();
+std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager(
+    EJitCodePoolPlacement Placement = EJitCodePoolPlacement::NearFixed);
 
 /// Install execute permission for the legacy 2MiB code pool containing
 /// \p FnPtr in the calling core's translation context. This is intentionally a

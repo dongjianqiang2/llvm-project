@@ -99,7 +99,12 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v13: non-owner cores can post a may_const-ranking diagnostic request to the
 /// owner worker and wait for its completion without sharing optimizer objects.
 /// v14: EJitCompileRequest owns an inline bound-pointer snapshot.
-constexpr uint32_t kEJitSharedAbiVersion = 14u;
+/// v15: each cache slot records whether its published JIT pointer was resolved
+/// by a later taskpool lookup, diagnosing compiled versions with no reuse.
+/// v16: code ranges identify near/far placement and the shared code-pool
+/// diagnostic mirror publishes aggregate plus placement-specific statistics.
+/// v17: one published compilation may carry a companion MFS cold-code range.
+constexpr uint32_t kEJitSharedAbiVersion = 17u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

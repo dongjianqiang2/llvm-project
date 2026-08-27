@@ -7,12 +7,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 #include "llvm/ExecutionEngine/Orc/Shared/AllocationActions.h"
 #include "llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <cstring>
+#ifndef EJIT_FREESTANDING
+#include <mutex>
+#endif
 #include <vector>
 
 using namespace llvm;
@@ -28,8 +34,15 @@ namespace {
 /// (non-contiguous) executable segments and any number of non-executable
 /// (read-only / writable / GOT) segments, which are NEVER sealed RX.
 struct ExecSegRange {
+  EJitCodePoolManager *Pool = nullptr;
   uintptr_t Addr = 0;
   uint64_t Size = 0;
+};
+
+struct PoolAllocRange {
+  EJitCodePoolManager *Pool = nullptr;
+  void *Base = nullptr;
+  size_t Size = 0;
 };
 } // namespace
 
@@ -40,14 +53,27 @@ struct EJitCodePoolMemoryManager::FinalizedInfo {
   std::vector<WrapperFunctionCall> DeallocActions;
 };
 
+struct EJitCodePoolMemoryManager::State {
+  struct AllocationRecord {
+    std::vector<ExecSegRange> ExecRanges;
+  };
+  // Code-pool v1 never reclaims executable storage, so allocation addresses
+  // remain valid for the manager lifetime. If reclamation is introduced,
+  // deallocate() must remove these records and this lookup should be indexed.
+  std::vector<AllocationRecord> Allocations;
+#ifndef EJIT_FREESTANDING
+  mutable std::mutex Mutex;
+#endif
+};
+
 class EJitCodePoolMemoryManager::InFlightAllocImpl
     : public JITLinkMemoryManager::InFlightAlloc {
 public:
-  InFlightAllocImpl(EJitCodePoolMemoryManager &MM, LinkGraph &G, BasicLayout BL,
-                    void *Base, size_t Size,
+  InFlightAllocImpl(EJitCodePoolMemoryManager &Owner, LinkGraph &G,
+                    BasicLayout BL, std::vector<PoolAllocRange> Allocs,
                     std::vector<ExecSegRange> ExecRanges,
                     std::vector<EJitWritableRange> WritableRanges)
-      : Pool(&MM.getPool()), G(&G), BL(std::move(BL)), Base(Base), Size(Size),
+      : Owner(&Owner), G(&G), BL(std::move(BL)), Allocs(std::move(Allocs)),
         ExecRanges(std::move(ExecRanges)),
         WritableRanges(std::move(WritableRanges)) {}
 
@@ -64,26 +90,32 @@ public:
     // engine.) We do not invalidate the instruction cache here either \u2014
     // the SRE seal callback does it (sealAndSyncCache: make page executable +
     // sync caches).
-    if (Pool->usesPageSeal()) {
-      for (const ExecSegRange &R : ExecRanges)
-        if (auto Err = Pool->sealCodeRange(reinterpret_cast<void *>(R.Addr),
+    for (const ExecSegRange &R : ExecRanges) {
+      if (!R.Pool->usesPageSeal())
+        continue;
+      if (auto Err = R.Pool->sealCodeRange(reinterpret_cast<void *>(R.Addr),
                                            static_cast<size_t>(R.Size))) {
-          EJIT_DIAG("finalize FAIL: sealCodeRange addr=0x%llx size=%llu",
-                    static_cast<unsigned long long>(R.Addr),
-                    static_cast<unsigned long long>(R.Size));
-          OnFinalized(
-              joinErrors(std::move(Err), Pool->restoreRxRange(Base, Size)));
-          return;
-        }
+        EJIT_DIAG("finalize FAIL: sealCodeRange addr=0x%llx size=%llu",
+                  static_cast<unsigned long long>(R.Addr),
+                  static_cast<unsigned long long>(R.Size));
+        for (const PoolAllocRange &A : Allocs)
+          Err = joinErrors(std::move(Err),
+                           A.Pool->restoreRxRange(A.Base, A.Size));
+        OnFinalized(std::move(Err));
+        return;
+      }
     }
     runFinalizeActions(
         G->allocActions(),
         [this, OnFinalized = std::move(OnFinalized)](
             Expected<std::vector<WrapperFunctionCall>> DeallocActions) mutable {
           if (!DeallocActions) {
-            EJIT_DIAG("finalize FAIL: runFinalizeActions error base=%p", Base);
-            OnFinalized(joinErrors(DeallocActions.takeError(),
-                                   Pool->restoreRxRange(Base, Size)));
+            Error Err = DeallocActions.takeError();
+            for (const PoolAllocRange &A : Allocs)
+              Err = joinErrors(std::move(Err),
+                               A.Pool->restoreRxRange(A.Base, A.Size));
+            EJIT_DIAG("finalize FAIL: runFinalizeActions error");
+            OnFinalized(std::move(Err));
             return;
           }
           // Publish executable ranges only after every finalize action has
@@ -95,27 +127,40 @@ public:
           // malformed writable set rather than truncating it; that must fail
           // finalize (no callable pointer) so a peer is never handed code whose
           // counter pages it cannot fully prepare. Restore W^X and report.
-          for (const ExecSegRange &R : ExecRanges)
-            if (!Pool->recordFinalizedRange(
+          for (const ExecSegRange &R : ExecRanges) {
+            SmallVector<EJitWritableRange, kEJitMaxWritableRanges> LocalWrites;
+            for (const EJitWritableRange &W : WritableRanges)
+              if (R.Pool->contains(reinterpret_cast<void *>(W.addr)))
+                LocalWrites.push_back(W);
+            if (!R.Pool->recordFinalizedRange(
                     reinterpret_cast<void *>(R.Addr),
                     static_cast<size_t>(R.Size),
-                    WritableRanges.empty() ? nullptr : WritableRanges.data(),
-                    static_cast<uint32_t>(WritableRanges.size()))) {
+                    LocalWrites.empty() ? nullptr : LocalWrites.data(),
+                    static_cast<uint32_t>(LocalWrites.size()))) {
               EJIT_DIAG(
                   "finalize FAIL: recordFinalizedRange rejected addr=0x%llx"
                   " writable=%zu",
                   static_cast<unsigned long long>(R.Addr),
                   WritableRanges.size());
-              OnFinalized(joinErrors(
-                  make_error<StringError>(
-                      "EJitCodePool: finalized allocation has an over-bound or "
-                      "malformed runtime-writable range set",
-                      inconvertibleErrorCode()),
-                  Pool->restoreRxRange(Base, Size)));
+              Error Err = make_error<StringError>(
+                  "EJitCodePool: finalized allocation has an over-bound or "
+                  "malformed runtime-writable range set",
+                  inconvertibleErrorCode());
+              for (const PoolAllocRange &A : Allocs)
+                Err = joinErrors(std::move(Err),
+                                 A.Pool->restoreRxRange(A.Base, A.Size));
+              OnFinalized(std::move(Err));
               return;
             }
+          }
+          {
+#ifndef EJIT_FREESTANDING
+            std::lock_guard<std::mutex> Lock(Owner->State_->Mutex);
+#endif
+            Owner->State_->Allocations.push_back({ExecRanges});
+          }
           auto *Info = new FinalizedInfo();
-          Info->Base = Base;
+          Info->Base = Allocs.empty() ? nullptr : Allocs.front().Base;
           Info->DeallocActions = std::move(*DeallocActions);
 #ifndef NDEBUG
           G = nullptr; // mark finalized
@@ -130,47 +175,189 @@ public:
 #ifndef NDEBUG
     G = nullptr;
 #endif
-    OnAbandoned(Pool->restoreRxRange(Base, Size));
+    Error Err = Error::success();
+    for (const PoolAllocRange &A : Allocs)
+      Err = joinErrors(std::move(Err), A.Pool->restoreRxRange(A.Base, A.Size));
+    OnAbandoned(std::move(Err));
   }
 
 private:
-  EJitCodePoolManager *Pool;
+  EJitCodePoolMemoryManager *Owner;
   LinkGraph *G;
   BasicLayout BL;
-  void *Base;
-  size_t Size;
+  std::vector<PoolAllocRange> Allocs;
   std::vector<ExecSegRange> ExecRanges;
   std::vector<EJitWritableRange> WritableRanges;
 };
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(EJitCodePoolManager &Pool,
                                                      size_t PageSize)
-    : Pool_(Pool), PageSize_(PageSize) {}
+    : NearPool_(Pool), PageSize_(PageSize), State_(std::make_unique<State>()) {}
+
+EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(
+    EJitCodePoolManager &NearPool, EJitCodePoolManager &FarPool,
+    size_t PageSize)
+    : NearPool_(NearPool), FarPool_(&FarPool), PageSize_(PageSize),
+      State_(std::make_unique<State>()) {}
+
+EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(
+    EJitCodePoolManager &NearPool, EJitCodePoolManager &ColdPool,
+    EJitCodePoolManager &FarPool, size_t PageSize)
+    : NearPool_(NearPool), ColdPool_(&ColdPool), FarPool_(&FarPool),
+      PageSize_(PageSize), State_(std::make_unique<State>()) {}
+
+EJitCodePoolMemoryManager::~EJitCodePoolMemoryManager() = default;
+
+EJitCodePoolManager &EJitCodePoolMemoryManager::selectPool(
+    const JITLinkDylib *JD) const {
+  if (FarPool_ && JD && StringRef(JD->getName()).starts_with("spec_t1_"))
+    return *FarPool_;
+  return NearPool_;
+}
+
+bool EJitCodePoolMemoryManager::findAllocation(
+    const void *Ptr, EJitCompiledCodeInfo &Out) const {
+  const uintptr_t Addr = reinterpret_cast<uintptr_t>(Ptr);
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(State_->Mutex);
+#endif
+  for (const State::AllocationRecord &A : State_->Allocations) {
+    const ExecSegRange *Primary = nullptr;
+    for (const ExecSegRange &R : A.ExecRanges)
+      if (Addr >= R.Addr && Addr < R.Addr + R.Size) {
+        Primary = &R;
+        break;
+      }
+    if (!Primary)
+      continue;
+    EJitCompiledCodeInfo Result{};
+    if (!Primary->Pool->findRange(Ptr, Result))
+      return false;
+    for (const ExecSegRange &R : A.ExecRanges) {
+      if (&R == Primary)
+        continue;
+      if (Result.extraCodeCount >= kEJitMaxExtraCodeRanges)
+        return false;
+      EJitCompiledCodeInfo ExtraInfo{};
+      if (!R.Pool->findRange(reinterpret_cast<void *>(R.Addr), ExtraInfo))
+        return false;
+      EJitExecutableRange &Extra =
+          Result.extraCodeRanges[Result.extraCodeCount++];
+      Extra.codeStart = ExtraInfo.codeStart;
+      Extra.codeSize = ExtraInfo.codeSize;
+      Extra.poolBase = ExtraInfo.poolBase;
+      Extra.poolSize = ExtraInfo.poolSize;
+      Extra.poolId = ExtraInfo.poolId;
+      Extra.poolKind = ExtraInfo.poolKind;
+    }
+    Out = Result;
+    return true;
+  }
+  return false;
+}
 
 void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
                                          OnAllocatedFunction OnAllocated) {
+  EJitCodePoolManager &Pool = selectPool(JD);
+  std::vector<PoolAllocRange> Allocs;
+  std::vector<ExecSegRange> ExecRanges;
+  auto RestoreAll = [&Allocs]() {
+    Error Err = Error::success();
+    for (const PoolAllocRange &A : Allocs)
+      Err = joinErrors(std::move(Err), A.Pool->restoreRxRange(A.Base, A.Size));
+    return Err;
+  };
+
+  // MFS emits profile-cold blocks as .text.split.<function>. Give those blocks
+  // addresses and working memory from the dedicated fixed cold pool, then mark
+  // the sections NoAlloc so BasicLayout lays out the remaining graph in the
+  // normal hot/far pool without merging both RX classes back together.
+  if (ColdPool_ && &Pool == &NearPool_) {
+    SmallVector<Section *, 4> ColdSections;
+    SmallVector<Block *, 16> ColdBlocks;
+    for (Section &Sec : G.sections()) {
+      if (!Sec.getName().starts_with(".text.split.") &&
+          !Sec.getName().starts_with(".text.ejit_cold"))
+        continue;
+      if ((Sec.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None)
+        continue;
+      ColdSections.push_back(&Sec);
+      for (Block *B : Sec.blocks())
+        ColdBlocks.push_back(B);
+    }
+    if (!ColdBlocks.empty()) {
+      llvm::sort(ColdBlocks, [](const Block *L, const Block *R) {
+        if (L->getSection().getOrdinal() != R->getSection().getOrdinal())
+          return L->getSection().getOrdinal() < R->getSection().getOrdinal();
+        return L->getAddress() < R->getAddress();
+      });
+      uint64_t ColdSize = 0;
+      for (Block *B : ColdBlocks) {
+        ColdSize = alignToBlock(ColdSize, *B);
+        ColdSize += B->getSize();
+      }
+      ColdSize = alignTo(ColdSize, PageSize_);
+      auto ColdMemOrErr =
+          ColdPool_->allocateCode(static_cast<size_t>(ColdSize), PageSize_);
+      if (!ColdMemOrErr) {
+        OnAllocated(ColdMemOrErr.takeError());
+        return;
+      }
+      void *ColdBase = *ColdMemOrErr;
+      if (auto Err = ColdPool_->enableRwRange(ColdBase, ColdSize)) {
+        OnAllocated(joinErrors(std::move(Err),
+                               ColdPool_->restoreRxRange(ColdBase, ColdSize)));
+        return;
+      }
+      std::memset(ColdBase, 0, static_cast<size_t>(ColdSize));
+      uintptr_t ColdAddr = reinterpret_cast<uintptr_t>(ColdBase);
+      size_t WorkingOffset = 0;
+      for (Block *B : ColdBlocks) {
+        ColdAddr = alignToBlock(ColdAddr, *B);
+        WorkingOffset = static_cast<size_t>(
+            alignToBlock(static_cast<uint64_t>(WorkingOffset), *B));
+        B->setAddress(ExecutorAddr(ColdAddr));
+        if (!B->isZeroFill()) {
+          char *Dst = static_cast<char *>(ColdBase) + WorkingOffset;
+          std::memcpy(Dst, B->getContent().data(), B->getSize());
+          B->setMutableContent({Dst, B->getSize()});
+        }
+        ColdAddr += B->getSize();
+        WorkingOffset += B->getSize();
+      }
+      for (Section *Sec : ColdSections)
+        Sec->setMemLifetime(orc::MemLifetime::NoAlloc);
+      Allocs.push_back({ColdPool_, ColdBase, static_cast<size_t>(ColdSize)});
+      ExecRanges.push_back(
+          {ColdPool_, reinterpret_cast<uintptr_t>(ColdBase), ColdSize});
+      EJIT_DIAG("allocate: graph=%s cold=%llu bytes sections=%zu",
+                G.getName().c_str(), static_cast<unsigned long long>(ColdSize),
+                ColdSections.size());
+    }
+  }
   BasicLayout BL(G);
 
   auto SegsSizes = BL.getContiguousPageBasedLayoutSizes(PageSize_);
   if (!SegsSizes) {
     EJIT_DIAG("allocate FAIL: layout sizes error graph=%s",
               G.getName().c_str());
-    OnAllocated(SegsSizes.takeError());
+    OnAllocated(joinErrors(SegsSizes.takeError(), RestoreAll()));
     return;
   }
 
   uint64_t Total = SegsSizes->total();
-  EJIT_DIAG("allocate: graph=%s total=%llu pageSize=%zu",
-            G.getName().c_str(),
+  const char *Placement = FarPool_ == &Pool ? "far" : "near";
+  EJIT_DIAG("allocate: graph=%s pool=%s total=%llu pageSize=%zu",
+            G.getName().c_str(), Placement,
             static_cast<unsigned long long>(Total), PageSize_);
 
   void *Slab = nullptr;
   if (Total > 0) {
-    auto MemOrErr = Pool_.allocateCode(static_cast<size_t>(Total), PageSize_);
+    auto MemOrErr = Pool.allocateCode(static_cast<size_t>(Total), PageSize_);
     if (!MemOrErr) {
       EJIT_DIAG("allocate FAIL: pool allocateCode total=%llu",
                 static_cast<unsigned long long>(Total));
-      OnAllocated(MemOrErr.takeError());
+      OnAllocated(joinErrors(MemOrErr.takeError(), RestoreAll()));
       return;
     }
     Slab = *MemOrErr;
@@ -178,10 +365,12 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     // so make its pages writable (RX -> RW via enable_rw) BEFORE any write. In
     // data-region placement this is a no-op (already RW). Failure means the slab
     // is not writable - do not hand it back for JITLink to write into.
-    if (auto Err = Pool_.enableRwRange(Slab, static_cast<size_t>(Total))) {
+    if (auto Err = Pool.enableRwRange(Slab, static_cast<size_t>(Total))) {
       EJIT_DIAG("allocate FAIL: enableRwRange total=%llu",
                 static_cast<unsigned long long>(Total));
-      OnAllocated(std::move(Err));
+      // enableRwRange seals every page it made writable before returning an
+      // error. Only the earlier companion cold allocation remains to restore.
+      OnAllocated(joinErrors(std::move(Err), RestoreAll()));
       return;
     }
     // Zero-fill the whole slab up-front (covers zero-fill segments and any
@@ -207,7 +396,6 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   // because a peer reads it fine from an RX page. The same page-aligned layout
   // guarantees a writable segment never shares a 4KiB page with an executable
   // one, so making these RW on a peer never touches a code page (no RWX).
-  std::vector<ExecSegRange> ExecRanges;
   std::vector<EJitWritableRange> WritableRanges;
   for (auto &KV : BL.segments()) {
     auto &AG = KV.first;
@@ -227,7 +415,8 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     if (IsExec) {
       if (SegSize > 0)
         ExecRanges.push_back(
-            {reinterpret_cast<uintptr_t>(SegAddr.toPtr<char *>()), SegSize});
+            {&Pool, reinterpret_cast<uintptr_t>(SegAddr.toPtr<char *>()),
+             SegSize});
     } else if (IsWrite) {
       if (SegSize > 0)
         WritableRanges.push_back(
@@ -249,25 +438,41 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
             "EJitCodePool: allocation has more runtime-writable segments than "
             "the fixed cross-core bound",
             inconvertibleErrorCode()),
-        Pool_.restoreRxRange(Slab, static_cast<size_t>(Total))));
+        joinErrors(Pool.restoreRxRange(Slab, static_cast<size_t>(Total)),
+                   RestoreAll())));
+    return;
+  }
+
+  if (ExecRanges.size() > 1 + kEJitMaxExtraCodeRanges) {
+    Error Err = make_error<StringError>(
+        "EJitCodePool: too many executable extents for cross-core metadata",
+        inconvertibleErrorCode());
+    Err = joinErrors(std::move(Err), RestoreAll());
+    if (Total > 0)
+      Err = joinErrors(std::move(Err),
+                       Pool.restoreRxRange(Slab, static_cast<size_t>(Total)));
+    OnAllocated(std::move(Err));
     return;
   }
 
   if (auto Err = BL.apply()) {
     EJIT_DIAG("allocate FAIL: BasicLayout apply error graph=%s",
               G.getName().c_str());
-    OnAllocated(
-        joinErrors(std::move(Err),
-                   Pool_.restoreRxRange(Slab, static_cast<size_t>(Total))));
+    OnAllocated(joinErrors(
+        std::move(Err),
+        joinErrors(Pool.restoreRxRange(Slab, static_cast<size_t>(Total)),
+                   RestoreAll())));
     return;
   }
 
   EJIT_DIAG("allocate OK: slab=%p total=%llu execRanges=%zu writableRanges=%zu",
             Slab, static_cast<unsigned long long>(Total), ExecRanges.size(),
             WritableRanges.size());
+  if (Total > 0)
+    Allocs.push_back({&Pool, Slab, static_cast<size_t>(Total)});
   OnAllocated(std::make_unique<InFlightAllocImpl>(
-      *this, G, std::move(BL), Slab, static_cast<size_t>(Total),
-      std::move(ExecRanges), std::move(WritableRanges)));
+      *this, G, std::move(BL), std::move(Allocs), std::move(ExecRanges),
+      std::move(WritableRanges)));
 }
 
 void EJitCodePoolMemoryManager::deallocate(std::vector<FinalizedAlloc> Allocs,

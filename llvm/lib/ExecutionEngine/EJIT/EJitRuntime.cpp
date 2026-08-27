@@ -796,6 +796,10 @@ static ejit_status_t taskpoolStatus(EJitCompileOrGetStatus s) {
   case EJitCompileOrGetStatus::EnqueuedPending:
   case EJitCompileOrGetStatus::AlreadyPending:
     return EJIT_PENDING;
+  case EJitCompileOrGetStatus::PgoAdmissionDeferred:
+    // No work was queued. Surface a clean resource-limit fallback instead of
+    // claiming that an asynchronous compilation is pending.
+    return EJIT_ERR_QUEUE_FULL;
   case EJitCompileOrGetStatus::QueueFullFallback:
     return EJIT_ERR_QUEUE_FULL;
   case EJitCompileOrGetStatus::OffMode:
@@ -1650,6 +1654,14 @@ void ejit_taskpool_print_stats() {
                   static_cast<unsigned long long>(d.workerTaskId),
                   static_cast<unsigned long long>(d.registrationFingerprint),
                   static_cast<unsigned long long>(d.executePrepareFailed));
+    EJIT_DIAG_RAW("  pgo active=%u/%u completed=%llu deferred=%llu "
+                  "tier1=%llu tier2=%llu mergeFailed=%llu",
+                  d.pgoActiveFunctionCount, d.pgoMaxActiveFunctions,
+                  static_cast<unsigned long long>(d.pgoCompletedFunctions),
+                  static_cast<unsigned long long>(d.pgoDeferredMisses),
+                  static_cast<unsigned long long>(d.tier1Compiles),
+                  static_cast<unsigned long long>(d.tier2Compiles),
+                  static_cast<unsigned long long>(d.profileMergeFails));
   }
   // Diagnostic: dump the inline-cache slot registry to help diagnose
   // why cacheHits keeps growing despite icache being enabled. Hand the
@@ -1688,7 +1700,11 @@ void ejit_taskpool_print_compiled() {
   // diverge by the same margin as any walk-based dump.
   struct CountCtx {
     uint32_t byDims[kEJitSharedMaxDims + 1];
-  } count = {{0}};
+    uint32_t byTier[3];
+    uint32_t byPool[4];
+    uint32_t withColdRange;
+    uint32_t finalPostPublishSeen;
+  } count = {{0}, {0}, {0}, 0, 0};
   EJitSharedTaskPool::ForEachCompiledStats st = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
         // Valid numDims is 0..kEJitSharedMaxDims; clamp a corrupt slot's
@@ -1696,6 +1712,16 @@ void ejit_taskpool_print_compiled() {
         uint32_t n = slot.numDims < kEJitSharedMaxDims ? slot.numDims
                                                        : kEJitSharedMaxDims;
         ++static_cast<CountCtx *>(cbCtx)->byDims[n];
+        uint8_t tier = slot.tier.loadRelaxed();
+        if (tier <= kEJitTierPgoUse)
+          ++static_cast<CountCtx *>(cbCtx)->byTier[tier];
+        if (slot.poolKind <= static_cast<uint32_t>(EJitCodePoolKind::Cold))
+          ++static_cast<CountCtx *>(cbCtx)->byPool[slot.poolKind];
+        if (slot.extraCodeCount != 0)
+          ++static_cast<CountCtx *>(cbCtx)->withColdRange;
+        if (tier != kEJitTierInstrumented &&
+            slot.postPublishSeen.loadRelaxed() != 0)
+          ++static_cast<CountCtx *>(cbCtx)->finalPostPublishSeen;
       },
       &count);
   // Summary line first (fixed line count, so no throttle): total, cache
@@ -1718,11 +1744,41 @@ void ejit_taskpool_print_compiled() {
                 st.visitedSlots, st.visitedSlots,
                 kEJitSharedCacheBuckets * kEJitSharedCacheSlots,
                 st.skippedBuckets, byDims[0] ? " byDims: " : "", byDims);
+  EJIT_DIAG_RAW("compiled tiers: baseline=%u tier1_collecting=%u tier2=%u",
+                count.byTier[kEJitTierBaseline],
+                count.byTier[kEJitTierInstrumented],
+                count.byTier[kEJitTierPgoUse]);
+  EJIT_DIAG_RAW("compiled pools: near-hot=%u far-tier1=%u unknown=%u "
+                "with_mfs_cold=%u",
+                count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Near)],
+                count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Far)],
+                count.byPool[static_cast<uint32_t>(EJitCodePoolKind::Unknown)],
+                count.withColdRange);
+#ifdef EJIT_STATS_ENABLE
+  constexpr bool ReuseTrackingEnabled = true;
+  const uint32_t FinalVersions = count.byTier[kEJitTierBaseline] +
+                                 count.byTier[kEJitTierPgoUse];
+  EJIT_DIAG_RAW("compiled final reuse: post_publish_seen=%u unseen=%u "
+                "(tier1_collecting_excluded=%u)",
+                count.finalPostPublishSeen,
+                FinalVersions >= count.finalPostPublishSeen
+                    ? FinalVersions - count.finalPostPublishSeen
+                    : 0,
+                count.byTier[kEJitTierInstrumented]);
+#else
+  constexpr bool ReuseTrackingEnabled = false;
+  EJIT_DIAG_RAW("compiled reuse: disabled (build with EJIT_STATS_ENABLE)");
+#endif
   // Entry lines: one RAW (prefix-free) line per Ready slot, throttled after
   // each printed line.
+  struct PrintCtx {
+    EJitModuleLoader &loader;
+    bool reuseTrackingEnabled;
+  } printCtx{loader, ReuseTrackingEnabled};
   EJitSharedTaskPool::ForEachCompiledStats st2 = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
-        EJitModuleLoader &ld = *static_cast<EJitModuleLoader *>(cbCtx);
+        PrintCtx &ctx = *static_cast<PrintCtx *>(cbCtx);
+        EJitModuleLoader &ld = ctx.loader;
         const std::string &name =
             ld.getFuncNameByFuncIdx(slot.funcIndex);
         // Per the publish protocol: fnPtr is read with acquire only after
@@ -1745,6 +1801,23 @@ void ejit_taskpool_print_compiled() {
         if (p >= end)
           p = end - 1;
         *p = '\0';
+        const char *PostPublishSeen =
+            !ctx.reuseTrackingEnabled
+                ? "disabled"
+                : (slot.postPublishSeen.loadRelaxed() != 0 ? "yes" : "no");
+        const uint8_t SlotTier = slot.tier.loadRelaxed();
+        const char *Tier = SlotTier == kEJitTierPgoUse ? "tier2"
+                           : SlotTier == kEJitTierInstrumented
+                               ? "tier1-collecting"
+                               : "baseline";
+        const char *PoolKind =
+            slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Near)
+                ? "near"
+            : slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Far)
+                ? "far"
+            : slot.poolKind == static_cast<uint32_t>(EJitCodePoolKind::Cold)
+                ? "cold"
+                : "unknown";
         if (gEJitDiagLevel >= EJIT_LOG_LVL_VERBOSE) {
           // Same shape for the per-instance version snapshot (uint32 x
           // kEJitSharedMaxDims + separators + NUL).
@@ -1757,22 +1830,30 @@ void ejit_taskpool_print_compiled() {
           if (p >= end)
             p = end - 1;
           *p = '\0';
-          EJIT_DIAG_RAW("funcIdx=%u name=%s numDims=%u dims=[%s] fn=%p "
-                        "ver=[%s] size=%llu pool=%u gen=%u",
-                        slot.funcIndex,
-                        name.empty() ? "<unknown>" : name.c_str(),
-                        slot.numDims, dims, fn, ver,
-                        static_cast<unsigned long long>(slot.codeSize),
-                        slot.poolId, slot.generation);
+          EJIT_DIAG_RAW(
+              "funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
+              "post_publish_seen=%s ver=[%s] size=%llu "
+              "pool=%s pool_id=%u cold_ranges=%u cold_size=%llu "
+              "gen=%u",
+              slot.funcIndex, name.empty() ? "<unknown>" : name.c_str(), Tier,
+              slot.numDims, dims, fn, PostPublishSeen, ver,
+              static_cast<unsigned long long>(slot.codeSize), PoolKind,
+              slot.poolId, slot.extraCodeCount,
+              slot.extraCodeCount ? static_cast<unsigned long long>(
+                                        slot.extraCodeRanges[0].codeSize)
+                                  : 0ull,
+              slot.generation);
         } else {
-          EJIT_DIAG_RAW("funcIdx=%u name=%s numDims=%u dims=[%s] fn=%p",
+          EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
+                        "pool=%s mfs_cold=%s post_publish_seen=%s",
                         slot.funcIndex,
-                        name.empty() ? "<unknown>" : name.c_str(),
-                        slot.numDims, dims, fn);
+                        name.empty() ? "<unknown>" : name.c_str(), Tier,
+                        slot.numDims, dims, fn, PoolKind,
+                        slot.extraCodeCount ? "yes" : "no", PostPublishSeen);
         }
         ejitDiagPrintThrottle();
       },
-      &loader);
+      &printCtx);
   // The summary counted the first walk; if the entry walk itself skipped
   // contended buckets, its lines are incomplete relative to it — report the
   // shortfall (fixed line count, so no throttle) instead of dropping it.
@@ -1880,6 +1961,31 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
     return EJIT_ERR_DISABLED;
   }
   return EJIT_OK;
+}
+
+ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out) {
+  if (!out) {
+    EJIT_DIAG("get_code_pool_stats_v2: null out pointer");
+    return EJIT_ERR_INVALID_PARAM;
+  }
+  if (!gEJIT) {
+    EJIT_DIAG("get_code_pool_stats_v2: not initialized");
+    return EJIT_ERR_NOT_ACTIVE;
+  }
+  if (!gEJIT->getCodePoolStatsV2(out)) {
+    EJIT_DIAG("get_code_pool_stats_v2: no code pool "
+              "(EJIT_SRE_CODE_POOL off or no engine)");
+    return EJIT_ERR_DISABLED;
+  }
+  return EJIT_OK;
+}
+
+ejit_status_t ejit_get_code_pool_stats_v3(ejit_code_pool_stats_v3_t *out) {
+  if (!out)
+    return EJIT_ERR_INVALID_PARAM;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  return gEJIT->getCodePoolStatsV3(out) ? EJIT_OK : EJIT_ERR_DISABLED;
 }
 
 void ejit_print_code_pool_stats(void) {

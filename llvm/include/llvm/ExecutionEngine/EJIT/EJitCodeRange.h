@@ -32,6 +32,24 @@
 namespace llvm {
 namespace ejit {
 
+enum class EJitCodePoolKind : uint32_t {
+  Unknown = 0,
+  Near = 1, // Hot fixed .text.ejit pool (kept for ABI compatibility).
+  Far = 2,
+  Cold = 3,
+};
+
+constexpr uint32_t kEJitMaxExtraCodeRanges = 1u;
+
+struct EJitExecutableRange {
+  uintptr_t codeStart = 0;
+  uint64_t codeSize = 0;
+  uintptr_t poolBase = 0;
+  uint64_t poolSize = 0;
+  uint32_t poolId = 0;
+  EJitCodePoolKind poolKind = EJitCodePoolKind::Unknown;
+};
+
 /// Maximum number of runtime-writable ranges carried with one finalized
 /// compilation. A finalized allocation normally has a single writable data
 /// segment (the Tier-1 __profc_ counters); the small fixed bound leaves head
@@ -88,8 +106,13 @@ struct EJitCompiledCodeInfo {
   /// The runtime-writable extents a peer core must enable_rw before executing.
   /// Only the first writableCount entries are meaningful.
   EJitWritableRange writableRanges[kEJitMaxWritableRanges] = {};
-  /// Reserved (must be 0). Keeps the struct's tail explicit.
-  uint32_t reserved = 0;
+  /// Placement class of the owning pool. Near is the fixed .text.ejit region;
+  /// Far is the dynamic SRE_MemDbgAlloc region used by temporary Tier-1 code.
+  EJitCodePoolKind poolKind = EJitCodePoolKind::Unknown;
+  /// Additional executable extent belonging to the same compilation. MFS
+  /// currently produces at most one cold RX extent in .text.ejit_cold.
+  uint32_t extraCodeCount = 0;
+  EJitExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges] = {};
 };
 
 } // namespace ejit

@@ -88,7 +88,8 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
   EJitOrcEngine *eng = drv->getJitEngine();
   if (eng && out) {
-    EJitCodePoolManager::Stats s = eng->getCodePoolStats();
+    EJitTieredCodePoolStats tiered = eng->getTieredCodePoolStats();
+    const EJitCodePoolManager::Stats &s = tiered.total;
     out->poolCount = s.poolCount;
     out->sealedCount = s.sealedCount;
     out->activeCount = s.activeCount;
@@ -98,6 +99,21 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
     out->sealInvocations = s.sealInvocations;
     out->splitInvocations = s.splitInvocations;
     out->finalizedRangeCount = s.finalizedRangeCount;
+    auto CopyDetail = [](EJitCodePoolStatsOut::Detail &Dst,
+                         const EJitCodePoolManager::Stats &Src) {
+      Dst.poolCount = Src.poolCount;
+      Dst.sealedCount = Src.sealedCount;
+      Dst.activeCount = Src.activeCount;
+      Dst.usedBytes = Src.usedBytes;
+      Dst.reservedBytes = Src.reservedBytes;
+      Dst.wastedBytes = Src.wastedBytes;
+      Dst.sealInvocations = Src.sealInvocations;
+      Dst.splitInvocations = Src.splitInvocations;
+      Dst.finalizedRangeCount = Src.finalizedRangeCount;
+    };
+    CopyDetail(out->near, tiered.near);
+    CopyDetail(out->cold, tiered.cold);
+    CopyDetail(out->far, tiered.far);
     return true;
   }
   return false;

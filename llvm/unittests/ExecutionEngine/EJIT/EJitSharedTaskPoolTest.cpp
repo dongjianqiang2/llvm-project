@@ -167,6 +167,9 @@ struct RangeCtx {
   uintptr_t codeStart = 0x40000000ull;
   uint64_t codeSize = 64;
   uint32_t poolId = 0;
+  EJitCodePoolKind poolKind = EJitCodePoolKind::Near;
+  uint32_t extraCodeCount = 0;
+  EJitExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges] = {};
   bool provide = true;
   // Runtime-writable ranges (v9): 0 => none (non-PGO / Tier-2). When set,
   // models the Tier-1 __profc_ counter pages a peer core must enable_rw.
@@ -188,6 +191,10 @@ bool mockCodeRange(void *ctx, const void *fnPtr, EJitCompiledCodeInfo *out) {
   out->poolBase = r->poolBase;
   out->poolSize = r->poolSize;
   out->poolId = r->poolId;
+  out->poolKind = r->poolKind;
+  out->extraCodeCount = r->extraCodeCount;
+  for (uint32_t I = 0; I < kEJitMaxExtraCodeRanges; ++I)
+    out->extraCodeRanges[I] = r->extraCodeRanges[I];
   out->writableCount = r->writableCount;
   out->requiresPeerEnableRw = r->requiresPeerEnableRw;
   for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -1714,6 +1721,32 @@ TEST_F(SharedTaskPoolTest, FourKPeerSplitsOnceSealsSinglePage) {
   EXPECT_EQ(fourK.seals[0].second, 3u);
 }
 
+TEST_F(SharedTaskPoolTest, FourKPeerPreparesMfsColdCompanionRange) {
+  FourKLog fourK;
+  RangeCtx range;
+  range.extraCodeCount = 1;
+  range.extraCodeRanges[0].codeStart = 0x40401200ull;
+  range.extraCodeRanges[0].codeSize = 0x80;
+  range.extraCodeRanges[0].poolBase = 0x40400000ull;
+  range.extraCodeRanges[0].poolSize = 0x200000ull;
+  range.extraCodeRanges[0].poolKind = EJitCodePoolKind::Cold;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(4);
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+
+  ASSERT_EQ(fourK.splits.size(), 2u);
+  EXPECT_EQ(fourK.splits[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.splits[1].first, 0x40400000ull);
+  ASSERT_EQ(fourK.seals.size(), 2u);
+  EXPECT_EQ(fourK.seals[0].first, 0x40000000ull);
+  EXPECT_EQ(fourK.seals[1].first, 0x40401000ull);
+}
+
 // 2/3 Range spanning two pages with an unaligned start/end: seal BOTH pages.
 TEST_F(SharedTaskPoolTest, FourKPeerSealsEveryCoveredPageUnaligned) {
   FourKLog fourK;
@@ -2371,8 +2404,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // address by every core, so a layout change that slips through unversioned is
   // a silent cross-core corruption.
   // v10-v13 add PGO controls, writable ranges, staged admission, and audit
-  // requests; v14 adds the owned bound-pointer snapshot.
-  EXPECT_EQ(kEJitSharedAbiVersion, 14u);
+  // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
+  // per-version post-publish reuse tracking; v16 adds near/far placement and
+  // v17 carries an MFS cold companion executable range.
+  EXPECT_EQ(kEJitSharedAbiVersion, 17u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -2388,6 +2423,13 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   range.poolBase = 0x40000000ull;
   range.poolSize = 0x200000ull;
   range.poolId = 7;
+  range.extraCodeCount = 1;
+  range.extraCodeRanges[0].codeStart = 0x40402000ull;
+  range.extraCodeRanges[0].codeSize = 0x321;
+  range.extraCodeRanges[0].poolBase = 0x40400000ull;
+  range.extraCodeRanges[0].poolSize = 0x200000ull;
+  range.extraCodeRanges[0].poolId = 2;
+  range.extraCodeRanges[0].poolKind = EJitCodePoolKind::Cold;
   range.writableCount = 1;
   range.writableAddr[0] = 0x40080000ull;
   range.writableSize[0] = 0x40;
@@ -2403,7 +2445,12 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolBase, 0x40000000ull);
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
-  EXPECT_EQ(slot->rangeReserved, 0u);
+  EXPECT_EQ(slot->poolKind,
+            static_cast<uint32_t>(EJitCodePoolKind::Near));
+  ASSERT_EQ(slot->extraCodeCount, 1u);
+  EXPECT_EQ(slot->extraCodeRanges[0].codeStart, 0x40402000ull);
+  EXPECT_EQ(slot->extraCodeRanges[0].poolKind,
+            static_cast<uint32_t>(EJitCodePoolKind::Cold));
   // Runtime-writable ranges (v9): published verbatim from the code-range info.
   EXPECT_EQ(slot->writableCount, 1u);
   EXPECT_EQ(slot->requiresPeerEnableRw, 1u); // RangeCtx default: fixed RX pool
@@ -2502,7 +2549,7 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       Slot.poolBase = 0x3333;
       Slot.poolSize = 0x4444;
       Slot.poolId = 0x5555;
-      Slot.rangeReserved = 0x6666;
+      Slot.poolKind = static_cast<uint32_t>(EJitCodePoolKind::Far);
       Slot.writableCount = 0x7777;
       Slot.requiresPeerEnableRw = 0x8888;
       for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -2535,7 +2582,8 @@ TEST_F(SharedTaskPoolTest, FourKReinitScrubsStaleV5Fields) {
       EXPECT_EQ(Slot.poolBase, 0u);
       EXPECT_EQ(Slot.poolSize, 0u);
       EXPECT_EQ(Slot.poolId, 0u);
-      EXPECT_EQ(Slot.rangeReserved, 0u);
+      EXPECT_EQ(Slot.poolKind,
+                static_cast<uint32_t>(EJitCodePoolKind::Unknown));
       EXPECT_EQ(Slot.writableCount, 0u);
       EXPECT_EQ(Slot.requiresPeerEnableRw, 0u);
       for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
@@ -4918,7 +4966,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
 
   // A different function stays on its AOT fallback and adds no compiler work.
   auto deferred = pool.compileOrGet(6, nullptr, 0, codeFor(6));
-  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
   EXPECT_EQ(deferred.fnPtr, codeFor(6));
   EXPECT_EQ(state_->enqueuePos.loadRelaxed() - state_->dequeuePos.loadRelaxed(),
             1u);
@@ -4951,6 +4999,46 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
   EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 7u);
 }
 
+TEST_F(SharedTaskPoolTest, SharedPgoProfilesOneVersionPerFunctionAtATime) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2, /*maxConcurrentProfiles=*/2);
+  pool.setInstanceEnabled(1, 4, true);
+  pool.setInstanceEnabled(1, 5, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+  EJitDimPair d1[1] = {dim(1, 5)};
+
+  ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  auto deferred = pool.compileOrGet(5, d1, 1, codeFor(5));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.fnPtr, codeFor(5));
+  EXPECT_EQ(pool.pendingCount(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 0u);
+
+  ASSERT_TRUE(pool.pollOne()); // Publish d0 Tier-1.
+  deferred = pool.compileOrGet(5, d1, 1, codeFor(5));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
+  EXPECT_EQ(pool.pendingCount(), 0u);
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 1u);
+
+  for (unsigned i = 0; i < 2; ++i) {
+    auto hit = pool.compileOrGet(5, d0, 1, codeFor(5));
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      pool.releaseRead(hit.bucketIndex);
+  }
+  ASSERT_EQ(pool.pendingCount(), 1u);
+  ASSERT_TRUE(pool.pollOne()); // Publish d0 Tier-2 and release admission.
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+
+  EXPECT_EQ(pool.compileOrGet(5, d1, 1, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+}
+
 TEST_F(SharedTaskPoolTest, SharedPgoReleasesAdmissionForPreexistingWork) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
@@ -4959,9 +5047,14 @@ TEST_F(SharedTaskPoolTest, SharedPgoReleasesAdmissionForPreexistingWork) {
   ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
             EJitCompileOrGetStatus::EnqueuedPending);
   pool.setPgoEnabled(true, 2);
+  uint32_t admissionHooks = 0;
+  pool.setPgoAdmissionTestHook(
+      [](void *ctx) { ++*static_cast<uint32_t *>(ctx); }, &admissionHooks);
 
   EXPECT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
             EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(admissionHooks, 0u)
+      << "an already-pending request must not transiently start PGO";
   EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
   EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 0u);
 
@@ -4985,7 +5078,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoHonorsConcurrentProfileLimit) {
   EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 2u);
 
   auto deferred = pool.compileOrGet(7, nullptr, 0, codeFor(7));
-  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
   EXPECT_EQ(deferred.fnPtr, codeFor(7));
   ASSERT_TRUE(pool.pollOne());
   ASSERT_TRUE(pool.pollOne());
@@ -5062,7 +5155,7 @@ TEST_F(SharedTaskPoolTest,
     if (first[i].status == EJitCompileOrGetStatus::EnqueuedPending) {
       ++admitted;
     } else {
-      EXPECT_EQ(first[i].status, EJitCompileOrGetStatus::AlreadyPending);
+      EXPECT_EQ(first[i].status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
       EXPECT_EQ(first[i].fnPtr, codeFor(kFuncIndices[i]));
       deferred = i;
     }
@@ -5116,7 +5209,7 @@ TEST_F(SharedTaskPoolTest,
     producer.join();
 
   EXPECT_EQ(profile[deferred][0].status,
-            EJitCompileOrGetStatus::AlreadyPending);
+            EJitCompileOrGetStatus::PgoAdmissionDeferred);
   EXPECT_EQ(profile[deferred][0].fnPtr, codeFor(kFuncIndices[deferred]));
   EXPECT_EQ(owner.pendingCount(), 2u);
   uint32_t profilesAtThreshold = 0;
@@ -5215,10 +5308,9 @@ TEST_F(SharedTaskPoolTest, SharedPgoTier2DiscardedOnVersionBump) {
   }
 }
 
-// PGO off → no hitCount increment and no Tier-2 enqueue.
-// Baseline guards: compileOrGet hits are ordinary cache hits with zero
-// PGO behaviour when setPgoEnabled was never called.
-TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
+// PGO off → no hitCount increment and no Tier-2 enqueue. Stats builds still
+// set the independent one-shot postPublishSeen diagnostic on the first reuse.
+TEST_F(SharedTaskPoolTest, SharedPgoOffTracksPostPublishReuse) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
   EJitCoreId::setCurrentForTest(0);
@@ -5232,6 +5324,9 @@ TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
   ASSERT_EQ(pool.compileOrGet(5, d0, 1, codeFor(5)).status,
             EJitCompileOrGetStatus::EnqueuedPending);
   ASSERT_TRUE(pool.pollOne());
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->postPublishSeen.loadRelaxed(), 0u);
 
   // Hits remain ordinary cache hits and do not enqueue Tier-2.
   for (int i = 0; i < 10; ++i) {
@@ -5243,9 +5338,8 @@ TEST_F(SharedTaskPoolTest, SharedPgoOffZeroOverhead) {
   EXPECT_EQ(pool.pendingCount(), 0u); // no Tier-2 enqueued
 
   // hitCount stays at 0 (threshold was never set).
-  EJitSharedCacheSlot *slot = findReadySlot(5);
-  ASSERT_NE(slot, nullptr);
   EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+  EXPECT_EQ(slot->postPublishSeen.loadRelaxed(), 1u);
 }
 
 // PGO threshold=0 (setPgoEnabled(true,0)) → counting disabled, no trigger.

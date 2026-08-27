@@ -128,7 +128,7 @@ unsigned      ejit_taskpool_pending_count(void); // 在途数量
 
 > 若 `cacheHits` 等逐调用计数全为零，说明运行库未启用逐调用统计（这些计数有热点路径开销，默认关闭）；`print_compiled()`、`get_worker_core()`、`pending_count()` 不受此影响，始终可用。
 
-`ejit_taskpool_print_compiled()` 的摘要中，`entries` 是本次尽力遍历到的 Ready 特化数，`slots` 是 cache 占用，`buckets skipped` 表示遍历时因并发竞争而跳过的 bucket；因此它不是强一致快照。明细中的 `dims=[d:i,...]` 表示 `dimType:instanceId`。VERBOSE 级额外显示各维度版本 `ver`、代码大小 `size`、代码池 `pool` 和发布代数 `gen`。
+`ejit_taskpool_print_compiled()` 的摘要中，`entries` 是本次尽力遍历到的 Ready 特化数，`slots` 是 cache 占用，`buckets skipped` 表示遍历时因并发竞争而跳过的 bucket；因此它不是强一致快照。摘要分别统计 `baseline/tier1_collecting/tier2`、主代码池落点和带 MFS 冷区的版本数。明细中的 `dims=[d:i,...]` 表示 `dimType:instanceId`，`pool=near|far` 表示入口代码实际落点，`mfs_cold=yes` 表示同一版本还有 `.text.ejit_cold` companion range。VERBOSE 级额外显示各维度版本 `ver`、热代码大小 `size`、`cold_size`、池内编号 `pool_id` 和发布代数 `gen`。
 
 ### 2.3 代码池统计
 
@@ -145,11 +145,18 @@ typedef struct ejit_code_pool_stats_t {
   uint64_t finalizedRangeCount; // 记录的可执行区间数
 } ejit_code_pool_stats_t;
 
+typedef struct ejit_code_pool_stats_v2_t {
+  ejit_code_pool_stats_t total; // 两个池合计，与旧接口相同
+  ejit_code_pool_stats_t near;  // 最终 Baseline / Tier-2 固定近端池
+  ejit_code_pool_stats_t far;   // 临时 Instrumented Tier-1 动态池
+} ejit_code_pool_stats_v2_t;
+
 ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
+ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
 void          ejit_print_code_pool_stats(void);
 ```
 
-**作用**：监控 JIT 代码内存占用与是否趋近耗尽（`usedBytes` vs `reservedBytes`）。返回值：`EJIT_OK` 成功；`EJIT_ERR_NOT_ACTIVE` 运行时未初始化；`EJIT_ERR_INVALID_PARAM` 入参为空；`EJIT_ERR_DISABLED` 运行库未含代码池支持。
+**作用**：监控 JIT 代码内存占用与是否趋近耗尽（`usedBytes` vs `reservedBytes`）。旧接口保持 ABI 不变并返回全部池合计；v2 的 `near` 合并 hot/cold 固定池以保持 ABI，v3 进一步拆分 `nearHot/nearCold/farTier1`。`ejit_print_code_pool_stats()` 同时打印 `total`、`near-hot(final)`、`near-cold(mfs)` 和 `far(tier1)`。返回值：`EJIT_OK` 成功；`EJIT_ERR_NOT_ACTIVE` 运行时未初始化；`EJIT_ERR_INVALID_PARAM` 入参为空；`EJIT_ERR_DISABLED` 运行库未含代码池支持。
 
 **结构体解读**：
 
@@ -193,7 +200,7 @@ void ejit_print_dumped(const char *name);// 打印 entry 函数视图；NULL/"" 
 void ejit_print_dumped_module(const char *name); // 打印完整特化模块视图
 ```
 
-运行时按函数名过滤捕获后续 JIT 编译产生的**优化后 IR 与汇编**，再通过 RAW 诊断输出逐行回读。`ejit_print_dumped(name)` 只显示指定 entry 函数，便于聚焦单函数；`ejit_print_dumped_module(name)` 显示该 entry 对应的完整特化模块，包括模块中保留的被调函数。
+运行时按函数名过滤捕获后续 JIT 编译产生的**优化后 IR 与汇编**，再通过 RAW 诊断输出逐行回读。在线 PGO 开启时会跳过临时 Tier-1 插桩代码，只捕获最终发布的 Tier-2；这样不会因诊断汇编生成而额外拉长 Tier-1 的生命周期竞争窗口。`ejit_print_dumped(name)` 只显示指定 entry 函数，便于聚焦单函数；`ejit_print_dumped_module(name)` 显示该 entry 对应的完整特化模块，包括模块中保留的被调函数。
 
 > - 捕获为**精确名匹配**，`"*"` 例外（捕获全部）。
 > - 每次捕获同时保存单函数视图和完整模块视图；同名函数重新编译时替换旧记录。

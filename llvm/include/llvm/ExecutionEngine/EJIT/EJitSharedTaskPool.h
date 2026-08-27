@@ -744,7 +744,9 @@ public:
     return pgoEnabled_.loadRelaxed() != 0;
   }
 
-  /// Return true when this miss may start/continue a staged PGO function.
+  /// Return true when this miss may start a staged PGO function. Only one
+  /// specialization of a funcIndex may own admission at a time; later versions
+  /// stay on AOT until the current Tier-2 finishes.
   bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
@@ -1098,6 +1100,10 @@ private:
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
     void *fnPtr = nullptr;
+    /// Matched shared slot for post-validation diagnostics. A token-bearing
+    /// hit keeps it stable; NO_RECLAIM marks it only after the outer seqlock
+    /// validation has accepted the lookup.
+    EJitSharedCacheSlot *slot = nullptr;
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;
@@ -1208,6 +1214,8 @@ private:
     uint64_t codeSize = 0;
     uintptr_t poolBase = 0;
     uint64_t poolSize = 0;
+    uint32_t extraCodeCount = 0;
+    EJitSharedExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges] = {};
     /// Runtime-writable extents (e.g. __profc_) this core must enable_rw before
     /// it may execute the code. Snapshotted with the range so the per-core
     /// enable_rw runs with NO bucket lock held. writableCount 0 => none.
@@ -1259,7 +1267,8 @@ private:
   /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
   /// completion and terminal worker failures call this; transient queue-full
   /// leaves ownership intact so the next hit can retry.
-  void finishPgoFunction(uint32_t funcIndex, bool completed);
+  void finishPgoFunction(uint32_t funcIndex, bool completed,
+                         const char *reason = nullptr);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every

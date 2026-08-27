@@ -127,6 +127,15 @@ extern const unsigned char __ejit_code_end[] __attribute__((weak));
 extern const unsigned char __ejit_code_start[];
 extern const unsigned char __ejit_code_end[];
 #endif
+#ifdef EJIT_MFS_COLD_CODE_POOL
+#ifndef EJIT_FREESTANDING
+extern const unsigned char __ejit_cold_code_start[] __attribute__((weak));
+extern const unsigned char __ejit_cold_code_end[] __attribute__((weak));
+#else
+extern const unsigned char __ejit_cold_code_start[];
+extern const unsigned char __ejit_cold_code_end[];
+#endif
+#endif
 }
 #endif
 
@@ -183,13 +192,21 @@ unsigned sealAndSyncCache(uintptr_t Va, size_t Size) {
 } // namespace
 
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
-llvm::ejit::makeSreCodePoolManager() {
+llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   EJitCodePoolManager::Options Opts;
+  Opts.kind =
+      Placement == EJitCodePoolPlacement::NearFixed   ? EJitCodePoolKind::Near
+      : Placement == EJitCodePoolPlacement::ColdFixed ? EJitCodePoolKind::Cold
+                                                      : EJitCodePoolKind::Far;
   Opts.poolSize = static_cast<size_t>(kSrePoolSize);
   Opts.poolAlign = k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
-  EJIT_DIAG_VERBOSE("makeSreCodePoolManager: poolSize=%llu poolAlign=%zu",
-                    kSrePoolSize, k2MiB);
+  EJIT_DIAG_VERBOSE(
+      "makeSreCodePoolManager: kind=%s poolSize=%llu poolAlign=%zu",
+      Placement == EJitCodePoolPlacement::NearFixed   ? "near-hot"
+      : Placement == EJitCodePoolPlacement::ColdFixed ? "near-cold"
+                                                      : "far-tier1",
+      kSrePoolSize, k2MiB);
 #ifdef EJIT_CODE_POOL_4K_SEAL
   // Adapt to the platform's 4K execute-permission interface: the 2MiB pool is
   // split into 4K mappings at creation and sealed one 4KiB page at a time.
@@ -208,36 +225,50 @@ llvm::ejit::makeSreCodePoolManager() {
   // fall back to SRE_MemDbgAlloc (a too-small fixed region would exhaust on
   // every compile). A fixed region gives a stable JIT address range and, when
   // placed within +-128MiB of .text, lets codegen use direct bl/adrp.
-  {
-    uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
-    uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
+  if (Placement != EJitCodePoolPlacement::FarDynamic) {
+    uintptr_t FBase = 0;
+    uintptr_t FEnd = 0;
+    const char *RegionName = ".text.ejit";
+    if (Placement == EJitCodePoolPlacement::NearFixed) {
+      FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
+      FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
+    }
+#ifdef EJIT_MFS_COLD_CODE_POOL
+    else {
+      FBase = reinterpret_cast<uintptr_t>(__ejit_cold_code_start);
+      FEnd = reinterpret_cast<uintptr_t>(__ejit_cold_code_end);
+      RegionName = ".text.ejit_cold";
+    }
+#endif
     uintptr_t AlignedBase =
         (FBase + (static_cast<uintptr_t>(k2MiB) - 1)) &
         ~(static_cast<uintptr_t>(k2MiB) - 1);
     if (FEnd > AlignedBase && (FEnd - AlignedBase) >= kSrePoolSize) {
       Opts.fixedBase = AlignedBase;
       Opts.fixedSize = FEnd - AlignedBase;
-      EJIT_DIAG("makeSreCodePoolManager: FIXED region sym=[0x%llx,0x%llx) "
-                "alignedBase=0x%llx usable=%llu (~%llu pools of %lluB)",
-                static_cast<unsigned long long>(FBase),
-                static_cast<unsigned long long>(FEnd),
-                static_cast<unsigned long long>(AlignedBase),
-                static_cast<unsigned long long>(FEnd - AlignedBase),
-                static_cast<unsigned long long>((FEnd - AlignedBase) / kSrePoolSize),
-                static_cast<unsigned long long>(kSrePoolSize));
+      EJIT_DIAG(
+          "makeSreCodePoolManager: FIXED %s region "
+          "sym=[0x%llx,0x%llx) "
+          "alignedBase=0x%llx usable=%llu (~%llu pools of %lluB)",
+          RegionName, static_cast<unsigned long long>(FBase),
+          static_cast<unsigned long long>(FEnd),
+          static_cast<unsigned long long>(AlignedBase),
+          static_cast<unsigned long long>(FEnd - AlignedBase),
+          static_cast<unsigned long long>((FEnd - AlignedBase) / kSrePoolSize),
+          static_cast<unsigned long long>(kSrePoolSize));
     } else {
-      EJIT_DIAG("makeSreCodePoolManager: fixed region absent or too small after "
-                "2MiB alignment (sym=[0x%llx,0x%llx) alignedBase=0x%llx "
-                "usable=%llu < poolSize=%llu), falling back to SRE_MemDbgAlloc "
-                "ptNo=%u",
-                static_cast<unsigned long long>(FBase),
-                static_cast<unsigned long long>(FEnd),
-                static_cast<unsigned long long>(AlignedBase),
-                static_cast<unsigned long long>(FEnd > AlignedBase
-                                                    ? FEnd - AlignedBase
-                                                    : 0),
-                static_cast<unsigned long long>(kSrePoolSize),
-                static_cast<unsigned>(kSrePtNo));
+      EJIT_DIAG(
+          "makeSreCodePoolManager: fixed %s region absent or too small after "
+          "2MiB alignment (sym=[0x%llx,0x%llx) alignedBase=0x%llx "
+          "usable=%llu < poolSize=%llu), falling back to SRE_MemDbgAlloc "
+          "ptNo=%u",
+          RegionName, static_cast<unsigned long long>(FBase),
+          static_cast<unsigned long long>(FEnd),
+          static_cast<unsigned long long>(AlignedBase),
+          static_cast<unsigned long long>(
+              FEnd > AlignedBase ? FEnd - AlignedBase : 0),
+          static_cast<unsigned long long>(kSrePoolSize),
+          static_cast<unsigned>(kSrePtNo));
     }
   }
 #endif

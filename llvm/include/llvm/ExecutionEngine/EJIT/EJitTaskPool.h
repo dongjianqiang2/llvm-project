@@ -45,6 +45,7 @@ enum class EJitCompileOrGetStatus : uint32_t {
   InstanceDisabled,
   EnqueuedPending,
   AlreadyPending,
+  PgoAdmissionDeferred,
   QueueFullFallback,
   CompileFailed,
   InvalidParam,

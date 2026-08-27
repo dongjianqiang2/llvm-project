@@ -36,6 +36,12 @@ namespace ejit {
 class EJitCodePoolMemoryManager : public jitlink::JITLinkMemoryManager {
 public:
   EJitCodePoolMemoryManager(EJitCodePoolManager &Pool, size_t PageSize);
+  EJitCodePoolMemoryManager(EJitCodePoolManager &NearPool,
+                            EJitCodePoolManager &FarPool, size_t PageSize);
+  EJitCodePoolMemoryManager(EJitCodePoolManager &NearPool,
+                            EJitCodePoolManager &ColdPool,
+                            EJitCodePoolManager &FarPool, size_t PageSize);
+  ~EJitCodePoolMemoryManager() override;
 
   void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
                 OnAllocatedFunction OnAllocated) override;
@@ -47,14 +53,25 @@ public:
   using JITLinkMemoryManager::allocate;
   using JITLinkMemoryManager::deallocate;
 
-  EJitCodePoolManager &getPool() { return Pool_; }
+  EJitCodePoolManager &getPool() { return NearPool_; }
+
+  /// Resolve an entry pointer to every executable extent in its finalized
+  /// allocation. A split Tier-2 allocation has a hot primary range and one
+  /// cold companion range that peers must also make executable.
+  bool findAllocation(const void *Ptr, EJitCompiledCodeInfo &Out) const;
 
 private:
   class InFlightAllocImpl;
   struct FinalizedInfo;
+  struct State;
 
-  EJitCodePoolManager &Pool_;
+  EJitCodePoolManager &selectPool(const jitlink::JITLinkDylib *JD) const;
+
+  EJitCodePoolManager &NearPool_;
+  EJitCodePoolManager *ColdPool_ = nullptr;
+  EJitCodePoolManager *FarPool_ = nullptr;
   size_t PageSize_;
+  std::unique_ptr<State> State_;
 };
 
 } // namespace ejit

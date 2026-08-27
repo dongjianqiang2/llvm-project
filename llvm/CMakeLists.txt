@@ -736,6 +736,22 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
                  "(size is __ejit_code_end - __ejit_code_start from the linker script's .text.ejit block)")
 endif()
 
+# Split profile-cold machine basic blocks out of final Tier-2 code and place
+# them in a second fixed RX linker-script region. This is opt-in because an
+# enabled freestanding build requires the product linker script to provide
+# __ejit_cold_code_start/__ejit_cold_code_end around .text.ejit_cold.
+option(EJIT_MFS_COLD_CODE_POOL
+  "Enable MachineFunctionSplitter for profiled JIT code and place cold blocks in .text.ejit_cold" OFF)
+if(EJIT_MFS_COLD_CODE_POOL)
+  if(NOT EJIT_SRE_CODE_POOL OR NOT EJIT_FIXED_CODE_POOL)
+    message(FATAL_ERROR
+      "EJIT_MFS_COLD_CODE_POOL requires EJIT_SRE_CODE_POOL=ON and EJIT_FIXED_CODE_POOL=ON")
+  endif()
+  add_definitions(-DEJIT_MFS_COLD_CODE_POOL)
+  message(STATUS "EmbeddedJIT: MFS cold code pool enabled "
+                 "(.text.ejit_cold, __ejit_cold_code_start/end)")
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

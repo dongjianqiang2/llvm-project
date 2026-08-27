@@ -650,12 +650,13 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       // dynamic SRE_MemDbgAlloc pool is already RW, so the ranges are then
       // diagnostic only.
       Out.requiresPeerEnableRw = Opts_.needsEnableRw ? 1u : 0u;
-      Out.reserved = 0;
+      Out.poolKind = Opts_.kind;
       EJIT_DIAG("findRange OK: ptr=%p codeStart=0x%llx codeSize=%llu poolId=%u "
-                "writable=%u peerRw=%u",
+                "kind=%u writable=%u peerRw=%u",
                 Ptr, static_cast<unsigned long long>(Out.codeStart),
                 static_cast<unsigned long long>(Out.codeSize), Out.poolId,
-                Out.writableCount, Out.requiresPeerEnableRw);
+                static_cast<unsigned>(Out.poolKind), Out.writableCount,
+                Out.requiresPeerEnableRw);
       return true;
     }
   }

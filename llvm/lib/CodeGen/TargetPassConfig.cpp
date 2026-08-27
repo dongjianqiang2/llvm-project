@@ -1301,6 +1301,16 @@ void TargetPassConfig::addMachinePasses() {
   }
 #endif
 
+#if defined(EJIT_MFS_COLD_CODE_POOL) &&                                        \
+    defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+  // The embedded backend trims the surrounding AutoFDO/BB-section machinery,
+  // but Tier-2 already carries an in-memory instrumentation profile. Restore
+  // only MFS: it consumes the IR profile through MBFI/PSI and emits the cold
+  // blocks as .text.split.<function> sections.
+  if (TM->Options.EnableMachineFunctionSplitter)
+    addPass(createMachineFunctionSplitterPass());
+#endif
+
   addPostBBSections();
 
   if (!DisableCFIFixup && TM->Options.EnableCFIFixup)

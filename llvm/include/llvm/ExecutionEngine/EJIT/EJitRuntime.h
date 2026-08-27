@@ -137,6 +137,22 @@ typedef struct ejit_code_pool_stats_t {
   uint64_t finalizedRangeCount; ///< distinct executable ranges recorded
 } ejit_code_pool_stats_t;
 
+/// Placement-aware code-pool statistics. The original stats API remains ABI
+/// stable and returns `total`; use this v2 shape to distinguish final code in
+/// the near fixed pool from temporary Tier-1 code in the far dynamic pool.
+typedef struct ejit_code_pool_stats_v2_t {
+  ejit_code_pool_stats_t total;
+  ejit_code_pool_stats_t near;
+  ejit_code_pool_stats_t far;
+} ejit_code_pool_stats_v2_t;
+
+typedef struct ejit_code_pool_stats_v3_t {
+  ejit_code_pool_stats_t total;
+  ejit_code_pool_stats_t nearHot;
+  ejit_code_pool_stats_t nearCold;
+  ejit_code_pool_stats_t farTier1;
+} ejit_code_pool_stats_v3_t;
+
 typedef struct {
   int code;
   char message[256];
@@ -338,6 +354,9 @@ typedef struct {
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
 
 void ejit_taskpool_print_stats();
+/// Print every published shared-cache version and its dimensions. Stats builds
+/// also report whether a later taskpool lookup reused each published version;
+/// wrapper inline-cache calls after that first reuse remain intentionally free.
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
@@ -428,15 +447,21 @@ void ejit_print_func_meta(const char *funcName);
 /// embedded code-memory exhaustion. Mirrors EJitCodePoolManager::Stats.
 ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
 
+/// Placement-aware counterpart; near includes hot and MFS-cold fixed pools.
+ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
+/// Three-way placement breakdown for hot final, MFS cold, and Tier-1 code.
+ejit_status_t ejit_get_code_pool_stats_v3(ejit_code_pool_stats_v3_t *out);
+
 /// Print code pool usage statistics through the platform log. Paired with
 /// ejit_get_code_pool_stats() (human-readable form).
 void ejit_print_code_pool_stats(void);
 
 /// Print a ranking for every sampled ejit_entry function. The ranking is
-/// ordered by the average number of may_const loads removed across its JIT
-/// specializations. Call this explicitly after the audit sampling windows have
-/// completed. In a shared-taskpool build, a non-owner core forwards the request
-/// to the compile-owner worker and waits for printing to finish.
+/// ordered by dynamically removed may_const load executions per million
+/// platform timestamp units (removed work per entry times entry frequency).
+/// Call this explicitly after the audit sampling windows have completed. In a
+/// shared-taskpool build, a non-owner core forwards the request to the
+/// compile-owner worker and waits for printing to finish.
 void ejit_print_mayconst_ranking(void);
 
 /// Print the currently-active time-window instances through the platform log:

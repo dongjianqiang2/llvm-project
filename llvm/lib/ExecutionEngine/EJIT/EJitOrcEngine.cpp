@@ -88,10 +88,13 @@ static void collectReferencedExternalDecls(
 
 struct EJitOrcEngine::Impl {
 #ifdef EJIT_SRE_CODE_POOL
-  /// Dedicated 2MiB code pools backing all JIT machine code. Declared before
-  /// J so it outlives the LLJIT (and the memory manager the object linking
-  /// layer owns, which references it).
-  std::unique_ptr<EJitCodePoolManager> codePool;
+  /// Final Baseline/Tier-2 code stays near AOT .text; temporary instrumented
+  /// Tier-1 code uses the previous dynamic SRE allocation path. Both outlive
+  /// LLJIT and its routing memory manager.
+  std::unique_ptr<EJitCodePoolManager> nearCodePool;
+  std::unique_ptr<EJitCodePoolManager> coldCodePool;
+  std::unique_ptr<EJitCodePoolManager> farCodePool;
+  EJitCodePoolMemoryManager *codePoolMemoryManager = nullptr;
 #endif
   std::unique_ptr<orc::LLJIT> J;
   PeriodArrayRegistry *periodReg = nullptr;
@@ -256,6 +259,7 @@ static bool getActiveDumpFilter(std::string &out) {
 /// Saved IR+ASM for a captured specialization (latest per function name).
 struct DumpEntry {
   uint64_t cacheKey = 0;
+  CompileTier tier = CompileTier::Baseline;
   std::string FunctionIR;
   std::string FunctionASM;
   std::string ModuleIR;
@@ -405,6 +409,7 @@ static bool printSharedDumpHint(const char *name) {
 /// Called from the IR transform layer when the filter matches: save the
 /// post-optimization IR and emitted ASM for later selective printing.
 static void captureDump(const std::string &fnName, uint64_t cacheKey,
+                        CompileTier tier,
                         std::string FunctionIR, std::string FunctionASM,
                         std::string ModuleIR, std::string ModuleASM) {
   EJIT_DIAG_DEBUG(
@@ -416,7 +421,7 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
   std::lock_guard<DumpMutexType> lock(gDumpMutex);
   EJIT_DIAG_DEBUG("capture store_size before=%u", (unsigned)gDumpStore.size());
   gDumpStore[fnName] =
-      DumpEntry{cacheKey, std::move(FunctionIR), std::move(FunctionASM),
+      DumpEntry{cacheKey, tier, std::move(FunctionIR), std::move(FunctionASM),
                 std::move(ModuleIR), std::move(ModuleASM)};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)gDumpStore.size());
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -447,6 +452,12 @@ void detail::renderDumpModuleIR(const Module &M, std::string &out) {
   raw_string_ostream OS(out);
   M.print(OS, nullptr);
   OS.flush();
+}
+
+bool detail::shouldCaptureDump(CompileTier tier, StringRef filter,
+                               StringRef fnName) {
+  return tier != CompileTier::Instrumented && !filter.empty() &&
+         (filter == "*" || filter == fnName);
 }
 
 /// Clone a diagnostic codegen module with only the requested function body.
@@ -485,10 +496,13 @@ static void printOneDumpSafe(const char *requestedName,
   uint32_t keyLo = (uint32_t)(e.cacheKey & 0xffffffffu);
   (void)keyHi;
   (void)keyLo;
-  EJIT_DIAG_RAW("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
-                "key_lo=0x%08x ir_size=%u asm_size=%u",
+  const char *Tier = e.tier == CompileTier::PGOUse ? "tier2"
+                     : e.tier == CompileTier::Instrumented ? "tier1"
+                                                          : "baseline";
+  EJIT_DIAG_RAW("print_dumped hit requested=%s stored=%s tier=%s "
+                "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u",
                 requestedName ? requestedName : "(list)", storedName.c_str(),
-                keyHi, keyLo, (unsigned)e.FunctionIR.size(),
+                Tier, keyHi, keyLo, (unsigned)e.FunctionIR.size(),
                 (unsigned)e.FunctionASM.size());
   if (!e.FunctionIR.empty())
     dumpLinesSafe("dump IR", e.FunctionIR);
@@ -503,10 +517,13 @@ static void printOneModuleDumpSafe(const char *requestedName,
   uint32_t keyLo = (uint32_t)(e.cacheKey & 0xffffffffu);
   (void)keyHi;
   (void)keyLo;
-  EJIT_DIAG_RAW("print_dumped_module hit requested=%s stored=%s "
+  const char *Tier = e.tier == CompileTier::PGOUse ? "tier2"
+                     : e.tier == CompileTier::Instrumented ? "tier1"
+                                                          : "baseline";
+  EJIT_DIAG_RAW("print_dumped_module hit requested=%s stored=%s tier=%s "
                 "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u",
                 requestedName ? requestedName : "(list)", storedName.c_str(),
-                keyHi, keyLo, (unsigned)e.ModuleIR.size(),
+                Tier, keyHi, keyLo, (unsigned)e.ModuleIR.size(),
                 (unsigned)e.ModuleASM.size());
   if (!e.ModuleIR.empty())
     dumpLinesSafe("dump module IR", e.ModuleIR);
@@ -624,6 +641,9 @@ EJitOrcEngine::Create(const Config &config,
   // the specialization savings (fewer BBs / folded branches). Small makes
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
   JTMBOrErr->setCodeModel(CodeModel::Small);
+#ifdef EJIT_MFS_COLD_CODE_POOL
+  JTMBOrErr->getOptions().EnableMachineFunctionSplitter = true;
+#endif
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
@@ -653,19 +673,35 @@ EJitOrcEngine::Create(const Config &config,
   // engine (so it outlives the LLJIT); the object linking layer owns a memory
   // manager that references it. Pages are kept RW here and sealed to RX later,
   // at lookup time, by the pool manager's enable_ex sealing.
-  engine->P->codePool = makeSreCodePoolManager();
+  engine->P->nearCodePool =
+      makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed);
+#ifdef EJIT_MFS_COLD_CODE_POOL
+  engine->P->coldCodePool =
+      makeSreCodePoolManager(EJitCodePoolPlacement::ColdFixed);
+#endif
+  engine->P->farCodePool =
+      makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic);
   {
-    EJitCodePoolManager *Pool = engine->P->codePool.get();
+    EJitCodePoolManager *NearPool = engine->P->nearCodePool.get();
+    EJitCodePoolManager *ColdPool = engine->P->coldCodePool.get();
+    EJitCodePoolManager *FarPool = engine->P->farCodePool.get();
+    Impl *EngineImpl = engine->P.get();
     Builder.setObjectLinkingLayerCreator(
-        [Pool](orc::ExecutionSession &ES)
+        [NearPool, ColdPool, FarPool, EngineImpl](orc::ExecutionSession &ES)
             -> Expected<std::unique_ptr<orc::ObjectLayer>> {
           // Page size only affects per-segment layout padding; we never apply
           // per-segment protections (sealing is done per 2MiB pool), so a
           // conservative 4KiB is sufficient and portable.
           constexpr size_t JitPageSize = 4096;
-          return std::make_unique<orc::ObjectLinkingLayer>(
-              ES, std::make_unique<EJitCodePoolMemoryManager>(*Pool,
-                                                              JitPageSize));
+          std::unique_ptr<EJitCodePoolMemoryManager> MM;
+          if (ColdPool)
+            MM = std::make_unique<EJitCodePoolMemoryManager>(
+                *NearPool, *ColdPool, *FarPool, JitPageSize);
+          else
+            MM = std::make_unique<EJitCodePoolMemoryManager>(
+                *NearPool, *FarPool, JitPageSize);
+          EngineImpl->codePoolMemoryManager = MM.get();
+          return std::make_unique<orc::ObjectLinkingLayer>(ES, std::move(MM));
         });
   }
 #endif
@@ -788,8 +824,12 @@ EJitOrcEngine::Create(const Config &config,
           {
             std::string DumpFilter;
             bool hasFilter = getActiveDumpFilter(DumpFilter);
-            bool match =
-                hasFilter && (DumpFilter == "*" || ctx->fnName == DumpFilter);
+            // Tier-1 is temporary profiling code. Capturing it doubles the
+            // already expensive diagnostic ASM codegen and lengthens the
+            // lifecycle race window before publish. The public dump APIs show
+            // executable final code: Baseline when PGO is off, Tier-2 when on.
+            bool match = hasFilter && detail::shouldCaptureDump(
+                                          ctx->tier, DumpFilter, ctx->fnName);
             EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
                             "key_lo=0x%08x match=%d &filter=%p",
                             hasFilter ? DumpFilter.c_str() : "(off)",
@@ -846,7 +886,7 @@ EJitOrcEngine::Create(const Config &config,
                               "EJIT_DUMP_ASM off) fn=%s; IR captured",
                               ctx->fnName.c_str());
 #endif
-              captureDump(ctx->fnName, ctx->cacheKey,
+              captureDump(ctx->fnName, ctx->cacheKey, ctx->tier,
                           std::move(FunctionIR), std::move(FunctionAsm),
                           std::move(ModuleIR), std::move(ModuleAsm));
             }
@@ -984,7 +1024,13 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     P->specDylibs.erase(it);
   }
 
-  auto JDOrErr = P->J->createJITDylib("spec_" + std::to_string(cacheKey));
+  const char *TierTag =
+      P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented
+          ? "t1"
+          : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse ? "t2"
+                                                                      : "base";
+  auto JDOrErr = P->J->createJITDylib("spec_" + std::string(TierTag) + "_" +
+                                      std::to_string(cacheKey));
   if (!JDOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
     return JDOrErr.takeError();
@@ -1118,13 +1164,36 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
   //
   // In 4K page-seal mode the seal already happened per-page at finalize (in the
   // code-pool memory manager), so nothing is done here.
-  if (P->codePool && !P->codePool->usesPageSeal() &&
-      P->codePool->contains(Ptr)) {
-    if (auto Err = P->codePool->sealPoolContaining(Ptr)) {
+  EJitCodePoolManager *OwningPool = nullptr;
+  if (P->nearCodePool && P->nearCodePool->contains(Ptr))
+    OwningPool = P->nearCodePool.get();
+  else if (P->coldCodePool && P->coldCodePool->contains(Ptr))
+    OwningPool = P->coldCodePool.get();
+  else if (P->farCodePool && P->farCodePool->contains(Ptr))
+    OwningPool = P->farCodePool.get();
+  if (OwningPool && !OwningPool->usesPageSeal()) {
+    if (auto Err = OwningPool->sealPoolContaining(Ptr)) {
       EJIT_DIAG("lookup FAIL key=0x%016lx ptr=%p: seal pool error", cacheKey,
                 Ptr);
       return std::move(Err);
     }
+  }
+  // Legacy whole-pool mode must also seal MFS's companion cold extent before
+  // the entry pointer can be published. In 4K mode finalize already sealed it.
+  if (P->codePoolMemoryManager) {
+    EJitCompiledCodeInfo Info{};
+    if (P->codePoolMemoryManager->findAllocation(Ptr, Info))
+      for (uint32_t I = 0; I < Info.extraCodeCount; ++I) {
+        const EJitExecutableRange &R = Info.extraCodeRanges[I];
+        EJitCodePoolManager *ExtraPool =
+            R.poolKind == EJitCodePoolKind::Cold  ? P->coldCodePool.get()
+            : R.poolKind == EJitCodePoolKind::Far ? P->farCodePool.get()
+                                                  : P->nearCodePool.get();
+        if (ExtraPool && !ExtraPool->usesPageSeal())
+          if (auto Err = ExtraPool->sealPoolContaining(
+                  reinterpret_cast<void *>(R.codeStart)))
+            return std::move(Err);
+      }
   }
 #endif
 
@@ -1172,17 +1241,46 @@ void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
 
 #ifdef EJIT_SRE_CODE_POOL
 EJitCodePoolManager::Stats EJitOrcEngine::getCodePoolStats() const {
-  if (P->codePool)
-    return P->codePool->getStats();
-  return EJitCodePoolManager::Stats{};
+  return getTieredCodePoolStats().total;
+}
+
+EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
+  EJitTieredCodePoolStats Out;
+  if (P->nearCodePool)
+    Out.near = P->nearCodePool->getStats();
+  if (P->coldCodePool)
+    Out.cold = P->coldCodePool->getStats();
+  if (P->farCodePool)
+    Out.far = P->farCodePool->getStats();
+#define EJIT_SUM_STAT(Field)                                                   \
+  Out.total.Field = Out.near.Field + Out.cold.Field + Out.far.Field
+  EJIT_SUM_STAT(poolCount);
+  EJIT_SUM_STAT(sealedCount);
+  EJIT_SUM_STAT(activeCount);
+  EJIT_SUM_STAT(usedBytes);
+  EJIT_SUM_STAT(reservedBytes);
+  EJIT_SUM_STAT(wastedBytes);
+  EJIT_SUM_STAT(sealInvocations);
+  EJIT_SUM_STAT(splitInvocations);
+  EJIT_SUM_STAT(rwEnableInvocations);
+  EJIT_SUM_STAT(finalizedRangeCount);
+#undef EJIT_SUM_STAT
+  return Out;
 }
 
 bool EJitOrcEngine::findCodeRange(const void *FnPtr,
                                   EJitCompiledCodeInfo &Out) const {
-  if (!P->codePool) {
+  if (!P->nearCodePool && !P->coldCodePool && !P->farCodePool) {
     EJIT_DIAG("findCodeRange FAIL: no code pool (fnPtr=%p)", FnPtr);
     return false;
   }
-  return P->codePool->findRange(FnPtr, Out);
+  if (P->codePoolMemoryManager &&
+      P->codePoolMemoryManager->findAllocation(FnPtr, Out))
+    return true;
+  if (P->nearCodePool && P->nearCodePool->findRange(FnPtr, Out))
+    return true;
+  if (P->coldCodePool && P->coldCodePool->findRange(FnPtr, Out))
+    return true;
+  return P->farCodePool && P->farCodePool->findRange(FnPtr, Out);
 }
 #endif

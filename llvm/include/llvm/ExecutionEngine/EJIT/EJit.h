@@ -21,6 +21,8 @@
 // C++ core. C language linkage to match the definition in EJitRuntime.h.
 extern "C" {
 struct ejit_code_pool_stats_t;
+struct ejit_code_pool_stats_v2_t;
+struct ejit_code_pool_stats_v3_t;
 }
 
 namespace llvm {
@@ -157,6 +159,12 @@ public:
   /// Fill \p out with code pool usage stats. Returns false if not initialized
   /// or built without EJIT_SRE_CODE_POOL. For ejit_get_code_pool_stats().
   bool getCodePoolStats(ejit_code_pool_stats_t *out) const;
+
+  /// Fill aggregate plus ABI-compatible near/far statistics. near includes
+  /// both hot and MFS-cold fixed pools.
+  bool getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const;
+  /// Fill aggregate plus near-hot/near-cold/far-Tier-1 statistics.
+  bool getCodePoolStatsV3(ejit_code_pool_stats_v3_t *out) const;
 
   /// Print code pool usage stats through EJIT_DIAG. For
   /// ejit_print_code_pool_stats().

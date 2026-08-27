@@ -17,6 +17,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
 #include "llvm/Support/Error.h"
@@ -118,6 +119,144 @@ TEST(EJitCodePoolMemMgr, CodeMemoryComesFromPool) {
   EXPECT_GT(S.usedBytes, 0u);
 
   auto FA = cantFail(IFA->finalize());
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+std::unique_ptr<LinkGraph> makeHotColdGraph() {
+  auto G = std::make_unique<LinkGraph>(
+      "hot-cold", std::make_shared<orc::SymbolStringPool>(),
+      Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
+      getGenericEdgeKindName);
+  auto &Hot =
+      G->createSection(".text.foo", orc::MemProt::Read | orc::MemProt::Exec);
+  auto &Cold = G->createSection(".text.split.foo",
+                                orc::MemProt::Read | orc::MemProt::Exec);
+  G->createContentBlock(Hot, ArrayRef<char>(CodeBytes, 32),
+                        orc::ExecutorAddr(0x1000), 16, 0);
+  G->createContentBlock(Cold, ArrayRef<char>(CodeBytes, 32),
+                        orc::ExecutorAddr(0x2000), 16, 0);
+  return G;
+}
+
+TEST(EJitCodePoolMemMgr, RoutesTemporaryTier1ToFarPool) {
+  MockSre M;
+  auto NearOpts = poolOpts(/*PoolSize=*/256 * 1024);
+  NearOpts.kind = EJitCodePoolKind::Near;
+  auto FarOpts = poolOpts(/*PoolSize=*/256 * 1024);
+  FarOpts.kind = EJitCodePoolKind::Far;
+  EJitCodePoolManager Near(
+      NearOpts, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); });
+  EJitCodePoolManager Far(
+      FarOpts, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); });
+  EJitCodePoolMemoryManager MM(Near, Far, /*PageSize=*/4096);
+
+  JITLinkDylib Tier1("spec_t1_1");
+  auto G1 = makeCodeGraph(64, 0x1000);
+  auto IFA1 = cantFail(MM.allocate(&Tier1, *G1));
+  void *Tier1Addr = firstBlockAddr(*G1);
+  auto FA1 = cantFail(IFA1->finalize());
+
+  EXPECT_FALSE(Near.contains(Tier1Addr));
+  EXPECT_TRUE(Far.contains(Tier1Addr));
+  EXPECT_EQ(Near.getStats().poolCount, 0u);
+  EXPECT_EQ(Far.getStats().poolCount, 1u);
+  EJitCompiledCodeInfo Tier1Info;
+  ASSERT_TRUE(Far.findRange(Tier1Addr, Tier1Info));
+  EXPECT_EQ(Tier1Info.poolKind, EJitCodePoolKind::Far);
+
+  JITLinkDylib Tier2("spec_t2_1");
+  auto G2 = makeCodeGraph(64, 0x2000);
+  auto IFA2 = cantFail(MM.allocate(&Tier2, *G2));
+  void *Tier2Addr = firstBlockAddr(*G2);
+  auto FA2 = cantFail(IFA2->finalize());
+
+  EXPECT_TRUE(Near.contains(Tier2Addr));
+  EXPECT_FALSE(Far.contains(Tier2Addr));
+  EXPECT_EQ(Near.getStats().poolCount, 1u);
+  EJitCompiledCodeInfo Tier2Info;
+  ASSERT_TRUE(Near.findRange(Tier2Addr, Tier2Info));
+  EXPECT_EQ(Tier2Info.poolKind, EJitCodePoolKind::Near);
+
+  cantFail(MM.deallocate(std::move(FA1)));
+  cantFail(MM.deallocate(std::move(FA2)));
+}
+
+TEST(EJitCodePoolMemMgr, RoutesMfsColdBlocksToCompanionPool) {
+  MockSre M;
+  auto HotOpts = poolOpts(256 * 1024);
+  HotOpts.kind = EJitCodePoolKind::Near;
+  auto ColdOpts = poolOpts(256 * 1024);
+  ColdOpts.kind = EJitCodePoolKind::Cold;
+  auto FarOpts = poolOpts(256 * 1024);
+  FarOpts.kind = EJitCodePoolKind::Far;
+  auto MakePool = [&](EJitCodePoolManager::Options Opts) {
+    return std::make_unique<EJitCodePoolManager>(
+        Opts, [&M](size_t N) { return M.rawAlloc(N); },
+        [&M](void *B) { return M.seal(B); });
+  };
+  auto Hot = MakePool(HotOpts);
+  auto Cold = MakePool(ColdOpts);
+  auto Far = MakePool(FarOpts);
+  EJitCodePoolMemoryManager MM(*Hot, *Cold, *Far, 4096);
+
+  JITLinkDylib Tier2("spec_t2_7");
+  auto G = makeHotColdGraph();
+  auto IFA = cantFail(MM.allocate(&Tier2, *G));
+  SmallVector<void *, 2> BlockAddrs;
+  for (Block *B : G->blocks())
+    BlockAddrs.push_back(B->getAddress().toPtr<void *>());
+  ASSERT_EQ(BlockAddrs.size(), 2u);
+  void *First = BlockAddrs[0];
+  void *Second = BlockAddrs[1];
+  void *HotAddr = Hot->contains(First) ? First : Second;
+  void *ColdAddr = Cold->contains(First) ? First : Second;
+  EXPECT_TRUE(Hot->contains(HotAddr));
+  EXPECT_TRUE(Cold->contains(ColdAddr));
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(MM.findAllocation(HotAddr, Info));
+  EXPECT_EQ(Info.poolKind, EJitCodePoolKind::Near);
+  ASSERT_EQ(Info.extraCodeCount, 1u);
+  EXPECT_EQ(Info.extraCodeRanges[0].poolKind, EJitCodePoolKind::Cold);
+  EXPECT_EQ(Info.extraCodeRanges[0].codeStart,
+            reinterpret_cast<uintptr_t>(ColdAddr));
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+TEST(EJitCodePoolMemMgr, ThreePoolManagerKeepsPureHotGraphInNearPool) {
+  MockSre M;
+  auto HotOpts = poolOpts(256 * 1024);
+  HotOpts.kind = EJitCodePoolKind::Near;
+  auto ColdOpts = poolOpts(256 * 1024);
+  ColdOpts.kind = EJitCodePoolKind::Cold;
+  auto FarOpts = poolOpts(256 * 1024);
+  FarOpts.kind = EJitCodePoolKind::Far;
+  auto MakePool = [&](EJitCodePoolManager::Options Opts) {
+    return std::make_unique<EJitCodePoolManager>(
+        Opts, [&M](size_t N) { return M.rawAlloc(N); },
+        [&M](void *B) { return M.seal(B); });
+  };
+  auto Hot = MakePool(HotOpts);
+  auto Cold = MakePool(ColdOpts);
+  auto Far = MakePool(FarOpts);
+  EJitCodePoolMemoryManager MM(*Hot, *Cold, *Far, 4096);
+
+  JITLinkDylib Tier2("spec_t2_hot_only");
+  auto G = makeCodeGraph(64, 0x1000);
+  auto IFA = cantFail(MM.allocate(&Tier2, *G));
+  void *HotAddr = firstBlockAddr(*G);
+  auto FA = cantFail(IFA->finalize());
+
+  EXPECT_TRUE(Hot->contains(HotAddr));
+  EXPECT_EQ(Cold->getStats().poolCount, 0u);
+  EXPECT_EQ(Far->getStats().poolCount, 0u);
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(MM.findAllocation(HotAddr, Info));
+  EXPECT_EQ(Info.poolKind, EJitCodePoolKind::Near);
+  EXPECT_EQ(Info.extraCodeCount, 0u);
   cantFail(MM.deallocate(std::move(FA)));
 }
 
