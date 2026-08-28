@@ -1071,8 +1071,8 @@ TEST_F(SharedTaskPoolTest, ExplicitBatchPublishDrainsPreexistingQueueFirst) {
 
   EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 1);
   ASSERT_EQ(Batch.compileOrder.size(), 2u);
-  EXPECT_EQ(stripReqTier(Batch.compileOrder[0].funcIndex), 47u);
-  EXPECT_EQ(stripReqTier(Batch.compileOrder[1].funcIndex), 48u);
+  EXPECT_EQ(stripReqTier(Batch.compileOrder[0].funcIndex), 48u);
+  EXPECT_EQ(stripReqTier(Batch.compileOrder[1].funcIndex), 47u);
 #if EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT != 0u &&                            \
     EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u
   // One queue drain plus two sorted ORC compiles happen inside this publish
@@ -1139,15 +1139,15 @@ TEST_F(SharedTaskPoolTest, BatchPgoTier2AutoPublishesWhenQueueDrains) {
     Owner.releaseRead(Tier1.bucketIndex);
   ASSERT_EQ(Owner.pendingCount(), 1u);
 
-  // Tier-2 compiles and links immediately, but remains owner-private and RW/NX
-  // until the worker observes the compile queue empty. Tier-1 stays allocated
-  // for counter synthesis, but dispatch falls back to AOT once sampling is
-  // complete instead of continuing atomic instrumentation while waiting.
+  // Tier-2 remains owner-private and uncompiled until the worker observes the
+  // queue empty. Tier-1 stays allocated for profile synthesis, but dispatch
+  // falls back to AOT once sampling is complete instead of continuing atomic
+  // instrumentation while waiting.
   ASSERT_TRUE(Owner.pollOne());
   EXPECT_EQ(Batch.flushCalls, 0u);
-  ASSERT_EQ(Batch.compileOrder.size(), 2u);
-  EXPECT_EQ(decodeReqTier(Batch.compileOrder[1].funcIndex), kEJitTierPgoUse);
-  EXPECT_EQ(Owner.pendingPublishCount(), 1u);
+  EXPECT_EQ(Batch.compileOrder.size(), 1u);
+  EXPECT_EQ(Owner.pendingBatchCompileCount(), 1u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
   EXPECT_EQ(Owner.pendingCount(), 1u);
 
   auto StillTier1 = Owner.tryCacheHit0D(46);
@@ -1161,6 +1161,9 @@ TEST_F(SharedTaskPoolTest, BatchPgoTier2AutoPublishesWhenQueueDrains) {
   ASSERT_TRUE(Owner.flushCodeBatch());
 #endif
   EXPECT_EQ(Batch.flushCalls, 1u);
+  ASSERT_EQ(Batch.compileOrder.size(), 2u);
+  EXPECT_EQ(decodeReqTier(Batch.compileOrder[1].funcIndex), kEJitTierPgoUse);
+  EXPECT_EQ(Owner.pendingBatchCompileCount(), 0u);
   EXPECT_EQ(Owner.pendingPublishCount(), 0u);
   EXPECT_EQ(Owner.pendingCount(), 0u);
 
@@ -1174,6 +1177,156 @@ TEST_F(SharedTaskPoolTest, BatchPgoTier2AutoPublishesWhenQueueDrains) {
   if (Tier2.hasReadToken)
     Owner.releaseRead(Tier2.bucketIndex);
 }
+
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+TEST_F(SharedTaskPoolTest, BatchPgoTier2SortsByCellBeforeJitLink) {
+  BatchPublishCtx Batch;
+  Batch.tier1ReadyImmediately = true;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockBatchCompile, &Batch);
+  Owner.setCodeRangeProvider(&mockBatchRange, &Batch);
+  Owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &Batch);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1, /*maxConcurrentProfiles=*/4);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  constexpr uint32_t Funcs[] = {73, 71, 72, 70};
+  constexpr uint32_t Cells[] = {3, 1, 2, 0};
+  for (uint32_t Cell : Cells)
+    Owner.setInstanceEnabled(0, Cell, true);
+
+  for (unsigned I = 0; I != 4; ++I) {
+    EJitDimPair Dims[1] = {dim(0, Cells[I])};
+    ASSERT_EQ(Owner.compileOrGet(Funcs[I], Dims, 1, codeFor(Funcs[I])).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+  }
+  ASSERT_EQ(Batch.compileOrder.size(), 4u);
+
+  // Complete profiling in deliberately non-lexicographic cell order.
+  for (unsigned I = 0; I != 4; ++I) {
+    EJitDimPair Dims[1] = {dim(0, Cells[I])};
+    auto Hit = Owner.tryCacheHit(Funcs[I], Dims, 1);
+    ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (Hit.hasReadToken)
+      Owner.releaseRead(Hit.bucketIndex);
+  }
+  ASSERT_EQ(Owner.pendingCount(), 4u);
+
+  for (unsigned I = 0; I != 4; ++I)
+    ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(Batch.compileOrder.size(), 4u)
+      << "Tier-2 must not allocate code before the layout batch is sorted";
+  EXPECT_EQ(Owner.pendingBatchCompileCount(), 4u);
+
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  ASSERT_EQ(Batch.compileOrder.size(), 8u);
+  for (unsigned I = 0; I != 4; ++I) {
+    const EJitCompileRequest &Req = Batch.compileOrder[4u + I];
+    EXPECT_EQ(decodeReqTier(Req.funcIndex), kEJitTierPgoUse);
+    ASSERT_EQ(Req.numDims, 1u);
+    EXPECT_EQ(Req.dims[0].instanceId, I);
+  }
+  EXPECT_EQ(Batch.flushCalls, 1u);
+  EXPECT_EQ(Owner.pendingBatchCompileCount(), 0u);
+  EXPECT_EQ(Owner.pendingPublishCount(), 0u);
+}
+
+TEST_F(SharedTaskPoolTest, BatchPgoTier2PreservesCallOrderWithinCell) {
+  BatchPublishCtx Batch;
+  Batch.tier1ReadyImmediately = true;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockBatchCompile, &Batch);
+  Owner.setCodeRangeProvider(&mockBatchRange, &Batch);
+  Owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &Batch);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1, /*maxConcurrentProfiles=*/3);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  Owner.setInstanceEnabled(0, 0, true);
+
+  // Descending funcIndex makes a funcIndex tie-break produce C,B,A. The
+  // expected layout must instead retain the observed A,B,C business order.
+  constexpr uint32_t Funcs[] = {82, 81, 80};
+  EJitDimPair Cell0[1] = {dim(0, 0)};
+  for (uint32_t Func : Funcs) {
+    ASSERT_EQ(Owner.compileOrGet(Func, Cell0, 1, codeFor(Func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+  }
+  ASSERT_EQ(Batch.compileOrder.size(), 3u);
+
+  for (uint32_t Func : Funcs) {
+    auto Hit = Owner.tryCacheHit(Func, Cell0, 1);
+    ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (Hit.hasReadToken)
+      Owner.releaseRead(Hit.bucketIndex);
+  }
+  for (unsigned I = 0; I != 3; ++I)
+    ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Batch.compileOrder.size(), 3u);
+
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  ASSERT_EQ(Batch.compileOrder.size(), 6u);
+  for (unsigned I = 0; I != 3; ++I) {
+    const EJitCompileRequest &Req = Batch.compileOrder[3u + I];
+    EXPECT_EQ(decodeReqTier(Req.funcIndex), kEJitTierPgoUse);
+    EXPECT_EQ(stripReqTier(Req.funcIndex), Funcs[I]);
+  }
+  EXPECT_EQ(Batch.flushCalls, 1u);
+}
+
+TEST_F(SharedTaskPoolTest, BatchPgoTier2BypassesFullBaselineLayoutBacklog) {
+  BatchPublishCtx Batch;
+  Batch.tier1ReadyImmediately = true;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockBatchCompile, &Batch);
+  Owner.setCodeRangeProvider(&mockBatchRange, &Batch);
+  Owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &Batch);
+  Owner.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint32_t BaselineCount = 0;
+  for (uint32_t Func = 1000; BaselineCount != kEJitSharedQueueSlots; ++Func) {
+    // Keep bucket zero available for the PGO identity below. The baseline
+    // layout vector still reaches its hard bound even after its other cache
+    // buckets fill and requests fall back to owner-private coarse claims.
+    if (Func % kEJitSharedCacheBuckets == 0)
+      continue;
+    ASSERT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    ++BaselineCount;
+  }
+  ASSERT_EQ(Owner.pendingBatchCompileCount(), kEJitSharedQueueSlots);
+  EXPECT_TRUE(Batch.compileOrder.empty());
+
+  Owner.setPgoEnabled(true, 1);
+  constexpr uint32_t PgoFunc = 3008; // hashIdentity(0D) -> bucket zero.
+  ASSERT_EQ(Owner.compileOrGet(PgoFunc, nullptr, 0, codeFor(PgoFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Batch.compileOrder.size(), 1u);
+  auto Hit = Owner.tryCacheHit0D(PgoFunc);
+  ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (Hit.hasReadToken)
+    Owner.releaseRead(Hit.bucketIndex);
+
+  ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(Owner.pendingBatchCompileCount(), kEJitSharedQueueSlots + 1u);
+  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
+  ASSERT_EQ(Batch.compileOrder.size(), 2u);
+  EXPECT_EQ(decodeReqTier(Batch.compileOrder.back().funcIndex),
+            kEJitTierPgoUse);
+  EXPECT_EQ(Owner.pendingBatchCompileCount(), kEJitSharedQueueSlots);
+  EXPECT_EQ(Batch.flushCalls, 1u);
+}
+#endif
 
 #ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
 TEST_F(SharedTaskPoolTest, BatchPgoAutoPublishWaitsForQueuedTier1) {
@@ -1204,18 +1357,20 @@ TEST_F(SharedTaskPoolTest, BatchPgoAutoPublishWaitsForQueuedTier1) {
             EJitCompileOrGetStatus::EnqueuedPending);
   EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
   EXPECT_EQ(Batch.flushCalls, 0u);
-  ASSERT_EQ(Batch.compileOrder.size(), 2u);
-  EXPECT_EQ(decodeReqTier(Batch.compileOrder[1].funcIndex), kEJitTierPgoUse);
+  ASSERT_EQ(Batch.compileOrder.size(), 1u);
+  EXPECT_EQ(Owner.pendingBatchCompileCount(), 1u);
 
   EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
   EXPECT_EQ(Batch.flushCalls, 0u);
-  ASSERT_EQ(Batch.compileOrder.size(), 3u);
-  EXPECT_EQ(stripReqTier(Batch.compileOrder[2].funcIndex), 53u);
-  EXPECT_EQ(decodeReqTier(Batch.compileOrder[2].funcIndex),
+  ASSERT_EQ(Batch.compileOrder.size(), 2u);
+  EXPECT_EQ(stripReqTier(Batch.compileOrder[1].funcIndex), 53u);
+  EXPECT_EQ(decodeReqTier(Batch.compileOrder[1].funcIndex),
             kEJitTierInstrumented);
 
   EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
   EXPECT_EQ(Batch.flushCalls, 1u);
+  ASSERT_EQ(Batch.compileOrder.size(), 3u);
+  EXPECT_EQ(decodeReqTier(Batch.compileOrder[2].funcIndex), kEJitTierPgoUse);
   EXPECT_EQ(Owner.pendingPublishCount(), 0u);
 }
 
@@ -1255,9 +1410,9 @@ TEST_F(SharedTaskPoolTest, BatchPgoFourTier2CompilesRetainWorkerThrottle) {
   Owner.setWorkerIdleHook(&mockBatchTimelineIdle, &Idle);
   Owner.runWorkerLoop();
 
-  // C=compile, D=worker throttle, F=enable_ex/cache publication. There must be
-  // a scheduling gap between every Tier-2 compile and after publication.
-  EXPECT_EQ(Batch.timeline, "CDCDCDCDFD");
+  // C=compile, D=worker throttle, F=enable_ex/cache publication. Queue staging
+  // retains its scheduling gaps, then every sorted Tier-2 compile does too.
+  EXPECT_EQ(Batch.timeline, "DDDDCDCDCDCDFD");
   EXPECT_EQ(Batch.maxActiveCompiles, 1u);
   EXPECT_EQ(Batch.flushCalls, 1u);
   EXPECT_EQ(Owner.pendingPublishCount(), 0u);
@@ -1308,7 +1463,7 @@ TEST_F(SharedTaskPoolTest, ExplicitPublishFourTier2CompilesRetainThrottle) {
   Caller.join();
 
   EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 1);
-  EXPECT_EQ(Batch.timeline, "CDCDCDCDF");
+  EXPECT_EQ(Batch.timeline, "DDDDCDCDCDCDF");
   EXPECT_EQ(Batch.maxActiveCompiles, 1u);
   EXPECT_EQ(Batch.flushCalls, 1u);
   EXPECT_EQ(Owner.pendingPublishCount(), 0u);
@@ -1340,7 +1495,10 @@ TEST_F(SharedTaskPoolTest, BatchPgoTwentyFunctionsRunInFiveThrottledWaves) {
 
   std::string Expected;
   for (unsigned Wave = 0; Wave != 5; ++Wave) {
-    for (unsigned Compile = 0; Compile != 8; ++Compile)
+    for (unsigned Compile = 0; Compile != 4; ++Compile)
+      Expected += "CD";
+    Expected += "DDDD";
+    for (unsigned Compile = 0; Compile != 4; ++Compile)
       Expected += "CD";
     Expected += "FD";
   }
@@ -1373,7 +1531,8 @@ TEST_F(SharedTaskPoolTest, BatchPgoAutoPublishFailureWaitsForExplicitRetry) {
   if (Tier1.hasReadToken)
     Owner.releaseRead(Tier1.bucketIndex);
   ASSERT_TRUE(Owner.pollOne());
-  ASSERT_EQ(Owner.pendingPublishCount(), 1u);
+  ASSERT_EQ(Owner.pendingBatchCompileCount(), 1u);
+  ASSERT_EQ(Owner.pendingPublishCount(), 0u);
 
   Batch.failFlush = true;
   EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
@@ -1429,7 +1588,10 @@ TEST_F(SharedTaskPoolTest, BatchCompileLayoutSortsFirstThenSecondDimension) {
 
   ASSERT_TRUE(Owner.flushCodeBatch());
   ASSERT_EQ(Batch.compileOrder.size(), 5u);
-  const uint32_t ExpectedFunc[] = {9, 13, 11, 10, 12};
+  // Func 13 reached the identical cell0/trp1 group before func 9. Stable
+  // dimension sorting must retain that business order instead of sorting by
+  // funcIndex.
+  const uint32_t ExpectedFunc[] = {13, 9, 11, 10, 12};
   const uint32_t ExpectedCell[] = {0, 0, 0, 1, 2};
   const uint32_t ExpectedTrp[] = {1, 1, 3, UINT32_MAX, 1};
   for (size_t I = 0; I != Batch.compileOrder.size(); ++I) {

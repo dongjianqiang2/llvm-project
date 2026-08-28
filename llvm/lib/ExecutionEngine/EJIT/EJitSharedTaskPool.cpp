@@ -3458,12 +3458,30 @@ void EJitSharedTaskPool::publishCodePoolStats() {
   PublishDetail(state_->codePoolStats.far, s.far);
 }
 
-void EJitSharedTaskPool::compilePendingBatchRequests() {
+void EJitSharedTaskPool::compilePendingBatchRequests(bool tier2Only) {
   if (pendingBatchCompiles_.empty())
     return;
 
+  std::vector<PendingBatchCompile> Batch;
+  if (tier2Only) {
+    std::vector<PendingBatchCompile> Deferred;
+    Batch.reserve(pendingBatchCompiles_.size());
+    Deferred.reserve(pendingBatchCompiles_.size());
+    for (PendingBatchCompile &P : pendingBatchCompiles_) {
+      if (decodeReqTier(P.req.funcIndex) == kEJitTierPgoUse)
+        Batch.push_back(P);
+      else
+        Deferred.push_back(P);
+    }
+    pendingBatchCompiles_.swap(Deferred);
+  } else {
+    Batch.swap(pendingBatchCompiles_);
+  }
+  if (Batch.empty())
+    return;
+
   std::stable_sort(
-      pendingBatchCompiles_.begin(), pendingBatchCompiles_.end(),
+      Batch.begin(), Batch.end(),
       [](const PendingBatchCompile &A, const PendingBatchCompile &B) {
         // Layout specializations lexicographically by dimensions. In the
         // product mapping this is cell first and TRP second; the same rule
@@ -3480,18 +3498,16 @@ void EJitSharedTaskPool::compilePendingBatchRequests() {
           if (A.req.dims[I].instanceId != B.req.dims[I].instanceId)
             return A.req.dims[I].instanceId < B.req.dims[I].instanceId;
         }
-        const uint32_t AFunc = stripReqTier(A.req.funcIndex);
-        const uint32_t BFunc = stripReqTier(B.req.funcIndex);
-        if (AFunc != BFunc)
-          return AFunc < BFunc;
-        return decodeReqTier(A.req.funcIndex) < decodeReqTier(B.req.funcIndex);
+        // stable_sort preserves business trigger order inside one complete
+        // dimension group. Do not reorder that hot call sequence by funcIndex.
+        return false;
       });
 
   [[maybe_unused]] size_t Dim0Groups = 0;
   bool HavePrevious = false;
   bool PreviousHasDim0 = false;
   EJitDimPair Previous{};
-  for (const PendingBatchCompile &P : pendingBatchCompiles_) {
+  for (const PendingBatchCompile &P : Batch) {
     const bool HasDim0 = P.req.numDims != 0;
     const bool Same =
         HavePrevious && HasDim0 == PreviousHasDim0 &&
@@ -3505,8 +3521,6 @@ void EJitSharedTaskPool::compilePendingBatchRequests() {
     PreviousHasDim0 = HasDim0;
   }
 
-  std::vector<PendingBatchCompile> Batch;
-  Batch.swap(pendingBatchCompiles_);
   EJIT_DIAG_DEBUG("shared worker batch layout: requests=%zu dim0Groups=%zu",
                   Batch.size(), Dim0Groups);
   for (const PendingBatchCompile &P : Batch) {
@@ -3632,14 +3646,18 @@ bool EJitSharedTaskPool::serviceAutoTier2Publish() {
   if (!autoTier2PublishPending_ || !state_)
     return false;
   // pollOne() has just observed the queue empty. Re-check both positions so a
-  // Tier-1 request that raced that observation is compiled from the far pool
-  // before the near-pool Tier-2 batch is sealed and published.
+  // Tier-1 request that raced that observation starts sampling before the
+  // near-pool Tier-2 batch is laid out, sealed, and published.
   if (state_->enqueuePos.loadAcquire() != state_->dequeuePos.loadAcquire())
     return false;
 
   autoTier2PublishPending_ = false;
-  EJIT_DIAG("PGO Tier-2 queue drained: auto-publishing %zu linked version(s)",
-            pendingPublishes_.size());
+  compilePendingBatchRequests(/*tier2Only=*/true);
+  EJIT_DIAG_DEBUG(
+      "PGO Tier-2 queue drained: auto-publishing %zu linked version(s)",
+      pendingPublishes_.size());
+  if (pendingPublishes_.empty())
+    return true;
   if (!flushPendingPublishes(/*compileBatchRequests=*/false))
     EJIT_DIAG("PGO Tier-2 auto-publish failed: pending=%zu; explicit publish "
               "may retry",
@@ -3834,7 +3852,6 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // compile queue empty and seals the batch. Keep only owner-private state
       // and retain the in-flight claim.
       pendingPublishes_.push_back({req, fn});
-      autoTier2PublishPending_ = true;
       EJIT_DIAG_DEBUG("PGO Tier-2 linked pending queue-drain publish func=%u "
                       "fn=%p pending=%zu",
                       realFuncIndex, fn, pendingPublishes_.size());
@@ -3930,27 +3947,40 @@ bool EJitSharedTaskPool::pollOne() {
     return false;
 
   // All tiers arrive on the same shared MPSC queue. Baseline requests defer
-  // compilation so explicit publication can sort their JITLink allocations.
-  // Tier-1 compiles immediately into the far pool and starts sampling. Tier-2
-  // also compiles immediately, but runCompile retains its near-pool result
-  // owner-private until queue-drain publication replaces the live Tier-1 slot.
+  // compilation until explicit publication. Tier-1 compiles immediately into
+  // the far pool and starts sampling. Tier-2 requests defer until the queue
+  // drains so their final near-pool JITLink allocations can be sorted by cell
+  // and TRP before one enable_ex/cache publication batch.
   EJitCompileRequest Req{};
   if (!queuePop(Req))
     return false;
+  const uint32_t Tier = decodeReqTier(Req.funcIndex);
   if (codeReadyFn_ && codeBatchFlushFn_ &&
-      decodeReqTier(Req.funcIndex) == kEJitTierBaseline) {
-    if (pendingBatchCompiles_.size() >= kEJitSharedQueueSlots) {
+      (Tier == kEJitTierBaseline || Tier == kEJitTierPgoUse)) {
+    // Baseline backlog is bounded by the shared queue capacity. Tier-2 has a
+    // separate hard bound from PGO admission (at most 16 active functions), so
+    // let final optimized code enter even when unpublished baseline work has
+    // consumed the normal layout budget.
+    if (Tier == kEJitTierBaseline &&
+        pendingBatchCompiles_.size() >= kEJitSharedQueueSlots) {
       dedupClear(Req.funcIndex, Req.generation);
       EJIT_STAT_INC(state_->counters.queueFull);
       EJIT_DIAG("shared worker batch backlog full func=%u capacity=%u",
                 stripReqTier(Req.funcIndex), kEJitSharedQueueSlots);
       return true;
     }
+    // Baseline has no live specialization to preserve, so a full-key Pending
+    // marker can release its coarse per-function claim and admit another cell.
+    // Tier-2 must leave the live Tier-1 slot untouched and retain its claim
+    // until the sorted replacement is published.
     const bool Marked =
+        Tier == kEJitTierBaseline &&
         cacheStageBatchRequest(Req) == EJitPublishStatus::Published;
     pendingBatchCompiles_.push_back({Req, Marked});
     if (Marked)
       dedupClear(Req.funcIndex, Req.generation);
+    if (Tier == kEJitTierPgoUse)
+      autoTier2PublishPending_ = true;
     EJIT_DIAG_VERBOSE(
         "shared worker batch queued func=%u dims=%u marker=%u requests=%zu",
         stripReqTier(Req.funcIndex), Req.numDims, static_cast<unsigned>(Marked),

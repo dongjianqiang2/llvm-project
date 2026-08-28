@@ -48,10 +48,10 @@
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
 #define EJIT_IN_PERIOD(x) __attribute__((ejit_in_period(#x)))
 #define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
-#define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))
+#define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
-#define EJIT_ENTRY              __attribute__((ejit_entry))
-#define EJIT_PERIOD_GUARD(x)    __attribute__((ejit_period_guard(#x)))
+#define EJIT_ENTRY __attribute__((ejit_entry))
+#define EJIT_PERIOD_GUARD(x) __attribute__((ejit_period_guard(#x)))
 // Old names (aliases — use new macros to avoid double expansion)
 #define ejit_may_const EJIT_PERIOD_CONST
 #define ejit_period(x) EJIT_IN_PERIOD(x)
@@ -360,6 +360,9 @@ void ejit_taskpool_print_stats();
 /// Print every published shared-cache version and its dimensions. Stats builds
 /// also report whether a later taskpool lookup reused each published version;
 /// wrapper inline-cache calls after that first reuse remain intentionally free.
+/// Entries are sorted by the exact JIT function address and include the owning
+/// executable allocation start/end/size. The allocation size may cover helper
+/// code, stubs, or multiple entry symbols; it is not an exact symbol size.
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 

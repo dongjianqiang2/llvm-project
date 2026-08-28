@@ -1319,7 +1319,7 @@ private:
   /// §4.9).
   void runCompile(const EJitCompileRequest &req,
                   bool hasBatchRequestMarker = false);
-  void compilePendingBatchRequests();
+  void compilePendingBatchRequests(bool tier2Only = false);
   bool flushPendingPublishes(bool compileBatchRequests = true);
   bool serviceCodeBatchRequest();
   bool serviceAutoTier2Publish();
@@ -1392,8 +1392,9 @@ private:
   };
   std::vector<PendingBatchCompile> pendingBatchCompiles_;
   std::vector<PendingPublish> pendingPublishes_;
-  /// Armed when Tier-2 links into the near RW/NX pool. Consumed only after the
-  /// owner worker observes the shared compile queue empty.
+  /// Armed when a Tier-2 request enters the owner-private layout batch.
+  /// Consumed only after the owner worker observes the shared compile queue
+  /// empty, sorts all queued Tier-2 requests, and publishes the linked batch.
   bool autoTier2PublishPending_ = false;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired

@@ -40,16 +40,17 @@
 
 `EJIT_CODE_POOL_BATCHED_PUBLISH` 只改变 4K 封固模式下的发布时机和纯代码布局。普通
 EJIT 请求先由共享 worker 搬出有界 MPSC 队列，收到显式发布请求后按维度字典序排列
-（第一维 cell、第二维 TRP，最后按函数编号），再依次编译。JITLink allocation 以 16B
-对齐连续写入近端 RW/NX 页面，批量调用 `enable_ex`，随后才把对应函数指针从共享缓存的
-Pending 状态切换为 Ready。未封页的地址不会返回给业务核。
+（第一维 cell、第二维 TRP），同一完整维度组内保持业务触发顺序，再依次编译。
+JITLink allocation 以 16B 对齐连续写入近端 RW/NX 页面，批量调用 `enable_ex`，随后才把
+对应函数指针从共享缓存的 Pending 状态切换为 Ready。未封页的地址不会返回给业务核。
 
 Online-PGO 使用分层发布：Tier-1 立即编译到远端临时池并自动封固、发布，以便马上开始
-采样；达到阈值后，Tier-2 立即编译和 JITLink 到近端池，但保持 RW/NX 且仅保存在 owner
-私有队列中。此时共享 cache 仍保留可执行的 Tier-1 及其 counters，但采样达到阈值后的
-业务调用临时回退 AOT，不再继续承担整模块原子插桩开销；inline cache 仍不填 Tier-1。
-worker 观察到共享编译队列排空后，自动封固整批 Tier-2 页面，并在封固成功后将 cache 和
-inline cache 原子替换为 Tier-2。封固或 cache 发布失败时保留 Tier-1；可调用
+采样；达到阈值后，Tier-2 请求先保存在 owner 私有布局队列中。此时共享 cache 仍保留
+可执行的 Tier-1 及其 counters，但采样达到阈值后的业务调用临时回退 AOT，不再继续承担
+整模块原子插桩开销；inline cache 仍不填 Tier-1。worker 观察到共享编译队列排空后，按
+cell、TRP 和其余维度排列 Tier-2，同一完整维度组内保持业务触发顺序，再依次编译和
+JITLink 到近端池，自动封固整批 Tier-2 页面，并在封固成功后将 cache 和 inline cache
+原子替换为 Tier-2。封固或 cache 发布失败时保留 Tier-1；可调用
 `ejit_publish_pending_code()` 显式重试，不会把不可执行的 Tier-2 地址暴露给业务核。
 批次封固前会把 bump cursor 推到下一页，因此已经 RX 的尾页不会再被写入；含 GOT、数据
 段或要求超过 16B 对齐的 allocation 自动保持原来的 4K 独占布局。
@@ -57,9 +58,9 @@ inline cache 原子替换为 Tier-2。封固或 cache 发布失败时保留 Tier
 普通 EJIT 的发布由业务侧显式调用 `ejit_publish_pending_code()` 触发；Online-PGO Tier-2
 则在编译队列排空时自动触发。接口仍可用于强制发布或失败重试；返回 `EJIT_OK` 时，近端
 pending code 的 `enable_ex`、共享 cache 发布和 inline-cache 回填均已完成。该模式用于
-验证紧凑布局对 I-cache/L3 冲突的影响，默认关闭。普通 EJIT 请求仍按 cell/TRP 排序后才
-分配真实地址；Tier-2 为缩短采样完成后的等待时间而提前 JITLink，其地址顺序由 profile
-完成顺序决定，队列排空发布只批量封固和回填，不会重新排列已写入的 Tier-2 代码。
+验证紧凑布局对 I-cache/L3 冲突的影响，默认关闭。普通 EJIT 和 Tier-2 均在分配真实地址
+前按 cell/TRP 排序；Tier-2 由队列排空自动触发，不要求业务再次调用显式发布接口。Tier-1
+继续使用远端立即池且不参与排序，避免延迟 profile 采集。
 
 显式发布在排空调用前已有请求及执行排序后的 ORC 编译时，仍逐项执行共享 worker 的
 `EJIT_SRE_TASKPOOL_WORKER_THROTTLE_*` 延时。批量发布只改变代码布局和封页时机，不绕过
@@ -625,3 +626,44 @@ peer 准备任一步失败（缺 `enable_rw` callback、`enable_rw`/`enable_ex` 
 `requiresPeerEnableRw`、`writableRanges[]`），Tier-2 覆盖 Tier-1 时不会继承旧可写范围；
 `initSharedStorage`（owner 选举/reinit）把所有 slot 的 writable 元数据与 prepared bit
 清零，generation 不匹配的发布在 commit gate 被拒——stale writable range 不会被新 slot 继承。
+
+## 15. 板端验证 Tier-2 物理排布
+
+`EJIT_CODE_POOL_BATCHED_PUBLISH` 的排序目标是最终常驻 Tier-2 的 **executable
+allocation**，不能只用编译日志中的先后顺序推断。待本轮 Tier-2 全部发布并进入稳定期后，
+在任意已初始化 EJIT 的核调用：
+
+```c
+ejit_set_log_level(EJIT_LOG_VERBOSE);
+ejit_taskpool_print_compiled();
+ejit_set_log_level(EJIT_LOG_INFO);
+```
+
+输出只保留一份 `compiled layout` 列表，按精确的 JIT 入口 `fn` 地址升序排列；
+VERBOSE 额外显示 allocation end、gap/overlap、版本号和 generation：
+
+```text
+compiled layout: 6 entries sorted by fn address
+layout[0] fn=0x... alloc_start=0x... alloc_end=0x... alloc_size=... gap=n/a pool=near:0 name=FuncA tier=tier2 dims=[0:0]
+layout[1] fn=0x... alloc_start=0x... alloc_end=0x... alloc_size=... gap=...   pool=near:0 name=FuncB tier=tier2 dims=[0:0]
+layout[2] fn=0x... alloc_start=0x... alloc_end=0x... alloc_size=... gap=...   pool=near:0 name=FuncC tier=tier2 dims=[0:0]
+layout[3] fn=0x... alloc_start=0x... alloc_end=0x... alloc_size=... gap=...   pool=near:0 name=FuncA tier=tier2 dims=[0:1]
+```
+
+验证判据：
+
+- 只比较同一个 `pool=near:<id>` 内的条目；跨 pool 地址没有连续性要求。
+- `fn` 全局单调递增；同一个 pool 内 allocation 不得出现 `OVERLAP=`。
+- Tier-2 的 dimensions 应按 `cell -> TRP -> 其余维度` 聚集。
+- 完整 dimensions 相同的条目应保持业务首次触发顺序，例如 `FuncA -> FuncB -> FuncC`。
+- `gap` 允许非零（JITLink 对齐、stub、常量或其他 executable 内容），但异常的大 gap
+  应结合 `ejit_print_code_pool_stats()` 的 `used/wasted/finalized ranges` 继续检查。
+- `fn` 是精确入口符号地址，应位于 `[alloc_start, alloc_end)` 内；`alloc_size` 是整个
+  特化模块的 executable allocation 大小，可能包含 helper、stub 或多个 entry，不是入口
+  函数 symbol 的精确机器码大小。列表顺序用于观察实际入口地址，allocation 范围用于检查
+  code-pool 占用与重叠。
+- 同一 allocation 内有多个入口时显示 `gap=shared_alloc`，不视为重叠错误；
+  `fn_in_alloc=no` 才表示入口地址与 allocation 元数据不一致。
+
+为避免调测本身污染性能数据，只在稳定期采样结束后调用一次，并立即把日志等级恢复为
+`EJIT_LOG_INFO`。
