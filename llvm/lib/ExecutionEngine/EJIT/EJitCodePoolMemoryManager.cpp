@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/Orc/Shared/AllocationActions.h"
 #include "llvm/ExecutionEngine/Orc/Shared/MemoryFlags.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -32,6 +33,21 @@ struct ExecSegRange {
   uintptr_t Addr = 0;
   uint64_t Size = 0;
 };
+
+/// Format a MemProt as a 3-char "RWX"/"R--" C string for the printf-based
+/// EJIT_DIAG path. MemProt only has a raw_ostream inserter (printed "RWX"),
+/// not a %s form, so this mirrors that mapping byte-for-byte without
+/// constructing a std::string on the hot allocation path. Guarded so the
+/// helper compiles away when diagnostics are disabled (see the #ifdef at the
+/// only call site).
+#ifdef EJIT_DIAG_ENABLE
+static void formatMemProt(orc::MemProt MP, char (&Out)[4]) {
+  Out[0] = ((MP & orc::MemProt::Read) != orc::MemProt::None) ? 'R' : '-';
+  Out[1] = ((MP & orc::MemProt::Write) != orc::MemProt::None) ? 'W' : '-';
+  Out[2] = ((MP & orc::MemProt::Exec) != orc::MemProt::None) ? 'X' : '-';
+  Out[3] = '\0';
+}
+#endif
 } // namespace
 
 /// Side record used as the FinalizedAlloc handle. Holds the dealloc actions and
@@ -192,6 +208,87 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   }
   const bool Compact =
       Pool.usesBatchedPageSeal() && HasSegments && ExecOnly && FitsCompactAlign;
+#ifdef EJIT_DIAG_ENABLE
+  // Temporary probe: unconditionally print the Compact-decision inputs so a
+  // missing `allocate noncompact:` line can be diagnosed (is Compact true?
+  // did .rodata make it into BasicLayout? is batchedPageSeal on?). Remove
+  // once the noncompact diagnosis is confirmed working on the board.
+  size_t SegCount = 0;
+  for ([[maybe_unused]] auto &KV : BL.segments())
+    ++SegCount;
+  size_t SectionCount = 0;
+  for (const Section &Sec : G.sections())
+    if (!Sec.empty())
+      ++SectionCount;
+  EJIT_DIAG(
+      "allocate probe: graph=%s compact=%u batched=%u execOnly=%u fitsAlign=%u "
+      "blSegs=%zu graphSections=%zu",
+      G.getName().c_str(), static_cast<unsigned>(Compact),
+      static_cast<unsigned>(Pool.usesBatchedPageSeal()),
+      static_cast<unsigned>(ExecOnly), static_cast<unsigned>(FitsCompactAlign),
+      SegCount, SectionCount);
+  // Dump every non-empty section's name + prot + size so we can see whether
+  // .rodata is in the LinkGraph and what prot it carries.
+  for (const Section &Sec : G.sections()) {
+    if (Sec.empty())
+      continue;
+    uint64_t SecSize = 0;
+    for (const Block *B : Sec.blocks())
+      SecSize += B->getSize();
+    char ProtStr[4];
+    formatMemProt(Sec.getMemProt(), ProtStr);
+    EJIT_DIAG("allocate probe: section=%s prot=%s size=%llu",
+              Sec.getName().str().c_str(), ProtStr,
+              static_cast<unsigned long long>(SecSize));
+    ejitDiagPrintThrottle();
+  }
+#endif
+  // When an allocation falls back to page-exclusive layout, name the offending
+  // sections at INFO level so the board can grep the cause without enabling
+  // DEBUG. Gate on (batchedPageSeal && HasSegments) so Compact being false is
+  // attributable solely to a section: otherwise compact is off for a config
+  // reason (batching disabled, or no allocatable segments), and naming sections
+  // would mis-attribute the cause. Two section failure classes remain: a
+  // section whose protection lacks Exec (e.g. a pure .rodata pulled in by
+  // specialized code), or one whose max block alignment exceeds the
+  // compact-alignment gate. NoAlloc sections are skipped: BasicLayout never
+  // admits them into a segment, so they cannot affect Compact. Diagnosis only
+  // -- no layout change here. See issue #197 item 5. The whole block is
+  // #ifdef-guarded so a build with diagnostics disabled pays nothing.
+#ifdef EJIT_DIAG_ENABLE
+  if (Pool.usesBatchedPageSeal() && HasSegments && !Compact) {
+    const uint64_t CodeAlign = static_cast<uint64_t>(Pool.codeAlignment());
+    for (const Section &Sec : G.sections()) {
+      if (Sec.empty() ||
+          Sec.getMemLifetime() == orc::MemLifetime::NoAlloc)
+        continue;
+      const orc::MemProt SP = Sec.getMemProt();
+      const bool ProtBlocks =
+          (SP & orc::MemProt::Exec) == orc::MemProt::None;
+      uint64_t SecSize = 0;
+      uint64_t MaxAlign = 0;
+      for (const Block *B : Sec.blocks()) {
+        SecSize += B->getSize();
+        MaxAlign = std::max(MaxAlign, B->getAlignment());
+      }
+      const bool AlignBlocks = MaxAlign > CodeAlign;
+      if (!ProtBlocks && !AlignBlocks)
+        continue; // this section is not a Compact offender
+      char ProtStr[4];
+      formatMemProt(SP, ProtStr);
+      EJIT_DIAG(
+          "allocate noncompact: graph=%s section=%s prot=%s size=%llu "
+          "maxAlign=%llu alignExceeds=%u",
+          G.getName().c_str(), Sec.getName().str().c_str(), ProtStr,
+          static_cast<unsigned long long>(SecSize),
+          static_cast<unsigned long long>(MaxAlign),
+          static_cast<unsigned>(AlignBlocks));
+      // Stay behind the serial ring-buffer consumer: one delay per emitted
+      // line so a graph with many offending sections does not drop lines.
+      ejitDiagPrintThrottle();
+    }
+  }
+#endif
   const size_t LayoutAlign = Compact ? Pool.codeAlignment() : PageSize_;
   auto SegsSizes = BL.getContiguousPageBasedLayoutSizes(LayoutAlign);
   if (!SegsSizes) {
