@@ -47,7 +47,9 @@ struct EJitVpFunctionInfo {
 /// every compilation.
 class EJitOptimizer {
 public:
-  EJitOptimizer(PeriodArrayRegistry &reg);
+  /// \p verifySubstitution forwards the EJitStructFieldPass diagnostic mode
+  /// (EJitVerify.h): check the may_const values instead of freezing them.
+  EJitOptimizer(PeriodArrayRegistry &reg, bool verifySubstitution = false);
 
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
@@ -159,6 +161,7 @@ private:
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
+  bool verifySubstitution_ = false;
 
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.

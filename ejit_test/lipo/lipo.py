@@ -374,6 +374,12 @@ def doit_gc_merge(args):
         "ejit_print_version",
     ]
     optional_api = [
+        # Substitution verifier: only in an EJIT_VERIFY_SUBSTITUTION build,
+        # hence optional. Called from user code, never from the runtime or AOT,
+        # so it needs a GC root. __ejit_verify_check does not — EJitLibcallStubs
+        # takes its address, which keeps it reachable.
+        "ejit_verify_get_stats", "ejit_verify_reset_stats",
+        "ejit_verify_available", "ejit_verify_get_sites",
         "ejit_register_lifecycle", "ejit_register_funcindex",
         "ejit_taskpool_compile_or_get", "ejit_taskpool_release_read",
         "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",

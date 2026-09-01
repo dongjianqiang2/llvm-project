@@ -71,7 +71,9 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 }
 #endif
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg,
+                             bool verifySubstitution)
+    : registry_(reg), verifySubstitution_(verifySubstitution) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
@@ -165,8 +167,17 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #endif
 
-  // Phase 1 - specialize (common to all tiers): turn the period index and
-  // every may_const field into a compile-time constant.
+
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  if (verifySubstitution_)
+    EJIT_DIAG("verify mode: checking may_const values instead of freezing "
+              "them; this specialization is NOT optimized");
+#endif
+
+
+  // Phase 1 — specialize: turn the period index and every may_const field into
+  // a compile-time constant.
+  //   (a) Substitute the ejit_period_arr_ind argument with its constant index.
   preReplacePeriodIndices(M, ctx);
   runInstCombine(M);
   EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
@@ -823,7 +834,8 @@ void EJitOptimizer::runStructFieldPass(Module &M,
                                        const SpecializationContext &ctx) {
   EJitStructFieldPass structField(
       registry_, ctx.boundData.empty() ? nullptr : ctx.boundData.data(),
-      static_cast<uint32_t>(ctx.boundData.size()), ctx.boundArgIndex);
+      static_cast<uint32_t>(ctx.boundData.size()), ctx.boundArgIndex,
+      verifySubstitution_);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())

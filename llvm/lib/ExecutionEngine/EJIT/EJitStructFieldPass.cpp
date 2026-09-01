@@ -2,8 +2,10 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitVerify.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -29,6 +31,20 @@ using namespace llvm::ejit;
 void EJitStructFieldPass::initFromModule(Module &M) {
   EJIT_DIAG_VERBOSE("struct-field initFromModule module=%s globals=%zu",
                     M.getName().str().c_str(), M.global_size());
+
+  // Verify mode keeps the loads, so the code must still reach the AOT globals.
+  // dso_local means direct addressing (ADRP+LDR), which only resolves while the
+  // code pool is in PC-relative range of the program's data; out of range the
+  // compile fails and the verifier reports nothing at all. Going through a GOT
+  // entry JITLink puts next to the code resolves either way, at one extra load
+  // per global. Substitution mode never gets here — its loads are gone.
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  if (verify_)
+    for (GlobalVariable &GV : M.globals())
+      if (GV.isDeclaration())
+        GV.setDSOLocal(false);
+#endif
+
   // Build GV period map.
   for (GlobalVariable &GV : M.globals()) {
     MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
@@ -654,6 +670,142 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
 }
 
 //===----------------------------------------------------------------------===//
+// Substitution verifier (Config::verifySubstitution) — see EJitVerify.h
+//===----------------------------------------------------------------------===//
+#ifdef EJIT_VERIFY_SUBSTITUTION
+
+/// Marks a load already instrumented. The pass runs twice (phases 1c and 1f)
+/// and verify mode does not consume the load, so without this the second run
+/// would double every counter.
+static constexpr const char *MD_EJIT_VERIFIED = "ejit.verified";
+
+/// Zero-extend \p V to i64 so every checked type reaches the helper through one
+/// signature. Floats go via a same-width bitcast: the check is bit equality, so
+/// NaN payloads and signed zeroes must survive. Null for types that do not fit,
+/// matching createConstantFromMemory, which cannot materialize them either.
+static Value *widenToI64(IRBuilder<> &B, Value *V) {
+  Type *Ty = V->getType();
+  Type *I64 = B.getInt64Ty();
+
+  if (Ty->isPointerTy())
+    return B.CreatePtrToInt(V, I64);
+
+  if (Ty->isFloatingPointTy()) {
+    unsigned Bits = Ty->getPrimitiveSizeInBits();
+    if (Bits > 64)
+      return nullptr;
+    return B.CreateZExt(B.CreateBitCast(V, B.getIntNTy(Bits)), I64);
+  }
+
+  if (Ty->isIntegerTy()) {
+    if (Ty->getIntegerBitWidth() > 64)
+      return nullptr;
+    return B.CreateZExt(V, I64);
+  }
+
+  return nullptr;
+}
+
+/// Private constant string naming an access, deduplicated per module run so a
+/// hot function with many accesses to one field does not emit one global each.
+static Constant *getSiteString(Module &M, StringRef S,
+                               StringMap<Constant *> &Cache) {
+  auto It = Cache.find(S);
+  if (It != Cache.end())
+    return It->second;
+
+  Constant *Init =
+      ConstantDataArray::getString(M.getContext(), S, /*AddNull=*/true);
+  auto *GV = new GlobalVariable(M, Init->getType(), /*isConstant=*/true,
+                                GlobalValue::PrivateLinkage, Init,
+                                ".ejit.verify.site");
+  GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  Cache[S] = GV;
+  return GV;
+}
+
+/// Sum the constant byte offsets along the GEP chain feeding \p Ptr, whatever
+/// the chain is rooted at. accumulateFullOffset() insists on reaching a global
+/// and gives up otherwise — which is precisely the indirect-pointer case, where
+/// the offset is still what tells two fields of one pointed-to struct apart.
+static std::optional<uint64_t> sumGEPChain(const Value *Ptr,
+                                           const DataLayout &DL) {
+  uint64_t total = 0;
+  const Value *V = Ptr;
+  while (V) {
+    V = V->stripPointerCasts();
+    auto *GEP = dyn_cast<GEPOperator>(V);
+    if (!GEP)
+      break;
+    auto off = computeGEPOffset(GEP, DL);
+    if (!off)
+      return std::nullopt;
+    total += *off;
+    V = GEP->getPointerOperand();
+  }
+  return total;
+}
+
+/// "<func>:<global>+<byteOffset>" — locates the field from a log line, and is
+/// the per-site table key, so distinct fields must not collide. The
+/// indirect-pointer pattern has no root global; it keeps the offset past the
+/// dereference, which separates fields of the pointed-to struct.
+static std::string makeSiteName(const Function &F, const LoadInst *LI,
+                                const DataLayout &DL) {
+  const Value *Ptr = LI->getPointerOperand();
+  std::string Out = F.getName().str() + ":";
+  if (const GlobalVariable *GV = findRootGV(Ptr)) {
+    Out += GV->getName().str();
+    if (auto Off = accumulateFullOffset(DL, Ptr))
+      Out += "+" + std::to_string(*Off);
+    return Out;
+  }
+  Out += "<indirect>";
+  if (auto Off = sumGEPChain(Ptr, DL))
+    Out += "+" + std::to_string(*Off);
+  return Out;
+}
+
+/// Keep \p LI and append a call comparing what it loads against \p Baked, the
+/// value substitution would have frozen. Returns false when the type cannot be
+/// widened, leaving the load untouched.
+static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
+                            const DataLayout &DL,
+                            StringMap<Constant *> &SiteCache) {
+  Module &M = *LI->getModule();
+  LLVMContext &Ctx = M.getContext();
+
+  // Insert after the load so the comparison observes the value it produced.
+  IRBuilder<> B(LI->getNextNode());
+
+  Value *Actual = widenToI64(B, LI);
+  Value *Frozen = Actual ? widenToI64(B, Baked) : nullptr;
+  if (!Frozen) {
+    // Left neither substituted nor checked, so it is a hole in the run's
+    // coverage rather than a clean result. Say so: silence here would read as
+    // "this field never diverged".
+    EJIT_DIAG("verify SKIP site=%s: type not checkable (>64-bit or vector)",
+              makeSiteName(F, LI, DL).c_str());
+    return false;
+  }
+
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  FunctionCallee Check = M.getOrInsertFunction(
+      "__ejit_verify_check",
+      FunctionType::get(Type::getVoidTy(Ctx),
+                        {PtrTy, B.getInt64Ty(), B.getInt64Ty()},
+                        /*isVarArg=*/false));
+
+  B.CreateCall(Check, {getSiteString(M, makeSiteName(F, LI, DL), SiteCache),
+                       Frozen, Actual});
+  LI->setMetadata(MD_EJIT_VERIFIED, MDNode::get(Ctx, {}));
+  ejitVerifyNoteSite();
+  return true;
+}
+
+#endif // EJIT_VERIFY_SUBSTITUTION
+
+//===----------------------------------------------------------------------===//
 // Public interface
 //===----------------------------------------------------------------------===//
 
@@ -713,7 +865,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   //    initFromModule(), reused across all function runs).
 
   // 2. Scan all loads and collect replacements.
-  struct Replacement { LoadInst *LI; Constant *ConstVal; };
+  // A period pointer base is an address root, not a may_const field: verify
+  // mode must still substitute it (see below), so the two kinds are tracked
+  // apart rather than by re-testing the load later.
+  struct Replacement { LoadInst *LI; Constant *ConstVal; bool IsMayConst; };
   SmallVector<Replacement, 16> replacements;
 #ifdef EJIT_DIAG_ENABLE
   size_t totalLoads = 0, mayConstLoads = 0;
@@ -741,7 +896,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // rounds, including when the field access lives in a non-inlined helper.
       if (Constant *C = tryReplacePeriodPointerBase(
               LI, gvPeriodMap_, registry_, DL)) {
-        replacements.push_back({LI, C});
+        replacements.push_back({LI, C, /*IsMayConst=*/false});
         continue;
       }
 
@@ -750,6 +905,13 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
 #ifdef EJIT_DIAG_ENABLE
       ++mayConstLoads;
+#endif
+
+#ifdef EJIT_VERIFY_SUBSTITUTION
+      // Verify mode leaves the load in place, so the pass's second run in
+      // runPipeline sees it again. Skip what the first run already checked.
+      if (verify_ && LI->getMetadata(MD_EJIT_VERIFIED))
+        continue;
 #endif
 
       Value *PtrOp = LI->getPointerOperand();
@@ -780,7 +942,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
 
       if (C)
-        replacements.push_back({LI, C});
+        replacements.push_back({LI, C, /*IsMayConst=*/true});
 #ifdef EJIT_DIAG_ENABLE
       else
         logReplaceFailure(LI, gvPeriodMap_, registry_, DL);
@@ -788,12 +950,42 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
     }
   }
 
-  // 3. Apply replacements.
+  // 3. Apply: substitute the loads, or — in verify mode — keep them and append
+  //    a runtime comparison against the value substitution would have frozen.
   bool changed = false;
-  for (auto &R : replacements) {
-    R.LI->replaceAllUsesWith(R.ConstVal);
-    R.LI->eraseFromParent();
-    changed = true;
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  if (verify_) {
+    StringMap<Constant *> siteCache;
+    size_t verifyCandidates = 0, verifyInstrumented = 0;
+    for (auto &R : replacements) {
+      // A period pointer base is an address root, not a marked field, so it
+      // is substituted as usual: keeping it would leave IPSCCP nothing to
+      // propagate, and the may_const fields behind a pointer-form period would
+      // never resolve, never be instrumented, and report zero mismatches.
+      if (!R.IsMayConst) {
+        R.LI->replaceAllUsesWith(R.ConstVal);
+        R.LI->eraseFromParent();
+        changed = true;
+        continue;
+      }
+      ++verifyCandidates;
+      if (emitVerifyCheck(F, R.LI, R.ConstVal, DL, siteCache)) {
+        ++verifyInstrumented;
+        changed = true;
+      }
+    }
+    if (verifyCandidates)
+      EJIT_DIAG("verify func=%s: instrumented %zu/%zu may_const load(s)",
+                F.getName().str().c_str(), verifyInstrumented,
+                verifyCandidates);
+  } else
+#endif
+  {
+    for (auto &R : replacements) {
+      R.LI->replaceAllUsesWith(R.ConstVal);
+      R.LI->eraseFromParent();
+      changed = true;
+    }
   }
 
 #ifdef EJIT_DIAG_ENABLE

@@ -211,6 +211,15 @@ ALL_TESTS=(
   ejit_sentinel_smoke_test
 )
 
+# Substitution-verifier test: the ejit_verify_* entry points exist only in a
+# runtime built with EJIT_VERIFY_SUBSTITUTION, so building it against a normal
+# runtime is an undefined-reference link failure, not a skip.
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && \
+   grep -q "^EJIT_VERIFY_SUBSTITUTION:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+  ALL_TESTS+=(ejit_verify_subst_test)
+  echo "Verifier:       EJIT_VERIFY_SUBSTITUTION=ON (ejit_verify_subst_test enabled)"
+fi
+
 # Per-test compile flags (e.g. for disabling global constructors)
 declare -A COMPILE_FLAGS
 COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false"
