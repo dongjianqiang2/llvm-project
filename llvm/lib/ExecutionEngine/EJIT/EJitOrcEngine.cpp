@@ -165,7 +165,9 @@ struct EJitOrcEngine::Impl {
   /// Tier-1 code uses the previous dynamic SRE allocation path. Both outlive
   /// LLJIT and its routing memory manager.
   std::unique_ptr<EJitCodePoolManager> nearCodePool;
+  std::unique_ptr<EJitCodePoolManager> coldCodePool;
   std::unique_ptr<EJitCodePoolManager> farCodePool;
+  EJitCodePoolMemoryManager *codePoolMemoryManager = nullptr;
 #endif
   std::unique_ptr<orc::LLJIT> J;
   PeriodArrayRegistry *periodReg = nullptr;
@@ -731,6 +733,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // the specialization savings (fewer BBs / folded branches). Small makes
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
   JTMBOrErr->setCodeModel(CodeModel::Small);
+#ifdef EJIT_MFS_COLD_CODE_POOL
+  JTMBOrErr->getOptions().EnableMachineFunctionSplitter = true;
+#endif
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
@@ -762,21 +767,33 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // at lookup time, by the pool manager's enable_ex sealing.
   engine->P->nearCodePool =
       makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed);
+#ifdef EJIT_MFS_COLD_CODE_POOL
+  engine->P->coldCodePool =
+      makeSreCodePoolManager(EJitCodePoolPlacement::ColdFixed);
+#endif
   engine->P->farCodePool =
       makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic);
   {
     EJitCodePoolManager *NearPool = engine->P->nearCodePool.get();
+    EJitCodePoolManager *ColdPool = engine->P->coldCodePool.get();
     EJitCodePoolManager *FarPool = engine->P->farCodePool.get();
+    Impl *EngineImpl = engine->P.get();
     Builder.setObjectLinkingLayerCreator(
-        [NearPool, FarPool](orc::ExecutionSession &ES)
+        [NearPool, ColdPool, FarPool, EngineImpl](orc::ExecutionSession &ES)
             -> Expected<std::unique_ptr<orc::ObjectLayer>> {
           // Page size only affects per-segment layout padding; we never apply
           // per-segment protections (sealing is done per 2MiB pool), so a
           // conservative 4KiB is sufficient and portable.
           constexpr size_t JitPageSize = 4096;
-          return std::make_unique<orc::ObjectLinkingLayer>(
-              ES, std::make_unique<EJitCodePoolMemoryManager>(
-                      *NearPool, *FarPool, JitPageSize));
+          std::unique_ptr<EJitCodePoolMemoryManager> MM;
+          if (ColdPool)
+            MM = std::make_unique<EJitCodePoolMemoryManager>(
+                *NearPool, *ColdPool, *FarPool, JitPageSize);
+          else
+            MM = std::make_unique<EJitCodePoolMemoryManager>(
+                *NearPool, *FarPool, JitPageSize);
+          EngineImpl->codePoolMemoryManager = MM.get();
+          return std::make_unique<orc::ObjectLinkingLayer>(ES, std::move(MM));
         });
   }
 #endif
@@ -1239,6 +1256,8 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
   EJitCodePoolManager *OwningPool = nullptr;
   if (P->nearCodePool && P->nearCodePool->contains(Ptr))
     OwningPool = P->nearCodePool.get();
+  else if (P->coldCodePool && P->coldCodePool->contains(Ptr))
+    OwningPool = P->coldCodePool.get();
   else if (P->farCodePool && P->farCodePool->contains(Ptr))
     OwningPool = P->farCodePool.get();
   if (OwningPool && !OwningPool->usesPageSeal()) {
@@ -1247,6 +1266,23 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
                 Ptr);
       return std::move(Err);
     }
+  }
+  // Legacy whole-pool mode must also seal MFS's companion cold extent before
+  // the entry pointer can be published. In 4K mode finalize already sealed it.
+  if (P->codePoolMemoryManager) {
+    EJitCompiledCodeInfo Info{};
+    if (P->codePoolMemoryManager->findAllocation(Ptr, Info))
+      for (uint32_t I = 0; I < Info.extraCodeCount; ++I) {
+        const EJitExecutableRange &R = Info.extraCodeRanges[I];
+        EJitCodePoolManager *ExtraPool =
+            R.poolKind == EJitCodePoolKind::Cold  ? P->coldCodePool.get()
+            : R.poolKind == EJitCodePoolKind::Far ? P->farCodePool.get()
+                                                  : P->nearCodePool.get();
+        if (ExtraPool && !ExtraPool->usesPageSeal())
+          if (auto Err = ExtraPool->sealPoolContaining(
+                  reinterpret_cast<void *>(R.codeStart)))
+            return std::move(Err);
+      }
   }
 #endif
 
@@ -1308,9 +1344,12 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJitTieredCodePoolStats Out;
   if (P->nearCodePool)
     Out.near = P->nearCodePool->getStats();
+  if (P->coldCodePool)
+    Out.cold = P->coldCodePool->getStats();
   if (P->farCodePool)
     Out.far = P->farCodePool->getStats();
-#define EJIT_SUM_STAT(Field) Out.total.Field = Out.near.Field + Out.far.Field
+#define EJIT_SUM_STAT(Field)                                                   \
+  Out.total.Field = Out.near.Field + Out.cold.Field + Out.far.Field
   EJIT_SUM_STAT(poolCount);
   EJIT_SUM_STAT(sealedCount);
   EJIT_SUM_STAT(activeCount);
@@ -1321,17 +1360,26 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJIT_SUM_STAT(splitInvocations);
   EJIT_SUM_STAT(rwEnableInvocations);
   EJIT_SUM_STAT(finalizedRangeCount);
+  EJIT_SUM_STAT(finalizedExecBytes);
+  EJIT_SUM_STAT(pendingExecBytes);
+  EJIT_SUM_STAT(pendingRangeCount);
+  EJIT_SUM_STAT(pendingAllocationCount);
 #undef EJIT_SUM_STAT
   return Out;
 }
 
 bool EJitOrcEngine::findCodeRange(const void *FnPtr,
                                   EJitCompiledCodeInfo &Out) const {
-  if (!P->nearCodePool && !P->farCodePool) {
+  if (!P->nearCodePool && !P->coldCodePool && !P->farCodePool) {
     EJIT_DIAG("findCodeRange FAIL: no code pool (fnPtr=%p)", FnPtr);
     return false;
   }
+  if (P->codePoolMemoryManager &&
+      P->codePoolMemoryManager->findAllocation(FnPtr, Out))
+    return true;
   if (P->nearCodePool && P->nearCodePool->findRange(FnPtr, Out))
+    return true;
+  if (P->coldCodePool && P->coldCodePool->findRange(FnPtr, Out))
     return true;
   return P->farCodePool && P->farCodePool->findRange(FnPtr, Out);
 }

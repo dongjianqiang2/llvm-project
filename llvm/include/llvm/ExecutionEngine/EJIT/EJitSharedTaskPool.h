@@ -347,11 +347,12 @@ public:
   using CodeRangeCallback = bool (*)(void *ctx, const void *fnPtr,
                                      EJitCompiledCodeInfo *outInfo);
   /// Owner-private provider that snapshots the owner-core code-pool manager
-  /// stats. The owner publishes this into the shared mirror after every
-  /// successful compile so every core's ejit_print_code_pool_stats is
-  /// consistent (the real pools are owner-private). Returns false when no code
-  /// pool exists (clean fallback). Optional: when unset, the shared mirror
-  /// stays zero and readers fall back to their per-core (empty) view.
+  /// stats. Pending changes mark the mirror dirty and are published at a
+  /// compile-batch/flush boundary; a diagnostic read can request an owner
+  /// refresh. This avoids sorting/unioning all ranges once per function while
+  /// keeping a peer read current. Returns false when no code pool exists
+  /// (clean fallback). Optional: when unset, the shared mirror stays zero and
+  /// readers fall back to their per-core (empty) view.
   using CodePoolStatsCallback = bool (*)(void *ctx, EJitCodePoolStatsOut *out);
   /// Batched code-pool hooks. isReady is false while a linked address remains
   /// RW/NX; flush seals the current owner-private batch and makes every staged
@@ -412,6 +413,10 @@ public:
   using MayConstRankingCallback = bool (*)(void *ctx);
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   using TestHookFn = void (*)(void *ctx);
+  /// Test-only hook fired at the two writer-side seqcount interruption points:
+  /// phase 1 is after the odd marker and full write barrier; phase 2 is after
+  /// the payload and full write barrier, immediately before the even marker.
+  using CodePoolStatsPublishHook = void (*)(void *ctx, uint32_t phase);
 #endif
 
   enum class InitResult : uint32_t {
@@ -621,9 +626,11 @@ public:
     codeBatchFlushFn_ = flush;
     codeBatchCtx_ = ctx;
   }
-  /// Read the shared code-pool stats mirror (last owner-published snapshot).
-  /// Returns false if the shared state is not bound. Every core sees the same
-  /// values. Use this for ejit_get/print_code_pool_stats in shared builds.
+  /// Read the shared code-pool stats mirror. A peer requests the owner to
+  /// refresh a dirty snapshot before reading, so this diagnostic-only call may
+  /// yield/wait; it returns false if the owner cannot refresh or the seqcount
+  /// remains unstable. Every core sees the same values. Use this for
+  /// ejit_get/print_code_pool_stats in shared builds.
   bool readCodePoolStats(EJitCodePoolStatsOut *out) const;
   /// Select the execute-permission seal granularity for non-owner preparation:
   /// true = 4KiB page seal (split the pool once per core, then enable_ex every
@@ -758,6 +765,11 @@ public:
   void setPgoAdmissionTestHook(TestHookFn fn, void *ctx) {
     pgoAdmissionTestHook_ = fn;
     pgoAdmissionTestHookCtx_ = ctx;
+  }
+
+  void setCodePoolStatsPublishHook(CodePoolStatsPublishHook fn, void *ctx) {
+    codePoolStatsPublishHook_ = fn;
+    codePoolStatsPublishHookCtx_ = ctx;
   }
 #endif
 
@@ -1138,6 +1150,7 @@ private:
   /// operations because they execute more than one operation per worker step.
   void workerThrottle();
   bool serviceMayConstRankingRequest();
+  bool serviceCodePoolStatsRequest();
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
@@ -1271,6 +1284,8 @@ private:
     uint64_t codeSize = 0;
     uintptr_t poolBase = 0;
     uint64_t poolSize = 0;
+    uint32_t extraCodeCount = 0;
+    EJitSharedExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges] = {};
     /// Runtime-writable extents (e.g. __profc_) this core must enable_rw before
     /// it may execute the code. Snapshotted with the range so the per-core
     /// enable_rw runs with NO bucket lock held. writableCount 0 => none.
@@ -1319,7 +1334,7 @@ private:
   /// §4.9).
   void runCompile(const EJitCompileRequest &req,
                   bool hasBatchRequestMarker = false);
-  void compilePendingBatchRequests();
+  void compilePendingBatchRequests(bool tier2Only = false);
   bool flushPendingPublishes(bool compileBatchRequests = true);
   bool serviceCodeBatchRequest();
   bool serviceAutoTier2Publish();
@@ -1331,10 +1346,13 @@ private:
                          const char *reason = nullptr);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
-  /// provider and storeRelaxed them into the shared mirror. Called after every
-  /// successful compile (sync + async publish) so the mirror stays fresh for
-  /// cross-core readers. No-op when no provider is registered.
+  /// provider and publish them into the shared mirror. The mirror uses a
+  /// full-barrier odd/even seqcount around its relaxed data fields, so peers
+  /// read a self-consistent provider snapshot. No-op when no provider is
+  /// registered or the provider fails.
   void publishCodePoolStats();
+  void markCodePoolStatsDirty();
+  void publishCodePoolStatsIfDirty();
 
   EJitSharedTaskPoolState *state_ = nullptr;
   CompileCallback compileFn_ = nullptr;
@@ -1369,6 +1387,8 @@ private:
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
+  CodePoolStatsPublishHook codePoolStatsPublishHook_ = nullptr;
+  void *codePoolStatsPublishHookCtx_ = nullptr;
 #endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
@@ -1392,8 +1412,13 @@ private:
   };
   std::vector<PendingBatchCompile> pendingBatchCompiles_;
   std::vector<PendingPublish> pendingPublishes_;
-  /// Armed when Tier-2 links into the near RW/NX pool. Consumed only after the
-  /// owner worker observes the shared compile queue empty.
+  /// Set by pending staging and cleared by the next successful stats publish.
+  /// It coalesces the provider's O(ranges log ranges) snapshot work across a
+  /// whole compile batch instead of paying it once per function.
+  bool codePoolStatsDirty_ = false;
+  /// Armed when a Tier-2 request enters the owner-private layout batch.
+  /// Consumed only after the owner worker observes the shared compile queue
+  /// empty, sorts all queued Tier-2 requests, and publishes the linked batch.
   bool autoTier2PublishPending_ = false;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired

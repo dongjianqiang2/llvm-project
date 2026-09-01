@@ -34,6 +34,7 @@ namespace ejit {
 struct EJitTieredCodePoolStats {
   EJitCodePoolManager::Stats total;
   EJitCodePoolManager::Stats near;
+  EJitCodePoolManager::Stats cold;
   EJitCodePoolManager::Stats far;
 };
 #endif

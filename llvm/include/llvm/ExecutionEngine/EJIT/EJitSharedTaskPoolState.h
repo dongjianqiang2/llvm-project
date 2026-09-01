@@ -179,6 +179,15 @@ struct EJitSharedWritableRange {
   uint64_t size;  ///< size in bytes of that extent (0 = unused entry)
 };
 
+struct EJitSharedExecutableRange {
+  uintptr_t codeStart;
+  uint64_t codeSize;
+  uintptr_t poolBase;
+  uint64_t poolSize;
+  uint32_t poolId;
+  uint32_t poolKind;
+};
+
 //===----------------------------------------------------------------------===//
 // EJitSharedCacheSlot: one POD result-cache entry.
 //===----------------------------------------------------------------------===//
@@ -206,8 +215,10 @@ struct EJitSharedCacheSlot {
   uint64_t codeSize;      ///< size in bytes of that allocation (0 = none)
   uintptr_t poolBase;     ///< 2MiB pool base (split_2m_to_4k granule)
   uint64_t poolSize;      ///< usable pool size
-  uint32_t poolId;   ///< stable pool index within its near/far manager
-  uint32_t poolKind; ///< EJitCodePoolKind: unknown=0, near=1, far=2
+  uint32_t poolId;        ///< stable pool index within its hot/cold/far manager
+  uint32_t poolKind; ///< EJitCodePoolKind: unknown=0, near=1, far=2, cold=3
+  uint32_t extraCodeCount;
+  EJitSharedExecutableRange extraCodeRanges[kEJitMaxExtraCodeRanges];
   /// Runtime-writable extents of the published code (v9): the pages the JIT
   /// body writes at runtime (e.g. Tier-1 __profc_ counters). A non-owner core
   /// in 4K-seal mode MUST enable_rw exactly these in its own translation
@@ -354,12 +365,29 @@ struct EJitSharedCounters {
 // EJitSharedCodePoolStats: owner-published mirror of the owner-core
 // EJitCodePoolManager stats. The code pool itself is owner-private (only the
 // worker core allocates/seals), so a non-owner core reading its own per-core
-// manager sees pools=0. The owner publishes a fresh snapshot here after every
-// successful compile (runCompile / sync publish), and every core reads this for
-// ejit_print_code_pool_stats / ejit_get_code_pool_stats — so the diagnostic is
-// consistent cross-core. Relaxed loads/stores: diagnostic only, monotone-ish.
+// manager sees pools=0. The owner publishes a fresh snapshot here at compile
+// batch / flush boundaries, and a diagnostic read can request a dirty owner
+// snapshot; every core reads this for ejit_print_code_pool_stats /
+// ejit_get_code_pool_stats. The mirror uses a seqcount with full barriers: the
+// owner publishes an odd sequence, executes a full write barrier, copies the
+// relaxed fields, executes another full write barrier, and publishes an even
+// sequence. Readers execute full barriers between the sequence and payload
+// reads and accept only an unchanged even sequence. This is intentional: a
+// release store alone is not a complete seqlock on weakly ordered AArch64.
 //===----------------------------------------------------------------------===//
 struct EJitSharedCodePoolStats {
+  /// Even means stable, odd means the owner is copying a new snapshot.
+  EJitAtomicU32 snapshotSeq;
+  /// ABI v19 diagnostic refresh controls. A peer increments this when a read
+  /// observes dirty owner data; the owner acknowledges the latest request
+  /// after attempting a refresh. refreshResult is 1 for success and 0 for
+  /// failure, and is published before refreshComplete.
+  EJitAtomicU32 refreshRequest;
+  EJitAtomicU32 refreshResult;
+  EJitAtomicU32 refreshComplete;
+  /// Non-zero means owner-private stats changed since the last published
+  /// snapshot. This is a control flag, not part of the copied stats payload.
+  EJitAtomicU32 dirty;
   EJitAtomicU64 poolCount;
   EJitAtomicU64 sealedCount;
   EJitAtomicU64 activeCount;
@@ -379,7 +407,15 @@ struct EJitSharedCodePoolStats {
     EJitAtomicU64 sealInvocations;
     EJitAtomicU64 splitInvocations;
     EJitAtomicU64 finalizedRangeCount;
-  } near, far;
+    EJitAtomicU64 finalizedExecBytes;
+    EJitAtomicU64 pendingExecBytes;
+    EJitAtomicU64 pendingRangeCount;
+    EJitAtomicU64 pendingAllocationCount;
+  } near, cold, far;
+  EJitAtomicU64 finalizedExecBytes;
+  EJitAtomicU64 pendingExecBytes;
+  EJitAtomicU64 pendingRangeCount;
+  EJitAtomicU64 pendingAllocationCount;
 };
 
 /// Plain (non-atomic) snapshot of code-pool stats, used as the callback
@@ -397,6 +433,10 @@ struct EJitCodePoolStatsOut {
     uint64_t sealInvocations = 0;
     uint64_t splitInvocations = 0;
     uint64_t finalizedRangeCount = 0;
+    uint64_t finalizedExecBytes = 0;
+    uint64_t pendingExecBytes = 0;
+    uint64_t pendingRangeCount = 0;
+    uint64_t pendingAllocationCount = 0;
   };
   uint64_t poolCount = 0;
   uint64_t sealedCount = 0;
@@ -407,7 +447,12 @@ struct EJitCodePoolStatsOut {
   uint64_t sealInvocations = 0;
   uint64_t splitInvocations = 0;
   uint64_t finalizedRangeCount = 0;
+  uint64_t finalizedExecBytes = 0;
+  uint64_t pendingExecBytes = 0;
+  uint64_t pendingRangeCount = 0;
+  uint64_t pendingAllocationCount = 0;
   Detail near;
+  Detail cold;
   Detail far;
 };
 

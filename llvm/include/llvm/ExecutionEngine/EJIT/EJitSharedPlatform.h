@@ -103,9 +103,12 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// by a later taskpool lookup, diagnosing compiled versions with no reuse.
 /// v16: code ranges identify near/far placement and the shared code-pool
 /// diagnostic mirror publishes aggregate plus placement-specific statistics.
-/// v17: cache slots can remain Pending while compact code waits for an explicit
-/// owner-worker batch publish request.
-constexpr uint32_t kEJitSharedAbiVersion = 17u;
+/// v17 was used independently by the batched-publish and MFS-cold branches.
+/// v18 combines both layouts: cache slots may remain Pending for explicit batch
+/// publication and one compilation may carry a companion cold-code range.
+/// v19 adds detailed executable/pending byte counters and a sequence-checked
+/// stats mirror snapshot.
+constexpr uint32_t kEJitSharedAbiVersion = 19u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

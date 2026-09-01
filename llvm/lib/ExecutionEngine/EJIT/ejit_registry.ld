@@ -125,6 +125,15 @@ SECTIONS
     __ejit_code_end = .;
   } > CODE       /* code segment, near .text (±128MiB bl/adrp reach to AOT) */
 
+  /* Optional EJIT_MFS_COLD_CODE_POOL region. Keep it within +-128MiB of both
+   * .text and .text.ejit so hot/cold machine-BB branches remain direct. */
+  .text.ejit_cold : ALIGN(4096)
+  {
+    __ejit_cold_code_start = .;
+    . = __ejit_cold_code_start + 8M;
+    __ejit_cold_code_end = .;
+  } > CODE
+
   /* ... your existing .bss / etc. ... */
 }
 

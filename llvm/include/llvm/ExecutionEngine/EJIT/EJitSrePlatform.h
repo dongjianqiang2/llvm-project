@@ -24,7 +24,7 @@
 namespace llvm {
 namespace ejit {
 
-enum class EJitCodePoolPlacement { NearFixed, FarDynamic };
+enum class EJitCodePoolPlacement { NearFixed, ColdFixed, FarDynamic };
 
 /// Construct an EJitCodePoolManager wired to the SRE platform: raw memory from
 /// SRE_MemDbgAlloc (partition EJIT_SRE_CODE_POOL_PTNO) and sealing via

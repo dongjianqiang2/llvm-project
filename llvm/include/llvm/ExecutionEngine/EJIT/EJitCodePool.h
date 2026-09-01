@@ -171,6 +171,13 @@ public:
                                     ///< (per 4K page, code-segment mode only)
     size_t finalizedRangeCount = 0; ///< distinct executable ranges recorded
                                     ///< (duplicates are not double-counted)
+    /// Union of the executable extents in finalized/pending range records.
+    /// This is code bytes, not pool bump usage (which includes alignment and
+    /// abandoned tails).
+    size_t finalizedExecBytes = 0;
+    size_t pendingExecBytes = 0;
+    size_t pendingRangeCount = 0;
+    size_t pendingAllocationCount = 0;
   };
 
   EJitCodePoolManager(Options Opts, RawAllocFn Alloc, SealFn Seal,

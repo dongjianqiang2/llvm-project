@@ -10,6 +10,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
+#include <limits>
+#include <utility>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -811,6 +813,41 @@ EJitCodePoolManager::Stats EJitCodePoolManager::getStats() const {
   S.splitInvocations = SplitInvocations_;
   S.rwEnableInvocations = RwEnableInvocations_;
   S.finalizedRangeCount = FinalizedRanges_.size();
+  auto SumUnionBytes = [](const std::vector<EJitCodePoolManager::FinalizedRange> &Ranges) {
+    std::vector<std::pair<uintptr_t, uintptr_t>> Intervals;
+    Intervals.reserve(Ranges.size());
+    for (const auto &R : Ranges) {
+      if (R.start == 0 || R.size == 0 ||
+          R.size > std::numeric_limits<uintptr_t>::max() - R.start)
+        continue;
+      Intervals.push_back({R.start, R.start + static_cast<uintptr_t>(R.size)});
+    }
+    std::sort(Intervals.begin(), Intervals.end());
+    uintptr_t CurrentStart = 0;
+    uintptr_t CurrentEnd = 0;
+    size_t Total = 0;
+    for (const auto &I : Intervals) {
+      if (CurrentStart == 0) {
+        CurrentStart = I.first;
+        CurrentEnd = I.second;
+        continue;
+      }
+      if (I.first <= CurrentEnd) {
+        CurrentEnd = std::max(CurrentEnd, I.second);
+        continue;
+      }
+      Total += static_cast<size_t>(CurrentEnd - CurrentStart);
+      CurrentStart = I.first;
+      CurrentEnd = I.second;
+    }
+    if (CurrentStart != 0)
+      Total += static_cast<size_t>(CurrentEnd - CurrentStart);
+    return Total;
+  };
+  S.finalizedExecBytes = SumUnionBytes(FinalizedRanges_);
+  S.pendingExecBytes = SumUnionBytes(PendingRanges_);
+  S.pendingRangeCount = PendingRanges_.size();
+  S.pendingAllocationCount = PendingAllocations_;
   for (auto &P : Pools_) {
     S.reservedBytes += P->size;
     S.usedBytes += P->used;

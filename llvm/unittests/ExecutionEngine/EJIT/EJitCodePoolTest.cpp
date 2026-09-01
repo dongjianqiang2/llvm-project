@@ -13,11 +13,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntimeDiagnostics.h"
 #include "llvm/Support/Error.h"
 #include "gtest/gtest.h"
 
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 using namespace llvm;
@@ -95,6 +97,52 @@ EJitCodePoolManager::Options smallOpts(size_t PoolSize = 256) {
 uintptr_t A(const void *P) { return reinterpret_cast<uintptr_t>(P); }
 
 } // namespace
+
+TEST(EJitRuntimeDiagnostics, PrintCompiledIncludesHotAndColdCompanions) {
+  std::vector<llvm::ejit::detail::EJitCompiledExecRange> Ranges = {
+      {1, 4, 0x1000, 0x100}, // primary near-hot range
+      {3, 9, 0x8000, 0x40},  // MFS near-cold companion
+  };
+  const auto S = llvm::ejit::detail::summarizeCompiledExecRanges(Ranges);
+  EXPECT_EQ(S.readyEntryExecBytes, 0x140u);
+  EXPECT_EQ(S.readyUniqueExecBytes, 0x140u);
+  EXPECT_EQ(S.readyUniqueExecRanges, 2u);
+  EXPECT_EQ(S.sharedSlotExecBytes, 0u);
+  EXPECT_EQ(S.nearHotUniqueExecBytes, 0x100u);
+  EXPECT_EQ(S.nearColdUniqueExecBytes, 0x40u);
+  EXPECT_EQ(S.farUniqueExecBytes, 0u);
+  EXPECT_EQ(S.invalidExecRanges, 0u);
+}
+
+TEST(EJitRuntimeDiagnostics, PrintCompiledDeduplicatesSharedHotAndColdRanges) {
+  std::vector<llvm::ejit::detail::EJitCompiledExecRange> Ranges = {
+      {1, 4, 0x1000, 0x100}, {1, 4, 0x1000, 0x100},
+      {3, 9, 0x8000, 0x80},  {3, 9, 0x8000, 0x80},
+  };
+  const auto S = llvm::ejit::detail::summarizeCompiledExecRanges(Ranges);
+  EXPECT_EQ(S.readyEntryExecBytes, 0x300u);
+  EXPECT_EQ(S.readyUniqueExecBytes, 0x180u);
+  EXPECT_EQ(S.readyUniqueExecRanges, 2u);
+  EXPECT_EQ(S.sharedSlotExecBytes, 0x180u);
+  EXPECT_EQ(S.nearHotUniqueExecBytes, 0x100u);
+  EXPECT_EQ(S.nearColdUniqueExecBytes, 0x80u);
+}
+
+TEST(EJitRuntimeDiagnostics, PrintCompiledUnionsOverlappingAndReportsInvalidCold) {
+  std::vector<llvm::ejit::detail::EJitCompiledExecRange> Ranges = {
+      {3, 9, 0x4000, 0x100},
+      {3, 9, 0x4080, 0x100}, // overlaps the first cold range by 0x80
+      {3, 9, 0, 0x10},
+      {3, 9, 0x5000, 0},
+      {3, 9, std::numeric_limits<uintptr_t>::max() - 3, 8},
+  };
+  const auto S = llvm::ejit::detail::summarizeCompiledExecRanges(Ranges);
+  EXPECT_EQ(S.readyEntryExecBytes, 0x200u);
+  EXPECT_EQ(S.readyUniqueExecBytes, 0x180u);
+  EXPECT_EQ(S.readyUniqueExecRanges, 1u);
+  EXPECT_EQ(S.nearColdUniqueExecBytes, 0x180u);
+  EXPECT_EQ(S.invalidExecRanges, 3u);
+}
 
 // 1. The usable base of a pool is 2MiB aligned.
 TEST(EJitCodePool, BaseIs2MiBAligned) {
@@ -1004,12 +1052,22 @@ TEST(EJitCodePoolBatch, PacksRangesAndStartsFreshPageAfterFlush) {
   Mgr.notePendingAllocation();
   Mgr.recordPendingRange(A1, 2000);
   Mgr.notePendingAllocation();
+  auto Pending = Mgr.getStats();
+  EXPECT_EQ(Pending.finalizedExecBytes, 0u);
+  EXPECT_EQ(Pending.pendingExecBytes, 4000u);
+  EXPECT_EQ(Pending.pendingRangeCount, 2u);
+  EXPECT_EQ(Pending.pendingAllocationCount, 2u);
   EJitCompiledCodeInfo Info{};
   EXPECT_FALSE(Mgr.findRange(A0, Info));
   EXPECT_EQ(M.SealCalls, 0u);
 
   cantFail(Mgr.flushPendingRanges());
   EXPECT_EQ(M.SealCalls, 1u);
+  auto Finalized = Mgr.getStats();
+  EXPECT_EQ(Finalized.finalizedExecBytes, 4000u);
+  EXPECT_EQ(Finalized.pendingExecBytes, 0u);
+  EXPECT_EQ(Finalized.pendingRangeCount, 0u);
+  EXPECT_EQ(Finalized.pendingAllocationCount, 0u);
   EXPECT_TRUE(Mgr.findRange(A0, Info));
   EXPECT_TRUE(Mgr.findRange(A1, Info));
 

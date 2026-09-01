@@ -918,6 +918,29 @@ bool EJit::getCodePoolStats(ejit_code_pool_stats_t *out) const {
 bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
   if (!out)
     return false;
+  ejit_code_pool_stats_v3_t V3{};
+  if (!getCodePoolStatsV3(&V3))
+    return false;
+  out->total = V3.total;
+  out->near = V3.nearHot;
+#define EJIT_ADD_PUBLIC_STAT(Field) out->near.Field += V3.nearCold.Field
+  EJIT_ADD_PUBLIC_STAT(poolCount);
+  EJIT_ADD_PUBLIC_STAT(sealedCount);
+  EJIT_ADD_PUBLIC_STAT(activeCount);
+  EJIT_ADD_PUBLIC_STAT(usedBytes);
+  EJIT_ADD_PUBLIC_STAT(reservedBytes);
+  EJIT_ADD_PUBLIC_STAT(wastedBytes);
+  EJIT_ADD_PUBLIC_STAT(sealInvocations);
+  EJIT_ADD_PUBLIC_STAT(splitInvocations);
+  EJIT_ADD_PUBLIC_STAT(finalizedRangeCount);
+#undef EJIT_ADD_PUBLIC_STAT
+  out->far = V3.farTier1;
+  return true;
+}
+
+bool EJit::getCodePoolStatsV3(ejit_code_pool_stats_v3_t *out) const {
+  if (!out)
+    return false;
 #if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_SRE_CODE_POOL)
   auto CopyShared = [](ejit_code_pool_stats_t &Dst,
                        const EJitCodePoolStatsOut::Detail &Src) {
@@ -965,8 +988,9 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
       Total.splitInvocations = s.splitInvocations;
       Total.finalizedRangeCount = s.finalizedRangeCount;
       CopyShared(out->total, Total);
-      CopyShared(out->near, s.near);
-      CopyShared(out->far, s.far);
+      CopyShared(out->nearHot, s.near);
+      CopyShared(out->nearCold, s.cold);
+      CopyShared(out->farTier1, s.far);
       return true;
     }
   }
@@ -979,8 +1003,9 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
     return false;
   EJitTieredCodePoolStats s = engine->getTieredCodePoolStats();
   CopyManager(out->total, s.total);
-  CopyManager(out->near, s.near);
-  CopyManager(out->far, s.far);
+  CopyManager(out->nearHot, s.near);
+  CopyManager(out->nearCold, s.cold);
+  CopyManager(out->farTier1, s.far);
   return true;
 #else
   return false;
@@ -989,33 +1014,94 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
 
 void EJit::printCodePoolStats() const {
 #ifdef EJIT_SRE_CODE_POOL
-  ejit_code_pool_stats_v2_t s{};
-  if (!getCodePoolStatsV2(&s)) {
+  auto PrintOne = [](const char *Kind, uint64_t PoolCount,
+                     uint64_t SealedCount, uint64_t ActiveCount,
+                     uint64_t UsedBytes, uint64_t ReservedBytes,
+                     uint64_t WastedBytes, uint64_t SealInvocations,
+                     uint64_t SplitInvocations, uint64_t FinalizedRanges,
+                     uint64_t FinalizedExecBytes, uint64_t PendingExecBytes,
+                     uint64_t PendingRangeCount,
+                     uint64_t PendingAllocationCount) {
+    const uint64_t Permille = ejitDiagPermille(UsedBytes, ReservedBytes);
+    EJIT_DIAG_RAW("code pool %s: pools=%llu sealed=%llu active=%llu "
+                  "used=%llu reserved=%llu wasted=%llu usage=%llu.%u%%",
+                  Kind, (unsigned long long)PoolCount,
+                  (unsigned long long)SealedCount,
+                  (unsigned long long)ActiveCount,
+                  (unsigned long long)UsedBytes,
+                  (unsigned long long)ReservedBytes,
+                  (unsigned long long)WastedBytes,
+                  (unsigned long long)(Permille / 10),
+                  (unsigned)(Permille % 10));
+    EJIT_DIAG_RAW(
+        "  %s sealInvocations=%llu splitInvocations=%llu "
+        "finalizedRanges=%llu finalizedExecBytes=%llu "
+        "pendingExecBytes=%llu pendingRangeCount=%llu "
+        "pendingAllocationCount=%llu",
+        Kind, (unsigned long long)SealInvocations,
+        (unsigned long long)SplitInvocations,
+        (unsigned long long)FinalizedRanges,
+        (unsigned long long)FinalizedExecBytes,
+        (unsigned long long)PendingExecBytes,
+        (unsigned long long)PendingRangeCount,
+        (unsigned long long)PendingAllocationCount);
+  };
+#if defined(EJIT_SRE_SHARED_TASKPOOL)
+  if (const EJitSharedTaskPool *sp = sharedTaskPool()) {
+    EJitCodePoolStatsOut S;
+    if (sp->readCodePoolStats(&S)) {
+      auto PrintDetail = [&](const char *Kind,
+                             const EJitCodePoolStatsOut::Detail &D) {
+        PrintOne(Kind, D.poolCount, D.sealedCount, D.activeCount, D.usedBytes,
+                 D.reservedBytes, D.wastedBytes, D.sealInvocations,
+                 D.splitInvocations, D.finalizedRangeCount,
+                 D.finalizedExecBytes, D.pendingExecBytes,
+                 D.pendingRangeCount, D.pendingAllocationCount);
+      };
+      EJitCodePoolStatsOut::Detail Total;
+      Total.poolCount = S.poolCount;
+      Total.sealedCount = S.sealedCount;
+      Total.activeCount = S.activeCount;
+      Total.usedBytes = S.usedBytes;
+      Total.reservedBytes = S.reservedBytes;
+      Total.wastedBytes = S.wastedBytes;
+      Total.sealInvocations = S.sealInvocations;
+      Total.splitInvocations = S.splitInvocations;
+      Total.finalizedRangeCount = S.finalizedRangeCount;
+      Total.finalizedExecBytes = S.finalizedExecBytes;
+      Total.pendingExecBytes = S.pendingExecBytes;
+      Total.pendingRangeCount = S.pendingRangeCount;
+      Total.pendingAllocationCount = S.pendingAllocationCount;
+      PrintDetail("total", Total);
+      PrintDetail("near-hot(final)", S.near);
+      PrintDetail("near-cold(mfs)", S.cold);
+      PrintDetail("far(tier1)", S.far);
+      return;
+    }
+  }
+#endif
+  if (!compileDriver_) {
     EJIT_DIAG_RAW("code pool: not available (no engine)");
     return;
   }
-  auto PrintOne = [](const char *Kind, const ejit_code_pool_stats_t &S) {
-    const uint64_t Permille = ejitDiagPermille(S.usedBytes, S.reservedBytes);
-    EJIT_DIAG_RAW("code pool %s: pools=%llu sealed=%llu active=%llu "
-                  "used=%llu reserved=%llu wasted=%llu usage=%llu.%u%%",
-                  Kind, (unsigned long long)S.poolCount,
-                  (unsigned long long)S.sealedCount,
-                  (unsigned long long)S.activeCount,
-                  (unsigned long long)S.usedBytes,
-                  (unsigned long long)S.reservedBytes,
-                  (unsigned long long)S.wastedBytes,
-                  (unsigned long long)(Permille / 10),
-                  (unsigned)(Permille % 10));
-    EJIT_DIAG_RAW("  %s sealInvocations=%llu splitInvocations=%llu "
-                  "finalizedRanges=%llu",
-                  Kind, (unsigned long long)S.sealInvocations,
-                  (unsigned long long)S.splitInvocations,
-                  (unsigned long long)S.finalizedRangeCount);
-    (void)Permille;
+  EJitOrcEngine *Engine = compileDriver_->getJitEngine();
+  if (!Engine) {
+    EJIT_DIAG_RAW("code pool: not available (no engine)");
+    return;
+  }
+  EJitTieredCodePoolStats S = Engine->getTieredCodePoolStats();
+  auto PrintManager = [&](const char *Kind,
+                          const EJitCodePoolManager::Stats &D) {
+    PrintOne(Kind, D.poolCount, D.sealedCount, D.activeCount, D.usedBytes,
+             D.reservedBytes, D.wastedBytes, D.sealInvocations,
+             D.splitInvocations, D.finalizedRangeCount, D.finalizedExecBytes,
+             D.pendingExecBytes, D.pendingRangeCount,
+             D.pendingAllocationCount);
   };
-  PrintOne("total", s.total);
-  PrintOne("near(final)", s.near);
-  PrintOne("far(tier1)", s.far);
+  PrintManager("total", S.total);
+  PrintManager("near-hot(final)", S.near);
+  PrintManager("near-cold(mfs)", S.cold);
+  PrintManager("far(tier1)", S.far);
 #else
   EJIT_DIAG_RAW("code pool: EJIT_SRE_CODE_POOL not enabled");
 #endif

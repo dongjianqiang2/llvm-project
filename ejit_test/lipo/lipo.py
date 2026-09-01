@@ -367,6 +367,7 @@ def doit_gc_merge(args):
         "ejit_set_log_level", "ejit_get_log_level",
         "ejit_print_registry", "ejit_print_func_meta",
         "ejit_get_code_pool_stats", "ejit_get_code_pool_stats_v2",
+        "ejit_get_code_pool_stats_v3",
         "ejit_print_code_pool_stats",
         "ejit_print_active",
         # Build identity (LLVM version + git commit). Called from user app

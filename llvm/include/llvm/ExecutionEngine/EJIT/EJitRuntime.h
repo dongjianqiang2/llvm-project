@@ -147,6 +147,13 @@ typedef struct ejit_code_pool_stats_v2_t {
   ejit_code_pool_stats_t far;
 } ejit_code_pool_stats_v2_t;
 
+typedef struct ejit_code_pool_stats_v3_t {
+  ejit_code_pool_stats_t total;
+  ejit_code_pool_stats_t nearHot;
+  ejit_code_pool_stats_t nearCold;
+  ejit_code_pool_stats_t farTier1;
+} ejit_code_pool_stats_v3_t;
+
 typedef struct {
   int code;
   char message[256];
@@ -360,6 +367,9 @@ void ejit_taskpool_print_stats();
 /// Print every published shared-cache version and its dimensions. Stats builds
 /// also report whether a later taskpool lookup reused each published version;
 /// wrapper inline-cache calls after that first reuse remain intentionally free.
+/// Entries are sorted by the exact JIT function address and include the owning
+/// executable allocation start/end/size. The allocation size may cover helper
+/// code, stubs, or multiple entry symbols; it is not an exact symbol size.
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
@@ -450,8 +460,10 @@ void ejit_print_func_meta(const char *funcName);
 /// embedded code-memory exhaustion. Mirrors EJitCodePoolManager::Stats.
 ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
 
-/// Placement-aware counterpart of ejit_get_code_pool_stats().
+/// Placement-aware counterpart; near includes hot and MFS-cold fixed pools.
 ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
+/// Three-way placement breakdown for hot final, MFS cold, and Tier-1 code.
+ejit_status_t ejit_get_code_pool_stats_v3(ejit_code_pool_stats_v3_t *out);
 
 /// Print code pool usage statistics through the platform log. Paired with
 /// ejit_get_code_pool_stats() (human-readable form).

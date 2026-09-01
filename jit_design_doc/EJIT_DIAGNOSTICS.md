@@ -128,7 +128,9 @@ unsigned      ejit_taskpool_pending_count(void); // 在途数量
 
 > 若 `cacheHits` 等逐调用计数全为零，说明运行库未启用逐调用统计（这些计数有热点路径开销，默认关闭）；`print_compiled()`、`get_worker_core()`、`pending_count()` 不受此影响，始终可用。
 
-`ejit_taskpool_print_compiled()` 的摘要中，`entries` 是本次尽力遍历到的 Ready 特化数，`slots` 是 cache 占用，`buckets skipped` 表示遍历时因并发竞争而跳过的 bucket；因此它不是强一致快照。摘要分别统计 `baseline/tier1_collecting/tier2` 和 `near/far/unknown`。明细中的 `dims=[d:i,...]` 表示 `dimType:instanceId`，`pool=near|far` 表示代码实际落点。VERBOSE 级额外显示各维度版本 `ver`、代码大小 `size`、池内编号 `pool_id` 和发布代数 `gen`。
+`ejit_taskpool_print_compiled()` 的摘要中，`entries` 是本次尽力遍历到的 Ready 特化数，`slots` 是 cache 占用，`buckets skipped` 表示遍历时因并发竞争而跳过的 bucket；因此它不是强一致快照。摘要分别统计 `baseline/tier1_collecting/tier2`、主代码池落点和带 MFS 冷区的版本数。明细中的 `dims=[d:i,...]` 表示 `dimType:instanceId`，`pool=near-hot|near-cold|far-tier1` 表示入口代码实际落点，`extra_ranges=[...]` 保留同一 slot 的全部 companion executable ranges（包括 `.text.ejit_cold`）。
+
+汇总行还会输出 `ready_entry_exec_bytes`（每个 Ready slot 的主 range 与全部 companion range 逐 entry 相加）、`ready_unique_exec_bytes` / `ready_unique_exec_ranges`（在 `(poolKind,poolId)` 域内做区间 union）、`shared_slot_exec_bytes`（entry 总量减去 union 后的重复覆盖量）以及 `invalid_exec_ranges`。`near_hot_unique_exec_bytes`、`near_cold_unique_exec_bytes`、`far_unique_exec_bytes` 分别给出三类池的 union 字节数；非法 range 不进入任何字节总量，只进入 invalid 计数。明细的 `entry_exec_bytes` 同样包含该 slot 的主 range 和全部合法 companion，`extra_ranges` 则保留每个 companion 的独立地址、池和大小。这样共享 allocation、cold range overlap 不会被重复算入 unique 值。
 
 ### 2.3 代码池统计
 
@@ -156,7 +158,7 @@ ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
 void          ejit_print_code_pool_stats(void);
 ```
 
-**作用**：监控 JIT 代码内存占用与是否趋近耗尽（`usedBytes` vs `reservedBytes`）。旧接口保持 ABI 不变并返回两池合计；v2 接口进一步区分 near/far。`ejit_print_code_pool_stats()` 同时打印 `total`、`near(final)` 和 `far(tier1)`。返回值：`EJIT_OK` 成功；`EJIT_ERR_NOT_ACTIVE` 运行时未初始化；`EJIT_ERR_INVALID_PARAM` 入参为空；`EJIT_ERR_DISABLED` 运行库未含代码池支持。
+**作用**：监控 JIT 代码内存占用与是否趋近耗尽（`usedBytes` vs `reservedBytes`）。旧接口保持 ABI 不变并返回全部池合计；v2 的 `near` 合并 hot/cold 固定池以保持 ABI，v3 进一步拆分 `nearHot/nearCold/farTier1`。`ejit_print_code_pool_stats()` 同时打印 `total`、`near-hot(final)`、`near-cold(mfs)` 和 `far(tier1)`。返回值：`EJIT_OK` 成功；`EJIT_ERR_NOT_ACTIVE` 运行时未初始化；`EJIT_ERR_INVALID_PARAM` 入参为空；`EJIT_ERR_DISABLED` 运行库未含代码池支持。
 
 **结构体解读**：
 
@@ -169,6 +171,10 @@ void          ejit_print_code_pool_stats(void);
 | `sealInvocations` | 成功切换为可执行状态的次数；4K 模式按页计，不能直接当成编译函数数。 |
 | `splitInvocations` | 成功将 2 MiB 映射拆成 4K 页的次数，仅 4K 模式有意义。 |
 | `finalizedRangeCount` | 已记录的可执行代码区间数，通常比 pool 数更接近已完成的代码分配批次数。 |
+| `finalizedExecBytes` / `pendingExecBytes` | owner 侧已封固 / 已 staging 的可执行区间 union 字节数；只统计真实 range，不包含页对齐、padding 或池尾空洞。 |
+| `pendingRangeCount` / `pendingAllocationCount` | 当前尚未 flush 的去重 range 数与 allocation 数；owner 在批量编译边界合并刷新，诊断 reader 发现 dirty 时请求 owner 刷新，flush 后归零。 |
+
+`usedBytes` 与 `finalizedExecBytes` 是有意不同的口径：前者是所有 pool 的 bump cursor，可能包含 4K 对齐、GOT/data、放弃的尾部和尚未发布的空间；后者是已记录 executable range 的 union。`ejit_print_code_pool_stats()` 会在原有池容量行之外打印这些详细字段。shared taskpool 的 owner mirror 使用 `snapshotSeq` 做带完整屏障的 seqcount：owner 在 odd 序号之后执行 full write barrier，在 relaxed payload 写入后、even 序号发布前再执行 full write barrier；peer 在两次序号读取之间也执行 full barrier，只有前后序号相同且为偶数时才接受整组字段。该顺序通过 `__atomic_thread_fence(__ATOMIC_SEQ_CST)` 映射到 AArch64/SRE 的系统级屏障，不依赖 x86 的隐含顺序。dirty/pending 变化在批次或 flush 边界合并发布；peer 的诊断读取会主动请求 owner 刷新，因此不需要每个 staging 函数都重算全量 range union。peer 刷新请求会先校验 `generation`、`initState`、owner 与 worker 可用性，并在等待期间重复校验；代际切换、worker 停止或超时会快速返回 `false`。owner 即使 provider 刷新失败也会发布失败结果并确认该 ticket，后续 worker 轮询不会重复重算，只有新的诊断请求才会重试。
 
 > **固定代码段模式**：若你的运行库使用固定代码段模式（代码池位于链接脚本固定的 `.text.ejit` 区域，给 JIT 稳定地址），每次页状态转换会在 **INFO 级**打印 `enableRwRange` 系列日志（`begin` / `OK` / `FAIL`（未归属 / 跨池 / `enable_rw` 失败）/ `rollback`（部分失败时回退 RW->RX）），用于诊断 W^X 页状态转换。封固粒度（4K 页 vs 整 2MiB 池）影响 `sealInvocations` / `splitInvocations` 的计数粒度。
 

@@ -139,6 +139,22 @@ TEST(EJitCodePoolMemMgr, CodeMemoryComesFromPool) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
+std::unique_ptr<LinkGraph> makeHotColdGraph() {
+  auto G = std::make_unique<LinkGraph>(
+      "hot-cold", std::make_shared<orc::SymbolStringPool>(),
+      Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
+      getGenericEdgeKindName);
+  auto &Hot =
+      G->createSection(".text.foo", orc::MemProt::Read | orc::MemProt::Exec);
+  auto &Cold = G->createSection(".text.split.foo",
+                                orc::MemProt::Read | orc::MemProt::Exec);
+  G->createContentBlock(Hot, ArrayRef<char>(CodeBytes, 32),
+                        orc::ExecutorAddr(0x1000), 16, 0);
+  G->createContentBlock(Cold, ArrayRef<char>(CodeBytes, 32),
+                        orc::ExecutorAddr(0x2000), 16, 0);
+  return G;
+}
+
 TEST(EJitCodePoolMemMgr, RoutesTemporaryTier1ToFarPool) {
   MockSre M;
   auto NearOpts = poolOpts(/*PoolSize=*/256 * 1024);
@@ -182,6 +198,83 @@ TEST(EJitCodePoolMemMgr, RoutesTemporaryTier1ToFarPool) {
 
   cantFail(MM.deallocate(std::move(FA1)));
   cantFail(MM.deallocate(std::move(FA2)));
+}
+
+TEST(EJitCodePoolMemMgr, RoutesMfsColdBlocksToCompanionPool) {
+  MockSre M;
+  auto HotOpts = poolOpts(256 * 1024);
+  HotOpts.kind = EJitCodePoolKind::Near;
+  auto ColdOpts = poolOpts(256 * 1024);
+  ColdOpts.kind = EJitCodePoolKind::Cold;
+  auto FarOpts = poolOpts(256 * 1024);
+  FarOpts.kind = EJitCodePoolKind::Far;
+  auto MakePool = [&](EJitCodePoolManager::Options Opts) {
+    return std::make_unique<EJitCodePoolManager>(
+        Opts, [&M](size_t N) { return M.rawAlloc(N); },
+        [&M](void *B) { return M.seal(B); });
+  };
+  auto Hot = MakePool(HotOpts);
+  auto Cold = MakePool(ColdOpts);
+  auto Far = MakePool(FarOpts);
+  EJitCodePoolMemoryManager MM(*Hot, *Cold, *Far, 4096);
+
+  JITLinkDylib Tier2("spec_t2_7");
+  auto G = makeHotColdGraph();
+  auto IFA = cantFail(MM.allocate(&Tier2, *G));
+  SmallVector<void *, 2> BlockAddrs;
+  for (Block *B : G->blocks())
+    BlockAddrs.push_back(B->getAddress().toPtr<void *>());
+  ASSERT_EQ(BlockAddrs.size(), 2u);
+  void *First = BlockAddrs[0];
+  void *Second = BlockAddrs[1];
+  void *HotAddr = Hot->contains(First) ? First : Second;
+  void *ColdAddr = Cold->contains(First) ? First : Second;
+  EXPECT_TRUE(Hot->contains(HotAddr));
+  EXPECT_TRUE(Cold->contains(ColdAddr));
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(MM.findAllocation(HotAddr, Info));
+  EXPECT_EQ(Info.poolKind, EJitCodePoolKind::Near);
+  ASSERT_EQ(Info.extraCodeCount, 1u);
+  EXPECT_EQ(Info.extraCodeRanges[0].poolKind, EJitCodePoolKind::Cold);
+  EXPECT_EQ(Info.extraCodeRanges[0].codeStart,
+            reinterpret_cast<uintptr_t>(ColdAddr));
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+TEST(EJitCodePoolMemMgr, ThreePoolManagerKeepsPureHotGraphInNearPool) {
+  MockSre M;
+  auto HotOpts = poolOpts(256 * 1024);
+  HotOpts.kind = EJitCodePoolKind::Near;
+  auto ColdOpts = poolOpts(256 * 1024);
+  ColdOpts.kind = EJitCodePoolKind::Cold;
+  auto FarOpts = poolOpts(256 * 1024);
+  FarOpts.kind = EJitCodePoolKind::Far;
+  auto MakePool = [&](EJitCodePoolManager::Options Opts) {
+    return std::make_unique<EJitCodePoolManager>(
+        Opts, [&M](size_t N) { return M.rawAlloc(N); },
+        [&M](void *B) { return M.seal(B); });
+  };
+  auto Hot = MakePool(HotOpts);
+  auto Cold = MakePool(ColdOpts);
+  auto Far = MakePool(FarOpts);
+  EJitCodePoolMemoryManager MM(*Hot, *Cold, *Far, 4096);
+
+  JITLinkDylib Tier2("spec_t2_hot_only");
+  auto G = makeCodeGraph(64, 0x1000);
+  auto IFA = cantFail(MM.allocate(&Tier2, *G));
+  void *HotAddr = firstBlockAddr(*G);
+  auto FA = cantFail(IFA->finalize());
+
+  EXPECT_TRUE(Hot->contains(HotAddr));
+  EXPECT_EQ(Cold->getStats().poolCount, 0u);
+  EXPECT_EQ(Far->getStats().poolCount, 0u);
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(MM.findAllocation(HotAddr, Info));
+  EXPECT_EQ(Info.poolKind, EJitCodePoolKind::Near);
+  EXPECT_EQ(Info.extraCodeCount, 0u);
+  cantFail(MM.deallocate(std::move(FA)));
 }
 
 // finalize() does NOT seal: the pool stays RW so JITLink can keep writing.
