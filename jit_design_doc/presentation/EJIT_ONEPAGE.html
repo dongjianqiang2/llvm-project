@@ -366,19 +366,11 @@ footer .fbrand{font-size:17px;font-weight:900;background:linear-gradient(90deg,#
         </div>
       </div>
       <div class="ctl-group">
-        <span class="ctl-label">编译</span>
-        <div class="seg" id="segMode">
-          <button data-m="sync" class="on">同步</button>
-          <button data-m="async">异步</button>
-        </div>
-      </div>
-      <div class="ctl-group">
         <button class="btn act" id="btnAct">⚡ activate 时间窗</button>
         <button class="btn deact" id="btnDeact">⛔ deactivate</button>
       </div>
       <div class="ctl-group">
         <button class="btn call" id="btnCall">▶ 调用 process_cell</button>
-        <button class="btn ghostb" id="btnCall50">×50 连发</button>
       </div>
       <div class="ctl-group">
         <button class="btn auto" id="btnAuto">🎬 一键演示</button>
@@ -576,7 +568,7 @@ var CFG = {
 var AOT_INSNS = 24, JIT_INSNS = 10;   /* 示意口径：含寻址与调用开销 */
 
 var state = {
-  cellIdx: 0, trpIdx: 0, mode: "sync",
+  cellIdx: 0, trpIdx: 0,
   active: false, busy: false, autoRunning: false,
   cache: new Map(), addrSeq: 0,
   stats: {calls:0, hits:0, miss:0, spec:0, fb:0, br:0, ld:0}
@@ -707,7 +699,7 @@ function renderCache(){
 /* ================= compile ================= */
 function setBusy(b){
   state.busy = b;
-  ["btnCall","btnCall50","btnAuto","btnAct","btnDeact","btnReset"].forEach(function(id){ $(id).disabled = b; });
+  ["btnCall","btnAuto","btnAct","btnDeact","btnReset"].forEach(function(id){ $(id).disabled = b; });
 }
 async function compile(c, t){
   setBusy(true);
@@ -758,25 +750,13 @@ async function doCall(quiet){
   }
   /* miss */
   state.stats.miss++;
-  if (state.mode === "sync"){
-    if (!quiet) log("… 调用 #" + state.stats.calls + " · cache MISS → 同步 JIT 编译 " + k + "（<100ms）", "miss");
-    setResPill("… MISS → 同步编译中", "miss");
-    await compile(c, t);
-    state.stats.hits++; state.stats.spec++; state.stats.br += 2; state.stats.ld += 4;
-    if (!quiet) log("✓ 编译完成并发布缓存 → 本次调用即执行特化码", "ok");
-    setResPill("⚡ 编译完成 → 特化码", "hit"); bump("m-hits");
-    updateMetrics();
-  } else {
-    state.stats.fb++;
-    if (!quiet) log("… 调用 #" + state.stats.calls + " · cache MISS → 异步入队(EJIT_PENDING) → 本次 AOT 兜底", "miss");
-    setResPill("… PENDING → 后台编译", "miss");
-    updateMetrics();
-    setTimeout(function(){
-      compile(c, t).then(function(kk){
-        log("✓ worker 后台编译完成 → 缓存已发布 " + kk + "，下次调用即命中", "ok");
-      });
-    }, 350);
-  }
+  if (!quiet) log("… 调用 #" + state.stats.calls + " · cache MISS → 同步 JIT 编译 " + k + "（<100ms）", "miss");
+  setResPill("… MISS → 同步编译中", "miss");
+  await compile(c, t);
+  state.stats.hits++; state.stats.spec++; state.stats.br += 2; state.stats.ld += 4;
+  if (!quiet) log("✓ 编译完成并发布缓存 → 本次调用即执行特化码", "ok");
+  setResPill("⚡ 编译完成 → 特化码", "hit"); bump("m-hits");
+  updateMetrics();
 }
 
 /* ================= actions ================= */
@@ -821,22 +801,9 @@ $("segTrp").addEventListener("click", function(e){
   this.querySelectorAll("button").forEach(function(x){ x.classList.remove("on"); });
   b.classList.add("on");
 });
-$("segMode").addEventListener("click", function(e){
-  var b = e.target.closest("button"); if (!b) return;
-  state.mode = b.dataset.m;
-  this.querySelectorAll("button").forEach(function(x){ x.classList.remove("on"); });
-  b.classList.add("on");
-  log("模式切换 → " + (state.mode === "sync" ? "同步编译（首调阻塞 <100ms）" : "异步编译（首调 AOT 兜底，worker 后台编译）"), "info");
-});
 $("btnAct").addEventListener("click", activate);
 $("btnDeact").addEventListener("click", deactivate);
 $("btnCall").addEventListener("click", function(){ doCall(false); });
-$("btnCall50").addEventListener("click", async function(){
-  if (state.busy) return;
-  log("—— ×50 连发开始 ——", "info");
-  for (var i = 0; i < 50; i++){ await doCall(true); await sleep(26); }
-  log("—— ×50 完成：命中 " + (state.stats.hits) + " · 特化执行 " + state.stats.spec + " · fallback " + state.stats.fb + " ——", "info");
-});
 $("btnReset").addEventListener("click", function(){ if (!state.busy) resetAll(); });
 
 $("btnAuto").addEventListener("click", autoDemo);
