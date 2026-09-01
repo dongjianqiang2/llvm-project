@@ -722,6 +722,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
     return JTMBOrErr.takeError();
   }
 
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  if (JTMBOrErr->getTargetTriple().isAArch64())
+    JTMBOrErr->addFeatures({"+sve"});
+#endif
+
   // Use Small code model so data accesses use ADRP+LDR (2 insns/global, ±4GB
   // PC-relative) instead of movz/movk absolute (5 insns/global). The JIT slab
   // is ~1.5-2.2GB from .text (within ADRP's ±4GB range), confirmed by
@@ -737,8 +742,14 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // simply unavailable.
   if (auto TMOrErr = JTMBOrErr->createTargetMachine())
     engine->P->dumpFunctionTM = std::move(*TMOrErr);
-  else
+  else {
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+    EJIT_DIAG("create FAIL: SVE optimizer target machine unavailable");
+    return TMOrErr.takeError();
+#else
     consumeError(TMOrErr.takeError());
+#endif
+  }
   if (auto TMOrErr = JTMBOrErr->createTargetMachine())
     engine->P->dumpModuleTM = std::move(*TMOrErr);
   else
@@ -819,7 +830,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
-  engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  engine->P->optimizer = std::make_unique<EJitOptimizer>(
+      periodReg, engine->P->dumpFunctionTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve

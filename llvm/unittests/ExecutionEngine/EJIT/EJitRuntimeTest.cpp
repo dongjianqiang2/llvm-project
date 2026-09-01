@@ -23,6 +23,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
+#endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
@@ -41,6 +44,9 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+#include "llvm/Target/TargetMachine.h"
+#endif
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
 #include <thread>
@@ -1503,6 +1509,106 @@ TEST(EJitOptimizer, OptimizationPipelineL3) {
   // L3 should not crash
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 }
+
+#if defined(EJIT_SRE_SVE_VECTORIZATION) && defined(EJIT_TEST_HAS_AARCH64)
+static std::unique_ptr<TargetMachine> createSVEVectorTestTM() {
+  static bool Initialized = false;
+  if (!Initialized) {
+    InitializeAllTargetInfos();
+    InitializeAllTargets();
+    InitializeAllTargetMCs();
+    Initialized = true;
+  }
+  orc::JITTargetMachineBuilder JTMB(Triple("aarch64_be-none-elf"));
+  JTMB.addFeatures({"+sve"});
+  return cantFail(JTMB.createTargetMachine());
+}
+
+static std::unique_ptr<Module> createSVEVectorLoop(LLVMContext &Ctx,
+                                                   TargetMachine &TM) {
+  auto M = std::make_unique<Module>("sve_vector_loop", Ctx);
+  M->setTargetTriple(TM.getTargetTriple());
+  M->setDataLayout(TM.createDataLayout());
+
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  auto *FT = FunctionType::get(Type::getVoidTy(Ctx), {Ptr, Ptr, I64}, false);
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, "sve_add", M.get());
+  F->addParamAttr(0, Attribute::NoAlias);
+  F->addParamAttr(1, Attribute::NoAlias);
+  F->getArg(0)->setName("dst");
+  F->getArg(1)->setName("src");
+  F->getArg(2)->setName("n");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "loop", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+  IRBuilder<> B(Entry);
+  B.CreateCondBr(B.CreateICmpNE(F->getArg(2), ConstantInt::get(I64, 0)), Loop,
+                 Exit);
+  B.SetInsertPoint(Loop);
+  PHINode *Index = B.CreatePHI(I64, 2, "i");
+  Index->addIncoming(ConstantInt::get(I64, 0), Entry);
+  Value *Dst = B.CreateGEP(F32, F->getArg(0), Index);
+  Value *Src = B.CreateGEP(F32, F->getArg(1), Index);
+  Value *V = B.CreateLoad(F32, Src);
+  B.CreateStore(B.CreateFAdd(V, ConstantFP::get(F32, 1.0)), Dst);
+  Value *Next = B.CreateAdd(Index, ConstantInt::get(I64, 1));
+  Index->addIncoming(Next, Loop);
+  B.CreateCondBr(B.CreateICmpULT(Next, F->getArg(2)), Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRetVoid();
+  return M;
+}
+
+static bool hasScalableVectorIR(const Module &M) {
+  auto IsScalable = [](Type *Ty) {
+    auto *VT = dyn_cast<VectorType>(Ty);
+    return VT && VT->getElementCount().isScalable();
+  };
+  for (const Function &F : M)
+    for (const BasicBlock &BB : F)
+      for (const Instruction &I : BB) {
+        if (IsScalable(I.getType()))
+          return true;
+        for (const Use &Op : I.operands())
+          if (IsScalable(Op->getType()))
+            return true;
+      }
+  return false;
+}
+
+TEST(EJitOptimizer, SVEVectorizesBaselineAndTier2ButNotTier1) {
+  auto TM = createSVEVectorTestTM();
+  PeriodArrayRegistry Reg;
+
+  LLVMContext BaselineCtx;
+  auto Baseline = createSVEVectorLoop(BaselineCtx, *TM);
+  EJitOptimizerTestAccess BaselineOpt(Reg, TM.get());
+  BaselineOpt.runOptimizationPipeline(
+      *Baseline, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
+  EXPECT_TRUE(hasScalableVectorIR(*Baseline));
+
+  LLVMContext Tier2Ctx;
+  auto Tier2 = createSVEVectorLoop(Tier2Ctx, *TM);
+  EJitOptimizerTestAccess Tier2Opt(Reg, TM.get());
+  Tier2Opt.runOptimizationPipeline(*Tier2, llvm::ejit::OptimizationLevel::L2,
+                                   CompileTier::PGOUse);
+  EXPECT_TRUE(hasScalableVectorIR(*Tier2));
+
+  LLVMContext Tier1Ctx;
+  auto Tier1 = createSVEVectorLoop(Tier1Ctx, *TM);
+  EJitOptimizer Tier1Opt(Reg, TM.get());
+  SpecializationContext SC;
+  SC.fnName = "sve_add";
+  SC.tier = CompileTier::Instrumented;
+  SC.optLevel = llvm::ejit::OptimizationLevel::L2;
+  Tier1Opt.runPipeline(*Tier1, SC);
+  EXPECT_FALSE(hasScalableVectorIR(*Tier1));
+}
+#endif
 
 TEST(EJitOptimizer, FullPipelineEndToEnd) {
   LLVMContext Ctx;

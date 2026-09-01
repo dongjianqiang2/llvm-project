@@ -608,6 +608,12 @@ if(EJIT_TRIM_LLVM_BACKEND)
   endif()
 endif()
 
+option(EJIT_SRE_SVE_VECTORIZATION
+  "Enable post-specialization SVE loop/SLP vectorization in EJIT Baseline and PGO Tier-2 code" OFF)
+if(EJIT_SRE_SVE_VECTORIZATION)
+  add_definitions(-DEJIT_SRE_SVE_VECTORIZATION)
+endif()
+
 option(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL "Trim backend for bare-metal: exclude non-ELF formats, non-AArch64 targets, DWARF/CFI" OFF)
 if(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)

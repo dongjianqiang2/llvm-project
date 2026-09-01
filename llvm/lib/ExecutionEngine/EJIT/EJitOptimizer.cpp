@@ -18,6 +18,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Triple.h"
 // The post-specialization cleanup is the real LLVM -O2 function-simplification
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
 // cleanupFPM_ and the LowerExpect prefix are hand-added below.
@@ -31,7 +33,9 @@
 #include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/IndVarSimplify.h"
+#include "llvm/Transforms/Scalar/InferAlignment.h"
 #include "llvm/Transforms/Scalar/LoopDeletion.h"
+#include "llvm/Transforms/Scalar/LoopLoadElimination.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
@@ -40,6 +44,11 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
+#include "llvm/Transforms/Vectorize/SLPVectorizer.h"
+#include "llvm/Transforms/Vectorize/VectorCombine.h"
+#endif
 #include <limits>
 
 using namespace llvm;
@@ -71,11 +80,15 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 }
 #endif
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
+    : EJitOptimizer(reg, nullptr) {}
+
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
+    : registry_(reg) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
-  PassBuilder PB;
+  PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
   PB.registerCGSCCAnalyses(CGAM_);
@@ -106,6 +119,21 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
       llvm::OptimizationLevel::O2, ThinOrFullLTOPhase::None);
   simplifyO3_ = PB.buildFunctionSimplificationPipeline(
       llvm::OptimizationLevel::O3, ThinOrFullLTOPhase::None);
+
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  vectorizationEnabled_ = TM != nullptr;
+  auto BuildVectorPipeline = [](FunctionPassManager &FPM) {
+    FPM.addPass(LoopVectorizePass());
+    FPM.addPass(LoopLoadEliminationPass());
+    FPM.addPass(InstCombinePass());
+    FPM.addPass(InferAlignmentPass());
+    FPM.addPass(SLPVectorizerPass());
+    FPM.addPass(VectorCombinePass());
+    FPM.addPass(InstCombinePass());
+  };
+  BuildVectorPipeline(vectorO2_);
+  BuildVectorPipeline(vectorO3_);
+#endif
 
   // The standard Ox function-simplification pipeline already runs
   // profile-aware loop transforms when !prof metadata is present. Keep only
@@ -848,6 +876,42 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
   }
 }
 
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+FunctionPassManager *
+EJitOptimizer::vectorFPMForLevel(ejit::OptimizationLevel level) {
+  switch (level) {
+  case ejit::OptimizationLevel::L2:
+    return &vectorO2_;
+  case ejit::OptimizationLevel::L3:
+    return &vectorO3_;
+  case ejit::OptimizationLevel::L1:
+    return nullptr;
+  }
+  llvm_unreachable("unknown EJIT optimization level");
+}
+
+static bool enableSVEForModule(Module &M) {
+  if (!Triple(M.getTargetTriple()).isAArch64())
+    return false;
+
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<StringRef, 16> Features;
+    Attribute A = F.getFnAttribute("target-features");
+    if (A.isValid())
+      A.getValueAsString().split(Features, ',', /*MaxSplit=*/-1,
+                                 /*KeepEmpty=*/false);
+    llvm::erase_if(Features, [](StringRef Feature) {
+      return Feature == "+sve" || Feature == "-sve";
+    });
+    Features.push_back("+sve");
+    F.addFnAttr("target-features", join(Features, ","));
+  }
+  return true;
+}
+#endif
+
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             ejit::OptimizationLevel level,
                                             CompileTier tier) {
@@ -859,6 +923,12 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // level (L1->O1, L2->O2, L3->O3). It folds the substituted constants, DCEs
   // the dead branches, and unrolls loops whose bounds became constant; this is
   // the bulk of the post-specialization optimization.
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  const bool SVEEnabledForModule =
+      vectorizationEnabled_ && enableSVEForModule(M);
+  FunctionPassManager *VectorFPM =
+      SVEEnabledForModule ? vectorFPMForLevel(level) : nullptr;
+#endif
   FunctionPassManager &simplifyFPM = simplifyFPMForLevel(level);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
@@ -866,6 +936,10 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
       simplifyFPM.run(F, FAM_);
       if (tier == CompileTier::PGOUse)
         pgoUseFPM_.run(F, FAM_);
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+      if (VectorFPM)
+        VectorFPM->run(F, FAM_);
+#endif
     }
 
   // Phase 4: unrolling exposed new constant-index array accesses

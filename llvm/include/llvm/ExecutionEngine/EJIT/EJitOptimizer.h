@@ -26,6 +26,8 @@
 #include "llvm/IR/Module.h"
 
 namespace llvm {
+class TargetMachine;
+
 namespace ejit {
 
 struct EJitMayConstLoadSite;
@@ -48,6 +50,7 @@ struct EJitVpFunctionInfo {
 class EJitOptimizer {
 public:
   EJitOptimizer(PeriodArrayRegistry &reg);
+  EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM);
 
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
@@ -158,6 +161,12 @@ private:
   /// Pick the cached function-simplification FPM for an EJIT optimization tier.
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  /// Pick the SVE vector pipeline used after Baseline/Tier-2 specialization.
+  /// L1 and Tier-1 intentionally have no vector pipeline.
+  FunctionPassManager *vectorFPMForLevel(OptimizationLevel level);
+#endif
+
   PeriodArrayRegistry &registry_;
 
   // Persistent analysis managers — registered once, reused across compilations.
@@ -171,13 +180,19 @@ private:
   //   lowerExpectFPM_ lower llvm.expect (not in buildFunctionSimplification
   //                   Pipeline); runs before the O2 pipeline (Phase 2).
   //   simplifyO1/2/3_ the real LLVM -O1/-O2/-O3 function-simplification
-  //   pipeline
-  //                   (Phase 3), one per tier; NO vectorization.
+  //   pipeline        (Phase 3), one per tier.
+  //   vectorO2/3_     Loop + SLP vectorization after Baseline/Tier-2
+  //                   specialization; never runs for temporary Tier-1.
   //   cleanupFPM_     light fold after the second StructFieldPass (Phase 5).
   FunctionPassManager lowerExpectFPM_;
   FunctionPassManager simplifyO1_;
   FunctionPassManager simplifyO2_;
   FunctionPassManager simplifyO3_;
+#ifdef EJIT_SRE_SVE_VECTORIZATION
+  FunctionPassManager vectorO2_;
+  FunctionPassManager vectorO3_;
+  bool vectorizationEnabled_ = false;
+#endif
   FunctionPassManager cleanupFPM_;
   // Tier-2-only profile-guided memory-operation specialization. The main
   // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
