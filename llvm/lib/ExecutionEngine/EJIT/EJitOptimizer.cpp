@@ -41,6 +41,7 @@
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include <limits>
+#include <optional>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -764,10 +765,38 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
 
 void EJitOptimizer::runStructFieldPass(Module &M,
                                        const SpecializationContext &ctx) {
-  EJitStructFieldPass structField(
-      registry_, ctx.boundData.empty() ? nullptr : ctx.boundData.data(),
-      static_cast<uint32_t>(ctx.boundData.size()), ctx.boundArgIndex,
-      ctx.fnName);
+  SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
+      ctx.boundPointers;
+  if (!BoundPointers.empty()) {
+    Function *Root = M.getFunction(ctx.fnName);
+    if (Root) {
+      for (EJitBoundPointerView &View : BoundPointers) {
+        MDNode *MD = Root->getMetadata(MD_EJIT_METADATA);
+        StringRef BoundPeriodName;
+        if (MD)
+          for (const MDOperand &Op : MD->operands()) {
+            auto *Sub = dyn_cast<MDNode>(Op.get());
+            if (!Sub || Sub->getNumOperands() < 3)
+              continue;
+            auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+            auto *Period = dyn_cast<MDString>(Sub->getOperand(1));
+            auto *Index = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+            if (Tag && Period && Index &&
+                Tag->getString() == TAG_EJIT_BOUND_PTR &&
+                Index->getZExtValue() == View.argIndex) {
+              BoundPeriodName = Period->getString();
+              break;
+            }
+          }
+        for (const auto &Dim : ctx.dimensions)
+          if (Dim.periodName == BoundPeriodName) {
+            View.periodInstance = Dim.cellIdx;
+            break;
+          }
+      }
+    }
+  }
+  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())

@@ -2,7 +2,6 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
@@ -514,15 +513,34 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
-  if (request && request->boundSize) {
-    if (request->boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
-      EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bound snapshot too large",
+  if (request && request->boundCount) {
+    if (!validateBoundPtrDescriptors(request->boundPointers,
+                                     request->boundCount)) {
+      EJIT_DIAG("compile FAIL key=0x%016lx func=%s: invalid bound pointer list",
                 cacheKey, funcName.c_str());
       return nullptr;
     }
-    ctx.boundArgIndex = request->boundArgIndex;
-    ctx.boundData.append(request->boundData,
-                         request->boundData + request->boundSize);
+    for (uint32_t I = 0; I < request->boundCount; ++I) {
+      const EJitBoundPtrDescriptor &B = request->boundPointers[I];
+      // Keep this lookup as an explicit loop. libc++ may lower generic
+      // uint32_t range searches to wmemchr, which is unavailable on the
+      // freestanding SRE target.
+      bool HasMatchingBoundFormal = false;
+      for (uint32_t ArgIndex : meta.boundPointerArgIndices) {
+        if (ArgIndex == B.argIndex) {
+          HasMatchingBoundFormal = true;
+          break;
+        }
+      }
+      if (!HasMatchingBoundFormal) {
+        EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bound argIndex=%u "
+                  "has no matching EJIT_BOUND_PTR pointer formal",
+                  cacheKey, funcName.c_str(), B.argIndex);
+        return nullptr;
+      }
+      ctx.boundPointers.push_back(
+          {static_cast<const uint8_t *>(B.rawPtr), B.size, B.argIndex});
+    }
   }
 
   // PGO tier (EJIT_ONLINE_PGO.md §4). Gated by Config::enablePgo: off => the

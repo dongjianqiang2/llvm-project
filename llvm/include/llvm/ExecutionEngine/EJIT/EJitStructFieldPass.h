@@ -9,12 +9,16 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITSTRUCTFIELDPASS_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSTRUCTFIELDPASS_H
 
-#include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
-#include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#include "llvm/IR/PassManager.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/IR/PassManager.h"
+#include <limits>
+#include <optional>
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #include <vector>
@@ -35,17 +39,30 @@ using MayConstOffsetMap =
 
 /// PASS6: JIT-time specialization pass. Scans the module for load instructions
 /// with !ejit.may_const metadata, reads the actual runtime values from process
-/// memory via the PeriodArrayRegistry, and replaces the loads with LLVM
-/// constants.
+/// memory via the PeriodArrayRegistry or a borrowed bound-pointer view, and
+/// replaces the loads with LLVM constants.
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
   EJitStructFieldPass(PeriodArrayRegistry &reg,
-                      const uint8_t *boundData = nullptr,
-                      uint32_t boundSize = 0, uint32_t boundArgIndex = 0,
+                      ArrayRef<EJitBoundPointerView> boundPointers,
                       StringRef boundRootFunction = {})
-      : registry_(reg), boundData_(boundData), boundSize_(boundSize),
-        boundArgIndex_(boundArgIndex),
+      : registry_(reg),
+        boundPointers_(boundPointers.begin(), boundPointers.end()),
         boundRootFunction_(boundRootFunction.str()) {}
+
+  /// Compatibility constructor for direct pass users. The data pointer is
+  /// borrowed for the duration of the pass and is never copied or freed.
+  EJitStructFieldPass(PeriodArrayRegistry &reg, const uint8_t *rawPtr = nullptr,
+                      uint32_t rawSize = 0, uint32_t boundArgIndex = 0,
+                      StringRef boundRootFunction = {},
+                      std::optional<uint8_t> boundPeriodInstance = std::nullopt)
+      : registry_(reg), boundRootFunction_(boundRootFunction.str()) {
+    if (rawPtr && rawSize)
+      boundPointers_.push_back({rawPtr, rawSize, boundArgIndex,
+                                boundPeriodInstance
+                                    ? *boundPeriodInstance
+                                    : std::numeric_limits<uint32_t>::max()});
+  }
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
@@ -74,16 +91,15 @@ public:
 
 private:
   PeriodArrayRegistry &registry_;
-  const uint8_t *boundData_ = nullptr;
-  uint32_t boundSize_ = 0;
-  uint32_t boundArgIndex_ = 0;
+  SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;
   std::string boundRootFunction_;
 
-  // A specialization owns one pointee snapshot. Track which formal arguments
-  // are proven to receive that snapshot, and their byte offset into it, across
-  // direct calls from the entry. Ambiguous or indirect flows are omitted.
-  DenseMap<const Argument *, uint64_t> boundArguments_;
-  SmallVector<std::pair<uint64_t, uint64_t>, 4> boundMayConstFields_;
+  struct BoundPointerState {
+    EJitBoundPointerView view;
+    DenseMap<const Argument *, uint64_t> boundArguments;
+    SmallVector<std::pair<uint64_t, uint64_t>, 4> mayConstFields;
+  };
+  SmallVector<BoundPointerState, kEJitMaxBoundPointers> boundStates_;
   void initBoundArgumentPropagation(Module &M);
 
   // Cached metadata maps — built once per module, reused across functions.

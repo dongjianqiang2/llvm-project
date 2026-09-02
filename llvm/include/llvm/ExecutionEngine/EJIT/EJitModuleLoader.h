@@ -15,6 +15,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace llvm {
 namespace ejit {
@@ -50,6 +51,9 @@ public:
     unsigned dimCount = 0;
     std::string periodNames[4];
     uint32_t dimTypes[4] = {0, 0, 0, 0};
+    /// Argument indices declared by EJIT_BOUND_PTR on the registered root.
+    /// Direct descriptor APIs are checked against this list on the cold path.
+    std::vector<uint32_t> boundPointerArgIndices;
   };
   /// Parse bitcode once per funcIdx, cache the result.
   const FuncMeta &getOrCacheFuncMeta(uint32_t funcIdx);

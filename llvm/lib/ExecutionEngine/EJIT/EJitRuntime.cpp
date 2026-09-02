@@ -901,11 +901,10 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
 }
 } // namespace
 
-static ejit_status_t
-taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
-                         uint32_t numDims, const void *snapshotData,
-                         uint32_t snapshotSize, uint32_t boundArgIndex,
-                         void **outFn, uint32_t *outBucket) {
+static ejit_status_t taskpoolCompileOrGetImpl(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount,
+    void **outFn, uint32_t *outBucket) {
   if (outFn)
     *outFn = nullptr;
   if (outBucket)
@@ -922,6 +921,12 @@ taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
   if (!tp) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: no taskpool", funcIndex);
     return EJIT_ERR_NOT_ACTIVE;
+  }
+  if (!validateBoundPtrDescriptors(boundPointers, boundCount)) {
+    EJIT_DIAG("taskpool_compile_or_get reject func=%u: invalid bound pointer "
+              "list count=%u",
+              funcIndex, boundCount);
+    return EJIT_ERR_INVALID_PARAM;
   }
   const uint64_t icTok = ejitIcacheBeginResolve();
 
@@ -962,6 +967,11 @@ taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
   // disabled instance never returns stale code. A true miss falls through to
   // compileOrGet unchanged (enqueue/dedup/compile).
   void *l0Fn = nullptr;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // L0 remains valid for bound calls: it contains only the identity -> code
+  // pointer mapping, while bound descriptors are needed only on a miss or a
+  // PGO Tier-2 arm. PGO enable/disable retires L0 via dispatchEpoch, so a
+  // successful L0 hit cannot bypass an active PGO counter.
   if (tp->l0Try(funcIndex, dimsCast, numDims, &l0Fn)) {
     if (outFn)
       *outFn = l0Fn;
@@ -969,7 +979,8 @@ taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
       *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
-  auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
+  auto fast =
+      tp->tryCacheHit(funcIndex, dimsCast, numDims, boundPointers, boundCount);
   if (fast.fastPathTerminal) {
     if (outFn)
       *outFn = fast.fnPtr;
@@ -983,10 +994,28 @@ taskpoolCompileOrGetImpl(uint32_t funcIndex, const ejit_dim_pair_t *dims,
       tp->l0Fill(funcIndex, fast.fnPtr, dimsCast, numDims);
     return taskpoolStatus(fast.status);
   }
+#else
+  // The per-instance taskpool has no shared L0 layer. Its compileOrGet() owns
+  // the ordinary cache lookup and the bound descriptors are copied only when
+  // a miss is actually submitted.
+  if (boundCount == 0) {
+    auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
+    if (fast.fastPathTerminal) {
+      if (outFn)
+        *outFn = fast.fnPtr;
+      if (outBucket)
+        *outBucket = fast.bucketIndex;
+      EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u fast status=%u fn=%p",
+                        funcIndex, static_cast<unsigned>(fast.status),
+                        fast.fnPtr);
+      ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dimsCast, numDims, icTok);
+      return taskpoolStatus(fast.status);
+    }
+  }
+#endif
 
   auto r = tp->compileOrGet(funcIndex, dimsCast, numDims,
-                            /*fallback=*/nullptr, snapshotData, snapshotSize,
-                            boundArgIndex);
+                            /*fallback=*/nullptr, boundPointers, boundCount);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)
@@ -1003,17 +1032,51 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,
                                            uint32_t *outBucket) {
-  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, nullptr, 0, 0,
-                                  outFn, outBucket);
+  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, nullptr, 0, outFn,
+                                  outBucket);
 }
 
 ejit_status_t ejit_taskpool_compile_or_get_bound(
     uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
-    const void *snapshotData, uint32_t snapshotSize, uint32_t boundArgIndex,
-    void **outFn, uint32_t *outBucket) {
-  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, snapshotData,
-                                  snapshotSize, boundArgIndex, outFn,
+    const void *rawPtr, uint32_t rawSize, uint32_t boundArgIndex, void **outFn,
+    uint32_t *outBucket) {
+  // This compatibility entry point promises a bound request. Treat an empty
+  // object as invalid instead of silently converting it into the generic,
+  // unbound API request (which could return an unbound JIT cache entry).
+  if (!rawPtr || rawSize == 0) {
+    if (outFn)
+      *outFn = nullptr;
+    if (outBucket)
+      *outBucket = 0;
+    EJIT_DIAG("taskpool_compile_or_get_bound reject func=%u: null/empty "
+              "bound object",
+              funcIndex);
+    return EJIT_ERR_INVALID_PARAM;
+  }
+  EJitBoundPtrDescriptor Bound{rawPtr, rawSize, boundArgIndex};
+  return taskpoolCompileOrGetImpl(funcIndex, dims, numDims, &Bound, 1u, outFn,
                                   outBucket);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_bound_v(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const ejit_bound_ptr_t *bounds, uint32_t boundCount, void **outFn,
+    uint32_t *outBucket) {
+  static_assert(sizeof(ejit_bound_ptr_t) == sizeof(EJitBoundPtrDescriptor),
+                "C and C++ bound descriptor layouts must match");
+  static_assert(offsetof(ejit_bound_ptr_t, rawPtr) ==
+                    offsetof(EJitBoundPtrDescriptor, rawPtr),
+                "C and C++ bound pointer offsets must match");
+  static_assert(offsetof(ejit_bound_ptr_t, size) ==
+                    offsetof(EJitBoundPtrDescriptor, size),
+                "C and C++ bound size offsets must match");
+  static_assert(offsetof(ejit_bound_ptr_t, argIndex) ==
+                    offsetof(EJitBoundPtrDescriptor, argIndex),
+                "C and C++ bound arg offsets must match");
+  return taskpoolCompileOrGetImpl(
+      funcIndex, dims, numDims,
+      reinterpret_cast<const EJitBoundPtrDescriptor *>(bounds), boundCount,
+      outFn, outBucket);
 }
 
 //===----------------------------------------------------------------------===//

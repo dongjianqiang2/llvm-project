@@ -869,11 +869,25 @@ public:
   void ownerShutdown();
 
   //--- producer path ----------------------------------------------------------
+  /// Submit a request carrying borrowed raw bound-pointer descriptors. Only
+  /// the fixed descriptors are copied into the queue; pointee bytes are read
+  /// by the compile callback and are never owned by this pool.
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                   uint32_t numDims, void *fallback,
-                                  const void *boundData = nullptr,
-                                  uint32_t boundSize = 0,
-                                  uint32_t boundArgIndex = 0);
+                                  const EJitBoundPtrDescriptor *boundPointers,
+                                  uint32_t boundCount);
+
+  /// Source-compatible single-pointer entry point. A zero size means no bound
+  /// pointer; a nonzero size borrows the pointed-to object through compilation.
+  CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
+                                  uint32_t numDims, void *fallback,
+                                  const void *rawPtr = nullptr,
+                                  uint32_t rawSize = 0,
+                                  uint32_t boundArgIndex = 0) {
+    EJitBoundPtrDescriptor Bound{rawPtr, rawSize, boundArgIndex};
+    return compileOrGet(funcIndex, dims, numDims, fallback,
+                        rawSize ? &Bound : nullptr, rawSize ? 1u : 0u);
+  }
   /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
   /// terminal front half of compileOrGet(): the Ready check, the
   /// instance-enabled check, and the cache lookup, then classifies the outcome:
@@ -888,8 +902,10 @@ public:
   /// enabled, no shareable cached code) returns fastPathTerminal = false and
   /// the caller must fall through to compileOrGet(). compileOrGet() itself
   /// calls this so the ordering/counters/semantics stay identical.
-  CompileOrGetResult tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
-                                 uint32_t numDims);
+  CompileOrGetResult
+  tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+              const EJitBoundPtrDescriptor *boundPointers = nullptr,
+              uint32_t boundCount = 0);
   /// Fixed-dimension fast cache-hit entries (0-4 dims). Same terminal
   /// semantics as tryCacheHit() but the instance-enabled check is unrolled and
   /// the dim identity is built directly on the stack (no numDims loop / no
@@ -1163,6 +1179,9 @@ private:
     /// first-touch path (which self-revalidates), so the seqlock caller must
     /// not second-guess it with the bucket publishSeq check.
     bool coldPrepared = false;
+    /// The matching hit crossed the Tier-2 threshold. The caller decides
+    /// whether to enqueue immediately or attach bound descriptors first.
+    bool tier2Arm = false;
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -1225,7 +1244,15 @@ private:
   /// Submit Tier-2 from an identity/version-validated slot while its bucket
   /// read lock is held. This preserves the exact slot snapshot without
   /// enlarging the 16-byte CompileOrGetResult hot-path return value.
-  void enqueueTier2FromSlot(const EJitSharedCacheSlot &slot);
+  void
+  enqueueTier2FromSlot(const EJitSharedCacheSlot &slot,
+                       const EJitBoundPtrDescriptor *boundPointers = nullptr,
+                       uint32_t boundCount = 0);
+  void
+  enqueueTier2ForIdentity(uint32_t funcIndex, const EJitDimPair *dims,
+                          uint32_t numDims,
+                          const EJitBoundPtrDescriptor *boundPointers = nullptr,
+                          uint32_t boundCount = 0);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
@@ -1239,7 +1266,8 @@ private:
   /// cache-hit counter is incremented exactly once and the semantics stay
   /// identical. Does NOT perform the Ready or instance-enabled checks (the
   /// callers do those first).
-  CompileOrGetResult classifyHit(const SharedLookup &Hit);
+  CompileOrGetResult classifyHit(const SharedLookup &Hit,
+                                 bool enqueueTier2 = true);
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info,
                                  bool pgoClearExclusive = false);

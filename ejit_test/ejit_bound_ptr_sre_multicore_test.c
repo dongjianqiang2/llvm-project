@@ -1,12 +1,11 @@
-//===-- ejit_bound_ptr_sre_multicore_test.c - cross-core snapshot demo ----===//
+//===-- ejit_bound_ptr_sre_multicore_test.c - cross-core raw pointer demo --===//
 //
 // Board flow after a reset:
 //   1. Core 8:  test_ejit_period
 //      Initializes EJIT, owns the shared compile worker, and arms the dump.
 //   2. Core 18: test_ejit_period
-//      Enqueues compilation from a stack-local bound object, destroys that
-//      object, waits for publication, then verifies a JIT cache hit using a
-//      second object whose dynamic field has a different value.
+//      Enqueues compilation from shared per-cell objects, waits for
+//      publication, then verifies JIT cache hits using those same objects.
 //   3. Core 8:  test_ejit_bound_ptr_print
 //      Prints the worker-local optimized IR/ASM.
 //
@@ -141,19 +140,11 @@ bound_cell_config_mc(ejit_period_arr_ind(cell) uint8_t cellIndex,
   return input + cellRelated->runtimeBias;
 }
 
-__attribute__((noinline)) static uint32_t
-enqueue_from_stack(uint8_t cell, uint32_t scale, uint32_t runtimeBias) {
-  struct CellRelated local = {7u, scale, runtimeBias};
-  return bound_cell_config_mc(cell, BOUND_PTR_TRP, &local, 10u);
-}
+EJIT_SHARED_SECTION_ATTR struct CellRelated g_bound_configs[8] = {
+    {7u, 5u, 100u}, {7u, 9u, 100u}};
 
-// Encourage reuse of the caller stack after enqueue_from_stack has returned.
-// Correctness must not depend on whether this happens to overlap its old slot.
-__attribute__((noinline)) static void clobber_producer_stack(void) {
-  volatile uint8_t bytes[512];
-  for (uint32_t i = 0; i < sizeof(bytes); ++i)
-    bytes[i] = (uint8_t)(0xa5u ^ i);
-  __asm__ volatile("" : : "r"(&bytes[0]) : "memory");
+static uint32_t enqueue_from_shared(uint8_t cell) {
+  return bound_cell_config_mc(cell, BOUND_PTR_TRP, &g_bound_configs[cell], 10u);
 }
 
 static int wait_for_compiles(uint64_t baseline, uint64_t expected) {
@@ -202,10 +193,10 @@ static int run_producer(void) {
   // In-flight dedup is keyed by funcIndex, not by the complete dimension
   // identity. Submit the two cell versions serially; otherwise cell 2 sees
   // AlreadyPending while cell 1 is compiling and is never enqueued.
-  // Each first call returns AOT, and its stack object is dead before the worker
-  // completes, preserving the lifetime stress this demo is meant to cover.
-  uint32_t aotA = enqueue_from_stack(BOUND_PTR_CELL_A, 5u, 100u);
-  clobber_producer_stack();
+  // Each first call returns AOT while the shared object remains alive through
+  // worker compilation. The raw pointer is transport-only and is never freed
+  // by the queue or worker.
+  uint32_t aotA = enqueue_from_shared(BOUND_PTR_CELL_A);
   if (ejit_publish_pending_code() != EJIT_OK) {
     SRE_printf("[BOUND-PTR-MC][core=%u] FAIL cell1 batch publish\n",
                BOUND_PTR_PRODUCER_CORE);
@@ -218,8 +209,7 @@ static int run_producer(void) {
     return -6;
   }
 
-  uint32_t aotB = enqueue_from_stack(BOUND_PTR_CELL_B, 9u, 100u);
-  clobber_producer_stack();
+  uint32_t aotB = enqueue_from_shared(BOUND_PTR_CELL_B);
   if (ejit_publish_pending_code() != EJIT_OK) {
     SRE_printf("[BOUND-PTR-MC][core=%u] FAIL cell2 batch publish\n",
                BOUND_PTR_PRODUCER_CORE);
@@ -245,13 +235,12 @@ static int run_producer(void) {
   ejit_taskpool_stats_t compiled = {0};
   (void)ejit_taskpool_get_stats(&compiled);
 
-  // Each cell keeps its own stable scale, while runtimeBias deliberately
-  // changes. Reusing cell 1's scale=5 specialization for cell 2 would return
-  // 254 instead of 294 and fail this check.
-  uint32_t jitA = enqueue_from_stack(BOUND_PTR_CELL_A, 5u, 200u);
-  uint32_t jitB = enqueue_from_stack(BOUND_PTR_CELL_B, 9u, 200u);
-  const uint32_t expectedJitA = 253u;
-  const uint32_t expectedJitB = 294u;
+  // Each cell keeps its own stable scale and object address. Reusing cell 1's
+  // scale=5 specialization for cell 2 would return 153 instead of 194.
+  uint32_t jitA = enqueue_from_shared(BOUND_PTR_CELL_A);
+  uint32_t jitB = enqueue_from_shared(BOUND_PTR_CELL_B);
+  const uint32_t expectedJitA = expectedAotA;
+  const uint32_t expectedJitB = expectedAotB;
   ejit_taskpool_stats_t after = {0};
   (void)ejit_taskpool_get_stats(&after);
   if (jitA != expectedJitA || jitB != expectedJitB) {

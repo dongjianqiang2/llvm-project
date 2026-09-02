@@ -26,4 +26,27 @@ __attribute__((ejit_entry))
 void two_bound(__attribute__((ejit_period_arr_ind("cell"))) int cell,
                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *a,
                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *b);
-// expected-error@-1 {{function 'two_bound' has 2 ejit_bound_ptr parameters; at most one is supported}}
+
+__attribute__((ejit_entry))
+void eight_bound(__attribute__((ejit_period_arr_ind("cell"))) int cell,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *a,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *b,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *c,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *d,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *e,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *f,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *g,
+                 __attribute__((ejit_bound_ptr("cell"))) struct Cfg *h);
+
+__attribute__((ejit_entry))
+void nine_bound(__attribute__((ejit_period_arr_ind("cell"))) int cell,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *a,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *b,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *c,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *d,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *e,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *f,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *g,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *h,
+                __attribute__((ejit_bound_ptr("cell"))) struct Cfg *i);
+// expected-error@-1 {{function 'nine_bound' has 9 ejit_bound_ptr parameters; at most 8 are supported}}

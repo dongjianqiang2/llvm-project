@@ -348,6 +348,42 @@ TEST(EJitModuleLoader, NullOrZeroPayloadRejected) {
   EXPECT_FALSE(loader.registerBitcode("zero_fn", d, 0));
 }
 
+TEST(EJitModuleLoader, CachesBoundPointerFormalIndices) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    define i32 @loader_bound_meta(ptr %cfg, i32 %not_a_pointer)
+        !ejit.metadata !0 {
+    entry:
+      ret i32 0
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_bound_ptr", !"cell", i32 0, i64 8}
+    !2 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8}
+    !3 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+
+  std::string Bitcode;
+  raw_string_ostream OS(Bitcode);
+  WriteBitcodeToFile(*M, OS);
+  OS.flush();
+
+  constexpr const char *Name = "loader_bound_meta";
+  EJitModuleLoader Loader;
+  EXPECT_TRUE(Loader.registerBitcode(
+      Name, reinterpret_cast<const uint8_t *>(Bitcode.data()),
+      Bitcode.size()));
+  uint32_t FuncIndex = EJitFuncRegistry::instance().lookup(Name);
+  ASSERT_NE(FuncIndex, kEJitInvalidFuncIndex);
+
+  const auto &Meta = Loader.getOrCacheFuncMeta(FuncIndex);
+  ASSERT_EQ(Meta.boundPointerArgIndices.size(), 1u)
+      << "non-pointer formals must not become valid bound descriptor targets";
+  EXPECT_EQ(Meta.boundPointerArgIndices.front(), 0u);
+}
+
 TEST(EJitModuleLoader, SameNameSamePayloadIdempotent) {
   EJitModuleLoader loader;
   const uint8_t d[] = {0x10, 0x11};
@@ -761,6 +797,10 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
 extern "C" {
 typedef enum { EJIT_OK_C = 0 } ejit_status_test_t;
 typedef struct {
+  uint32_t dimType;
+  uint32_t instanceId;
+} ejit_dim_pair_test_t;
+typedef struct {
   uint64_t count;
   uint64_t total;
   uint64_t min;
@@ -789,6 +829,9 @@ extern void ejit_register_lifecycle(const char *, uint32_t *);
 // for branchless-probe slots (null keeps the guarded form's 0 semantics).
 extern void ejit_register_funcindex(const char *, uint32_t *);
 extern void ejit_register_icache_slot(const char *, void *, uint32_t, void *);
+extern int ejit_taskpool_compile_or_get_bound(
+    uint32_t, const ejit_dim_pair_test_t *, uint32_t, const void *, uint32_t,
+    uint32_t, void **, uint32_t *);
 extern void ejit_set_log_level(int level);
 extern int ejit_get_log_level(void);
 extern void ejit_print_registry(void);
@@ -1018,6 +1061,29 @@ void resetTaskpoolRegState() {
   llvm::ejit::EJitRegistrationStore::instance().consumeError();
 }
 } // namespace
+
+TEST(EJitCApiTaskpool, SingleBoundRejectsEmptyObject) {
+  resetTaskpoolRegState();
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
+
+  uint32_t value = 1;
+  void *Fn = reinterpret_cast<void *>(0x1);
+  uint32_t Bucket = 7;
+  EXPECT_EQ(ejit_taskpool_compile_or_get_bound(
+                0, nullptr, 0, &value, 0, 0, &Fn, &Bucket),
+            -1);
+  EXPECT_EQ(Fn, nullptr);
+  EXPECT_EQ(Bucket, 0u);
+
+  Fn = reinterpret_cast<void *>(0x1);
+  Bucket = 7;
+  EXPECT_EQ(ejit_taskpool_compile_or_get_bound(
+                0, nullptr, 0, nullptr, sizeof(value), 0, &Fn, &Bucket),
+            -1);
+  EXPECT_EQ(Fn, nullptr);
+  EXPECT_EQ(Bucket, 0u);
+  ejit_shutdown();
+}
 
 // Finding (二): in a taskpool build, all registration is frozen after
 // ejit_init; post-init register_* calls are rejected and mutate nothing.
@@ -1682,7 +1748,7 @@ TEST(EJitStructFieldPass, NoMayConstNoChange) {
   EXPECT_TRUE(PA.areAllPreserved());
 }
 
-TEST(EJitStructFieldPass, BoundPointerUsesOwnedSnapshot) {
+TEST(EJitStructFieldPass, BoundPointerReadsBorrowedObject) {
   LLVMContext Ctx;
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
@@ -1711,27 +1777,80 @@ TEST(EJitStructFieldPass, BoundPointerUsesOwnedSnapshot) {
     uint32_t stablePrefix;
     uint32_t mode;
     uint32_t dynamic;
-  } Snapshot{3, 7, 99};
+  } Config{3, 7, 99};
   PeriodArrayRegistry Registry;
-  EJitStructFieldPass Pass(Registry,
-                           reinterpret_cast<const uint8_t *>(&Snapshot),
-                           sizeof(Snapshot), 1);
+  EJitStructFieldPass Pass(Registry, reinterpret_cast<const uint8_t *>(&Config),
+                           sizeof(Config), 1);
   Pass.initFromModule(*M);
   FunctionAnalysisManager FAM;
   Pass.run(*M->getFunction("bound"), FAM);
 
   unsigned Loads = 0;
-  bool SawSnapshotConstant = false;
+  bool SawBoundConstant = false;
   for (Instruction &I : instructions(*M->getFunction("bound"))) {
     if (isa<LoadInst>(I))
       ++Loads;
     if (auto *Add = dyn_cast<BinaryOperator>(&I))
       for (Value *Operand : Add->operands())
         if (auto *C = dyn_cast<ConstantInt>(Operand))
-          SawSnapshotConstant |= C->getZExtValue() == 7;
+          SawBoundConstant |= C->getZExtValue() == 7;
   }
   EXPECT_EQ(Loads, 1u) << "dynamic field must remain a runtime load";
-  EXPECT_TRUE(SawSnapshotConstant);
+  EXPECT_TRUE(SawBoundConstant);
+}
+
+TEST(EJitStructFieldPass, PointerConstantUsesTargetWidthAndEndian) {
+  for (bool LittleEndian : {true, false}) {
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(R"(
+      @period_ptr = external global ptr, !ejit.metadata !0
+      define ptr @read_period_ptr() {
+      entry:
+        %value = load ptr, ptr @period_ptr
+        ret ptr %value
+      }
+      !0 = !{!1}
+      !1 = !{!"ejit_period", !"period_ptr"}
+    )",
+                                 Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    M->setDataLayout(LittleEndian ? "e-p:32:32-i64:64-n32-S128"
+                                  : "E-p:32:32-i64:64-n32-S128");
+
+    uint8_t PointerSlot[8] = {0};
+    if (LittleEndian) {
+      PointerSlot[0] = 0x78;
+      PointerSlot[1] = 0x56;
+      PointerSlot[2] = 0x34;
+      PointerSlot[3] = 0x12;
+    } else {
+      PointerSlot[0] = 0x12;
+      PointerSlot[1] = 0x34;
+      PointerSlot[2] = 0x56;
+      PointerSlot[3] = 0x78;
+    }
+    PointerSlot[4] = PointerSlot[5] = PointerSlot[6] = PointerSlot[7] = 0xA5;
+
+    PeriodArrayRegistry Registry;
+    Registry.registerStaticVar("period_ptr", PointerSlot);
+    EJitStructFieldPass Pass(Registry);
+    Pass.initFromModule(*M);
+    FunctionAnalysisManager FAM;
+    Function *F = M->getFunction("read_period_ptr");
+    ASSERT_NE(F, nullptr);
+    Pass.run(*F, FAM);
+
+    auto *Ret = dyn_cast<ReturnInst>(&F->back().back());
+    ASSERT_NE(Ret, nullptr);
+    auto *IntToPtr = dyn_cast<ConstantExpr>(Ret->getReturnValue());
+    ASSERT_NE(IntToPtr, nullptr);
+    ASSERT_EQ(IntToPtr->getOpcode(), Instruction::IntToPtr);
+    auto *Address = dyn_cast<ConstantInt>(IntToPtr->getOperand(0));
+    ASSERT_NE(Address, nullptr);
+    EXPECT_EQ(cast<IntegerType>(Address->getType())->getBitWidth(), 32u);
+    EXPECT_EQ(Address->getZExtValue(), 0x12345678u);
+  }
 }
 
 TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
@@ -1739,28 +1858,44 @@ TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
     %Cfg = type { i32, i32 }
-    define i32 @bound_chain(i32 %cell, ptr %cfg) !ejit.metadata !0 {
+    define i32 @bound_chain(i8 %cell, ptr %cfg) !ejit.metadata !0 {
     entry:
-      %result = call i32 @bound_helper1(i64 123, ptr %cfg)
+      %cell32 = zext i8 %cell to i32
+      %result = call i32 @bound_helper1(i32 %cell32, ptr %cfg)
       ret i32 %result
     }
-    define internal i32 @bound_helper1(i64 %unused, ptr %cfg) noinline {
+    define i32 @bound_helper1(i32 %cell, ptr %cfg) noinline !ejit.metadata !4 {
+    entry:
+      %cell8 = trunc i32 %cell to i8
+      %result = call i32 @bound_helper2(i8 %cell8, ptr %cfg)
+      ret i32 %result
+    }
+    define i32 @bound_helper2(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !7 {
     entry:
       %mode.ptr = getelementptr %Cfg, ptr %cfg, i32 0, i32 1
-      %result = call i32 @bound_helper2(ptr %mode.ptr)
+      %mode = load i32, ptr %mode.ptr, !ejit.may_const !10
+      %tail = call i32 @bound_helper3(ptr %mode.ptr)
+      %result = add i32 %mode, %tail
       ret i32 %result
     }
-    define internal i32 @bound_helper2(ptr %mode.ptr) noinline {
+    define internal i32 @bound_helper3(ptr %mode.ptr) noinline {
     entry:
-      %mode = load i32, ptr %mode.ptr, !ejit.may_const !4
+      %mode = load i32, ptr %mode.ptr, !ejit.may_const !10
       ret i32 %mode
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
-    !4 = !{!"ejit"}
+    !4 = distinct !{!8, !9, !12}
     !5 = !{i64 4, i64 4}
+    !7 = distinct !{!10, !11, !12}
+    !8 = !{!"ejit_entry"}
+    !9 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !10 = !{!"ejit"}
+    !11 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !12 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -1769,11 +1904,11 @@ TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
   struct Config {
     uint32_t dynamic;
     uint32_t mode;
-  } Snapshot{99, 17};
+  } BoundObject{99, 17};
   PeriodArrayRegistry Registry;
   EJitStructFieldPass Pass(Registry,
-                           reinterpret_cast<const uint8_t *>(&Snapshot),
-                           sizeof(Snapshot), 1, "bound_chain");
+                           reinterpret_cast<const uint8_t *>(&BoundObject),
+                           sizeof(BoundObject), 1, "bound_chain");
   Pass.initFromModule(*M);
   FunctionAnalysisManager FAM;
   for (Function &F : *M)
@@ -1787,9 +1922,14 @@ TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
             0);
   auto *Ret = dyn_cast<ReturnInst>(Leaf->getEntryBlock().getTerminator());
   ASSERT_NE(Ret, nullptr);
-  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
-  ASSERT_NE(Value, nullptr);
-  EXPECT_EQ(Value->getZExtValue(), 17u);
+  EXPECT_TRUE(isa<BinaryOperator>(Ret->getReturnValue()));
+
+  Function *Unannotated = M->getFunction("bound_helper3");
+  ASSERT_NE(Unannotated, nullptr);
+  EXPECT_EQ(std::count_if(inst_begin(Unannotated), inst_end(Unannotated),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            1)
+      << "the unannotated nested helper is a propagation boundary";
 }
 
 TEST(EJitStructFieldPass, AmbiguousHelperPointerIsNotSpecialized) {
@@ -1797,15 +1937,62 @@ TEST(EJitStructFieldPass, AmbiguousHelperPointerIsNotSpecialized) {
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
     %Cfg = type { i32 }
-    define i32 @bound_ambiguous(i32 %cell, ptr %cfg, ptr %other)
+    define i32 @bound_ambiguous(i8 %cell, ptr %cfg, ptr %other)
         !ejit.metadata !0 {
     entry:
-      %a = call i32 @shared_helper(ptr %cfg)
-      %b = call i32 @shared_helper(ptr %other)
+      %a = call i32 @shared_helper(i8 %cell, ptr %cfg)
+      %b = call i32 @shared_helper(i8 %cell, ptr %other)
       %sum = add i32 %a, %b
       ret i32 %sum
     }
-    define internal i32 @shared_helper(ptr %cfg) noinline {
+    define i32 @shared_helper(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !4 {
+    entry:
+      %value = load i32, ptr %cfg, !ejit.may_const !8
+      ret i32 %value
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+    !4 = distinct !{!6, !7, !9}
+    !5 = !{i64 0, i64 4}
+    !6 = !{!"ejit_entry"}
+    !7 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !8 = !{!"ejit"}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t BoundObject = 23;
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&BoundObject),
+                           sizeof(BoundObject), 1, "bound_ambiguous");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("shared_helper"), FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(M->getFunction("shared_helper")),
+                          inst_end(M->getFunction("shared_helper")),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            1);
+}
+
+TEST(EJitStructFieldPass, EntryDimensionWithoutBoundPointerIsNotSpecialized) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Cfg = type { i32 }
+    define i32 @bound_root(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %result = call i32 @unannotated_helper(i8 %cell, ptr %cfg)
+      ret i32 %result
+    }
+    define i32 @unannotated_helper(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !6 {
     entry:
       %value = load i32, ptr %cfg, !ejit.may_const !4
       ret i32 %value
@@ -1816,24 +2003,347 @@ TEST(EJitStructFieldPass, AmbiguousHelperPointerIsNotSpecialized) {
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
     !4 = !{!"ejit"}
     !5 = !{i64 0, i64 4}
+    !6 = distinct !{!1, !2}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
   M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
 
-  uint32_t Snapshot = 23;
+  uint32_t BoundObject = 31;
   PeriodArrayRegistry Registry;
   EJitStructFieldPass Pass(Registry,
-                           reinterpret_cast<const uint8_t *>(&Snapshot),
-                           sizeof(Snapshot), 1, "bound_ambiguous");
+                           reinterpret_cast<const uint8_t *>(&BoundObject),
+                           sizeof(BoundObject), 1, "bound_root");
   Pass.initFromModule(*M);
   FunctionAnalysisManager FAM;
-  Pass.run(*M->getFunction("shared_helper"), FAM);
+  Function *Helper = M->getFunction("unannotated_helper");
+  ASSERT_NE(Helper, nullptr);
+  Pass.run(*Helper, FAM);
 
-  EXPECT_EQ(std::count_if(inst_begin(M->getFunction("shared_helper")),
-                          inst_end(M->getFunction("shared_helper")),
+  EXPECT_EQ(std::count_if(inst_begin(Helper), inst_end(Helper),
                           [](Instruction &I) { return isa<LoadInst>(I); }),
             1);
+}
+
+TEST(EJitStructFieldPass, MismatchedHelperDimensionIsNotSpecialized) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Cfg = type { i32 }
+    define i32 @bound_root(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %result = call i32 @wrong_dimension_helper(i8 %cell, ptr %cfg)
+      ret i32 %result
+    }
+    define i32 @wrong_dimension_helper(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !4 {
+    entry:
+      %value = load i32, ptr %cfg, !ejit.may_const !7
+      ret i32 %value
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+    !4 = distinct !{!6, !8, !9}
+    !5 = !{i64 0, i64 4}
+    !6 = !{!"ejit_entry"}
+    !7 = !{!"ejit"}
+    !8 = !{!"ejit_period_arr_ind", !"other", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"other", i32 1, i64 4, !5}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t BoundObject = 37;
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&BoundObject),
+                           sizeof(BoundObject), 1, "bound_root");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Function *Helper = M->getFunction("wrong_dimension_helper");
+  ASSERT_NE(Helper, nullptr);
+  Pass.run(*Helper, FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(Helper), inst_end(Helper),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            1)
+      << "a helper with a different dimension is a boundary";
+}
+
+TEST(EJitStructFieldPass, HelperOtherCellIsNotSpecialized) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Cfg = type { i32 }
+    define i32 @bound_root(i8 %cell, i8 %otherCell, ptr %cfg)
+        !ejit.metadata !0 {
+    entry:
+      %result = call i32 @bound_helper(i8 %otherCell, ptr %cfg)
+      ret i32 %result
+    }
+    define i32 @bound_helper(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !4 {
+    entry:
+      %value = load i32, ptr %cfg, !ejit.may_const !7
+      ret i32 %value
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
+    !4 = distinct !{!6, !8, !9}
+    !5 = !{i64 0, i64 4}
+    !6 = !{!"ejit_entry"}
+    !7 = !{!"ejit"}
+    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t BoundObject = 41;
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&BoundObject),
+                           sizeof(BoundObject), 2, "bound_root");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Function *Helper = M->getFunction("bound_helper");
+  ASSERT_NE(Helper, nullptr);
+  Pass.run(*Helper, FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(Helper), inst_end(Helper),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            1)
+      << "the helper must use the caller's cell identity";
+}
+
+TEST(EJitStructFieldPass, HelperDifferentSpecializedConstantIsNotSpecialized) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Cfg = type { i32 }
+    define i32 @bound_root(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %result = call i32 @bound_helper(i8 9, ptr %cfg)
+      ret i32 %result
+    }
+    define i32 @bound_helper(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !4 {
+    entry:
+      %value = load i32, ptr %cfg, !ejit.may_const !7
+      ret i32 %value
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+    !4 = distinct !{!6, !8, !9}
+    !5 = !{i64 0, i64 4}
+    !6 = !{!"ejit_entry"}
+    !7 = !{!"ejit"}
+    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  PeriodArrayRegistry Registry;
+  SpecializationContext CtxSpec;
+  CtxSpec.fnName = "bound_root";
+  CtxSpec.dimensions.push_back({"cell", 3});
+  EJitOptimizerTestAccess Opt(Registry);
+  Opt.preReplacePeriodIndices(*M, CtxSpec);
+
+  uint32_t BoundObject = 43;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&BoundObject),
+                           sizeof(BoundObject), 1, "bound_root", 3);
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Function *Helper = M->getFunction("bound_helper");
+  ASSERT_NE(Helper, nullptr);
+  Pass.run(*Helper, FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(Helper), inst_end(Helper),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            1)
+      << "a different specialized cell constant is not equivalent";
+}
+
+TEST(EJitStructFieldPass, InconsistentHelperDimensionSourcesAreNotSpecialized) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %Cfg = type { i32 }
+    define i32 @bound_root(i8 %cell, i8 %otherCell, ptr %cfg)
+        !ejit.metadata !0 {
+    entry:
+      %a = call i32 @bound_helper(i8 %cell, ptr %cfg)
+      %b = call i32 @bound_helper(i8 %otherCell, ptr %cfg)
+      %sum = add i32 %a, %b
+      ret i32 %sum
+    }
+    define i32 @bound_helper(i8 %cell, ptr %cfg) noinline
+        !ejit.metadata !4 {
+    entry:
+      %value = load i32, ptr %cfg, !ejit.may_const !7
+      ret i32 %value
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
+    !4 = distinct !{!6, !8, !9}
+    !5 = !{i64 0, i64 4}
+    !6 = !{!"ejit_entry"}
+    !7 = !{!"ejit"}
+    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t BoundObject = 47;
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry,
+                           reinterpret_cast<const uint8_t *>(&BoundObject),
+                           sizeof(BoundObject), 2, "bound_root");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Function *Helper = M->getFunction("bound_helper");
+  ASSERT_NE(Helper, nullptr);
+  Pass.run(*Helper, FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(Helper), inst_end(Helper),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            1)
+      << "all callsites must agree on the helper cell identity";
+}
+
+TEST(EJitStructFieldPass, BoundPointerHelperSupportsMultipleCellVersions) {
+  constexpr const char *IR = R"(
+    %Cfg = type { i32 }
+    define i32 @bound_root(i8 %cell, i8 %trp, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %result = call i32 @bound_helper(i8 %cell, i8 %trp, ptr %cfg)
+      ret i32 %result
+    }
+    define i32 @bound_helper(i8 %cell, i8 %trp, ptr %cfg) noinline
+        !ejit.metadata !4 {
+    entry:
+      %value = load i32, ptr %cfg, !ejit.may_const !7
+      ret i32 %value
+    }
+    !0 = distinct !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
+    !4 = distinct !{!6, !8, !9, !10}
+    !5 = !{i64 0, i64 4}
+    !6 = !{!"ejit_entry"}
+    !7 = !{!"ejit"}
+    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !10 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
+  )";
+
+  for (uint32_t Cell = 0; Cell < 2; ++Cell) {
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(IR, Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+    uint32_t BoundObject = 17 + Cell * 10;
+    PeriodArrayRegistry Registry;
+    SpecializationContext CtxSpec;
+    CtxSpec.fnName = "bound_root";
+    CtxSpec.dimensions.push_back({"cell", static_cast<uint8_t>(Cell)});
+    EJitOptimizerTestAccess Opt(Registry);
+    Opt.preReplacePeriodIndices(*M, CtxSpec);
+
+    EJitStructFieldPass Pass(
+        Registry, reinterpret_cast<const uint8_t *>(&BoundObject),
+        sizeof(BoundObject), 2, "bound_root", static_cast<uint8_t>(Cell));
+    Pass.initFromModule(*M);
+    FunctionAnalysisManager FAM;
+    Function *Helper = M->getFunction("bound_helper");
+    ASSERT_NE(Helper, nullptr);
+    Pass.run(*Helper, FAM);
+
+    auto *Ret = dyn_cast<ReturnInst>(Helper->getEntryBlock().getTerminator());
+    ASSERT_NE(Ret, nullptr);
+    auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+    ASSERT_NE(Value, nullptr);
+    EXPECT_EQ(Value->getZExtValue(), BoundObject);
+  }
+}
+
+TEST(EJitStructFieldPass, BoundPointerHelperPropagatesCellAndTrpPointers) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    %CellCfg = type { i32 }
+    %TrpCfg = type { i32 }
+    define i32 @bound_root(i8 %cell, i8 %trp, ptr %cellCfg, ptr %trpCfg)
+        !ejit.metadata !0 {
+    entry:
+      %result = call i32 @bound_helper(i8 %cell, i8 %trp,
+                                      ptr %cellCfg, ptr %trpCfg)
+      ret i32 %result
+    }
+    define i32 @bound_helper(i8 %cell, i8 %trp, ptr %cellCfg, ptr %trpCfg)
+        noinline !ejit.metadata !1 {
+    entry:
+      %cellValue = load i32, ptr %cellCfg, !ejit.may_const !8
+      %trpValue = load i32, ptr %trpCfg, !ejit.may_const !8
+      %sum = add i32 %cellValue, %trpValue
+      ret i32 %sum
+    }
+    !0 = distinct !{!2, !3, !4, !5, !6}
+    !1 = distinct !{!2, !3, !4, !5, !6}
+    !2 = !{!"ejit_entry"}
+    !3 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !4 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !5 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !7}
+    !6 = !{!"ejit_bound_ptr", !"trp", i32 3, i64 4, !7}
+    !7 = !{i64 0, i64 4}
+    !8 = !{!"ejit"}
+  )",
+                               Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+
+  uint32_t CellConfig = 13;
+  uint32_t TrpConfig = 29;
+  SmallVector<EJitBoundPointerView, 2> Views{
+      {reinterpret_cast<const uint8_t *>(&CellConfig), sizeof(CellConfig), 2,
+       1},
+      {reinterpret_cast<const uint8_t *>(&TrpConfig), sizeof(TrpConfig), 3,
+       2}};
+  PeriodArrayRegistry Registry;
+  EJitStructFieldPass Pass(Registry, Views, "bound_root");
+  Pass.initFromModule(*M);
+  FunctionAnalysisManager FAM;
+  Function *Helper = M->getFunction("bound_helper");
+  ASSERT_NE(Helper, nullptr);
+  Pass.run(*Helper, FAM);
+
+  EXPECT_EQ(std::count_if(inst_begin(Helper), inst_end(Helper),
+                          [](Instruction &I) { return isa<LoadInst>(I); }),
+            0);
+  auto *Sum = dyn_cast<BinaryOperator>(
+      Helper->getEntryBlock().getTerminator()->getOperand(0));
+  ASSERT_NE(Sum, nullptr);
+  EXPECT_EQ(cast<ConstantInt>(Sum->getOperand(0))->getZExtValue(), CellConfig);
+  EXPECT_EQ(cast<ConstantInt>(Sum->getOperand(1))->getZExtValue(), TrpConfig);
 }
 
 //===----------------------------------------------------------------------===//

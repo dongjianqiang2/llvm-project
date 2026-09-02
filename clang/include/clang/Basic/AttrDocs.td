@@ -9516,14 +9516,18 @@ def EjitBoundPtrDocs : Documentation {
   let Content = [{
 EmbeddedJIT: binds a pointer parameter's pointee to a specialization dimension.
 
-On a JIT cache miss, the runtime snapshots the complete pointee before the
-call returns. Loads of ``ejit_may_const`` fields through the parameter may then
-be specialized from that snapshot. The function must also have exactly one
+On a JIT cache miss, the worker reads the pointee through a borrowed raw pointer
+while compiling. The caller must keep the object alive, mapped at the same
+virtual address, and unchanged until compilation finishes. Loads of
+``ejit_may_const`` fields through the parameter may then be specialized from
+that object. The function must also have exactly one
 ``ejit_period_arr_ind`` parameter with the same period name.
 
 Only a pointer to a complete object type is accepted. The first implementation
-supports one bound pointer per function and performs a shallow object copy;
-pointers contained inside the object are not followed.
+supports up to eight bound pointers per function. Pointers contained inside an
+object are not followed. The pointer and object contents are transport data,
+not part of the cache identity; changing them requires deactivating the
+dimension, modifying the object, and reactivating the dimension.
 
 .. code-block:: c
 

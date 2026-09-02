@@ -10,6 +10,20 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+namespace {
+
+// Bound pointers are transport-only. A publish notification happens after
+// compilation, so it must not expose a borrowed object to callback code.
+EJitCompileRequest requestForPublication(const EJitCompileRequest &Req) {
+  EJitCompileRequest Published = Req;
+  Published.boundCount = 0;
+  for (EJitBoundPtrDescriptor &Bound : Published.boundPointers)
+    Bound = {};
+  return Published;
+}
+
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // EJitSwitchController (§5.1)
 //
@@ -489,13 +503,21 @@ EJitTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
 EJitTaskPool::CompileOrGetResult
 EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims, void *fallback,
-                           const void *boundData, uint32_t boundSize,
-                           uint32_t boundArgIndex) {
+                           const EJitBoundPtrDescriptor *boundPointers,
+                           uint32_t boundCount) {
   EJIT_DIAG_VERBOSE("taskpool request func=%u dims=%u fallback=%p", funcIndex,
                     numDims, fallback);
 
   // Parameter check already done by the C API layer
   // (ejit_taskpool_compile_or_get).
+  if (!validateBoundPtrDescriptors(boundPointers, boundCount)) {
+    EJIT_DIAG("taskpool bound pointer reject func=%u count=%u", funcIndex,
+              boundCount);
+    CompileOrGetResult Invalid;
+    Invalid.fnPtr = fallback;
+    Invalid.status = EJitCompileOrGetStatus::InvalidParam;
+    return Invalid;
+  }
 
   // Fast cache-hit path (§5.2 steps 0-1). On a terminal outcome (hit or a
   // disabled instance) return directly.
@@ -515,11 +537,14 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       T2.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
       T2.numDims = numDims;
       T2.fallbackPtr = reinterpret_cast<uintptr_t>(fallback);
+      T2.boundCount = boundCount;
       for (uint32_t i = 0; i < numDims; ++i) {
         T2.dims[i] = dims[i];
         T2.versions[i] =
             switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
       }
+      for (uint32_t i = 0; i < boundCount; ++i)
+        T2.boundPointers[i] = boundPointers[i];
       if (queue_.tryEnqueue(T2) == EJitTaskQueue::EnqueueResult::Enqueued)
         EJIT_DIAG_VERBOSE("taskpool PGO Tier-2 armed func=%u", funcIndex);
     }
@@ -527,14 +552,6 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
-
-  if ((boundSize != 0 && !boundData) || boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
-    EJIT_DIAG("taskpool bound snapshot reject func=%u size=%u max=%u",
-              funcIndex, boundSize,
-              static_cast<unsigned>(EJIT_BOUND_PTR_MAX_BYTES));
-    R.status = EJitCompileOrGetStatus::InvalidParam;
-    return R;
-  }
 
   // 3. Off mode (§5.2 step 2) — fall back, never enqueue/compile.
   if (switch_.getMode() == EJitCompileMode::Off) {
@@ -560,12 +577,11 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       Req.versions[i] =
           switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
     }
-    Req.boundArgIndex = boundArgIndex;
-    Req.boundSize = boundSize;
-    if (boundSize)
-      std::memcpy(Req.boundData, boundData, boundSize);
+    Req.boundCount = boundCount;
+    for (uint32_t i = 0; i < boundCount; ++i)
+      Req.boundPointers[i] = boundPointers[i];
     if (!versionsMatch(Req)) {
-      EJIT_DIAG("taskpool sync snapshot drop func=%u: version changed",
+      EJIT_DIAG("taskpool sync bound request drop func=%u: version changed",
                 funcIndex);
       R.status = EJitCompileOrGetStatus::CompileFailed;
       return R;
@@ -624,12 +640,11 @@ EJitTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     Req.versions[i] =
         switch_.getInstanceVersion(dims[i].dimType, dims[i].instanceId);
   }
-  Req.boundArgIndex = boundArgIndex;
-  Req.boundSize = boundSize;
-  if (boundSize)
-    std::memcpy(Req.boundData, boundData, boundSize);
+  Req.boundCount = boundCount;
+  for (uint32_t i = 0; i < boundCount; ++i)
+    Req.boundPointers[i] = boundPointers[i];
   if (!versionsMatch(Req)) {
-    EJIT_DIAG("taskpool async snapshot drop func=%u: version changed",
+    EJIT_DIAG("taskpool async bound request drop func=%u: version changed",
               funcIndex);
     R.status = EJitCompileOrGetStatus::CompileFailed;
     return R;
@@ -692,11 +707,12 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
               static_cast<unsigned>(ok), fn);
     return;
   }
+  const EJitCompileRequest PublishReq = requestForPublication(req);
 
   // Checkpoint 2 (§5.3): a toggle during compilation invalidates the result.
   if (!versionsMatch(req)) {
     if (publishFn_)
-      publishFn_(publishCtx_, req, false);
+      publishFn_(publishCtx_, PublishReq, false);
     cache_.retireCode(fn); // Retire the now-stale code (real callback only).
     queue_.release(req.funcIndex);
     EJIT_STAT_INC(counters_.compileFailed);
@@ -714,13 +730,13 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
   case EJitPublishStatus::Published:
     EJIT_STAT_INC(counters_.asyncCompiles);
     if (publishFn_)
-      publishFn_(publishCtx_, req, true);
+      publishFn_(publishCtx_, PublishReq, true);
     queue_.release(req.funcIndex);
     EJIT_DIAG_VERBOSE("worker publish ok func=%u fn=%p", req.funcIndex, fn);
     return;
   case EJitPublishStatus::VersionMismatch:
     if (publishFn_)
-      publishFn_(publishCtx_, req, false);
+      publishFn_(publishCtx_, PublishReq, false);
     // Rejected at the commit gate: retire the stale code, do not overwrite any
     // existing entry, release the dedup slot, count as a (cancelled) failure.
     cache_.retireCode(fn);
@@ -731,7 +747,7 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
   case EJitPublishStatus::InvalidParam:
   case EJitPublishStatus::Failed:
     if (publishFn_)
-      publishFn_(publishCtx_, req, false);
+      publishFn_(publishCtx_, PublishReq, false);
     cache_.retireCode(fn);
     queue_.release(req.funcIndex);
     EJIT_STAT_INC(counters_.publishFailed);

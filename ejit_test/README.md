@@ -49,11 +49,11 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 ### Board-only Multicore Demo
 
 `ejit_bound_ptr_sre_multicore_test.c` provides the SRE `test_ejit_period`
-entry for validating dimension-bound pointer snapshots across cores:
+entry for validating dimension-bound raw pointers across cores:
 
 1. Core 8 runs `test_ejit_period` to start the shared worker and arm capture.
 2. Core 18 runs `test_ejit_period` to enqueue independent cell 1 (`scale=5`)
-   and cell 2 (`scale=9`) stack snapshots, then verifies both JIT versions.
+   and cell 2 (`scale=9`) shared objects, then verifies both JIT versions.
 3. Core 8 runs `test_ejit_bound_ptr_print` to print the optimized function.
 
 The expected AOT/JIT pairs are `153/253` for cell 1 and `194/294` for cell 2.

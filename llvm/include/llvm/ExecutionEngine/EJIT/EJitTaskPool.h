@@ -366,11 +366,25 @@ public:
   EJitSwitchController &switchController() { return switch_; }
   EJitTaskPoolCache &cache() { return cache_; }
 
+  /// Submit a request carrying borrowed raw bound-pointer descriptors. Only
+  /// the fixed descriptors are copied into the queue; pointee bytes are read
+  /// by compileFn_ and are never owned by this pool.
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                   uint32_t numDims, void *fallback,
-                                  const void *boundData = nullptr,
-                                  uint32_t boundSize = 0,
-                                  uint32_t boundArgIndex = 0);
+                                  const EJitBoundPtrDescriptor *boundPointers,
+                                  uint32_t boundCount);
+
+  /// Source-compatible single-pointer entry point. A zero size means no bound
+  /// pointer; a nonzero size borrows the pointed-to object through compilation.
+  CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
+                                  uint32_t numDims, void *fallback,
+                                  const void *rawPtr = nullptr,
+                                  uint32_t rawSize = 0,
+                                  uint32_t boundArgIndex = 0) {
+    EJitBoundPtrDescriptor Bound{rawPtr, rawSize, boundArgIndex};
+    return compileOrGet(funcIndex, dims, numDims, fallback,
+                        rawSize ? &Bound : nullptr, rawSize ? 1u : 0u);
+  }
 
   /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
   /// terminal front half of compileOrGet(): the instance-enabled check and the

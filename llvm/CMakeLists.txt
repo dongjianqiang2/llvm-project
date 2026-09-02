@@ -840,8 +840,6 @@ set(EJIT_SRE_TASKPOOL_BUCKETS "32" CACHE STRING
 # Async work-queue capacity (rounded up to a power of two).
 set(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY "1024" CACHE STRING
   "EmbeddedJIT SRE taskpool async queue capacity (power of two)")
-set(EJIT_BOUND_PTR_MAX_BYTES "256" CACHE STRING
-  "Maximum shallow pointee snapshot carried by one EJIT compile request")
 # Flat dedup table capacity = max dense funcIndex (spec §3.5 inFlight_[]).
 set(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX "4096" CACHE STRING
   "EmbeddedJIT SRE taskpool flat dedup capacity (max dense funcIndex)")
@@ -849,7 +847,6 @@ set(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX "4096" CACHE STRING
 # value fails at `cmake` time with a clear message instead of mid-build.
 ejit_require_numeric(EJIT_SRE_TASKPOOL_BUCKETS)
 ejit_require_numeric(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY)
-ejit_require_numeric(EJIT_BOUND_PTR_MAX_BYTES)
 ejit_require_numeric(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)
 if(EJIT_SRE_TASKPOOL_BUCKETS LESS 1 OR EJIT_SRE_TASKPOOL_BUCKETS GREATER 254)
   message(FATAL_ERROR
@@ -863,18 +860,6 @@ if(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY LESS 2 OR NOT _ejit_queue_pow2 EQUAL 0)
     "EJIT_SRE_TASKPOOL_QUEUE_CAPACITY (${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}) "
     "must be a power of two >= 2 (the ring queue indexes with a mask).")
 endif()
-if(EJIT_BOUND_PTR_MAX_BYTES LESS 1 OR EJIT_BOUND_PTR_MAX_BYTES GREATER 65536)
-  message(FATAL_ERROR
-    "EJIT_BOUND_PTR_MAX_BYTES must be in [1, 65536], got ${EJIT_BOUND_PTR_MAX_BYTES}")
-endif()
-math(EXPR _ejit_bound_ptr_rem "${EJIT_BOUND_PTR_MAX_BYTES} % 8")
-if(NOT _ejit_bound_ptr_rem EQUAL 0)
-  message(FATAL_ERROR
-    "EJIT_BOUND_PTR_MAX_BYTES must be a multiple of 8, got ${EJIT_BOUND_PTR_MAX_BYTES}")
-endif()
-unset(_ejit_bound_ptr_rem)
-add_definitions(-DEJIT_BOUND_PTR_MAX_BYTES=${EJIT_BOUND_PTR_MAX_BYTES})
-message(STATUS "EmbeddedJIT: bound-pointer snapshot cap=${EJIT_BOUND_PTR_MAX_BYTES} bytes")
 unset(_ejit_queue_pow2)
 if(EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX LESS 1)
   message(FATAL_ERROR

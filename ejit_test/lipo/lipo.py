@@ -376,6 +376,7 @@ def doit_gc_merge(args):
     optional_api = [
         "ejit_register_lifecycle", "ejit_register_funcindex",
         "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
+        "ejit_taskpool_compile_or_get_bound_v",
         "ejit_taskpool_release_read",
         "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",
         "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",

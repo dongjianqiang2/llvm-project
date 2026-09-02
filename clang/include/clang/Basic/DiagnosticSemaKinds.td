@@ -13504,8 +13504,8 @@ def err_ejit_bound_ptr_invalid_type : Error<
 def err_ejit_bound_ptr_missing_dim : Error<
   "ejit_bound_ptr(%0) requires exactly one matching "
   "ejit_period_arr_ind(%0) parameter">;
-def err_ejit_bound_ptr_too_many : Error<
-  "function %0 has %1 ejit_bound_ptr parameters; at most one is supported">;
+def err_ejit_bound_ptr_too_many : Error<"function %0 has %1 ejit_bound_ptr "
+                                        "parameters; at most 8 are supported">;
 def err_ejit_entry_recursive : Error<
   "ejit_entry function %0 cannot be recursive">;
 def err_ejit_period_lc_no_index : Error<

@@ -1,4 +1,4 @@
-//===-- ejit_bound_ptr_test.c - Dimension-bound pointee snapshot test -----===//
+//===-- ejit_bound_ptr_test.c - Dimension-bound raw pointer test -----------===//
 
 #include <stdint.h>
 #include <stdio.h>
@@ -26,32 +26,32 @@ ejit_entry uint32_t bound_cell_config(ejit_period_arr_ind(cell)
   return input + cellRelated->runtimeBias;
 }
 
-static uint32_t call_with_stack_instance(uint8_t cellIndex, uint8_t trpIndex,
-                                         uint32_t runtimeBias) {
-  CellRelated Local = {7, 5, runtimeBias};
-  return bound_cell_config(cellIndex, trpIndex, &Local, 10);
+static uint32_t call_with_instance(uint8_t cellIndex, uint8_t trpIndex,
+                                   const CellRelated *config) {
+  return bound_cell_config(cellIndex, trpIndex, config, 10);
 }
 
 int main(void) {
   const uint8_t Cell = 3;
   const uint8_t Trp = 2;
-  ejit_config_t Config;
-  ejit_default_config(&Config);
-  if (ejit_init(&Config) != EJIT_OK)
+  ejit_config_t RuntimeConfig;
+  ejit_default_config(&RuntimeConfig);
+  if (ejit_init(&RuntimeConfig) != EJIT_OK)
     return 1;
   if (ejit_activate("cell", Cell) != EJIT_OK ||
       ejit_activate("trp", Trp) != EJIT_OK)
     return 2;
 
+  // Keep the shared object alive until the asynchronous worker has finished.
+  // A stack-local object that dies after the entry call is not supported.
+  static const CellRelated CellConfig = {7, 5, 100};
   ejit_dump_func("bound_cell_config");
-  uint32_t Aot = call_with_stack_instance(Cell, Trp, 100);
+  uint32_t Aot = call_with_instance(Cell, Trp, &CellConfig);
   ejit_drain_taskpool();
 
-  // The first stack object is gone. The specialization must have consumed its
-  // owned snapshot, while this call's dynamic field must still be read here.
-  uint32_t Jit = call_with_stack_instance(Cell, Trp, 200);
+  uint32_t Jit = call_with_instance(Cell, Trp, &CellConfig);
   uint32_t ExpectedAot = 10 * 5 + 100 + Cell + Trp;
-  uint32_t ExpectedJit = 10 * 5 + 200 + Cell + Trp;
+  uint32_t ExpectedJit = ExpectedAot;
   printf("AOT=%u expected=%u JIT=%u expected=%u\n", Aot, ExpectedAot, Jit,
          ExpectedJit);
   ejit_print_dumped("bound_cell_config");

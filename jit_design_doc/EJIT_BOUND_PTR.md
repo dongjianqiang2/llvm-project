@@ -1,8 +1,9 @@
-# EJIT dimension-bound pointer snapshots
+# EJIT dimension-bound pointers
 
-`EJIT_BOUND_PTR(period)` associates one pointer parameter with an existing
-`EJIT_DIM(period)` parameter. It lets EJIT specialize fields whose values are
-stable for that period instance without requiring a global array name.
+`EJIT_BOUND_PTR(period)` associates a pointer parameter with an existing
+`EJIT_DIM(period)` parameter. It lets EJIT specialize `ejit_may_const` fields
+whose values are stable for a period instance without requiring a global array
+name.
 
 ```c
 typedef struct {
@@ -19,39 +20,77 @@ EJIT_ENTRY uint32_t process(
 }
 ```
 
-On a real JIT cache miss, the wrapper copies the complete `CellConfig` object
-into the compile request before returning. The asynchronous worker therefore
-never retains or dereferences the caller's pointer. Stack-local objects are
-safe to destroy immediately after the entry call.
+## Runtime model
 
-Only loads of `ejit_may_const` fields are replaced from the snapshot. Other
-fields, such as `runtime_bias` above, remain ordinary loads through the pointer
-passed to each invocation of the JIT function.
+The wrapper passes a fixed descriptor containing `{rawPtr, size, argIndex}`.
+The descriptor is copied into the request and queue, but the pointee bytes are
+never copied. The worker reads the object through `rawPtr` only during the
+actual compilation pass. The compile callback must finish all reads before it
+returns.
 
-The annotation belongs only on the `ejit_entry` parameter. When that pointer is
-passed through non-inlined direct helpers, EJIT tracks the corresponding formal
-argument through the call chain and specializes marked field loads in those
-helpers from the same owned snapshot. Helpers do not need `ejit_entry` or a
-repeated `EJIT_BOUND_PTR` annotation.
+The caller owns every object and must guarantee all of the following from
+enqueue until compilation finishes:
 
-## Contract and limits
+- the object remains alive and mapped;
+- producer and worker cores can use the same virtual address;
+- no thread writes the object while the worker reads it;
+- an active dimension specialization keeps the object's relevant contents
+  stable.
 
-- The function must have exactly one matching `EJIT_DIM(period)` parameter.
-- The first implementation supports one `EJIT_BOUND_PTR` parameter per entry.
-- Helper propagation accepts pointer casts and constant-offset GEPs. It stops
-  conservatively at indirect calls, address-taken helpers, or a helper argument
-  that receives different pointer sources at different call sites.
-- The copy is shallow. Pointer fields inside the object are not followed.
-- An `ejit_may_const` field must remain stable while its period instance is
-  active. Change it only as part of the normal deactivate/update/reactivate
-  lifecycle so the period version invalidates old specialized code.
-- The default snapshot cap is 256 bytes. Configure
-  `EJIT_BOUND_PTR_MAX_BYTES` to a positive multiple of 8 when a larger object
-  is required. An oversize request falls back to AOT without queuing work.
-- Volatile, atomic, bit-field, union, dynamically indexed, and unmarked field
-  loads are never folded from the snapshot.
+To update a bound object, deactivate the dimension, modify the object, and
+reactivate the dimension. Changing a pointer or its contents without that
+protocol is a contract violation. The pointer and pointee contents are
+transport data, not cache identity, so changing them does not create a new
+cache version by itself.
 
-The snapshot is carried inline in `EJitCompileRequest`. This increases shared
-queue storage by `EJIT_BOUND_PTR_MAX_BYTES * queue capacity`, but avoids heap
-allocation, ownership handoff, cleanup races, and dangling-pointer failure
-paths on the worker side.
+There is no bound-payload allocation, copy, destructor, or cross-core free.
+Queue retry, deduplication, batch layout, PGO Tier-1 and
+Tier-2, delayed publication, and shutdown retain only the fixed descriptors
+until the compile callback is done. Publication and cache state do not depend
+on dereferencing the pointer after compilation.
+
+## Multiple pointers
+
+An entry may have up to eight `EJIT_BOUND_PTR` parameters. Each one must point
+to a complete object type and name exactly one matching `EJIT_DIM` parameter.
+The `_bound_v` runtime API carries the fixed descriptor table. The original
+single-pointer `ejit_taskpool_compile_or_get_bound` API remains source and ABI
+compatible, but its pointer is borrowed under the same lifetime contract.
+
+The size in each descriptor is the readable byte range for that object. Null,
+zero-sized, overflowing, duplicate-argument, and more-than-eight descriptor
+lists are rejected and fall back cleanly to AOT. An object may be larger than
+1 KiB; request size is constant and does not grow with the object payload.
+
+Only marked `ejit_may_const` fields are read from the bound object. Other
+fields remain ordinary loads through the pointer passed to each invocation.
+No nested pointer is followed.
+
+## Helper propagation
+
+The root and every direct helper own their pointer contracts independently.
+A helper that receives propagated bound facts must repeat
+`EJIT_BOUND_PTR(period)` on that pointer formal, be an `EJIT_ENTRY`, and declare
+the matching `EJIT_DIM(period)` parameter. Its bound size and `ejit_may_const`
+field metadata must describe the same object range. Together these annotations
+give the helper an independent wrapper/cache identity for the same cell.
+
+Every direct call edge is checked. The helper's period argument must come from
+the caller's same period formal, or from the same specialization constant after
+dimension replacement; pointer and integer casts are accepted where the
+existing IR pipeline proves them equivalent. Each pointer formal must also
+receive the same bound pointer source and offset. A helper pointer formal
+without matching `EJIT_BOUND_PTR`, an indirect or address-taken call, missing
+or ambiguous dimension, different constant, or inconsistent callsite is a
+conservative boundary: the bound pointer is not propagated across that edge.
+
+## Build and compatibility
+
+The shared request ABI is versioned for fixed raw-pointer descriptors. Rebuild
+and relink the EJIT runtime library and every business package that exchanges
+shared requests. Rebuild the EJIT-enabled Clang when using the multi-pointer
+attribute and wrapper generation; an unchanged Clang binary cannot emit the
+new wrapper path. No payload allocator or free hook is required.
+
+Volatile, atomic, bit-field, union, dynamically indexed, and unmarked field
+loads are never folded from a bound pointer.

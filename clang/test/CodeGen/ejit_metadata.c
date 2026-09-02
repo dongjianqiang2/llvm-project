@@ -35,6 +35,16 @@ int bound_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx,
   return cfg->cellType + cfg->xx;
 }
 
+// CHECK: define {{.*}}i32 @multi_bound_entry({{.*}} !ejit.metadata ![[MULTI_BOUND_META:[0-9]+]]
+__attribute__((ejit_entry))
+int multi_bound_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx,
+                      __attribute__((ejit_bound_ptr("cell")))
+                      const struct CellConfig *cfgA,
+                      __attribute__((ejit_bound_ptr("cell")))
+                      const struct CellConfig *cfgB) {
+  return cfgA->cellType + cfgB->cellType + cellIdx;
+}
+
 // CHECK-DAG: ![[MAYCONST_FIELD:[0-9]+]] = !{!"ejit_may_const_field", i32 0}
 // CHECK-DAG: ![[PERIOD_META]] = distinct !{![[PERIOD:[0-9]+]], ![[MAYCONST_FIELD]]}
 // CHECK-DAG: ![[PERIOD]] = !{!"ejit_period", !"static"}
@@ -49,3 +59,6 @@ int bound_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx,
 // CHECK-DAG: ![[BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND:[0-9]+]]}
 // CHECK-DAG: ![[BOUND]] = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, ![[BOUND_FIELD:[0-9]+]]}
 // CHECK-DAG: ![[BOUND_FIELD]] = !{i64 0, i64 4}
+// CHECK-DAG: ![[MULTI_BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND_A:[0-9]+]], ![[BOUND_B:[0-9]+]]}
+// CHECK-DAG: ![[BOUND_A]] = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, ![[BOUND_FIELD]]}
+// CHECK-DAG: ![[BOUND_B]] = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, ![[BOUND_FIELD]]}

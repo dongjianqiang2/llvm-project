@@ -22,6 +22,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 
+using llvm::ejit::MAX_BOUND_PTR_PARAMS;
 using llvm::ejit::MAX_PERIOD_ARR_IND_PARAMS;
 using llvm::ejit::MAX_PERIOD_ARR_SIZE;
 
@@ -331,22 +332,28 @@ void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
       LastBound = A;
     }
 
-  if (BoundCount > 1 && LastBound) {
+  if (BoundCount > MAX_BOUND_PTR_PARAMS && LastBound) {
     S.Diag(LastBound->getLocation(), diag::err_ejit_bound_ptr_too_many)
         << FD << BoundCount;
     return;
   }
 
-  if (!LastBound)
+  if (!BoundCount)
     return;
-  unsigned MatchingDims = 0;
-  for (const ParmVarDecl *P : FD->parameters())
-    if (const auto *D = P->getAttr<EjitPeriodArrIndAttr>())
-      if (D->getPeriodName() == LastBound->getPeriodName())
-        ++MatchingDims;
-  if (MatchingDims != 1)
-    S.Diag(LastBound->getLocation(), diag::err_ejit_bound_ptr_missing_dim)
-        << LastBound->getPeriodName();
+
+  for (const ParmVarDecl *P : FD->parameters()) {
+    const auto *Bound = P->getAttr<EjitBoundPtrAttr>();
+    if (!Bound)
+      continue;
+    unsigned MatchingDims = 0;
+    for (const ParmVarDecl *DimP : FD->parameters())
+      if (const auto *D = DimP->getAttr<EjitPeriodArrIndAttr>())
+        if (D->getPeriodName() == Bound->getPeriodName())
+          ++MatchingDims;
+    if (MatchingDims != 1)
+      S.Diag(Bound->getLocation(), diag::err_ejit_bound_ptr_missing_dim)
+          << Bound->getPeriodName();
+  }
 }
 
 /// checkEjitEntryLcConflict - ejit_entry and ejit_period_lc are mutually

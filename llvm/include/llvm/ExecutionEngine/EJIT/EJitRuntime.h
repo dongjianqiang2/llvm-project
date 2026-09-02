@@ -224,18 +224,40 @@ typedef struct {
   uint32_t instanceId;
 } ejit_dim_pair_t;
 
+/// Borrowed bound object descriptor. The object must remain valid and mapped
+/// at the same virtual address from enqueue through the end of compilation.
+/// The runtime copies this descriptor only; it never copies, allocates, or
+/// frees the pointed-to bytes.
+typedef struct {
+  const void *rawPtr;
+  uint32_t size;
+  uint32_t argIndex;
+} ejit_bound_ptr_t;
+
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,
                                            uint32_t *outBucket);
 
-// Slow-path variant used by wrappers with EJIT_BOUND_PTR. The runtime copies
-// snapshotData before returning; asynchronous compilation never retains the
-// caller's pointer. Oversize/null snapshots fail cleanly and execute AOT.
+// Slow-path compatibility variant used by wrappers with one EJIT_BOUND_PTR.
+// rawPtr is borrowed until the compile callback returns. It requires a
+// non-null, non-empty, non-overflowing object; invalid input returns
+// EJIT_ERR_INVALID_PARAM so the wrapper can take its AOT path.
 ejit_status_t ejit_taskpool_compile_or_get_bound(
     uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
-    const void *snapshotData, uint32_t snapshotSize, uint32_t boundArgIndex,
-    void **outFn, uint32_t *outBucket);
+    const void *rawPtr, uint32_t rawSize, uint32_t boundArgIndex, void **outFn,
+    uint32_t *outBucket);
+
+// Multi-pointer raw transport variant. The fixed descriptor list supports up
+// to eight bound parameters and has no relationship to cache identity. The
+// each argIndex must name a pointer formal declared with EJIT_BOUND_PTR in the
+// registered root; the cold compile path rejects other indices. The caller
+// owns every object and must apply the deactivate -> modify -> reactivate
+// protocol before changing an active specialization's object.
+ejit_status_t ejit_taskpool_compile_or_get_bound_v(
+    uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
+    const ejit_bound_ptr_t *bounds, uint32_t boundCount, void **outFn,
+    uint32_t *outBucket);
 
 // Fixed-dimension fast paths (0-4 dims). Additive alternatives to
 // ejit_taskpool_compile_or_get that pass the dim identity as scalar arguments

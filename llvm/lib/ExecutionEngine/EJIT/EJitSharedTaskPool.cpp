@@ -70,6 +70,16 @@ namespace {
 // symbol, no arch-specific instruction in this layer).
 inline void cpuRelax() { __asm__ __volatile__("" ::: "memory"); }
 
+// Bound pointers are transport-only. Once the compile callback has returned,
+// no owner-private publication/retry state should retain or expose them.
+EJitCompileRequest requestForPublication(const EJitCompileRequest &Req) {
+  EJitCompileRequest Published = Req;
+  Published.boundCount = 0;
+  for (EJitBoundPtrDescriptor &Bound : Published.boundPointers)
+    Bound = {};
+  return Published;
+}
+
 // Fixed worker core (build policy, spec §11.4): CMake
 // EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE pins the single shared worker to ONE
 // designated core. When set, ONLY that core may win the owner election - it
@@ -1424,7 +1434,8 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
           // lost to queue pressure. dedupMark makes the normal pending case a
           // cheap no-op. The slot and Tier-1 code remain intact because Tier-2
           // profile synthesis still reads their counter storage.
-          enqueueTier2FromSlot(Slot);
+          R.slot = &Slot;
+          R.tier2Arm = true;
 #ifndef EJIT_SRE_TASKPOOL_NO_RECLAIM
           bucketReadRelease(B);
 #endif
@@ -1461,7 +1472,11 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
       // >= (not ==): if the enqueue fails (queue full / already pending),
       // the next hit can still arm — a transient failure is not fatal (§7).
       if (threshold && sampleIndex >= threshold) {
-        enqueueTier2FromSlot(Slot);
+        // Preserve the fixed slot address even when this producer cannot read
+        // the cross-core code pointer. tryCacheHit() performs the deferred
+        // enqueue after lookup so a bound call can attach its descriptors.
+        R.slot = &Slot;
+        R.tier2Arm = true;
         if (slotTier == kEJitTierInstrumented && sampleIndex == threshold)
           EJIT_DIAG("PGO sampling complete func=%u: %llu/%u; routing AOT "
                     "until Tier-2 publish",
@@ -1535,38 +1550,52 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     return R;
   }
 
-  // Cold: this core has never prepared this code. Tier-2 submission, when
-  // armed above, has already captured the exact slot.
-  return peerPrepareSlot(B, bucket, slotIndex);
+  // Cold: this core has never prepared this code. Preserve the Tier-2 signal
+  // across the out-of-line execute-permission preparation; the producer may
+  // need to attach bound descriptors before enqueueing the recompile.
+  SharedLookup Prepared = peerPrepareSlot(B, bucket, slotIndex);
+  Prepared.tier2Arm = R.tier2Arm;
+  return Prepared;
 }
 
-void EJitSharedTaskPool::enqueueTier2FromSlot(const EJitSharedCacheSlot &Slot) {
+void EJitSharedTaskPool::enqueueTier2ForIdentity(
+    uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+    const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
   if (state_->mode.loadAcquire() !=
       static_cast<uint32_t>(EJitCompileMode::Async))
     return;
 
   EJitCompileRequest T2{};
-  T2.funcIndex = encodeReqTier(Slot.funcIndex, kEJitTierPgoUse);
-  T2.numDims = Slot.numDims;
-  T2.generation = Slot.generation;
-  for (uint32_t i = 0; i < Slot.numDims && i < 4; ++i) {
-    T2.dims[i] = Slot.dims[i];
-    T2.versions[i] = Slot.versions[i];
+  T2.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
+  T2.numDims = numDims;
+  T2.generation = state_->generation.loadAcquire();
+  for (uint32_t i = 0; i < numDims && i < 4; ++i) {
+    T2.dims[i] = dims[i];
+    T2.versions[i] = instanceVersion(dims[i].dimType, dims[i].instanceId);
   }
+  T2.boundCount = boundCount;
+  for (uint32_t i = 0; i < boundCount; ++i)
+    T2.boundPointers[i] = boundPointers[i];
 
   if (dedupMark(T2.funcIndex, T2.generation) != EJitDedupResult::Claimed)
     return;
   if (queuePush(T2)) {
     EJIT_STAT_INC(state_->counters.asyncEnqueues);
     EJIT_DIAG_VERBOSE("shared taskpool PGO Tier-2 enqueued func=%u gen=%u",
-                      Slot.funcIndex, T2.generation);
+                      funcIndex, T2.generation);
     return;
   }
 
   dedupClear(T2.funcIndex, T2.generation);
   EJIT_STAT_INC(state_->counters.queueFull);
-  EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full",
-            Slot.funcIndex);
+  EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full", funcIndex);
+}
+
+void EJitSharedTaskPool::enqueueTier2FromSlot(
+    const EJitSharedCacheSlot &Slot,
+    const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
+  enqueueTier2ForIdentity(Slot.funcIndex, Slot.dims, Slot.numDims,
+                          boundPointers, boundCount);
 }
 
 bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
@@ -2993,8 +3022,10 @@ void EJitSharedTaskPool::ownerShutdown() {
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
+EJitSharedTaskPool::classifyHit(const SharedLookup &Hit, bool enqueueTier2) {
   CompileOrGetResult R;
+  if (enqueueTier2 && Hit.tier2Arm && Hit.slot)
+    enqueueTier2FromSlot(*Hit.slot);
   if (Hit.hasReadToken && Hit.fnPtr) {
     if (Hit.slot)
       markPostPublishSeen(*Hit.slot);
@@ -3044,9 +3075,9 @@ EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   return R;
 }
 
-EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
-                                uint32_t numDims) {
+EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
+    uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+    const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
   CompileOrGetResult R;
   // Parameter check already done by the C API layer.
 
@@ -3074,10 +3105,19 @@ EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
   // Cache lookup (§5.2 step 1) — runs BEFORE the Off check, so an already
   // compiled entry is still served even when the pool is globally Off.
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  return classifyHit(cacheLookupSeq(funcIndex, dims, numDims));
+  SharedLookup Hit = cacheLookupSeq(funcIndex, dims, numDims);
 #else
-  return classifyHit(cacheLookup(funcIndex, dims, numDims));
+  SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
 #endif
+  if (Hit.tier2Arm && Hit.slot) {
+    if (boundCount)
+      enqueueTier2ForIdentity(funcIndex, dims, numDims, boundPointers,
+                              boundCount);
+    else
+      enqueueTier2FromSlot(*Hit.slot);
+    Hit.tier2Arm = false;
+  }
+  return classifyHit(Hit, /*enqueueTier2=*/false);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3205,15 +3245,23 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
 EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                  uint32_t numDims, void *fallback,
-                                 const void *boundData, uint32_t boundSize,
-                                 uint32_t boundArgIndex) {
+                                 const EJitBoundPtrDescriptor *boundPointers,
+                                 uint32_t boundCount) {
   EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p",
                     funcIndex, numDims, fallback);
   // Parameter check already done by the C API layer.
 
   // Fast cache-hit path (§5.2 steps 0-1). On any terminal outcome (hit,
   // disabled instance, not-Ready, or ready-but-not-shareable) return directly.
-  CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
+  CompileOrGetResult R;
+  if (!validateBoundPtrDescriptors(boundPointers, boundCount)) {
+    EJIT_DIAG("shared taskpool bound pointer reject func=%u count=%u",
+              funcIndex, boundCount);
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    R.fnPtr = fallback;
+    return R;
+  }
+  R = tryCacheHit(funcIndex, dims, numDims, boundPointers, boundCount);
   if (R.fastPathTerminal) {
     // Non-hit terminals surface the caller's fallback pointer (a hit already
     // carries the cached fnPtr + read token).
@@ -3230,13 +3278,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   if (cacheHasPending(funcIndex, dims, numDims)) {
     EJIT_STAT_INC(state_->counters.alreadyPending);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
-    return R;
-  }
-  if ((boundSize != 0 && !boundData) || boundSize > EJIT_BOUND_PTR_MAX_BYTES) {
-    EJIT_DIAG("shared taskpool bound snapshot reject func=%u size=%u max=%u",
-              funcIndex, boundSize,
-              static_cast<unsigned>(EJIT_BOUND_PTR_MAX_BYTES));
-    R.status = EJitCompileOrGetStatus::InvalidParam;
     return R;
   }
   // Off mode (§5.2 step 2).
@@ -3267,13 +3308,13 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
       ReqLocal.versions[i] =
           instanceVersion(dims[i].dimType, dims[i].instanceId);
     }
-    ReqLocal.boundArgIndex = boundArgIndex;
-    ReqLocal.boundSize = boundSize;
-    if (boundSize)
-      std::memcpy(ReqLocal.boundData, boundData, boundSize);
+    ReqLocal.boundCount = boundCount;
+    for (uint32_t i = 0; i < boundCount; ++i)
+      ReqLocal.boundPointers[i] = boundPointers[i];
     if (!versionsCurrent(ReqLocal)) {
-      EJIT_DIAG("shared taskpool sync snapshot drop func=%u: version changed",
-                funcIndex);
+      EJIT_DIAG(
+          "shared taskpool sync bound request drop func=%u: version changed",
+          funcIndex);
       R.status = EJitCompileOrGetStatus::CompileFailed;
       return R;
     }
@@ -3395,17 +3436,17 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     Req.dims[i] = dims[i];
     Req.versions[i] = instanceVersion(dims[i].dimType, dims[i].instanceId);
   }
-  Req.boundArgIndex = boundArgIndex;
-  Req.boundSize = boundSize;
-  if (boundSize)
-    std::memcpy(Req.boundData, boundData, boundSize);
+  Req.boundCount = boundCount;
+  for (uint32_t i = 0; i < boundCount; ++i)
+    Req.boundPointers[i] = boundPointers[i];
   if (!versionsCurrent(Req) || state_->generation.loadAcquire() != gen) {
     dedupClear(funcIndex, gen);
     if (newlyAdmitted)
       finishPgoFunction(funcIndex, /*completed=*/false,
                         "lifecycle-changed-during-admission");
-    EJIT_DIAG("shared taskpool async snapshot drop func=%u: lifecycle changed",
-              funcIndex);
+    EJIT_DIAG(
+        "shared taskpool async bound request drop func=%u: lifecycle changed",
+        funcIndex);
     R.status = EJitCompileOrGetStatus::CompileFailed;
     return R;
   }
@@ -3799,6 +3840,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
               static_cast<unsigned>(ok), fn);
     return;
   }
+  const EJitCompileRequest PublishReq = requestForPublication(req);
   // Resolve the real executable range for the freshly compiled pointer (from
   // the owner's code-pool finalize metadata) so it can be published into the
   // cache slot for cross-core 4K sealing. Optional: if no provider is wired or
@@ -3813,7 +3855,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       !versionsCurrent(req)) {
     dropBatchRequestMarker();
     if (publishFn_)
-      publishFn_(publishCtx_, req, false);
+      publishFn_(publishCtx_, PublishReq, false);
     dedupClear(req.funcIndex, req.generation);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
@@ -3833,7 +3875,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // must not replace the live Tier-1 slot until the worker observes the
       // compile queue empty and seals the batch. Keep only owner-private state
       // and retain the in-flight claim.
-      pendingPublishes_.push_back({req, fn});
+      pendingPublishes_.push_back({PublishReq, fn});
       autoTier2PublishPending_ = true;
       EJIT_DIAG_DEBUG("PGO Tier-2 linked pending queue-drain publish func=%u "
                       "fn=%p pending=%zu",
@@ -3845,7 +3887,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // a pool-routing/configuration failure instead of delaying profiling or
       // replacing the AOT path with an NX pointer.
       if (publishFn_)
-        publishFn_(publishCtx_, req, false);
+        publishFn_(publishCtx_, PublishReq, false);
       dedupClear(req.funcIndex, req.generation);
       finishPgoOnFailure();
       if (releaseFn_)
@@ -3855,9 +3897,9 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
                 realFuncIndex);
       return;
     }
-    EJitPublishStatus Staged = cacheStagePending(req, fn);
+    EJitPublishStatus Staged = cacheStagePending(PublishReq, fn);
     if (Staged == EJitPublishStatus::Published) {
-      pendingPublishes_.push_back({req, fn});
+      pendingPublishes_.push_back({PublishReq, fn});
       dedupClear(req.funcIndex, req.generation);
       EJIT_DIAG_DEBUG("shared worker batch staged func=%u fn=%p pending=%zu",
                       req.funcIndex, fn, pendingPublishes_.size());
@@ -3869,7 +3911,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     // A bucket containing only other Pending identities has no safe eviction
     // victim. Keep the result owner-private with its coarse in-flight claim;
     // the explicit publish call seals all code and then inserts this identity.
-    pendingPublishes_.push_back({req, fn});
+    pendingPublishes_.push_back({PublishReq, fn});
     EJIT_DIAG_VERBOSE(
         "shared worker batch retained unstaged func=%u pending=%zu",
         req.funcIndex, pendingPublishes_.size());
@@ -3877,12 +3919,12 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   }
   if (info.codeSize == 0 && codeRangeFn_)
     (void)codeRangeFn_(codeRangeCtx_, fn, &info);
-  EJitPublishStatus PS = cachePublish(req, fn, &info, pgoClearExclusive);
+  EJitPublishStatus PS = cachePublish(PublishReq, fn, &info, pgoClearExclusive);
   switch (PS) {
   case EJitPublishStatus::Published:
     EJIT_STAT_INC(state_->counters.asyncCompiles);
     if (publishFn_)
-      publishFn_(publishCtx_, req, true);
+      publishFn_(publishCtx_, PublishReq, true);
     dedupClear(req.funcIndex, req.generation);
     if (tier == kEJitTierInstrumented) {
       EJIT_STAT_INC(state_->counters.tier1Compiles);
@@ -3898,7 +3940,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     return;
   case EJitPublishStatus::VersionMismatch:
     if (publishFn_)
-      publishFn_(publishCtx_, req, false);
+      publishFn_(publishCtx_, PublishReq, false);
     dedupClear(req.funcIndex, req.generation);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
@@ -3913,7 +3955,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   case EJitPublishStatus::InvalidParam:
   case EJitPublishStatus::Failed:
     if (publishFn_)
-      publishFn_(publishCtx_, req, false);
+      publishFn_(publishCtx_, PublishReq, false);
     dedupClear(req.funcIndex, req.generation);
     finishPgoOnFailure();
     if (releaseFn_)

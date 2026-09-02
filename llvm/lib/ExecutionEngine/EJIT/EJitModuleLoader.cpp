@@ -135,7 +135,23 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
       if (!Sub || Sub->getNumOperands() < 3)
         continue;
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      if (!Tag)
+        continue;
+      if (Tag->getString() == TAG_EJIT_BOUND_PTR) {
+        auto *ArgIndexMD =
+            mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+        if (!ArgIndexMD)
+          continue;
+        uint64_t ArgIndex = ArgIndexMD->getZExtValue();
+        if (ArgIndex < F.arg_size() &&
+            F.getArg(static_cast<unsigned>(ArgIndex))
+                ->getType()
+                ->isPointerTy())
+          meta.boundPointerArgIndices.push_back(
+              static_cast<uint32_t>(ArgIndex));
+        continue;
+      }
+      if (Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
         continue;
       auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
       if (PN && meta.dimCount < 4) {

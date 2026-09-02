@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <type_traits>
@@ -56,18 +57,25 @@ bool mockCompile(void * /*ctx*/, const EJitCompileRequest &req, void **outFn) {
   return true;
 }
 
-struct BoundSnapshotLog {
+struct BoundPointerLog {
   uint32_t argIndex = 0;
   uint32_t size = 0;
   uint32_t value = 0;
+  const void *rawPtr = nullptr;
+  uint32_t boundCount = 0;
 };
-bool mockCompileBoundSnapshot(void *ctx, const EJitCompileRequest &req,
-                              void **outFn) {
-  auto *log = static_cast<BoundSnapshotLog *>(ctx);
-  log->argIndex = req.boundArgIndex;
-  log->size = req.boundSize;
-  if (req.boundSize >= sizeof(log->value))
-    std::memcpy(&log->value, req.boundData, sizeof(log->value));
+bool mockCompileBoundPointer(void *ctx, const EJitCompileRequest &req,
+                             void **outFn) {
+  auto *log = static_cast<BoundPointerLog *>(ctx);
+  log->boundCount = req.boundCount;
+  if (req.boundCount == 1) {
+    const auto &Bound = req.boundPointers[0];
+    log->argIndex = Bound.argIndex;
+    log->size = Bound.size;
+    log->rawPtr = Bound.rawPtr;
+    if (Bound.size >= sizeof(log->value))
+      std::memcpy(&log->value, Bound.rawPtr, sizeof(log->value));
+  }
   *outFn = codeFor(req.funcIndex);
   return true;
 }
@@ -361,11 +369,15 @@ bool mockCompileSeq(void *ctx, const EJitCompileRequest & /*req*/,
 struct PublishObserver {
   uint32_t calls = 0;
   bool lastPublished = false;
+  uint32_t lastBoundCount = 0;
+  const void *lastRawPtr = nullptr;
 
-  static void notify(void *ctx, const EJitCompileRequest &, bool published) {
+  static void notify(void *ctx, const EJitCompileRequest &req, bool published) {
     auto *self = static_cast<PublishObserver *>(ctx);
     ++self->calls;
     self->lastPublished = published;
+    self->lastBoundCount = req.boundCount;
+    self->lastRawPtr = req.boundCount ? req.boundPointers[0].rawPtr : nullptr;
   }
 };
 
@@ -908,11 +920,11 @@ TEST_F(SharedTaskPoolTest, MultiProducerSharedQueue) {
   EXPECT_EQ(d.asyncCompiles, 3u);
 }
 
-TEST_F(SharedTaskPoolTest, BoundSnapshotOwnedAcrossCores) {
+TEST_F(SharedTaskPoolTest, BoundPointerSharedAcrossCores) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner);
-  BoundSnapshotLog log;
-  owner.setCompiler(&mockCompileBoundSnapshot, &log);
+  BoundPointerLog log;
+  owner.setCompiler(&mockCompileBoundPointer, &log);
 
   EJitCoreId::setCurrentForTest(2);
   uint32_t callerValue = 0x12345678u;
@@ -920,13 +932,93 @@ TEST_F(SharedTaskPoolTest, BoundSnapshotOwnedAcrossCores) {
                               sizeof(callerValue), 3);
   ASSERT_EQ(r.status, EJitCompileOrGetStatus::EnqueuedPending);
 
-  // The producer may reuse or destroy its object before the owner runs.
-  callerValue = 0;
+  // The producer keeps the shared object alive until the worker callback
+  // returns. The queue carries its address and size, not a payload copy.
   EJitCoreId::setCurrentForTest(0);
   ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(log.boundCount, 1u);
+  EXPECT_EQ(log.rawPtr, static_cast<const void *>(&callerValue));
   EXPECT_EQ(log.argIndex, 3u);
   EXPECT_EQ(log.size, sizeof(callerValue));
   EXPECT_EQ(log.value, 0x12345678u);
+}
+
+TEST_F(SharedTaskPoolTest, BoundPointerDescriptorsAreFixedAndValidated) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  BoundPointerLog log;
+  owner.setCompiler(&mockCompileBoundPointer, &log);
+
+  uint8_t Data[kEJitMaxBoundPointers][2048] = {};
+  EJitBoundPtrDescriptor Bounds[kEJitMaxBoundPointers] = {};
+  for (uint32_t I = 0; I < kEJitMaxBoundPointers; ++I)
+    Bounds[I] = {Data[I], sizeof(Data[I]), I};
+
+  EJitCoreId::setCurrentForTest(3);
+  auto accepted = owner.compileOrGet(102, nullptr, 0, codeFor(102), Bounds,
+                                     kEJitMaxBoundPointers);
+  ASSERT_EQ(accepted.status, EJitCompileOrGetStatus::EnqueuedPending);
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(log.boundCount, kEJitMaxBoundPointers);
+
+  EJitBoundPtrDescriptor Invalid{nullptr, sizeof(Data[0]), 0};
+  EXPECT_EQ(
+      owner.compileOrGet(103, nullptr, 0, codeFor(103), &Invalid, 1).status,
+      EJitCompileOrGetStatus::InvalidParam);
+  Invalid = {Data[0], 0, 0};
+  EXPECT_EQ(
+      owner.compileOrGet(104, nullptr, 0, codeFor(104), &Invalid, 1).status,
+      EJitCompileOrGetStatus::InvalidParam);
+  Invalid = {reinterpret_cast<const void *>(
+                 std::numeric_limits<uintptr_t>::max() - 3u),
+             8, 0};
+  EXPECT_EQ(
+      owner.compileOrGet(105, nullptr, 0, codeFor(105), &Invalid, 1).status,
+      EJitCompileOrGetStatus::InvalidParam);
+}
+
+TEST_F(SharedTaskPoolTest, PgoBoundPointerIsReadOnlyDuringCompile) {
+  EJitSharedTaskPool owner;
+  BatchPublishCtx Batch;
+  PublishObserver Observer;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockBatchCompile, &Batch);
+  owner.setPublishCallback(&PublishObserver::notify, &Observer);
+  owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &Batch);
+  owner.setMode(EJitCompileMode::Async);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  owner.setPgoEnabled(true, 1);
+
+  uint8_t Data[2048] = {};
+  Data[0] = 0x5a;
+  EJitBoundPtrDescriptor Bound{Data, sizeof(Data), 1};
+  ASSERT_EQ(owner.compileOrGet(106, nullptr, 0, codeFor(106), &Bound, 1).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_EQ(Batch.compileOrder.size(), 1u);
+  EXPECT_EQ(Batch.compileOrder[0].boundCount, 1u);
+  EXPECT_EQ(Batch.compileOrder[0].boundPointers[0].rawPtr, Data);
+  ASSERT_EQ(owner.pendingPublishCount(), 1u);
+  ASSERT_TRUE(owner.flushCodeBatch());
+  EXPECT_EQ(Observer.lastBoundCount, 0u);
+  EXPECT_EQ(Observer.lastRawPtr, nullptr);
+
+  auto hit = owner.compileOrGet(106, nullptr, 0, codeFor(106), &Bound, 1);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+  ASSERT_EQ(owner.pendingCount(), 1u);
+
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_EQ(Batch.compileOrder.size(), 2u);
+  EXPECT_EQ(Batch.compileOrder[1].boundCount, 1u);
+  EXPECT_EQ(Batch.compileOrder[1].boundPointers[0].rawPtr, Data);
+  Data[0] = 0xa5;
+  ASSERT_TRUE(owner.flushCodeBatch());
+  EXPECT_EQ(Observer.lastBoundCount, 0u);
+  EXPECT_EQ(Observer.lastRawPtr, nullptr);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3030,10 +3122,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // address by every core, so a layout change that slips through unversioned is
   // a silent cross-core corruption.
   // v10-v13 add PGO controls, writable ranges, staged admission, and audit
-  // requests; v14 adds the owned bound-pointer snapshot, and v15 adds
+  // requests; v14 introduced bound-pointer transport, and v15 adds
   // per-version post-publish reuse tracking; v16 adds near/far placement.
   // v17 adds explicit batch publish state.
-  EXPECT_EQ(kEJitSharedAbiVersion, 17u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(

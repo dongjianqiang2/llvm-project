@@ -83,8 +83,8 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   }
 
   // ejit_bound_ptr (on pointer parameters). The pointee size is part of the
-  // metadata so the AOT wrapper can snapshot it before an async request
-  // outlives the call and its pointer.
+  // metadata so the wrapper can build a fixed borrowed descriptor at the
+  // compile slow path. The runtime never takes ownership of the pointee.
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {
     const ParmVarDecl *PD = FD->getParamDecl(I);
     if (const auto *BoundAttr = PD->getAttr<EjitBoundPtrAttr>()) {

@@ -27,6 +27,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h"
 #include "gtest/gtest.h"
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -77,27 +78,38 @@ struct MockCompiler {
 struct PublishObserver {
   uint32_t calls = 0;
   bool lastPublished = false;
+  uint32_t lastBoundCount = 0;
+  const void *lastRawPtr = nullptr;
 
-  static void notify(void *ctx, const EJitCompileRequest &, bool published) {
+  static void notify(void *ctx, const EJitCompileRequest &req, bool published) {
     auto *self = static_cast<PublishObserver *>(ctx);
     ++self->calls;
     self->lastPublished = published;
+    self->lastBoundCount = req.boundCount;
+    self->lastRawPtr = req.boundCount ? req.boundPointers[0].rawPtr : nullptr;
   }
 };
 
-struct SnapshotCompiler {
+struct BoundPointerCompiler {
   uint32_t first = 0;
   uint32_t second = 0;
   uint32_t argIndex = 0;
+  const void *rawPtr = nullptr;
+  uint32_t boundCount = 0;
 
   static bool compile(void *ctx, const EJitCompileRequest &req, void **outFn) {
-    auto *self = static_cast<SnapshotCompiler *>(ctx);
-    if (req.boundSize >= 2 * sizeof(uint32_t)) {
-      std::memcpy(&self->first, req.boundData, sizeof(uint32_t));
-      std::memcpy(&self->second, req.boundData + sizeof(uint32_t),
+    auto *self = static_cast<BoundPointerCompiler *>(ctx);
+    self->boundCount = req.boundCount;
+    if (req.boundCount == 1 &&
+        req.boundPointers[0].size >= 2 * sizeof(uint32_t)) {
+      const auto &Bound = req.boundPointers[0];
+      self->rawPtr = Bound.rawPtr;
+      std::memcpy(&self->first, Bound.rawPtr, sizeof(uint32_t));
+      std::memcpy(&self->second,
+                  static_cast<const uint8_t *>(Bound.rawPtr) + sizeof(uint32_t),
                   sizeof(uint32_t));
+      self->argIndex = Bound.argIndex;
     }
-    self->argIndex = req.boundArgIndex;
     *outFn = reinterpret_cast<void *>(&DummyFn0);
     return true;
   }
@@ -125,11 +137,10 @@ TEST(EJitTaskPoolLayout, RequestIsFlatPod) {
   static_assert(std::is_standard_layout<EJitCompileRequest>::value,
                 "EJitCompileRequest must be standard layout");
   EXPECT_LE(alignof(EJitCompileRequest), 8u);
-  // The fixed request owns its optional bound-pointer bytes inline. See the
-  // cross-pointer-width layout assertion in EJitSreQueue.h.
-  EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8
-                                            ? 80u + EJIT_BOUND_PTR_MAX_BYTES
-                                            : 72u + EJIT_BOUND_PTR_MAX_BYTES);
+  // The fixed request carries descriptors only; its size is independent of
+  // every pointee's payload size. See the cross-pointer-width assertion in
+  // EJitSreQueue.h.
+  EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8 ? 200u : 164u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -953,39 +964,83 @@ TEST(EJitTaskPoolTest, InvalidParam) {
   // already-validated inputs.
 }
 
-TEST(EJitTaskPoolTest, BoundSnapshotOutlivesCallerObject) {
+TEST(EJitTaskPoolTest, BoundPointerIsReadDuringCompile) {
   EJitTaskPool P(8, false);
   P.switchController().setMode(EJitCompileMode::Async);
-  SnapshotCompiler C;
-  P.setCompiler(&SnapshotCompiler::compile, &C);
+  BoundPointerCompiler C;
   EJitDimPair D[1] = {{0, 3}};
+
   struct Config {
     uint32_t mode;
     uint32_t scale;
-  };
-
-  {
-    Config Local{7, 5};
-    auto R = P.compileOrGet(17, D, 1, nullptr, &Local, sizeof(Local), 2);
-    ASSERT_EQ(R.status, EJitCompileOrGetStatus::EnqueuedPending);
-    Local.mode = 99;
-    Local.scale = 99;
-  }
+  } Local{7, 5};
+  P.setCompiler(&BoundPointerCompiler::compile, &C);
+  auto R = P.compileOrGet(17, D, 1, nullptr, &Local, sizeof(Local), 2);
+  ASSERT_EQ(R.status, EJitCompileOrGetStatus::EnqueuedPending);
 
   ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(C.boundCount, 1u);
+  EXPECT_EQ(C.rawPtr, static_cast<const void *>(&Local));
   EXPECT_EQ(C.first, 7u);
   EXPECT_EQ(C.second, 5u);
   EXPECT_EQ(C.argIndex, 2u);
 }
 
-TEST(EJitTaskPoolTest, OversizeBoundSnapshotFallsBack) {
+TEST(EJitTaskPoolTest, BoundPointerDescriptorsAreFixedAndValidated) {
   EJitTaskPool P(8, false);
   P.switchController().setMode(EJitCompileMode::Async);
-  uint8_t Data[EJIT_BOUND_PTR_MAX_BYTES + 1] = {};
+  uint8_t Data[kEJitMaxBoundPointers][2048] = {};
   EJitDimPair D[1] = {{0, 3}};
-  auto R = P.compileOrGet(18, D, 1, nullptr, Data, sizeof(Data), 1);
-  EXPECT_EQ(R.status, EJitCompileOrGetStatus::InvalidParam);
-  EXPECT_EQ(P.pendingCount(), 0u);
+  EJitBoundPtrDescriptor Bounds[kEJitMaxBoundPointers] = {};
+  for (uint32_t I = 0; I < kEJitMaxBoundPointers; ++I)
+    Bounds[I] = {Data[I], sizeof(Data[I]), I};
+  auto Accepted =
+      P.compileOrGet(18, D, 1, nullptr, Bounds, kEJitMaxBoundPointers);
+  EXPECT_EQ(Accepted.status, EJitCompileOrGetStatus::EnqueuedPending);
+
+  Bounds[1].argIndex = Bounds[0].argIndex;
+  auto Rejected =
+      P.compileOrGet(19, D, 1, nullptr, Bounds, kEJitMaxBoundPointers);
+  EXPECT_EQ(Rejected.status, EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(P.pendingCount(), 1u);
+
+  EJitBoundPtrDescriptor Invalid{Data, sizeof(Data), 0};
+  Invalid.rawPtr = nullptr;
+  EXPECT_EQ(P.compileOrGet(20, D, 1, nullptr, &Invalid, 1).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  Invalid.rawPtr = Data;
+  Invalid.size = 0;
+  EXPECT_EQ(P.compileOrGet(21, D, 1, nullptr, &Invalid, 1).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  Invalid.size = 8;
+  Invalid.rawPtr = reinterpret_cast<const void *>(
+      std::numeric_limits<uintptr_t>::max() - 3u);
+  EXPECT_EQ(P.compileOrGet(22, D, 1, nullptr, &Invalid, 1).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(
+      P.compileOrGet(23, D, 1, nullptr, Bounds, kEJitMaxBoundPointers + 1u)
+          .status,
+      EJitCompileOrGetStatus::InvalidParam);
+}
+
+TEST(EJitTaskPoolTest, BoundPointerPublishCallbackDoesNotBorrowAfterCompile) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  PublishObserver O;
+  P.setCompiler(&MockCompiler::compile, &C);
+  P.setPublishCallback(&PublishObserver::notify, &O);
+  uint32_t Config[2] = {7, 5};
+  EJitBoundPtrDescriptor Bound{Config, sizeof(Config), 1};
+  EJitDimPair D[1] = {{0, 3}};
+
+  ASSERT_EQ(P.compileOrGet(24, D, 1, nullptr, &Bound, 1).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(P.pollOne());
+  EXPECT_EQ(O.calls, 1u);
+  EXPECT_TRUE(O.lastPublished);
+  EXPECT_EQ(O.lastBoundCount, 0u);
+  EXPECT_EQ(O.lastRawPtr, nullptr);
 }
 
 TEST(EJitTaskPoolTest, OutOfRangeFuncIndexRejected) {

@@ -16,6 +16,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -153,10 +154,11 @@ struct BoundPtrInfo {
   uint64_t PointeeSize;
 };
 
-static std::optional<BoundPtrInfo> getBoundPtrInfo(const Function &F) {
+static SmallVector<BoundPtrInfo, 8> getBoundPtrInfos(const Function &F) {
+  SmallVector<BoundPtrInfo, 8> Result;
   MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
   if (!MD)
-    return std::nullopt;
+    return Result;
   for (const MDOperand &Op : MD->operands()) {
     auto *Sub = dyn_cast<MDNode>(Op.get());
     if (!Sub || Sub->getNumOperands() < 4)
@@ -166,11 +168,11 @@ static std::optional<BoundPtrInfo> getBoundPtrInfo(const Function &F) {
     auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
     auto *Size = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(3));
     if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && PN && Idx && Size)
-      return BoundPtrInfo{PN->getString().str(),
-                          static_cast<unsigned>(Idx->getZExtValue()),
-                          Size->getZExtValue()};
+      Result.push_back(BoundPtrInfo{PN->getString().str(),
+                                    static_cast<unsigned>(Idx->getZExtValue()),
+                                    Size->getZExtValue()});
   }
-  return std::nullopt;
+  return Result;
 }
 
 static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
@@ -586,7 +588,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       FN_TASKPOOL_COMPILE_OR_GET,
       FunctionType::get(I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
   bool HasBoundPtr = llvm::any_of(EntryFuncs, [](const Function *F) {
-    return getBoundPtrInfo(*F).has_value();
+    return !getBoundPtrInfos(*F).empty();
   });
   if (HasBoundPtr)
     M.getOrInsertFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND,
@@ -594,6 +596,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                                             {I32Ty, PtrTy, I32Ty, PtrTy, I32Ty,
                                              I32Ty, PtrTy, PtrTy},
                                             false));
+  if (HasBoundPtr)
+    M.getOrInsertFunction(
+        FN_TASKPOOL_COMPILE_OR_GET_BOUND_V,
+        FunctionType::get(
+            I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
   M.getOrInsertFunction(
       FN_TASKPOOL_RELEASE_READ,
       FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
@@ -720,8 +727,16 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       F->addFnAttr(Attribute::NoInline);
 
     auto PeriodInds = getPeriodArrIndInfo(*F);
-    auto BoundPtr = getBoundPtrInfo(*F);
+    SmallVector<BoundPtrInfo, 8> BoundPtrs = getBoundPtrInfos(*F);
     unsigned DimCount = PeriodInds.size();
+
+    if (BoundPtrs.size() > MAX_BOUND_PTR_PARAMS) {
+      F->getContext().emitError("ejit-wrapper-gen: function has " +
+                                Twine(BoundPtrs.size()) +
+                                " ejit_bound_ptr parameters; at most " +
+                                Twine(MAX_BOUND_PTR_PARAMS) + " are supported");
+      continue;
+    }
 
     if (DimCount > EJIT_ICACHE_MAX_DIMS) {
       F->getContext().emitError("ejit-wrapper-gen: more than "
@@ -775,21 +790,25 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (Invalid)
       continue;
 
-    if (BoundPtr) {
+    for (const BoundPtrInfo &BoundPtr : BoundPtrs) {
       unsigned MatchingDims =
           llvm::count_if(PeriodInds, [&](const PeriodArrIndInfo &I) {
-            return I.PeriodName == BoundPtr->PeriodName;
+            return I.PeriodName == BoundPtr.PeriodName;
           });
-      if (BoundPtr->ArgIndex >= ArgCount ||
-          !F->getArg(BoundPtr->ArgIndex)->getType()->isPointerTy() ||
-          BoundPtr->PointeeSize == 0 ||
-          BoundPtr->PointeeSize > std::numeric_limits<uint32_t>::max() ||
+      if (BoundPtr.ArgIndex >= ArgCount ||
+          !F->getArg(BoundPtr.ArgIndex)->getType()->isPointerTy() ||
+          BoundPtr.PointeeSize == 0 ||
+          BoundPtr.PointeeSize > std::numeric_limits<uint32_t>::max() ||
           MatchingDims != 1) {
         F->getContext().emitError(
             "ejit-wrapper-gen: invalid ejit_bound_ptr metadata");
-        continue;
+        Invalid = true;
+        break;
       }
     }
+
+    if (Invalid)
+      continue;
 
     // Save original entry block
     BasicBlock &OrigEntry = F->getEntryBlock();
@@ -802,7 +821,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
     auto *I64Ty = Type::getInt64Ty(Ctx);
-    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2 && !BoundPtr;
+    bool UseFixed =
+        EJitWrapperFixedDimEntry && DimCount <= 2 && BoundPtrs.empty();
 
     SmallVector<ReturnInst *, 8> OriginalReturns;
     for (BasicBlock &BB : *F)
@@ -921,6 +941,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           B.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
       Value *OutFnArg = B.CreatePointerCast(OutFnAlloca, PtrTy);
       Value *OutBucketArg = B.CreatePointerCast(OutBucketAlloca, PtrTy);
+      ArrayType *BoundDescArrayTy = nullptr;
+      Value *BoundDescAlloca = nullptr;
+      if (BoundPtrs.size() > 1) {
+        auto *BoundDescTy = StructType::get(PtrTy, I32Ty, I32Ty);
+        BoundDescArrayTy = ArrayType::get(BoundDescTy, BoundPtrs.size());
+        BoundDescAlloca =
+            B.CreateAlloca(BoundDescArrayTy, nullptr, "ejit_bound_ptrs");
+      }
       if (EJitFunctionBodyTiming && !WrapperBegin)
         WrapperBegin = B.CreateCall(TraceNow, {}, "ejit_wrapper_begin");
       Value *FuncIdx = B.CreateLoad(I32Ty, FuncIndexGlobals[F->getName().str()],
@@ -985,14 +1013,41 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         }
         Value *DimsPtr = DimCount > 0 ? B.CreatePointerCast(DimsAlloca, PtrTy)
                                       : ConstantPointerNull::get(PtrTy);
-        if (BoundPtr) {
-          Value *Snapshot = Fn.getArg(BoundPtr->ArgIndex);
+        if (BoundPtrs.size() == 1) {
+          const BoundPtrInfo &BoundPtr = BoundPtrs.front();
+          Value *RawPtr = Fn.getArg(BoundPtr.ArgIndex);
+          if (RawPtr->getType() != PtrTy)
+            RawPtr = B.CreatePointerCast(RawPtr, PtrTy);
           Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND),
                                 {FuncIdx, DimsPtr,
-                                 ConstantInt::get(I32Ty, DimCount), Snapshot,
-                                 ConstantInt::get(I32Ty, BoundPtr->PointeeSize),
-                                 ConstantInt::get(I32Ty, BoundPtr->ArgIndex),
+                                 ConstantInt::get(I32Ty, DimCount), RawPtr,
+                                 ConstantInt::get(I32Ty, BoundPtr.PointeeSize),
+                                 ConstantInt::get(I32Ty, BoundPtr.ArgIndex),
                                  OutFnArg, OutBucketArg});
+        } else if (BoundPtrs.size() > 1) {
+          auto *BoundDescTy =
+              cast<StructType>(BoundDescArrayTy->getElementType());
+          for (unsigned I = 0; I < BoundPtrs.size(); ++I) {
+            const BoundPtrInfo &BoundPtr = BoundPtrs[I];
+            Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
+                             ConstantInt::get(I32Ty, I)};
+            Value *DescPtr =
+                B.CreateInBoundsGEP(BoundDescArrayTy, BoundDescAlloca, Idxs);
+            Value *RawPtr = Fn.getArg(BoundPtr.ArgIndex);
+            if (RawPtr->getType() != PtrTy)
+              RawPtr = B.CreatePointerCast(RawPtr, PtrTy);
+            B.CreateStore(RawPtr, B.CreateStructGEP(BoundDescTy, DescPtr, 0));
+            B.CreateStore(ConstantInt::get(I32Ty, BoundPtr.PointeeSize),
+                          B.CreateStructGEP(BoundDescTy, DescPtr, 1));
+            B.CreateStore(ConstantInt::get(I32Ty, BoundPtr.ArgIndex),
+                          B.CreateStructGEP(BoundDescTy, DescPtr, 2));
+          }
+          Status =
+              B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND_V),
+                           {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
+                            B.CreatePointerCast(BoundDescAlloca, PtrTy),
+                            ConstantInt::get(I32Ty, BoundPtrs.size()), OutFnArg,
+                            OutBucketArg});
         } else {
           Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
                                 {FuncIdx, DimsPtr,
