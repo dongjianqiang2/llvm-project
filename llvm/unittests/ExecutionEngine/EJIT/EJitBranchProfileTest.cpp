@@ -131,20 +131,31 @@ TEST(EJitBranchProfile, BenefitScalingRoundsToNearestFixedPoint) {
   EXPECT_EQ(Summary.removedHitsPerEntryPermille, 667u);
 }
 
+TEST(EJitBranchProfile, SixVersionsReportExactFrozenEntryTotal) {
+  std::vector<EJitMayConstBenefitSample> Samples(6);
+  for (EJitMayConstBenefitSample &Sample : Samples)
+    Sample.sampledEntries = 64;
+  EXPECT_EQ(summarizeMayConstBenefits(Samples).sampledEntries, 384u);
+}
+
 TEST(EJitBranchProfile, ComputesBenefitDensityFromPerVersionCacheLines) {
   EJitMayConstBenefitSample First;
   First.removedRuntimeHits = 200;
   First.sampleCycles = 500;
   First.publishedHotCodeBytes = 65;
+  First.publishedHotCodeSizeValid = true;
   EJitMayConstBenefitSample Second;
   Second.removedRuntimeHits = 100;
   Second.sampleCycles = 500;
   Second.publishedHotCodeBytes = 64;
+  Second.publishedHotCodeSizeValid = true;
 
   EJitMayConstBenefitSummary Summary =
       summarizeMayConstBenefits({First, Second});
   EXPECT_EQ(Summary.publishedHotCodeBytes, 129u);
   EXPECT_EQ(Summary.publishedHotICacheLines, 3u);
+  EXPECT_EQ(Summary.validPublishedHotCodeVersions, 2u);
+  EXPECT_TRUE(Summary.entryBenefitDensityValid);
   EXPECT_EQ(Summary.benefitPerMillionCyclesMilli, 300000000u);
   EXPECT_EQ(Summary.entryBenefitDensityMilli, 100000000u);
 }
@@ -156,17 +167,21 @@ TEST(EJitBranchProfile, ZeroCodeFootprintHasZeroBenefitDensity) {
   EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits({Sample});
   EXPECT_EQ(Summary.publishedHotICacheLines, 0u);
   EXPECT_EQ(Summary.entryBenefitDensityMilli, 0u);
+  EXPECT_FALSE(Summary.entryBenefitDensityValid);
 }
 
 TEST(EJitBranchProfile, AuditsCrossVersionPartialJitCandidates) {
   EJitMayConstBenefitSample First;
   First.publishedHotCodeBytes = 5 * 64;
+  First.publishedHotCodeSizeValid = true;
   First.publishedHotLineFingerprints = {1, 2, 3, 9, 9};
   EJitMayConstBenefitSample Second;
   Second.publishedHotCodeBytes = 3 * 64;
+  Second.publishedHotCodeSizeValid = true;
   Second.publishedHotLineFingerprints = {2, 3, 4};
   EJitMayConstBenefitSample Third;
   Third.publishedHotCodeBytes = 2 * 64;
+  Third.publishedHotCodeSizeValid = true;
   Third.publishedHotLineFingerprints = {2, 5};
 
   EJitMayConstBenefitSummary Summary =
@@ -183,11 +198,63 @@ TEST(EJitBranchProfile, FingerprintsPublishedCodeLinesAndSkipsZeroPadding) {
   std::fill(Code.begin() + 128, Code.begin() + 192, 0x5a);
   std::fill(Code.begin() + 192, Code.end(), 0x5a);
 
-  std::vector<uint64_t> Fingerprints =
-      fingerprintPublishedHotICacheLines(Code);
+  std::vector<uint64_t> Fingerprints = fingerprintPublishedHotICacheLines(Code);
   ASSERT_EQ(Fingerprints.size(), 3u);
   EXPECT_EQ(Fingerprints[0], Fingerprints[1]);
   EXPECT_NE(Fingerprints[0], Fingerprints[2]);
+}
+
+TEST(EJitBranchProfile, PublishedFunctionBytesUseExactSymbolExtent) {
+  std::vector<uint8_t> Allocation(256, 0x7a);
+  ArrayRef<uint8_t> FunctionBytes;
+  ASSERT_TRUE(
+      getPublishedFunctionBytes(Allocation.data() + 64, 65,
+                                reinterpret_cast<uintptr_t>(Allocation.data()),
+                                Allocation.size(), FunctionBytes));
+  EXPECT_EQ(FunctionBytes.data(), Allocation.data() + 64);
+  EXPECT_EQ(FunctionBytes.size(), 65u);
+  EXPECT_EQ(fingerprintPublishedHotICacheLines(FunctionBytes).size(), 2u);
+}
+
+TEST(EJitBranchProfile, PublishedFunctionBytesRejectUnknownOrOutOfRangeSize) {
+  std::vector<uint8_t> Allocation(128, 0x5a);
+  ArrayRef<uint8_t> FunctionBytes;
+  EXPECT_FALSE(getPublishedFunctionBytes(
+      Allocation.data(), 0, reinterpret_cast<uintptr_t>(Allocation.data()),
+      Allocation.size(), FunctionBytes));
+  EXPECT_TRUE(FunctionBytes.empty());
+  EXPECT_FALSE(
+      getPublishedFunctionBytes(Allocation.data() + 96, 64,
+                                reinterpret_cast<uintptr_t>(Allocation.data()),
+                                Allocation.size(), FunctionBytes));
+  EXPECT_TRUE(FunctionBytes.empty());
+  EXPECT_FALSE(getPublishedFunctionBytes(
+      reinterpret_cast<const void *>(
+          reinterpret_cast<uintptr_t>(Allocation.data()) - 1),
+      1, reinterpret_cast<uintptr_t>(Allocation.data()), Allocation.size(),
+      FunctionBytes));
+}
+
+TEST(EJitBranchProfile, UnknownFunctionSizeInvalidatesEntryDensity) {
+  EJitMayConstBenefitSample Known;
+  Known.removedRuntimeHits = 100;
+  Known.sampleCycles = 100;
+  Known.publishedHotCodeBytes = 64;
+  Known.publishedHotCodeSizeValid = true;
+  Known.publishedHotLineFingerprints = {0x1234};
+  EJitMayConstBenefitSample Unknown = Known;
+  Unknown.publishedHotCodeBytes = 0;
+  Unknown.publishedHotCodeSizeValid = false;
+
+  EJitMayConstBenefitSummary Summary =
+      summarizeMayConstBenefits({Known, Unknown});
+  EXPECT_EQ(Summary.validPublishedHotCodeVersions, 1u);
+  EXPECT_FALSE(Summary.entryBenefitDensityValid);
+  EXPECT_EQ(Summary.entryBenefitDensityMilli, 0u);
+  EXPECT_EQ(Summary.fingerprintedHotICacheLines, 0u);
+  EXPECT_EQ(Summary.crossVersionMatchingICacheLines, 0u);
+  EXPECT_EQ(Summary.partialJitCandidateICacheLines, 0u);
+  EXPECT_EQ(Summary.benefitPerMillionCyclesMilli, 1000000000u);
 }
 
 } // namespace

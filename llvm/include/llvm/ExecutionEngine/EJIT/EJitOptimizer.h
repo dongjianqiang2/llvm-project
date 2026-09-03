@@ -105,7 +105,9 @@ public:
   /// Attach the finalized executable footprint to a completed specialization
   /// sample. Returns false when the sample is unavailable or audit is off.
   bool recordMayConstPublishedCode(StringRef Entry, uint64_t CacheKey,
-                                   const void *CodeStart, uint64_t CodeBytes);
+                                   const void *FnPtr, uint64_t FnSize,
+                                   uintptr_t AllocationStart,
+                                   uint64_t AllocationSize);
 
 private:
   /// Replace ejit_period_arr_ind parameters with their runtime constants.

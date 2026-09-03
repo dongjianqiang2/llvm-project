@@ -113,7 +113,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// recorded (print_compiled reports fn_size=0, overhead=codeSize).
 /// v19: the owner-published pool mirror carries the 16 cell + public near-hot
 /// pool details and pool ids are stable across separate managers.
-constexpr uint32_t kEJitSharedAbiVersion = 19u;
+/// v20: Tier-1 sampling end/count are frozen in the shared slot and carried by
+/// the Tier-2 request, excluding queue and compile delay from ranking cycles.
+constexpr uint32_t kEJitSharedAbiVersion = 20u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

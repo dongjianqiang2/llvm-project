@@ -207,8 +207,10 @@ private:
     EJitCompileRequest request{};
     std::string entry;
     uint64_t cacheKey = 0;
-    uintptr_t codeStart = 0;
-    uint64_t codeSize = 0;
+    uintptr_t fnPtr = 0;
+    uint64_t fnSize = 0;
+    uintptr_t allocationStart = 0;
+    uint64_t allocationSize = 0;
   };
   /// Batch mode may link several Tier-2 versions before publishing them. Keep
   /// their readable ranges private until the matching publish callback says

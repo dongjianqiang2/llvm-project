@@ -795,12 +795,10 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
       Out.fnPtr = const_cast<void *>(Ptr);
       Out.codeStart = Found->start;
       Out.codeSize = Found->size;
-      // Recover the entry function's real size for print_compiled waste
-      // diagnostics. The published fnPtr is the entry symbol's address; match
-      // it against the recorded defined symbols. Prefer an exact address match
-      // (the entry itself); otherwise fall back to the symbol whose body
-      // contains A (SAddr <= A < SAddr + size). 0 if no symbol metadata was
-      // recorded (then overhead defaults to the whole codeSize).
+      // Recover the entry function's real size for diagnostics. A size is
+      // exact only when the published fnPtr equals a defined symbol's start;
+      // a pointer into a symbol still resolves its executable allocation, but
+      // must report an unknown fnSize rather than hashing past the body tail.
       Out.fnSize = 0;
       for (uint32_t S = 0; S < Found->symCount; ++S) {
         uintptr_t SAddr = Found->syms[S].addr;
@@ -808,12 +806,6 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
           Out.fnSize = Found->syms[S].size;
           break; // exact entry match
         }
-        // Containing-symbol fallback (e.g. fnPtr points into the middle of a
-        // symbol body rather than at its start). A real "contains" test needs
-        // both bounds; without it a non-containing preceding symbol could win.
-        if (SAddr <= A &&
-            A - SAddr < Found->syms[S].size) // SAddr <= A < SAddr + size
-          Out.fnSize = Found->syms[S].size;
       }
       Out.poolBase = B;
       Out.poolSize = static_cast<uint64_t>(P.size);

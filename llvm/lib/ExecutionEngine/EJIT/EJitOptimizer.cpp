@@ -317,7 +317,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
         ZeroEdges += Summary.zeroCountEdges;
         if (Summary.isRoot) {
           RootEntries = Summary.entryCount;
-          AuditSampledEntries = Summary.entryCount;
+          AuditSampledEntries = ctx.mayConstSampledEntries != 0
+                                    ? ctx.mayConstSampledEntries
+                                    : Summary.entryCount;
         }
         EJIT_DIAG_DEBUG(
             "branch-audit-fn entry=%s fn=%s root=%u entries=%llu insts=%llu "
@@ -549,16 +551,16 @@ void EJitOptimizer::recordMayConstBenefit(
 }
 #endif
 
-bool EJitOptimizer::recordMayConstPublishedCode(StringRef Entry,
-                                                uint64_t CacheKey,
-                                                const void *CodeStart,
-                                                uint64_t CodeBytes) {
+bool EJitOptimizer::recordMayConstPublishedCode(
+    StringRef Entry, uint64_t CacheKey, const void *FnPtr, uint64_t FnSize,
+    uintptr_t AllocationStart, uint64_t AllocationSize) {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  const auto *Bytes = static_cast<const uint8_t *>(CodeStart);
+  ArrayRef<uint8_t> FunctionBytes;
+  const bool SizeValid = getPublishedFunctionBytes(
+      FnPtr, FnSize, AllocationStart, AllocationSize, FunctionBytes);
   std::vector<uint64_t> Fingerprints;
-  if (Bytes && CodeBytes <= std::numeric_limits<size_t>::max())
-    Fingerprints = fingerprintPublishedHotICacheLines(
-        ArrayRef<uint8_t>(Bytes, static_cast<size_t>(CodeBytes)));
+  if (SizeValid)
+    Fingerprints = fingerprintPublishedHotICacheLines(FunctionBytes);
 
   uint32_t Expected = 0;
   while (!mayConstBenefitLock_.compareExchange(Expected, 1))
@@ -573,7 +575,8 @@ bool EJitOptimizer::recordMayConstPublishedCode(StringRef Entry,
     mayConstBenefitLock_.storeRelease(0);
     return false;
   }
-  VersionIt->second.publishedHotCodeBytes = CodeBytes;
+  VersionIt->second.publishedHotCodeBytes = SizeValid ? FnSize : 0;
+  VersionIt->second.publishedHotCodeSizeValid = SizeValid;
   VersionIt->second.publishedHotLineFingerprints.assign(Fingerprints.begin(),
                                                         Fingerprints.end());
   mayConstBenefitLock_.storeRelease(0);
@@ -581,8 +584,10 @@ bool EJitOptimizer::recordMayConstPublishedCode(StringRef Entry,
 #else
   (void)Entry;
   (void)CacheKey;
-  (void)CodeStart;
-  (void)CodeBytes;
+  (void)FnPtr;
+  (void)FnSize;
+  (void)AllocationStart;
+  (void)AllocationSize;
   return false;
 #endif
 }
@@ -646,7 +651,8 @@ bool EJitOptimizer::printMayConstRanking() const {
         Row.summary.partialJitCandidatePermille;
     EJIT_DIAG_RAW(
         "rank=%u entry=%s versions=%llu benefit_per_mcycle=%llu.%03llu "
-        "entry_benefit_density=%llu.%03llu hot_code_bytes=%llu "
+        "entry_benefit_density=%llu.%03llu density_valid=%u "
+        "hot_code_bytes=%llu size_source=%s size_valid_versions=%llu/%llu "
         "hot_icache_lines=%llu fingerprinted_lines=%llu "
         "cross_version_matching_lines=%llu partial_jit_candidate_lines=%llu "
         "partial_jit_candidate_ratio=%llu.%01llu%% "
@@ -660,7 +666,15 @@ bool EJitOptimizer::printMayConstRanking() const {
         static_cast<unsigned long long>(Benefit % 1000),
         static_cast<unsigned long long>(Density / 1000),
         static_cast<unsigned long long>(Density % 1000),
+        Row.summary.entryBenefitDensityValid ? 1u : 0u,
         static_cast<unsigned long long>(Row.summary.publishedHotCodeBytes),
+        Row.summary.validPublishedHotCodeVersions == Row.summary.versions
+            ? "fn"
+            : (Row.summary.validPublishedHotCodeVersions == 0 ? "unknown"
+                                                              : "mixed"),
+        static_cast<unsigned long long>(
+            Row.summary.validPublishedHotCodeVersions),
+        static_cast<unsigned long long>(Row.summary.versions),
         static_cast<unsigned long long>(Row.summary.publishedHotICacheLines),
         static_cast<unsigned long long>(
             Row.summary.fingerprintedHotICacheLines),

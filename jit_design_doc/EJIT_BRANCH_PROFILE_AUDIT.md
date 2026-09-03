@@ -34,18 +34,22 @@ the shared light-optimization prefix so Tier-1 and Tier-2 keep matching CFG
 hashes. Those temporary increments and their global are removed immediately
 after `PGOInstrumentationUse`; they never reach stable Baseline/PGOUse code.
 
-After the normal 64-entry sampling window, the compile driver snapshots the
-site counters before replacing T0. `ejit_init()` publishes ordinary Baseline
-code; `ejit_init_pgo()` continues to the normal PGOUse code. Thus audit-only
-mode samples runtime behavior without applying profile-guided optimization to
-the stable JIT version. The INFO line reports the current version plus the
+The 64-entry window counts only calls that actually dispatch an executable
+Tier-1 pointer. A peer that cannot execute the shared pointer, a null pointer,
+execute-permission preparation failure, or any other AOT fallback does not
+consume the quota. The 64th real dispatch still executes Tier-1 and atomically
+freezes the timestamp and entry count; later calls use AOT while Tier-2 waits or
+compiles. The compile driver therefore snapshots the site counters without
+including queue, worker-throttle, or Tier-2 compile delay in `sample_cycles`.
+`ejit_init()` publishes ordinary Baseline code; `ejit_init_pgo()` continues to
+normal PGOUse code. The INFO line reports the current version plus the
 unique-cache-key aggregate for that entry:
 
 ```text
 [EJIT] mayconst-audit entry=FuncA key=0x1234 tier=2 versions=30 \
   mayconst=42/3/0 removed=42 direct=39 pipeline=3 runtime_hits=99872 \
   hit_sites=17 removed_runtime_hits=95000 removed_hit_sites=16 \
-  sampled_entries=67 sample_cycles=1900000 avg_removed=40 \
+  sampled_entries=64 sample_cycles=1900000 avg_removed=40 \
   weighted_permille=952 min=36 max=42
 ```
 
@@ -102,10 +106,14 @@ million platform timestamp units:
 
 ```text
 [EJIT] mayconst-ranking entries=2 sort=benefit_per_mcycle_desc
-[EJIT] rank=1 entry=FuncA versions=30 benefit_per_mcycle=71225.850 \
-  removed_per_entry=20882.518 removed_runtime_hits=8582715 \
-  sampled_entries=411 sample_cycles=120500000 avg_active_sites=17.000 \
-  hit_sites=510 runtime_hits=10000000 avg_removed=40 total_removed=1200 \
+[EJIT] rank=1 entry=FuncA versions=6 benefit_per_mcycle=71225.850 \
+  entry_benefit_density=1187.097 density_valid=1 hot_code_bytes=23040 \
+  size_source=fn size_valid_versions=6/6 hot_icache_lines=360 \
+  fingerprinted_lines=360 cross_version_matching_lines=90 \
+  partial_jit_candidate_lines=75 partial_jit_candidate_ratio=20.8% \
+  removed_per_entry=20882.518 removed_runtime_hits=8018887 \
+  sampled_entries=384 sample_cycles=112583000 avg_active_sites=17.000 \
+  hit_sites=102 runtime_hits=9000000 avg_removed=40 total_removed=240 \
   min=36 max=42
 ```
 
@@ -116,9 +124,19 @@ floating point. The primary score is
 `removed_runtime_hits * 1,000,000 / sample_cycles`. The equivalent decomposition
 is `(removed_runtime_hits / sampled_entries) *
 (sampled_entries / sample_cycles)`: work removed per entry multiplied by entry
-frequency. Recording the actual entries and elapsed ticks makes samples
-comparable even though the asynchronous Tier-2 snapshot normally occurs after
-the nominal 64-hit trigger rather than at exactly 64 completed calls.
+frequency. With the default threshold, six completed versions therefore report
+`sampled_entries=384`. Queueing and compilation after the threshold cannot
+change either that count or the frozen interval.
+
+`hot_code_bytes` and `hot_icache_lines` use the finalized entry symbol's exact
+`fnPtr + fnSize`, not the containing JITLink allocation. The byte range is read
+only after publication and only when it lies completely inside the finalized
+executable allocation; a zero/missing/out-of-range size is reported as
+`size_source=unknown` or `mixed`, with `density_valid=0`. In that case density
+and all aggregate line-fingerprint metrics are omitted rather than estimated
+from a partial version set or allocation bytes.
+`entry_benefit_density` divides `benefit_per_mcycle` by the sum of per-version
+`ceil(fnSize / 64)` I-cache lines.
 
 `avg_active_sites` is `hit_sites / versions` and remains an explanatory metric;
 three decimal places are printed using integer fixed-point arithmetic.

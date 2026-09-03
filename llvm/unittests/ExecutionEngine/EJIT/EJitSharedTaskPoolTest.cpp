@@ -1787,6 +1787,7 @@ TEST_F(SharedTaskPoolTest, PeerPrepareFailureCleanlyFallsBack) {
   EJitSharedTaskPool owner;
   owner.setPrepareCodeCallback(&mockPrepareCode, &prepare);
   bringUpOwner(owner, /*codeSharing=*/true);
+  owner.setPgoEnabled(true, 1);
 
   EJitCoreId::setCurrentForTest(0);
   ASSERT_EQ(owner.compileOrGet(23, nullptr, 0, codeFor(23)).status,
@@ -1801,6 +1802,10 @@ TEST_F(SharedTaskPoolTest, PeerPrepareFailureCleanlyFallsBack) {
   EXPECT_FALSE(peerHit.hasReadToken);
   EXPECT_TRUE(peerHit.readyButNotShareable);
   EXPECT_EQ(state_->counters.executePrepareFailed.loadAcquire(), 1u);
+  EJitSharedCacheSlot *Slot = findReadySlot(23);
+  ASSERT_NE(Slot, nullptr);
+  EXPECT_EQ(Slot->hitCount.loadAcquire(), 0u)
+      << "a peer that falls back before execution must not consume T1 quota";
 }
 
 //===----------------------------------------------------------------------===//
@@ -2209,6 +2214,32 @@ TEST_F(SharedTaskPoolTest, CodeSharingOffRejectsPeerWithoutReenqueue) {
   peer.getDiagnostics(after);
   EXPECT_EQ(after.queueDepth, before.queueDepth); // NOT re-enqueued
   EXPECT_EQ(after.pendingCount, before.pendingCount);
+}
+
+TEST_F(SharedTaskPoolTest, UnshareablePeerDoesNotConsumeTier1Sample) {
+  EJitSharedTaskPool Owner;
+  Owner.setPgoEnabled(true, 1);
+  bringUpOwner(Owner, /*codeSharing=*/false);
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(Owner.compileOrGet(60, nullptr, 0, codeFor(60)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+
+  EJitSharedTaskPool Peer;
+  Peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(7);
+  auto Fallback = Peer.compileOrGet(60, nullptr, 0, codeFor(60));
+  EXPECT_TRUE(Fallback.readyButNotShareable);
+  EJitSharedCacheSlot *Slot = findReadySlot(60);
+  ASSERT_NE(Slot, nullptr);
+  EXPECT_EQ(Slot->hitCount.loadAcquire(), 0u);
+
+  EJitCoreId::setCurrentForTest(0);
+  auto OwnerHit = Owner.compileOrGet(60, nullptr, 0, codeFor(60));
+  EXPECT_EQ(OwnerHit.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(Slot->hitCount.loadAcquire(), 1u);
+  if (OwnerHit.hasReadToken)
+    Owner.releaseRead(OwnerHit.bucketIndex);
 }
 #endif
 
@@ -3091,7 +3122,8 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // peer for sealing or enable_rw.
   // v19 adds fixed near-hot pool
   // diagnostics and stable semantic pool ids.
-  EXPECT_EQ(kEJitSharedAbiVersion, 19u);
+  // v20 freezes the exact Tier-1 sample end/count in shared state.
+  EXPECT_EQ(kEJitSharedAbiVersion, 20u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -6155,6 +6187,8 @@ struct PgoRecorder {
   std::vector<uint32_t> t2Func; // stripped funcIndex per Tier-2 compile
   std::vector<uint32_t> t2Gen;  // generation per Tier-2 compile
   std::vector<uint32_t> t2Ver0; // versions[0] per Tier-2 compile
+  std::vector<uint64_t> t2SampleEnd;
+  std::vector<uint32_t> t2SampleEntries;
 };
 bool mockCompileRecordPgo(void *ctx, const EJitCompileRequest &req,
                           void **outFn) {
@@ -6164,12 +6198,16 @@ bool mockCompileRecordPgo(void *ctx, const EJitCompileRequest &req,
     r->t2Func.push_back(stripReqTier(req.funcIndex));
     r->t2Gen.push_back(req.generation);
     r->t2Ver0.push_back(req.numDims ? req.versions[0] : 0u);
+    r->t2SampleEnd.push_back(req.pgoSampleEnd);
+    r->t2SampleEntries.push_back(req.pgoSampleEntries);
   } else {
     ++r->tier1;
   }
   *outFn = codeFor(req.funcIndex);
   return true;
 }
+
+uint64_t controlledPgoClock(void *Ctx) { return *static_cast<uint64_t *>(Ctx); }
 
 // Fails only the Tier-2 (PGOUse) compile; Tier-1/Baseline succeed. Lets a test
 // drive the compile-failure dedup-rollback path.
@@ -6368,6 +6406,73 @@ TEST_F(SharedTaskPoolTest, PeerCrossesThresholdOwnerConsumes) {
   EXPECT_FALSE(owner.pollOne()); // queue empty
 }
 
+TEST_F(SharedTaskPoolTest, FinalRealTier1DispatchFreezesSamplingWindow) {
+  EJitSharedTaskPool Owner;
+  PgoRecorder Recorder;
+  uint64_t Clock = 111;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockCompileRecordPgo, &Recorder);
+  Owner.setTraceNowCallback(&controlledPgoClock, &Clock);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setCodeSharingEnabled(true);
+  Owner.setPgoEnabled(true, 3);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+
+  for (uint32_t I = 1; I <= 3; ++I) {
+    auto Result = Owner.compileOrGet(5, nullptr, 0, codeFor(5));
+    EXPECT_EQ(Result.status, EJitCompileOrGetStatus::CacheHit) << I;
+    if (Result.hasReadToken)
+      Owner.releaseRead(Result.bucketIndex);
+  }
+  EJitSharedCacheSlot *Slot = findReadySlot(5);
+  ASSERT_NE(Slot, nullptr);
+  EXPECT_EQ(Slot->hitCount.loadAcquire(), 3u);
+  EXPECT_EQ(Slot->pgoSampleEnd.loadAcquire(), 111u);
+  EXPECT_EQ(Slot->pgoSampleEntries.loadAcquire(), 3u);
+
+  Clock = 999999;
+  for (uint32_t I = 0; I != 1000; ++I) {
+    auto Fallback = Owner.compileOrGet(5, nullptr, 0, codeFor(5));
+    EXPECT_EQ(Fallback.status, EJitCompileOrGetStatus::AlreadyPending);
+    EXPECT_EQ(Fallback.fnPtr, codeFor(5));
+  }
+  EXPECT_EQ(Slot->hitCount.loadAcquire(), 3u);
+  ASSERT_TRUE(Owner.pollOne());
+  ASSERT_EQ(Recorder.t2SampleEnd.size(), 1u);
+  EXPECT_EQ(Recorder.t2SampleEnd[0], 111u);
+  EXPECT_EQ(Recorder.t2SampleEntries[0], 3u);
+
+  auto Tier2 = Owner.compileOrGet(5, nullptr, 0, codeFor(5));
+  EXPECT_EQ(Tier2.status, EJitCompileOrGetStatus::CacheHit);
+  if (Tier2.hasReadToken)
+    Owner.releaseRead(Tier2.bucketIndex);
+}
+
+TEST_F(SharedTaskPoolTest, NullTier1PointerDoesNotConsumeSamplingQuota) {
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockCompile, nullptr);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, 1);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  EJitSharedCacheSlot *Slot = findReadySlot(5);
+  ASSERT_NE(Slot, nullptr);
+  Slot->fnPtr.storeRelease(0);
+
+  auto Result = Owner.compileOrGet(5, nullptr, 0, codeFor(5));
+  EXPECT_NE(Result.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(Slot->hitCount.loadAcquire(), 0u);
+  EXPECT_EQ(Slot->pgoSampleEnd.loadAcquire(), 0u);
+}
+
 // (2) Two peers cross the threshold on the SAME identity; shared dedup admits
 // exactly one Tier-2 request and the owner compiles it once. No permanent
 // pending remains.
@@ -6484,6 +6589,61 @@ TEST_F(SharedTaskPoolTest, ConcurrentPeersCapTier1AtConfiguredSampleCount) {
   EJitCoreId::setCurrentForTest(0);
   ASSERT_TRUE(owner.pollOne());
   EXPECT_EQ(rec.tier2, 1);
+}
+
+TEST_F(SharedTaskPoolTest, FiveFunctionsHandoffAcrossFourProfileSlots) {
+  constexpr uint32_t FirstFunc = 40;
+  constexpr uint32_t Threshold = 64;
+  EJitSharedTaskPool Owner;
+  PgoRecorder Recorder;
+  uint64_t Clock = 1000;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockCompileRecordPgo, &Recorder);
+  Owner.setTraceNowCallback(&controlledPgoClock, &Clock);
+  Owner.setMode(EJitCompileMode::Async);
+  Owner.setPgoEnabled(true, Threshold, 4);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  for (uint32_t Func = FirstFunc; Func != FirstFunc + 4; ++Func)
+    ASSERT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(
+      Owner.compileOrGet(FirstFunc + 4, nullptr, 0, codeFor(FirstFunc + 4))
+          .status,
+      EJitCompileOrGetStatus::PgoAdmissionDeferred);
+  for (uint32_t I = 0; I != 4; ++I)
+    ASSERT_TRUE(Owner.pollOne());
+
+  for (uint32_t Func = FirstFunc; Func != FirstFunc + 4; ++Func) {
+    for (uint32_t I = 0; I != Threshold; ++I) {
+      auto Hit = Owner.compileOrGet(Func, nullptr, 0, codeFor(Func));
+      ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+      if (Hit.hasReadToken)
+        Owner.releaseRead(Hit.bucketIndex);
+    }
+  }
+  for (uint32_t I = 0; I != 4; ++I)
+    ASSERT_TRUE(Owner.pollOne());
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+
+  const uint32_t LastFunc = FirstFunc + 4;
+  ASSERT_EQ(Owner.compileOrGet(LastFunc, nullptr, 0, codeFor(LastFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  for (uint32_t I = 0; I != Threshold; ++I) {
+    auto Hit = Owner.compileOrGet(LastFunc, nullptr, 0, codeFor(LastFunc));
+    ASSERT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (Hit.hasReadToken)
+      Owner.releaseRead(Hit.bucketIndex);
+  }
+  ASSERT_TRUE(Owner.pollOne());
+
+  ASSERT_EQ(Recorder.t2SampleEntries.size(), 5u);
+  for (uint32_t Entries : Recorder.t2SampleEntries)
+    EXPECT_EQ(Entries, Threshold);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(Owner.pendingCount(), 0u);
 }
 
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
@@ -6617,8 +6777,15 @@ TEST_F(SharedTaskPoolTest, SameFuncSameNumDimsBucketCollisionUsesExactSlot) {
 // rolled back so a later hit (after space frees) can retrigger and succeed.
 TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
   EJitSharedTaskPool pool;
-  bringUpOwner(pool);
+  PgoRecorder Recorder;
+  uint64_t Clock = 777;
   EJitCoreId::setCurrentForTest(0);
+  pool.bind(state_.get());
+  pool.setCompiler(&mockCompileRecordPgo, &Recorder);
+  pool.setTraceNowCallback(&controlledPgoClock, &Clock);
+  pool.setMode(EJitCompileMode::Async);
+  pool.setPgoEnabled(true, 1);
+  ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
   pool.setInstanceEnabled(1, 4, true);
   EJitDimPair d0[1] = {dim(1, 4)};
 
@@ -6627,8 +6794,8 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
             EJitCompileOrGetStatus::EnqueuedPending);
   ASSERT_TRUE(pool.pollOne());
 
-  // Fill the shared queue with ordinary undrained requests until full, then
-  // enable PGO so staged admission does not intentionally defer the fillers.
+  // Fill with ordinary requests without consuming the target's PGO admission.
+  pool.setPgoEnabled(false, 0);
   bool full = false;
   uint32_t f = 100;
   for (; f < 100 + kEJitSharedQueueSlots + 8; ++f) {
@@ -6646,6 +6813,10 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
   ASSERT_EQ(state_->inFlight[5].loadRelaxed(), 0u);
   auto hit = pool.compileOrGet(5, d0, 1, codeFor(5));
   EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  EJitSharedCacheSlot *Target = findReadySlot(5);
+  ASSERT_NE(Target, nullptr);
+  EXPECT_EQ(Target->pgoSampleEnd.loadAcquire(), 777u);
+  EXPECT_EQ(Target->pgoSampleEntries.loadAcquire(), 1u);
   EXPECT_EQ(state_->inFlight[5].loadRelaxed(), 0u)
       << "queue-full Tier-2 must roll back its in-flight claim";
   if (hit.hasReadToken)
@@ -6655,9 +6826,11 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
   // slot is not evicted by a full recompile storm before we retry).
   (void)pool.pollBudget(8);
 
-  // Now the target can retrigger and successfully enqueue its Tier-2.
+  // Retry queues Tier-2 with the same frozen window but routes this call AOT.
+  Clock = 999999;
   auto hit2 = pool.compileOrGet(5, d0, 1, codeFor(5));
-  EXPECT_EQ(hit2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(hit2.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(hit2.fnPtr, codeFor(5));
   EXPECT_NE(state_->inFlight[5].loadRelaxed(), 0u)
       << "retry after space frees must claim the in-flight bit";
   if (hit2.hasReadToken)
@@ -6670,6 +6843,9 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
   EJitSharedCacheSlot *s = findReadySlot(5);
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->tier.loadRelaxed(), static_cast<uint8_t>(kEJitTierPgoUse));
+  ASSERT_EQ(Recorder.t2SampleEnd.size(), 1u);
+  EXPECT_EQ(Recorder.t2SampleEnd[0], 777u);
+  EXPECT_EQ(Recorder.t2SampleEntries[0], 1u);
 }
 
 // (6) The encoded Tier-2 funcIndex must leave NO in-flight bit after success,

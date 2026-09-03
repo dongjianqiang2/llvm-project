@@ -128,6 +128,8 @@ struct SpecializationContext {
   /// Platform timestamp distance from Tier-1 counter capture to the Tier-2
   /// snapshot. SRE uses cycle counter ticks; hosts use steady-clock ns.
   uint64_t mayConstSampleCycles = 0;
+  /// Root Tier-1 dispatches admitted into this frozen sampling window.
+  uint64_t mayConstSampledEntries = 0;
   /// True when profile data is collected for diagnostics only. The optimizer
   /// restores weights for reporting but must publish ordinary Baseline code.
   bool profileAuditOnly = false;
@@ -182,7 +184,9 @@ public:
 
   /// Attach finalized executable bytes to a completed may_const sample.
   bool recordMayConstPublishedCode(const std::string &Entry, uint64_t CacheKey,
-                                   const void *CodeStart, uint64_t CodeBytes);
+                                   const void *FnPtr, uint64_t FnSize,
+                                   uintptr_t AllocationStart,
+                                   uint64_t AllocationSize);
 
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal

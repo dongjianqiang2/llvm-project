@@ -57,6 +57,8 @@ struct EJitMayConstBenefitSample {
   uint64_t sampleCycles = 0;
   /// Finalized executable bytes published for this JIT version.
   uint64_t publishedHotCodeBytes = 0;
+  /// True only when publishedHotCodeBytes came from a validated fnPtr/fnSize.
+  bool publishedHotCodeSizeValid = false;
   /// Fingerprints of non-zero 64-byte executable lines. Used only by the
   /// diagnostic cross-version Partial JIT audit.
   std::vector<uint64_t> publishedHotLineFingerprints;
@@ -81,6 +83,8 @@ struct EJitMayConstBenefitSummary {
   uint64_t sampledEntries = 0;
   uint64_t sampleCycles = 0;
   uint64_t publishedHotCodeBytes = 0;
+  uint64_t validPublishedHotCodeVersions = 0;
+  bool entryBenefitDensityValid = false;
   /// Sum of per-version ceil(publishedHotCodeBytes / 64).
   uint64_t publishedHotICacheLines = 0;
   /// Non-zero executable lines included in the cross-version audit.
@@ -116,6 +120,14 @@ summarizeMayConstBenefits(ArrayRef<EJitMayConstBenefitSample> Samples);
 /// Fingerprint non-zero 64-byte executable lines for the Partial JIT audit.
 std::vector<uint64_t>
 fingerprintPublishedHotICacheLines(ArrayRef<uint8_t> CodeBytes);
+
+/// Validate that fnPtr/fnSize names a complete function body inside its
+/// finalized executable allocation. Out is empty on failure and no bytes are
+/// read, which keeps RW/NX, missing-size, and neighboring allocations out of
+/// the ranking audit.
+bool getPublishedFunctionBytes(const void *FnPtr, uint64_t FnSize,
+                               uintptr_t AllocationStart,
+                               uint64_t AllocationSize, ArrayRef<uint8_t> &Out);
 
 } // namespace ejit
 } // namespace llvm

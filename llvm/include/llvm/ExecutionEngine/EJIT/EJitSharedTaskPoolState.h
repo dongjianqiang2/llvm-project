@@ -253,6 +253,10 @@ struct EJitSharedCacheSlot {
   /// compile driver via ORC lookup and kept driver-private — they do not
   /// need to live in the shared slot.
   EJitAtomicU64 hitCount;
+  /// Sampling window frozen by the threshold-winning real Tier-1 dispatch.
+  /// The end and entry count are published before hitCount reaches threshold.
+  EJitAtomicU64 pgoSampleEnd;
+  EJitAtomicU32 pgoSampleEntries;
   /// PGO (§7.1): current compile tier of the published code.  0 = Baseline /
   /// not yet published, 1 = Instrumented (Tier-1), 2 = PGOUse (Tier-2).
   /// Used to suppress the Tier-2 auto-trigger on slots that are already

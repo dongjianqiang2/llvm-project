@@ -34,8 +34,7 @@ uint64_t saturatingAdd(uint64_t L, uint64_t R) {
   return R > Max - L ? Max : L + R;
 }
 
-uint64_t scaledRatio(uint64_t Numerator, uint64_t Denominator,
-                     uint64_t Scale) {
+uint64_t scaledRatio(uint64_t Numerator, uint64_t Denominator, uint64_t Scale) {
   if (Denominator == 0)
     return 0;
   APInt Wide(129, Numerator);
@@ -66,8 +65,8 @@ uint64_t scaledRatioWithProductDenominator(uint64_t Numerator,
 
 } // namespace
 
-std::vector<uint64_t> llvm::ejit::fingerprintPublishedHotICacheLines(
-    ArrayRef<uint8_t> CodeBytes) {
+std::vector<uint64_t>
+llvm::ejit::fingerprintPublishedHotICacheLines(ArrayRef<uint8_t> CodeBytes) {
   std::vector<uint64_t> Fingerprints;
   Fingerprints.reserve(CodeBytes.size() / EJitICacheLineBytes +
                        (CodeBytes.size() % EJitICacheLineBytes != 0));
@@ -85,6 +84,24 @@ std::vector<uint64_t> llvm::ejit::fingerprintPublishedHotICacheLines(
     Fingerprints.push_back(Fingerprint);
   }
   return Fingerprints;
+}
+
+bool llvm::ejit::getPublishedFunctionBytes(const void *FnPtr, uint64_t FnSize,
+                                           uintptr_t AllocationStart,
+                                           uint64_t AllocationSize,
+                                           ArrayRef<uint8_t> &Out) {
+  Out = {};
+  const uintptr_t FnStart = reinterpret_cast<uintptr_t>(FnPtr);
+  if (FnStart == 0 || FnSize == 0 || AllocationStart == 0 ||
+      AllocationSize == 0 || FnSize > std::numeric_limits<size_t>::max() ||
+      FnStart < AllocationStart)
+    return false;
+  const uint64_t Offset = FnStart - AllocationStart;
+  if (Offset > AllocationSize || FnSize > AllocationSize - Offset)
+    return false;
+  Out = ArrayRef<uint8_t>(static_cast<const uint8_t *>(FnPtr),
+                          static_cast<size_t>(FnSize));
+  return true;
 }
 
 EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
@@ -107,7 +124,8 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
         Summary.specializedMayConstLoads, Sample.specializedMayConstLoads);
     Summary.finalMayConstLoads =
         saturatingAdd(Summary.finalMayConstLoads, Sample.finalMayConstLoads);
-    Summary.runtimeHits = saturatingAdd(Summary.runtimeHits, Sample.runtimeHits);
+    Summary.runtimeHits =
+        saturatingAdd(Summary.runtimeHits, Sample.runtimeHits);
     Summary.hitSites = saturatingAdd(Summary.hitSites, Sample.hitSites);
     Summary.removedRuntimeHits =
         saturatingAdd(Summary.removedRuntimeHits, Sample.removedRuntimeHits);
@@ -117,13 +135,16 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
         saturatingAdd(Summary.sampledEntries, Sample.sampledEntries);
     Summary.sampleCycles =
         saturatingAdd(Summary.sampleCycles, Sample.sampleCycles);
-    Summary.publishedHotCodeBytes = saturatingAdd(
-        Summary.publishedHotCodeBytes, Sample.publishedHotCodeBytes);
+    Summary.publishedHotCodeBytes = saturatingAdd(Summary.publishedHotCodeBytes,
+                                                  Sample.publishedHotCodeBytes);
+    Summary.validPublishedHotCodeVersions =
+        saturatingAdd(Summary.validPublishedHotCodeVersions,
+                      Sample.publishedHotCodeSizeValid ? 1 : 0);
     const uint64_t VersionICacheLines =
         Sample.publishedHotCodeBytes / EJitICacheLineBytes +
         (Sample.publishedHotCodeBytes % EJitICacheLineBytes != 0);
-    Summary.publishedHotICacheLines = saturatingAdd(
-        Summary.publishedHotICacheLines, VersionICacheLines);
+    Summary.publishedHotICacheLines =
+        saturatingAdd(Summary.publishedHotICacheLines, VersionICacheLines);
     DenseSet<uint64_t> SeenInVersion;
     for (uint64_t Fingerprint : Sample.publishedHotLineFingerprints) {
       Summary.fingerprintedHotICacheLines =
@@ -159,23 +180,32 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
       scaledRatio(Summary.hitSites, Summary.versions, 1000);
   Summary.removedHitsPerEntryPermille =
       scaledRatio(Summary.removedRuntimeHits, Summary.sampledEntries, 1000);
-  Summary.benefitPerMillionCyclesMilli = scaledRatio(
-      Summary.removedRuntimeHits, Summary.sampleCycles, 1000000000);
-  Summary.entryBenefitDensityMilli = scaledRatioWithProductDenominator(
-      Summary.removedRuntimeHits, Summary.sampleCycles,
-      Summary.publishedHotICacheLines, 1000000000);
-  for (const auto &Entry : Fingerprints) {
-    const FingerprintCounts &Counts = Entry.second;
-    if (Counts.versions < 2)
-      continue;
-    Summary.crossVersionMatchingICacheLines = saturatingAdd(
-        Summary.crossVersionMatchingICacheLines, Counts.occurrences);
-    Summary.partialJitCandidateICacheLines = saturatingAdd(
-        Summary.partialJitCandidateICacheLines, Counts.occurrences - 1);
+  Summary.benefitPerMillionCyclesMilli =
+      scaledRatio(Summary.removedRuntimeHits, Summary.sampleCycles, 1000000000);
+  Summary.entryBenefitDensityValid =
+      Summary.validPublishedHotCodeVersions == Summary.versions;
+  if (Summary.entryBenefitDensityValid) {
+    Summary.entryBenefitDensityMilli = scaledRatioWithProductDenominator(
+        Summary.removedRuntimeHits, Summary.sampleCycles,
+        Summary.publishedHotICacheLines, 1000000000);
+    for (const auto &Entry : Fingerprints) {
+      const FingerprintCounts &Counts = Entry.second;
+      if (Counts.versions < 2)
+        continue;
+      Summary.crossVersionMatchingICacheLines = saturatingAdd(
+          Summary.crossVersionMatchingICacheLines, Counts.occurrences);
+      Summary.partialJitCandidateICacheLines = saturatingAdd(
+          Summary.partialJitCandidateICacheLines, Counts.occurrences - 1);
+    }
+    Summary.partialJitCandidatePermille =
+        scaledRatio(Summary.partialJitCandidateICacheLines,
+                    Summary.publishedHotICacheLines, 1000);
+  } else {
+    // A partial version set cannot support an honest cross-version code
+    // comparison. Keep size_valid_versions as the explanation, but suppress
+    // all aggregate fingerprint claims alongside density.
+    Summary.fingerprintedHotICacheLines = 0;
   }
-  Summary.partialJitCandidatePermille =
-      scaledRatio(Summary.partialJitCandidateICacheLines,
-                  Summary.publishedHotICacheLines, 1000);
   if (Summary.inputMayConstLoads != 0)
     Summary.weightedRemovedPermille =
         Summary.totalRemoved * 1000 /

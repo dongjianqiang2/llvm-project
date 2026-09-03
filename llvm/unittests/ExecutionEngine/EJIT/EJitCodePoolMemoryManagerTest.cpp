@@ -703,6 +703,30 @@ TEST(EJitCodePoolMemMgr4K, FinalizedRangeCarriesEntryFnSize) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
+// A pointer inside a symbol is enough to recover its executable allocation,
+// but not an exact function body beginning at that pointer.
+TEST(EJitCodePoolMemMgr4K, InteriorPointerHasUnknownFnSize) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeCodeGraphWithDefinedSymbol(64, 0x1000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  auto *EntryAddr = static_cast<uint8_t *>(firstBlockAddr(*G));
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(EntryAddr + 1, Info));
+  EXPECT_EQ(Info.fnPtr, EntryAddr + 1);
+  EXPECT_EQ(Info.fnSize, 0u);
+  EXPECT_GT(Info.codeSize, 0u);
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
 // A graph with no defined symbol records no symbol metadata: fnSize is 0
 // (print_compiled then reports fn_size=0, overhead=codeSize). This guards the
 // "no symbol metadata" fallback path so a symbolless graph never mis-reports

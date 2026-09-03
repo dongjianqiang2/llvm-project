@@ -1358,12 +1358,12 @@ bool EJitOrcEngine::printMayConstRanking() const {
   return P->optimizer && P->optimizer->printMayConstRanking();
 }
 
-bool EJitOrcEngine::recordMayConstPublishedCode(const std::string &Entry,
-                                                uint64_t CacheKey,
-                                                const void *CodeStart,
-                                                uint64_t CodeBytes) {
-  return P->optimizer && P->optimizer->recordMayConstPublishedCode(
-                             Entry, CacheKey, CodeStart, CodeBytes);
+bool EJitOrcEngine::recordMayConstPublishedCode(
+    const std::string &Entry, uint64_t CacheKey, const void *FnPtr,
+    uint64_t FnSize, uintptr_t AllocationStart, uint64_t AllocationSize) {
+  return P->optimizer &&
+         P->optimizer->recordMayConstPublishedCode(
+             Entry, CacheKey, FnPtr, FnSize, AllocationStart, AllocationSize);
 }
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {

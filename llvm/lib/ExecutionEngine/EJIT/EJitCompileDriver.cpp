@@ -64,6 +64,8 @@ bool sameAuditRequest(const EJitCompileRequest &L,
                       const EJitCompileRequest &R) {
   if (L.funcIndex != R.funcIndex || L.numDims != R.numDims ||
       L.fallbackPtr != R.fallbackPtr || L.generation != R.generation ||
+      L.pgoSampleEnd != R.pgoSampleEnd ||
+      L.pgoSampleEntries != R.pgoSampleEntries ||
       L.boundArgIndex != R.boundArgIndex || L.boundSize != R.boundSize ||
       L.boundSize > EJIT_BOUND_PTR_MAX_BYTES)
     return false;
@@ -93,6 +95,8 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
   static_cast<EJitCompileDriver *>(ctx)->notifyTaskpoolPublished(req,
                                                                  published);
 }
+
+uint64_t taskpoolTraceNowThunk(void *) { return ejit_taskpool_trace_now(); }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 [[maybe_unused]] bool sharedPrepareCodeThunk(void * /*ctx*/,
@@ -317,6 +321,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
+  sharedPool_.setTraceNowCallback(&taskpoolTraceNowThunk, this);
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
   // Inject the platform yield so the worker never busy-spins while waiting for
@@ -622,10 +627,14 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       auto mayConstIt = tier1MayConst_.find(cacheKey);
       if (mayConstIt != tier1MayConst_.end()) {
         ctx.mayConstLoadSites = mayConstIt->second.sites;
-        const uint64_t SampleEnd = ejit_taskpool_trace_now();
+        const uint64_t SampleEnd = request && request->pgoSampleEntries != 0
+                                       ? request->pgoSampleEnd
+                                       : ejit_taskpool_trace_now();
         if (mayConstIt->second.sampleStart != 0)
           ctx.mayConstSampleCycles =
               SampleEnd - mayConstIt->second.sampleStart;
+        if (request)
+          ctx.mayConstSampledEntries = request->pgoSampleEntries;
         const auto *Counters = reinterpret_cast<const EJitAtomicU64 *>(
             mayConstIt->second.counterBase);
         if (Counters) {
@@ -910,12 +919,11 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       jitEngine_->findCodeRange(funcPtr, CodeInfo)) {
     if (request) {
       pendingMayConstCodeAudits_.push_back(
-          {*request, funcName, cacheKey, CodeInfo.codeStart,
-           CodeInfo.codeSize});
+          {*request, funcName, cacheKey, reinterpret_cast<uintptr_t>(funcPtr),
+           CodeInfo.fnSize, CodeInfo.codeStart, CodeInfo.codeSize});
     } else {
       (void)jitEngine_->recordMayConstPublishedCode(
-          funcName, cacheKey,
-          reinterpret_cast<const void *>(CodeInfo.codeStart),
+          funcName, cacheKey, funcPtr, CodeInfo.fnSize, CodeInfo.codeStart,
           CodeInfo.codeSize);
     }
   }
@@ -1016,8 +1024,8 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
     if (published && jitEngine_)
       (void)jitEngine_->recordMayConstPublishedCode(
           CodeAudit->entry, CodeAudit->cacheKey,
-          reinterpret_cast<const void *>(CodeAudit->codeStart),
-          CodeAudit->codeSize);
+          reinterpret_cast<const void *>(CodeAudit->fnPtr), CodeAudit->fnSize,
+          CodeAudit->allocationStart, CodeAudit->allocationSize);
     pendingMayConstCodeAudits_.erase(CodeAudit);
   }
 

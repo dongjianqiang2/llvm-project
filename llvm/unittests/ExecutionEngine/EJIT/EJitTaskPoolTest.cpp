@@ -128,8 +128,8 @@ TEST(EJitTaskPoolLayout, RequestIsFlatPod) {
   // The fixed request owns its optional bound-pointer bytes inline. See the
   // cross-pointer-width layout assertion in EJitSreQueue.h.
   EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8
-                                            ? 80u + EJIT_BOUND_PTR_MAX_BYTES
-                                            : 72u + EJIT_BOUND_PTR_MAX_BYTES);
+                                            ? 88u + EJIT_BOUND_PTR_MAX_BYTES
+                                            : 84u + EJIT_BOUND_PTR_MAX_BYTES);
 }
 
 //===----------------------------------------------------------------------===//

@@ -63,6 +63,10 @@ struct EJitCompileRequest {
   uint32_t numDims;
   EJitDimPair dims[4];
   uint32_t versions[4];
+  /// Frozen at the final real Tier-1 dispatch. Tier-2 must use these values
+  /// instead of measuring after queue/worker delay. pgoSampleEntries == 0
+  /// means this timestamp is unavailable; the timestamp itself may be zero.
+  uint64_t pgoSampleEnd;
   uintptr_t fallbackPtr;
   // Shared-taskpool owner generation captured at enqueue time. A worker drops a
   // request whose generation no longer equals the shared state's generation
@@ -70,6 +74,7 @@ struct EJitCompileRequest {
   // cache. Unused (left 0) by the non-shared taskpool. Endianness: a plain
   // fixed-width scalar accessed by value, never byte-parsed.
   uint32_t generation;
+  uint32_t pgoSampleEntries;
   // Optional shallow pointee snapshot for ejit_bound_ptr. It is stored inline
   // so an async request owns every byte it needs after the caller returns.
   // boundSize == 0 means no bound pointer. No raw caller pointer crosses the
@@ -79,13 +84,12 @@ struct EJitCompileRequest {
   alignas(uintptr_t) uint8_t boundData[EJIT_BOUND_PTR_MAX_BYTES];
 };
 
-// Size is stable per pointer width: on a 64-bit target the trailing uint32_t
-// generation forces 4 bytes of tail padding (alignof == 8) -> 72; on a 32-bit
-// target everything is 4-aligned with no padding -> 64.
+// Size is stable per pointer width. The 64-bit layout retains 8-byte alignment;
+// the 32-bit layout is 4-byte aligned.
 static_assert(sizeof(EJitCompileRequest) ==
-                  (sizeof(uintptr_t) == 8 ? 80u + EJIT_BOUND_PTR_MAX_BYTES
-                                          : 72u + EJIT_BOUND_PTR_MAX_BYTES),
-              "EJitCompileRequest size must stay stable (incl. generation)");
+                  (sizeof(uintptr_t) == 8 ? 88u + EJIT_BOUND_PTR_MAX_BYTES
+                                          : 84u + EJIT_BOUND_PTR_MAX_BYTES),
+              "EJitCompileRequest size must stay stable (incl. PGO sample)");
 static_assert(alignof(EJitCompileRequest) <= 8,
               "EJitCompileRequest alignment must stay <= 8 bytes");
 static_assert(sizeof(uintptr_t) == 4 || sizeof(uintptr_t) == 8,

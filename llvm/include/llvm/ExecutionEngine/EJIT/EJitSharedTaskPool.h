@@ -413,6 +413,8 @@ public:
   /// Owner-private diagnostic callback. It runs only on the owner worker and
   /// may access owner-local optimizer state.
   using MayConstRankingCallback = bool (*)(void *ctx);
+  /// Platform timestamp source used on the core closing a Tier-1 window.
+  using TraceNowCallback = uint64_t (*)(void *ctx);
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   using TestHookFn = void (*)(void *ctx);
 #endif
@@ -519,6 +521,10 @@ public:
   void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
     mayConstRankingFn_ = fn;
     mayConstRankingCtx_ = ctx;
+  }
+  void setTraceNowCallback(TraceNowCallback fn, void *ctx) {
+    traceNowFn_ = fn;
+    traceNowCtx_ = ctx;
   }
   void setReleaser(ReleaseCallback fn, void *ctx) {
     const bool had = (releaseFn_ != nullptr);
@@ -753,10 +759,10 @@ public:
   void setMode(EJitCompileMode mode) { configuredMode_ = mode; }
 
   /// PGO (§6): enable the online-PGO Tier-2 auto-trigger on the shared
-  /// taskpool.  When enabled, every cache hit atomically increments the
-  /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
-  /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
-  /// the trigger (hits are still counted).
+  /// taskpool. Only a dispatch that returns an executable Tier-1 pointer
+  /// consumes the sampling quota. The threshold dispatch freezes the sample
+  /// end/count and arms Tier-2; later calls use AOT until Tier-2 publishes.
+  /// \p threshold 0 disables the trigger (legal hits are still counted).
   void setPgoEnabled(
       bool enable, uint32_t threshold,
       uint32_t maxConcurrentProfiles = EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
@@ -1188,11 +1194,6 @@ private:
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
     bool readyButNotShareable = false;
-    /// The instrumented Tier-1 has collected its configured number of root
-    /// samples and Tier-2 is queued/compiling. Keep the Tier-1 allocation and
-    /// counters alive for profile synthesis, but route calls back to AOT until
-    /// Tier-2 publication replaces the slot.
-    bool pgoSamplingComplete = false;
     /// EJIT_SRE_TASKPOOL_NO_RECLAIM only: a validated seqlock hit that holds NO
     /// read token. classifyHit() treats it as a CacheHit; bucketIndex is the
     /// out-of-range sentinel (kEJitSharedCacheBuckets) so the wrapper's
@@ -1264,7 +1265,11 @@ private:
   /// Submit Tier-2 from an identity/version-validated slot while its bucket
   /// read lock is held. This preserves the exact slot snapshot without
   /// enlarging the 16-byte CompileOrGetResult hot-path return value.
-  void enqueueTier2FromSlot(const EJitSharedCacheSlot &slot);
+  void enqueueTier2FromSlot(const EJitSharedCacheSlot &slot, uint64_t sampleEnd,
+                            uint32_t sampleEntries);
+  /// Count one dispatch only after a legal Tier-1 pointer is ready to return.
+  /// False means sampling was already complete and this call must use AOT.
+  bool accountTier1Dispatch(const SharedLookup &hit);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
@@ -1447,6 +1452,8 @@ private:
   void *codePoolStatsCtx_ = nullptr;
   MayConstRankingCallback mayConstRankingFn_ = nullptr;
   void *mayConstRankingCtx_ = nullptr;
+  TraceNowCallback traceNowFn_ = nullptr;
+  void *traceNowCtx_ = nullptr;
   CodeReadyCallback codeReadyFn_ = nullptr;
   CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;
   void *codeBatchCtx_ = nullptr;
