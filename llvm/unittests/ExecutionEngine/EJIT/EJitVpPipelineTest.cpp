@@ -60,7 +60,8 @@ static void markEJitEntry(Function &F) {
 // Builds: @vp_callee (indirect-call target),
 // @vp_entry(i32 %bound, i32 %size, i32 %sel): dynamic indirect call via a
 // global slot, dynamic-size memcpy, and a loop bound by %bound.
-static std::unique_ptr<Module> makeVpModule(LLVMContext &Ctx) {
+static std::unique_ptr<Module> makeVpModule(LLVMContext &Ctx,
+                                            bool AddCleanupFixtures = false) {
   auto M = std::make_unique<Module>("vp_pipeline_test", Ctx);
   auto *I32 = Type::getInt32Ty(Ctx);
 
@@ -82,6 +83,39 @@ static std::unique_ptr<Module> makeVpModule(LLVMContext &Ctx) {
       *M, PointerType::getUnqual(M->getContext()), /*isConstant=*/false,
       GlobalValue::ExternalLinkage, Callee, "vp_slot");
 
+  Function *DeadArg = nullptr;
+  Function *Externalized = nullptr;
+  if (AddCleanupFixtures) {
+    auto *Sink =
+        new GlobalVariable(*M, I32, false, GlobalValue::InternalLinkage,
+                           ConstantInt::get(I32, 0), "vp_cleanup_sink");
+    DeadArg = Function::Create(FunctionType::get(I32, {I32}, false),
+                               GlobalValue::InternalLinkage,
+                               "vp_cleanup_dead_arg", M.get());
+    DeadArg->addFnAttr(Attribute::NoInline);
+    {
+      BasicBlock *BB = BasicBlock::Create(Ctx, "entry", DeadArg);
+      IRBuilder<> B(BB);
+      StoreInst *Store = B.CreateStore(ConstantInt::get(I32, 1), Sink);
+      Store->setVolatile(true);
+      B.CreateRet(ConstantInt::get(I32, 7));
+    }
+
+    // This models a #156 closure helper: the body is externalized into the
+    // AOT image and must remain a declaration in the extracted module.
+    Externalized = Function::Create(FunctionType::get(I32, {I32}, false),
+                                    GlobalValue::ExternalLinkage,
+                                    "vp_cleanup_externalized", M.get());
+    Externalized->setDSOLocal(false);
+
+    auto *Dead = Function::Create(FunctionType::get(I32, {}, false),
+                                  GlobalValue::InternalLinkage,
+                                  "vp_cleanup_dead_callee", M.get());
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Dead);
+    IRBuilder<> B(BB);
+    B.CreateRet(ConstantInt::get(I32, 11));
+  }
+
   auto *Entry =
       Function::Create(FunctionType::get(I32, {I32, I32, I32}, false),
                        GlobalValue::ExternalLinkage, "vp_entry", M.get());
@@ -94,6 +128,11 @@ static std::unique_ptr<Module> makeVpModule(LLVMContext &Ctx) {
     Value *Sel = Entry->getArg(2);
     // Dynamic indirect call (target constant, callee expression dynamic).
     Value *V = B.CreateCall(Callee->getFunctionType(), Fp, {Sel});
+    if (AddCleanupFixtures) {
+      V = B.CreateAdd(V, B.CreateCall(DeadArg, {Arg0}), "cleanup_dead_arg_v");
+      V = B.CreateAdd(V, B.CreateCall(Externalized, {Arg0}),
+                      "cleanup_externalized_v");
+    }
 
     // Dynamic-size memcpy on alloca buffers; the destination IS read below so
     // no optimization may remove the memop site before Gen.
@@ -257,12 +296,11 @@ TEST(EJitVpPipeline, IcpPromotesWithValueMetadata) {
 }
 
 // Regression for the review finding "ICP address table cannot resolve
-// module-internal targets": the Tier-1 capture resolves every module
-// function's address through ORC lookup, but internal-linkage functions (C
-// `static` targets - the common indirect-call case) are normally excluded
-// from the JITDylib symbol table. The Instrumented tier must export them
-// before addIRModule so the driver can map their runtime addresses into the
-// verified address -> MD5 table.
+// module-internal targets": the Tier-1 capture resolves every surviving
+// module function's address through ORC lookup, but internal-linkage functions
+// (C `static` targets - the common indirect-call case) are normally excluded
+// from the JITDylib symbol table. The Instrumented transform re-exports and
+// claims surviving targets after cleanup, while dead locals are never claimed.
 TEST(EJitVpPipeline, OrcLookupResolvesInternalTargets) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("vp_orc_internal", Ctx);
@@ -275,6 +313,28 @@ TEST(EJitVpPipeline, OrcLookupResolvesInternalTargets) {
     BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Callee);
     IRBuilder<> B(BB);
     B.CreateRet(B.CreateAdd(Callee->getArg(0), ConstantInt::get(I32, 1)));
+  }
+  // This definition is removed by the common GlobalDCE. It must not be
+  // preclaimed by ORC, otherwise JITLink reports MissingSymbolDefinitions
+  // when the transformed module no longer defines it.
+  auto *Dead = Function::Create(FunctionType::get(I32, {}, false),
+                                GlobalValue::InternalLinkage,
+                                "vp_internal_dead", M.get());
+  {
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Dead);
+    IRBuilder<> B(BB);
+    B.CreateRet(ConstantInt::get(I32, 42));
+  }
+  // An originally external helper is also internalized before addIRModule.
+  // This catches stale claims that would otherwise be created for a
+  // non-local definition and then invalidated by the optimizer.
+  auto *ExternalDead = Function::Create(FunctionType::get(I32, {}, false),
+                                        GlobalValue::ExternalLinkage,
+                                        "vp_external_dead", M.get());
+  {
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", ExternalDead);
+    IRBuilder<> B(BB);
+    B.CreateRet(ConstantInt::get(I32, 43));
   }
   auto *Slot = new GlobalVariable(*M, PointerType::getUnqual(M->getContext()),
                                   false, GlobalValue::InternalLinkage, Callee,
@@ -323,10 +383,14 @@ TEST(EJitVpPipeline, OrcLookupResolvesInternalTargets) {
       EXPECT_NE(info.pgoHash, 0u);
     }
   EXPECT_TRUE(sawCallee);
+  for (const EJitVpFunctionInfo &info : engine->getLastVpFunctions())
+    EXPECT_NE(info.name, "vp_internal_dead");
+  for (const EJitVpFunctionInfo &info : engine->getLastVpFunctions())
+    EXPECT_NE(info.name, "vp_external_dead");
   auto calleeOrErr = engine->lookup(0x77, "vp_internal_tgt");
   ASSERT_TRUE(static_cast<bool>(calleeOrErr))
       << "ORC lookup of an internal-linkage target must succeed in the "
-         "Instrumented tier (pre-addIRModule export + capture re-export)";
+         "Instrumented tier (post-cleanup re-export + claim)";
   EXPECT_NE(*calleeOrErr, nullptr);
 }
 
@@ -334,7 +398,7 @@ TEST(EJitVpPipeline, Tier1CaptureToTier2GuardedSpecialization) {
   LLVMContext Ctx;
 
   // --- Tier-1: instrument + capture ----------------------------------------
-  std::unique_ptr<Module> M1 = makeVpModule(Ctx);
+  std::unique_ptr<Module> M1 = makeVpModule(Ctx, /*AddCleanupFixtures=*/true);
 
   PeriodArrayRegistry reg;
   EJitOptimizer opt(reg);
@@ -388,6 +452,26 @@ TEST(EJitVpPipeline, Tier1CaptureToTier2GuardedSpecialization) {
   ASSERT_TRUE(entryInfo);
   EXPECT_EQ(entryInfo->pgoHash, entryHash);
   EXPECT_EQ(entryInfo->numScalarSites, 1u);
+
+  // The shared cleanup prefix must remove the unreferenced local callee,
+  // reduce the local helper signature in both Gen and Use, and preserve the
+  // externalized #156-style declaration.
+  EXPECT_EQ(M1->getFunction("vp_cleanup_dead_callee"), nullptr);
+  Function *DeadArg = M1->getFunction("vp_cleanup_dead_arg");
+  ASSERT_NE(DeadArg, nullptr);
+  EXPECT_EQ(DeadArg->arg_size(), 0u);
+  Function *Externalized = M1->getFunction("vp_cleanup_externalized");
+  ASSERT_NE(Externalized, nullptr);
+  EXPECT_TRUE(Externalized->isDeclaration());
+  bool SawDeadArgCall = false;
+  for (BasicBlock &BB : *M1->getFunction("vp_entry"))
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getCalledFunction() == DeadArg) {
+          SawDeadArgCall = true;
+          EXPECT_EQ(CI->arg_size(), 0u);
+        }
+  EXPECT_TRUE(SawDeadArgCall);
 
   // --- Merge: fabricate the runtime payloads the driver would read ---------
   ProfdLayout layout;
@@ -457,14 +541,17 @@ TEST(EJitVpPipeline, Tier1CaptureToTier2GuardedSpecialization) {
     auto RecOrErr = Reader->getInstrProfRecord("vp_entry", layout.funcHash);
     ASSERT_TRUE(static_cast<bool>(RecOrErr));
     NamedInstrProfRecord Rec = std::move(*RecOrErr);
+    EXPECT_EQ(Rec.Hash, layout.funcHash);
+    EXPECT_EQ(Rec.Counts.size(), layout.numCounters);
     EXPECT_EQ(Rec.getNumValueSites(IPVK_IndirectCallTarget),
               layout.numValueSites[0]);
+    EXPECT_EQ(Rec.getNumValueSites(IPVK_MemOPSize), layout.numValueSites[1]);
     EXPECT_EQ(Rec.getValueArrayForSite(IPVK_IndirectCallTarget, 0)[0].Value,
               calleeHash);
   }
 
   // --- Tier-2: PGOUse + ICP + guarded scalar specialization -----------------
-  std::unique_ptr<Module> M2 = makeVpModule(Ctx);
+  std::unique_ptr<Module> M2 = makeVpModule(Ctx, /*AddCleanupFixtures=*/true);
   EJitOptimizer opt2(reg);
   SpecializationContext sc2;
   sc2.fnName = "vp_entry";
@@ -489,6 +576,13 @@ TEST(EJitVpPipeline, Tier1CaptureToTier2GuardedSpecialization) {
   // dependency is covered semantically by the LLJIT equivalence tests in
   // EJitVpScalarSpecTest (the O2 pipeline may re-form the cold loop too).
   EXPECT_NE(IR.find(".vp.cold"), std::string::npos);
+  EXPECT_EQ(M2->getFunction("vp_cleanup_dead_callee"), nullptr);
+  Function *DeadArg2 = M2->getFunction("vp_cleanup_dead_arg");
+  ASSERT_NE(DeadArg2, nullptr);
+  EXPECT_EQ(DeadArg2->arg_size(), 0u);
+  Function *Externalized2 = M2->getFunction("vp_cleanup_externalized");
+  ASSERT_NE(Externalized2, nullptr);
+  EXPECT_TRUE(Externalized2->isDeclaration());
   // Constant propagation evidence in the hot path: the 100-trip loop either
   // folds to its closed form (sum 0..99 = 4950, when the pipeline fully
   // unrolls) or, when unrolling is legitimately declined, keeps a comparison

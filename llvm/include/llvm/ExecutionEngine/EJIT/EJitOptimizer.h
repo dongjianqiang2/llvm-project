@@ -26,6 +26,9 @@
 #include "llvm/IR/Module.h"
 
 namespace llvm {
+
+class TargetMachine;
+
 namespace ejit {
 
 struct EJitMayConstLoadSite;
@@ -51,12 +54,22 @@ public:
   /// (EJitVerify.h): check the may_const values instead of freezing them.
   EJitOptimizer(PeriodArrayRegistry &reg, bool verifySubstitution = false);
 
+  /// \p TM supplies backend-accurate TargetIRAnalysis to the cached LLVM
+  /// pipelines. A null TM is supported for hosted unit tests, but disables
+  /// the target-dependent vectorization stage explicitly.
+  EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM,
+                bool verifySubstitution = false);
+
   /// Run the full JIT specialization pipeline:
-  ///   1. Parameter substitution (ejit_period_arr_ind → constants)
-  ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
-  ///   4. StructFieldPass (may_const loads → runtime constants)
-  ///   5. Core optimization pipeline (L1/L2/L3)
+  ///   1a. Parameter substitution (ejit_period_arr_ind → constants)
+  ///   1b. InstCombine (fold GEP chains from substituted params)
+  ///   1c. StructFieldPass (may_const loads → runtime constants)
+  ///   1d. IPSCCP (push constants across call edges)
+  ///   1e/1f. InstCombine + StructFieldPass for callees
+  ///   1g. Module cleanup (RPO attrs + DAE + GlobalDCE)
+  ///   2-4. LowerExpect → O1/O2/O3 simplification → re-substitution + cleanup
+  ///   5. Generic vectorization (Baseline/PGOUse L2+ only)
+  ///   6. Final GlobalDCE sweep (callees freed by phases 2-5)
   ///
   /// ctx.tier selects the PGO branch (EJIT_ONLINE_PGO.md §4): Baseline (no
   /// PGO), Instrumented (Tier-1: + PGOGen/Lowering/capture), PGOUse (Tier-2:
@@ -129,6 +142,10 @@ private:
   /// constant returns back to call sites.
   void runInterproceduralPropagation(Module &M);
 
+  /// Module-level cleanup after specialization. This runs before PGO Gen/Use
+  /// so both modes see the same function signatures and CFG.
+  void runModuleCleanup(Module &M);
+
   /// Light fold pass run at the PGO Gen/Use point (InstCombine + SimplifyCFG)
   /// to fold branches exposed by specialization. Identical prefix for Tier-1
   /// and Tier-2 keeps the CFG (and thus the PGO hash) aligned.
@@ -144,10 +161,19 @@ private:
   /// the just-substituted period-index / may_const constants to their fixed
   /// point (scalar fold/propagate/simplify), folds loops whose bounds became
   /// constant, re-specializes the array accesses that unrolling turns into
-  /// constant-index GEPs, then does a final cleanup. `level` is accepted for
-  /// ABI compatibility and does not affect the pipeline.
+  /// constant-index GEPs, then runs the generic vector tier for published code
+  /// when the selected level and target machine permit it. Instrumented Tier-1
+  /// intentionally stops before vectorization.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
                                CompileTier tier);
+
+  /// Run the generic post-specialization vector pipeline. L1 and Instrumented
+  /// Tier-1 deliberately skip this stage; L2 adds SLP and L3 adds loop
+  /// vectorization.
+  void runVectorization(Module &M, OptimizationLevel level);
+
+  /// Remove callees that became dead after LowerExpect and later transforms.
+  void runFinalGlobalDCE(Module &M);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,
@@ -163,6 +189,11 @@ private:
   PeriodArrayRegistry &registry_;
   bool verifySubstitution_ = false;
 
+  // A target machine is owned by EJitOrcEngine and outlives this optimizer.
+  // Keep the gate separate from the non-owning pointer: test-only optimizers
+  // may intentionally run the scalar pipeline without a backend TM.
+  bool vectorizationEnabled_ = false;
+
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.
   LoopAnalysisManager LAM_;
@@ -176,12 +207,19 @@ private:
   //   simplifyO1/2/3_ the real LLVM -O1/-O2/-O3 function-simplification
   //   pipeline
   //                   (Phase 3), one per tier; NO vectorization.
-  //   cleanupFPM_     light fold after the second StructFieldPass (Phase 5).
+  //   cleanupFPM_     light fold after the second StructFieldPass (Phase 4).
+  //   cleanupMPM_     RPO attrs + DAE + GlobalDCE module cleanup (Phase 1g).
+  //   vectorizeL2/3_  generic post-specialization vector tiers (Phase 5).
+  //   finalDCEMPM_    final GlobalDCE sweep (Phase 6).
   FunctionPassManager lowerExpectFPM_;
   FunctionPassManager simplifyO1_;
   FunctionPassManager simplifyO2_;
   FunctionPassManager simplifyO3_;
   FunctionPassManager cleanupFPM_;
+  ModulePassManager cleanupMPM_;
+  FunctionPassManager vectorizeL2_;
+  FunctionPassManager vectorizeL3_;
+  ModulePassManager finalDCEMPM_;
   // Tier-2-only profile-guided memory-operation specialization. The main
   // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
   FunctionPassManager pgoUseFPM_;

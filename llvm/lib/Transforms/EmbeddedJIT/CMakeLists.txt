@@ -8,6 +8,7 @@ add_llvm_component_library(LLVMEmbeddedJIT
 
   LINK_COMPONENTS
   Core
+  IPO
   IRReader
   Support
   TransformUtils

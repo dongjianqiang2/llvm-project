@@ -750,8 +750,11 @@ engine->J->getIRTransformLayer().setTransform(
             // 全部阶段封装在 EJitOptimizer::runPipeline 内（见 §2.4.2/§2.4.3）：
             //   preReplacePeriodIndices → runInstCombine → EJitStructFieldPass
             //   → runInterproceduralPropagation(内部化 + IPSCCP)
-            //   → runInstCombine → EJitStructFieldPass
-            //   → runOptimizationPipeline(LowerExpect + buildFunctionSimplificationPipeline)
+            //   → runInstCombine → EJitStructFieldPass →
+            //   runModuleCleanup(RPO attrs + DAE + GlobalDCE)
+            //   → runOptimizationPipeline(LowerExpect + buildFunctionSimplificationPipeline
+            //      + optional generic vectorization for Baseline/PGOUse L2/L3)
+            //   → final GlobalDCE
             // JIT 侧不再运行 Inline（AOT 预优化已内联）。
             engine->P->optimizer->runPipeline(M, *ctx);
             return Error::success();
@@ -825,9 +828,13 @@ void EJitOptimizer::runInterproceduralPropagation(Module& M) {
 
 后特化清理直接复用 **真实的 LLVM 函数级简化流水线** `PassBuilder::buildFunctionSimplificationPipeline`（O1/O2/O3 各预建一份并缓存），而不是手工拼装的 pass 序列。`ctx.optLevel`（L1→O1、L2→O2、L3→O3）只选择这三条已缓存的 FPM 之一；它**不改变**流水线其余部分。注意这是**函数级**简化流水线，并非完整的 `clang -O2` module 流水线——除 phase 1d 的 IPSCCP 外，不含 GlobalOpt、CalledValuePropagation、ArgumentPromotion 等 module/CGSCC pass。
 
+在第二次 `StructFieldPass` 之后，所有 tier 先运行共同的 module cleanup：`ReversePostOrderFunctionAttrsPass`、`DeadArgumentEliminationPass` 和 `GlobalDCEPass`。这一步必须位于 Gen/Use 的共同前缀，确保 profile instrumentation 的函数签名、CFG 与 site 布局对称；它不会删除 `ejit_entry`，也不会删除 #156 外部化的 AOT helper 声明或 profile roots。优化结束后再运行一次 `GlobalDCE`，清理 LowerExpect、特化和函数级简化暴露出的死代码。
+
+在 VP Instrumented 路径中，local function 不会在 `addIRModule` 前被预先 claim。optimizer cleanup 完成后，只把仍存在且已重新导出的定义通过 `MaterializationResponsibility::defineMaterializing` 加入 ORC claim；被 `GlobalDCE` 删除的 local function 因而不会制造 `MissingSymbolDefinitions`。Issue #197 任务 3 的另一半位于 PASS1：AOT 抽取在 non-entry internalize 后、最终 bitcode serialization 前再运行 GlobalDCE，先缩小嵌入业务包的 bitcode，再由这里的 JIT transform cleanup 清理特化阶段新暴露的死代码。
+
 ```cpp
-// 构造时预建（EJitOptimizer 构造函数）
-PassBuilder PB;
+// 构造时预建（EJitOptimizer 构造函数）；TM 由 ORC 持有并覆盖 optimizer 生命周期
+PassBuilder PB(optimizerTargetMachine);
 PB.registerModuleAnalyses(MAM_);   PB.registerCGSCCAnalyses(CGAM_);
 PB.registerFunctionAnalyses(FAM_); PB.registerLoopAnalyses(LAM_);
 PB.crossRegisterProxies(LAM_, FAM_, CGAM_, MAM_);
@@ -838,7 +845,9 @@ simplifyO3_ = PB.buildFunctionSimplificationPipeline(O3, ThinOrFullLTOPhase::Non
 cleanupFPM_.addPass(InstCombinePass());  cleanupFPM_.addPass(SCCPPass());
 cleanupFPM_.addPass(SimplifyCFGPass());  cleanupFPM_.addPass(ADCEPass());
 
-void EJitOptimizer::runOptimizationPipeline(Module& M, ejit::OptimizationLevel level) {
+void EJitOptimizer::runOptimizationPipeline(Module& M,
+                                            ejit::OptimizationLevel level,
+                                            CompileTier tier) {
     FunctionPassManager& simplifyFPM = simplifyFPMForLevel(level); // L1→O1 / L2→O2 / L3→O3
     for (Function& F : M.functions())
         if (!F.isDeclaration()) {
@@ -850,10 +859,20 @@ void EJitOptimizer::runOptimizationPipeline(Module& M, ejit::OptimizationLevel l
     for (Function& F : M.functions())
         if (!F.isDeclaration())
             cleanupFPM_.run(F, FAM_);
+
 }
 ```
 
-> **注**：`buildFunctionSimplificationPipeline` 包含 SROA、InstCombine、SCCP、GVN、CorrelatedValuePropagation、BDCE、DSE、loop-rotate、LICM、loop-unroll 等，但**不含向量化**。首次 Inline 由 AOT 预优化完成；JIT 侧不再做二次 Inline。
+`runOptimizationPipeline` 的 `tier` 参数只允许已发布的 Baseline/PGOUse 在
+L2/L3 进入通用 vector pipeline：L2 使用 SLP/VectorCombine，L3 再加
+LoopVectorize/LoopLoadElimination。Instrumented/Tier-1 不运行 vector pass；若
+ORC 没有可用的 TargetMachine，优化器会安全回退为 scalar。调用方随后运行最终
+`GlobalDCE`，以清理向量化及后续特化留下的死函数/全局。
+
+通用 vector stage 不再额外插入一次 LoopUnroll；循环展开由已有的
+`buildFunctionSimplificationPipeline` 负责，避免 L2/L3 重复扩大代码体积和编译时间。
+
+> **注**：`buildFunctionSimplificationPipeline` 包含 SROA、InstCombine、SCCP、GVN、CorrelatedValuePropagation、BDCE、DSE、loop-rotate、LICM、loop-unroll 等。Tier-1/Instrumented 的定义是“不运行 vector pass”；共享的 TargetMachine 仍由后端按目标配置生成机器码。Baseline/PGOUse 的 L2 运行 SLP/VectorCombine 等通用 vector pass，L3 额外运行 LoopVectorize/LoopLoadElimination。首次 Inline 由 AOT 预优化完成；JIT 侧不再做二次 Inline。
 
 ---
 

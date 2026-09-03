@@ -15,6 +15,7 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
+  EJitRegisterBitcodeTest.cpp
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp

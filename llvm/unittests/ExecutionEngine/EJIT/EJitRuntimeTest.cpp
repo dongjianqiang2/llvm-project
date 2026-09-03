@@ -37,12 +37,20 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Host.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
+#include <chrono>
+#include <cstdio>
 #include <thread>
 #endif
 
@@ -259,8 +267,10 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::preReplacePeriodIndices;
   using EJitOptimizer::runInstCombine;
   using EJitOptimizer::runInterproceduralPropagation;
+  using EJitOptimizer::runModuleCleanup;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
+  using EJitOptimizer::runVectorization;
 };
 } // namespace ejit
 } // namespace llvm
@@ -1600,6 +1610,260 @@ TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
   auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
   ASSERT_NE(RetVal, nullptr);
   EXPECT_EQ(RetVal->getZExtValue(), 0u);
+}
+
+static Function *createDeadArgCallee(LLVMContext &Ctx, Module &M,
+                                     StringRef Name) {
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  auto *F = Function::Create(FunctionType::get(I32Ty, {I32Ty}, false),
+                             GlobalValue::InternalLinkage, Name, &M);
+  F->addFnAttr(Attribute::NoInline);
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  B.SetInsertPoint(BB);
+  B.CreateRet(B.getInt32(7));
+  return F;
+}
+
+TEST(EJitOptimizer, ModuleCleanupDropsDeadArgumentsAndCallees) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "module_cleanup");
+  Function *Callee = createDeadArgCallee(Ctx, *M, "dead_arg_callee");
+  createDeadArgCallee(Ctx, *M, "dead_callee");
+
+  IRBuilder<> B(Ctx);
+  auto *Entry =
+      Function::Create(FunctionType::get(B.getInt32Ty(), {}, false),
+                       GlobalValue::ExternalLinkage, "cleanup_entry", M.get());
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Entry);
+  B.SetInsertPoint(BB);
+  B.CreateRet(B.CreateCall(Callee, {B.getInt32(11)}));
+
+  PeriodArrayRegistry Reg;
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.runModuleCleanup(*M);
+
+  // DAE may replace both the local function and call site, so do not retain
+  // either pointer across the module pass.
+  Callee = M->getFunction("dead_arg_callee");
+  ASSERT_NE(Callee, nullptr);
+  EXPECT_EQ(Callee->arg_size(), 0u);
+  CallInst *Call = nullptr;
+  for (BasicBlock &Block : *Entry)
+    for (Instruction &I : Block)
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        Call = CI;
+        break;
+      }
+  ASSERT_NE(Call, nullptr);
+  EXPECT_EQ(Call->arg_size(), 0u);
+  EXPECT_EQ(M->getFunction("dead_callee"), nullptr);
+}
+
+TEST(EJitOptimizer, FinalGlobalDceDropsExpectGuardFreedCallee) {
+  LLVMContext Ctx;
+  auto M = std::make_unique<Module>("final_dce", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  Type *I64Ty = B.getInt64Ty();
+
+  auto *Helper = Function::Create(FunctionType::get(B.getVoidTy(), {}, false),
+                                  GlobalValue::InternalLinkage,
+                                  "late_dead_helper", M.get());
+  B.SetInsertPoint(BasicBlock::Create(Ctx, "entry", Helper));
+  B.CreateRetVoid();
+
+  FunctionCallee Expect = M->getOrInsertFunction(
+      "llvm.expect.i64", FunctionType::get(I64Ty, {I64Ty, I64Ty}, false));
+  auto *Entry = Function::Create(FunctionType::get(I32Ty, {}, false),
+                                 GlobalValue::ExternalLinkage,
+                                 "final_dce_entry", M.get());
+  Metadata *EntryOps[] = {MDString::get(Ctx, TAG_EJIT_ENTRY)};
+  Entry->setMetadata(MD_EJIT_METADATA,
+                     MDNode::get(Ctx, {MDNode::get(Ctx, EntryOps)}));
+  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Entry);
+  BasicBlock *Live = BasicBlock::Create(Ctx, "live", Entry);
+  BasicBlock *Dead = BasicBlock::Create(Ctx, "dead", Entry);
+  B.SetInsertPoint(EntryBB);
+  Value *E = B.CreateCall(Expect, {B.getInt64(0), B.getInt64(0)});
+  Value *Cond = B.CreateICmpEQ(E, B.getInt64(0));
+  B.CreateCondBr(Cond, Live, Dead);
+  B.SetInsertPoint(Live);
+  B.CreateRet(B.getInt32(0));
+  B.SetInsertPoint(Dead);
+  B.CreateCall(Helper, {});
+  B.CreateRet(B.getInt32(1));
+
+  PeriodArrayRegistry Reg;
+  SpecializationContext CtxSpec;
+  CtxSpec.fnName = "final_dce_entry";
+  CtxSpec.tier = CompileTier::Baseline;
+  CtxSpec.optLevel = llvm::ejit::OptimizationLevel::L3;
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.runPipeline(*M, CtxSpec);
+
+  EXPECT_EQ(M->getFunction("late_dead_helper"), nullptr);
+  EXPECT_EQ(M->getFunction("llvm.expect.i64"), nullptr);
+}
+
+static std::unique_ptr<TargetMachine> createNativeTargetMachine() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  Triple HostTriple(sys::getDefaultTargetTriple());
+  std::string Error;
+  const Target *T = TargetRegistry::lookupTarget(HostTriple, Error);
+  if (!T)
+    return nullptr;
+  TargetOptions Options;
+  return std::unique_ptr<TargetMachine>(
+      T->createTargetMachine(HostTriple, "generic", "", Options, Reloc::PIC_));
+}
+
+static void setTargetAttrsFromTM(Module &M, const TargetMachine &TM) {
+  M.setTargetTriple(TM.getTargetTriple());
+  M.setDataLayout(TM.createDataLayout());
+}
+
+static Function *createSLPStoreFunc(LLVMContext &Ctx, Module &M,
+                                    StringRef Name) {
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  auto *ArrTy = ArrayType::get(I32Ty, 4);
+  auto *Arr = new GlobalVariable(M, ArrTy, false, GlobalValue::ExternalLinkage,
+                                 Constant::getNullValue(ArrTy), "slp_arr");
+  auto *F = Function::Create(FunctionType::get(B.getVoidTy(), {}, false),
+                             GlobalValue::ExternalLinkage, Name, &M);
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  B.SetInsertPoint(BB);
+  for (unsigned I = 0; I != 4; ++I) {
+    Value *GEP = B.CreateConstGEP2_64(ArrTy, Arr, 0, I);
+    B.CreateStore(B.getInt32(I * 3 + 1), GEP);
+  }
+  B.CreateRetVoid();
+  return F;
+}
+
+static bool hasVectorType(const Function &F) {
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB) {
+      if (I.getType()->isVectorTy())
+        return true;
+      for (const Use &U : I.operands())
+        if (U->getType()->isVectorTy())
+          return true;
+    }
+  return false;
+}
+
+static unsigned countModuleInstructions(const Module &M) {
+  unsigned Count = 0;
+  for (const Function &F : M)
+    for (const BasicBlock &BB : F)
+      Count += static_cast<unsigned>(BB.size());
+  return Count;
+}
+
+TEST(EJitOptimizer, L2SlpVectorizesButTier1DoesNot) {
+  LLVMContext Ctx;
+  auto TM = createNativeTargetMachine();
+  if (!TM)
+    GTEST_SKIP() << "host target not registered in this build";
+
+  auto M = createTestModule(Ctx, "slp_l1");
+  Function *F = createSLPStoreFunc(Ctx, *M, "slp_store");
+  setTargetAttrsFromTM(*M, *TM);
+  PeriodArrayRegistry Reg;
+  EJitOptimizerTestAccess Opt(Reg, TM.get());
+
+  // Instrumented Tier-1 must stop at the profile path, even at L2.
+  Opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Instrumented);
+  EXPECT_FALSE(hasVectorType(*F));
+
+  Opt.clearAnalyses();
+  M = createTestModule(Ctx, "slp_l2");
+  F = createSLPStoreFunc(Ctx, *M, "slp_store");
+  setTargetAttrsFromTM(*M, *TM);
+  const unsigned Before = countModuleInstructions(*M);
+  const auto Start = std::chrono::steady_clock::now();
+  Opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Baseline);
+  const auto Elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - Start);
+  const unsigned After = countModuleInstructions(*M);
+  std::printf("[EJIT-VECTOR] tier=L2 ir_insts=%u->%u elapsed_us=%lld\n", Before,
+              After, static_cast<long long>(Elapsed.count()));
+  RecordProperty("vector_l2_ir_insts_before", Before);
+  RecordProperty("vector_l2_ir_insts_after", After);
+  RecordProperty("vector_l2_elapsed_us", Elapsed.count());
+  EXPECT_TRUE(hasVectorType(*F));
+}
+
+static Function *createLoopSumFunc(LLVMContext &Ctx, Module &M,
+                                   StringRef Name) {
+  IRBuilder<> B(Ctx);
+  Type *I32Ty = B.getInt32Ty();
+  auto *F =
+      Function::Create(FunctionType::get(I32Ty, {B.getPtrTy(), I32Ty}, false),
+                       GlobalValue::ExternalLinkage, Name, &M);
+  Argument *Ptr = F->getArg(0);
+  Argument *N = F->getArg(1);
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "loop", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+  B.SetInsertPoint(Entry);
+  B.CreateBr(Loop);
+  B.SetInsertPoint(Loop);
+  PHINode *I = B.CreatePHI(I32Ty, 2, "i");
+  PHINode *Acc = B.CreatePHI(I32Ty, 2, "acc");
+  I->addIncoming(B.getInt32(0), Entry);
+  Acc->addIncoming(B.getInt32(0), Entry);
+  Value *GEP = B.CreateGEP(I32Ty, Ptr, I);
+  Value *V = B.CreateLoad(I32Ty, GEP);
+  Value *NextAcc = B.CreateAdd(Acc, V);
+  Value *NextI = B.CreateAdd(I, B.getInt32(1));
+  Value *Cond = B.CreateICmpULT(NextI, N);
+  I->addIncoming(NextI, Loop);
+  Acc->addIncoming(NextAcc, Loop);
+  B.CreateCondBr(Cond, Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(NextAcc);
+  return F;
+}
+
+TEST(EJitOptimizer, L3LoopVectorizesButL2DoesNot) {
+  LLVMContext Ctx;
+  auto TM = createNativeTargetMachine();
+  if (!TM)
+    GTEST_SKIP() << "host target not registered in this build";
+
+  auto M = createTestModule(Ctx, "loop_l2");
+  Function *F = createLoopSumFunc(Ctx, *M, "loop_sum");
+  setTargetAttrsFromTM(*M, *TM);
+  PeriodArrayRegistry Reg;
+  EJitOptimizerTestAccess Opt(Reg, TM.get());
+  Opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Baseline);
+  EXPECT_FALSE(hasVectorType(*F));
+
+  Opt.clearAnalyses();
+  M = createTestModule(Ctx, "loop_l3");
+  F = createLoopSumFunc(Ctx, *M, "loop_sum");
+  setTargetAttrsFromTM(*M, *TM);
+  const unsigned Before = countModuleInstructions(*M);
+  const auto Start = std::chrono::steady_clock::now();
+  Opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3,
+                              CompileTier::Baseline);
+  const auto Elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - Start);
+  const unsigned After = countModuleInstructions(*M);
+  std::printf("[EJIT-VECTOR] tier=L3 ir_insts=%u->%u elapsed_us=%lld\n", Before,
+              After, static_cast<long long>(Elapsed.count()));
+  RecordProperty("vector_l3_ir_insts_before", Before);
+  RecordProperty("vector_l3_ir_insts_after", After);
+  RecordProperty("vector_l3_elapsed_us", Elapsed.count());
+  EXPECT_TRUE(hasVectorType(*F));
 }
 
 //===----------------------------------------------------------------------===//
@@ -3118,7 +3382,7 @@ std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
     !3 = !{!4}
     !4 = !{!"ejit_entry"}
   )",
-                              Err, Ctx);
+                               Err, Ctx);
   if (!M)
     Err.print("parseInterprocModule", errs());
   return M;

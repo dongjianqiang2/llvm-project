@@ -19,33 +19,93 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
 // The post-specialization cleanup is the real LLVM -O2 function-simplification
-// pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
-// cleanupFPM_ and the LowerExpect prefix are hand-added below.
+// pipeline (PassBuilder::buildFunctionSimplificationPipeline); hand-added on
+// top are the shared module cleanup, final GlobalDCE, and generic vector tiers.
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Transforms/IPO/DeadArgumentElimination.h"
+#include "llvm/Transforms/IPO/FunctionAttrs.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/IPO/Inliner.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
 #include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/CorrelatedValuePropagation.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/IndVarSimplify.h"
+#include "llvm/Transforms/Scalar/LICM.h"
 #include "llvm/Transforms/Scalar/LoopDeletion.h"
+#include "llvm/Transforms/Scalar/LoopLoadElimination.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
-#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
+#include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
+#include "llvm/Transforms/Vectorize/SLPVectorizer.h"
+#include "llvm/Transforms/Vectorize/VectorCombine.h"
 #include <limits>
 
 using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-optimizer"
+
+/// Build the generic post-specialization vector pipeline. L2 gets SLP and
+/// vector combine, while L3 additionally gets loop vectorization and
+/// loop-load elimination. Instrumented Tier-1 never calls this helper.
+static FunctionPassManager buildVectorizeFPM(const PipelineTuningOptions &PTO,
+                                             bool EnableLoopVectorize) {
+  FunctionPassManager FPM;
+  if (EnableLoopVectorize) {
+    FPM.addPass(LoopVectorizePass(LoopVectorizeOptions()));
+    FPM.addPass(LoopLoadEliminationPass());
+    FPM.addPass(InstCombinePass());
+    FPM.addPass(EarlyCSEPass());
+    FPM.addPass(CorrelatedValuePropagationPass());
+    FPM.addPass(InstCombinePass());
+  }
+  FPM.addPass(SLPVectorizerPass());
+  FPM.addPass(VectorCombinePass());
+  FPM.addPass(InstCombinePass());
+  FPM.addPass(SROAPass(SROAOptions::PreserveCFG));
+  FPM.addPass(InstCombinePass());
+  FPM.addPass(createFunctionToLoopPassAdaptor(
+      LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,
+               /*AllowSpeculation=*/true),
+      /*UseMemorySSA=*/true, /*UseBlockFrequencyInfo=*/false));
+  return FPM;
+}
+
+static void disableOutlinedAtomics(Module &M) {
+  // AOT bitcode may carry +outline-atomics, which makes the atomic profiling
+  // increment lower to an unavailable outlined helper on SRE. Removing both
+  // spellings and appending an explicit disable avoids the target-machine
+  // default re-enabling it.
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    Attribute A = F.getFnAttribute("target-features");
+    if (!A.isValid())
+      continue;
+    SmallVector<StringRef, 8> Feats;
+    StringRef(A.getValueAsString()).split(Feats, ',');
+    auto It = llvm::remove_if(Feats, [](StringRef S) {
+      return S == "+outline-atomics" || S == "-outline-atomics";
+    });
+    if (It != Feats.end()) {
+      Feats.erase(It, Feats.end());
+      Feats.push_back("-outline-atomics");
+      F.addFnAttr("target-features", join(Feats, ","));
+    }
+  }
+}
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 static std::vector<EJitMayConstLoadSite>
@@ -72,11 +132,17 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 #endif
 
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, bool verifySubstitution)
-    : registry_(reg), verifySubstitution_(verifySubstitution) {
+    : EJitOptimizer(reg, static_cast<TargetMachine *>(nullptr),
+                    verifySubstitution) {}
+
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM,
+                             bool verifySubstitution)
+    : registry_(reg), verifySubstitution_(verifySubstitution),
+      vectorizationEnabled_(TM != nullptr) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
-  PassBuilder PB;
+  PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
   PB.registerCGSCCAnalyses(CGAM_);
@@ -89,9 +155,11 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, bool verifySubstitution)
   // every may_const field into a compile-time constant. The post-specialization
   // cleanup is the real LLVM -O2 function-simplification pipeline (SROA,
   // InstCombine, SCCP, GVN, CorrelatedValuePropagation, BDCE, DSE, loop-rotate,
-  // LICM, loop-unroll, ... - NO vectorization), which exploits those constants
-  // far more aggressively than the old hand-rolled 8-pass sequence. One cached
-  // FPM per tier; runOptimizationPipeline picks by ctx.optLevel.
+  // LICM, loop-unroll, ...), which exploits those constants far more
+  // aggressively than the old hand-rolled 8-pass sequence. The separate
+  // generic vector pipeline is enabled only for published Baseline/PGOUse
+  // L2/L3 code. One cached FPM per tier; runOptimizationPipeline picks by
+  // ctx.optLevel.
   //
   // LowerExpectIntrinsic must run FIRST: it is NOT in
   // buildFunctionSimplificationPipeline, and the AOT IR carries llvm.expect
@@ -123,6 +191,18 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, bool verifySubstitution)
   cleanupFPM_.addPass(SCCPPass());
   cleanupFPM_.addPass(SimplifyCFGPass());
   cleanupFPM_.addPass(ADCEPass());
+
+  // DAE and GlobalDCE are module passes, so keep them in the common prefix.
+  // Running this before PGO Gen/Use gives both modes identical signatures and
+  // CFGs while still preserving the entry and profile roots.
+  cleanupMPM_.addPass(ReversePostOrderFunctionAttrsPass());
+  cleanupMPM_.addPass(DeadArgumentEliminationPass());
+  cleanupMPM_.addPass(GlobalDCEPass());
+
+  PipelineTuningOptions PTO;
+  vectorizeL2_ = buildVectorizeFPM(PTO, /*EnableLoopVectorize=*/false);
+  vectorizeL3_ = buildVectorizeFPM(PTO, /*EnableLoopVectorize=*/true);
+  finalDCEMPM_.addPass(GlobalDCEPass());
 }
 
 void EJitOptimizer::clearAnalyses() {
@@ -199,6 +279,18 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   runStructFieldPass(M, ctx);
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
 
+  // Shared module cleanup is deliberately before the Tier-1/Tier-2 split.
+  // DAE can change local signatures and GlobalDCE can remove dead callees, so
+  // running it in only one PGO mode would change the profile layout.
+  runModuleCleanup(M);
+  EJIT_DIAG_DEBUG("pipeline phase1g done: module cleanup");
+
+  // Keep target-feature normalization in the shared PGO prefix so Gen and
+  // Use see identical function attributes before lightOpt and profile-site
+  // processing. Baseline keeps its historical target attributes.
+  if (ctx.tier == CompileTier::Instrumented || ctx.tier == CompileTier::PGOUse)
+    disableOutlinedAtomics(M);
+
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint64_t AuditSpecializedMayConstLoads =
       ctx.tier != CompileTier::Instrumented
@@ -208,31 +300,6 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 
   if (ctx.tier == CompileTier::Instrumented) {
     // The counter increment lowers to `atomicrmw add i64` (§5, InstrProfOpts
-    // .Atomic). AOT bitcode compiled for generic AArch64 carries
-    // "+outline-atomics" in its fn "target-features" attribute (the default
-    // on Linux aarch64 toolchains), which overrides the JIT's global target
-    // features and makes the backend outline the atomicrmw into an
-    // __aarch64_ldadd8_relax libcall that does not exist on SRE / freestanding.
-    // Replace either spelling with an explicit disable. Merely deleting
-    // -outline-atomics can re-enable the target-machine default.
-    for (Function &F : M) {
-      if (F.isDeclaration())
-        continue;
-      Attribute A = F.getFnAttribute("target-features");
-      if (!A.isValid())
-        continue;
-      SmallVector<StringRef, 8> Feats;
-      StringRef(A.getValueAsString()).split(Feats, ',');
-      auto It = llvm::remove_if(Feats, [](StringRef S) {
-        return S == "+outline-atomics" || S == "-outline-atomics";
-      });
-      if (It != Feats.end()) {
-        Feats.erase(It, Feats.end());
-        Feats.push_back("-outline-atomics");
-        F.addFnAttr("target-features", join(Feats, ","));
-      }
-    }
-
     // Tier-1 (PGO Gen): lightOpt then instrument. lightOpt is the shared
     // Gen/Use prefix (identical to Tier-2) so the CFG - and thus the PGO
     // hash - matches. No mainFPM_: Tier-1 is temporary, lightly optimized.
@@ -349,6 +416,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
       runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runFinalGlobalDCE(M);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -408,6 +476,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     }
 #endif
     runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runFinalGlobalDCE(M);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -420,6 +489,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 
   // Baseline (PGO off): the existing full specialization pipeline.
   runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runFinalGlobalDCE(M);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -883,4 +953,30 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);
+
+  // Instrumented Tier-1 is intentionally limited to the shared light/profile
+  // path. Vectorization is only for published Baseline and PGOUse code.
+  if (tier != CompileTier::Instrumented &&
+      static_cast<unsigned>(level) >=
+          static_cast<unsigned>(ejit::OptimizationLevel::L2)) {
+    if (vectorizationEnabled_) {
+      runVectorization(M, level);
+      EJIT_DIAG_DEBUG("pipeline phase5 done: vectorization opt=%d",
+                      static_cast<int>(level));
+    } else {
+      EJIT_DIAG_DEBUG("pipeline phase5 skipped: no TargetMachine");
+    }
+  }
 }
+
+void EJitOptimizer::runModuleCleanup(Module &M) { cleanupMPM_.run(M, MAM_); }
+
+void EJitOptimizer::runVectorization(Module &M, ejit::OptimizationLevel level) {
+  FunctionPassManager &FPM =
+      level == ejit::OptimizationLevel::L3 ? vectorizeL3_ : vectorizeL2_;
+  for (Function &F : M.functions())
+    if (!F.isDeclaration())
+      FPM.run(F, FAM_);
+}
+
+void EJitOptimizer::runFinalGlobalDCE(Module &M) { finalDCEMPM_.run(M, MAM_); }

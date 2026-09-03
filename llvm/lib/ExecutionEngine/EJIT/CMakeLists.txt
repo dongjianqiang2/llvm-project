@@ -183,6 +183,7 @@ add_llvm_component_library(LLVMEJIT
   InstCombine
   TransformUtils
   Analysis
+  Vectorize
   ${EJIT_TARGET_COMPONENTS}
   # PGO (EJIT_ONLINE_PGO.md): Instrumentation (PGOInstrumentationGen/Use +
   # InstrProfilingLowering) and ProfileData (InstrProfWriter) are required for
@@ -361,7 +362,7 @@ llvm_map_components_to_libnames(EJIT_LLVM_LIBS
 # IPO and Scalar are added manually to avoid their LINK_COMPONENTS
 # (BitWriter, Instrumentation, Linker, AsmParser, AggressiveInstCombine).
 # See EJIT_LIBRARY_TRIMMING.md §6.5.
-list(APPEND EJIT_LLVM_LIBS LLVMipo LLVMScalarOpts)
+list(APPEND EJIT_LLVM_LIBS LLVMipo LLVMScalarOpts LLVMVectorize)
 # PGO (EJIT_ONLINE_PGO.md): LLVMInstrumentation + LLVMProfileData are NOT added
 # to this fat archive yet. The fat archive is pre-gc and bundling the full
 # Instrumentation.a (all sanitizers) would blow the 10 MB check-ejit-size gate.

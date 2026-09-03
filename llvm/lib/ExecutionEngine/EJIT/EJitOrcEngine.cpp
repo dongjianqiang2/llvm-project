@@ -160,6 +160,24 @@ static void isolateSpecializationEntry(Module &M, StringRef EntryName) {
   }
 }
 
+static void internalizeSpecializationHelpers(Module &M, StringRef EntryName) {
+  // ORC computes its initial MaterializationResponsibility before the IR
+  // transform runs. Keep only the requested entry externally visible at that
+  // point: every other defined helper is owned by this specialization and can
+  // be internalized or removed by the optimizer without leaving a stale ORC
+  // claim behind. Other ejit_entry functions were turned into declarations by
+  // isolateSpecializationEntry and are intentionally left alone.
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration() || F.isIntrinsic() || F.getName() == EntryName ||
+        hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+      continue;
+    if (!F.hasLocalLinkage()) {
+      F.setVisibility(GlobalValue::DefaultVisibility);
+      F.setLinkage(GlobalValue::InternalLinkage);
+    }
+  }
+}
+
 struct EJitOrcEngine::Impl {
 #ifdef EJIT_SRE_CODE_POOL
   /// Final Baseline/Tier-2 code stays near AOT .text; temporary instrumented
@@ -186,6 +204,9 @@ struct EJitOrcEngine::Impl {
   std::map<std::string, void *> userSymbols;
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
+  /// TargetMachine feeding the optimizer's TargetIRAnalysis. Declared before
+  /// the optimizer so reverse destruction order tears down the optimizer first.
+  std::unique_ptr<TargetMachine> optimizerTM;
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
@@ -750,6 +771,16 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   else
     consumeError(TMOrErr.takeError());
 
+  // Give PassBuilder the same target configuration used by LLJIT. If this
+  // optional backend TM cannot be created, EJitOptimizer keeps its scalar
+  // path usable and explicitly disables target-dependent vector passes.
+  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
+    engine->P->optimizerTM = std::move(*TMOrErr);
+  else
+    EJIT_DIAG("optimizer: createTargetMachine failed (%s); vectorization "
+              "disabled",
+              toString(TMOrErr.takeError()).c_str());
+
   orc::LLJITBuilder Builder;
   Builder.setJITTargetMachineBuilder(*JTMBOrErr);
   Builder.setNumCompileThreads(0);
@@ -861,8 +892,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
-  engine->P->optimizer =
-      std::make_unique<EJitOptimizer>(periodReg, config.verifySubstitution);
+  engine->P->optimizer = std::make_unique<EJitOptimizer>(
+      periodReg, engine->P->optimizerTM.get(), config.verifySubstitution);
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -893,7 +924,10 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
       [engine = engine.get()](orc::ThreadSafeModule TSM,
                               orc::MaterializationResponsibility &R)
           -> Expected<orc::ThreadSafeModule> {
-        TSM.withModuleDo([engine](Module &M) {
+        // Keep value-profile function names until after cleanup: local
+        // definitions must not be claimed before GlobalDCE can remove them.
+        SmallVector<std::string, 16> CapturedFunctionNames;
+        TSM.withModuleDo([engine, &CapturedFunctionNames](Module &M) {
           LLVM_DEBUG(dbgs() << "ejit-orc-engine: JIT transform on "
                             << M.getName() << "\n");
           const SpecializationContext *ctx = engine->P->activeCtx;
@@ -916,6 +950,17 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           }
 
           engine->P->optimizer->runPipeline(M, *ctx);
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+          if (ctx->tier == CompileTier::Instrumented) {
+            for (Function &F : M.functions()) {
+              if (F.isDeclaration() || F.isIntrinsic() || !F.hasName() ||
+                  F.getName().empty() || F.hasLocalLinkage())
+                continue;
+              CapturedFunctionNames.push_back(F.getName().str());
+            }
+          }
+#endif
 
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
@@ -1008,6 +1053,33 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             }
           }
         });
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+        // captureCounterGlobals re-exports surviving local definitions after
+        // common cleanup. Claim those definitions now, after the transform;
+        // dead locals were never promised to JITLink and cannot become
+        // MissingSymbolDefinitions at notifyResolved.
+        if (!CapturedFunctionNames.empty()) {
+          orc::SymbolFlagsMap functionFlags;
+          for (const std::string &name : CapturedFunctionNames) {
+            auto symbol = engine->P->J->mangleAndIntern(name);
+            if (!R.getSymbols().count(symbol))
+              functionFlags[symbol] =
+                  JITSymbolFlags::Exported | JITSymbolFlags::Callable;
+          }
+          if (!functionFlags.empty()) {
+            if (auto Err = R.defineMaterializing(std::move(functionFlags))) {
+              EJIT_DIAG("transform: defineMaterializing captured functions "
+                        "failed: %s",
+                        toString(std::move(Err)).c_str());
+              return make_error<StringError>(
+                  "failed to claim transformed EJIT value-profile functions",
+                  inconvertibleErrorCode());
+            }
+          }
+        }
+#else
+        (void)CapturedFunctionNames;
+#endif
         // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
         // Gen creates them inside runPipeline (after addIRModule), so the
         // MR's claim - computed at addIRModule from the original module -
@@ -1054,8 +1126,11 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     return ModuleOrErr.takeError();
   }
 
-  // Do this before addIRModule so ORC's materialization-unit symbol claims
-  // match the definitions that codegen will actually emit.
+  // Do this before addIRModule so the entry and ordinary external definitions
+  // are reflected in ORC's initial materialization-unit claims. In the
+  // value-profile Instrumented path, local definitions intentionally remain
+  // unclaimed until the post-cleanup transform can distinguish live targets
+  // from dead functions.
   isolateSpecializationEntry(**ModuleOrErr, origFnName);
 
   Triple TT((*ModuleOrErr)->getTargetTriple());
@@ -1089,23 +1164,18 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
+  internalizeSpecializationHelpers(**ModuleOrErr, origFnName);
+
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   // Value-profile target capture (EJIT_VALUE_PROFILE.md §5.1): the Tier-1
   // compile resolves EVERY module function's runtime address to build the
   // verified address -> IR-PGO-name-MD5 table. Most callees are internal
   // linkage (C `static`), which ORC excludes from the JITDylib symbol table,
   // so lookup would fail for exactly the targets the indirect-call promotion
-  // needs. Two-part fix: (1) export every defined function here, BEFORE
-  // addIRModule, so ORC claims the symbol; (2) the optimizer's capture
-  // re-exports them again AFTER the transform (phase 1 internalized them for
-  // IPSCCP) so the EMITTED symbol is global again - a claimed-but-local
-  // symbol would link as a null absolute (same claim discipline as the
-  // __profc_* counters, §5.2).
-  if (P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented) {
-    for (Function &F : (**ModuleOrErr).functions())
-      if (!F.isDeclaration() && !F.isIntrinsic() && F.hasLocalLinkage())
-        F.setLinkage(GlobalValue::ExternalLinkage);
-  }
+  // needs. Helpers remain internal until the transform has completed: the
+  // common module cleanup is allowed to remove dead functions before ORC
+  // claims them. The transform re-exports surviving definitions and adds
+  // those symbols to its MaterializationResponsibility after cleanup.
 #endif
 
   // Collect global variable addresses from the registry for symbols

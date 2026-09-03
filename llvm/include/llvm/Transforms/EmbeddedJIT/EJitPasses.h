@@ -9,10 +9,31 @@
 #ifndef LLVM_TRANSFORMS_EMBEDDEDJIT_EJITPASSES_H
 #define LLVM_TRANSFORMS_EMBEDDEDJIT_EJITPASSES_H
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/IR/PassManager.h"
+#include <cstdint>
 
 namespace llvm {
+
+namespace ejit::detail {
+
+struct EJitPreSerializationDCEStats {
+  uint64_t FunctionDefinitionsBefore = 0;
+  uint64_t FunctionDefinitionsAfter = 0;
+  uint64_t InstructionsBefore = 0;
+  uint64_t InstructionsAfter = 0;
+};
+
+/// Remove internal definitions that became unreachable after AOT extraction
+/// and internalization. Entry definitions are retained even when their source
+/// linkage is discardable.
+EJitPreSerializationDCEStats
+runEJitPreSerializationGlobalDCE(Module &M,
+                                 ArrayRef<StringRef> AdditionalRootNames = {});
+
+} // namespace ejit::detail
 
 struct EJitRegisterBitcodePass
     : public PassInfoMixin<EJitRegisterBitcodePass> {

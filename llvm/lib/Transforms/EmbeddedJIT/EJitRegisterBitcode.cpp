@@ -6,42 +6,45 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
-#include "llvm/Support/Format.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Format.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
-#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Scalar/SROA.h"
-#include "llvm/Transforms/Utils/Mem2Reg.h"
-#include "llvm/IR/Module.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Process.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
-#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
-#include "llvm/Support/Path.h"
 #include <cctype>
 
 using namespace llvm;
@@ -104,6 +107,12 @@ static void collectEntryFunctions(Module &M,
       EntryFuncs.push_back(&F);
 }
 
+static void collectFunctionsFromConstant(Constant *C,
+                                         SmallPtrSetImpl<Function *> &Funcs);
+static void
+collectGlobalsFromConstant(Constant *C,
+                           SmallPtrSetImpl<GlobalVariable *> &Globals);
+
 static const GlobalVariable *findRootGV(const Value *V, APInt &Offset,
                                         const DataLayout &DL);
 
@@ -120,33 +129,82 @@ static GlobalVariable *rootGlobal(Value *V, const DataLayout &DL) {
   return const_cast<GlobalVariable *>(findRootGV(V, Offset, DL));
 }
 
-static void collectReferencedGlobals(Function &F,
-                                     SetVector<GlobalVariable *> &Globals) {
-  const DataLayout &DL = F.getParent()->getDataLayout();
-  for (BasicBlock &BB : F)
-    for (Instruction &I : BB)
-      for (Value *Op : I.operands())
-        if (auto *GV = rootGlobal(Op, DL))
-          Globals.insert(GV);
-}
+static void
+computeTransitiveClosure(const SmallVectorImpl<Function *> &EntryFuncs,
+                         SetVector<Function *> &ClosureFuncs,
+                         SetVector<GlobalVariable *> &ClosureGlobals,
+                         SetVector<Function *> &ConservativeIndirectTargets) {
 
-static void computeTransitiveClosure(
-    const SmallVectorImpl<Function *> &EntryFuncs,
-    SetVector<Function *> &ClosureFuncs,
-    SetVector<GlobalVariable *> &ClosureGlobals) {
+  SmallVector<Function *, 16> FunctionWorklist(EntryFuncs.begin(),
+                                               EntryFuncs.end());
+  SmallVector<GlobalVariable *, 16> GlobalWorklist;
+  bool PreservedUnknownIndirectTargets = false;
 
-  SmallVector<Function *, 16> Worklist(EntryFuncs.begin(), EntryFuncs.end());
-  while (!Worklist.empty()) {
-    Function *F = Worklist.pop_back_val();
-    if (!ClosureFuncs.insert(F))
+  auto enqueueFunction = [&](Function *F) {
+    if (F && !F->isDeclaration() && !F->isIntrinsic() && !ClosureFuncs.count(F))
+      FunctionWorklist.push_back(F);
+  };
+  auto enqueueGlobal = [&](GlobalVariable *GV) {
+    if (GV && ClosureGlobals.insert(GV))
+      GlobalWorklist.push_back(GV);
+  };
+
+  while (!FunctionWorklist.empty() || !GlobalWorklist.empty()) {
+    if (!FunctionWorklist.empty()) {
+      Function *F = FunctionWorklist.pop_back_val();
+      if (!ClosureFuncs.insert(F))
+        continue;
+
+      bool HasUnknownIndirectCall = false;
+      for (BasicBlock &BB : *F) {
+        for (Instruction &I : BB) {
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (!CB->getCalledFunction() &&
+                !isa<InlineAsm>(CB->getCalledOperand()))
+              HasUnknownIndirectCall = true;
+
+          SmallPtrSet<Function *, 4> ReferencedFunctions;
+          SmallPtrSet<GlobalVariable *, 4> ReferencedGlobals;
+          for (Value *Op : I.operands()) {
+            auto *C = dyn_cast<Constant>(Op);
+            if (!C)
+              continue;
+            collectFunctionsFromConstant(C, ReferencedFunctions);
+            collectGlobalsFromConstant(C, ReferencedGlobals);
+          }
+          for (Function *Referenced : ReferencedFunctions)
+            enqueueFunction(Referenced);
+          for (GlobalVariable *Referenced : ReferencedGlobals)
+            enqueueGlobal(Referenced);
+        }
+      }
+
+      // A dynamically supplied indirect target cannot be resolved from the IR.
+      // Conservatively retain every local definition whose address escapes.
+      if (HasUnknownIndirectCall && !PreservedUnknownIndirectTargets) {
+        PreservedUnknownIndirectTargets = true;
+        for (Function &Candidate : *F->getParent()) {
+          if (Candidate.hasAddressTaken() && !Candidate.isDeclaration() &&
+              !Candidate.isIntrinsic()) {
+            ConservativeIndirectTargets.insert(&Candidate);
+            enqueueFunction(&Candidate);
+          }
+        }
+      }
       continue;
-    collectReferencedGlobals(*F, ClosureGlobals);
-    for (BasicBlock &BB : *F)
-      for (Instruction &I : BB)
-        if (auto *CB = dyn_cast<CallBase>(&I))
-          if (Function *Callee = CB->getCalledFunction())
-            if (!Callee->isDeclaration() && !Callee->isIntrinsic())
-              Worklist.push_back(Callee);
+    }
+
+    GlobalVariable *GV = GlobalWorklist.pop_back_val();
+    if (!GV->hasInitializer())
+      continue;
+    SmallPtrSet<Function *, 4> ReferencedFunctions;
+    SmallPtrSet<GlobalVariable *, 4> ReferencedGlobals;
+    collectFunctionsFromConstant(GV->getInitializer(), ReferencedFunctions);
+    collectGlobalsFromConstant(GV->getInitializer(), ReferencedGlobals);
+    for (Function *Referenced : ReferencedFunctions)
+      enqueueFunction(Referenced);
+    for (GlobalVariable *Referenced : ReferencedGlobals)
+      enqueueGlobal(Referenced);
   }
 }
 
@@ -325,6 +383,53 @@ static void preOptimizeBitcode(Module &M) {
 #else
 static void preOptimizeBitcode(Module &) {}
 #endif
+
+ejit::detail::EJitPreSerializationDCEStats
+ejit::detail::runEJitPreSerializationGlobalDCE(
+    Module &M, ArrayRef<StringRef> AdditionalRootNames) {
+  EJitPreSerializationDCEStats Stats;
+  auto countModule = [&](uint64_t &Definitions, uint64_t &Instructions) {
+    for (const Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      ++Definitions;
+      Instructions += F.getInstructionCount();
+    }
+  };
+  countModule(Stats.FunctionDefinitionsBefore, Stats.InstructionsBefore);
+
+  struct SavedEntryLinkage {
+    Function *F;
+    GlobalValue::LinkageTypes Linkage;
+    GlobalValue::VisibilityTypes Visibility;
+    bool DSOLocal;
+  };
+  SmallVector<SavedEntryLinkage, 4> SavedEntries;
+  for (Function &F : M) {
+    bool IsAdditionalRoot =
+        llvm::is_contained(AdditionalRootNames, F.getName());
+    if (F.isDeclaration() || (!isEjitEntryFunction(F) && !IsAdditionalRoot) ||
+        !F.isDiscardableIfUnused())
+      continue;
+    SavedEntries.push_back(
+        {&F, F.getLinkage(), F.getVisibility(), F.isDSOLocal()});
+    F.setLinkage(GlobalValue::ExternalLinkage);
+    F.setVisibility(GlobalValue::DefaultVisibility);
+    F.setDSOLocal(false);
+  }
+
+  ModuleAnalysisManager MAM;
+  GlobalDCEPass().run(M, MAM);
+
+  for (const SavedEntryLinkage &Saved : SavedEntries) {
+    Saved.F->setLinkage(Saved.Linkage);
+    Saved.F->setVisibility(Saved.Visibility);
+    Saved.F->setDSOLocal(Saved.DSOLocal);
+  }
+
+  countModule(Stats.FunctionDefinitionsAfter, Stats.InstructionsAfter);
+  return Stats;
+}
 
 /// Dump the extracted bitcode module to EJitDumpBitcodeDir (if set) for
 /// debugging — e.g. to confirm an ejit_entry function is emitted as a
@@ -677,11 +782,12 @@ runSpecializationDiagnostic(Module &Extracted,
   }
 }
 
-static std::string extractAndSerialize(Module &M,
-    const SetVector<Function *> &Funcs,
-    const SetVector<GlobalVariable *> &Globals,
-    const SmallVectorImpl<Function *> &EntryFuncs,
-    const SetVector<Function *> &ToExternalize) {
+static std::string
+extractAndSerialize(Module &M, const SetVector<Function *> &Funcs,
+                    const SetVector<GlobalVariable *> &Globals,
+                    const SmallVectorImpl<Function *> &EntryFuncs,
+                    const SetVector<Function *> &ToExternalize,
+                    const SetVector<Function *> &ConservativeIndirectTargets) {
 
   auto Extracted = CloneModule(M);
 
@@ -836,6 +942,20 @@ static std::string extractAndSerialize(Module &M,
       FnList.splice(InsertPt, FnList, F->getIterator());
     }
   }
+  // The AOT inliner may have copied a helper into every caller while leaving
+  // its externally visible source definition behind. Once non-entry helpers
+  // are internal, remove those unreachable bodies before the bitcode is
+  // serialized and embedded in the business image.
+  SmallVector<StringRef, 4> AdditionalRootNames;
+  for (Function *F : ConservativeIndirectTargets)
+    AdditionalRootNames.push_back(F->getName());
+  auto DCEStats = ejit::detail::runEJitPreSerializationGlobalDCE(
+      *Extracted, AdditionalRootNames);
+  LLVM_DEBUG(dbgs() << "ejit-register-bitcode: pre-serialization GlobalDCE "
+                    << "definitions " << DCEStats.FunctionDefinitionsBefore
+                    << " -> " << DCEStats.FunctionDefinitionsAfter
+                    << ", instructions " << DCEStats.InstructionsBefore
+                    << " -> " << DCEStats.InstructionsAfter << "\n");
 
   logEJitGlobalMeta("extract-after-extern", *Extracted);
 
@@ -868,9 +988,6 @@ static GlobalVariable *embedBitcode(Module &M, const std::string &Bitcode) {
   // needed — bare-metal environments may not support custom ELF sections.
   return GV;
 }
-
-static void collectFunctionsFromConstant(Constant *C,
-                                         SmallPtrSetImpl<Function *> &Funcs);
 
 /// Collect external symbols (functions + globals) referenced by the
 /// closure and generate ejit_register_symbol calls so the JIT can resolve
@@ -1016,6 +1133,19 @@ static void collectFunctionsFromConstant(Constant *C,
 }
 
 static void
+collectGlobalsFromConstant(Constant *C,
+                           SmallPtrSetImpl<GlobalVariable *> &Globals) {
+  if (auto *GV = dyn_cast<GlobalVariable>(C)) {
+    Globals.insert(GV);
+    return;
+  }
+  if (isa<GlobalValue>(C))
+    return;
+  for (Value *Op : C->operands())
+    collectGlobalsFromConstant(cast<Constant>(Op), Globals);
+}
+
+static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
                       const SetVector<GlobalVariable *> &ClosureGlobals,
@@ -1158,8 +1288,7 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   }
 
   // Global variable symbol entries. Resolve through bitcasts/GEPs via
-  // rootGlobal so registration matches what collectReferencedGlobals kept in
-  // the extracted bitcode.
+  // rootGlobal so registration matches the extraction closure.
   SmallPtrSet<const GlobalVariable *, 4> GVsDone;
   const DataLayout &DL = M.getDataLayout();
   for (Function *F : ClosureFuncs) {
@@ -1245,7 +1374,9 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
 
   SetVector<Function *> ClosureFuncs;
   SetVector<GlobalVariable *> ClosureGlobals;
-  computeTransitiveClosure(EntryFuncs, ClosureFuncs, ClosureGlobals);
+  SetVector<Function *> ConservativeIndirectTargets;
+  computeTransitiveClosure(EntryFuncs, ClosureFuncs, ClosureGlobals,
+                           ConservativeIndirectTargets);
   LLVM_DEBUG(dbgs() << "ejit-register-bitcode: closure " << ClosureFuncs.size()
                     << " funcs, " << ClosureGlobals.size() << " globals\n");
   if (ClosureFuncs.empty())
@@ -1263,7 +1394,7 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
 
   std::string Bitcode =
       extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs,
-                          ToExternalize);
+                          ToExternalize, ConservativeIndirectTargets);
   GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode);
   generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs, ClosureGlobals,
                        ToExternalize);

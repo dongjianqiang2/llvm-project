@@ -15,11 +15,11 @@ EJitRegisterBitcodePass 负责从编译单元中提取所有 `ejit_entry` 标记
 ### 1.1 核心职责
 
 - 识别所有带 `!ejit.metadata` 且包含 `!{"ejit_entry"}` 子节点的函数
-- 构建函数依赖图的传递闭包（被这些函数调用的所有内部函数）
+- 构建函数依赖图的传递闭包（直接调用、函数指针和全局初始化器）
 - 将选中函数及必要符号提取到独立的 LLVM Module
 - **对提取的 bitcode 运行 AOT 预优化**（§1.4）
 - **自动扫描外部符号并生成 `ejit_register_symbol` 调用**（§1.3）
-- 序列化为 Bitcode 字节数组
+- 在非入口定义 internalize 后运行最终 GlobalDCE，再序列化为 Bitcode 字节数组
 - 在原始 Module 中创建全局变量存储 Bitcode 数据
 - 生成运行时注册调用，将 Bitcode 指针/大小注册到运行时
 
@@ -29,7 +29,7 @@ EJitRegisterBitcodePass 负责从编译单元中提取所有 `ejit_entry` 标记
 |--------|------|
 | 外部函数 | 不提取外部函数（external linkage），仅收集声明 |
 | 递归 | 已由 Sema 检查排除，Pass 层面不再验证 |
-| 函数指针 | 不做函数指针分析，不特化间接调用目标 |
+| 函数指针 | 收集可静态发现的函数指针目标；存在未知间接调用时保守保留所有 address-taken 本地定义 |
 | Bitcode 版本 | 必须与运行时 LLVM 版本匹配 |
 | Pipeline 位置 | **必须在标准优化（O2/O3）之前执行** —— 见 §1.3 |
 
@@ -62,6 +62,13 @@ AlwaysInline → ModuleInliner(O2) → Mem2Reg → EarlyCSE+InstCombine → Simp
 | reAnnotateMayConst | 从 GV metadata 恢复可能丢失的 `!ejit.may_const` |
 
 > **NDEBUG 守卫**：debug 构建（共享库）跳过预优化，避免 `LLVMPasses ↔ LLVMEmbeddedJIT` 循环链接依赖。同一套 Pass 在 JIT 管线中运行。
+
+预优化和 helper externalize 完成后，PASS1 将非入口定义转为内部符号，
+随后无条件运行一次 pre-serialization `GlobalDCE`。该顺序使内联后遗留的
+原函数体不再作为外部保留根，能够在写入 `__ejit_bitcode` 前删除。所有
+`ejit_entry`（包括 local/linkonce entry）在 DCE 期间被临时提升为保留根并
+恢复原 linkage；仍被调用、被可达常量引用、被多个 entry 共享或无法证明
+不可达的 address-taken helper 均保守保留。
 
 ---
 
@@ -102,11 +109,14 @@ ejit_entry 函数本身在 IR 中不含 period 依赖的直接声明。依赖通
 
 步骤:
 1. CollectEntryFunctions(M) → 收集所有 ejit_entry 函数
-2. ComputeTransitiveClosure(entryFuncs) → 计算依赖函数集
-3. ExtractModule(fullFuncSet) → 提取独立的 bitcode Module
-4. SerializeToBitcode(extractedModule) → 序列化为字节数组
-5. EmbedBitcodeInModule(M, bitcodeBytes) → 在原始 Module 中创建全局变量
-6. GenerateRegisterCall(M, globalVar) → 插入注册函数调用
+2. ComputeTransitiveClosure(entryFuncs) → 计算直接调用、函数指针和全局初始化器依赖
+3. ExtractModule(fullFuncSet) → 提取独立的 bitcode Module 并预优化
+4. ExternalizeLargeHelpers() → 大 helper 改为 AOT 侧解析的声明
+5. InternalizeNonEntries() → 非入口定义转为内部符号
+6. GlobalDCE() → 删除内联后不可达的内部函数体
+7. SerializeToBitcode(extractedModule) → 序列化为字节数组
+8. EmbedBitcodeInModule(M, bitcodeBytes) → 在原始 Module 中创建全局变量
+9. GenerateRegisterCall(M, globalVar) → 插入注册函数调用
 ```
 
 ### 3.2 详细伪代码
@@ -455,6 +465,9 @@ EJitPeriodHandlerPass    (晚期: 生命周期处理)
 |--------|------|
 | Bitcode 序列化正确性 | 将嵌入的 bitcode 重新反序列化，验证函数列表一致 |
 | 传递闭包完整性 | 检查调用链中所有内部函数都在提取结果中 |
+| 函数指针安全性 | address-taken、全局函数指针表和未知间接调用目标被保守保留 |
+| 序列化前 DCE | dead internal helper 不在导出 bitcode；live/shared/address-taken helper 仍为定义 |
+| Bitcode 体积收益 | 对同一 post-internalize module 在 DCE 前后序列化并比较字节数 |
 | 注册调用参数正确性 | FileCheck 匹配函数名、指针、大小 |
 | 无 ejit_entry 的 Module | FileCheck: not check |
 
@@ -478,7 +491,7 @@ EJitPeriodHandlerPass    (晚期: 生命周期处理)
 
 8. **自动符号注册 (v1.6)**: `ejit_auto_register` 函数中除了 `ejit_register_bitcode` 调用外，还自动生成 `ejit_register_symbol` 调用。PASS1 扫描闭包中所有外部函数调用（`isDeclaration() && !isIntrinsic()`）和全局变量引用，为每个唯一符号生成注册代码。这使 JIT 在裸核环境无需 dlsym 即可解析外部符号。符号地址暂存于 `EJitRegistrationStore`，在 `ejit_init` 时消费。
 
-9. **常量全局变量保留 (v1.6)**: `collectReferencedGlobals` 现在包含所有被引用的全局变量（含常量）。`extractAndSerialize` 在转换为外部声明时跳过了常量（`GV.isConstant()`），避免版本字符串等编译器生成的常量在 JIT 链接时出现 "Symbols not found" 错误。这些常量作为定义保留在 bitcode 中。
+9. **常量全局变量保留 (v1.6)**: 提取闭包包含所有被引用的全局变量（含常量）。`extractAndSerialize` 在转换为外部声明时跳过常量（`GV.isConstant()`），避免版本字符串等编译器生成的常量在 JIT 链接时出现 "Symbols not found" 错误。这些常量作为定义保留在 bitcode 中。闭包还递归扫描可达常量初始化器中的函数和全局引用。
 
 ---
 
