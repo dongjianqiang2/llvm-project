@@ -82,6 +82,7 @@ struct EJitSharedDiagnostics {
   uint64_t tier1Compiles;
   uint64_t tier2Compiles;
   uint64_t profileMergeFails;
+  uint64_t pgoColdExpired;
 };
 
 //===----------------------------------------------------------------------===//
@@ -404,6 +405,9 @@ public:
   /// publish Ready. MUST NOT be called while holding a bucket lock / queue slot
   /// / dedup critical state.
   using WorkerIdleFn = void (*)(void *ctx, uint32_t ticks);
+  using NowTicksFn = uint64_t (*)(void *ctx);
+  using AbortPgoProfileFn = void (*)(void *ctx,
+                                    const EJitCompileRequest &req);
   /// Owner-only setup hook (see setOwnerElectedCallback). Return false to fail
   /// init. Runs on the elected owner, inside init(), before the worker starts.
   using OwnerElectedFn = bool (*)(void *ctx);
@@ -736,6 +740,14 @@ public:
     workerIdle_ = fn;
     workerIdleCtx_ = ctx;
   }
+  void setNowTicksSource(NowTicksFn fn, void *ctx) {
+    nowTicksFn_ = fn;
+    nowTicksCtx_ = ctx;
+  }
+  void setAbortPgoProfileCallback(AbortPgoProfileFn fn, void *ctx) {
+    abortPgoProfileFn_ = fn;
+    abortPgoProfileCtx_ = ctx;
+  }
   /// Owner publishes this digest of its funcIndex/dimType registration mapping
   /// into the shared state; a peer attaching to a Ready blob compares its own
   /// digest and cleanly fails (FingerprintMismatch) on any divergence, so a
@@ -753,17 +765,18 @@ public:
   void setMode(EJitCompileMode mode) { configuredMode_ = mode; }
 
   /// PGO (§6): enable the online-PGO Tier-2 auto-trigger on the shared
-  /// taskpool.  When enabled, every cache hit atomically increments the
-  /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
-  /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
-  /// the trigger (hits are still counted).
+  /// taskpool. When enabled, each call that actually returns Tier-1 code
+  /// increments the slot's hitCount; the call that reaches \p threshold arms
+  /// a one-shot Tier-2 (PGOUse) lazy recompile via enqueue. A zero threshold
+  /// disables profiling and counting.
   void setPgoEnabled(
       bool enable, uint32_t threshold,
       uint32_t maxConcurrentProfiles = EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
     maxConcurrentProfiles = std::max(
         1u, std::min(maxConcurrentProfiles, kEJitSharedMaxConcurrentProfiles));
-    pgoEnabled_.storeRelaxed(enable ? 1 : 0);
-    tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
+    const bool EffectiveEnable = enable && threshold != 0;
+    pgoEnabled_.storeRelaxed(EffectiveEnable ? 1 : 0);
+    tier2Threshold_.storeRelaxed(EffectiveEnable ? threshold : 0u);
     pgoMaxConcurrentProfiles_.storeRelaxed(maxConcurrentProfiles);
     if (!state_ || state_->initState.loadAcquire() !=
                        static_cast<uint32_t>(EJitSharedInitState::Ready))
@@ -772,7 +785,7 @@ public:
     // Publish the threshold before enabling so a peer that acquires the
     // enabled flag also observes the matching threshold. Disable first when
     // turning PGO off so no new hit can arm a Tier-2 request.
-    if (enable) {
+    if (EffectiveEnable) {
       state_->tier2Threshold.storeRelease(threshold);
       state_->pgoMaxActiveFunctions.storeRelease(maxConcurrentProfiles);
       state_->pgoEnabled.storeRelease(1);
@@ -791,6 +804,30 @@ public:
     pgoAdmissionTestHook_ = fn;
     pgoAdmissionTestHookCtx_ = ctx;
   }
+  void setPgoAbortTransitionTestHook(TestHookFn fn, void *ctx) {
+    pgoAbortTransitionTestHook_ = fn;
+    pgoAbortTransitionTestHookCtx_ = ctx;
+  }
+  void setAutoPublishBarrierTestHook(TestHookFn fn, void *ctx) {
+    autoPublishBarrierTestHook_ = fn;
+    autoPublishBarrierTestHookCtx_ = ctx;
+  }
+  void setColdPgoSnapshotTestHook(TestHookFn fn, void *ctx) {
+    coldPgoSnapshotTestHook_ = fn;
+    coldPgoSnapshotTestHookCtx_ = ctx;
+  }
+  void setPgoCacheMissTestHook(TestHookFn fn, void *ctx) {
+    pgoCacheMissTestHook_ = fn;
+    pgoCacheMissTestHookCtx_ = ctx;
+  }
+  void setPgoLinkedPendingMissTestHook(TestHookFn fn, void *ctx) {
+    pgoLinkedPendingMissTestHook_ = fn;
+    pgoLinkedPendingMissTestHookCtx_ = ctx;
+  }
+  void abortPgoProfileForTest(const EJitCompileRequest &req,
+                              bool suppress = false) {
+    abortPgoProfile(req, "test", suppress, /*countCold=*/false);
+  }
 #endif
 
   /// True when the shared PGO auto-trigger is armed.
@@ -804,7 +841,7 @@ public:
   /// Return true when this miss may start a staged PGO function. Only one
   /// specialization of a funcIndex may own admission at a time; later versions
   /// stay on AOT until the current Tier-2 finishes.
-  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
+  bool admitPgoFunction(EJitCompileRequest &req, bool &newlyAdmitted);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -1136,7 +1173,8 @@ public:
   /// Owner-side explicit flush for deterministic tests. Production callers use
   /// requestCodeBatchFlushAndWait() so enable_ex runs on the owner worker.
   bool flushCodeBatch() {
-    autoTier2PublishBlocked_ = false;
+    for (PendingPublish &P : pendingPublishes_)
+      P.retryAfterStep = 0;
     return flushPendingPublishes();
   }
   size_t pendingPublishCount() const { return pendingPublishes_.size(); }
@@ -1193,6 +1231,8 @@ private:
   /// operations because they execute more than one operation per worker step.
   void workerThrottle();
   bool serviceMayConstRankingRequest();
+  bool serviceColdPgoProfiles();
+  uint64_t nowTicks() const;
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
@@ -1221,6 +1261,7 @@ private:
     /// The matching hit crossed the Tier-2 threshold. The caller decides
     /// whether to enqueue immediately or attach bound descriptors first.
     bool tier2Arm = false;
+    uint64_t pgoToken = 0;
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -1290,6 +1331,7 @@ private:
   void
   enqueueTier2ForIdentity(uint32_t funcIndex, const EJitDimPair *dims,
                           uint32_t numDims,
+                          uint64_t pgoToken,
                           const EJitBoundPtrDescriptor *boundPointers = nullptr,
                           uint32_t boundCount = 0);
   /// Cold non-owner first-touch execute-permission preparation for a matched
@@ -1370,12 +1412,11 @@ private:
   // queue/dedup helpers
   bool queuePush(const EJitCompileRequest &req);
   bool queuePop(EJitCompileRequest &out);
-  /// Claim the in-flight slot for \p funcIndex at generation \p gen: CAS
-  /// 0->gen.
-  EJitDedupResult dedupMark(uint32_t funcIndex, uint32_t gen);
-  /// Release the in-flight slot ONLY if it still holds \p gen: CAS gen->0. A
-  /// stale worker (older gen) therefore cannot clear a newer generation's bit.
-  void dedupClear(uint32_t funcIndex, uint32_t gen);
+  /// Claim the in-flight slot for \p funcIndex with a unique lifecycle token.
+  EJitDedupResult dedupMark(uint32_t funcIndex, uint64_t &token);
+  /// Release the in-flight slot only when it still holds \p token. A stale
+  /// completion therefore cannot clear a later request in the same generation.
+  void dedupClear(uint32_t funcIndex, uint64_t token);
 
   /// Compile one dequeued request through the two version checkpoints and the
   /// commit-gated publish. The Tier-2 aarch64 exclusive-monitor workaround
@@ -1448,11 +1489,39 @@ private:
   bool codeBatchFlushPoolCallbacksIntact() const;
 #endif
 
-  /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2
-  /// completion and terminal worker failures call this; transient queue-full
+  /// Release staged-PGO ownership if \p funcIndex still owns it. Tier-2 link
+  /// releases sampling resources before delayed publication; terminal worker
+  /// failures release them through finishPgoFunction. Transient queue-full
   /// leaves ownership intact so the next hit can retry.
-  void finishPgoFunction(uint32_t funcIndex, bool completed,
+  bool updatePgoPhase(const EJitCompileRequest &req, EJitPgoProfilePhase phase);
+  bool releasePgoAdmission(const EJitCompileRequest &req);
+  enum class PgoMissClaimResult : uint8_t {
+    Claimed,
+    AlreadyPending,
+    InvalidFuncIndex,
+    RetryCache,
+  };
+  PgoMissClaimResult claimPgoMiss(uint32_t funcIndex,
+                                  const EJitDimPair *dims, uint32_t numDims,
+                                  uint32_t observedDispatchEpoch,
+                                  uint64_t &token);
+  bool registerLinkedPending(const EJitCompileRequest &req);
+  bool linkedPendingOwns(const EJitCompileRequest &req) const;
+  bool clearLinkedPending(const EJitCompileRequest &req);
+  bool releasePgoResources(const EJitCompileRequest &req);
+  void settlePgoFunction(const EJitCompileRequest &req, bool completed,
                          const char *reason = nullptr);
+  void finishPgoFunction(const EJitCompileRequest &req, bool completed,
+                         const char *reason = nullptr);
+  bool abortPgoStateTransition(const EJitCompileRequest &req, bool suppress,
+                               bool resourcesReleased = false);
+  bool pgoAdmissionActive(const EJitCompileRequest &req) const;
+  bool coldSuppresses(const EJitCompileRequest &req) const;
+  void abortPgoProfile(const EJitCompileRequest &req, const char *reason,
+                       bool suppress, bool countCold, uint64_t hits = 0,
+                       uint64_t age = 0, bool resourcesReleased = false);
+  void retireColdProfile(const EJitCompileRequest &req, uint64_t hits,
+                         uint64_t age);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -1497,9 +1566,23 @@ private:
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+  NowTicksFn nowTicksFn_ = nullptr;
+  void *nowTicksCtx_ = nullptr;
+  AbortPgoProfileFn abortPgoProfileFn_ = nullptr;
+  void *abortPgoProfileCtx_ = nullptr;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
+  TestHookFn pgoAbortTransitionTestHook_ = nullptr;
+  void *pgoAbortTransitionTestHookCtx_ = nullptr;
+  TestHookFn autoPublishBarrierTestHook_ = nullptr;
+  void *autoPublishBarrierTestHookCtx_ = nullptr;
+  TestHookFn coldPgoSnapshotTestHook_ = nullptr;
+  void *coldPgoSnapshotTestHookCtx_ = nullptr;
+  TestHookFn pgoCacheMissTestHook_ = nullptr;
+  void *pgoCacheMissTestHookCtx_ = nullptr;
+  TestHookFn pgoLinkedPendingMissTestHook_ = nullptr;
+  void *pgoLinkedPendingMissTestHookCtx_ = nullptr;
 #endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
@@ -1519,6 +1602,8 @@ private:
     EJitCompileRequest req{};
     void *fn = nullptr;
     uint32_t poolId = 0xFFFFFFFFu;
+    uint32_t retryAfterStep = 0;
+    uint8_t publishAttempts = 0;
   };
   struct PendingBatchCompile {
     EJitCompileRequest req{};
@@ -1526,13 +1611,16 @@ private:
   };
   std::vector<PendingBatchCompile> pendingBatchCompiles_;
   std::vector<PendingPublish> pendingPublishes_;
-  /// Armed when Tier-2 links into the near RW/NX pool. Consumed only after the
-  /// owner worker observes the shared compile queue empty.
+  /// Armed when Tier-2 links into the near RW/NX pool. The owner publishes only
+  /// after the shared PGO activity epoch stays unchanged for the configured
+  /// monotonic-cycle quiet window, or on an explicit/capacity flush.
   bool autoTier2PublishPending_ = false;
-  uint32_t autoTier2IdleTicks_ = 0;
-  /// A failed per-pool seal/publish must wait for an explicit retry. Keeping
-  /// this separate from pending state avoids retrying every idle worker tick.
-  bool autoTier2PublishBlocked_ = false;
+  uint32_t autoTier2ObservedActivityEpoch_ = 0;
+  uint64_t autoTier2QuietStartCycle_ = 0;
+  bool autoTier2QuietWindowArmed_ = false;
+  uint32_t autoTier2WorkerStep_ = 0;
+  bool compileInFlight_ = false;
+  bool coldTimeoutDisabledDiagnosed_ = false;
   // Inline-cache safety gate: true while the cache is safe to use (no releaser
   // wired - the production default). v2 does no HP-scan retire, so a wired
   // releaser (code may be freed) + the cache = UAF; the gate then auto-disables

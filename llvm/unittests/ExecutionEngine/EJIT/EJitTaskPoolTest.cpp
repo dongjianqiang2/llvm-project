@@ -140,7 +140,7 @@ TEST(EJitTaskPoolLayout, RequestIsFlatPod) {
   // The fixed request carries descriptors only; its size is independent of
   // every pointee's payload size. See the cross-pointer-width assertion in
   // EJitSreQueue.h.
-  EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8 ? 200u : 164u);
+  EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8 ? 208u : 176u);
 }
 
 //===----------------------------------------------------------------------===//

@@ -35,6 +35,16 @@ to public.
 ORC/JITLink allocates and fixes up near code while its pool remains RW/NX.
 Pending ranges are owner-private and are not returned by the finalized range
 query, so no cache, inline-cache cell, or shared `fnPtr` can observe them.
+ABI v22 adds a 256-entry shared linked-pending identity registry. A Tier-2
+request enters it before releasing its PGO admission, function gate, and coarse
+dedup claim. Producers consult it only after a shared-cache miss, so eviction
+of the Tier-1 slot cannot restart sampling while the linked Tier-2 waits for
+publication. The exact registry check and per-function dedup claim share one
+critical section. If publication changes the dispatch epoch after a cache
+miss, the producer drops the registry lock and retries the cache lookup; after
+a bounded number of retries it stays on AOT. If the registry is full, the
+request retains its original claims until publication and remains safely on
+AOT.
 After two empty worker observations, or an explicit
 `ejit_publish_pending_code`, the owner commits each pool independently:
 

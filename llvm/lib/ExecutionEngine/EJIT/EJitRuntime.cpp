@@ -1847,10 +1847,11 @@ void ejit_taskpool_print_stats() {
                   static_cast<unsigned long long>(d.registrationFingerprint),
                   static_cast<unsigned long long>(d.executePrepareFailed));
     EJIT_DIAG_RAW("  pgo active=%u/%u completed=%llu deferred=%llu "
-                  "tier1=%llu tier2=%llu mergeFailed=%llu",
+                  "coldExpired=%llu tier1=%llu tier2=%llu mergeFailed=%llu",
                   d.pgoActiveFunctionCount, d.pgoMaxActiveFunctions,
                   static_cast<unsigned long long>(d.pgoCompletedFunctions),
                   static_cast<unsigned long long>(d.pgoDeferredMisses),
+                  static_cast<unsigned long long>(d.pgoColdExpired),
                   static_cast<unsigned long long>(d.tier1Compiles),
                   static_cast<unsigned long long>(d.tier2Compiles),
                   static_cast<unsigned long long>(d.profileMergeFails));

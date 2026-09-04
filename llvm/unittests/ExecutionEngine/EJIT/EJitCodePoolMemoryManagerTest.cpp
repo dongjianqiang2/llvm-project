@@ -703,6 +703,44 @@ TEST(EJitCodePoolMemMgr4K, FinalizedRangeCarriesEntryFnSize) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
+// Keep enough owner-private symbol metadata to find an entry that appears
+// after the legacy eight-symbol capture limit.
+TEST(EJitCodePoolMemMgr4K, FinalizedRangeCapturesEntryPastLegacySymbolLimit) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  constexpr size_t FillerCount = 11;
+  constexpr size_t EntryOffset = FillerCount * 4;
+  constexpr size_t EntrySize = 12;
+  const char *FillerNames[FillerCount] = {"f0", "f1", "f2", "f3", "f4", "f5",
+                                          "f6", "f7", "f8", "f9", "f10"};
+  auto G = makeCodeGraph(64, 0x1000);
+  Block &B = **G->blocks().begin();
+  for (size_t I = 0; I != FillerCount; ++I)
+    G->addDefinedSymbol(B, orc::ExecutorAddrDiff(I * 4), FillerNames[I],
+                        orc::ExecutorAddrDiff(4), Linkage::Strong,
+                        Scope::Default, true, false);
+  G->addDefinedSymbol(B, orc::ExecutorAddrDiff(EntryOffset), "late_entry",
+                      orc::ExecutorAddrDiff(EntrySize), Linkage::Strong,
+                      Scope::Default, true, false);
+
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  auto *EntryAddr = reinterpret_cast<void *>(
+      reinterpret_cast<uintptr_t>(firstBlockAddr(*G)) + EntryOffset);
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(EntryAddr, Info));
+  EXPECT_EQ(Info.fnPtr, EntryAddr);
+  EXPECT_EQ(Info.fnSize, static_cast<uint64_t>(EntrySize));
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
 // A graph with no defined symbol records no symbol metadata: fnSize is 0
 // (print_compiled then reports fn_size=0, overhead=codeSize). This guards the
 // "no symbol metadata" fallback path so a symbolless graph never mis-reports
@@ -1178,12 +1216,9 @@ TEST(EJitCodePoolMemMgrBatch, ReadOnlySectionFoldsIntoExecSegment) {
   cantFail(MM.deallocate(std::move(FA2)));
 }
 
-// A read-only block aligned BEYOND the code alignment (e.g. alignas(32))
-// keeps the page-granular fallback: the promotion still folds it into the
-// executable segment, but the merged segment's alignment then exceeds the
-// compact threshold, so the layout is page-per-segment again — the safety
-// valve that keeps over-aligned content out of 16B packing.
-TEST(EJitCodePoolMemMgrBatch, HighAlignedReadOnlySectionKeepsPageLayout) {
+// A read-only block aligned beyond the minimum code alignment but within the
+// supported compact limit keeps the graph compact at its actual alignment.
+TEST(EJitCodePoolMemMgrBatch, SixtyFourAlignedReadOnlySectionStaysCompact) {
   MockSre4K M;
   auto O = fourKMemMgrOpts();
   O.minCodeAlign = 16;
@@ -1194,7 +1229,7 @@ TEST(EJitCodePoolMemMgrBatch, HighAlignedReadOnlySectionKeepsPageLayout) {
       [&M](void *B, size_t S) { return M.split(B, S); });
   EJitCodePoolMemoryManager MM(Pool, kFourKiB);
 
-  auto G = makeTextAndRoDataGraph(0x1000, 0x2000, /*RodataAlign=*/32);
+  auto G = makeTextAndRoDataGraph(0x1000, 0x2000, /*RodataAlign=*/64);
   Section *Text = G->findSectionByName("__text");
   Section *RoData = G->findSectionByName("__rodata");
   ASSERT_NE(Text, nullptr);
@@ -1213,15 +1248,58 @@ TEST(EJitCodePoolMemMgrBatch, HighAlignedReadOnlySectionKeepsPageLayout) {
   };
   EXPECT_EQ(PageOf(TextAddr), PageOf(RoAddr));
 
-  // …but the layout fell back to page granularity: a following allocation
-  // cannot share this page (a compact stride would land it ~112 bytes in).
+  // The following allocation shares the page while starting at an address
+  // that preserves the graph's 64-byte alignment.
   auto G2 = makeCodeGraph(64, 0x3000);
   auto IFA2 = cantFail(MM.allocate(nullptr, *G2));
   void *Addr2 = firstBlockAddr(*G2);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(TextAddr) % 64, 0u);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(RoAddr) % 64, 0u);
+  EXPECT_EQ(PageOf(Addr2), PageOf(TextAddr));
+
+  auto FA = cantFail(IFA->finalize());
+  auto FA2 = cantFail(IFA2->finalize());
+  EXPECT_EQ(Pool.pendingRangeCount(), 2u);
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 1u);
+  cantFail(MM.deallocate(std::move(FA)));
+  cantFail(MM.deallocate(std::move(FA2)));
+}
+
+// Content aligned beyond the supported compact limit retains the conservative
+// page layout.
+TEST(EJitCodePoolMemMgrBatch, OverAlignedReadOnlySectionKeepsPageLayout) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndRoDataGraph(0x1000, 0x2000, /*RodataAlign=*/128);
+  Section *Text = G->findSectionByName("__text");
+  ASSERT_NE(Text, nullptr);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrInSection(*G, *Text);
+  ASSERT_NE(TextAddr, nullptr);
+
+  auto G2 = makeCodeGraph(64, 0x3000);
+  auto IFA2 = cantFail(MM.allocate(nullptr, *G2));
+  void *Addr2 = firstBlockAddr(*G2);
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
   EXPECT_NE(PageOf(Addr2), PageOf(TextAddr));
 
   auto FA = cantFail(IFA->finalize());
   auto FA2 = cantFail(IFA2->finalize());
+  EXPECT_EQ(Pool.pendingRangeCount(), 2u);
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 2u);
   cantFail(MM.deallocate(std::move(FA)));
   cantFail(MM.deallocate(std::move(FA2)));
 }
