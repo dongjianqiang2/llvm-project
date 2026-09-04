@@ -30,9 +30,9 @@ EJIT 的诊断手段按“何时用到”分两类：
 | 级别 | 值 | 作用 |
 |------|----|------|
 | `EJIT_LOG_OFF` | 0 | 不输出 |
-| `EJIT_LOG_INFO` | 1 | 关键事件（默认）：init/shutdown、编译 begin/OK/FAIL、cache MISS、激活、错误、注册消费摘要 |
-| `EJIT_LOG_VERBOSE` | 2 | 逐项细节：每次首次注册、逐函数 struct-field 统计、逐次 `compile_or_get`、taskpool 请求 |
-| `EJIT_LOG_DEBUG` | 3 | 内部机理：幂等注册跳过、逐 load 替换失败、staging 内部、funcMeta 缓存 |
+| `EJIT_LOG_INFO` | 1 | 关键事件（默认）：init/shutdown、编译 begin/OK/FAIL、cache MISS、激活、错误、注册消费摘要、特化替换失败（period 索引实参替换失败；末轮 may_const load 未替换，逐条输出）及逐函数 `spec summary` 总汇总行 |
+| `EJIT_LOG_VERBOSE` | 2 | 逐项细节：每次首次注册、逐函数 struct-field 统计、逐次 `compile_or_get`、taskpool 请求、流水线中途轮次的 may_const 替换失败 |
+| `EJIT_LOG_DEBUG` | 3 | 内部机理：幂等注册跳过、staging 内部、funcMeta 缓存 |
 
 ```c
 void ejit_set_log_level(ejit_log_level_t level);   // 立即生效，影响后续所有日志输出
@@ -47,6 +47,39 @@ ejit_set_log_level(EJIT_LOG_VERBOSE);  // 排查问题时提升到细节级
 ```
 
 > 若调用后无任何日志输出，说明你的 EJIT 运行库未启用诊断日志输出，向提供方确认。
+
+### 1.1 编译期特化替换诊断（INFO 级）
+
+JIT 编译时由 `!ejit.metadata` 驱动的 IR 替换有两类，失败均在 INFO 级可见：
+
+**period 索引实参替换**（`ejit_period_arr_ind` 条目 -> 运行时 cellIdx 常量），每条失败一行：
+
+```text
+[EJIT] preReplacePeriodIndices:NNN period_arr_ind replace FAIL func=<f>: <原因>
+```
+
+原因固定为三种：`malformed metadata entry`（元数据条目畸形）、`arg index %u out of range (nargs=%u)`（实参索引越界）、`period '%s' not in compile context`（period 名不在本次编译上下文）。
+
+**may_const load 替换**：StructFieldPass 每次编译运行三轮（1c/1e/phase4）。中途轮次失败的 load 常会被后续轮次成功替换，因此逐条失败明细仅在**末轮**打 INFO（此时失败即最终失败），中途轮次为 VERBOSE。原因码固定五种：`no-root-gv`（指针不根植于 GlobalVariable）、`gv-not-in-map`（根 GV 无 ejit.metadata，非 period 变量）、`base-unresolved`（period 变量未在运行时注册）、`non-const-offset`（GEP 索引未折叠为常量）、`unsupported-type`（无法按 load 类型构造常量）：
+
+```text
+[EJIT] logReplaceFailure:NNN may_const load NOT replaced: <原因> [gv=<g>] func=<f>
+```
+
+**每函数总汇总行**：流水线结束后，对每个有特化活动（或为 `ejit_entry`）的函数输出一行。`key=`/`func=` 与 `compile OK/FAIL`、`cache MISS` 行同构，可做日志关联；字段全部为精确计数：
+
+```text
+[EJIT] runPipeline:NNN spec summary key=0x<16hex> func=<f> pind_ok=<n> pind_fail=<n> pb_repl=<n> mc_repl=<n> mc_failed=<n>
+```
+
+| 字段 | 含义 |
+|------|------|
+| `pind_ok` / `pind_fail` | period 索引实参替换成功 / 失败条数 |
+| `pb_repl` | 指针形态 period 根替换次数（全轮累计；被替换的 load 立即删除，不会重复计数） |
+| `mc_repl` | may_const load 替换次数（全轮累计，同上不重复计数） |
+| `mc_failed` | 末轮仍存活且未替换的 may_const load 数，即最终特化损失数（与末轮逐条 INFO 失败行一一对应） |
+
+注意 `mc_failed` 计的是 **load 指令条数**而非元数据条目数：同一字段的多次加载各计一次；`mc_repl + mc_failed` 不等于"机会总数"，因为循环展开会在中途轮产生新 load、替换会删除旧 load，跨轮总数没有无歧义的定义。需要每轮存活明细时升 VERBOSE 查看逐函数统计块。
 
 ---
 

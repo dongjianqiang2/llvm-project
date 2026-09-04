@@ -91,6 +91,9 @@ foreach(_t ${LLVM_TARGETS_TO_BUILD})
   if(_t STREQUAL "AArch64")
     list(APPEND EJIT_TARGET_COMPONENTS AArch64AsmParser)
   endif()
+  # initializeEJitTargets() falls through to InitializeAllAsmParsers() on
+  # hosted builds, so standalone links of LLVMEJIT (EJITTests) need the
+  # native AsmParser component too; linking into clang/lld hides the gap.
   if(_t STREQUAL "X86")
     list(APPEND EJIT_TARGET_COMPONENTS X86AsmParser)
   endif()

@@ -43,14 +43,29 @@ using MayConstOffsetMap =
 /// replaces the loads with LLVM constants.
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
+  /// Specialization counters from the most recent run() call, feeding the
+  /// INFO-level per-function compile summary.
+  struct RunStats {
+    size_t MayConstLoads = 0;    // may_const loads seen
+    size_t MayConstReplaced = 0; // may_const loads replaced with constants
+    size_t PtrBaseReplaced = 0;  // pointer-form period roots replaced
+  };
+
   /// \p verify selects the diagnostic mode described in EJitVerify.h: keep
   /// each may_const load and check it at run time instead of substituting it.
+  /// \p FinalRound marks the last StructFieldPass invocation of a compile.
+  /// The optimizer runs this pass several times and a load that fails an
+  /// early round is often replaced by a later one, so per-load replace
+  /// failures log at INFO only in the final round (where failure is final)
+  /// and at VERBOSE in earlier rounds.
   EJitStructFieldPass(PeriodArrayRegistry &reg,
                       ArrayRef<EJitBoundPointerView> boundPointers,
-                      StringRef boundRootFunction = {}, bool verify = false)
+                      StringRef boundRootFunction = {}, bool verify = false,
+                      bool FinalRound = false)
       : registry_(reg),
         boundPointers_(boundPointers.begin(), boundPointers.end()),
-        boundRootFunction_(boundRootFunction.str()), verify_(verify) {}
+        boundRootFunction_(boundRootFunction.str()), verify_(verify),
+        finalRound_(FinalRound) {}
 
   /// Compatibility constructor for direct pass users. The data pointer is
   /// borrowed for the duration of the pass and is never copied or freed.
@@ -58,9 +73,9 @@ public:
                       uint32_t rawSize = 0, uint32_t boundArgIndex = 0,
                       StringRef boundRootFunction = {},
                       std::optional<uint8_t> boundPeriodInstance = std::nullopt,
-                      bool verify = false)
+                      bool verify = false, bool FinalRound = false)
       : registry_(reg), boundRootFunction_(boundRootFunction.str()),
-        verify_(verify) {
+        verify_(verify), finalRound_(FinalRound) {
     if (rawPtr && rawSize)
       boundPointers_.push_back({rawPtr, rawSize, boundArgIndex,
                                 boundPeriodInstance
@@ -109,6 +124,8 @@ public:
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
+  const RunStats &lastStats() const { return lastStats_; }
+
 private:
   PeriodArrayRegistry &registry_;
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;
@@ -116,6 +133,8 @@ private:
   /// Unread without EJIT_VERIFY_SUBSTITUTION; kept in the interface so callers
   /// need no #ifdef.
   [[maybe_unused]] bool verify_ = false;
+  bool finalRound_ = false;
+  RunStats lastStats_;
 
   struct BoundPointerState {
     EJitBoundPointerView view;
