@@ -7,7 +7,8 @@
 //===----------------------------------------------------------------------===//
 //
 // Process-global, name-keyed assignment of lifecycle (period) names to a dense
-// dimType slot in [0, kEJitMaxDimTypes) (spec §5.1 MAX_DIM_TYPES).
+// dimType slot in [0, kEJitMaxLifecycles) — the SwitchController's slots (spec
+// §5.1 MAX_DIM_TYPES) less the top one, which is reserved for ejit_const_dim.
 //
 // A dimType must be (a) identical for one lifecycle across every independently
 // compiled module and (b) distinct for different lifecycles, while fitting in
@@ -23,7 +24,7 @@
 // Determinism / ordering: a lifecycle's slot is fixed by the FIRST registration
 // and is never reassigned, so registering more modules never shifts an existing
 // lifecycle's slot. Distinct names always receive distinct slots (no collision)
-// until the 8 slots are exhausted; the 9th distinct lifecycle is rejected
+// until the 7 slots are exhausted; the 8th distinct lifecycle is rejected
 // (kEJitInvalidDimType) — a clean failure, never a silent alias or default
 // enable.
 //
@@ -56,13 +57,17 @@ public:
 
   /// Return the dense dimType slot for \p Name, assigning the next free slot on
   /// first sight. Idempotent: the same name always maps to the same slot.
-  /// Returns kEJitInvalidDimType once all kEJitMaxDimTypes slots are taken (the
-  /// 9th distinct lifecycle is rejected, never aliased). Registration-only.
+  /// Returns kEJitInvalidDimType once all kEJitMaxLifecycles slots are taken
+  /// (the next distinct lifecycle is rejected, never aliased).
+  /// Registration-only.
+  ///
+  /// The top dimType slot is kEJitConstDimType, reserved for ejit_const_dim, so
+  /// a lifecycle must never be assigned it.
   uint32_t resolveAssign(StringRef Name) {
     for (uint32_t I = 0; I < count_; ++I)
       if (names_[I] == Name)
         return I;
-    if (count_ >= kEJitMaxDimTypes)
+    if (count_ >= kEJitMaxLifecycles)
       return kEJitInvalidDimType;
     names_[count_] = Name.str();
     return count_++;

@@ -100,12 +100,17 @@ struct SpecializationContext {
   std::string fnName;
   uint64_t cacheKey = 0;
   struct DimInfo {
+    /// Empty for a const dim, which names no lifecycle and is instead
+    /// identified by argIndex.
     std::string periodName;
     uint8_t cellIdx;
     /// The lifecycle slot read from registration metadata. The invalid
     /// sentinel is retained so fixed near-hot routing can reject malformed
-    /// metadata instead of silently placing it in the public pool.
+    /// metadata instead of silently placing it in the public pool. A const
+    /// dim names no lifecycle, so it keeps the sentinel.
     uint32_t dimType = 0xFFFFFFFFu;
+    bool isConst = false;
+    unsigned argIndex = 0;
   };
   SmallVector<DimInfo, 4> dimensions;
   /// Borrowed bound-pointer views. This vector is used only during the

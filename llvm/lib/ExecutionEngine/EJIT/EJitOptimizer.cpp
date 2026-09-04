@@ -173,9 +173,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #endif
 
-  // Phase 1 - specialize (common to all tiers): turn the period index and
-  // every may_const field into a compile-time constant.
-  preReplacePeriodIndices(M, ctx);
+  // Phase 1 - specialize (common to all tiers): turn the specialization dims
+  // and every may_const field into a compile-time constant.
+  preReplaceSpecializationIndices(M, ctx);
   runInstCombine(M);
   EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
   // Inlining is intentionally not run here: the AOT pre-optimization
@@ -755,14 +755,20 @@ void EJitOptimizer::captureCounterGlobals(Module &M) {
 #endif
 }
 
-void EJitOptimizer::preReplacePeriodIndices(Module &M,
-                                            const SpecializationContext &ctx) {
-  LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
+void EJitOptimizer::preReplaceSpecializationIndices(
+    Module &M, const SpecializationContext &ctx) {
+  LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplaceSpecializationIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (!MD)
       continue;
+
+    // A const dim is identified by parameter index, which is meaningful only
+    // for the function the index was recorded against. Lifecycle dims match by
+    // period name and stay module-wide (a callee declaring the same period is
+    // specialized too).
+    const bool isEntry = F.getName() == ctx.fnName;
 
     for (const MDOperand &Op : MD->operands()) {
       auto *Sub = dyn_cast<MDNode>(Op.get());
@@ -770,7 +776,12 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
         continue;
 
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      if (!Tag)
+        continue;
+      const bool isConst = Tag->getString() == TAG_EJIT_CONST_DIM;
+      if (!isConst && Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+        continue;
+      if (isConst && !isEntry)
         continue;
 
       auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
@@ -783,12 +794,14 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
         continue;
 
       for (auto &dim : ctx.dimensions) {
-        if (dim.periodName == PN->getString()) {
-          Argument *arg = F.getArg(argIdx);
-          arg->replaceAllUsesWith(
-              ConstantInt::get(arg->getType(), dim.cellIdx));
-          break;
-        }
+        const bool match = isConst ? (dim.isConst && dim.argIndex == argIdx)
+                                   : (!dim.isConst &&
+                                      dim.periodName == PN->getString());
+        if (!match)
+          continue;
+        Argument *arg = F.getArg(argIdx);
+        arg->replaceAllUsesWith(ConstantInt::get(arg->getType(), dim.cellIdx));
+        break;
       }
     }
   }

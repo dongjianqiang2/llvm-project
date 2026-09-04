@@ -78,6 +78,10 @@ class EJitSwitchController {
 public:
   static constexpr uint32_t MAX_DIM_TYPES = 8;
   static constexpr uint32_t MAX_INSTANCES = 256;
+  /// Mirror of kEJitConstDimType (EJitCommon.h), which this intentionally
+  /// light-include header cannot reach; EJitRuntime.cpp static_asserts them
+  /// equal. The row exists but is never a gate: see isInstanceEnabled.
+  static constexpr uint32_t CONST_DIM_TYPE = MAX_DIM_TYPES - 1;
 
   EJitSwitchController();
 

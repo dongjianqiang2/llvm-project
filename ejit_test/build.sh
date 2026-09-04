@@ -182,6 +182,7 @@ ALL_TESTS=(
   ejit_attr_test
   ejit_closure_slim_test
   ejit_complex_test
+  ejit_const_dim_test
   ejit_config_api_test
   ejit_dump_test
   ejit_external_idx_test
@@ -257,6 +258,7 @@ EXTRA_SRCS[ejit_sentinel_smoke_test]="ejit_sentinel_smoke_test_1d.c ejit_sentine
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"
+TEST_ARGS[ejit_const_dim_test]="3 7"
 TEST_ARGS[ejit_l0_dispatch_test]="1"
 TEST_ARGS[ejit_fold_loop_test]="0"
 TEST_ARGS[ejit_opt_level_test]="L2"

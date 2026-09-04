@@ -63,6 +63,9 @@ constexpr const char *TAG_EJIT_ENTRY = "ejit_entry";
 constexpr const char *TAG_EJIT_PERIOD_LC = "ejit_period_lc";
 constexpr const char *TAG_EJIT_PERIOD_ARR_IND = "ejit_period_arr_ind";
 constexpr const char *TAG_EJIT_BOUND_PTR = "ejit_bound_ptr";
+// Same {tag, MDString, i32 argIndex} shape as TAG_EJIT_PERIOD_ARR_IND; the
+// MDString is always empty (a const dim names no period).
+constexpr const char *TAG_EJIT_CONST_DIM = "ejit_const_dim";
 constexpr const char *TAG_EJIT_PERIOD_ARR = "ejit_period_arr";
 constexpr const char *TAG_EJIT_PERIOD = "ejit_period";
 constexpr const char *TAG_EJIT_MAY_CONST_FIELD = "ejit_may_const_field";
@@ -428,6 +431,17 @@ constexpr uint32_t kEJitMaxFuncIndex = EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX;
 /// Sentinel for "no dimType" (unknown / unregistered lifecycle). Out of
 /// [0, kEJitMaxDimTypes), so it can never be a valid dimType.
 constexpr uint32_t kEJitInvalidDimType = 0xFFFFFFFFu;
+
+/// dimType reserved for every ejit_const_dim, in every function. It must be a
+/// real in-range slot (the ABI rejects dimType >= kEJitMaxDimTypes), but it
+/// never indexes a lifecycle: the enable gate always passes it, its version is
+/// pinned at 0, and activate/deactivate refuse it. EJitLifecycleRegistry hands
+/// out [0, kEJitConstDimType) so no lifecycle can ever land on it.
+constexpr uint32_t kEJitConstDimType = kEJitMaxDimTypes - 1;
+
+/// How many distinct lifecycles EJitLifecycleRegistry can assign: every dimType
+/// slot except the one reserved above.
+constexpr uint32_t kEJitMaxLifecycles = kEJitConstDimType;
 
 /// Sentinel for "no funcIndex" (unregistered function or funcIndex capacity
 /// exhausted). Out of [0, kEJitMaxFuncIndex); the wrapper treats it as

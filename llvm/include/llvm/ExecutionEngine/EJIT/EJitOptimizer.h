@@ -108,8 +108,10 @@ public:
                                    const void *CodeStart, uint64_t CodeBytes);
 
 private:
-  /// Replace ejit_period_arr_ind parameters with their runtime constants.
-  void preReplacePeriodIndices(Module &M, const SpecializationContext &ctx);
+  /// Replace ejit_period_arr_ind / ejit_const_dim parameters with their
+  /// runtime constants.
+  void preReplaceSpecializationIndices(Module &M,
+                                       const SpecializationContext &ctx);
 
   /// Run InstCombine on all functions (single pass).
   void runInstCombine(Module &M);

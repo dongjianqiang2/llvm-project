@@ -151,19 +151,31 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
               static_cast<uint32_t>(ArgIndex));
         continue;
       }
-      if (Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      const bool isConst = Tag->getString() == TAG_EJIT_CONST_DIM;
+      if (!isConst && Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
         continue;
       auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
-      if (PN && meta.dimCount < 4) {
+      auto *IdxC = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+      if (!PN || !IdxC || meta.dimCount >= 4)
+        continue;
+      const unsigned i = meta.dimCount;
+      meta.argIndices[i] = static_cast<unsigned>(IdxC->getZExtValue());
+      if (isConst) {
+        // No name to resolve: the wrapper baked the reserved slot directly.
+        meta.periodNames[i].clear();
+        meta.dimTypes[i] = kEJitConstDimType;
+        meta.dimKinds[i] = FuncMeta::DimKind::Const;
+      } else {
         // Read the explicit dimType slot the wrapper used, BY NAME, from the
         // process-global lifecycle registry — the loader never re-derives or
         // re-sorts it. Unregistered lifecycle → kEJitInvalidDimType (the
         // compile driver then rejects the request).
-        meta.periodNames[meta.dimCount] = PN->getString().str();
-        meta.dimTypes[meta.dimCount] =
+        meta.periodNames[i] = PN->getString().str();
+        meta.dimTypes[i] =
             EJitLifecycleRegistry::instance().lookup(PN->getString());
-        ++meta.dimCount;
+        meta.dimKinds[i] = FuncMeta::DimKind::Lifecycle;
       }
+      ++meta.dimCount;
     }
     break;
   }

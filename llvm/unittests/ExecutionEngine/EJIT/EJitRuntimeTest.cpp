@@ -256,7 +256,7 @@ namespace ejit {
 // an EJitOptimizer; all other call syntax is unchanged.
 struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::EJitOptimizer;
-  using EJitOptimizer::preReplacePeriodIndices;
+  using EJitOptimizer::preReplaceSpecializationIndices;
   using EJitOptimizer::runInstCombine;
   using EJitOptimizer::runInterproceduralPropagation;
   using EJitOptimizer::runOptimizationPipeline;
@@ -1390,16 +1390,17 @@ TEST(EJitTaskpoolArray, UnknownPeriodCleanReject) {
 // stopped, and rejects further registration.
 TEST(EJitTaskpoolInit, InitFailureSetsFailedAndStopsWorker) {
   resetTaskpoolRegState();
-  // Fill the 8 lifecycle slots; the 9th records a capacity error that the next
-  // construction consumes as an init failure.
-  for (uint32_t i = 0; i < kEJitMaxDimTypes; ++i) {
+  // Fill every lifecycle slot (one dimType is reserved for ejit_const_dim, so
+  // that is kEJitMaxLifecycles, not kEJitMaxDimTypes); the next one records a
+  // capacity error that the following construction consumes as an init failure.
+  for (uint32_t i = 0; i < kEJitMaxLifecycles; ++i) {
     uint32_t s = 0xFFFFFFFFu;
     ejit_register_lifecycle(("k" + std::to_string(i)).c_str(), &s);
     ASSERT_NE(s, 0xFFFFFFFFu);
   }
   uint32_t s9 = 0xFFFFFFFFu;
   ejit_register_lifecycle("k_overflow", &s9);
-  EXPECT_EQ(s9, 0xFFFFFFFFu); // 9th rejected
+  EXPECT_EQ(s9, 0xFFFFFFFFu); // one past capacity: rejected, never aliased
 
   EJit ejit(Config{});
   EXPECT_TRUE(ejit.initFailed());
@@ -1417,9 +1418,10 @@ TEST(EJitTaskpoolInit, InitFailureSetsFailedAndStopsWorker) {
 // error; a subsequent C ABI call sees "not initialized".
 TEST(EJitCApiTaskpool, InitFailsAndDestroysOnRegistrationError) {
   resetTaskpoolRegState();
-  for (uint32_t i = 0; i < kEJitMaxDimTypes; ++i) {
+  for (uint32_t i = 0; i < kEJitMaxLifecycles; ++i) {
     uint32_t s = 0xFFFFFFFFu;
     ejit_register_lifecycle(("m" + std::to_string(i)).c_str(), &s);
+    ASSERT_NE(s, 0xFFFFFFFFu);
   }
   uint32_t s9 = 0xFFFFFFFFu;
   ejit_register_lifecycle("m_overflow", &s9);
@@ -1528,10 +1530,155 @@ TEST(EJitOptimizer, PreReplacePeriodIndices) {
   EXPECT_TRUE(Arg.hasNUsesOrMore(1));
 
   EJitOptimizerTestAccess opt(reg);
-  opt.preReplacePeriodIndices(*M, ctx);
+  opt.preReplaceSpecializationIndices(*M, ctx);
 
   // After replacement: the arg should have zero uses (replaced by constant 42)
   EXPECT_EQ(Arg.getNumUses(), 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// ejit_const_dim: a specialization dimension with no lifecycle behind it.
+//===----------------------------------------------------------------------===//
+
+/// Build `define i32 @<name>(i32 %a, i32 %b) { ret i32 %a + %b }` carrying
+/// !ejit.metadata with \p Dims sub-nodes, each {tag, periodName, argIndex}.
+static Function *createDimFunc(LLVMContext &Ctx, Module &M, const char *Name,
+                               ArrayRef<std::tuple<const char *, const char *,
+                                                   unsigned>> Dims) {
+  IRBuilder<> B(Ctx);
+  auto *FT = FunctionType::get(B.getInt32Ty(),
+                               {B.getInt32Ty(), B.getInt32Ty()}, false);
+  auto *F = Function::Create(FT, Function::ExternalLinkage, Name, &M);
+  F->getArg(0)->setName("a");
+  F->getArg(1)->setName("b");
+  B.SetInsertPoint(BasicBlock::Create(Ctx, "entry", F));
+  B.CreateRet(B.CreateAdd(F->getArg(0), F->getArg(1)));
+
+  SmallVector<Metadata *, 4> Subs;
+  for (auto &D : Dims) {
+    Metadata *Ops[] = {
+        MDString::get(Ctx, std::get<0>(D)),
+        MDString::get(Ctx, std::get<1>(D)),
+        ConstantAsMetadata::get(
+            ConstantInt::get(B.getInt32Ty(), std::get<2>(D))),
+    };
+    Subs.push_back(MDNode::get(Ctx, Ops));
+  }
+  F->setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, Subs));
+  return F;
+}
+
+// A const dim is substituted by ARG INDEX (it has no period name to match on),
+// exactly as a period dim is substituted by name.
+TEST(EJitOptimizer, PreReplaceConstDim) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "constDimTest");
+  Function *F = createDimFunc(Ctx, *M, "test_func",
+                              {{TAG_EJIT_PERIOD_ARR_IND, "cell", 0},
+                               {TAG_EJIT_CONST_DIM, "", 1}});
+
+  PeriodArrayRegistry reg;
+  SpecializationContext ctx;
+  ctx.fnName = "test_func";
+  ctx.dimensions.push_back({"cell", 42, /*isConst=*/false, /*argIndex=*/0});
+  ctx.dimensions.push_back({"", 7, /*isConst=*/true, /*argIndex=*/1});
+
+  EJitOptimizerTestAccess opt(reg);
+  opt.preReplaceSpecializationIndices(*M, ctx);
+
+  // BOTH arguments are now constants: the period dim by name, the const dim by
+  // index. This is the whole point -- a const dim frees an index the period dim
+  // alone could not fold.
+  EXPECT_EQ(F->getArg(0)->getNumUses(), 0u);
+  EXPECT_EQ(F->getArg(1)->getNumUses(), 0u);
+}
+
+// A const dim's arg index is meaningful only for the function it was recorded
+// against, so it must not be substituted into a same-named-metadata callee.
+TEST(EJitOptimizer, PreReplaceConstDimOnlyTouchesEntry) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "constDimScopeTest");
+  Function *Entry =
+      createDimFunc(Ctx, *M, "the_entry", {{TAG_EJIT_CONST_DIM, "", 1}});
+  Function *Other =
+      createDimFunc(Ctx, *M, "not_the_entry", {{TAG_EJIT_CONST_DIM, "", 1}});
+
+  PeriodArrayRegistry reg;
+  SpecializationContext ctx;
+  ctx.fnName = "the_entry";
+  ctx.dimensions.push_back({"", 3, /*isConst=*/true, /*argIndex=*/1});
+
+  EJitOptimizerTestAccess opt(reg);
+  opt.preReplaceSpecializationIndices(*M, ctx);
+
+  EXPECT_EQ(Entry->getArg(1)->getNumUses(), 0u);
+  EXPECT_TRUE(Other->getArg(1)->hasNUsesOrMore(1));
+}
+
+// Two distinct const-dim VALUES must substitute two distinct constants -- the
+// §1 invariant ("one specialization per distinct value observed") as an
+// executable assertion, at the substitution end.
+TEST(EJitOptimizer, PreReplaceConstDimDistinctValues) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "constDimValuesTest");
+  PeriodArrayRegistry reg;
+
+  auto substituted = [&](uint8_t value) -> int64_t {
+    Function *F = createDimFunc(Ctx, *M, ("f" + std::to_string(value)).c_str(),
+                                {{TAG_EJIT_CONST_DIM, "", 0}});
+    SpecializationContext ctx;
+    ctx.fnName = F->getName().str();
+    ctx.dimensions.push_back({"", value, /*isConst=*/true, /*argIndex=*/0});
+    EJitOptimizerTestAccess opt(reg);
+    opt.preReplaceSpecializationIndices(*M, ctx);
+    auto *Add = cast<BinaryOperator>(F->getEntryBlock().begin());
+    return cast<ConstantInt>(Add->getOperand(0))->getSExtValue();
+  };
+
+  EXPECT_EQ(substituted(7), 7);
+  EXPECT_EQ(substituted(8), 8);
+}
+
+// The reserved const dimType is NOT a gate: it reports enabled without anyone
+// activating it, its version is pinned at 0, and nothing can toggle it. Without
+// this a const dim would never compile in a shared-taskpool build, where
+// initSharedStorage zeroes every enabled bit.
+TEST(EJitSwitchControllerConstDim, ReservedSlotIsNeverAGate) {
+  EJitSwitchController sw;
+  const uint32_t cd = EJitSwitchController::CONST_DIM_TYPE;
+
+  EXPECT_TRUE(sw.isInstanceEnabled(cd, 0));
+  EXPECT_TRUE(sw.isInstanceEnabled(cd, 255));
+  EXPECT_EQ(sw.getInstanceVersion(cd, 0), 0u);
+
+  // Disabling the reserved row is refused, and does not take effect.
+  EXPECT_FALSE(sw.setEnabled(cd, 0, false));
+  EXPECT_TRUE(sw.isInstanceEnabled(cd, 0));
+  EXPECT_EQ(sw.getInstanceVersion(cd, 0), 0u);
+
+  // A real lifecycle slot still gates normally.
+  ASSERT_TRUE(sw.setEnabled(0, 0, false));
+  EXPECT_FALSE(sw.isInstanceEnabled(0, 0));
+
+  // Out-of-range is still rejected, reserved slot or not.
+  EXPECT_FALSE(sw.isInstanceEnabled(EJitSwitchController::MAX_DIM_TYPES, 0));
+  EXPECT_FALSE(sw.isInstanceEnabled(cd, EJitSwitchController::MAX_INSTANCES));
+}
+
+// The reserved slot must stay out of the lifecycle registry's range, or an
+// ejit_activate on the lifecycle that landed there would bump the version under
+// every const-dim clone.
+TEST(EJitSwitchControllerConstDim, RegistryNeverAssignsTheReservedSlot) {
+  EJitLifecycleRegistry &reg = EJitLifecycleRegistry::instance();
+  reg.reset();
+  for (uint32_t i = 0; i < kEJitMaxLifecycles; ++i) {
+    uint32_t slot = reg.resolveAssign("lc" + std::to_string(i));
+    ASSERT_NE(slot, kEJitInvalidDimType);
+    EXPECT_NE(slot, kEJitConstDimType);
+    EXPECT_LT(slot, kEJitMaxLifecycles);
+  }
+  EXPECT_EQ(reg.resolveAssign("one_too_many"), kEJitInvalidDimType);
+  reg.reset();
 }
 
 TEST(EJitOptimizer, OptimizationPipelineL1) {
@@ -1584,7 +1731,7 @@ TEST(EJitOptimizer, FullPipelineEndToEnd) {
   EJitOptimizerTestAccess opt(reg);
 
   // 1. Pre-replace
-  opt.preReplacePeriodIndices(*M, ctx);
+  opt.preReplaceSpecializationIndices(*M, ctx);
 
   // 2. InstCombine
   opt.runInstCombine(*M);
@@ -3371,7 +3518,7 @@ TEST(EJitOptimizer, PreReplacePeriodIndicesMultiDim) {
   ctx.dimensions.push_back({"trp", 25});
 
   EJitOptimizerTestAccess opt(reg);
-  opt.preReplacePeriodIndices(*M, ctx);
+  opt.preReplaceSpecializationIndices(*M, ctx);
 
   // Both args should be replaced; sum should fold to 35
   FunctionAnalysisManager FAM;
@@ -4082,7 +4229,7 @@ TEST(EJitPipelineIR, BranchFoldingOnMayConst) {
 
 /// Create IR matching the process_cell trace test pattern:
 ///   g_arr[idx].field == 0xFD ? a += 5 : a += 15
-/// With idx=0 replaced by constant during preReplacePeriodIndices.
+/// With idx=0 replaced by constant during preReplaceSpecializationIndices.
 static Function *createCellProcessFunc(LLVMContext &Ctx, Module &M) {
   IRBuilder<> B(Ctx);
   auto *Int32Ty = B.getInt32Ty();
@@ -4175,7 +4322,7 @@ TEST(EJitPipelineIR, CellProcessBranchFolding) {
 
   EJitOptimizerTestAccess opt(reg);
   // 1. Replace period index arg (cell_idx=0) with constant
-  opt.preReplacePeriodIndices(*M, ctx);
+  opt.preReplaceSpecializationIndices(*M, ctx);
   // 2. Fold constant chains + Promote
   opt.runInstCombine(*M);
 
@@ -4219,7 +4366,7 @@ TEST(EJitPipelineIR, CellProcessBranchFolding) {
 }
 
 /// Verify InstCombine runs correctly after period index replacement
-/// (catches the case where preReplacePeriodIndices + InstCombine should
+/// (catches the case where preReplaceSpecializationIndices + InstCombine should
 /// fold a constant expression like "period_idx" replaced with constant).
 TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
   LLVMContext Ctx;
@@ -4255,7 +4402,7 @@ TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
   ctx.dimensions.push_back({"cell", 42});
 
   EJitOptimizerTestAccess opt(reg);
-  opt.preReplacePeriodIndices(*M, ctx);
+  opt.preReplaceSpecializationIndices(*M, ctx);
   opt.runInstCombine(*M);
 
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());

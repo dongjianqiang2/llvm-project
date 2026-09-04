@@ -531,6 +531,11 @@ bool EJitSharedTaskPool::isInstanceEnabled(uint32_t dimType,
                                            uint32_t instanceId) const {
   if (dimType >= kEJitSharedDimTypes || instanceId >= kEJitSharedInstances)
     return false;
+  // An ejit_const_dim has no lifecycle to activate. initSharedStorage zeroes
+  // every enabled bit, so without this exemption a const dim would be gated off
+  // permanently in a shared-taskpool build and never compile.
+  if (dimType == kEJitSharedConstDimType)
+    return true;
   return state_->enabled[dimType][instanceId].loadRelaxed() != 0;
 }
 
@@ -546,6 +551,9 @@ bool EJitSharedTaskPool::isInstanceActive(uint32_t dimType,
 uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
                                              uint32_t instanceId) const {
   if (dimType >= kEJitSharedDimTypes || instanceId >= kEJitSharedInstances)
+    return 0;
+  // Pinned at 0: a const dim contributes nothing to the compile checkpoints.
+  if (dimType == kEJitSharedConstDimType)
     return 0;
   return state_->version[dimType][instanceId].loadAcquire();
 }
@@ -909,11 +917,12 @@ EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb, void *ctx) const {
 bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
                                             uint32_t instanceId, bool enabled) {
   if (!state_ || dimType >= kEJitSharedDimTypes ||
-      instanceId >= kEJitSharedInstances) {
+      instanceId >= kEJitSharedInstances ||
+      dimType == kEJitSharedConstDimType) {
     EJIT_DIAG("shared setInstanceEnabled reject: state=%p dim=%u inst=%u "
-              "(OOR dim<%u inst<%u)",
+              "(OOR dim<%u inst<%u, or reserved const-dim slot %u)",
               (void *)state_, dimType, instanceId, kEJitSharedDimTypes,
-              kEJitSharedInstances);
+              kEJitSharedInstances, kEJitSharedConstDimType);
     return false;
   }
   uint8_t expected = enabled ? 0 : 1;
@@ -945,10 +954,12 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
 
 uint32_t EJitSharedTaskPool::setAllInstancesEnabled(uint32_t dimType,
                                                     bool enabled) {
-  if (!state_ || dimType >= kEJitSharedDimTypes) {
+  if (!state_ || dimType >= kEJitSharedDimTypes ||
+      dimType == kEJitSharedConstDimType) {
     EJIT_DIAG("shared setAllInstancesEnabled reject: state=%p dim=%u (OOR "
-              "dim<%u)",
-              (void *)state_, dimType, kEJitSharedDimTypes);
+              "dim<%u, or reserved const-dim slot %u)",
+              (void *)state_, dimType, kEJitSharedDimTypes,
+              kEJitSharedConstDimType);
     return 0;
   }
   const uint8_t desired = enabled ? 1 : 0;

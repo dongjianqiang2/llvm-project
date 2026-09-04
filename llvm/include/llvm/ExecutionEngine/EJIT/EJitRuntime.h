@@ -39,6 +39,8 @@
 #define EJIT_DIM(x)
 #define EJIT_BOUND_PTR(x)
 #define ejit_period_arr_ind(x)
+#define EJIT_CONST_DIM
+#define ejit_const_dim
 #define EJIT_ENTRY
 #define ejit_entry
 #define EJIT_PERIOD_GUARD(x)
@@ -50,6 +52,11 @@
 #define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
 #define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
+// A specialization dimension with no lifecycle: the parameter's VALUE is baked
+// in and is part of the cache key, so one specialization exists per distinct
+// value observed. Nothing activates or invalidates it. Only for parameters with
+// a naturally small value set -- a wide domain thrashes the cache.
+#define EJIT_CONST_DIM          __attribute__((ejit_const_dim))
 #define EJIT_ENTRY              __attribute__((ejit_entry))
 #define EJIT_PERIOD_GUARD(x)    __attribute__((ejit_period_guard(#x)))
 // Old names (aliases — use new macros to avoid double expansion)
@@ -57,6 +64,7 @@
 #define ejit_period(x) EJIT_IN_PERIOD(x)
 #define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
 #define ejit_period_arr_ind(x) EJIT_DIM(x)
+#define ejit_const_dim EJIT_CONST_DIM
 #define ejit_entry EJIT_ENTRY
 #define ejit_period_lc(x) EJIT_PERIOD_GUARD(x)
 #endif

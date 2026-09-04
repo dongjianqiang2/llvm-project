@@ -74,7 +74,7 @@ using namespace sema;
 
 // Forward declaration for EmbeddedJIT deferred parameter check.
 // Defined in SemaEJIT.cpp.
-void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
+void checkEjitDimLimit(Sema &S, const FunctionDecl *FD);
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD);
 
 // Forward declaration for EmbeddedJIT always_inline conflict check.
@@ -10537,7 +10537,7 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
   ProcessDeclAttributes(S, NewFD, D);
 
   // Enforce at most 4 ejit_period_arr_ind parameters per function.
-  checkEjitPeriodArrIndLimit(*this, NewFD);
+  checkEjitDimLimit(*this, NewFD);
 
   // An ejit_entry / ejit_period_lc function must not carry always_inline
   // (it conflicts with the noinline CodeGen/PASS3 add for LTO survival).

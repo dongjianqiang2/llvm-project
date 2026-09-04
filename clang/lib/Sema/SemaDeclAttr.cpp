@@ -79,6 +79,7 @@ void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitBoundPtrAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleEjitConstDimAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 
@@ -7907,6 +7908,9 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_EjitBoundPtr:
     handleEjitBoundPtrAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_EjitConstDim:
+    handleEjitConstDimAttr(S, D, AL);
     break;
   case ParsedAttr::AT_EjitEntry:
     handleEjitEntryAttr(S, D, AL);
