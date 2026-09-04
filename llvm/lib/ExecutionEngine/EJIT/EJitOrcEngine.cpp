@@ -728,6 +728,13 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
     return JTMBOrErr.takeError();
   }
 
+  // Match machine-code optimization to the IR optimization tier. Previously
+  // Config::optLevel selected the O1/O2/O3 function-simplification pipeline,
+  // but JITTargetMachineBuilder stayed at CodeGenOptLevel::Default for every
+  // tier. In particular, L3 never enabled the AArch64 backend's aggressive
+  // scheduling and late machine optimizations.
+  JTMBOrErr->setCodeGenOptLevel(detail::codeGenOptLevelFor(config.optLevel));
+
   // Use Small code model so data accesses use ADRP+LDR (2 insns/global, ±4GB
   // PC-relative) instead of movz/movk absolute (5 insns/global). The JIT slab
   // is ~1.5-2.2GB from .text (within ADRP's ±4GB range), confirmed by
