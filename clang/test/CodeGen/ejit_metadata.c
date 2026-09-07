@@ -59,6 +59,5 @@ int multi_bound_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx,
 // CHECK-DAG: ![[BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND:[0-9]+]]}
 // CHECK-DAG: ![[BOUND]] = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, ![[BOUND_FIELD:[0-9]+]]}
 // CHECK-DAG: ![[BOUND_FIELD]] = !{i64 0, i64 4}
-// CHECK-DAG: ![[MULTI_BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND_A:[0-9]+]], ![[BOUND_B:[0-9]+]]}
-// CHECK-DAG: ![[BOUND_A]] = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, ![[BOUND_FIELD]]}
+// CHECK-DAG: ![[MULTI_BOUND_META]] = distinct !{![[ENTRY]], ![[IND]], ![[BOUND]], ![[BOUND_B:[0-9]+]]}
 // CHECK-DAG: ![[BOUND_B]] = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, ![[BOUND_FIELD]]}

@@ -93,6 +93,28 @@ static std::string ejitRegistrationKey(const Module &M, const Function &F) {
                              : F.getName().str();
 }
 
+/// Registration key for a const global variable that extractAndSerialize
+/// externalizes out of the bitcode. Externally linked constants keep their
+/// (already process-unique) name; internal constants (static const, private
+/// string literals) are module-local only, so they get the same deterministic
+/// "ejit_static.<TU basename>.<hash>.<name>" scheme as externalized helper
+/// functions. Single source of truth shared by the extracted-bitcode rename
+/// and both registration emitters.
+///
+/// The runtime symbol table is a flat per-process map (EJitOrcEngine
+/// userSymbols): two TUs both defining `static const int table[]` would
+/// silently bind the second registration to the first address, so the
+/// module-unique prefix is mandatory for anything with local linkage. The
+/// IR name is appended verbatim: names are unique within a module, so the
+/// key is injective per TU (".str" and "_str" hash into the same suffix but
+/// keep distinct keys) and no per-run collision handling is needed.
+static std::string ejitGVRegistrationKey(const Module &M,
+                                         const GlobalVariable &GV) {
+  if (!GV.hasLocalLinkage())
+    return GV.getName().str();
+  return ejitStaticHelperKey(M.getName(), GV.getName());
+}
+
 static bool isEjitEntryFunction(const Function &F) {
   return hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY);
 }
@@ -767,13 +789,54 @@ static std::string extractAndSerialize(Module &M,
                     << " of " << ToExternalize.size()
                     << " closure helper(s) in bitcode\n");
 
-  // Convert kept non-constant global definitions to external declarations
-  // so the JIT linker resolves them from the host process. Constants (e.g.
-  // version strings, lookup tables) are kept as-is since they're embedded
-  // in the bitcode and don't need external resolution.
+  // Convert kept global definitions to external declarations so the JIT
+  // linker resolves them from the host process — including constants.
+  // Constant definitions in the extracted bitcode materialize as JIT-side
+  // .rodata: every adrp+ldr that survives preOptimizeBitcode then reads a
+  // private copy instead of the AOT original. Externalizing every surviving
+  // const definition (closures whose loads folded away lose their dead
+  // definition entirely) resolves the loads to the AOT image's own rodata,
+  // so the JIT object carries no constant pool of its own.
+  //
+  // Internal constants (static const, private string literals) are renamed
+  // to their deterministic registration key — module-local names are not
+  // process-unique and the runtime's flat symbol table would collide across
+  // TUs. External constants keep their unique name. The rename and the
+  // registration both derive from ejitGVRegistrationKey, so they cannot
+  // disagree.
   for (GlobalVariable &GV : Extracted->globals()) {
-    if (GV.isDeclaration() || GV.isConstant())
+    if (GV.isDeclaration())
       continue;
+    // Period variables carry !ejit.metadata: PASS2 registers them under their
+    // ORIGINAL name (ejit_register_period_array / ejit_register_static_var)
+    // and the JIT optimizer looks the array up by the bitcode-declaration
+    // name (getArrayInfo). Renaming one to its ejit_static.* key would
+    // break that lookup, and registering it under the key would break the
+    // period registry — so period variables keep their definition and name
+    // exactly as before this externalization. A const period array is not a
+    // JIT rodata copy anyway: it is the specialization array itself.
+    if (GV.isConstant() && !GV.hasMetadata(MD_EJIT_METADATA)) {
+      // Capture the key before dropping the linkage: internal constants are
+      // renamed to it and the registration emitters must use the same value.
+      // ejitGVRegistrationKey only reads the module name and the GV name, so
+      // calling it on the clone's GV against the original module is fine.
+      bool WasLocal = GV.hasLocalLinkage();
+      std::string Key = ejitGVRegistrationKey(M, GV);
+      GV.setInitializer(nullptr);
+      GV.setVisibility(GlobalValue::DefaultVisibility);
+      GV.setLinkage(GlobalValue::ExternalLinkage);
+      // InternalLinkage implies dso_local and changing the linkage does not
+      // clear it (same pitfall the closure-helper externalization below
+      // fixes); a dso_local declaration drives PC-relative addressing and
+      // GOT lowering against a definition that no longer exists in this
+      // module.
+      GV.setDSOLocal(false);
+      if (WasLocal)
+        GV.setName(Key);
+      continue;
+    }
+    if (GV.hasMetadata(MD_EJIT_METADATA))
+      continue; // Period variable: keep its definition (see above).
     GV.setInitializer(nullptr);
     GV.setLinkage(GlobalValue::ExternalLinkage);
   }
@@ -931,21 +994,22 @@ static void generateSymbolRegisters(
             }
           }
         }
-        // External global variable references. A const global *with a local
-        // definition* (initializer) is embedded in the extracted bitcode by
-        // extractAndSerialize, so it needs no registration. A const global that
-        // is only a *declaration* (extern const, no initializer in this TU)
-        // cannot be embedded and must be resolved from the host process at JIT
-        // link time, so it MUST be registered — dropping it leaves an
-        // unresolved external that fails JITLink. Resolve through bitcasts/GEPs
-        // via rootGlobal so every global the collector kept in the extracted
-        // bitcode is actually registered here.
+        // Global variable references. Every closure global the collector
+        // kept is resolved from the host process at JIT link time: const
+        // definitions are externalized by extractAndSerialize (no JIT-side
+        // copy — loads resolve to the AOT image's own rodata), and period
+        // variables were always external. Dropping any of them leaves an
+        // unresolved external that fails JITLink. Internal constants are
+        // registered under their deterministic ejit_static.* key, matching
+        // the extracted-bitcode rename. Resolve through bitcasts/GEPs via
+        // rootGlobal so registration matches what collectReferencedGlobals
+        // kept in the extracted bitcode.
         for (Use &U : I.operands()) {
           auto *GV = rootGlobal(U.get(), DL);
-          if (!GV || (GV->isConstant() && !GV->isDeclaration()))
+          if (!GV)
             continue;
           if (GV->isDeclaration() || !isPeriodVar(*GV)) {
-            std::string Name = GV->getName().str();
+            std::string Name = ejitGVRegistrationKey(M, *GV);
             if (registered.insert(Name).second) {
               IRBuilder<> Builder(InsertBefore);
               Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
@@ -1168,15 +1232,18 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
         for (const Value *Op : I.operands()) {
           const GlobalVariable *GV =
               rootGlobal(const_cast<Value *>(Op), DL);
-          // Skip const globals that have a local definition (they're embedded
-          // in the bitcode), but keep const *declarations* (extern const) so
-          // they get registered and resolved from the host at JIT link time.
-          if (!GV || (GV->isConstant() && !GV->isDeclaration()) ||
-              GV->getName().starts_with("llvm."))
+          // Every closure global is registered: const definitions are
+          // externalized in the extracted bitcode and must resolve to the
+          // AOT original at JIT link time; extern const / extern mut were
+          // always declarations. Internal constants register under their
+          // deterministic ejit_static.* key, matching the extracted-bitcode
+          // rename (same source of truth as generateSymbolRegisters).
+          if (!GV || GV->getName().starts_with("llvm."))
             continue;
           if (!GVsDone.insert(GV).second)
             continue;
-          Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
+          std::string Key = ejitGVRegistrationKey(M, *GV);
+          Constant *NameStr = ConstantDataArray::getString(Ctx, Key, true);
           auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
               GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
           Entries.push_back(ConstantStruct::get(EntryTy, {
