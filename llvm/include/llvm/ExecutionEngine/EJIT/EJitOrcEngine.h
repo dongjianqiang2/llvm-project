@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/Support/CodeGen.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -49,6 +50,24 @@ struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
 enum class CompileTier : uint8_t;
 
 namespace detail {
+/// Map the public EJIT optimization level to the backend machine-code
+/// optimization level. Keep this alongside the engine interface so focused
+/// tests can lock the contract without constructing an LLJIT instance.
+constexpr CodeGenOptLevel
+codeGenOptLevelFor(OptimizationLevel Level) {
+  switch (Level) {
+  case OptimizationLevel::L1:
+    return CodeGenOptLevel::Less;
+  case OptimizationLevel::L2:
+    return CodeGenOptLevel::Default;
+  case OptimizationLevel::L3:
+    return CodeGenOptLevel::Aggressive;
+  }
+  // parseConfig() rejects out-of-range C values, so this is reachable only
+  // from a hand-built C++ Config holding an invalid enum representation.
+  return CodeGenOptLevel::Default;
+}
+
 /// Render one function definition without the rest of its specialization
 /// module. Exposed for focused dump-path testing; callers should use the
 /// ejit_dump_* APIs.

@@ -323,7 +323,23 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
   dst.compileMode = (src->compileMode == EJIT_COMPILE_ASYNC)
                         ? CompileMode::Async
                         : CompileMode::Sync;
-  dst.optLevel = static_cast<OptimizationLevel>(src->optLevel);
+  // Only adopt a level the enum actually defines. optLevel now selects the
+  // backend CodeGenOptLevel as well as the IR pipeline, so an out-of-range
+  // value would otherwise reach two separate switches and depend on both
+  // agreeing on a fallback. A zero-initialised ejit_config_t is the common
+  // case here and keeps the L2 default.
+  switch (src->optLevel) {
+  case EJIT_OPT_L1:
+  case EJIT_OPT_L2:
+  case EJIT_OPT_L3:
+    dst.optLevel = static_cast<OptimizationLevel>(src->optLevel);
+    break;
+  default:
+    EJIT_DIAG("config: optLevel=%d out of range, keeping L%d",
+              static_cast<int>(src->optLevel),
+              static_cast<int>(dst.optLevel));
+    break;
+  }
   if (src->maxCodeMemory > 0)
     dst.maxCodeMemory = src->maxCodeMemory;
   if (src->maxDataMemory > 0)
