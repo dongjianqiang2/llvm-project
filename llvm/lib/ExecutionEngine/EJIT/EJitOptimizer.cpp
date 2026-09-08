@@ -770,6 +770,12 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
         continue;
 
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+      // Only TAG_EJIT_PERIOD_ARR_IND. TAG_EJIT_FREE_DIM has the same node shape
+      // and must NEVER be added here: a free dim's parameter is not part of the
+      // specialization identity, so one clone serves every value of it, and
+      // replacing the argument with the witness would redirect the STORES that
+      // share its address to a single element. PASS6 consumes the tag instead,
+      // where the assumed value reaches a load's offset and nothing else.
       if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
         continue;
 

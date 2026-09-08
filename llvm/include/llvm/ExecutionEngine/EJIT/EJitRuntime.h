@@ -38,6 +38,7 @@
 #define ejit_period_arr(x)
 #define EJIT_DIM(x)
 #define EJIT_BOUND_PTR(x)
+#define ejit_free_dim
 #define ejit_period_arr_ind(x)
 #define EJIT_ENTRY
 #define ejit_entry
@@ -52,6 +53,12 @@
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
 #define EJIT_ENTRY              __attribute__((ejit_entry))
 #define EJIT_PERIOD_GUARD(x)    __attribute__((ejit_period_guard(#x)))
+// Self-referential on purpose, and deliberately WITHOUT an EJIT_FREE_DIM twin:
+// the macro name matches the attribute spelling, so the expansion is stopped by
+// the "macro is not replaced inside its own expansion" rule. A second macro
+// expanding to the same __attribute__ would not be protected — it would rewrite
+// the inner ejit_free_dim token and emit __attribute__((__attribute__(...))).
+#define ejit_free_dim           __attribute__((ejit_free_dim))
 // Old names (aliases — use new macros to avoid double expansion)
 #define ejit_may_const EJIT_PERIOD_CONST
 #define ejit_period(x) EJIT_IN_PERIOD(x)

@@ -1649,6 +1649,69 @@ void ClangToLLVMArgMapping::construct(const ASTContext &Context,
 }
 } // namespace
 
+std::optional<unsigned>
+CodeGen::getEjitIRArgIndex(CodeGenModule &CGM, GlobalDecl GD,
+                           unsigned ParamIndex) {
+  const auto *FD = dyn_cast_or_null<FunctionDecl>(GD.getDecl());
+  if (!FD || ParamIndex >= FD->getNumParams())
+    return std::nullopt;
+
+  const CGFunctionInfo &FI = CGM.getTypes().arrangeGlobalDeclaration(GD);
+
+  // CGFunctionInfo's argument list is not the source parameter list. Two
+  // things move a parameter's position, and they move it in opposite
+  // directions, so neither can be derived from the total:
+  //
+  //  * a PREFIX of implicit arguments the source list does not have (`this`);
+  //  * arguments INTERLEAVED after a parameter -- appendParameterTypes()
+  //    pushes a size argument immediately after each pass_object_size
+  //    parameter, so later parameters shift by one for each earlier one.
+  //
+  // Count the interleaved ones, recover the prefix from what is left, then
+  // walk to the parameter rather than assuming a constant offset.
+  unsigned NumInterleaved = 0;
+  for (unsigned I = 0, E = FD->getNumParams(); I != E; ++I)
+    if (FD->getParamDecl(I)->hasAttr<PassObjectSizeAttr>())
+      ++NumInterleaved;
+  if (FI.arg_size() < FD->getNumParams() + NumInterleaved)
+    return std::nullopt;
+  const unsigned Prefix = FI.arg_size() - FD->getNumParams() - NumInterleaved;
+
+  unsigned FIArgNo = Prefix;
+  for (unsigned I = 0; I < ParamIndex; ++I) {
+    ++FIArgNo;
+    if (FD->getParamDecl(I)->hasAttr<PassObjectSizeAttr>())
+      ++FIArgNo;
+  }
+  if (FIArgNo >= FI.arg_size())
+    return std::nullopt;
+
+  // Backstop: the slot must at least hold this parameter's type. The walk
+  // above is what has to be right -- this only catches an unmodelled insertion
+  // that puts a DIFFERENTLY typed argument in the slot, and is blind to a
+  // shift among same-typed parameters (`f(int, int, int)` would pass it while
+  // naming the wrong one). It is cheap insurance against a future insertion,
+  // not a substitute for modelling the ones that exist.
+  if (FI.arg_begin()[FIArgNo].type !=
+      CGM.getContext().getCanonicalParamType(
+          FD->getParamDecl(ParamIndex)->getType()))
+    return std::nullopt;
+
+  // Only a value passed directly is addressable as "the parameter" by index.
+  // Indirect passes a pointer to it, InAlloca and Ignore have no IR argument
+  // at all, and Expand/CoerceAndExpand spread it over several -- in every one
+  // of those cases getArg(index) would not name the value the user annotated.
+  const ABIArgInfo &AI = FI.arg_begin()[FIArgNo].info;
+  if (AI.getKind() != ABIArgInfo::Direct && AI.getKind() != ABIArgInfo::Extend)
+    return std::nullopt;
+
+  ClangToLLVMArgMapping IRArgs(CGM.getContext(), FI);
+  auto [First, Count] = IRArgs.getIRArgs(FIArgNo);
+  if (Count != 1)
+    return std::nullopt;
+  return First;
+}
+
 /***/
 
 bool CodeGenModule::ReturnTypeUsesSRet(const CGFunctionInfo &FI) {

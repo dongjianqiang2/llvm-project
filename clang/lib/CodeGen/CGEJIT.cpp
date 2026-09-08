@@ -15,6 +15,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/Basic/AttrKinds.h"
+#include "clang/Basic/DiagnosticFrontend.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
@@ -69,15 +70,58 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
       !F->hasFnAttribute(llvm::Attribute::AlwaysInline))
     F->addFnAttr(llvm::Attribute::NoInline);
 
+  // Every parameter attribute below records an index that its consumer
+  // resolves with Function::getArg(), so it must be an IR argument number.
+  // getEjitIRArgIndex maps through the ABI lowering and refuses any parameter
+  // that is not exactly one directly-passed IR argument; such a parameter is
+  // dropped with a warning rather than annotated at a guessed index, because a
+  // wrong index would specialize on an argument the user never marked.
+  auto irArg = [&](unsigned ParamIndex) -> std::optional<unsigned> {
+    return getEjitIRArgIndex(CGM, GlobalDecl(FD), ParamIndex);
+  };
+  auto diagnoseUnmappable = [&](const ParmVarDecl *PD, StringRef AttrName) {
+    CGM.getDiags().Report(PD->getLocation(), diag::warn_ejit_param_not_lowered)
+        << AttrName << PD;
+  };
+
   // ejit_period_arr_ind (on parameters)
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {
     const ParmVarDecl *PD = FD->getParamDecl(I);
     if (const auto *IdxAttr = PD->getAttr<EjitPeriodArrIndAttr>()) {
+      std::optional<unsigned> ArgNo = irArg(I);
+      if (!ArgNo) {
+        diagnoseUnmappable(PD, "ejit_period_arr_ind");
+        continue;
+      }
       Entries.push_back(llvm::MDNode::get(Ctx, {
           llvm::MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
           llvm::MDString::get(Ctx, IdxAttr->getPeriodName()),
           llvm::ConstantAsMetadata::get(
-              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), I))
+              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), *ArgNo))
+      }));
+    }
+  }
+
+  // ejit_free_dim (on parameters). Same {tag, name, argIndex} shape as
+  // ejit_period_arr_ind with an empty name, so a consumer that identifies a dim
+  // by operand position needs no special case. It is deliberately NOT a
+  // dimension on the wire: no consumer of TAG_EJIT_PERIOD_ARR_IND matches this
+  // tag, so the wrapper registers no dim, the cache key does not grow, and the
+  // parameter is never substituted into the IR. Only PASS6 reads it, to
+  // evaluate may_const addresses at a witness of 0.
+  for (unsigned I = 0; I < FD->getNumParams(); ++I) {
+    const ParmVarDecl *PD = FD->getParamDecl(I);
+    if (PD->hasAttr<EjitFreeDimAttr>()) {
+      std::optional<unsigned> ArgNo = irArg(I);
+      if (!ArgNo) {
+        diagnoseUnmappable(PD, "ejit_free_dim");
+        continue;
+      }
+      Entries.push_back(llvm::MDNode::get(Ctx, {
+          llvm::MDString::get(Ctx, TAG_EJIT_FREE_DIM),
+          llvm::MDString::get(Ctx, ""),
+          llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), *ArgNo))
       }));
     }
   }
@@ -88,6 +132,11 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {
     const ParmVarDecl *PD = FD->getParamDecl(I);
     if (const auto *BoundAttr = PD->getAttr<EjitBoundPtrAttr>()) {
+      std::optional<unsigned> ArgNo = irArg(I);
+      if (!ArgNo) {
+        diagnoseUnmappable(PD, "ejit_bound_ptr");
+        continue;
+      }
       QualType Pointee = PD->getType()->getPointeeType();
       uint64_t Size =
           CGM.getContext().getTypeSizeInChars(Pointee).getQuantity();
@@ -95,7 +144,7 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
           llvm::MDString::get(Ctx, TAG_EJIT_BOUND_PTR),
           llvm::MDString::get(Ctx, BoundAttr->getPeriodName()),
           llvm::ConstantAsMetadata::get(
-              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), I)),
+              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), *ArgNo)),
           llvm::ConstantAsMetadata::get(
               llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), Size))};
       if (const auto *RD = Pointee->getAsRecordDecl()) {

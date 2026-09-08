@@ -63,6 +63,13 @@ constexpr const char *TAG_EJIT_ENTRY = "ejit_entry";
 constexpr const char *TAG_EJIT_PERIOD_LC = "ejit_period_lc";
 constexpr const char *TAG_EJIT_PERIOD_ARR_IND = "ejit_period_arr_ind";
 constexpr const char *TAG_EJIT_BOUND_PTR = "ejit_bound_ptr";
+// Same {tag, MDString, i32 argIndex} shape as TAG_EJIT_PERIOD_ARR_IND; the
+// MDString is always empty (a free dim names no period). Unlike every other
+// dim tag this one is NOT a dimension on the wire: it never reaches the
+// wrapper, the cache key or the inline cache. It marks a parameter whose value
+// the may_const data behind it does not depend on, so PASS6 may evaluate an
+// address at a fixed witness of 0 instead of failing on a non-constant index.
+constexpr const char *TAG_EJIT_FREE_DIM = "ejit_free_dim";
 constexpr const char *TAG_EJIT_PERIOD_ARR = "ejit_period_arr";
 constexpr const char *TAG_EJIT_PERIOD = "ejit_period";
 constexpr const char *TAG_EJIT_MAY_CONST_FIELD = "ejit_may_const_field";

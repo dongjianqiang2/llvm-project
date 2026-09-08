@@ -2553,6 +2553,476 @@ static Function *createMultiFieldFunc(LLVMContext &Ctx, Module &M) {
   return F;
 }
 
+//===----------------------------------------------------------------------===//
+// ejit_free_dim: address folded at a witness of 0, argument left alone
+//===----------------------------------------------------------------------===//
+
+/// Build the motivating shape:
+///
+///   define i32 @init_trp(i32 %slot) !ejit.metadata !{{"ejit_entry"},
+///                                                    {"ejit_free_dim","",i32 0}}
+///     %idx  = add i32 15, (urem i32 %slot, 5)   ; 15 == a folded unitIdx*5
+///     %gep  = getelementptr [20 x i32], ptr @g_arr, i32 0, i32 %idx
+///     store i32 99, ptr %gep                    ; shares the address
+///     %v    = load i32, ptr %gep, !ejit.may_const
+///     ret i32 %v
+///
+/// \p WithFreeDim controls whether the free-dim metadata node is attached, so
+/// one builder covers both the folding and the not-folding case.
+/// \p Shape selects how the slot term is written.
+enum class FreeDimShape {
+  Urem,       ///< urem %slot, 5           — the real code shape
+  SelectIcmp, ///< select (icmp ult %slot, 5), %slot, 0
+  ThroughLoad ///< an unfoldable index rooted at a load
+};
+
+static Function *createFreeDimFunc(LLVMContext &Ctx, Module &M,
+                                   bool WithFreeDim,
+                                   FreeDimShape Shape = FreeDimShape::Urem) {
+  IRBuilder<> B(Ctx);
+  Type *Int32Ty = B.getInt32Ty();
+  auto *ArrTy = ArrayType::get(Int32Ty, 20);
+
+  auto *GVar = new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
+                                  ConstantAggregateZero::get(ArrTy), "g_arr");
+  Metadata *ArrMDOps[] = {
+      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, "trp"),
+      ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 20)),
+  };
+  GVar->setMetadata(MD_EJIT_METADATA,
+                    MDNode::get(Ctx, {MDNode::get(Ctx, ArrMDOps)}));
+
+  auto *Scratch =
+      new GlobalVariable(M, Int32Ty, false, GlobalValue::InternalLinkage,
+                         ConstantInt::get(Int32Ty, 0), "g_scratch");
+
+  FunctionType *FT = FunctionType::get(Int32Ty, {Int32Ty}, false);
+  auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, "init_trp", &M);
+  Argument &Slot = *F->arg_begin();
+  Slot.setName("slot");
+
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  B.SetInsertPoint(BB);
+
+  Value *SlotTerm = nullptr;
+  switch (Shape) {
+  case FreeDimShape::Urem:
+    SlotTerm = B.CreateURem(&Slot, B.getInt32(5), "slotmod");
+    break;
+  case FreeDimShape::SelectIcmp:
+    SlotTerm = B.CreateSelect(B.CreateICmpULT(&Slot, B.getInt32(5), "inrange"),
+                              &Slot, B.getInt32(0), "slotsel");
+    break;
+  case FreeDimShape::ThroughLoad:
+    // Rooted at a load the pass cannot evaluate: folding must give up rather
+    // than guess.
+    SlotTerm = B.CreateLoad(Int32Ty, Scratch, "opaque");
+    break;
+  }
+
+  // 15 stands in for unitIdx * 5 after the period index has been substituted
+  // and folded, which is exactly the state PASS6 sees.
+  Value *Idx = B.CreateAdd(B.getInt32(15), SlotTerm, "idx");
+  Value *IdxList[] = {B.getInt32(0), Idx};
+  auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, IdxList, "gep");
+
+  // The store shares the address with the load. It must keep the live argument:
+  // redirecting it to element 15 would corrupt every other slot.
+  B.CreateStore(B.getInt32(99), GEP);
+
+  auto *Load = B.CreateLoad(Int32Ty, GEP, "val");
+  Load->setMetadata(MD_EJIT_MAY_CONST,
+                    MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
+  B.CreateRet(Load);
+
+  SmallVector<Metadata *, 2> Entries = {
+      MDNode::get(Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY))};
+  if (WithFreeDim) {
+    Metadata *FreeOps[] = {
+        MDString::get(Ctx, TAG_EJIT_FREE_DIM),
+        MDString::get(Ctx, ""),
+        ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 0)),
+    };
+    Entries.push_back(MDNode::get(Ctx, FreeOps));
+  }
+  F->setMetadata(MD_EJIT_METADATA, MDNode::getDistinct(Ctx, Entries));
+  return F;
+}
+
+static bool runStructFieldOn(Function &F, EJitStructFieldPass &Pass) {
+  FunctionAnalysisManager FAM;
+  LoopAnalysisManager LAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+  PassBuilder PB;
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerModuleAnalyses(MAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  return !Pass.run(F, FAM).areAllPreserved();
+}
+
+/// The whole point: an index the pass cannot constant-fold is folded anyway,
+/// at slot 0, so the load resolves to g_arr[15].
+TEST(EJitStructFieldPass, FreeDimFoldsNonConstantIndex) {
+  LLVMContext Ctx;
+  Module M("free_dim_fold", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimFunc(Ctx, M, /*WithFreeDim=*/true);
+
+  int32_t MockArr[20] = {};
+  for (int I = 0; I < 20; ++I)
+    MockArr[I] = 100 + I;
+
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", MockArr, 20);
+
+  EJitStructFieldPass Pass(Reg);
+  Pass.initFromModule(M);
+  EXPECT_TRUE(runStructFieldOn(*F, Pass));
+
+  auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr) << "may_const load was not folded";
+  EXPECT_EQ(RetVal->getSExtValue(), 115) << "expected g_arr[15 + 0 % 5]";
+}
+
+/// The argument must survive with its uses intact: only the load's RESULT is
+/// replaced. A RAUW here would send every slot's store to element 15.
+TEST(EJitStructFieldPass, FreeDimLeavesStoreAddressLive) {
+  LLVMContext Ctx;
+  Module M("free_dim_store", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimFunc(Ctx, M, /*WithFreeDim=*/true);
+
+  int32_t MockArr[20] = {};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", MockArr, 20);
+
+  EJitStructFieldPass Pass(Reg);
+  Pass.initFromModule(M);
+  EXPECT_TRUE(runStructFieldOn(*F, Pass));
+
+  Argument &Slot = *F->arg_begin();
+  EXPECT_GT(Slot.getNumUses(), 0u)
+      << "free-dim argument was replaced; stores now target one element";
+
+  StoreInst *Store = nullptr;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB)
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        Store = SI;
+  ASSERT_NE(Store, nullptr) << "the store was removed";
+
+  // The store's address must still be a GEP with a non-constant index.
+  auto *GEP = dyn_cast<GetElementPtrInst>(Store->getPointerOperand());
+  ASSERT_NE(GEP, nullptr);
+  EXPECT_FALSE(GEP->hasAllConstantIndices())
+      << "the store's index was constant-folded to the witness";
+}
+
+/// Without the attribute the index is exactly as unfoldable as before: the
+/// assumption is opt-in, never inferred.
+TEST(EJitStructFieldPass, FreeDimAbsentDoesNotFold) {
+  LLVMContext Ctx;
+  Module M("free_dim_absent", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimFunc(Ctx, M, /*WithFreeDim=*/false);
+
+  int32_t MockArr[20] = {};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", MockArr, 20);
+
+  EJitStructFieldPass Pass(Reg);
+  Pass.initFromModule(M);
+  runStructFieldOn(*F, Pass);
+
+  bool LoadSurvives = false;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB)
+      if (auto *LI = dyn_cast<LoadInst>(&I))
+        LoadSurvives |= LI->hasMetadata(MD_EJIT_MAY_CONST);
+  EXPECT_TRUE(LoadSurvives) << "folded without an ejit_free_dim annotation";
+}
+
+/// select/icmp are folded so a range-clamped index still resolves.
+TEST(EJitStructFieldPass, FreeDimEvaluatorFoldsSelect) {
+  LLVMContext Ctx;
+  Module M("free_dim_select", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimFunc(Ctx, M, /*WithFreeDim=*/true,
+                                  FreeDimShape::SelectIcmp);
+
+  int32_t MockArr[20] = {};
+  for (int I = 0; I < 20; ++I)
+    MockArr[I] = 200 + I;
+
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", MockArr, 20);
+
+  EJitStructFieldPass Pass(Reg);
+  Pass.initFromModule(M);
+  EXPECT_TRUE(runStructFieldOn(*F, Pass));
+
+  auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr) << "select/icmp index was not folded";
+  EXPECT_EQ(RetVal->getSExtValue(), 215);
+}
+
+/// An index the evaluator cannot reach must leave the load alone rather than
+/// substitute a value read from a guessed address.
+TEST(EJitStructFieldPass, FreeDimEvaluatorBailsOnOpaqueIndex) {
+  LLVMContext Ctx;
+  Module M("free_dim_opaque", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimFunc(Ctx, M, /*WithFreeDim=*/true,
+                                  FreeDimShape::ThroughLoad);
+
+  int32_t MockArr[20] = {};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", MockArr, 20);
+
+  EJitStructFieldPass Pass(Reg);
+  Pass.initFromModule(M);
+  runStructFieldOn(*F, Pass);
+
+  bool MayConstSurvives = false;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB)
+      if (auto *LI = dyn_cast<LoadInst>(&I))
+        MayConstSurvives |= LI->hasMetadata(MD_EJIT_MAY_CONST);
+  EXPECT_TRUE(MayConstSurvives)
+      << "an unevaluable index was folded to some address anyway";
+}
+
+/// Build `g_arr[<idx expr>]` with a may_const load, where the index expression
+/// is supplied by \p MakeIndex. Used for the witness-validity and
+/// poison-flag cases, which both turn on what the index evaluates to.
+static Function *createFreeDimIndexFunc(
+    LLVMContext &Ctx, Module &M, unsigned NumElems,
+    llvm::function_ref<Value *(IRBuilder<> &, Argument &)> MakeIndex) {
+  IRBuilder<> B(Ctx);
+  Type *Int32Ty = B.getInt32Ty();
+  auto *ArrTy = ArrayType::get(Int32Ty, NumElems);
+
+  auto *GVar = new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
+                                  ConstantAggregateZero::get(ArrTy), "g_arr");
+  Metadata *ArrMDOps[] = {
+      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, "trp"),
+      ConstantAsMetadata::get(ConstantInt::get(Int32Ty, NumElems)),
+  };
+  GVar->setMetadata(MD_EJIT_METADATA,
+                    MDNode::get(Ctx, {MDNode::get(Ctx, ArrMDOps)}));
+
+  FunctionType *FT = FunctionType::get(Int32Ty, {Int32Ty}, false);
+  auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, "idx_fn", &M);
+  Argument &Slot = *F->arg_begin();
+  Slot.setName("slot");
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  B.SetInsertPoint(BB);
+
+  Value *IdxList[] = {B.getInt32(0), MakeIndex(B, Slot)};
+  auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, IdxList, "gep");
+  auto *Load = B.CreateLoad(Int32Ty, GEP, "val");
+  Load->setMetadata(MD_EJIT_MAY_CONST,
+                    MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
+  B.CreateRet(Load);
+
+  Metadata *FreeOps[] = {
+      MDString::get(Ctx, TAG_EJIT_FREE_DIM),
+      MDString::get(Ctx, ""),
+      ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 0)),
+  };
+  F->setMetadata(MD_EJIT_METADATA,
+                 MDNode::getDistinct(
+                     Ctx, {MDNode::get(Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY)),
+                           MDNode::get(Ctx, FreeOps)}));
+  return F;
+}
+
+/// Returns whether the may_const load survived the pass.
+static bool freeDimLoadSurvives(Module &M, Function &F,
+                                PeriodArrayRegistry &Reg) {
+  EJitStructFieldPass Pass(Reg);
+  Pass.initFromModule(M);
+  runStructFieldOn(F, Pass);
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *LI = dyn_cast<LoadInst>(&I))
+        if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+          return true;
+  return false;
+}
+
+/// The contract says the marked fields agree for every value the parameter
+/// takes. It does NOT say the witness is one of those values: for
+/// `arr[slot - 1]` with slot in 1..5 the witness names arr[-1]. Folding that
+/// would bake in whatever precedes the object, so the address must be rejected.
+TEST(EJitStructFieldPass, FreeDimRejectsWitnessBeforeObject) {
+  LLVMContext Ctx;
+  Module M("free_dim_underflow", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimIndexFunc(
+      Ctx, M, 5, [](IRBuilder<> &B, Argument &Slot) -> Value * {
+        return B.CreateSub(&Slot, B.getInt32(1), "slotm1");
+      });
+
+  struct { int32_t before[4]; int32_t arr[5]; } Mem = {{99, 99, 99, 99},
+                                                       {7, 7, 7, 7, 7}};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", Mem.arr, 5);
+
+  EXPECT_TRUE(freeDimLoadSurvives(M, *F, Reg))
+      << "folded arr[-1] and baked in memory preceding the object";
+}
+
+/// The same guard rejects an offset past the end.
+TEST(EJitStructFieldPass, FreeDimRejectsWitnessPastObject) {
+  LLVMContext Ctx;
+  Module M("free_dim_overflow", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimIndexFunc(
+      Ctx, M, 4, [](IRBuilder<> &B, Argument &Slot) -> Value * {
+        // Witness 0 -> index 9, past the 4-element array.
+        return B.CreateAdd(&Slot, B.getInt32(9), "slotp9");
+      });
+
+  int32_t Arr[4] = {1, 2, 3, 4};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", Arr, 4);
+
+  EXPECT_TRUE(freeDimLoadSurvives(M, *F, Reg))
+      << "folded an index past the end of the object";
+}
+
+/// A poison-generating flag whose precondition the witness breaks means the
+/// expression is poison at the witness. `sub nuw i32 %slot, 1` at witness 0
+/// wraps to 0xFFFFFFFF; masking that can produce a plausible in-bounds index,
+/// so bounds checking alone would not catch it.
+TEST(EJitStructFieldPass, FreeDimRejectsPoisonFromNUW) {
+  LLVMContext Ctx;
+  Module M("free_dim_nuw", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimIndexFunc(
+      Ctx, M, 4, [](IRBuilder<> &B, Argument &Slot) -> Value * {
+        // (slot -nuw 1) & 3 -- in bounds for any value, but poison at 0.
+        Value *Sub = B.CreateSub(&Slot, B.getInt32(1), "slotm1",
+                                 /*HasNUW=*/true, /*HasNSW=*/false);
+        return B.CreateAnd(Sub, B.getInt32(3), "masked");
+      });
+
+  int32_t Arr[4] = {10, 20, 30, 40};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", Arr, 4);
+
+  EXPECT_TRUE(freeDimLoadSurvives(M, *F, Reg))
+      << "evaluated `sub nuw` past its no-wrap promise and folded the result";
+}
+
+/// Without the flag the same shape is an ordinary wrap the program could
+/// produce, so the mask makes it in bounds and folding is correct.
+TEST(EJitStructFieldPass, FreeDimFoldsWrapWithoutNUW) {
+  LLVMContext Ctx;
+  Module M("free_dim_wrap_ok", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimIndexFunc(
+      Ctx, M, 4, [](IRBuilder<> &B, Argument &Slot) -> Value * {
+        Value *Sub = B.CreateSub(&Slot, B.getInt32(1), "slotm1");
+        return B.CreateAnd(Sub, B.getInt32(3), "masked");
+      });
+
+  int32_t Arr[4] = {10, 20, 30, 40};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", Arr, 4);
+
+  EXPECT_FALSE(freeDimLoadSurvives(M, *F, Reg));
+  auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr);
+  EXPECT_EQ(RetVal->getSExtValue(), 40) << "(0 - 1) & 3 == 3 -> Arr[3]";
+}
+
+/// `icmp samesign` is poison when the operands differ in sign, and the witness
+/// may be a value that breaks that promise. Here the comparison is poison at
+/// witness 0, so the select feeding the index is too -- and the index it would
+/// otherwise produce is perfectly in bounds, so no bounds check would catch it.
+TEST(EJitStructFieldPass, FreeDimRejectsPoisonFromSamesign) {
+  LLVMContext Ctx;
+  Module M("free_dim_samesign", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimIndexFunc(
+      Ctx, M, 4, [](IRBuilder<> &B, Argument &Slot) -> Value * {
+        auto *Cmp = cast<ICmpInst>(
+            B.CreateICmpSLT(&Slot, B.getInt32(-1), "cmp"));
+        Cmp->setSameSign(true);
+        return B.CreateSelect(Cmp, B.getInt32(0), B.getInt32(1), "idx");
+      });
+
+  int32_t Arr[4] = {10, 20, 30, 40};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", Arr, 4);
+
+  EXPECT_TRUE(freeDimLoadSurvives(M, *F, Reg))
+      << "evaluated a samesign comparison past its promise and folded the "
+         "index it produced";
+}
+
+/// Without the flag the same comparison is ordinary and folds: 0 < -1 is
+/// false, so the select yields 1.
+TEST(EJitStructFieldPass, FreeDimFoldsComparisonWithoutSamesign) {
+  LLVMContext Ctx;
+  Module M("free_dim_no_samesign", Ctx);
+  M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  Function *F = createFreeDimIndexFunc(
+      Ctx, M, 4, [](IRBuilder<> &B, Argument &Slot) -> Value * {
+        Value *Cmp = B.CreateICmpSLT(&Slot, B.getInt32(-1), "cmp");
+        return B.CreateSelect(Cmp, B.getInt32(0), B.getInt32(1), "idx");
+      });
+
+  int32_t Arr[4] = {10, 20, 30, 40};
+  PeriodArrayRegistry Reg;
+  Reg.registerArray("trp", "g_arr", Arr, 4);
+
+  EXPECT_FALSE(freeDimLoadSurvives(M, *F, Reg));
+  auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
+  ASSERT_NE(Ret, nullptr);
+  auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(RetVal, nullptr);
+  EXPECT_EQ(RetVal->getSExtValue(), 20) << "!(0 < -1) -> index 1 -> Arr[1]";
+}
+
+/// preReplacePeriodIndices substitutes period dims. It must never substitute a
+/// free dim: the free dim is not part of the specialization identity, so one
+/// clone serves every value of it.
+TEST(EJitOptimizer, PreReplaceDoesNotSubstituteFreeDim) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "freeDimNoSubst");
+  Function *F = createFreeDimFunc(Ctx, *M, /*WithFreeDim=*/true);
+  ASSERT_NE(F, nullptr);
+
+  PeriodArrayRegistry Reg;
+  SpecializationContext Ctxt;
+  Ctxt.fnName = "init_trp";
+  Ctxt.dimensions.push_back({"trp", 3});
+
+  Argument &Slot = *F->arg_begin();
+  const unsigned Before = Slot.getNumUses();
+  ASSERT_GT(Before, 0u);
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.preReplacePeriodIndices(*M, Ctxt);
+
+  EXPECT_EQ(Slot.getNumUses(), Before)
+      << "a free dim was substituted into the IR";
+}
+
 TEST(EJitStructFieldPass, MayConstLoadSubstitutionMultipleFields) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_multifield", Ctx);

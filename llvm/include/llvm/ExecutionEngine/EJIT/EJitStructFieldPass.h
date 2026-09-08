@@ -37,6 +37,12 @@ using GVPeriodMap = DenseMap<const GlobalVariable *, GVPeriodInfo>;
 using MayConstOffsetMap =
     DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>>;
 
+/// Arguments the pass may assume a value for while computing the address of a
+/// may_const load. Used for both ejit_bound_ptr roots (where the value is the
+/// offset of the borrowed object) and ejit_free_dim parameters (where it is the
+/// witness the address is evaluated at).
+using AssumedArgMap = DenseMap<const Argument *, uint64_t>;
+
 /// PASS6: JIT-time specialization pass. Scans the module for load instructions
 /// with !ejit.may_const metadata, reads the actual runtime values from process
 /// memory via the PeriodArrayRegistry or a borrowed bound-pointer view, and
@@ -119,11 +125,19 @@ private:
 
   struct BoundPointerState {
     EJitBoundPointerView view;
-    DenseMap<const Argument *, uint64_t> boundArguments;
+    AssumedArgMap boundArguments;
     SmallVector<std::pair<uint64_t, uint64_t>, 4> mayConstFields;
   };
   SmallVector<BoundPointerState, kEJitMaxBoundPointers> boundStates_;
   void initBoundArgumentPropagation(Module &M);
+
+  /// ejit_free_dim parameters, mapped to the witness their addresses are
+  /// evaluated at (always 0). Consulted ONLY when computing the byte offset of
+  /// a may_const load: the argument itself is never replaced, so the stores and
+  /// the address arithmetic the source performs keep the live parameter. See
+  /// initFreeDimAssumptions().
+  AssumedArgMap freeDimArgs_;
+  void initFreeDimAssumptions(Module &M);
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;
