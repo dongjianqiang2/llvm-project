@@ -134,6 +134,12 @@ void EJitOptimizer::clearAnalyses() {
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
+#ifdef EJIT_T2_MFS
+  for (Function &F : M) {
+    F.removeFnAttr("ejit-mfs-zero-count-only");
+    F.addFnAttr("ejit-mfs-disabled");
+  }
+#endif
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
@@ -296,10 +302,28 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       InMemFS->addFile("/ejit.prof", 0,
                        MemoryBuffer::getMemBufferCopy(ctx.profileData));
       ModulePassManager UseMPM;
+#ifdef EJIT_T2_MFS
+      // Require a fresh matched instrumentation record. Input bitcode metadata
+      // must not authorize cold placement when the supplied profile mismatches.
+      for (Function &F : *ProfileModule)
+        F.setMetadata(LLVMContext::MD_prof, nullptr);
+#endif
       UseMPM.addPass(PGOInstrumentationUse(
           /*Filename=*/"/ejit.prof", /*Remap=*/"", /*IsCS=*/false,
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(*ProfileModule, MAM_);
+#ifdef EJIT_T2_MFS
+      if (ProfileModule == &M) {
+        for (Function &F : M) {
+          auto Entry = F.getEntryCount();
+          if (!F.isDeclaration() && Entry && !Entry->isSynthetic() &&
+              Entry->getCount() != 0) {
+            F.removeFnAttr("ejit-mfs-disabled");
+            F.addFnAttr("ejit-mfs-zero-count-only");
+          }
+        }
+      }
+#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       auto Summaries = analyzeBranchProfiles(*ProfileModule, ctx.fnName);
       uint64_t Instructions = 0;

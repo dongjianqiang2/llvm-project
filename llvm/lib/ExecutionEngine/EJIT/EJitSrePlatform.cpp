@@ -153,6 +153,18 @@ extern const unsigned char __ejit_code_end[];
 }
 #endif
 
+#ifdef EJIT_T2_MFS
+extern "C" {
+#ifndef EJIT_FREESTANDING
+extern const unsigned char __ejit_cold_start[] __attribute__((weak));
+extern const unsigned char __ejit_cold_end[] __attribute__((weak));
+#else
+extern const unsigned char __ejit_cold_start[];
+extern const unsigned char __ejit_cold_end[];
+#endif
+}
+#endif
+
 namespace {
 /// Make newly-written JIT code in [Va, Va + Size) observable to instruction
 /// fetch. On AArch64 the I-cache does not snoop D-cache writes, so code
@@ -214,6 +226,9 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement,
                   ? EJitCodePoolKind::Near
                   : EJitCodePoolKind::Far;
   Opts.poolId = PoolId;
+  if (Placement == EJitCodePoolPlacement::NearFixed &&
+      PoolId == kEJitColdPoolId)
+    Opts.kind = EJitCodePoolKind::Cold;
   Opts.poolSize = static_cast<size_t>(kSrePoolSize);
   Opts.poolAlign = k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
@@ -409,6 +424,26 @@ llvm::ejit::makeSreNearHotCodePoolManager(uint32_t PoolId) {
 #else
   EJIT_DIAG("make near-hot pool: EJIT_FIXED_CODE_POOL is disabled poolId=%u",
             PoolId);
+  return nullptr;
+#endif
+}
+
+std::unique_ptr<llvm::ejit::EJitCodePoolManager>
+llvm::ejit::makeSreColdCodePoolManager() {
+#if defined(EJIT_T2_MFS) && defined(EJIT_FIXED_CODE_POOL)
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(__ejit_cold_start);
+  const uintptr_t End = reinterpret_cast<uintptr_t>(__ejit_cold_end);
+  const uintptr_t NearBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
+  const uintptr_t NearEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
+  if (Base == 0 || End <= Base || Base % k2MiB != 0 ||
+      (End - Base) % k2MiB != 0 || NearBase == 0 || NearEnd <= NearBase ||
+      !(End <= NearBase || Base >= NearEnd)) {
+    EJIT_DIAG("make cold pool: missing, unaligned or overlapping reservation");
+    return nullptr;
+  }
+  return makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed,
+                                kEJitColdPoolId, Base, End - Base);
+#else
   return nullptr;
 #endif
 }

@@ -798,6 +798,12 @@ if(EJIT_CODE_POOL_FIXED_NEAR_HOT)
     "EmbeddedJIT: fixed near-hot layout enabled (16x${EJIT_CODE_POOL_NEAR_HOT_CELL_BYTES}B cell + ${EJIT_CODE_POOL_NEAR_HOT_PUBLIC_BYTES}B public = ${_ejit_near_hot_region_bytes}B)")
 endif()
 
+option(EJIT_T2_MFS
+  "Split reliable zero-count Tier-2 blocks into a dedicated fixed cold pool" OFF)
+if(EJIT_T2_MFS AND NOT EJIT_CODE_POOL_FIXED_NEAR_HOT)
+  message(FATAL_ERROR "EJIT_T2_MFS requires EJIT_CODE_POOL_FIXED_NEAR_HOT")
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

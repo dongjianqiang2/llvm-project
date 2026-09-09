@@ -2931,6 +2931,112 @@ TEST_F(SharedTaskPoolTest, FourKSecondFuncSamePoolNoResplit) {
   EXPECT_EQ(fourK.seals[1].first, 0x40010000ull);
 }
 
+// These exercise the real peer slow path with separate, bounded pool ranges.
+// They inject slot metadata and do not establish allocator/owner readiness.
+#ifdef EJIT_SRE_SHARED_CODE_POINTERS
+TEST_F(SharedTaskPoolTest, Tier2PcWitnessRejectsTier1AndStaleGeneration) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  auto *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  slot->cold = {0x50001000ull, 64, 0x50000000ull, 0x200000ull, kEJitColdPoolId};
+  EXPECT_EQ(owner.classifyTier2PC(range.codeStart), 0u);
+  slot->tier.storeRelaxed(kEJitTierPgoUse);
+  EXPECT_EQ(owner.classifyTier2PC(range.codeStart), 1u);
+  EXPECT_EQ(owner.classifyTier2PC(slot->cold.codeStart), 2u);
+  EXPECT_EQ(owner.classifyTier2PC(range.codeStart + range.codeSize), 0u);
+  EXPECT_EQ(owner.classifyTier2PC(slot->cold.codeStart + slot->cold.codeSize),
+            0u);
+  state_->generation.fetchAdd(1);
+  EXPECT_EQ(owner.classifyTier2PC(range.codeStart), 0u);
+  EXPECT_EQ(owner.classifyTier2PC(slot->cold.codeStart), 0u);
+}
+
+TEST_F(SharedTaskPoolTest, ColdCompanionSealFailureRetriesBothRanges) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  auto *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  slot->cold = {0x50001000ull, 64, 0x50000000ull, 0x200000ull, kEJitColdPoolId};
+  fourK.failSealAtIndex = 1;
+  EJitCoreId::setCurrentForTest(3);
+  auto failed = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_TRUE(failed.readyButNotShareable);
+  EXPECT_FALSE(failed.hasReadToken);
+  EXPECT_EQ(slot->executableCoreMask.loadAcquire() & (uint64_t{1} << 3), 0u);
+  ASSERT_EQ(fourK.seals.size(), 2u);
+  EXPECT_EQ(fourK.seals[0].first, range.codeStart);
+  EXPECT_EQ(fourK.seals[1].first, slot->cold.codeStart);
+  ASSERT_EQ(fourK.splits.size(), 2u);
+  EXPECT_EQ(fourK.splits[0].first, range.poolBase);
+  EXPECT_EQ(fourK.splits[1].first, slot->cold.poolBase);
+
+  fourK.failSealAtIndex = -1;
+  auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit.bucketIndex);
+  EXPECT_EQ(fourK.seals.size(), 4u);
+  EXPECT_TRUE(fourK.rwPages.empty());
+  auto stable = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  ASSERT_EQ(stable.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(stable.bucketIndex);
+  EXPECT_EQ(fourK.seals.size(), 4u);
+}
+
+TEST_F(SharedTaskPoolTest, ColdCompanionRejectsOverlapAndPartialDescriptor) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  auto *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  slot->cold = {range.codeStart + 4096, 64, range.poolBase, range.poolSize,
+                kEJitColdPoolId};
+  EJitCoreId::setCurrentForTest(3);
+  auto overlap = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_TRUE(overlap.readyButNotShareable);
+  EXPECT_TRUE(fourK.splits.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+  slot->cold = {};
+  slot->cold.poolId = kEJitColdPoolId;
+  auto partial = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_TRUE(partial.readyButNotShareable);
+  EXPECT_TRUE(fourK.splits.empty());
+  EXPECT_TRUE(fourK.seals.empty());
+}
+
+TEST_F(SharedTaskPoolTest,
+       ColdCompanionGenerationChangeDiscardsPreparedPointer) {
+  FourKLog fourK;
+  RangeCtx range;
+  EJitSharedTaskPool owner;
+  bringUpOwner4K(owner, fourK, range);
+  publish(owner, 1);
+  auto *slot = findReadySlot(1);
+  ASSERT_NE(slot, nullptr);
+  slot->cold = {0x50001000ull, 64, 0x50000000ull, 0x200000ull, kEJitColdPoolId};
+  fourK.raceAtSealIndex = 1;
+  fourK.raceCtx = state_.get();
+  fourK.raceHook = [](void *ctx) {
+    auto *state = static_cast<EJitSharedTaskPoolState *>(ctx);
+    state->generation.fetchAdd(1);
+  };
+  EJitCoreId::setCurrentForTest(3);
+  auto stale = owner.compileOrGet(1, nullptr, 0, codeFor(1));
+  EXPECT_TRUE(stale.readyButNotShareable);
+  EXPECT_FALSE(stale.hasReadToken);
+  EXPECT_EQ(slot->executableCoreMask.loadAcquire() & (uint64_t{1} << 3), 0u);
+}
+
+#endif
+
 // 6/ Two peer cores each split + seal in their own translation context.
 TEST_F(SharedTaskPoolTest, FourKTwoPeerCoresEachPrepare) {
   FourKLog fourK;
@@ -3186,7 +3292,10 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // v19 adds fixed near-hot pool
   // diagnostics and stable semantic pool ids.
   // v20 replaces the inline bound-pointer payload with borrowed descriptors.
-  EXPECT_EQ(kEJitSharedAbiVersion, 20u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 23u);
+  EXPECT_TRUE(std::is_standard_layout<EJitColdCodeRange>::value);
+  EXPECT_TRUE(
+      std::is_trivially_default_constructible<EJitColdCodeRange>::value);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(

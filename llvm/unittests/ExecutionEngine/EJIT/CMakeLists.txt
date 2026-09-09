@@ -13,6 +13,14 @@ set(LLVM_LINK_COMPONENTS
   TargetParser
   )
 
+if(EJIT_T2_MFS AND UNIX AND NOT EJIT_FREESTANDING)
+  add_llvm_unittest(EJITMfsIntegrationTests EJitMfsIntegrationTest.cpp
+    PARTIAL_SOURCES_INTENDED)
+  get_target_property(_ejit_mfs_product_defs LLVMEJIT COMPILE_DEFINITIONS)
+  target_compile_definitions(EJITMfsIntegrationTests PRIVATE
+    ${_ejit_mfs_product_defs})
+endif()
+
 add_llvm_unittest(EJITTests
   EJitOrcEngineHeaderTest.cpp
   EJitRuntimeTest.cpp

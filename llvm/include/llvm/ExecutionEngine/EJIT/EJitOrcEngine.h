@@ -39,6 +39,7 @@ struct EJitTieredCodePoolStats {
   EJitCodePoolManager::Stats near;
   std::array<EJitCodePoolManager::Stats, kEJitNearHotPoolCount> nearHot;
   EJitCodePoolManager::Stats far;
+  EJitCodePoolManager::Stats cold;
 };
 #endif
 

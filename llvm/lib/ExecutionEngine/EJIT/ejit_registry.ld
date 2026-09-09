@@ -127,6 +127,17 @@ SECTIONS
     __ejit_code_end = .;
   } > CODE       /* code segment, near .text (±128MiB bl/adrp reach to AOT) */
 
+  /* MFS opt-in: pass --defsym=__ejit_cold_bytes=<multiple of 2MiB>.
+   * This reservation is independent of the 36MiB near pools above. */
+  .text.ejit_cold ALIGN(DEFINED(__ejit_cold_bytes) ? 2M : 1) :
+  {
+    __ejit_cold_start = .;
+    . += DEFINED(__ejit_cold_bytes) ? __ejit_cold_bytes : 0;
+    __ejit_cold_end = .;
+  } > CODE
+  ASSERT(((__ejit_cold_end - __ejit_cold_start) % 2M) == 0,
+         "EJIT cold reservation must be a multiple of 2MiB")
+
   /* ... your existing .bss / etc. ... */
 }
 

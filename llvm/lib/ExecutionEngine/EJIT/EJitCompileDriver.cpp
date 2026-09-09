@@ -214,6 +214,7 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
     for (size_t I = 0; I < tiered.nearHot.size(); ++I)
       CopyDetail(out->nearHot[I], tiered.nearHot[I]);
     CopyDetail(out->far, tiered.far);
+    CopyDetail(out->cold, tiered.cold);
     return true;
   }
   return false;

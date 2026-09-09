@@ -36,6 +36,7 @@ enum class EJitCodePoolKind : uint32_t {
   Unknown = 0,
   Near = 1,
   Far = 2,
+  Cold = 3,
 };
 
 /// Stable near-hot pool ids. IDs 0..15 are semantic cell pools and 16 is the
@@ -46,6 +47,31 @@ constexpr uint32_t kEJitNearHotCellPoolCount = 16u;
 constexpr uint32_t kEJitNearHotPublicPoolId = kEJitNearHotCellPoolCount;
 constexpr uint32_t kEJitNearHotPoolCount = kEJitNearHotPublicPoolId + 1u;
 constexpr uint32_t kEJitFarPoolId = kEJitNearHotPoolCount;
+constexpr uint32_t kEJitColdPoolId = kEJitFarPoolId + 1u;
+
+/// One optional executable companion in the dedicated cold pool. This is a
+/// bounded extent, never the enclosing interval between hot and cold code.
+/// Plain fields keep the shared slot trivially constructible. All-zero means
+/// absent; partially initialized descriptors are invalid.
+struct EJitColdCodeRange {
+  uintptr_t codeStart;
+  uint64_t codeSize;
+  uintptr_t poolBase;
+  uint64_t poolSize;
+  uint32_t poolId;
+
+  bool empty() const {
+    return codeStart == 0 && codeSize == 0 && poolBase == 0 && poolSize == 0 &&
+           poolId == 0;
+  }
+
+  bool valid() const {
+    return codeStart != 0 && codeSize != 0 && poolBase != 0 && poolSize != 0 &&
+           poolId == kEJitColdPoolId && codeStart >= poolBase &&
+           poolSize <= UINTPTR_MAX - poolBase && codeSize <= poolSize &&
+           codeStart - poolBase <= poolSize - codeSize;
+  }
+};
 
 /// Maximum number of runtime-writable ranges carried with one finalized
 /// compilation. A finalized allocation normally has a single writable data
@@ -138,6 +164,9 @@ struct EJitCompiledCodeInfo {
   /// Placement class of the owning pool. Near is the fixed .text.ejit region;
   /// Far is the dynamic SRE_MemDbgAlloc region used by temporary Tier-1 code.
   EJitCodePoolKind poolKind = EJitCodePoolKind::Unknown;
+  /// MFS companion, executable only after independent owner/peer preparation.
+  /// fnSize above continues to describe only the entry symbol in the hot range.
+  EJitColdCodeRange cold = {};
 };
 
 } // namespace ejit

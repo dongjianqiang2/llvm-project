@@ -269,8 +269,16 @@ public:
                           uint32_t WritableCount = 0,
                           const EJitFnSymEntry *Syms = nullptr,
                           uint32_t SymCount = 0);
+  /// Remove an exact staged range after a finalize-time transaction fails.
+  /// The bump allocation is intentionally retained, but the range can no
+  /// longer be promoted or resolved as executable.
+  void discardPendingRange(const void *Base, size_t Size);
   void notePendingAllocation();
   Error flushPendingRanges();
+  /// Seal and promote only the staged range containing Ptr. Cold MFS ranges
+  /// are page-disjoint, so one hot pool can publish without committing cold
+  /// companions owned by unrelated hot pools.
+  Error flushPendingRange(const void *Ptr);
   size_t pendingRangeCount() const;
 
   /// Record the executable extent of a finalized JITLink allocation
@@ -336,6 +344,7 @@ private:
   CodePool *findPoolLocked(const void *Ptr);
   Error newActivePoolLocked();
   Error sealPoolLocked(CodePool &P);
+  Error flushPendingRangesLocked(const void *OnlyPtr);
   bool poolHasRoomLocked(const CodePool &P, size_t Size, size_t Align) const;
 
   Options Opts_;

@@ -574,6 +574,20 @@ bool EJitCodePoolManager::recordPendingRange(const void *Base, size_t Size,
   return true;
 }
 
+void EJitCodePoolManager::discardPendingRange(const void *Base, size_t Size) {
+  if (!Opts_.batchedPageSeal || !Base || Size == 0)
+    return;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  const uintptr_t Start = addr(Base);
+  for (size_t I = PendingRanges_.size(); I != 0; --I) {
+    const FinalizedRange &R = PendingRanges_[I - 1];
+    if (R.start == Start && R.size == Size)
+      PendingRanges_.erase(PendingRanges_.begin() + I - 1);
+  }
+}
+
 void EJitCodePoolManager::notePendingAllocation() {
   if (!Opts_.batchedPageSeal)
     return;
@@ -594,8 +608,25 @@ Error EJitCodePoolManager::flushPendingRanges() {
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
 #endif
+  return flushPendingRangesLocked(nullptr);
+}
+
+Error EJitCodePoolManager::flushPendingRange(const void *Ptr) {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  if (!Ptr)
+    return make_error<StringError>("EJitCodePool: null pending range pointer",
+                                   inconvertibleErrorCode());
+  return flushPendingRangesLocked(Ptr);
+}
+
+Error EJitCodePoolManager::flushPendingRangesLocked(const void *OnlyPtr) {
   if (!Opts_.batchedPageSeal || PendingRanges_.empty())
-    return Error::success();
+    return OnlyPtr ? make_error<StringError>(
+                         "EJitCodePool: requested pending range not found",
+                         inconvertibleErrorCode())
+                   : Error::success();
 
   // The batch's final partial page becomes RX and must never be allocated
   // again. Only Active_ can receive a future bump allocation, so advancing its
@@ -605,8 +636,14 @@ Error EJitCodePoolManager::flushPendingRanges() {
     Active_->used = alignUp(Active_->used, Opts_.sealPageSize);
 
   std::vector<uintptr_t> Pages;
+  std::vector<size_t> Selected;
   [[maybe_unused]] size_t Bytes = 0;
-  for (const FinalizedRange &R : PendingRanges_) {
+  const uintptr_t Only = addr(OnlyPtr);
+  for (size_t I = 0; I < PendingRanges_.size(); ++I) {
+    const FinalizedRange &R = PendingRanges_[I];
+    if (OnlyPtr && !(Only >= R.start && Only - R.start < R.size))
+      continue;
+    Selected.push_back(I);
     CodePool *P = findPoolLocked(reinterpret_cast<void *>(R.start));
     if (!P || !rangeFitsPool(*P, reinterpret_cast<void *>(R.start),
                              static_cast<size_t>(R.size)))
@@ -619,6 +656,10 @@ Error EJitCodePoolManager::flushPendingRanges() {
     for (uintptr_t VA = Begin; VA < End; VA += Opts_.sealPageSize)
       Pages.push_back(VA);
   }
+  if (Selected.empty())
+    return make_error<StringError>(
+        "EJitCodePool: requested pending range not found",
+        inconvertibleErrorCode());
   std::sort(Pages.begin(), Pages.end());
   Pages.erase(std::unique(Pages.begin(), Pages.end()), Pages.end());
 
@@ -635,7 +676,8 @@ Error EJitCodePoolManager::flushPendingRanges() {
     ++SealInvocations_;
   }
 
-  for (const FinalizedRange &R : PendingRanges_) {
+  for (size_t I : Selected) {
+    const FinalizedRange &R = PendingRanges_[I];
     bool Duplicate = false;
     for (const FinalizedRange &F : FinalizedRanges_)
       if (F.start == R.start && F.size == R.size) {
@@ -648,10 +690,18 @@ Error EJitCodePoolManager::flushPendingRanges() {
 
   EJIT_DIAG_DEBUG("batch enable OK: allocations=%zu ranges=%zu pages=%zu "
                   "codeBytes=%zu",
-                  PendingAllocations_, PendingRanges_.size(), Pages.size(),
-                  Bytes);
-  PendingRanges_.clear();
-  PendingAllocations_ = 0;
+                  PendingAllocations_, Selected.size(), Pages.size(), Bytes);
+  if (!OnlyPtr) {
+    PendingRanges_.clear();
+    PendingAllocations_ = 0;
+  } else {
+    // The selection is ascending; erase back-to-front without generic search.
+    for (size_t I = Selected.size(); I != 0; --I)
+      PendingRanges_.erase(PendingRanges_.begin() + Selected[I - 1]);
+    PendingAllocations_ = PendingAllocations_ > Selected.size()
+                              ? PendingAllocations_ - Selected.size()
+                              : 0;
+  }
   return Error::success();
 }
 

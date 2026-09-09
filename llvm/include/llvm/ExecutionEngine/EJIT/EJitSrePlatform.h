@@ -42,6 +42,9 @@ std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager(
 std::unique_ptr<EJitCodePoolManager>
 makeSreNearHotCodePoolManager(uint32_t PoolId);
 
+/// Dedicated linker-reserved cold pool. Missing/invalid reservation fails.
+std::unique_ptr<EJitCodePoolManager> makeSreColdCodePoolManager();
+
 /// Install execute permission for the legacy 2MiB code pool containing
 /// \p FnPtr in the calling core's translation context. This is intentionally a
 /// per-core operation: another core sealing the same VA does not imply that

@@ -264,6 +264,14 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
 endif()
 
+if(EJIT_T2_MFS)
+  set_property(SOURCE
+    EJitOptimizer.cpp
+    EJitOrcEngine.cpp
+    EJitSrePlatform.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS EJIT_T2_MFS)
+endif()
+
 if(EJIT_CODE_POOL_FIXED_NEAR_HOT)
   target_compile_definitions(LLVMEJIT PRIVATE
     EJIT_CODE_POOL_FIXED_NEAR_HOT

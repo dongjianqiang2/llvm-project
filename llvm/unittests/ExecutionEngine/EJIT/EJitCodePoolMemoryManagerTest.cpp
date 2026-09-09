@@ -1237,3 +1237,125 @@ TEST(EJitCodePoolMemMgrBatch, FixedNearPoolsSelectAndCommitIndependently) {
   cantFail(MM.deallocate(std::move(FA1)));
   cantFail(MM.deallocate(std::move(FAP)));
 }
+
+TEST(EJitCodePoolMemMgrBatch, DiscardedPendingRangeCannotBePromoted) {
+  MockSre4K M;
+  auto Opts = fourKMemMgrOpts();
+  Opts.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      Opts, [&](size_t N) { return M.rawAlloc(N); },
+      [&](void *V) { return M.seal(V); },
+      [&](void *B, size_t N) { return M.split(B, N); },
+      [&](void *V) { return M.enableRw(V); });
+  void *Addr = cantFail(Pool.allocateCode(64, 16));
+  ASSERT_TRUE(Pool.recordPendingRange(Addr, 64));
+  ASSERT_EQ(Pool.pendingRangeCount(), 1u);
+
+  Pool.discardPendingRange(Addr, 64);
+  EXPECT_EQ(Pool.pendingRangeCount(), 0u);
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_FALSE(Pool.isRangeReady(Addr));
+  EXPECT_EQ(M.SealCalls, 0u);
+}
+
+TEST(EJitCodePoolMemMgrBatch, MfsTwoVersionsUseIndependentColdPool) {
+  MockSre4K M;
+  auto HotOpts = fourKMemMgrOpts();
+  HotOpts.kind = EJitCodePoolKind::Near;
+  HotOpts.batchedPageSeal = true;
+  HotOpts.minCodeAlign = 16;
+  auto ColdOpts = HotOpts;
+  ColdOpts.kind = EJitCodePoolKind::Cold;
+  ColdOpts.poolId = kEJitColdPoolId;
+  auto Make = [&](EJitCodePoolManager::Options O) {
+    return std::make_unique<EJitCodePoolManager>(
+        O, [&](size_t N) { return M.rawAlloc(N); },
+        [&](void *V) { return M.seal(V); },
+        [&](void *B, size_t N) { return M.split(B, N); },
+        [&](void *V) { return M.enableRw(V); });
+  };
+  auto Hot = Make(HotOpts);
+  auto Cold = Make(ColdOpts);
+  auto Far = Make(fourKMemMgrOpts());
+  bool AuthorizeCold = true;
+  std::vector<EJitColdCodeRange> Recorded;
+  std::vector<void *> HotAddresses;
+  EJitCodePoolMemoryManager MM(
+      {Hot.get()}, *Far, kFourKiB,
+      [&](const JITLinkDylib *) { return Hot.get(); },
+      [&](const JITLinkDylib *) {
+        return AuthorizeCold ? Cold.get() : nullptr;
+      },
+      [&](uintptr_t Start, uint64_t Size, const EJitColdCodeRange &R) {
+        EXPECT_EQ(Size, 64u);
+        EXPECT_TRUE(R.valid());
+        EXPECT_NE(R.poolBase, Hot->getStats().baseAddress);
+        HotAddresses.push_back(reinterpret_cast<void *>(Start));
+        Recorded.push_back(R);
+      });
+  auto MakeGraph = [&]() {
+    auto G = makeCodeGraph(64, 0x1000);
+    auto &S = G->createSection(".text.split.entry",
+                               orc::MemProt::Read | orc::MemProt::Exec);
+    G->createContentBlock(S, ArrayRef<char>(CodeBytes, 32),
+                          orc::ExecutorAddr(0x2000), 64, 16);
+    return G;
+  };
+  JITLinkDylib JD("controlled-t2");
+  for (unsigned I = 0; I != 2; ++I) {
+    auto G = MakeGraph();
+    auto InFlight = cantFail(MM.allocate(&JD, *G));
+    for (auto *B : G->blocks()) {
+      if (B->getSection().getName().starts_with(".text.split.")) {
+        EXPECT_TRUE(Cold->contains(B->getAddress().toPtr<void *>()));
+        EXPECT_EQ(B->getAddress().getValue() % 64, 16u);
+        EXPECT_EQ(B->getSection().getMemLifetime(), orc::MemLifetime::Standard);
+        EXPECT_EQ(std::memcmp(B->getContent().data(), CodeBytes, 32), 0);
+      } else {
+        EXPECT_TRUE(Hot->contains(B->getAddress().toPtr<void *>()));
+      }
+    }
+    auto Allocation = cantFail(InFlight->finalize());
+    cantFail(MM.deallocate(std::move(Allocation)));
+  }
+  ASSERT_EQ(Recorded.size(), 2u);
+  EXPECT_NE(Recorded[0].codeStart, Recorded[1].codeStart);
+  EXPECT_EQ(Hot->pendingRangeCount(), 2u);
+  EXPECT_EQ(Cold->pendingRangeCount(), 2u);
+  EXPECT_EQ(Far->getStats().usedBytes, 0u);
+  EXPECT_EQ(M.SealCalls, 0u);
+
+  M.FailSealOnCall = 1;
+  auto Failed =
+      Cold->flushPendingRange(reinterpret_cast<void *>(Recorded[0].codeStart));
+  EXPECT_TRUE(static_cast<bool>(Failed));
+  consumeError(std::move(Failed));
+  for (void *Addr : HotAddresses)
+    EXPECT_FALSE(Hot->isRangeReady(Addr));
+  M.FailSealOnCall = -1;
+  cantFail(
+      Cold->flushPendingRange(reinterpret_cast<void *>(Recorded[1].codeStart)));
+  EXPECT_FALSE(
+      Cold->isRangeReady(reinterpret_cast<void *>(Recorded[0].codeStart)));
+  EXPECT_TRUE(
+      Cold->isRangeReady(reinterpret_cast<void *>(Recorded[1].codeStart)));
+  cantFail(
+      Cold->flushPendingRange(reinterpret_cast<void *>(Recorded[0].codeStart)));
+  cantFail(Hot->flushPendingRanges());
+  for (unsigned I = 0; I != 2; ++I) {
+    EXPECT_TRUE(Hot->isRangeReady(HotAddresses[I]));
+    EXPECT_TRUE(
+        Cold->isRangeReady(reinterpret_cast<void *>(Recorded[I].codeStart)));
+  }
+
+  const auto HotUsed = Hot->getStats().usedBytes;
+  const auto ColdUsed = Cold->getStats().usedBytes;
+  AuthorizeCold = false;
+  auto G = MakeGraph();
+  auto Rejected = MM.allocate(&JD, *G);
+  EXPECT_FALSE(static_cast<bool>(Rejected));
+  consumeError(Rejected.takeError());
+  EXPECT_EQ(Hot->getStats().usedBytes, HotUsed);
+  EXPECT_EQ(Cold->getStats().usedBytes, ColdUsed);
+  EXPECT_EQ(Recorded.size(), 2u);
+}

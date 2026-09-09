@@ -42,13 +42,17 @@ public:
   /// makes allocation fail instead of silently placing code in another pool.
   using PoolSelector =
       std::function<EJitCodePoolManager *(const jitlink::JITLinkDylib *)>;
+  using ColdRangeRecorder =
+      std::function<void(uintptr_t, uint64_t, const EJitColdCodeRange &)>;
 
   EJitCodePoolMemoryManager(EJitCodePoolManager &Pool, size_t PageSize);
   EJitCodePoolMemoryManager(EJitCodePoolManager &NearPool,
                             EJitCodePoolManager &FarPool, size_t PageSize);
   EJitCodePoolMemoryManager(std::vector<EJitCodePoolManager *> NearPools,
                             EJitCodePoolManager &FarPool, size_t PageSize,
-                            PoolSelector Selector);
+                            PoolSelector Selector,
+                            PoolSelector ColdSelector = {},
+                            ColdRangeRecorder RecordCold = {});
 
   void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
                 OnAllocatedFunction OnAllocated) override;
@@ -72,6 +76,8 @@ private:
   std::vector<EJitCodePoolManager *> NearPools_;
   EJitCodePoolManager *FarPool_ = nullptr;
   PoolSelector Selector_;
+  PoolSelector ColdSelector_;
+  ColdRangeRecorder RecordCold_;
   size_t PageSize_;
 };
 

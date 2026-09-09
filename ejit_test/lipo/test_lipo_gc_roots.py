@@ -17,6 +17,8 @@ DUMP_APIS = (
     "ejit_dump_func",
     "ejit_print_dumped",
     "ejit_print_dumped_module",
+    "ejit_get_cold_code_pool_stats",
+    "ejit_taskpool_classify_tier2_pc",
 )
 
 

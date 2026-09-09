@@ -2017,6 +2017,7 @@ void ejit_taskpool_print_compiled() {
     uint64_t codeSize = 0;
     uint64_t fnSize = 0;
     EJitDimPair dims[kEJitSharedMaxDims] = {};
+    EJitColdCodeRange cold = {};
     uint32_t versions[kEJitSharedMaxDims] = {};
   };
   SmallVector<CompiledRow, 128> rows;
@@ -2039,6 +2040,7 @@ void ejit_taskpool_print_compiled() {
         row.codeStart = slot.codeStart;
         row.codeSize = slot.codeSize;
         row.fnSize = slot.fnSize;
+        row.cold = slot.cold;
         for (uint32_t i = 0; i < row.numDims; ++i) {
           row.dims[i] = slot.dims[i];
           row.versions[i] = slot.versions[i];
@@ -2136,6 +2138,15 @@ void ejit_taskpool_print_compiled() {
         !ReuseTrackingEnabled ? "disabled"
         : row.postPublishSeen ? "yes"
                               : "no");
+    if (!row.cold.empty())
+      EJIT_DIAG_RAW("compiled cold: funcIdx=%u generation=%u hot_address=%p "
+                    "pool_id=%u cold_range=[0x%llx,0x%llx) cold_size=%llu",
+                    row.funcIndex, row.generation,
+                    reinterpret_cast<void *>(row.address), row.cold.poolId,
+                    static_cast<unsigned long long>(row.cold.codeStart),
+                    static_cast<unsigned long long>(row.cold.codeStart +
+                                                    row.cold.codeSize),
+                    static_cast<unsigned long long>(row.cold.codeSize));
     ejitDiagPrintThrottle();
   }
   EJIT_DIAG_RAW("compiled layout: address_order=ascending rows=%zu",
@@ -2272,6 +2283,23 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
     return EJIT_ERR_DISABLED;
   }
   return EJIT_OK;
+}
+
+uint32_t ejit_taskpool_classify_tier2_pc(uintptr_t pc) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT)
+    if (auto *Pool = gEJIT->sharedTaskPool())
+      return Pool->classifyTier2PC(pc);
+#endif
+  return 0;
+}
+
+ejit_status_t ejit_get_cold_code_pool_stats(ejit_code_pool_stats_t *out) {
+  if (!out)
+    return EJIT_ERR_INVALID_PARAM;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  return gEJIT->getColdCodePoolStats(out) ? EJIT_OK : EJIT_ERR_DISABLED;
 }
 
 ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out) {

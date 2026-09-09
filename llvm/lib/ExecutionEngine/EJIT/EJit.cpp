@@ -999,9 +999,43 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
 #endif
 }
 
+bool EJit::getColdCodePoolStats(ejit_code_pool_stats_t *out) const {
+  if (!out)
+    return false;
+  *out = {};
+#ifdef EJIT_SRE_CODE_POOL
+  auto Copy = [out](const auto &S) {
+    out->poolCount = S.poolCount;
+    out->sealedCount = S.sealedCount;
+    out->activeCount = S.activeCount;
+    out->usedBytes = S.usedBytes;
+    out->reservedBytes = S.reservedBytes;
+    out->wastedBytes = S.wastedBytes;
+    out->sealInvocations = S.sealInvocations;
+    out->splitInvocations = S.splitInvocations;
+    out->finalizedRangeCount = S.finalizedRangeCount;
+  };
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (const auto *Pool = sharedTaskPool()) {
+    EJitCodePoolStatsOut S;
+    if (Pool->readCodePoolStats(&S)) {
+      Copy(S.cold);
+      return true;
+    }
+  }
+#endif
+  if (compileDriver_ && compileDriver_->getJitEngine()) {
+    Copy(compileDriver_->getJitEngine()->getTieredCodePoolStats().cold);
+    return true;
+  }
+#endif
+  return false;
+}
+
 void EJit::printCodePoolStats() const {
 #ifdef EJIT_SRE_CODE_POOL
   ejit_code_pool_stats_v2_t s{};
+  bool PrintedColdDetail = false;
   if (!getCodePoolStatsV2(&s)) {
     EJIT_DIAG_RAW("code pool: not available (no engine)");
     return;
@@ -1056,10 +1090,15 @@ void EJit::printCodePoolStats() const {
             (std::string("near(cell") + std::to_string(I) + ")").c_str(),
             detailed.nearHot[I]);
       PrintDetail("near(public)", detailed.nearHot[16]);
+      PrintDetail("cold(tier2)", detailed.cold);
+      PrintedColdDetail = true;
     }
   }
 #endif
   PrintOne("far(tier1)", s.far);
+  ejit_code_pool_stats_t Cold{};
+  if (!PrintedColdDetail && getColdCodePoolStats(&Cold))
+    PrintOne("cold(tier2)", Cold);
 #else
   EJIT_DIAG_RAW("code pool: EJIT_SRE_CODE_POOL not enabled");
 #endif

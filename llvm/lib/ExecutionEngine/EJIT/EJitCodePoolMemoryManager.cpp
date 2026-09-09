@@ -47,10 +47,22 @@ public:
   InFlightAllocImpl(EJitCodePoolManager &Pool, LinkGraph &G, BasicLayout BL,
                     void *Base, size_t Size,
                     std::vector<ExecSegRange> ExecRanges,
-                    std::vector<EJitWritableRange> WritableRanges)
+                    std::vector<EJitWritableRange> WritableRanges,
+                    EJitCodePoolManager *ColdPool, void *ColdBase,
+                    size_t ColdSize, ColdRangeRecorder RecordCold)
       : Pool(&Pool), G(&G), BL(std::move(BL)), Base(Base), Size(Size),
         ExecRanges(std::move(ExecRanges)),
-        WritableRanges(std::move(WritableRanges)) {}
+        WritableRanges(std::move(WritableRanges)), ColdPool(ColdPool),
+        ColdBase(ColdBase), ColdSize(ColdSize),
+        RecordCold(std::move(RecordCold)) {}
+
+  Error restoreRanges() {
+    Error Err = Pool->restoreRxRange(Base, Size);
+    if (ColdPool && ColdBase)
+      Err = joinErrors(std::move(Err),
+                       ColdPool->restoreRxRange(ColdBase, ColdSize));
+    return Err;
+  }
 
   void finalize(OnFinalizedFunction OnFinalized) override {
     // The content has already been written into working memory, which (for an
@@ -72,8 +84,7 @@ public:
           EJIT_DIAG("finalize FAIL: sealCodeRange addr=0x%llx size=%llu",
                     static_cast<unsigned long long>(R.Addr),
                     static_cast<unsigned long long>(R.Size));
-          OnFinalized(
-              joinErrors(std::move(Err), Pool->restoreRxRange(Base, Size)));
+          OnFinalized(joinErrors(std::move(Err), restoreRanges()));
           return;
         }
     }
@@ -83,8 +94,8 @@ public:
             Expected<std::vector<WrapperFunctionCall>> DeallocActions) mutable {
           if (!DeallocActions) {
             EJIT_DIAG("finalize FAIL: runFinalizeActions error base=%p", Base);
-            OnFinalized(joinErrors(DeallocActions.takeError(),
-                                   Pool->restoreRxRange(Base, Size)));
+            OnFinalized(
+                joinErrors(DeallocActions.takeError(), restoreRanges()));
             return;
           }
           // Publish executable ranges only after every finalize action has
@@ -102,6 +113,23 @@ public:
           // marked finalized (below). isolateSpecializationEntry guarantees the
           // TU's ejit_entry has the sole defined body, so the executable
           // segment normally holds exactly one defined symbol (the entry).
+          EJitCompiledCodeInfo ColdInfo;
+          bool ColdRecorded = false;
+          if (ColdBase) {
+            ColdRecorded = ColdPool->recordPendingRange(ColdBase, ColdSize);
+            if (!ColdRecorded ||
+                !ColdPool->findPendingRange(ColdBase, ColdInfo) ||
+                ColdInfo.poolKind != EJitCodePoolKind::Cold ||
+                ColdInfo.poolId != kEJitColdPoolId) {
+              if (ColdRecorded)
+                ColdPool->discardPendingRange(ColdBase, ColdSize);
+              OnFinalized(joinErrors(
+                  make_error<StringError>("EJitCodePool: invalid cold range",
+                                          inconvertibleErrorCode()),
+                  restoreRanges()));
+              return;
+            }
+          }
           for (const ExecSegRange &R : ExecRanges) {
             EJitFnSymEntry Syms[kEJitMaxSymsPerRange];
             uint32_t SymCount = 0;
@@ -142,17 +170,25 @@ public:
                   " writable=%zu",
                   static_cast<unsigned long long>(R.Addr),
                   WritableRanges.size());
+              if (ColdRecorded)
+                ColdPool->discardPendingRange(ColdBase, ColdSize);
               OnFinalized(joinErrors(
                   make_error<StringError>(
                       "EJitCodePool: finalized allocation has an over-bound or "
                       "malformed runtime-writable range set",
                       inconvertibleErrorCode()),
-                  Pool->restoreRxRange(Base, Size)));
+                  restoreRanges()));
               return;
             }
           }
           if (Pool->usesBatchedPageSeal() && !ExecRanges.empty())
             Pool->notePendingAllocation();
+          if (ColdBase) {
+            ColdPool->notePendingAllocation();
+            RecordCold(ExecRanges.front().Addr, ExecRanges.front().Size,
+                       {ColdInfo.codeStart, ColdInfo.codeSize,
+                        ColdInfo.poolBase, ColdInfo.poolSize, ColdInfo.poolId});
+          }
           auto *Info = new FinalizedInfo();
           Info->Base = Base;
           Info->DeallocActions = std::move(*DeallocActions);
@@ -169,7 +205,7 @@ public:
 #ifndef NDEBUG
     G = nullptr;
 #endif
-    OnAbandoned(Pool->restoreRxRange(Base, Size));
+    OnAbandoned(restoreRanges());
   }
 
 private:
@@ -180,6 +216,10 @@ private:
   size_t Size;
   std::vector<ExecSegRange> ExecRanges;
   std::vector<EJitWritableRange> WritableRanges;
+  EJitCodePoolManager *ColdPool;
+  void *ColdBase;
+  size_t ColdSize;
+  ColdRangeRecorder RecordCold;
 };
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(EJitCodePoolManager &Pool,
@@ -194,10 +234,12 @@ EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(
 
 EJitCodePoolMemoryManager::EJitCodePoolMemoryManager(
     std::vector<EJitCodePoolManager *> NearPools, EJitCodePoolManager &FarPool,
-    size_t PageSize, PoolSelector Selector)
+    size_t PageSize, PoolSelector Selector, PoolSelector ColdSelector,
+    ColdRangeRecorder RecordCold)
     : NearPool_(NearPools.empty() ? nullptr : NearPools.front()),
       NearPools_(std::move(NearPools)), FarPool_(&FarPool),
-      Selector_(std::move(Selector)), PageSize_(PageSize) {}
+      Selector_(std::move(Selector)), ColdSelector_(std::move(ColdSelector)),
+      RecordCold_(std::move(RecordCold)), PageSize_(PageSize) {}
 
 EJitCodePoolManager *
 EJitCodePoolMemoryManager::selectPool(const JITLinkDylib *JD) const {
@@ -225,7 +267,66 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     return;
   }
   EJitCodePoolManager &Pool = *SelectedPool;
+  std::vector<Section *> ColdSections;
+  std::vector<Block *> ColdBlocks;
+  EJitCodePoolManager *ColdPool = nullptr;
+  uint64_t ColdSize = 0;
+  if (ColdSelector_) {
+    for (auto &S : G.sections()) {
+      if (!S.getName().starts_with(".text.split."))
+        continue;
+      if (S.getMemProt() != (orc::MemProt::Read | orc::MemProt::Exec) ||
+          S.getMemLifetime() != orc::MemLifetime::Standard) {
+        OnAllocated(make_error<StringError>(
+            "EJitCodePool: cold section must be persistent pure RX code",
+            inconvertibleErrorCode()));
+        return;
+      }
+      ColdSections.push_back(&S);
+      for (auto *B : S.blocks()) {
+        if (B->isZeroFill() || B->getAlignment() > PageSize_) {
+          OnAllocated(make_error<StringError>(
+              "EJitCodePool: unsupported cold block layout",
+              inconvertibleErrorCode()));
+          return;
+        }
+        ColdBlocks.push_back(B);
+      }
+    }
+    if (!ColdBlocks.empty()) {
+      ColdPool = ColdSelector_(JD);
+      if (!ColdPool || ColdPool == &Pool || !RecordCold_ ||
+          !Pool.usesBatchedPageSeal() || !ColdPool->usesBatchedPageSeal()) {
+        OnAllocated(make_error<StringError>(
+            "EJitCodePool: cold placement is not authorized for this graph",
+            inconvertibleErrorCode()));
+        return;
+      }
+      llvm::sort(ColdBlocks, [](const Block *L, const Block *R) {
+        if (L->getSection().getOrdinal() != R->getSection().getOrdinal())
+          return L->getSection().getOrdinal() < R->getSection().getOrdinal();
+        if (L->getAddress() != R->getAddress())
+          return L->getAddress() < R->getAddress();
+        return L->getSize() < R->getSize();
+      });
+      for (auto *B : ColdBlocks) {
+        const uint64_t Offset = alignToBlock(ColdSize, *B);
+        if (Offset < ColdSize || B->getSize() > SIZE_MAX - Offset) {
+          OnAllocated(make_error<StringError>(
+              "EJitCodePool: cold layout overflow", inconvertibleErrorCode()));
+          return;
+        }
+        ColdSize = Offset + B->getSize();
+      }
+    }
+  }
+  // Exclude only the identified cold sections while BasicLayout captures the
+  // hot/data segments. Restore graph metadata before JITLink sees the graph.
+  for (auto *S : ColdSections)
+    S->setMemLifetime(orc::MemLifetime::NoAlloc);
   BasicLayout BL(G);
+  for (auto *S : ColdSections)
+    S->setMemLifetime(orc::MemLifetime::Standard);
 
   bool ExecOnly = true;
   bool HasSegments = false;
@@ -355,13 +456,52 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     return;
   }
 
+  void *ColdBase = nullptr;
+  if (ColdSize != 0) {
+    if (ExecRanges.size() != 1) {
+      OnAllocated(joinErrors(
+          make_error<StringError>("EJitCodePool: MFS requires one hot extent",
+                                  inconvertibleErrorCode()),
+          Pool.restoreRxRange(Slab, static_cast<size_t>(Total))));
+      return;
+    }
+    // Cold publications can be committed per hot pool. Keep every companion
+    // page-disjoint so sealing one can never freeze another pool's live tail.
+    auto Mem = ColdPool->allocateCode(ColdSize, PageSize_);
+    if (!Mem) {
+      OnAllocated(
+          joinErrors(Mem.takeError(), Pool.restoreRxRange(Slab, Total)));
+      return;
+    }
+    ColdBase = *Mem;
+    if (auto Err = ColdPool->enableRwRange(ColdBase, ColdSize)) {
+      OnAllocated(
+          joinErrors(std::move(Err),
+                     joinErrors(ColdPool->restoreRxRange(ColdBase, ColdSize),
+                                Pool.restoreRxRange(Slab, Total))));
+      return;
+    }
+    std::memset(ColdBase, 0, ColdSize);
+    auto Next = ExecutorAddr::fromPtr(ColdBase);
+    for (auto *B : ColdBlocks) {
+      Next = alignToBlock(Next, *B);
+      auto Content = B->getContent();
+      auto *Dest = Next.toPtr<char *>();
+      std::memcpy(Dest, Content.data(), Content.size());
+      B->setMutableContent({Dest, Content.size()});
+      B->setAddress(Next);
+      Next += Content.size();
+    }
+  }
+
   EJIT_DIAG_DEBUG(
       "allocate OK: slab=%p total=%llu execRanges=%zu writableRanges=%zu", Slab,
       static_cast<unsigned long long>(Total), ExecRanges.size(),
       WritableRanges.size());
   OnAllocated(std::make_unique<InFlightAllocImpl>(
       Pool, G, std::move(BL), Slab, static_cast<size_t>(Total),
-      std::move(ExecRanges), std::move(WritableRanges)));
+      std::move(ExecRanges), std::move(WritableRanges), ColdPool, ColdBase,
+      static_cast<size_t>(ColdSize), RecordCold_));
 }
 
 void EJitCodePoolMemoryManager::deallocate(

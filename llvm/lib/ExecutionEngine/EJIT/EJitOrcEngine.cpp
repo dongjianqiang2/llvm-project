@@ -172,6 +172,27 @@ struct EJitOrcEngine::Impl {
   /// Controlled allocation metadata. The key is the exact name of a
   /// JITDylib created by loadBitcodeModule; the MemoryManager never parses it.
   std::map<std::string, EJitCodePoolManager *> specPoolByDylib;
+#ifdef EJIT_T2_MFS
+  std::unique_ptr<EJitCodePoolManager> coldCodePool;
+  std::map<std::string, bool> coldEligibleDylibs;
+  struct ColdCompanion {
+    uint64_t hotSize;
+    EJitColdCodeRange cold;
+  };
+  std::map<uintptr_t, ColdCompanion> coldCompanions;
+
+  bool attachCold(EJitCompiledCodeInfo &Info, bool RequireReady) const {
+    auto It = coldCompanions.find(Info.codeStart);
+    if (It == coldCompanions.end())
+      return true;
+    if (It->second.hotSize != Info.codeSize || !It->second.cold.valid())
+      return false;
+    Info.cold = It->second.cold;
+    return !RequireReady ||
+           (coldCodePool && coldCodePool->isRangeReady(
+                                reinterpret_cast<void *>(Info.cold.codeStart)));
+  }
+#endif
 #endif
   std::unique_ptr<orc::LLJIT> J;
   PeriodArrayRegistry *periodReg = nullptr;
@@ -737,6 +758,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // the specialization savings (fewer BBs / folded branches). Small makes
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
   JTMBOrErr->setCodeModel(CodeModel::Small);
+#ifdef EJIT_T2_MFS
+  JTMBOrErr->getOptions().EnableMachineFunctionSplitter = true;
+#endif
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
@@ -781,6 +805,13 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 #endif
   engine->P->farCodePool =
       makeSreCodePoolManager(EJitCodePoolPlacement::FarDynamic, kEJitFarPoolId);
+#ifdef EJIT_T2_MFS
+  engine->P->coldCodePool = makeSreColdCodePoolManager();
+  if (!engine->P->coldCodePool)
+    return make_error<StringError>(
+        "EJitOrcEngine: dedicated cold pool reservation unavailable",
+        inconvertibleErrorCode());
+#endif
   {
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
     std::vector<EJitCodePoolManager *> NearPools;
@@ -796,14 +827,30 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
       auto It = State->specPoolByDylib.find(JD->getName());
       return It == State->specPoolByDylib.end() ? nullptr : It->second;
     };
+    EJitCodePoolMemoryManager::PoolSelector ColdSelector;
+    EJitCodePoolMemoryManager::ColdRangeRecorder RecordCold;
+#ifdef EJIT_T2_MFS
+    ColdSelector = [State = engine->P.get()](const jitlink::JITLinkDylib *JD) {
+      auto It = JD ? State->coldEligibleDylibs.find(JD->getName())
+                   : State->coldEligibleDylibs.end();
+      return It != State->coldEligibleDylibs.end() && It->second
+                 ? State->coldCodePool.get()
+                 : nullptr;
+    };
+    RecordCold = [State = engine->P.get()](uintptr_t Hot, uint64_t Size,
+                                           const EJitColdCodeRange &Cold) {
+      State->coldCompanions.emplace(Hot, Impl::ColdCompanion{Size, Cold});
+    };
+#endif
     Builder.setObjectLinkingLayerCreator(
-        [NearPools = std::move(NearPools), FarPool,
-         Selector](orc::ExecutionSession &ES)
+        [NearPools = std::move(NearPools), FarPool, Selector, ColdSelector,
+         RecordCold](orc::ExecutionSession &ES)
             -> Expected<std::unique_ptr<orc::ObjectLayer>> {
           constexpr size_t JitPageSize = 4096;
           return std::make_unique<orc::ObjectLinkingLayer>(
               ES, std::make_unique<EJitCodePoolMemoryManager>(
-                      NearPools, *FarPool, JitPageSize, Selector));
+                      NearPools, *FarPool, JitPageSize, Selector, ColdSelector,
+                      RecordCold));
         });
 #else
     EJitCodePoolManager *NearPool = engine->P->nearCodePool.get();
@@ -916,6 +963,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           }
 
           engine->P->optimizer->runPipeline(M, *ctx);
+#ifdef EJIT_T2_MFS
+          for (Function &F : M)
+            if (!F.hasFnAttribute("ejit-mfs-zero-count-only"))
+              F.addFnAttr("ejit-mfs-disabled");
+#endif
 
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
@@ -1008,6 +1060,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             }
           }
         });
+        // ORC consumes this IR after the transform returns. Analyses such as
+        // MemorySSA own Values tied to its context, so destroy them while the
+        // module is still alive, not at the next compilation or shutdown.
+        engine->P->optimizer->clearAnalyses();
+
         // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
         // Gen creates them inside runPipeline (after addIRModule), so the
         // MR's claim - computed at addIRModule from the original module -
@@ -1139,6 +1196,9 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   if (it != P->specDylibs.end()) {
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
     P->specPoolByDylib.erase(it->second->getName());
+#ifdef EJIT_T2_MFS
+    P->coldEligibleDylibs.erase(it->second->getName());
+#endif
 #endif
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
       EJIT_DIAG("loadBitcode key=0x%016lx: remove stale JD FAILED: %s",
@@ -1174,6 +1234,11 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
         inconvertibleErrorCode());
   }
   P->specPoolByDylib.emplace(JDName, SelectedPool);
+#ifdef EJIT_T2_MFS
+  P->coldEligibleDylibs.emplace(
+      JDName, P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse &&
+                  !P->activeCtx->profileData.empty());
+#endif
 #endif
 
   // Resolve undefined function symbols from user-registered table.
@@ -1264,6 +1329,9 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error", cacheKey);
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
     P->specPoolByDylib.erase(JDName);
+#ifdef EJIT_T2_MFS
+    P->coldEligibleDylibs.erase(JDName);
+#endif
 #endif
     if (auto RemoveErr = P->J->getExecutionSession().removeJITDylib(*JDOrErr))
       EJIT_DIAG("loadBitcode key=0x%016lx: remove failed JD FAILED: %s",
@@ -1407,7 +1475,12 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
 #endif
   if (P->farCodePool)
     Out.far = P->farCodePool->getStats();
-#define EJIT_SUM_STAT(Field) Out.total.Field = Out.near.Field + Out.far.Field
+#ifdef EJIT_T2_MFS
+  if (P->coldCodePool)
+    Out.cold = P->coldCodePool->getStats();
+#endif
+#define EJIT_SUM_STAT(Field)                                                   \
+  Out.total.Field = Out.near.Field + Out.far.Field + Out.cold.Field
   EJIT_SUM_STAT(poolCount);
   EJIT_SUM_STAT(sealedCount);
   EJIT_SUM_STAT(activeCount);
@@ -1418,16 +1491,19 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJIT_SUM_STAT(splitInvocations);
   EJIT_SUM_STAT(rwEnableInvocations);
   EJIT_SUM_STAT(finalizedRangeCount);
-  Out.total.pendingBytes = Out.near.pendingBytes + Out.far.pendingBytes;
-  Out.total.pendingRangeCount =
-      Out.near.pendingRangeCount + Out.far.pendingRangeCount;
-  Out.total.fallbackCount = Out.near.fallbackCount + Out.far.fallbackCount;
-  Out.total.full = Out.near.full || Out.far.full;
+  EJIT_SUM_STAT(pendingBytes);
+  EJIT_SUM_STAT(pendingRangeCount);
+  EJIT_SUM_STAT(fallbackCount);
+  Out.total.full = Out.near.full || Out.far.full || Out.cold.full;
   Out.total.baseAddress =
       Out.near.baseAddress != 0 ? Out.near.baseAddress : Out.far.baseAddress;
   Out.total.endAddress = Out.far.endAddress > Out.near.endAddress
                              ? Out.far.endAddress
                              : Out.near.endAddress;
+  if (Out.cold.baseAddress &&
+      (!Out.total.baseAddress || Out.cold.baseAddress < Out.total.baseAddress))
+    Out.total.baseAddress = Out.cold.baseAddress;
+  Out.total.endAddress = std::max(Out.total.endAddress, Out.cold.endAddress);
 #undef EJIT_SUM_STAT
   return Out;
 }
@@ -1441,8 +1517,13 @@ bool EJitOrcEngine::findCodeRange(const void *FnPtr,
   }
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
   for (const auto &Pool : P->nearHotCodePools)
-    if (Pool && Pool->findRange(FnPtr, Out))
+    if (Pool && Pool->findRange(FnPtr, Out)) {
+#ifdef EJIT_T2_MFS
+      return P->attachCold(Out, /*RequireReady=*/true);
+#else
       return true;
+#endif
+    }
 #else
   if (P->nearCodePool && P->nearCodePool->findRange(FnPtr, Out))
     return true;
@@ -1454,8 +1535,13 @@ bool EJitOrcEngine::findPendingCodeRange(const void *FnPtr,
                                          EJitCompiledCodeInfo &Out) const {
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
   for (const auto &Pool : P->nearHotCodePools)
-    if (Pool && Pool->findPendingRange(FnPtr, Out))
+    if (Pool && Pool->findPendingRange(FnPtr, Out)) {
+#ifdef EJIT_T2_MFS
+      return P->attachCold(Out, /*RequireReady=*/false);
+#else
       return true;
+#endif
+    }
 #else
   if (P->nearCodePool && P->nearCodePool->findPendingRange(FnPtr, Out))
     return true;
@@ -1466,8 +1552,15 @@ bool EJitOrcEngine::findPendingCodeRange(const void *FnPtr,
 bool EJitOrcEngine::isCodeReady(const void *FnPtr) const {
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
   for (const auto &Pool : P->nearHotCodePools)
-    if (Pool && Pool->isRangeReady(FnPtr))
+    if (Pool && Pool->isRangeReady(FnPtr)) {
+#ifdef EJIT_T2_MFS
+      EJitCompiledCodeInfo Info;
+      return Pool->findRange(FnPtr, Info) &&
+             P->attachCold(Info, /*RequireReady=*/true);
+#else
       return true;
+#endif
+    }
 #else
   if (P->nearCodePool && P->nearCodePool->isRangeReady(FnPtr))
     return true;
@@ -1476,7 +1569,38 @@ bool EJitOrcEngine::isCodeReady(const void *FnPtr) const {
 }
 
 Error EJitOrcEngine::flushPendingCode(uint32_t poolId) {
-  Error Result = Error::success();
+#ifdef EJIT_T2_MFS
+  // Called only at the existing worker batch publication point. A failed cold
+  // seal must prevent the corresponding hot pointer from becoming publishable.
+  if (P->coldCodePool) {
+    for (const auto &KV : P->coldCompanions) {
+      EJitCompiledCodeInfo Hot;
+      bool Matches = false;
+#ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
+      if (poolId == 0xFFFFFFFFu) {
+        for (const auto &Pool : P->nearHotCodePools)
+          if (Pool &&
+              Pool->findPendingRange(reinterpret_cast<void *>(KV.first), Hot)) {
+            Matches = true;
+            break;
+          }
+      } else if (poolId < kEJitNearHotPoolCount &&
+                 P->nearHotCodePools[poolId]) {
+        Matches = P->nearHotCodePools[poolId]->findPendingRange(
+            reinterpret_cast<void *>(KV.first), Hot);
+      }
+#else
+      Matches = P->nearCodePool && P->nearCodePool->findPendingRange(
+                                       reinterpret_cast<void *>(KV.first), Hot);
+#endif
+      if (Matches && !P->coldCodePool->isRangeReady(
+                         reinterpret_cast<void *>(KV.second.cold.codeStart)))
+        if (auto Err = P->coldCodePool->flushPendingRange(
+                reinterpret_cast<void *>(KV.second.cold.codeStart)))
+          return Err;
+    }
+  }
+#endif
 #ifdef EJIT_CODE_POOL_FIXED_NEAR_HOT
   if (poolId != 0xFFFFFFFFu) {
     if (poolId >= kEJitNearHotPoolCount || !P->nearHotCodePools[poolId])
@@ -1484,11 +1608,13 @@ Error EJitOrcEngine::flushPendingCode(uint32_t poolId) {
                                      inconvertibleErrorCode());
     return P->nearHotCodePools[poolId]->flushPendingRanges();
   }
+  Error Result = Error::success();
   for (auto &Pool : P->nearHotCodePools)
     if (Pool)
       Result = joinErrors(std::move(Result), Pool->flushPendingRanges());
 #else
   (void)poolId;
+  Error Result = Error::success();
   if (P->nearCodePool)
     Result = P->nearCodePool->flushPendingRanges();
 #endif

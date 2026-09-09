@@ -437,6 +437,11 @@ void ejit_taskpool_print_stats();
 void ejit_taskpool_print_compiled();
 uint32_t ejit_taskpool_get_worker_core();
 
+/// Diagnose an observed instruction/return address in a currently published
+/// Tier-2 version: 1=hot, 2=cold, 0=unknown/stale/contended. This does not make
+/// an address callable; it is intended for explicit execution-witness checks.
+uint32_t ejit_taskpool_classify_tier2_pc(uintptr_t pc);
+
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 // Online-PGO value-profiling observability (EJIT_VALUE_PROFILE.md §9). All
 // counters are cold-path (Tier-2 merge / transform), so they are always
@@ -526,6 +531,10 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out);
 
 /// Placement-aware counterpart of ejit_get_code_pool_stats().
 ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
+
+/// Dedicated MFS cold-pool usage, separate from near/far and their
+/// reservations. The existing v1/v2 output structures retain their sizes.
+ejit_status_t ejit_get_cold_code_pool_stats(ejit_code_pool_stats_t *out);
 
 /// Print code pool usage statistics through the platform log. Paired with
 /// ejit_get_code_pool_stats() (human-readable form).
