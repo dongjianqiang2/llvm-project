@@ -175,6 +175,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 
   // Phase 1 - specialize (common to all tiers): turn the period index and
   // every may_const field into a compile-time constant.
+  applyBoundPointerFacts(M, ctx);
   preReplacePeriodIndices(M, ctx);
   runInstCombine(M);
   EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
@@ -753,6 +754,93 @@ void EJitOptimizer::captureCounterGlobals(Module &M) {
     }
   }
 #endif
+}
+
+/// The pointee alignment CodeGen recorded for bound-pointer parameter
+/// \p ArgIndex, or nullopt when the entry predates the operand.
+static MaybeAlign boundPointeeAlign(const Function &F, unsigned ArgIndex) {
+  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
+  if (!MD)
+    return std::nullopt;
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    // {tag, period, i32 argIndex, i64 size, i64 align, <field nodes...>}
+    if (!Sub || Sub->getNumOperands() < 5)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    if (!Tag || Tag->getString() != TAG_EJIT_BOUND_PTR)
+      continue;
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (!Idx || Idx->getZExtValue() != ArgIndex)
+      continue;
+    auto *Al = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(4));
+    if (!Al)
+      return std::nullopt;
+    const uint64_t A = Al->getZExtValue();
+    // Reject rather than trust: Attribute::getWithAlignment asserts above
+    // Value::MaximumAlignment, so malformed or hand-written bitcode could
+    // otherwise abort the JIT (or build an invalid attribute with NDEBUG).
+    if (A == 0 || !isPowerOf2_64(A) || A > Value::MaximumAlignment)
+      return std::nullopt;
+    return MaybeAlign(Align(A));
+  }
+  return std::nullopt;
+}
+
+/// Give the entry's ejit_bound_ptr parameters the facts their contract already
+/// guarantees, so the alias analysis and the simplification pipeline can use
+/// them.
+///
+///   nonnull, dereferenceable(size) -- the parameter is a pointer to a
+///       complete object and the worker read `size` bytes through it while
+///       compiling. The pointer may not change while the dimension is active,
+///       so this holds for every call reaching the specialization.
+///   align(alignof(T)) -- from the pointee TYPE, recorded by CodeGen in the
+///       ejit_bound_ptr metadata node. Never from the observed address, which
+///       the contract does not fix.
+///
+/// noalias is not attached: nothing makes two bound pointers disjoint.
+///
+/// These facts sharpen what a contract violation costs. Passing a different
+/// pointer while the dimension is active already produced stale values; it can
+/// now also produce miscompiled code.
+void EJitOptimizer::applyBoundPointerFacts(Module &M,
+                                           const SpecializationContext &ctx) {
+  if (ctx.boundPointers.empty())
+    return;
+  Function *Root = M.getFunction(ctx.fnName);
+  if (!Root)
+    return;
+
+  LLVMContext &Ctx = M.getContext();
+  [[maybe_unused]] unsigned Applied = 0;
+  for (const EJitBoundPointerView &View : ctx.boundPointers) {
+    // A view without a live pointer or size promises nothing.
+    if (!View.rawPtr || View.size == 0)
+      continue;
+    if (View.argIndex >= Root->arg_size())
+      continue;
+    Argument *Arg = Root->getArg(View.argIndex);
+    if (!Arg->getType()->isPointerTy())
+      continue;
+    // Merge, never overwrite: addAttr REPLACES an integer attribute, so a
+    // parameter already carrying a stronger fact -- align_value(64) from the
+    // source, or a wider dereferenceable -- would be weakened by the
+    // ABI-derived one. Keep whichever is stronger.
+    Arg->addAttr(Attribute::NonNull);
+    if (View.size > Arg->getDereferenceableBytes())
+      Arg->addAttr(Attribute::getWithDereferenceableBytes(Ctx, View.size));
+    // Both halves matter: speculating a load needs
+    // isDereferenceableAndAlignedPointer, and size alone leaves it false.
+    if (MaybeAlign A = boundPointeeAlign(*Root, View.argIndex)) {
+      MaybeAlign Cur = Arg->getParamAlign();
+      if (!Cur || *A > *Cur)
+        Arg->addAttr(Attribute::getWithAlignment(Ctx, *A));
+    }
+    ++Applied;
+  }
+  EJIT_DIAG_VERBOSE("bound-ptr facts func=%s applied=%u of %zu",
+                    ctx.fnName.c_str(), Applied, ctx.boundPointers.size());
 }
 
 void EJitOptimizer::preReplacePeriodIndices(Module &M,
