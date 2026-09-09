@@ -92,6 +92,9 @@ namespace ejit {
 /// Max dims in one identity; matches EJitSharedCacheSlot::dims.
 constexpr uint32_t kEJitSharedMaxDims = 4u;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
+/// Mirror of kEJitConstDimType (EJitCommon.h), which this intentionally
+/// light-include TU cannot reach; EJitRuntime.cpp static_asserts them equal.
+constexpr uint32_t kEJitSharedConstDimType = kEJitSharedDimTypes - 1;
 constexpr uint32_t kEJitSharedInstances = 256u;
 /// Max runtime-writable ranges carried per cache slot (v9). Kept in lockstep
 /// with the code-pool descriptor bound so a range published by the owner is

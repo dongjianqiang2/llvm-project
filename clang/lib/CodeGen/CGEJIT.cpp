@@ -69,17 +69,30 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
       !F->hasFnAttribute(llvm::Attribute::AlwaysInline))
     F->addFnAttr(llvm::Attribute::NoInline);
 
-  // ejit_period_arr_ind (on parameters)
+  // Specialization dimensions (on parameters). Both kinds are emitted in ONE
+  // parameter-ordered loop: the wrapper, module loader and JIT optimizer all
+  // identify a dim by its position in this operand list, so splitting the two
+  // kinds into separate loops would desync the cache-key packing from the
+  // source parameter order.
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {
     const ParmVarDecl *PD = FD->getParamDecl(I);
+    llvm::Metadata *Tag = nullptr;
+    llvm::Metadata *Name = nullptr;
     if (const auto *IdxAttr = PD->getAttr<EjitPeriodArrIndAttr>()) {
-      Entries.push_back(llvm::MDNode::get(Ctx, {
-          llvm::MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
-          llvm::MDString::get(Ctx, IdxAttr->getPeriodName()),
-          llvm::ConstantAsMetadata::get(
-              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), I))
-      }));
+      Tag = llvm::MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND);
+      Name = llvm::MDString::get(Ctx, IdxAttr->getPeriodName());
+    } else if (PD->hasAttr<EjitConstDimAttr>()) {
+      // Empty period name: a const dim names no lifecycle.
+      Tag = llvm::MDString::get(Ctx, TAG_EJIT_CONST_DIM);
+      Name = llvm::MDString::get(Ctx, "");
+    } else {
+      continue;
     }
+    Entries.push_back(llvm::MDNode::get(Ctx, {
+        Tag, Name,
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), I))
+    }));
   }
 
   // ejit_bound_ptr (on pointer parameters). The pointee size is part of the

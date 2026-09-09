@@ -13497,8 +13497,8 @@ def err_ejit_period_arr_too_large : Error<
 def err_ejit_period_arr_ind_invalid_type : Error<
   "ejit_period_arr_ind parameter %0 must have integer type">;
 def err_ejit_period_arr_ind_too_many : Error<
-  "function %0 has %1 ejit_period_arr_ind parameters, "
-  "which exceeds the maximum of 4">;
+  "function %0 has %1 specialization dimension parameters "
+  "(ejit_period_arr_ind / ejit_const_dim), which exceeds the maximum of 4">;
 def err_ejit_bound_ptr_invalid_type : Error<
   "ejit_bound_ptr parameter %0 must be a pointer to a complete object type">;
 def err_ejit_bound_ptr_duplicate : Error<
@@ -13508,6 +13508,13 @@ def err_ejit_bound_ptr_missing_dim : Error<
   "ejit_period_arr_ind(%0) parameter">;
 def err_ejit_bound_ptr_too_many : Error<"function %0 has %1 ejit_bound_ptr "
                                         "parameters; at most 8 are supported">;
+def err_ejit_const_dim_invalid_type : Error<
+  "ejit_const_dim parameter %0 must have integer type">;
+def err_ejit_const_dim_too_wide : Error<
+  "ejit_const_dim parameter %0 has %1 bits, which exceeds the maximum of 32">;
+def err_ejit_dim_kind_conflict : Error<
+  "'ejit_const_dim' and 'ejit_period_arr_ind' cannot be combined on "
+  "parameter %0">;
 def err_ejit_entry_recursive : Error<
   "ejit_entry function %0 cannot be recursive">;
 def err_ejit_period_lc_no_index : Error<

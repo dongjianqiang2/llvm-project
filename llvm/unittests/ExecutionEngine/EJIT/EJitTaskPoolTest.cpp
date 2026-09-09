@@ -242,12 +242,16 @@ TEST(EJitSwitchControllerTest, DefaultsEnabledVersionZero) {
   EXPECT_EQ(S.getInstanceVersion(7, 255), 0u);
 }
 
-TEST(EJitSwitchControllerTest, DimType0And7Valid) {
+// The top row is reserved for ejit_const_dim, so the highest TOGGLABLE dimType
+// is the one below it; the reserved row refuses every toggle.
+TEST(EJitSwitchControllerTest, DimType0AndTopLifecycleValid) {
   EJitSwitchController S;
+  const uint32_t Top = EJitSwitchController::CONST_DIM_TYPE - 1;
   EXPECT_TRUE(S.setEnabled(0, 1, false));
   EXPECT_EQ(S.getInstanceVersion(0, 1), 1u);
-  EXPECT_TRUE(S.setEnabled(7, 1, false));
-  EXPECT_EQ(S.getInstanceVersion(7, 1), 1u);
+  EXPECT_TRUE(S.setEnabled(Top, 1, false));
+  EXPECT_EQ(S.getInstanceVersion(Top, 1), 1u);
+  EXPECT_FALSE(S.setEnabled(EJitSwitchController::CONST_DIM_TYPE, 1, false));
 }
 
 TEST(EJitSwitchControllerTest, DimType8Rejected) {
@@ -856,17 +860,19 @@ TEST(EJitLifecycleRegistry, CrossModuleSameNameSameSlot) {
   R.reset();
 }
 
-// The 9th distinct lifecycle is rejected (kEJitInvalidDimType), never aliased
-// onto an existing slot.
-TEST(EJitLifecycleRegistry, NinthLifecycleRejected) {
+// One lifecycle past capacity is rejected (kEJitInvalidDimType), never aliased
+// onto an existing slot. Capacity is kEJitMaxLifecycles, not kEJitMaxDimTypes:
+// the top dimType is reserved for ejit_const_dim and the registry never hands
+// it out.
+TEST(EJitLifecycleRegistry, LifecycleBeyondCapacityRejected) {
   auto &R = EJitLifecycleRegistry::instance();
   R.reset();
-  for (uint32_t i = 0; i < kEJitMaxDimTypes; ++i)
+  for (uint32_t i = 0; i < kEJitMaxLifecycles; ++i)
     EXPECT_EQ(R.resolveAssign("lc" + std::to_string(i)), i);
-  EXPECT_EQ(R.count(), kEJitMaxDimTypes);
-  EXPECT_EQ(R.resolveAssign("ninth"), kEJitInvalidDimType);
-  EXPECT_EQ(R.lookup("ninth"), kEJitInvalidDimType);
-  EXPECT_EQ(R.count(), kEJitMaxDimTypes); // unchanged
+  EXPECT_EQ(R.count(), kEJitMaxLifecycles);
+  EXPECT_EQ(R.resolveAssign("one_too_many"), kEJitInvalidDimType);
+  EXPECT_EQ(R.lookup("one_too_many"), kEJitInvalidDimType);
+  EXPECT_EQ(R.count(), kEJitMaxLifecycles); // unchanged
   R.reset();
 }
 

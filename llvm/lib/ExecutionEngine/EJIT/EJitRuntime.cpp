@@ -142,6 +142,11 @@ static_assert(kEJitMaxDimTypes == kEJitSharedDimTypes,
 static_assert(kEJitMaxInstances == kEJitSharedInstances,
               "kEJitMaxInstances (EJitCommon.h) must equal "
               "kEJitSharedInstances (EJitSharedTaskPoolState.h).");
+static_assert(kEJitConstDimType == kEJitSharedConstDimType,
+              "kEJitConstDimType (EJitCommon.h) must equal "
+              "kEJitSharedConstDimType (EJitSharedTaskPoolState.h): the "
+              "wrapper bakes the former, the shared enable gate exempts the "
+              "latter.");
 static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
               "kEJitMaxFuncIndex (EJitCommon.h) must equal "
               "kEJitSharedMaxFuncIndex (EJitSharedTaskPoolState.h).");

@@ -554,6 +554,11 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
   // Verify time-window state for each dimension.
   for (unsigned i = 0; i < dimCount; ++i) {
+    // A const dim has no lifecycle: nothing activates it, and nothing can
+    // invalidate a clone on account of it (the value is part of the key).
+    // Gating on activation here would mean it never compiles at all.
+    if (meta.dimKinds[i] == EJitModuleLoader::FuncMeta::DimKind::Const)
+      continue;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
     // Cross-core: gate on the SHARED enabled bit (the one the producer's
     // ejit_activate writes), NOT the owner-private runtimeState_. The shared
@@ -590,8 +595,12 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.fnName = funcName;
   ctx.cacheKey = cacheKey;
   ctx.optLevel = config_.optLevel;
-  for (unsigned i = 0; i < dimCount; ++i)
-    ctx.dimensions.push_back({periodNames[i], dims[i], meta.dimTypes[i]});
+  for (unsigned i = 0; i < dimCount; ++i) {
+    const bool isConst =
+        meta.dimKinds[i] == EJitModuleLoader::FuncMeta::DimKind::Const;
+    ctx.dimensions.push_back({periodNames[i], dims[i], meta.dimTypes[i],
+                              isConst, meta.argIndices[i]});
+  }
   if (request && request->boundCount) {
     if (!validateBoundPtrDescriptors(request->boundPointers,
                                      request->boundCount)) {
@@ -960,8 +969,9 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   }
 
   // Validate the request: instanceIds must be encodable in the legacy 8-bit
-  // cacheKey slots, and no two dims may share a dimType (a duplicated lifecycle
-  // dimension).
+  // cacheKey slots, and no two dims may share a LIFECYCLE dimType (a duplicated
+  // lifecycle dimension). Const dims are exempt: every one of them carries the
+  // same reserved kEJitConstDimType, and they are told apart by position.
   uint32_t seenDimTypes[4] = {};
   uint32_t seenCount = 0;
 
@@ -971,6 +981,9 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
                 funcIdx, req.dims[i].instanceId, i);
       return nullptr;
     }
+
+    if (req.dims[i].dimType == kEJitConstDimType)
+      continue;
 
     for (uint32_t j = 0; j < seenCount; ++j)
       if (seenDimTypes[j] == req.dims[i].dimType) {
@@ -994,6 +1007,20 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
       EJIT_DIAG("compileNow reject func=%u: meta dim[%u] dimType invalid",
                 funcIdx, i);
       return nullptr;
+    }
+    // Const dims all share one dimType, so a search by type cannot tell them
+    // apart. They are matched POSITIONALLY instead: the wrapper emits dims in
+    // metadata order and the loader records them in that same order, so
+    // req.dims[i] is meta dim i.
+    if (meta.dimKinds[i] == EJitModuleLoader::FuncMeta::DimKind::Const) {
+      if (i >= req.numDims || req.dims[i].dimType != kEJitConstDimType) {
+        EJIT_DIAG("compileNow reject func=%u: meta dim[%u] is const but request "
+                  "dim is not (numDims=%u)",
+                  req.funcIndex, i, req.numDims);
+        return nullptr;
+      }
+      packedDims[i] = static_cast<uint8_t>(req.dims[i].instanceId);
+      continue;
     }
     bool found = false;
     for (uint32_t j = 0; j < req.numDims; ++j) {

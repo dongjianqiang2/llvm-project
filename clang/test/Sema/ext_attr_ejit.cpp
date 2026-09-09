@@ -46,7 +46,7 @@ void too_many_ind(
     __attribute__((ejit_period_arr_ind("c"))) int c,
     __attribute__((ejit_period_arr_ind("d"))) int d,
     __attribute__((ejit_period_arr_ind("e"))) int e);
-// expected-error@-1 {{function 'too_many_ind' has 5 ejit_period_arr_ind parameters, which exceeds the maximum of 4}}
+// expected-error@-1 {{function 'too_many_ind' has 5 specialization dimension parameters (ejit_period_arr_ind / ejit_const_dim), which exceeds the maximum of 4}}
 
 // === Error: ejit_period_lc without matching ind parameter ===
 // Note: %0 is printed without quotes for string arguments

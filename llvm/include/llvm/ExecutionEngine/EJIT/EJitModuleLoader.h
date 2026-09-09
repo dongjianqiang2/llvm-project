@@ -47,13 +47,31 @@ public:
   /// dimTypes[i] is the explicit lifecycle dimType for periodNames[i], read
   /// back from the process-global EJitLifecycleRegistry (the SAME slot the
   /// wrapper baked into its per-lifecycle global), never re-derived here.
+  ///
+  /// For a Const dim there is no name to look up: periodNames[i] is empty and
+  /// dimTypes[i] is the reserved kEJitConstDimType the wrapper baked directly.
+  /// argIndices[i] is the entry function's parameter index, which is how the
+  /// optimizer identifies a const dim (it has no name to match on).
   struct FuncMeta {
+    /// What a specialization dimension is keyed by.
+    enum class DimKind : uint8_t {
+      /// ejit_dim: an instance of a named lifecycle. Gated on activation, and
+      /// invalidated when that lifecycle toggles.
+      Lifecycle,
+      /// ejit_const_dim: the parameter's own value. No lifecycle, so no
+      /// activation gate and no version to check.
+      Const,
+    };
+
     unsigned dimCount = 0;
     std::string periodNames[4];
     uint32_t dimTypes[4] = {0, 0, 0, 0};
     /// Argument indices declared by EJIT_BOUND_PTR on the registered root.
     /// Direct descriptor APIs are checked against this list on the cold path.
     std::vector<uint32_t> boundPointerArgIndices;
+    DimKind dimKinds[4] = {DimKind::Lifecycle, DimKind::Lifecycle,
+                           DimKind::Lifecycle, DimKind::Lifecycle};
+    unsigned argIndices[4] = {0, 0, 0, 0};
   };
   /// Parse bitcode once per funcIdx, cache the result.
   const FuncMeta &getOrCacheFuncMeta(uint32_t funcIdx);

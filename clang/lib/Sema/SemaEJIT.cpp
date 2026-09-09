@@ -207,9 +207,14 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     return;
   }
 
-  // Max count check (4 per function) is deferred to
-  // checkEjitPeriodArrIndLimit() in ActOnFunctionDeclarator because the
-  // FunctionDecl is not yet set as ParmVarDecl DeclContext during parsing.
+  if (PVD->hasAttr<EjitConstDimAttr>()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_dim_kind_conflict) << PVD;
+    return;
+  }
+
+  // Max count check (4 per function, both dim kinds together) is deferred to
+  // checkEjitDimLimit() in ActOnFunctionDeclarator because the FunctionDecl is
+  // not yet set as ParmVarDecl DeclContext during parsing.
 
   // Extract period name
   StringRef PeriodName;
@@ -246,6 +251,47 @@ void handleEjitBoundPtrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     return;
   }
   PVD->addAttr(::new (S.Context) EjitBoundPtrAttr(S.Context, AL, PeriodName));
+}
+
+/// handleEjitConstDimAttr - Process the ejit_const_dim attribute.
+/// Checks:
+///   1. Applies only to ParmVarDecl
+///   2. Parameter type must be an integer of at most 32 bits
+///   3. Not also ejit_period_arr_ind on the same parameter
+///   4. At most 4 dimension parameters per function (both kinds together,
+///      deferred to checkEjitDimLimit)
+void handleEjitConstDimAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  auto *PVD = dyn_cast<ParmVarDecl>(D);
+  if (!PVD) {
+    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+        << AL << AL.isRegularKeywordAttribute() << "function parameters";
+    return;
+  }
+
+  QualType PT = PVD->getType();
+  if (!PT->isIntegerType()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_const_dim_invalid_type) << PVD;
+    return;
+  }
+
+  // The wrapper narrows the argument to i32 before the runtime can range-check
+  // it, so a wider parameter would alias two values onto one specialization.
+  // Dependent widths are re-checked on instantiation.
+  if (!PT->isDependentType()) {
+    uint64_t Width = S.Context.getIntWidth(PT);
+    if (Width > 32) {
+      S.Diag(AL.getLoc(), diag::err_ejit_const_dim_too_wide)
+          << PVD << static_cast<unsigned>(Width);
+      return;
+    }
+  }
+
+  if (PVD->hasAttr<EjitPeriodArrIndAttr>()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_dim_kind_conflict) << PVD;
+    return;
+  }
+
+  PVD->addAttr(::new (S.Context) EjitConstDimAttr(S.Context, AL));
 }
 
 /// handleEjitEntryAttr - Process the ejit_entry attribute.
@@ -298,30 +344,36 @@ void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   D->addAttr(::new (S.Context) EjitPeriodLcAttr(S.Context, AL, PeriodName));
 }
 
-/// checkEjitPeriodArrIndLimit - Enforce the limit of at most 4
-/// ejit_period_arr_ind parameters per function. Called from
+/// checkEjitDimLimit - Enforce the limit of at most 4 specialization dimension
+/// parameters per function. Both kinds count against the SAME limit: they
+/// occupy the same fixed EJitDimPair dims[4] on the wire. Called from
 /// ActOnFunctionDeclarator after all parameter attributes have been processed.
-void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
+void checkEjitDimLimit(Sema &S, const FunctionDecl *FD) {
   if (!FD)
     return;
 
   unsigned Count = 0;
   const ParmVarDecl *OverflowPVD = nullptr;
   for (const ParmVarDecl *P : FD->parameters()) {
-    if (P->hasAttr<EjitPeriodArrIndAttr>()) {
+    if (P->hasAttr<EjitPeriodArrIndAttr>() || P->hasAttr<EjitConstDimAttr>()) {
       Count++;
       if (Count > MAX_PERIOD_ARR_IND_PARAMS)
         OverflowPVD = P;
     }
   }
 
-  if (Count > MAX_PERIOD_ARR_IND_PARAMS && OverflowPVD) {
-    // Get the attribute location from the overflow parameter
-    if (auto *A = OverflowPVD->getAttr<EjitPeriodArrIndAttr>()) {
-      S.Diag(A->getLocation(), diag::err_ejit_period_arr_ind_too_many)
-          << FD << Count;
-    }
-  }
+  if (Count <= MAX_PERIOD_ARR_IND_PARAMS || !OverflowPVD)
+    return;
+
+  // Anchor the error on whichever dim attribute the overflow parameter carries.
+  SourceLocation Loc;
+  if (auto *A = OverflowPVD->getAttr<EjitPeriodArrIndAttr>())
+    Loc = A->getLocation();
+  else if (auto *A = OverflowPVD->getAttr<EjitConstDimAttr>())
+    Loc = A->getLocation();
+  else
+    return;
+  S.Diag(Loc, diag::err_ejit_period_arr_ind_too_many) << FD << Count;
 }
 
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {

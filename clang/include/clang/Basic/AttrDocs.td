@@ -9537,6 +9537,41 @@ dimension, modifying the object, and reactivating the dimension.
   }];
 }
 
+def EjitConstDimDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+EmbeddedJIT: marks a function parameter as a lifecycle-free specialization
+dimension.
+
+Like ``ejit_dim``, the parameter's value is substituted as a compile-time
+constant during JIT compilation. Unlike ``ejit_dim``, it names no time window:
+there is no period array behind it, no ``ejit_activate``/``ejit_deactivate``,
+and nothing that ever invalidates a specialization on account of it.
+
+The value is part of the specialization's cache key, so one specialization is
+compiled per distinct value observed and is only ever reached by calls passing
+that value. The attribute therefore does **not** assert that the parameter is
+stable across calls -- only that the code compiled for a given value stays
+correct for that value. A parameter that cycles every invocation (a slot number,
+a mode selector) is a valid subject.
+
+Because the clone count is the number of distinct values seen at runtime, this
+is only appropriate for parameters with a naturally small value set. Annotating
+a wide-domain parameter (a counter, a timestamp) thrashes the JIT cache with no
+diagnostic. Values of 256 or greater are not specialized and run the AOT body.
+
+The parameter type must be an integer of 32 bits or fewer. The attribute cannot
+be combined with ``ejit_dim`` on the same parameter, and the two kinds share one
+budget of 4 dimension parameters per function.
+
+.. code-block:: c
+
+  __attribute__((ejit_entry))
+  void init_trp(__attribute__((ejit_period_arr_ind("trp"))) uint32_t trpIdx,
+                __attribute__((ejit_const_dim)) uint32_t slotNo);
+  }];
+}
+
 def EjitEntryDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{

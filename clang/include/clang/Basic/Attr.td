@@ -5265,6 +5265,13 @@ def EjitBoundPtr : InheritableParamAttr {
   let Documentation = [EjitBoundPtrDocs];
 }
 
+// Marks a function parameter as a lifecycle-free specialization dimension
+def EjitConstDim : InheritableParamAttr {
+  let Spellings = [Clang<"ejit_const_dim">];
+  let Subjects = SubjectList<[ParmVar]>;
+  let Documentation = [EjitConstDimDocs];
+}
+
 // Marks a function for JIT optimization
 def EjitEntry : InheritableAttr {
   let Spellings = [Clang<"ejit_entry">];

@@ -46,6 +46,11 @@ bool EJitSwitchController::isInstanceEnabled(uint32_t dimType,
                                              uint32_t instanceId) const {
   if (dimType >= MAX_DIM_TYPES || instanceId >= MAX_INSTANCES)
     return false;
+  // An ejit_const_dim has no lifecycle to activate, so its row is not a gate.
+  // The exemption lives here rather than at the call sites so no lookup path
+  // (tryCacheHit and the unrolled 1D-4D variants) can omit it.
+  if (dimType == CONST_DIM_TYPE)
+    return true;
   return enabled_[dimType][instanceId].loadRelaxed() != 0;
 }
 
@@ -53,12 +58,19 @@ uint32_t EJitSwitchController::getInstanceVersion(uint32_t dimType,
                                                   uint32_t instanceId) const {
   if (dimType >= MAX_DIM_TYPES || instanceId >= MAX_INSTANCES)
     return 0;
+  // Pinned at 0: a const dim contributes nothing to the compile checkpoints.
+  if (dimType == CONST_DIM_TYPE)
+    return 0;
   return version_[dimType][instanceId].loadAcquire();
 }
 
 bool EJitSwitchController::setEnabled(uint32_t dimType, uint32_t instanceId,
                                       bool wantOn) {
   if (dimType >= MAX_DIM_TYPES || instanceId >= MAX_INSTANCES)
+    return false;
+  // Nothing may toggle the reserved const-dim row: its clones are keyed by the
+  // value they baked in, so there is no event that could invalidate one.
+  if (dimType == CONST_DIM_TYPE)
     return false;
   // One CAS; version bumps by exactly one only when the flag actually flips.
   uint8_t expected = wantOn ? 0 : 1;

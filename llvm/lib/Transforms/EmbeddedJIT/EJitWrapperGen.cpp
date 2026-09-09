@@ -142,10 +142,13 @@ static cl::opt<bool> EJitMissFnCold(
 
 namespace {
 
-struct PeriodArrIndInfo {
+// One specialization dimension, in metadata (= source parameter) order.
+// PeriodName is empty exactly when IsConst.
+struct DimInfo {
   std::string PeriodName;
   unsigned ArgIndex;
   uint32_t DimType;
+  bool IsConst;
 };
 
 struct BoundPtrInfo {
@@ -175,8 +178,8 @@ static SmallVector<BoundPtrInfo, 8> getBoundPtrInfos(const Function &F) {
   return Result;
 }
 
-static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
-  SmallVector<PeriodArrIndInfo, 4> Result;
+static SmallVector<DimInfo, 4> getDimInfo(const Function &F) {
+  SmallVector<DimInfo, 4> Result;
   MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
   if (!MD)
     return Result;
@@ -185,16 +188,19 @@ static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
     auto *Sub = dyn_cast<MDNode>(Op.get());
     if (!Sub || Sub->getNumOperands() < 3)
       continue;
-    if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
-      if (Tag->getString() == TAG_EJIT_PERIOD_ARR_IND) {
-        auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
-        auto *IdxC = dyn_cast<ConstantAsMetadata>(Sub->getOperand(2));
-        if (PN && IdxC)
-          if (auto *CI = dyn_cast<ConstantInt>(IdxC->getValue()))
-            Result.push_back({PN->getString().str(),
-                              static_cast<unsigned>(CI->getZExtValue()), 0});
-      }
-    }
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    if (!Tag)
+      continue;
+    bool IsConst = Tag->getString() == TAG_EJIT_CONST_DIM;
+    if (!IsConst && Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      continue;
+    auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
+    auto *IdxC = dyn_cast<ConstantAsMetadata>(Sub->getOperand(2));
+    if (PN && IdxC)
+      if (auto *CI = dyn_cast<ConstantInt>(IdxC->getValue()))
+        Result.push_back({PN->getString().str(),
+                          static_cast<unsigned>(CI->getZExtValue()), 0,
+                          IsConst});
   }
   return Result;
 }
@@ -611,23 +617,26 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   auto isAlreadyWrapped = [](Function &F) -> bool {
     if (!F.getEntryBlock().getName().starts_with("jit_entry"))
       return false;
-    // The wrapper's jit_entry references a per-function global that uniquely
-    // identifies an already-wrapped function: @__ejit_icache_fn_<name> (the
-    // icache probe -- a direct load for 0-dim, or a GEP for numDims>0) or, with
-    // the cache off, @__ejit_funcidx_<name> (the funcIndex load in jit_entry).
-    for (Instruction &I : F.getEntryBlock()) {
-      Value *Ptr = nullptr;
-      if (auto *LI = dyn_cast<LoadInst>(&I))
-        Ptr = LI->getPointerOperand();
-      else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
-        Ptr = GEP->getPointerOperand();
-      if (!Ptr)
-        continue;
-      if (auto *GV = dyn_cast<GlobalVariable>(Ptr))
-        if (GV->getName().starts_with("__ejit_funcidx_") ||
-            GV->getName().starts_with("__ejit_icache_fn_"))
-          return true;
-    }
+    // A jit_entry-headed function that references a per-function wrapper global
+    // is already wrapped: @__ejit_icache_fn_<name> (the icache probe -- a direct
+    // load for 0-dim, or a GEP for numDims>0) or, with the cache off,
+    // @__ejit_funcidx_<name> (the funcIndex load in jit_entry). The search spans
+    // the whole function, not just the entry block: an ejit_const_dim probe puts
+    // its bound guard in jit_entry and the GEP in the guarded successor.
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        Value *Ptr = nullptr;
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+          Ptr = LI->getPointerOperand();
+        else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+          Ptr = GEP->getPointerOperand();
+        if (!Ptr)
+          continue;
+        if (auto *GV = dyn_cast<GlobalVariable>(Ptr))
+          if (GV->getName().starts_with("__ejit_funcidx_") ||
+              GV->getName().starts_with("__ejit_icache_fn_"))
+            return true;
+      }
     return false;
   };
 
@@ -647,16 +656,19 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // guess, so two modules sharing a lifecycle observe the same slot and two
   // different lifecycles never collide (EJitLifecycleRegistry.h). funcIndex is
   // assigned the same way by the process-global EJitFuncRegistry (below).
+  // Const dims are skipped here: they have no lifecycle, so no global and no
+  // registration — the wrapper passes the reserved kEJitConstDimType instead.
   std::map<std::string, GlobalVariable *> DimTypeGlobals;
   for (Function *F : EntryFuncs)
-    for (auto &PI : getPeriodArrIndInfo(*F))
-      if (!PI.PeriodName.empty())
+    for (auto &PI : getDimInfo(*F))
+      if (!PI.IsConst && !PI.PeriodName.empty())
         DimTypeGlobals.emplace(PI.PeriodName, nullptr);
-  if (DimTypeGlobals.size() > kEJitMaxDimTypes) {
+  if (DimTypeGlobals.size() > kEJitMaxLifecycles) {
     Ctx.emitError("ejit-wrapper-gen: module references " +
                   Twine(DimTypeGlobals.size()) +
                   " distinct lifecycle dimensions but at most " +
-                  Twine(kEJitMaxDimTypes) + " are supported (spec §5.1)");
+                  Twine(kEJitMaxLifecycles) + " are supported (spec §5.1, "
+                  "one dimType slot reserved for ejit_const_dim)");
     return PreservedAnalyses::all();
   }
   for (auto &KV : DimTypeGlobals)
@@ -686,7 +698,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   std::map<std::string, IcacheSlotInfo> IcacheFnGlobals;
   if (EJitInlineCache) {
     for (Function *F : EntryFuncs) {
-      unsigned NumDims = getPeriodArrIndInfo(*F).size();
+      unsigned NumDims = getDimInfo(*F).size();
       // Skip functions exceeding the cache dimensionality cap from the icache
       // map. They are still wrapped (taskpool path) but without an icache probe;
       // the per-function DimCount > EJIT_ICACHE_MAX_DIMS check below emits the
@@ -726,9 +738,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (!F->hasFnAttribute(Attribute::AlwaysInline))
       F->addFnAttr(Attribute::NoInline);
 
-    auto PeriodInds = getPeriodArrIndInfo(*F);
+    auto Dims = getDimInfo(*F);
     SmallVector<BoundPtrInfo, 8> BoundPtrs = getBoundPtrInfos(*F);
-    unsigned DimCount = PeriodInds.size();
+    unsigned DimCount = Dims.size();
 
     if (BoundPtrs.size() > MAX_BOUND_PTR_PARAMS) {
       F->getContext().emitError("ejit-wrapper-gen: function has " +
@@ -741,46 +753,58 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (DimCount > EJIT_ICACHE_MAX_DIMS) {
       F->getContext().emitError("ejit-wrapper-gen: more than "
                                 + Twine(EJIT_ICACHE_MAX_DIMS) +
-                                " ejit_period_arr_ind dimensions are not "
+                                " specialization dimensions are not "
                                 "supported");
       continue;
     }
 
-    // Validate the metadata: every dim must name a non-empty lifecycle that has
-    // a per-lifecycle dimType global (created above for every distinct name the
-    // module references), no two dims may name the SAME lifecycle (a duplicated
-    // dimension — distinct names are guaranteed distinct slots at runtime), and
-    // arg indices/types must be in range. The dimType slot itself is resolved
-    // at runtime via the global, never baked here.
+    // Validate the metadata: every LIFECYCLE dim must name a non-empty period
+    // that has a per-lifecycle dimType global (created above for every distinct
+    // name the module references), no two may name the SAME lifecycle (a
+    // duplicated dimension — distinct names are guaranteed distinct slots at
+    // runtime), and arg indices/types must be in range. The dimType slot itself
+    // is resolved at runtime via the global, never baked here.
+    //
+    // Const dims are exempt from the name checks: they carry no period, and any
+    // number of them legitimately share the reserved kEJitConstDimType (the
+    // cache compares dim identity positionally, so they stay distinct).
     bool Invalid = false;
     SmallVector<StringRef, 4> SeenNames;
     unsigned ArgCount = F->arg_size();
     for (unsigned I = 0; I < DimCount; ++I) {
-      auto GIt = DimTypeGlobals.find(PeriodInds[I].PeriodName);
-      if (PeriodInds[I].PeriodName.empty() || GIt == DimTypeGlobals.end()) {
-        F->getContext().emitError("ejit-wrapper-gen: invalid period name in "
-                                  "ejit_period_arr_ind: " +
-                                  PeriodInds[I].PeriodName);
+      if (!Dims[I].IsConst) {
+        auto GIt = DimTypeGlobals.find(Dims[I].PeriodName);
+        if (Dims[I].PeriodName.empty() || GIt == DimTypeGlobals.end()) {
+          F->getContext().emitError("ejit-wrapper-gen: invalid period name in "
+                                    "ejit_period_arr_ind: " +
+                                    Dims[I].PeriodName);
+          Invalid = true;
+          break;
+        }
+        if (llvm::is_contained(SeenNames, StringRef(Dims[I].PeriodName))) {
+          F->getContext().emitError("ejit-wrapper-gen: duplicated lifecycle "
+                                    "dimension in ejit_period_arr_ind metadata");
+          Invalid = true;
+          break;
+        }
+        SeenNames.push_back(Dims[I].PeriodName);
+      } else if (!Dims[I].PeriodName.empty()) {
+        F->getContext().emitError("ejit-wrapper-gen: ejit_const_dim metadata "
+                                  "must carry an empty period name, got: " +
+                                  Dims[I].PeriodName);
         Invalid = true;
         break;
       }
-      if (llvm::is_contained(SeenNames, StringRef(PeriodInds[I].PeriodName))) {
-        F->getContext().emitError("ejit-wrapper-gen: duplicated lifecycle "
-                                  "dimension in ejit_period_arr_ind metadata");
-        Invalid = true;
-        break;
-      }
-      SeenNames.push_back(PeriodInds[I].PeriodName);
 
-      if (PeriodInds[I].ArgIndex >= ArgCount) {
-        F->getContext().emitError("ejit-wrapper-gen: ejit_period_arr_ind "
+      if (Dims[I].ArgIndex >= ArgCount) {
+        F->getContext().emitError("ejit-wrapper-gen: specialization dimension "
                                   "argument index out of range");
         Invalid = true;
         break;
       }
-      Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
+      Value *ArgVal = F->getArg(Dims[I].ArgIndex);
       if (!ArgVal->getType()->isIntegerTy()) {
-        F->getContext().emitError("ejit-wrapper-gen: ejit_period_arr_ind "
+        F->getContext().emitError("ejit-wrapper-gen: specialization dimension "
                                   "argument must be an integer type");
         Invalid = true;
         break;
@@ -792,7 +816,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     for (const BoundPtrInfo &BoundPtr : BoundPtrs) {
       unsigned MatchingDims =
-          llvm::count_if(PeriodInds, [&](const PeriodArrIndInfo &I) {
+          llvm::count_if(Dims, [&](const DimInfo &I) {
             return I.PeriodName == BoundPtr.PeriodName;
           });
       if (BoundPtr.ArgIndex >= ArgCount ||
@@ -959,12 +983,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       B.CreateCondBr(IdxValid, CallBB, FallbackBB);
 
       B.SetInsertPoint(CallBB);
-      auto emitDimTypeVal = [&](unsigned I) {
-        return B.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
+      auto emitDimTypeVal = [&](unsigned I) -> Value * {
+        if (Dims[I].IsConst)
+          return ConstantInt::get(I32Ty, kEJitConstDimType);
+        return B.CreateLoad(I32Ty, DimTypeGlobals[Dims[I].PeriodName],
                             "ejit_dimtype");
       };
       auto emitInstanceVal = [&](unsigned I) -> Value * {
-        Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
+        Value *ArgVal = Fn.getArg(Dims[I].ArgIndex);
         unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
         if (BW > 32)
           return B.CreateTrunc(ArgVal, I32Ty);
@@ -1220,9 +1246,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // Function-body timing is also excluded: it threads an extra wrapper-
       // begin argument into MissFn (changing its signature away from F's) and
       // emits trace calls around the specialization call, neither of which
-      // survives a single-block musttail BLR.
+      // survives a single-block musttail BLR. A const dim is excluded too: its
+      // range guard below needs a miss block to branch to, so the wrapper is
+      // never one block anyway, and the null check it keeps costs one cbz.
+      const bool HasConstDim =
+          llvm::any_of(Dims, [](const DimInfo &I) { return I.IsConst; });
       const bool Sentinelize = !EJitWrapperTiming && !EJitFunctionBodyTiming &&
-                               NumDims <= 2;
+                               NumDims <= 2 && !HasConstDim;
       if (!Sentinelize) {
         JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
         JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
@@ -1231,8 +1261,16 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       if (NumDims > 0) {
         SmallVector<Value *, 5> Indices;
         Indices.push_back(ConstantInt::get(I32Ty, 0));
+        // An ejit_dim value is contractually a dense period-array index in
+        // [0, D), so its axis is indexed unguarded. A const dim carries no such
+        // contract — nothing bounds the value a caller passes — so it gets a
+        // dynamic guard; without it an out-of-range value would index past the
+        // [D]^NumDims table and indirect-call whatever it read. The runtime's
+        // icacheFill declines the same values, so both sides agree on which
+        // identities own a cell.
+        Value *InBounds = nullptr;
         for (unsigned I = 0; I < NumDims; ++I) {
-          Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
+          Value *ArgVal = F->getArg(Dims[I].ArgIndex);
           unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
           Value *Idx = ArgVal;
           if (BW > 32)
@@ -1240,6 +1278,20 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           else if (BW < 32)
             Idx = B.CreateZExt(ArgVal, I32Ty);
           Indices.push_back(Idx);
+          if (Dims[I].IsConst) {
+            Value *Lt = B.CreateICmpULT(
+                Idx, ConstantInt::get(I32Ty, EJIT_ICACHE_DIM_SIZE),
+                "ejit_ic_inrange");
+            InBounds = InBounds ? B.CreateAnd(InBounds, Lt) : Lt;
+          }
+        }
+        if (InBounds) {
+          auto *JitIcacheProbe =
+              BasicBlock::Create(Ctx, "jit_icache_probe", F, JitIcacheDispatch);
+          InBounds = B.CreateIntrinsic(Intrinsic::expect, {InBounds->getType()},
+                                       {InBounds, ConstantInt::getTrue(Ctx)});
+          B.CreateCondBr(InBounds, JitIcacheProbe, JitMiss);
+          B.SetInsertPoint(JitIcacheProbe);
         }
         SlotPtr = B.CreateInBoundsGEP(IcacheSlot->getValueType(), IcacheSlot,
                                       Indices, "ejit_ic_slot");
