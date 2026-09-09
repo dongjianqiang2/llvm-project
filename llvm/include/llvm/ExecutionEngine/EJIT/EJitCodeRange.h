@@ -81,7 +81,7 @@ struct EJitWritableRange {
 /// truncated rather than rejected. Owner-private bookkeeping only — never
 /// serialized into the shared cache slot; only fnSize (the matched entry's
 /// size) crosses the ABI boundary.
-constexpr uint32_t kEJitMaxSymsPerRange = 8u;
+constexpr uint32_t kEJitMaxSymsPerRange = 32u;
 
 /// One defined symbol of a finalized executable range (owner-private,
 /// diagnostic only): the entry function's real size is recovered by matching

@@ -97,7 +97,8 @@ EJitCodePoolManager::Options poolOpts(size_t PoolSize) {
 // 64 bytes of filler "code" referenced by the content block (must outlive G).
 const char CodeBytes[64] = {0};
 
-std::unique_ptr<LinkGraph> makeCodeGraph(size_t Size, uint64_t VAddr) {
+std::unique_ptr<LinkGraph> makeCodeGraph(size_t Size, uint64_t VAddr,
+                                         unsigned Align = 16) {
   auto G = std::make_unique<LinkGraph>(
       "g", std::make_shared<orc::SymbolStringPool>(),
       Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
@@ -105,7 +106,7 @@ std::unique_ptr<LinkGraph> makeCodeGraph(size_t Size, uint64_t VAddr) {
   auto &Sec =
       G->createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
   G->createContentBlock(Sec, ArrayRef<char>(CodeBytes, Size),
-                        orc::ExecutorAddr(VAddr), 16, 0);
+                        orc::ExecutorAddr(VAddr), Align, 0);
   return G;
 }
 
@@ -645,6 +646,44 @@ TEST(EJitCodePoolMemMgr4K, FinalizedRangeCarriesEntryFnSize) {
   cantFail(MM.deallocate(std::move(FA)));
 }
 
+// Keep enough owner-private symbol metadata to find an entry that appears
+// after the legacy eight-symbol capture limit.
+TEST(EJitCodePoolMemMgr4K, FinalizedRangeCapturesEntryPastLegacySymbolLimit) {
+  MockSre4K M;
+  EJitCodePoolManager Pool(
+      fourKMemMgrOpts(), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  constexpr size_t FillerCount = 11;
+  constexpr size_t EntryOffset = FillerCount * 4;
+  constexpr size_t EntrySize = 12;
+  const char *FillerNames[FillerCount] = {"f0", "f1", "f2", "f3", "f4", "f5",
+                                          "f6", "f7", "f8", "f9", "f10"};
+  auto G = makeCodeGraph(64, 0x1000);
+  Block &B = **G->blocks().begin();
+  for (size_t I = 0; I != FillerCount; ++I)
+    G->addDefinedSymbol(B, orc::ExecutorAddrDiff(I * 4), FillerNames[I],
+                        orc::ExecutorAddrDiff(4), Linkage::Strong,
+                        Scope::Default, true, false);
+  G->addDefinedSymbol(B, orc::ExecutorAddrDiff(EntryOffset), "late_entry",
+                      orc::ExecutorAddrDiff(EntrySize), Linkage::Strong,
+                      Scope::Default, true, false);
+
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  auto *EntryAddr = reinterpret_cast<void *>(
+      reinterpret_cast<uintptr_t>(firstBlockAddr(*G)) + EntryOffset);
+  auto FA = cantFail(IFA->finalize());
+
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(EntryAddr, Info));
+  EXPECT_EQ(Info.fnPtr, EntryAddr);
+  EXPECT_EQ(Info.fnSize, static_cast<uint64_t>(EntrySize));
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
 // A graph with no defined symbol records no symbol metadata: fnSize is 0
 // (print_compiled then reports fn_size=0, overhead=codeSize). This guards the
 // "no symbol metadata" fallback path so a symbolless graph never mis-reports
@@ -1052,6 +1091,43 @@ TEST(EJitCodePoolMemMgrBatch, PureCodeAllocationsSharePageUntilFlush) {
   EXPECT_TRUE(Pool.findRange(Addr0, Info));
   EXPECT_TRUE(Pool.findRange(Addr1, Info));
 
+  cantFail(MM.deallocate(std::move(FA0)));
+  cantFail(MM.deallocate(std::move(FA1)));
+}
+
+TEST(EJitCodePoolMemMgrBatch, SixtyFourAlignedPureCodeStaysCompact) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G0 = makeCodeGraph(64, 0x1000, /*Align=*/64);
+  auto IFA0 = cantFail(MM.allocate(nullptr, *G0));
+  void *Addr0 = firstBlockAddr(*G0);
+  auto G1 = makeCodeGraph(64, 0x2000, /*Align=*/64);
+  auto IFA1 = cantFail(MM.allocate(nullptr, *G1));
+  void *Addr1 = firstBlockAddr(*G1);
+
+  auto PageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(Addr0) % 64, 0u);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(Addr1) % 64, 0u);
+  EXPECT_EQ(PageOf(Addr0), PageOf(Addr1));
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(Addr1) -
+                reinterpret_cast<uintptr_t>(Addr0),
+            64u);
+
+  auto FA0 = cantFail(IFA0->finalize());
+  auto FA1 = cantFail(IFA1->finalize());
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 1u);
   cantFail(MM.deallocate(std::move(FA0)));
   cantFail(MM.deallocate(std::move(FA1)));
 }

@@ -57,6 +57,10 @@ struct EJitCompileRequest {
   uint32_t numDims;
   EJitDimPair dims[4];
   uint32_t versions[4];
+  // Unique owner-generation request token. PGO Tier-1 and Tier-2 requests for
+  // one profile lifecycle deliberately share this token, so stale completion
+  // paths cannot clear a newer lifecycle's dedup/admission state.
+  uint64_t requestToken;
   uintptr_t fallbackPtr;
   // Shared-taskpool owner generation captured at enqueue time. A worker drops a
   // request whose generation no longer equals the shared state's generation
@@ -71,10 +75,10 @@ struct EJitCompileRequest {
   EJitBoundPtrDescriptor boundPointers[kEJitMaxBoundPointers];
 };
 
-// Size is stable per pointer width and independent of pointee size: 200 bytes
-// on 64-bit targets and 164 bytes on 32-bit targets.
+// Size is stable per pointer width and independent of pointee size: 208 bytes
+// on 64-bit targets and 176 bytes on 32-bit targets.
 static_assert(
-    sizeof(EJitCompileRequest) == (sizeof(uintptr_t) == 8 ? 200u : 164u),
+    sizeof(EJitCompileRequest) == (sizeof(uintptr_t) == 8 ? 208u : 176u),
     "EJitCompileRequest size must stay fixed and payload-independent");
 static_assert(alignof(EJitCompileRequest) <= 8,
               "EJitCompileRequest alignment must stay <= 8 bytes");

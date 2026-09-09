@@ -61,7 +61,8 @@ namespace {
 bool sameAuditRequest(const EJitCompileRequest &L,
                       const EJitCompileRequest &R) {
   if (L.funcIndex != R.funcIndex || L.numDims != R.numDims ||
-      L.fallbackPtr != R.fallbackPtr || L.generation != R.generation)
+      L.fallbackPtr != R.fallbackPtr || L.generation != R.generation ||
+      L.requestToken != R.requestToken)
     return false;
   for (uint32_t I = 0; I < 4; ++I)
     if (L.dims[I].dimType != R.dims[I].dimType ||
@@ -320,6 +321,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // Ready or on an empty queue (spec §11): a high-priority worker that spun
   // could starve the owner core trying to publish Ready / a producer enqueuing.
   sharedPool_.setWorkerIdleHook(&EJitCompileDriver::sharedWorkerIdle, this);
+  sharedPool_.setNowTicksSource(&EJitCompileDriver::sharedNowTicks, this);
+  sharedPool_.setAbortPgoProfileCallback(
+      &EJitCompileDriver::sharedAbortPgoProfile, this);
   // Owner-only setup, armed for the pool's WHOLE lifetime with a stable ctx.
   // It must stay armed after the first election: ownerShutdown() returns the
   // blob to Uninitialized, so a later init() can elect a DIFFERENT peer, and a
@@ -413,6 +417,15 @@ void EJitCompileDriver::sharedWorkerIdle(void * /*ctx*/, uint32_t ticks) {
   // SRE_TaskDelay directly -- it goes through this injected hook (delay(1) ==
   // yield()).
   EJitSreTask::delay(ticks);
+}
+
+uint64_t EJitCompileDriver::sharedNowTicks(void * /*ctx*/) {
+  return ejit_taskpool_trace_now();
+}
+
+void EJitCompileDriver::sharedAbortPgoProfile(
+    void *ctx, const EJitCompileRequest &req) {
+  static_cast<EJitCompileDriver *>(ctx)->abortPgoProfile(req);
 }
 
 bool EJitCompileDriver::sharedOwnerElected(void *ctx) {
@@ -943,6 +956,51 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 }
 
 #ifdef EJIT_SRE_TASKPOOL
+void EJitCompileDriver::abortPgoProfile(const EJitCompileRequest &req) {
+  const uint32_t FuncIndex = stripReqTier(req.funcIndex);
+  if (req.numDims > 4)
+    return;
+  const auto &Meta = loader_.getOrCacheFuncMeta(FuncIndex);
+  uint8_t Packed[4] = {0, 0, 0, 0};
+  for (unsigned I = 0; I < Meta.dimCount && I < 4; ++I) {
+    bool Found = false;
+    for (uint32_t J = 0; J < req.numDims; ++J)
+      if (req.dims[J].dimType == Meta.dimTypes[I] &&
+          req.dims[J].instanceId <= 255u) {
+        Packed[I] = static_cast<uint8_t>(req.dims[J].instanceId);
+        Found = true;
+        break;
+      }
+    if (!Found)
+      return;
+  }
+  const uint64_t CacheKey =
+      (static_cast<uint64_t>(FuncIndex) << 32) |
+      static_cast<uint64_t>(Packed[0]) |
+      (static_cast<uint64_t>(Packed[1]) << 8) |
+      (static_cast<uint64_t>(Packed[2]) << 16) |
+      (static_cast<uint64_t>(Packed[3]) << 24);
+  notifyTaskpoolPublished(req, false);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Tier-2 failure is terminal for this profile round. A failed PGOUse publish
+  // does not satisfy notifyTaskpoolPublished's normal success condition, so
+  // retire the round explicitly and disarm collection when it was the last.
+  if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse &&
+      vpRoundsActive_ > 0 && --vpRoundsActive_ == 0)
+    ejitVpSetArmed(false);
+#endif
+  tier1Counters_.erase(CacheKey);
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  tier1MayConst_.erase(CacheKey);
+#endif
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  tier1Vp_.erase(CacheKey);
+#endif
+  EJIT_DIAG_DEBUG("PGO profile state cleared key=0x%016lx token=%llu",
+                  CacheKey,
+                  static_cast<unsigned long long>(req.requestToken));
+}
+
 void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   // PGO tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it to
   // recover the real funcIndex - the loader lookup and cacheKey must NOT carry

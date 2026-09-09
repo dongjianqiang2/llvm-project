@@ -24,6 +24,8 @@ using orc::ExecutorAddr;
 using WrapperFunctionCall = orc::shared::WrapperFunctionCall;
 
 namespace {
+constexpr size_t kMaxBatchedCompactAlign = 64;
+
 /// One contiguous executable segment of a finalized allocation (the only kind
 /// of memory that needs execute permission). An allocation may contain several
 /// (non-contiguous) executable segments and any number of non-executable
@@ -230,18 +232,28 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   bool ExecOnly = true;
   bool HasSegments = false;
   bool FitsCompactAlign = true;
+  size_t SegmentCount = 0;
+  size_t MaxSegmentAlign = 0;
+  const size_t CompactAlignLimit =
+      Pool.codeAlignment() > kMaxBatchedCompactAlign ? Pool.codeAlignment()
+                                                     : kMaxBatchedCompactAlign;
   for (auto &KV : BL.segments()) {
     HasSegments = true;
-    if ((KV.first.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None) {
+    ++SegmentCount;
+    const size_t SegmentAlign = KV.second.Alignment.value();
+    if (SegmentAlign > MaxSegmentAlign)
+      MaxSegmentAlign = SegmentAlign;
+    if ((KV.first.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None)
       ExecOnly = false;
-      break;
-    }
-    if (KV.second.Alignment > Pool.codeAlignment())
+    if (SegmentAlign > CompactAlignLimit)
       FitsCompactAlign = false;
   }
   const bool Compact =
       Pool.usesBatchedPageSeal() && HasSegments && ExecOnly && FitsCompactAlign;
-  const size_t LayoutAlign = Compact ? Pool.codeAlignment() : PageSize_;
+  const size_t CompactAlign = MaxSegmentAlign > Pool.codeAlignment()
+                                  ? MaxSegmentAlign
+                                  : Pool.codeAlignment();
+  const size_t LayoutAlign = Compact ? CompactAlign : PageSize_;
   auto SegsSizes = BL.getContiguousPageBasedLayoutSizes(LayoutAlign);
   if (!SegsSizes) {
     EJIT_DIAG("allocate FAIL: layout sizes error graph=%s",
@@ -253,9 +265,14 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   uint64_t Total = SegsSizes->total();
   [[maybe_unused]] const char *Placement = FarPool_ == &Pool ? "far" : "near";
   EJIT_DIAG_DEBUG(
-      "allocate: graph=%s pool=%s total=%llu layoutAlign=%zu compact=%u",
+      "allocate: graph=%s pool=%s total=%llu layoutAlign=%zu compact=%u "
+      "batched=%u segments=%zu execOnly=%u fitsAlign=%u maxAlign=%zu "
+      "configuredAlign=%zu compactAlignLimit=%zu",
       G.getName().c_str(), Placement, static_cast<unsigned long long>(Total),
-      LayoutAlign, static_cast<unsigned>(Compact));
+      LayoutAlign, static_cast<unsigned>(Compact),
+      static_cast<unsigned>(Pool.usesBatchedPageSeal()), SegmentCount,
+      static_cast<unsigned>(ExecOnly), static_cast<unsigned>(FitsCompactAlign),
+      MaxSegmentAlign, Pool.codeAlignment(), CompactAlignLimit);
 
   void *Slab = nullptr;
   if (Total > 0) {

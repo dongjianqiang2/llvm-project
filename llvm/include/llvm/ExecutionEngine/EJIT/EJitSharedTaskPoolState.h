@@ -67,6 +67,20 @@
 #ifndef EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES
 #define EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES 1u
 #endif
+#ifndef EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS
+#define EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS UINT64_C(300000000000)
+#endif
+#ifndef EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES
+#define EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES UINT64_C(3000000000)
+#endif
+#ifndef EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY
+#define EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY 128u
+#endif
+static_assert(EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY >= 1u &&
+                  EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY <= 128u,
+              "cold suppression capacity must be in [1, 128]");
+static_assert(EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES > 0,
+              "PGO publish quiet window must be non-zero");
 // Fixed slots per cache bucket. The shared cache is a fixed-capacity POD table
 // (no std::unordered_map can live in shared memory), so each bucket holds a
 // fixed array of slots. A bucket that fills evicts its oldest-generation slot.
@@ -110,6 +124,11 @@ constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
+constexpr uint32_t kEJitSharedLinkedPendingSlots =
+    EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT;
+static_assert(kEJitSharedLinkedPendingSlots >=
+                  EJIT_CODE_POOL_FIXED_NEAR_HOT_PENDING_LIMIT,
+              "linked-pending registry must cover the near-hot pending bound");
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
 constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
 static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
@@ -173,6 +192,63 @@ enum class EJitCodeBatchRequestState : uint32_t {
   Running = 2,
   Succeeded = 3,
   Failed = 4,
+};
+
+enum class EJitPgoAdmissionState : uint32_t {
+  Free = 0,
+  Active = 1,
+  Aborting = 2,
+};
+
+enum class EJitPgoProfilePhase : uint32_t {
+  Tier1Queued = 0,
+  Tier1Sampling = 1,
+  Tier2Queued = 2,
+  Tier2Compiling = 3,
+};
+
+/// Exact shared ownership record for one pre-link online-PGO lifecycle.
+/// Producer cores only create the record under pgoAdmissionLock. Progress and
+/// expiry are maintained by the single owner worker.
+struct EJitPgoAdmissionSlot {
+  EJitAtomicU32 state; ///< EJitPgoAdmissionState; published last on admission.
+  uint32_t funcIndex;
+  uint32_t numDims;
+  uint32_t generation;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
+  EJitAtomicU64 token;
+  EJitAtomicU64 lastObservedHits;
+  EJitAtomicU64 lastProgressTick;
+  EJitAtomicU32 phase; ///< EJitPgoProfilePhase
+  EJitAtomicU32 progressQuarter;
+};
+
+/// Bounded, admission-lock protected AOT-only identities. Keeping these out of
+/// the result cache means cold profiles cannot evict executable code or consume
+/// cache ways. Old records are replaced round-robin; generation/version checks
+/// make stale records harmless.
+struct EJitPgoColdSuppression {
+  uint32_t valid;
+  uint32_t funcIndex;
+  uint32_t numDims;
+  uint32_t generation;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
+  uint64_t token;
+};
+
+/// Exact identities whose Tier-2 code is linked but not yet executable or
+/// published. The token is zero for a free entry. All fields are protected by
+/// pgoLinkedPendingLock; producers consult this table only after a cache miss.
+struct EJitPgoLinkedPending {
+  uint64_t token;
+  uint32_t funcIndex;
+  uint32_t numDims;
+  uint32_t generation;
+  uint32_t reserved;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
 };
 
 //===----------------------------------------------------------------------===//
@@ -253,6 +329,9 @@ struct EJitSharedCacheSlot {
   /// compile driver via ORC lookup and kept driver-private — they do not
   /// need to live in the shared slot.
   EJitAtomicU64 hitCount;
+  /// Exact online-PGO lifecycle token. Non-zero only for Tier-1/Tier-2 code;
+  /// used by owner cold-GC and late completion checks, never by the wrapper.
+  EJitAtomicU64 pgoToken;
   /// PGO (§7.1): current compile tier of the published code.  0 = Baseline /
   /// not yet published, 1 = Instrumented (Tier-1), 2 = PGOUse (Tier-2).
   /// Used to suppress the Tier-2 auto-trigger on slots that are already
@@ -365,6 +444,7 @@ struct EJitSharedCounters {
   EJitAtomicU64 tier1Compiles;
   EJitAtomicU64 tier2Compiles;
   EJitAtomicU64 profileMergeFails;
+  EJitAtomicU64 coldExpired;
 };
 
 //===----------------------------------------------------------------------===//
@@ -544,13 +624,28 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 icacheReleasersWired;
   EJitAtomicU32 pgoEnabled;     ///< 1 => shared online-PGO trigger is enabled
   EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
-  /// Staged PGO admission. Entries are funcIndex + 1; zero means free.
+  /// Staged PGO admission. Exact token/identity matching prevents stale
+  /// completion from releasing a newer specialization of the same function.
   EJitAtomicU32 pgoAdmissionLock;
   EJitAtomicU32 pgoMaxActiveFunctions;
   EJitAtomicU32 pgoActiveFunctionCount;
-  EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
-  /// Last logged progress quarter for each admission slot: 0..4.
-  EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
+  EJitAtomicU32 pgoActivityEpoch;
+  EJitAtomicU32 pgoPublishBarrier;
+  EJitAtomicU32 pgoProducerInFlight;
+  EJitPgoAdmissionSlot pgoAdmissions[kEJitSharedMaxConcurrentProfiles];
+  /// Per-function value-profile gate. It serializes sampling and snapshot
+  /// capture for identities that share one function's VP storage. Tier-2 link
+  /// transfers duplicate suppression to pgoLinkedPending before clearing it.
+  EJitAtomicU64 pgoVpFunctionGates[kEJitSharedMaxFuncIndex];
+  EJitAtomicU32 pgoLinkedPendingLock;
+  EJitPgoLinkedPending
+      pgoLinkedPending[kEJitSharedLinkedPendingSlots];
+  /// Bounded independently of MAX_FUNC_INDEX. Full tables use deterministic
+  /// round-robin replacement; replacing a record only permits a future PGO
+  /// retry and cannot affect functional AOT correctness.
+  EJitPgoColdSuppression
+      pgoColdSuppressions[EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY];
+  uint32_t pgoColdSuppressionNext;
   EJitAtomicU64 pgoCompletedFunctions;
   EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
@@ -564,12 +659,11 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
                                       ///< with stats off the acquire-load gate
                                       ///< on the disabled path is compiled out.
 
-  //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
-  //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen
-  //    and a dedupClear CASes gen->0, so a stale worker from an earlier
-  //    generation can never clear a slot a newer generation re-claimed for the
-  //    same funcIndex (spec §11 generation-aware dedup).
-  alignas(kEJitSharedCacheLine) EJitAtomicU32 inFlight[kEJitSharedMaxFuncIndex];
+  //--- flat dedup slots (own cache line). Each slot stores a unique request
+  //    token, so stale completion cannot clear a newer request even within the
+  //    same owner generation.
+  EJitAtomicU64 nextRequestToken;
+  alignas(kEJitSharedCacheLine) EJitAtomicU64 inFlight[kEJitSharedMaxFuncIndex];
 
   //--- MPSC queue: head and tail on SEPARATE cache lines (false-sharing), ring
   //    storage on its own.
@@ -631,6 +725,11 @@ static_assert(
         std::is_trivially_default_constructible<EJitSharedCacheSlot>::value,
     "EJitSharedCacheSlot must be POD-style");
 static_assert(
+    std::is_standard_layout<EJitPgoLinkedPending>::value &&
+        std::is_trivially_destructible<EJitPgoLinkedPending>::value &&
+        std::is_trivially_default_constructible<EJitPgoLinkedPending>::value,
+    "EJitPgoLinkedPending must be POD-style");
+static_assert(
     std::is_standard_layout<EJitSharedWritableRange>::value &&
         std::is_trivially_destructible<EJitSharedWritableRange>::value &&
         std::is_trivially_default_constructible<EJitSharedWritableRange>::value,
@@ -658,6 +757,8 @@ static_assert(
 static_assert(
     offsetof(EJitSharedTaskPoolState, magic) == 0,
     "magic must be the first word so a foreign/zero blob is rejected");
+static_assert(sizeof(EJitSharedTaskPoolState) <= 512u * 1024u,
+              "shared taskpool blob exceeds its 512 KiB placement budget");
 
 } // namespace ejit
 } // namespace llvm

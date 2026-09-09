@@ -929,6 +929,12 @@ set(EJIT_ICACHE_FUNC_SLOTS "4096" CACHE STRING
 message(STATUS "EmbeddedJIT: inline-cache slot capacity=${EJIT_ICACHE_FUNC_SLOTS}")
 set(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES "1" CACHE STRING
   "EmbeddedJIT concurrent functions collecting online PGO profiles (1-16)")
+set(EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS "300000000000" CACHE STRING
+  "Online-PGO no-progress timeout in monotonic cycle-counter ticks (0 disables)")
+set(EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES "3000000000" CACHE STRING
+  "Online-PGO Tier-2 publish quiet window in owner monotonic cycle-counter cycles")
+set(EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY "128" CACHE STRING
+  "Maximum exact cold-profile suppression records in shared memory")
 # Single source of truth for the worker task stack size (bytes). The worker —
 # shared OR per-instance — runs LLVM optimize/codegen/ORC/JITLink on its OWN
 # stack via EJitSreTask, so this drives the platform SRE_TaskCreate stack too
@@ -943,12 +949,32 @@ set(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS "100" CACHE STRING
 # Fail at configure time (not in the SRE platform layer's static_asserts) when
 # the worker geometry is nonsense.
 ejit_require_numeric(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE)
+ejit_require_numeric(EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS)
+ejit_require_numeric(EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES)
+ejit_require_numeric(EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY)
 ejit_require_numeric(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT)
 ejit_require_numeric(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS)
 if(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE LESS 1)
   message(FATAL_ERROR
     "EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE (${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}) "
     "must be >= 1 byte.")
+endif()
+if(EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS LESS 0)
+  message(FATAL_ERROR
+    "EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS must be >= 0 (0 disables).")
+endif()
+if(EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES LESS 1)
+  message(FATAL_ERROR
+    "EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES must be >= 1 cycle.")
+endif()
+if(EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY LESS 1)
+  message(FATAL_ERROR
+    "EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY must be >= 1.")
+endif()
+if(EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY GREATER 128)
+  message(FATAL_ERROR
+    "EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY must be <= 128 to keep the "
+    "shared taskpool blob within its 512 KiB budget.")
 endif()
 if(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT LESS 0 OR
    EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS LESS 0)
@@ -960,6 +986,9 @@ if(EJIT_SRE_TASKPOOL)
   add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
   add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
   add_definitions(-DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES})
+  add_definitions(-DEJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS=${EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS}ULL)
+  add_definitions(-DEJIT_SRE_PGO_PUBLISH_QUIET_CYCLES=${EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES}ULL)
+  add_definitions(-DEJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY=${EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})
@@ -968,6 +997,9 @@ if(EJIT_SRE_TASKPOOL)
                  "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
                  "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
                  "pgoConcurrentProfiles=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}, "
+                 "pgoColdTimeoutTicks=${EJIT_SRE_PGO_COLD_PROFILE_TIMEOUT_TICKS}, "
+                 "pgoPublishQuietCycles=${EJIT_SRE_PGO_PUBLISH_QUIET_CYCLES}, "
+                 "pgoColdSuppressions=${EJIT_SRE_PGO_COLD_SUPPRESSION_CAPACITY}, "
                  "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
                  "throttleMult=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT}, "
                  "throttleDelayTicks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})")

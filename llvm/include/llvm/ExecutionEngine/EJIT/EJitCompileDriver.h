@@ -166,6 +166,10 @@ private:
   /// (EJitSreTask::delay) so the shared worker never busy-spins. ticks=1 is a
   /// single yield; ticks=MULT*DELAY_TICKS is the post-task throttle delay.
   static void sharedWorkerIdle(void *ctx, uint32_t ticks);
+  static uint64_t sharedNowTicks(void *ctx);
+  static void sharedAbortPgoProfile(void *ctx,
+                                    const EJitCompileRequest &req);
+  void abortPgoProfile(const EJitCompileRequest &req);
   /// Owner-elected hook: builds the engine on whichever core wins the election.
   /// ctx is the driver, which owns sharedPool_ and so always outlives it.
   static bool sharedOwnerElected(void *ctx);

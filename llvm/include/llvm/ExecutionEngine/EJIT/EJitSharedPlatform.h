@@ -116,7 +116,12 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v20: the old inline payload is replaced by a fixed table of borrowed
 /// raw bound-pointer descriptors; no pointee bytes or ownership cross the
 /// shared queue.
-constexpr uint32_t kEJitSharedAbiVersion = 20u;
+/// v21: requests and PGO admission slots carry exact lifecycle tokens and
+/// identities; cold-profile progress/expiry and per-function VP gates are
+/// shared across producers and the owner worker.
+/// v22: a bounded exact-identity registry suppresses duplicate sampling while
+/// Tier-2 code is linked but waiting for batch publication.
+constexpr uint32_t kEJitSharedAbiVersion = 22u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
