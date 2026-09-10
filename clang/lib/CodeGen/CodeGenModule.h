@@ -2020,6 +2020,25 @@ private:
                                                StringRef Suffix);
 };
 
+/// EmbeddedJIT: the LLVM IR argument index a source parameter lowers to.
+///
+/// Every EJIT parameter attribute records an index that a consumer resolves
+/// with llvm::Function::getArg(), so the index must be an IR argument number,
+/// not a source parameter number. The two diverge whenever ABI lowering
+/// inserts an argument (an sret pointer, `this`) or expands an earlier
+/// parameter into several -- on x86-64, `f(int, struct {long,long}, int slot)`
+/// lowers to four IR arguments and source index 2 names the second half of the
+/// struct, not `slot`.
+///
+/// Returns nullopt unless the parameter is passed directly as exactly one IR
+/// argument that holds the value itself. Callers must then omit the annotation
+/// rather than guess: a missing EJIT dimension costs an optimization, while a
+/// wrong one substitutes into an argument the user never annotated.
+///
+/// Defined in CGCall.cpp, where the ABI argument mapping lives.
+std::optional<unsigned> getEjitIRArgIndex(CodeGenModule &CGM, GlobalDecl GD,
+                                          unsigned ParamIndex);
+
 // EmbeddedJIT metadata generation (defined in CGEJIT.cpp)
 void emitEjitFunctionMetadata(CodeGenModule &CGM, const FunctionDecl *FD,
                                llvm::Function *F);

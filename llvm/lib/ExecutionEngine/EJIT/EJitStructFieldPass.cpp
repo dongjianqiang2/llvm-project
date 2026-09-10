@@ -95,6 +95,7 @@ void EJitStructFieldPass::initFromModule(Module &M) {
   }
 
   initBoundArgumentPropagation(M);
+  initFreeDimAssumptions(M);
   mapsBuilt_ = true;
 #ifdef EJIT_DIAG_ENABLE
   EJIT_DIAG_DEBUG("struct-field initFromModule module=%s globals=%zu "
@@ -213,28 +214,255 @@ static bool hasMatchingBoundArgumentContract(
   return DeclaredFields == ExpectedFields;
 }
 
-static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
-                                                        const Value *PtrOp,
-                                                        const Argument *Root);
+static std::optional<uint64_t> accumulateArgumentOffset(
+    const DataLayout &DL, const Value *PtrOp, const Argument *Root,
+    const AssumedArgMap &Assumed);
 
-/// If all GEP indices are ConstantInt, compute the cumulative byte offset.
-/// Returns std::nullopt if any index is not constant.
+/// Depth cap for evalWithAssumed. An index expression that needs more than this
+/// is not one this pass should be reasoning about.
+static constexpr unsigned kMaxAssumedEvalDepth = 16;
+
+/// Constant-fold an integer expression, taking the value of any argument in
+/// \p Assumed from that map. Returns std::nullopt when the expression reaches
+/// anything else — a load, a call, an unmapped argument, an unhandled opcode —
+/// or when folding would produce poison.
+///
+/// This is what lets an ejit_free_dim parameter unblock an address: after
+/// IPSCCP folds the period index, `unitIdx * 5 + slotNo % 5` is
+/// `add(15, urem(%slotNo, 5))`, which no constant test accepts but which folds
+/// to 15 once %slotNo is assumed 0.
+///
+/// Deliberately an evaluation and not a rewrite of the expression: the caller
+/// wants a byte offset to read process memory at, and the IR must be left
+/// exactly as it was so the stores through the same address stay correct.
+static std::optional<APInt> evalWithAssumed(const Value *V,
+                                            const AssumedArgMap &Assumed,
+                                            unsigned Depth) {
+  if (Depth > kMaxAssumedEvalDepth || !V->getType()->isIntegerTy())
+    return std::nullopt;
+
+  if (const auto *CI = dyn_cast<ConstantInt>(V))
+    return CI->getValue();
+
+  if (const auto *Arg = dyn_cast<Argument>(V)) {
+    auto It = Assumed.find(Arg);
+    if (It == Assumed.end())
+      return std::nullopt;
+    return APInt(V->getType()->getIntegerBitWidth(), It->second);
+  }
+
+  // An icmp feeding a select is the only comparison worth folding here; its
+  // result is i1, so it cannot share the binary-operator path below.
+  if (const auto *Cmp = dyn_cast<ICmpInst>(V)) {
+    auto L = evalWithAssumed(Cmp->getOperand(0), Assumed, Depth + 1);
+    if (!L)
+      return std::nullopt;
+    auto R = evalWithAssumed(Cmp->getOperand(1), Assumed, Depth + 1);
+    if (!R)
+      return std::nullopt;
+    // `icmp samesign` promises both operands have the same sign; the
+    // comparison is poison when they do not. Like the arithmetic flags below,
+    // this is a fact about the values the program passes, and the witness may
+    // not be one of them -- `icmp samesign slt i32 %slot, -1` is poison at
+    // witness 0, and the select it feeds would otherwise yield an index that
+    // passes every bounds check.
+    if (Cmp->hasSameSign() && L->isNegative() != R->isNegative())
+      return std::nullopt;
+    return APInt(1, ICmpInst::compare(*L, *R, Cmp->getPredicate()) ? 1 : 0);
+  }
+
+  const auto *Op = dyn_cast<Operator>(V);
+  if (!Op)
+    return std::nullopt;
+
+  const unsigned Opcode = Op->getOpcode();
+  const unsigned Width = V->getType()->getIntegerBitWidth();
+
+  switch (Opcode) {
+  case Instruction::ZExt:
+  case Instruction::SExt:
+  case Instruction::Trunc: {
+    auto X = evalWithAssumed(Op->getOperand(0), Assumed, Depth + 1);
+    if (!X)
+      return std::nullopt;
+    if (Opcode == Instruction::ZExt) {
+      // `zext nneg` promises the operand is non-negative as a signed value.
+      if (const auto *PNI = dyn_cast<PossiblyNonNegInst>(Op))
+        if (PNI->hasNonNeg() && X->isNegative())
+          return std::nullopt;
+      return X->zext(Width);
+    }
+    if (Opcode == Instruction::SExt)
+      return X->sext(Width);
+    // `trunc nuw/nsw` promise the discarded bits carry no information.
+    APInt Res = X->trunc(Width);
+    if (const auto *TI = dyn_cast<TruncInst>(Op)) {
+      if (TI->hasNoUnsignedWrap() && Res.zext(X->getBitWidth()) != *X)
+        return std::nullopt;
+      if (TI->hasNoSignedWrap() && Res.sext(X->getBitWidth()) != *X)
+        return std::nullopt;
+    }
+    return Res;
+  }
+  case Instruction::Select: {
+    auto C = evalWithAssumed(Op->getOperand(0), Assumed, Depth + 1);
+    if (!C)
+      return std::nullopt;
+    // Only the taken arm is evaluated: the other one may be unfoldable and is
+    // irrelevant at this witness.
+    return evalWithAssumed(Op->getOperand(C->isZero() ? 2 : 1), Assumed,
+                           Depth + 1);
+  }
+  default:
+    break;
+  }
+
+  if (Op->getNumOperands() != 2)
+    return std::nullopt;
+  auto L = evalWithAssumed(Op->getOperand(0), Assumed, Depth + 1);
+  if (!L)
+    return std::nullopt;
+  auto R = evalWithAssumed(Op->getOperand(1), Assumed, Depth + 1);
+  if (!R)
+    return std::nullopt;
+
+  // Poison-generating flags must be honoured, not just the always-poison cases
+  // below. InstCombine attaches nuw/nsw/exact/disjoint/nneg using facts that
+  // hold for the values the program actually passes; the witness is a value it
+  // may never pass, so a flag whose precondition the witness breaks means this
+  // expression is poison at the witness and the address derived from it is
+  // fiction. `sub nuw i32 %slot, 1` at witness 0 would otherwise yield
+  // 0xFFFFFFFF, which a later mask can launder into a plausible in-bounds
+  // index.
+  const auto *OBO = dyn_cast<OverflowingBinaryOperator>(Op);
+  const bool NUW = OBO && OBO->hasNoUnsignedWrap();
+  const bool NSW = OBO && OBO->hasNoSignedWrap();
+  const auto *PEO = dyn_cast<PossiblyExactOperator>(Op);
+  const bool Exact = PEO && PEO->isExact();
+
+  switch (Opcode) {
+  case Instruction::Add: {
+    bool OvU = false, OvS = false;
+    APInt Res = L->uadd_ov(*R, OvU);
+    (void)L->sadd_ov(*R, OvS);
+    if ((NUW && OvU) || (NSW && OvS))
+      return std::nullopt;
+    return Res;
+  }
+  case Instruction::Sub: {
+    bool OvU = false, OvS = false;
+    APInt Res = L->usub_ov(*R, OvU);
+    (void)L->ssub_ov(*R, OvS);
+    if ((NUW && OvU) || (NSW && OvS))
+      return std::nullopt;
+    return Res;
+  }
+  case Instruction::Mul: {
+    bool OvU = false, OvS = false;
+    APInt Res = L->umul_ov(*R, OvU);
+    (void)L->smul_ov(*R, OvS);
+    if ((NUW && OvU) || (NSW && OvS))
+      return std::nullopt;
+    return Res;
+  }
+  case Instruction::And:
+    return *L & *R;
+  case Instruction::Or:
+    // `or disjoint` promises the operands share no set bit.
+    if (const auto *PDI = dyn_cast<PossiblyDisjointInst>(Op))
+      if (PDI->isDisjoint() && (*L & *R) != 0)
+        return std::nullopt;
+    return *L | *R;
+  case Instruction::Xor:
+    return *L ^ *R;
+  // A shift at or past the bit width is poison, and a division or remainder
+  // whose result is not representable likewise. Bail rather than bake in a
+  // value the program would never have produced.
+  case Instruction::Shl: {
+    if (R->uge(Width))
+      return std::nullopt;
+    APInt Res = L->shl(*R);
+    // nuw: no set bit shifted out. nsw: also the sign bit is preserved.
+    if (NUW && Res.lshr(*R) != *L)
+      return std::nullopt;
+    if (NSW && Res.ashr(*R) != *L)
+      return std::nullopt;
+    return Res;
+  }
+  case Instruction::LShr: {
+    if (R->uge(Width))
+      return std::nullopt;
+    APInt Res = L->lshr(*R);
+    if (Exact && Res.shl(*R) != *L)
+      return std::nullopt;
+    return Res;
+  }
+  case Instruction::AShr: {
+    if (R->uge(Width))
+      return std::nullopt;
+    APInt Res = L->ashr(*R);
+    if (Exact && Res.shl(*R) != *L)
+      return std::nullopt;
+    return Res;
+  }
+  case Instruction::UDiv:
+    if (R->isZero())
+      return std::nullopt;
+    if (Exact && !L->urem(*R).isZero())
+      return std::nullopt;
+    return std::optional<APInt>(L->udiv(*R));
+  case Instruction::URem:
+    return R->isZero() ? std::nullopt : std::optional<APInt>(L->urem(*R));
+  case Instruction::SDiv:
+    if (R->isZero() || (L->isMinSignedValue() && R->isAllOnes()))
+      return std::nullopt;
+    if (Exact && !L->srem(*R).isZero())
+      return std::nullopt;
+    return std::optional<APInt>(L->sdiv(*R));
+  case Instruction::SRem:
+    return R->isZero() || (L->isMinSignedValue() && R->isAllOnes())
+               ? std::nullopt
+               : std::optional<APInt>(L->srem(*R));
+  default:
+    return std::nullopt;
+  }
+}
+
+/// Compute the cumulative byte offset of a GEP. Every index must be a
+/// ConstantInt, or fold to one under \p Assumed.
 static std::optional<uint64_t>
-computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL) {
+computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
+                 const AssumedArgMap &Assumed,
+                 bool *UsedAssumption = nullptr) {
   SmallVector<Value *, 4> IdxList;
   for (auto I = GEP->idx_begin(), E = GEP->idx_end(); I != E; ++I) {
-    if (!isa<ConstantInt>(*I))
+    if (isa<ConstantInt>(*I)) {
+      IdxList.push_back(*I);
+      continue;
+    }
+    if (Assumed.empty())
       return std::nullopt;
-    IdxList.push_back(*I);
+    auto Folded = evalWithAssumed(*I, Assumed, 0);
+    if (!Folded)
+      return std::nullopt;
+    if (UsedAssumption)
+      *UsedAssumption = true;
+    // Materialized only to be handed to getIndexedOffsetInType below. Constants
+    // are uniqued in the context, not inserted anywhere: the GEP still holds
+    // its original, non-constant index operand.
+    IdxList.push_back(ConstantInt::get(GEP->getContext(), *Folded));
   }
   return DL.getIndexedOffsetInType(GEP->getSourceElementType(), IdxList);
 }
 
 /// Walk a GEP chain from the load's pointer operand down to the root
 /// global variable, accumulating the total byte offset. All GEP indices
-/// must be constants (already folded by InstCombine after param substitution).
+/// must be constants (already folded by InstCombine after param substitution)
+/// or fold to constants under \p Assumed.
 static std::optional<uint64_t>
-accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
+accumulateFullOffset(const DataLayout &DL, const Value *PtrOp,
+                     const AssumedArgMap &Assumed,
+                     bool *UsedAssumption = nullptr) {
   APInt total(DL.getPointerSizeInBits(0), 0);
 
   while (PtrOp) {
@@ -246,7 +474,7 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
     if (!GEP)
       return std::nullopt;
 
-    auto off = computeGEPOffset(GEP, DL);
+    auto off = computeGEPOffset(GEP, DL, Assumed, UsedAssumption);
     if (!off)
       return std::nullopt;
     total += APInt(total.getBitWidth(), *off);
@@ -257,9 +485,9 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp) {
   return total.getZExtValue();
 }
 
-static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
-                                                        const Value *PtrOp,
-                                                        const Argument *Root) {
+static std::optional<uint64_t> accumulateArgumentOffset(
+    const DataLayout &DL, const Value *PtrOp, const Argument *Root,
+    const AssumedArgMap &Assumed) {
   APInt Total(DL.getPointerSizeInBits(0), 0);
   while (PtrOp) {
     PtrOp = PtrOp->stripPointerCasts();
@@ -268,7 +496,7 @@ static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
     auto *GEP = dyn_cast<GEPOperator>(PtrOp);
     if (!GEP)
       return std::nullopt;
-    auto Off = computeGEPOffset(GEP, DL);
+    auto Off = computeGEPOffset(GEP, DL, Assumed);
     if (!Off)
       return std::nullopt;
     Total += APInt(Total.getBitWidth(), *Off);
@@ -277,16 +505,16 @@ static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
   return std::nullopt;
 }
 
-static std::optional<uint64_t> getBoundPointerOffset(
-    const Value *V, const DenseMap<const Argument *, uint64_t> &BoundArguments,
-    const DataLayout &DL) {
+static std::optional<uint64_t>
+getBoundPointerOffset(const Value *V, const AssumedArgMap &BoundArguments,
+                      const DataLayout &DL, const AssumedArgMap &Assumed) {
   const Argument *Root = findRootArgument(V);
   if (!Root)
     return std::nullopt;
   auto It = BoundArguments.find(Root);
   if (It == BoundArguments.end())
     return std::nullopt;
-  auto Relative = accumulateArgumentOffset(DL, V, Root);
+  auto Relative = accumulateArgumentOffset(DL, V, Root, Assumed);
   if (!Relative ||
       It->second > std::numeric_limits<uint64_t>::max() - *Relative)
     return std::nullopt;
@@ -387,11 +615,60 @@ callUsesSameBoundDimension(const CallBase &CB, StringRef BoundPeriodName,
          isSpecializedDimensionConstant(Actual, *ExpectedInstance);
 }
 
+/// Collect the ejit_free_dim parameters of every function in the module and map
+/// each to the witness its addresses are evaluated at.
+///
+/// The witness is 0, unconditionally. It is not a tuning knob: the attribute
+/// asserts the may_const data does not vary with the parameter, so every legal
+/// value reads the same field values, and 0 is the one value guaranteed to be
+/// in range for a dense index. Reading through element 0 is what "drop the
+/// `+ slotNo % 5` term" means once the address is actually computed.
+///
+/// Matching is per function rather than entry-only because an argument index is
+/// meaningful only against the function it was recorded on, and CodeGen records
+/// each parameter on its own function. A callee that was not annotated is
+/// simply absent from the map; the assumption does not propagate across a call
+/// that survived inlining.
+void EJitStructFieldPass::initFreeDimAssumptions(Module &M) {
+  freeDimArgs_.clear();
+  for (Function &F : M) {
+    MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
+    if (!MD)
+      continue;
+    for (const MDOperand &Op : MD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || Sub->getNumOperands() < 3)
+        continue;
+      auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+      if (!Tag || Tag->getString() != TAG_EJIT_FREE_DIM)
+        continue;
+      auto *IdxC = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+      if (!IdxC)
+        continue;
+      uint64_t ArgIdx = IdxC->getZExtValue();
+      if (ArgIdx >= F.arg_size())
+        continue;
+      Argument *Arg = F.getArg(static_cast<unsigned>(ArgIdx));
+      if (!Arg->getType()->isIntegerTy())
+        continue;
+      freeDimArgs_[Arg] = 0;
+    }
+  }
+  EJIT_DIAG_VERBOSE("struct-field free dims: %zu", freeDimArgs_.size());
+}
+
 void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
   boundStates_.clear();
   if (boundPointers_.empty())
     return;
 
+  // Bound-pointer propagation decides which callee formals alias the borrowed
+  // object, and that has to hold for EVERY call. A free-dim assumption is only
+  // valid for the value being read at one address, so it must not be used to
+  // prove an argument relationship: two calls whose offsets differ in the free
+  // parameter would map one formal to one of them. Address computation for a
+  // may_const LOAD does use the assumption — see run().
+  const AssumedArgMap NoAssumed;
   const DataLayout &DL = M.getDataLayout();
   SmallVector<CallBase *, 32> DirectCalls;
   DenseMap<const Function *, SmallVector<CallBase *, 4>> CallsByCallee;
@@ -482,8 +759,9 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
             Argument *Formal = Callee->getArg(ArgIndex);
             if (!Formal->getType()->isPointerTy())
               continue;
-            auto Offset = getBoundPointerOffset(CB->getArgOperand(ArgIndex),
-                                                State.boundArguments, DL);
+            auto Offset =
+                getBoundPointerOffset(CB->getArgOperand(ArgIndex),
+                                      State.boundArguments, DL, NoAssumed);
             if (!Offset || *Offset >= View.size)
               continue;
             if (!hasMatchingBoundArgumentContract(
@@ -540,8 +818,9 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
                 AllMatch = false;
                 continue;
               }
-              auto ActualOffset = getBoundPointerOffset(
-                  CB->getArgOperand(ArgIndex), State.boundArguments, DL);
+              auto ActualOffset =
+                  getBoundPointerOffset(CB->getArgOperand(ArgIndex),
+                                        State.boundArguments, DL, NoAssumed);
               if (!ActualOffset || *ActualOffset != ExpectedOffset)
                 AllMatch = false;
             }
@@ -559,13 +838,13 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
 }
 
 static bool isBoundMayConstLoad(
-    LoadInst *LI, const DenseMap<const Argument *, uint64_t> &BoundArguments,
+    LoadInst *LI, const AssumedArgMap &BoundArguments,
     ArrayRef<std::pair<uint64_t, uint64_t>> MayConstFields,
-    const DataLayout &DL) {
+    const DataLayout &DL, const AssumedArgMap &Assumed) {
   if (LI->isVolatile() || LI->isAtomic())
     return false;
-  auto Offset =
-      getBoundPointerOffset(LI->getPointerOperand(), BoundArguments, DL);
+  auto Offset = getBoundPointerOffset(LI->getPointerOperand(), BoundArguments,
+                                      DL, Assumed);
   if (!Offset)
     return false;
   if (LI->hasMetadata(MD_EJIT_MAY_CONST))
@@ -872,14 +1151,15 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   return nullptr;
 }
 
-static Constant *tryReplaceBoundPointer(
-    LoadInst *LI, const uint8_t *Data, uint32_t Size,
-    const DenseMap<const Argument *, uint64_t> &BoundArguments,
-    const DataLayout &DL) {
+static Constant *tryReplaceBoundPointer(LoadInst *LI, const uint8_t *Data,
+                                        uint32_t Size,
+                                        const AssumedArgMap &BoundArguments,
+                                        const DataLayout &DL,
+                                        const AssumedArgMap &Assumed) {
   if (!Data || !Size)
     return nullptr;
-  auto Offset =
-      getBoundPointerOffset(LI->getPointerOperand(), BoundArguments, DL);
+  auto Offset = getBoundPointerOffset(LI->getPointerOperand(), BoundArguments,
+                                      DL, Assumed);
   TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
   if (!Offset || AccessSize.isScalable() || *Offset > Size ||
       AccessSize.getFixedValue() > Size - *Offset)
@@ -890,6 +1170,29 @@ static Constant *tryReplaceBoundPointer(
 //===----------------------------------------------------------------------===//
 // Load replacement helpers — one per access pattern
 //===----------------------------------------------------------------------===//
+
+/// Is a byte offset derived from a free-dim witness inside \p GV's object?
+///
+/// The declared type of the AOT global is the extent the source could legally
+/// index; a witness-derived offset outside it is not an address the program
+/// would ever have formed. Unsized types cannot be checked, so they are
+/// refused: this guard only ever runs when an assumption was used, where
+/// refusing costs an optimization and accepting risks reading unrelated memory
+/// (or faulting during specialization).
+static bool offsetFitsInObject(const GlobalVariable *GV, uint64_t ByteOffset,
+                               Type *AccessTy, const DataLayout &DL) {
+  Type *ValueTy = GV->getValueType();
+  if (!ValueTy || !ValueTy->isSized())
+    return false;
+  TypeSize ObjSize = DL.getTypeAllocSize(ValueTy);
+  TypeSize AccessSize = DL.getTypeStoreSize(AccessTy);
+  if (ObjSize.isScalable() || AccessSize.isScalable())
+    return false;
+  const uint64_t Obj = ObjSize.getFixedValue();
+  const uint64_t Access = AccessSize.getFixedValue();
+  // Written so a wrapped-negative ByteOffset fails rather than overflows.
+  return Access <= Obj && ByteOffset <= Obj - Access;
+}
 
 /// Pattern 1: load directly from a GlobalVariable (scalar static variable).
 static Constant *
@@ -912,7 +1215,7 @@ tryReplaceDirectGV(LoadInst *LI, const GlobalVariable *GV,
 static Constant *
 tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp,
                     const GVPeriodMap &gvMap, PeriodArrayRegistry &reg,
-                    const DataLayout &DL) {
+                    const DataLayout &DL, const AssumedArgMap &Assumed) {
   const GlobalVariable *GV = findRootGV(PtrOp);
   if (!GV)
     return nullptr;
@@ -921,8 +1224,20 @@ tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp,
   if (it == gvMap.end())
     return nullptr;
 
-  auto byteOffset = accumulateFullOffset(DL, PtrOp);
+  bool UsedAssumption = false;
+  auto byteOffset = accumulateFullOffset(DL, PtrOp, Assumed, &UsedAssumption);
   if (!byteOffset)
+    return nullptr;
+
+  // An offset the source computed is in bounds by construction. One computed
+  // at the witness is not: ejit_free_dim asserts that the marked fields hold
+  // the same value for every value the parameter takes, which says nothing
+  // about whether the witness is itself a value the parameter takes. For
+  // `arr[slot - 1]` with slot in 1..5 every valid element may agree while the
+  // witness names arr[-1] -- a negative offset, which arrives here as a huge
+  // unsigned and would read whatever precedes the object. Require the whole
+  // access to lie inside the object before trusting the address.
+  if (UsedAssumption && !offsetFitsInObject(GV, *byteOffset, LI->getType(), DL))
     return nullptr;
 
   void *base = resolveBase(GV, it->second, reg);
@@ -940,6 +1255,13 @@ static Constant *
 tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
                    const GVPeriodMap &gvMap, PeriodArrayRegistry &reg,
                    const DataLayout &DL) {
+  // Deliberately takes no AssumedArgMap. The base here is a pointer read out
+  // of a global at compile time, so the pointee's extent is unknown and a
+  // witness-derived offset cannot be bounds checked the way
+  // tryReplaceDirectGEP bounds one. Declining the assumption is the
+  // conservative half of that trade: a constant index still resolves exactly
+  // as before, and no address the program may never form is dereferenced.
+  const AssumedArgMap Assumed;
   // Walk the GEP chain from the load's pointer operand to find
   // the base LoadInst that reads the pointer value from a GV.
   const Value *V = PtrOp;
@@ -969,7 +1291,7 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
     PtrGV = dyn_cast<GlobalVariable>(
         PtrGEP->getPointerOperand()->stripPointerCasts());
     if (PtrGV) {
-      auto off = computeGEPOffset(PtrGEP, DL);
+      auto off = computeGEPOffset(PtrGEP, DL, Assumed);
       if (!off)
         return nullptr;
       ptrArrayByteOff = *off;
@@ -996,7 +1318,7 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
   // Compute field offset from the GEPs past the pointer dereference.
   uint64_t fieldOff = 0;
   for (auto It = FieldGEPs.rbegin(); It != FieldGEPs.rend(); ++It) {
-    auto off = computeGEPOffset(*It, DL);
+    auto off = computeGEPOffset(*It, DL, Assumed);
     if (!off)
       return nullptr;
     fieldOff += *off;
@@ -1066,7 +1388,8 @@ static Constant *getSiteString(Module &M, StringRef S,
 /// and gives up otherwise — which is precisely the indirect-pointer case, where
 /// the offset is still what tells two fields of one pointed-to struct apart.
 static std::optional<uint64_t> sumGEPChain(const Value *Ptr,
-                                           const DataLayout &DL) {
+                                           const DataLayout &DL,
+                                           const AssumedArgMap &Assumed) {
   uint64_t total = 0;
   const Value *V = Ptr;
   while (V) {
@@ -1074,7 +1397,7 @@ static std::optional<uint64_t> sumGEPChain(const Value *Ptr,
     auto *GEP = dyn_cast<GEPOperator>(V);
     if (!GEP)
       break;
-    auto off = computeGEPOffset(GEP, DL);
+    auto off = computeGEPOffset(GEP, DL, Assumed);
     if (!off)
       return std::nullopt;
     total += *off;
@@ -1088,17 +1411,18 @@ static std::optional<uint64_t> sumGEPChain(const Value *Ptr,
 /// indirect-pointer pattern has no root global; it keeps the offset past the
 /// dereference, which separates fields of the pointed-to struct.
 static std::string makeSiteName(const Function &F, const LoadInst *LI,
-                                const DataLayout &DL) {
+                                const DataLayout &DL,
+                                const AssumedArgMap &Assumed) {
   const Value *Ptr = LI->getPointerOperand();
   std::string Out = F.getName().str() + ":";
   if (const GlobalVariable *GV = findRootGV(Ptr)) {
     Out += GV->getName().str();
-    if (auto Off = accumulateFullOffset(DL, Ptr))
+    if (auto Off = accumulateFullOffset(DL, Ptr, Assumed))
       Out += "+" + std::to_string(*Off);
     return Out;
   }
   Out += "<indirect>";
-  if (auto Off = sumGEPChain(Ptr, DL))
+  if (auto Off = sumGEPChain(Ptr, DL, Assumed))
     Out += "+" + std::to_string(*Off);
   return Out;
 }
@@ -1107,6 +1431,7 @@ static std::string makeSiteName(const Function &F, const LoadInst *LI,
 /// value substitution would have frozen. Returns false when the type cannot be
 /// widened, leaving the load untouched.
 static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
+                            const AssumedArgMap &Assumed,
                             const DataLayout &DL,
                             StringMap<Constant *> &SiteCache) {
   Module &M = *LI->getModule();
@@ -1122,7 +1447,7 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
     // coverage rather than a clean result. Say so: silence here would read as
     // "this field never diverged".
     EJIT_DIAG("verify SKIP site=%s: type not checkable (>64-bit or vector)",
-              makeSiteName(F, LI, DL).c_str());
+              makeSiteName(F, LI, DL, Assumed).c_str());
     return false;
   }
 
@@ -1133,7 +1458,8 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
                         {PtrTy, B.getInt64Ty(), B.getInt64Ty()},
                         /*isVarArg=*/false));
 
-  B.CreateCall(Check, {getSiteString(M, makeSiteName(F, LI, DL), SiteCache),
+  B.CreateCall(Check, {getSiteString(M, makeSiteName(F, LI, DL, Assumed),
+                                    SiteCache),
                        Frozen, Actual});
   LI->setMetadata(MD_EJIT_VERIFIED, MDNode::get(Ctx, {}));
   ejitVerifyNoteSite();
@@ -1153,10 +1479,12 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
 ///   gv-not-in-map     — root GV has no ejit.metadata (not a period var)
 ///   base-unresolved   — GV is a period var but not registered at runtime
 ///   non-const-offset  — GEP index not folded to a constant
+///   witness-out-of-bounds — folded only via an ejit_free_dim witness, and that
+///                     address lies outside the object (see tryReplaceDirectGEP)
 ///   unsupported-type  — createConstantFromMemory cannot build the load type
 static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
-                              PeriodArrayRegistry &reg,
-                              const DataLayout &DL) {
+                              PeriodArrayRegistry &reg, const DataLayout &DL,
+                              const AssumedArgMap &Assumed) {
   Value *Ptr = LI->getPointerOperand();
   const GlobalVariable *GV = findRootGV(Ptr);
   if (!GV) {
@@ -1174,9 +1502,23 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
                       GV->getName().str().c_str());
     return;
   }
-  if (!accumulateFullOffset(DL, Ptr)) {
+  bool UsedAssumption = false;
+  auto Off = accumulateFullOffset(DL, Ptr, Assumed, &UsedAssumption);
+  if (!Off) {
     EJIT_DIAG_VERBOSE("  may_const load NOT replaced: non-const-offset gv=%s",
                       GV->getName().str().c_str());
+    return;
+  }
+  // Must mirror tryReplaceDirectGEP's guard, and must be tested BEFORE falling
+  // through: accumulateFullOffset succeeds for a witness-derived address (it
+  // returns the wrapped offset), so without this the rejection would be
+  // reported as unsupported-type and send a reader looking at the load's type
+  // instead of at the ejit_free_dim annotation that caused it.
+  if (UsedAssumption && !offsetFitsInObject(GV, *Off, LI->getType(), DL)) {
+    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: witness-out-of-bounds "
+                      "gv=%s off=%llu",
+                      GV->getName().str().c_str(),
+                      static_cast<unsigned long long>(*Off));
     return;
   }
   EJIT_DIAG_VERBOSE("  may_const load NOT replaced: unsupported-type gv=%s",
@@ -1239,8 +1581,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       bool BoundMayConst = false;
       for (const BoundPointerState &State : boundStates_)
-        BoundMayConst |= isBoundMayConstLoad(LI, State.boundArguments,
-                                             State.mayConstFields, DL);
+        BoundMayConst |= isBoundMayConstLoad(
+            LI, State.boundArguments, State.mayConstFields, DL, freeDimArgs_);
       if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
 #ifdef EJIT_DIAG_ENABLE
@@ -1266,7 +1608,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (!C) {
         for (const BoundPointerState &State : boundStates_) {
           C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
-                                     State.boundArguments, DL);
+                                     State.boundArguments, DL, freeDimArgs_);
           if (C)
             break;
         }
@@ -1280,7 +1622,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       // Pattern 2: GEP-based access (array or struct field).
       if (!C)
-        C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, registry_, DL);
+        C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, registry_, DL,
+                                freeDimArgs_);
 
       // Pattern 3: indirect pointer access (pointer-type period variable).
       if (!C)
@@ -1290,7 +1633,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         replacements.push_back({LI, C, /*IsMayConst=*/true});
 #ifdef EJIT_DIAG_ENABLE
       else
-        logReplaceFailure(LI, gvPeriodMap_, registry_, DL);
+        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimArgs_);
 #endif
     }
   }
@@ -1314,7 +1657,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
       ++verifyCandidates;
-      if (emitVerifyCheck(F, R.LI, R.ConstVal, DL, siteCache)) {
+      if (emitVerifyCheck(F, R.LI, R.ConstVal, freeDimArgs_, DL, siteCache)) {
         ++verifyInstrumented;
         changed = true;
       }

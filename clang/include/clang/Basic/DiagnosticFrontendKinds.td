@@ -400,4 +400,14 @@ def err_cir_to_cir_transform_failed : Error<
 def err_cir_verification_failed_pre_passes : Error<
     "CIR module verification error before running CIR-to-CIR passes">,
     DefaultFatal;
+
+// EmbeddedJIT: a dimension attribute records an IR argument index for the JIT
+// to resolve with Function::getArg(). When ABI lowering does not give the
+// parameter exactly one directly-passed IR argument there is no such index, so
+// the annotation is dropped -- silently doing so would look like the attribute
+// simply had no effect.
+def warn_ejit_param_not_lowered : Warning<
+    "%0 on parameter %1 is ignored: the parameter is not passed as a single "
+    "value, so the JIT has no argument to attribute it to">,
+    InGroup<EmbeddedJIT>;
 }

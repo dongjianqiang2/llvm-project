@@ -9511,6 +9511,64 @@ may be marked with this attribute.
   }];
 }
 
+def EjitFreeDimDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+EmbeddedJIT: marks a parameter that the ``ejit_may_const`` data behind it does
+not depend on.
+
+A parameter the JIT cannot fold blocks every ``ejit_may_const`` field reached
+through it, including the fields that never varied with it. In
+``g_unitParams[unitIdx * 5 + slotNo % 5]`` the JIT knows ``unitIdx`` but not
+``slotNo``, so the sum is not constant, no address can be computed, and no field
+of that element can be specialized -- not even the ones copied unchanged from a
+slot-independent base. Such a parameter does not make the data unstable; it
+makes the data unaddressable.
+
+Marking the parameter ``ejit_free_dim`` asserts **both** of the following, for
+every ``ejit_may_const`` field whose address depends on it:
+
+* the field holds the same value for every value the parameter takes; and
+* the address the field has when the parameter is ``0`` is a valid address of
+  that field, holding that same value.
+
+The JIT may then evaluate those addresses at a fixed witness of ``0`` -- reading
+the field from the element the parameter selects when it is zero -- and fold the
+loads.
+
+The second requirement is not implied by the first. ``arr[slot - 1]`` with
+``slot`` in ``1..5`` may hold one value in all five valid elements while the
+witness names ``arr[-1]``, which is not an address the program ever forms. The
+JIT rejects a witness address it can prove lies outside the object, so such a
+load is simply not specialized, but it cannot prove this in general -- for a
+conditionally executed load, or one reached through a pointer of unknown extent,
+the requirement is on the annotation.
+
+The assertion is about the memory, not about the argument: the parameter itself
+may change on every call. It is also not checkable by the compiler; build with
+``EJIT_VERIFY_SUBSTITUTION`` and run a real workload to confirm it holds.
+
+The parameter is not a specialization dimension. It is not part of the cache
+key, it adds no inline-cache axis, it consumes no dimension slot, and it does
+not count against the limit on ``ejit_period_arr_ind`` parameters: a function
+using it has one specialization, not one per value. Its frozen values are
+invalidated through the function's other dimensions, so an ``ejit_entry`` with
+no ``ejit_period_arr_ind`` parameter has no way to refresh them and is
+diagnosed.
+
+The parameter must have integer type, must belong to an ``ejit_entry``
+function, and cannot also be ``ejit_period_arr_ind`` or ``ejit_bound_ptr``.
+Annotate the raw parameter rather than a pre-reduced one: marking ``slotNo % 5``
+would merge slots that share a buffer element but hold different values.
+
+.. code-block:: c
+
+  __attribute__((ejit_entry))
+  void init_unit(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+                 __attribute__((ejit_free_dim)) unsigned slotNo);
+  }];
+}
+
 def EjitBoundPtrDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{

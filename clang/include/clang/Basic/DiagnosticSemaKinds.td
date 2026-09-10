@@ -13499,6 +13499,17 @@ def err_ejit_period_arr_ind_invalid_type : Error<
 def err_ejit_period_arr_ind_too_many : Error<
   "function %0 has %1 ejit_period_arr_ind parameters, "
   "which exceeds the maximum of 4">;
+def err_ejit_free_dim_invalid_type : Error<
+  "ejit_free_dim parameter %0 must have integer type">;
+def err_ejit_free_dim_kind_conflict : Error<
+  "parameter %0 cannot be both ejit_free_dim and ejit_period_arr_ind">;
+def err_ejit_free_dim_not_entry : Error<
+  "ejit_free_dim parameter %0 requires function %1 to be ejit_entry">;
+def warn_ejit_free_dim_no_dimension : Warning<
+  "ejit_entry function %0 has no ejit_period_arr_ind parameter; "
+  "ejit_may_const values frozen through ejit_free_dim parameter %1 can "
+  "never be invalidated">,
+  InGroup<EmbeddedJIT>;
 def err_ejit_bound_ptr_invalid_type : Error<
   "ejit_bound_ptr parameter %0 must be a pointer to a complete object type">;
 def err_ejit_bound_ptr_duplicate : Error<

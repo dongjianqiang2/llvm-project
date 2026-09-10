@@ -5257,6 +5257,14 @@ def EjitPeriodArrInd : InheritableParamAttr {
   let Documentation = [EjitPeriodArrIndDocs];
 }
 
+// Marks a function parameter whose value the may_const data behind it does not
+// depend on. Not a specialization dimension: it adds no clone and no cache axis.
+def EjitFreeDim : InheritableParamAttr {
+  let Spellings = [Clang<"ejit_free_dim">];
+  let Subjects = SubjectList<[ParmVar]>;
+  let Documentation = [EjitFreeDimDocs];
+}
+
 // Binds a pointer parameter's pointee to one specialization dimension.
 def EjitBoundPtr : InheritableParamAttr {
   let Spellings = [Clang<"ejit_bound_ptr">];

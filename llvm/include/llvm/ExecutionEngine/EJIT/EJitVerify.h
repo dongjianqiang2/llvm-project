@@ -28,6 +28,17 @@
 // shows up — cases where substitution would bake in a value from the wrong
 // place.
 //
+// That same asymmetry is what checks ejit_free_dim, and it needs no extra
+// machinery. A free dim asserts the may_const data behind a parameter is the
+// same for every value the parameter takes, so PASS6 evaluates the address at a
+// witness of 0. The retained load still indexes with the LIVE parameter. Every
+// execution therefore compares "the field at the slot this call actually used"
+// against "the field at slot 0", and a field that is not in fact uniform along
+// that axis reports a mismatch naming the function and offset. Nothing else can
+// check that assertion — the compiler cannot see it and the runtime never
+// revisits it — so a workload run under this build is the only evidence an
+// ejit_free_dim annotation is correct.
+//
 // The loads survive, so nothing folds: this validates the frozen values, it
 // does not produce fast code. Coverage is limited to sites that execute.
 //

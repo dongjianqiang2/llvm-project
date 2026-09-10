@@ -220,6 +220,37 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
       EjitPeriodArrIndAttr(S.Context, AL, PeriodName));
 }
 
+/// handleEjitFreeDimAttr - Process the ejit_free_dim attribute.
+/// Checks:
+///   1. Applies only to ParmVarDecl
+///   2. Parameter type must be integer
+///
+/// No width limit: unlike a specialization dimension, a free dim never reaches
+/// the runtime ABI, so there is no narrowing that two values could alias
+/// through. The only value the JIT ever substitutes is the witness 0.
+///
+/// The "enclosing function must be ejit_entry" and "must not also be
+/// ejit_period_arr_ind / ejit_bound_ptr" checks are NOT here. At handler time
+/// the ParmVarDecl's DeclContext is not yet the FunctionDecl, and a conflicting
+/// parameter attribute written AFTER this one has not been processed yet. Both
+/// run once the merged declaration is complete -- see checkEjitFreeDim.
+void handleEjitFreeDimAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  auto *PVD = dyn_cast<ParmVarDecl>(D);
+  if (!PVD) {
+    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+        << AL << AL.isRegularKeywordAttribute() << "function parameters";
+    return;
+  }
+
+  QualType PT = PVD->getType();
+  if (!PT->isIntegerType()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_free_dim_invalid_type) << PVD;
+    return;
+  }
+
+  PVD->addAttr(::new (S.Context) EjitFreeDimAttr(S.Context, AL));
+}
+
 void handleEjitBoundPtrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *PVD = dyn_cast<ParmVarDecl>(D);
   if (!PVD) {
@@ -322,6 +353,60 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
           << FD << Count;
     }
   }
+}
+
+/// checkEjitFreeDim - Post-merge validation of ejit_free_dim parameters.
+/// Called from CheckFunctionDeclaration after MergeFunctionDecl, so it sees the
+/// complete parameter attribute set and an ejit_entry written on any
+/// declaration of the function.
+///
+///   1. A free dim only means something on an ejit_entry: the assertion it
+///      makes is consumed by the JIT specializer, and nothing specializes a
+///      function that is not an entry.
+///   2. It cannot share a parameter with ejit_period_arr_ind. That puts the
+///      parameter on the specialization identity; a free dim asserts the data
+///      does not vary with it. Honouring both would compile one clone per value
+///      of a parameter whose values were declared interchangeable.
+///      (ejit_bound_ptr needs no check: it requires a pointer and a free dim
+///      requires an integer, so no parameter can carry both.)
+///   3. A free dim freezes may_const values but adds no dimension of its own,
+///      so an entry with no ejit_period_arr_ind has nothing that can ever
+///      invalidate them: no ejit_deactivate reaches it and the cached
+///      specialization is re-served for the life of the process. Warn rather
+///      than reject -- an entry that reads no may_const field through the free
+///      parameter is unaffected, and the compiler cannot tell the two apart.
+void checkEjitFreeDim(Sema &S, const FunctionDecl *FD) {
+  if (!FD)
+    return;
+
+  const EjitFreeDimAttr *FirstFree = nullptr;
+  const ParmVarDecl *FirstFreeParm = nullptr;
+  for (const ParmVarDecl *P : FD->parameters()) {
+    const auto *Free = P->getAttr<EjitFreeDimAttr>();
+    if (!Free)
+      continue;
+    if (!FirstFree) {
+      FirstFree = Free;
+      FirstFreeParm = P;
+    }
+    if (P->hasAttr<EjitPeriodArrIndAttr>())
+      S.Diag(Free->getLocation(), diag::err_ejit_free_dim_kind_conflict) << P;
+  }
+
+  if (!FirstFree)
+    return;
+
+  if (!FD->hasAttr<EjitEntryAttr>()) {
+    S.Diag(FirstFree->getLocation(), diag::err_ejit_free_dim_not_entry)
+        << FirstFreeParm << FD;
+    return;
+  }
+
+  if (!llvm::any_of(FD->parameters(), [](const ParmVarDecl *P) {
+        return P->hasAttr<EjitPeriodArrIndAttr>();
+      }))
+    S.Diag(FirstFree->getLocation(), diag::warn_ejit_free_dim_no_dimension)
+        << FD << FirstFreeParm;
 }
 
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
