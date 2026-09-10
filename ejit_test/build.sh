@@ -180,6 +180,7 @@ NC='\033[0m'
 
 ALL_TESTS=(
   ejit_attr_test
+  ejit_bound_ptr_test
   ejit_closure_slim_test
   ejit_complex_test
   ejit_config_api_test

@@ -26,6 +26,24 @@ ejit_entry uint32_t bound_cell_config(ejit_period_arr_ind(cell)
   return input + cellRelated->runtimeBias;
 }
 
+/* runtimeBias is not may_const, so it stays a live load. Reading it inside a
+   condition inside a loop is the shape that only folds once the bound pointer
+   is known nonnull, dereferenceable and aligned: without those the load cannot
+   be speculated out of its guard and the loop survives. */
+ejit_entry uint32_t bound_conditional_load(ejit_period_arr_ind(cell)
+                                               uint8_t cellIndex,
+                                           EJIT_BOUND_PTR(cell)
+                                               const CellRelated *cellRelated,
+                                           uint32_t count, int enabled) {
+  uint32_t acc = 0;
+  for (uint32_t i = 0; i < count; ++i)
+    if (enabled)
+      acc += cellRelated->runtimeBias;
+  /* scale IS may_const, so it folds to a literal and this stays a real
+     specialization target; runtimeBias above stays a load. */
+  return acc * cellRelated->scale + cellIndex;
+}
+
 static uint32_t call_with_instance(uint8_t cellIndex, uint8_t trpIndex,
                                    const CellRelated *config) {
   return bound_cell_config(cellIndex, trpIndex, config, 10);
@@ -59,6 +77,24 @@ int main(void) {
     printf("FAIL\n");
     return 3;
   }
+
+  /* The conditionally executed live load. Dump its specialized IR so the
+     hoist is inspectable, and check the value on both paths. */
+  ejit_dump_func("bound_conditional_load");
+  const uint32_t Count = 4;
+  uint32_t LoopAot = bound_conditional_load(Cell, &CellConfig, Count, 1);
+  ejit_drain_taskpool();
+  uint32_t LoopJit = bound_conditional_load(Cell, &CellConfig, Count, 1);
+  uint32_t LoopOff = bound_conditional_load(Cell, &CellConfig, Count, 0);
+  uint32_t ExpectedLoop = Count * 100u * 5u + Cell;
+  printf("loop AOT=%u JIT=%u expected=%u; disabled=%u expected=%u\n", LoopAot,
+         LoopJit, ExpectedLoop, LoopOff, Cell);
+  ejit_print_dumped("bound_conditional_load");
+  if (LoopAot != ExpectedLoop || LoopJit != ExpectedLoop || LoopOff != Cell) {
+    printf("FAIL\n");
+    return 4;
+  }
+
   printf("PASS\n");
   return 0;
 }

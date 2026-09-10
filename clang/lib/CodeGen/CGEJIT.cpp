@@ -91,13 +91,21 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
       QualType Pointee = PD->getType()->getPointeeType();
       uint64_t Size =
           CGM.getContext().getTypeSizeInChars(Pointee).getQuantity();
+      // Opaque pointers erase the pointee type, so the JIT cannot recover
+      // alignof(T) from the IR. ejit_bound_ptr requires a complete object
+      // type, so it holds for any conforming caller.
+      uint64_t PointeeAlign =
+          CGM.getContext().getTypeAlignInChars(Pointee).getQuantity();
       SmallVector<llvm::Metadata *, 8> BoundOps = {
           llvm::MDString::get(Ctx, TAG_EJIT_BOUND_PTR),
           llvm::MDString::get(Ctx, BoundAttr->getPeriodName()),
           llvm::ConstantAsMetadata::get(
               llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), I)),
           llvm::ConstantAsMetadata::get(
-              llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), Size))};
+              llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), Size)),
+          llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx),
+                                     PointeeAlign))};
       if (const auto *RD = Pointee->getAsRecordDecl()) {
         SmallVector<std::pair<uint64_t, uint64_t>, 8> Fields;
         collectBoundMayConstFields(CGM.getContext(), RD, 0, Fields);

@@ -256,6 +256,7 @@ namespace ejit {
 // an EJitOptimizer; all other call syntax is unchanged.
 struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::EJitOptimizer;
+  using EJitOptimizer::applyBoundPointerFacts;
   using EJitOptimizer::preReplacePeriodIndices;
   using EJitOptimizer::runInstCombine;
   using EJitOptimizer::runInterproceduralPropagation;
@@ -1510,6 +1511,322 @@ static Function *createPeriodIndFunc(LLVMContext &Ctx, Module &M,
   F->setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Sub}));
 
   return F;
+}
+
+//===----------------------------------------------------------------------===//
+// ejit_bound_ptr pointer facts
+//===----------------------------------------------------------------------===//
+
+/// Entry taking a bound pointer, with a load of the same address on both sides
+/// of an opaque call. Without a dereferenceable/nonnull fact the second load
+/// cannot be hoisted or CSE'd past a call that might free or shorten the
+/// object; with it, the pipeline is free to.
+static const char *kBoundPtrIR = R"(
+define i32 @entry(i32 %cell, ptr %cfg) {
+  %a = load i32, ptr %cfg
+  %b = load i32, ptr %cfg
+  %s = add i32 %a, %b
+  ret i32 %s
+}
+)";
+
+static std::unique_ptr<Module> parseBoundPtrModule(LLVMContext &Ctx) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(kBoundPtrIR, Err, Ctx);
+  if (!M)
+    ADD_FAILURE() << "bad test IR: " << Err.getMessage().str();
+  return M;
+}
+
+TEST(EJitOptimizer, BoundPointerFactsAreAttached) {
+  LLVMContext Ctx;
+  auto M = parseBoundPtrModule(Ctx);
+  ASSERT_NE(M, nullptr);
+
+  uint32_t Object = 0;
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(&Object),
+                                /*size=*/4, /*argIndex=*/1});
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.applyBoundPointerFacts(*M, SCtx);
+
+  Argument *Arg = M->getFunction("entry")->getArg(1);
+  EXPECT_TRUE(Arg->hasNonNullAttr());
+  EXPECT_EQ(Arg->getDereferenceableBytes(), 4u);
+}
+
+/// Only facts the contract promises: alignment is not attached, because the
+/// only source for it is the observed address and the contract does not
+/// promise that a later call passes an equally aligned object.
+/// Alignment comes from the pointee TYPE via metadata, never from the observed
+/// address. With no metadata operand there is no alignment to attach, however
+/// well-aligned the object the worker happened to see.
+TEST(EJitOptimizer, BoundPointerFactsIgnoreObservedAlignment) {
+  LLVMContext Ctx;
+  auto M = parseBoundPtrModule(Ctx);
+  ASSERT_NE(M, nullptr);
+
+  alignas(64) uint64_t Object = 0; // deliberately over-aligned
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(&Object),
+                                /*size=*/8, /*argIndex=*/1});
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.applyBoundPointerFacts(*M, SCtx);
+
+  Argument *Arg = M->getFunction("entry")->getArg(1);
+  EXPECT_FALSE(Arg->getParamAlign().has_value())
+      << "alignment was inferred from the observed address, which the "
+         "ejit_bound_ptr contract does not promise stays the same";
+}
+
+/// Mark a function as ejit_entry and nothing else. Both arms of the
+/// with/without comparison need this: an entry is exempt from the pipeline's
+/// internalization, and a function that is not one gets folded away for
+/// reasons that have nothing to do with bound pointers.
+static void addEntryMetadata(Function *F) {
+  LLVMContext &Ctx = F->getContext();
+  F->setMetadata(MD_EJIT_METADATA,
+                 MDNode::getDistinct(
+                     Ctx, {MDNode::get(Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY))}));
+}
+
+/// Attach the metadata node CodeGen emits for a bound pointer, so the
+/// optimizer can recover the pointee alignment opaque pointers erased.
+static void addBoundPtrMetadata(Function *F, unsigned ArgIndex, uint64_t Size,
+                                uint64_t PointeeAlign) {
+  LLVMContext &Ctx = F->getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Metadata *Ops[] = {
+      MDString::get(Ctx, TAG_EJIT_BOUND_PTR),
+      MDString::get(Ctx, "cell"),
+      ConstantAsMetadata::get(ConstantInt::get(I32, ArgIndex)),
+      ConstantAsMetadata::get(ConstantInt::get(I64, Size)),
+      ConstantAsMetadata::get(ConstantInt::get(I64, PointeeAlign)),
+  };
+  F->setMetadata(MD_EJIT_METADATA,
+                 MDNode::getDistinct(
+                     Ctx, {MDNode::get(Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY)),
+                           MDNode::get(Ctx, Ops)}));
+}
+
+TEST(EJitOptimizer, BoundPointerAlignComesFromMetadata) {
+  LLVMContext Ctx;
+  auto M = parseBoundPtrModule(Ctx);
+  ASSERT_NE(M, nullptr);
+  addBoundPtrMetadata(M->getFunction("entry"), /*ArgIndex=*/1, /*Size=*/16,
+                      /*PointeeAlign=*/8);
+
+  uint32_t Object = 0;
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(&Object),
+                                /*size=*/16, /*argIndex=*/1});
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.applyBoundPointerFacts(*M, SCtx);
+
+  Argument *Arg = M->getFunction("entry")->getArg(1);
+  EXPECT_TRUE(Arg->hasNonNullAttr());
+  EXPECT_EQ(Arg->getDereferenceableBytes(), 16u);
+  ASSERT_TRUE(Arg->getParamAlign().has_value());
+  EXPECT_EQ(Arg->getParamAlign()->value(), 8u);
+}
+
+/// A malformed alignment is dropped rather than handed to LLVM.
+TEST(EJitOptimizer, BoundPointerAlignRejectsNonPowerOfTwo) {
+  LLVMContext Ctx;
+  auto M = parseBoundPtrModule(Ctx);
+  ASSERT_NE(M, nullptr);
+  addBoundPtrMetadata(M->getFunction("entry"), 1, 16, /*PointeeAlign=*/3);
+
+  uint32_t Object = 0;
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(&Object),
+                                16, 1});
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.applyBoundPointerFacts(*M, SCtx);
+  EXPECT_FALSE(M->getFunction("entry")->getArg(1)->getParamAlign().has_value());
+}
+
+/// An alignment past Value::MaximumAlignment is rejected, not handed to
+/// Attribute::getWithAlignment, which asserts on it. Only malformed or
+/// hand-written bitcode gets here, and it must not take the JIT down.
+TEST(EJitOptimizer, BoundPointerAlignRejectsOversized) {
+  LLVMContext Ctx;
+  auto M = parseBoundPtrModule(Ctx);
+  ASSERT_NE(M, nullptr);
+  addBoundPtrMetadata(M->getFunction("entry"), 1, 16,
+                      /*PointeeAlign=*/Value::MaximumAlignment * 2);
+
+  uint32_t Object = 0;
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(&Object),
+                                16, 1});
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.applyBoundPointerFacts(*M, SCtx);
+  EXPECT_FALSE(M->getFunction("entry")->getArg(1)->getParamAlign().has_value());
+}
+
+/// addAttr replaces an integer attribute, so a parameter that already carries
+/// a stronger fact must keep it rather than be reduced to the ABI-derived one.
+TEST(EJitOptimizer, BoundPointerFactsKeepStrongerExistingAttributes) {
+  LLVMContext Ctx;
+  auto M = parseBoundPtrModule(Ctx);
+  ASSERT_NE(M, nullptr);
+  Function *F = M->getFunction("entry");
+  addBoundPtrMetadata(F, 1, /*Size=*/16, /*PointeeAlign=*/8);
+
+  Argument *Arg = F->getArg(1);
+  Arg->addAttr(Attribute::getWithAlignment(Ctx, Align(64)));
+  Arg->addAttr(Attribute::getWithDereferenceableBytes(Ctx, 64));
+
+  uint32_t Object = 0;
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(&Object),
+                                16, 1});
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.applyBoundPointerFacts(*M, SCtx);
+
+  ASSERT_TRUE(Arg->getParamAlign().has_value());
+  EXPECT_EQ(Arg->getParamAlign()->value(), 64u) << "align(64) downgraded to 8";
+  EXPECT_EQ(Arg->getDereferenceableBytes(), 64u)
+      << "dereferenceable(64) downgraded to 16";
+}
+
+/// End to end: the same entry, compiled with and without ejit_bound_ptr on
+/// its pointer parameter. The loop-invariant load is conditionally executed,
+/// so it can only leave the loop once the parameter is known dereferenceable
+/// and aligned.
+TEST(EJitOptimizer, BoundPtrParameterUnlocksLoadSpeculation) {
+  static const char *kIR = R"(
+define i32 @entry(i32 %n, ptr %cfg, i1 %p) {
+b:
+  br label %head
+head:
+  %i = phi i32 [ 0, %b ], [ %i.n, %latch ]
+  %acc = phi i32 [ 0, %b ], [ %acc.n, %latch ]
+  %c = icmp slt i32 %i, %n
+  br i1 %c, label %body, label %exit
+body:
+  br i1 %p, label %doit, label %latch
+doit:
+  %v = load i32, ptr %cfg
+  br label %latch
+latch:
+  %a = phi i32 [ %v, %doit ], [ 0, %body ]
+  %acc.n = add i32 %acc, %a
+  %i.n = add i32 %i, 1
+  br label %head
+exit:
+  ret i32 %acc
+}
+)";
+  // Returns the specialized block count, and whether a load survives a loop.
+  auto Run = [&](bool AsBoundPtr, unsigned &Blocks) {
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(kIR, Err, Ctx);
+    EXPECT_NE(M, nullptr) << Err.getMessage().str();
+    if (!M)
+      return;
+    M->setTargetTriple(Triple("aarch64-unknown-linux-gnu"));
+
+    uint64_t Object[2] = {0, 0};
+    PeriodArrayRegistry Reg;
+    SpecializationContext SCtx;
+    SCtx.fnName = "entry";
+    if (AsBoundPtr) {
+      addBoundPtrMetadata(M->getFunction("entry"), /*ArgIndex=*/1, /*Size=*/16,
+                          /*PointeeAlign=*/8);
+      SCtx.boundPointers.push_back(
+          {reinterpret_cast<const uint8_t *>(Object), 16, 1});
+    } else {
+      addEntryMetadata(M->getFunction("entry"));
+    }
+    // Through the PUBLIC pipeline entry, not the private helper: this must
+    // fail if runPipeline ever stops applying the facts.
+    SCtx.optLevel = llvm::ejit::OptimizationLevel::L2;
+    SCtx.tier = CompileTier::Baseline;
+    EJitOptimizerTestAccess Opt(Reg);
+    Opt.runPipeline(*M, SCtx);
+    Blocks = M->getFunction("entry")->size();
+  };
+
+  unsigned Plain = 0, Bound = 0;
+  Run(/*AsBoundPtr=*/false, Plain);
+  Run(/*AsBoundPtr=*/true, Bound);
+
+  EXPECT_GT(Plain, 1u) << "a plain pointer parameter must keep the loop: the "
+                          "load cannot be speculated out of its guard";
+  EXPECT_EQ(Bound, 1u) << "with ejit_bound_ptr the load leaves the loop and "
+                          "the loop folds away";
+}
+
+/// Size alone is not enough -- speculation needs the alignment half too, so an
+/// entry whose metadata predates the alignment operand keeps its loop.
+TEST(EJitOptimizer, BoundPtrWithoutAlignKeepsLoop) {
+  static const char *kIR = R"(
+define i32 @entry(i32 %n, ptr %cfg, i1 %p) {
+b:
+  br label %head
+head:
+  %i = phi i32 [ 0, %b ], [ %i.n, %latch ]
+  %acc = phi i32 [ 0, %b ], [ %acc.n, %latch ]
+  %c = icmp slt i32 %i, %n
+  br i1 %c, label %body, label %exit
+body:
+  br i1 %p, label %doit, label %latch
+doit:
+  %v = load i32, ptr %cfg
+  br label %latch
+latch:
+  %a = phi i32 [ %v, %doit ], [ 0, %body ]
+  %acc.n = add i32 %acc, %a
+  %i.n = add i32 %i, 1
+  br label %head
+exit:
+  ret i32 %acc
+}
+)";
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(kIR, Err, Ctx);
+  ASSERT_NE(M, nullptr) << Err.getMessage().str();
+  M->setTargetTriple(Triple("aarch64-unknown-linux-gnu"));
+  // No metadata node, so no alignment -- only nonnull + dereferenceable.
+  uint64_t Object[2] = {0, 0};
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.boundPointers.push_back(
+      {reinterpret_cast<const uint8_t *>(Object), 16, 1});
+
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.applyBoundPointerFacts(*M, SCtx);
+  Argument *Arg = M->getFunction("entry")->getArg(1);
+  ASSERT_TRUE(Arg->hasNonNullAttr());
+  ASSERT_FALSE(Arg->getParamAlign().has_value());
+
+  Opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2,
+                              CompileTier::Baseline);
+  EXPECT_GT(M->getFunction("entry")->size(), 1u);
 }
 
 TEST(EJitOptimizer, PreReplacePeriodIndices) {

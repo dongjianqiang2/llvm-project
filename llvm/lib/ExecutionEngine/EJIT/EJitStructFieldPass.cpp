@@ -180,8 +180,14 @@ static bool hasMatchingBoundArgumentContract(
 
   SmallVector<std::pair<uint64_t, uint64_t>, 4> DeclaredFields;
   for (unsigned I = 4; I < MD->getNumOperands(); ++I) {
+    // Only MDNode operands are field descriptors; fixed scalars may follow
+    // Size (the pointee alignment does). Skipping non-nodes keeps this loop
+    // position-independent, so adding another scalar cannot silently
+    // invalidate every bound pointer. A malformed NODE is still rejected.
     auto *Field = dyn_cast<MDNode>(MD->getOperand(I));
-    if (!Field || Field->getNumOperands() != 2)
+    if (!Field)
+      continue;
+    if (Field->getNumOperands() != 2)
       return false;
     auto *Offset = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
     auto *FieldSize = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
