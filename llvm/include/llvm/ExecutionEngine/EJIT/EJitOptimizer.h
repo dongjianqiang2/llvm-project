@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
@@ -24,6 +25,7 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
 #include "llvm/IR/Module.h"
+#include <memory>
 
 namespace llvm {
 namespace ejit {
@@ -65,12 +67,37 @@ public:
   /// to avoid dangling pointers to IR units from previous modules.
   void clearAnalyses();
 
+  /// Install the small-table plan set the optimizer consults (PR231 §6.5/§6.6).
+  /// Default is an empty set: the small-table pass is then never constructed
+  /// and every compile takes the unmodified baseline pipeline. The optimizer
+  /// keeps the shared_ptr alive for the lifetime of the plan lookup; plans are
+  /// immutable value snapshots. Production wiring of this seam (plan
+  /// construction from a confirmed-ready member set, admission validation and
+  /// row publication) is a later milestone; the host tests drive it directly.
+  void setSmallTablePlans(std::shared_ptr<const EJitSmallTablePlanSet> Plans) {
+    smallTablePlans_ = std::move(Plans);
+  }
+  const EJitSmallTablePlanSet *getSmallTablePlans() const {
+    return smallTablePlans_.get();
+  }
+
   /// PGO counter global names captured during the last Instrumented (Tier-1)
   /// compile (PGOFuncName suffix of each __profc_<name>). Empty for
   /// Baseline/PGOUse. The compile driver looks up __profc_/__profd_ by these
   /// names to capture counter addresses for Tier-2 profile synthesis.
   ArrayRef<std::string> getLastCounterNames() const {
     return lastCounterNames_;
+  }
+
+  /// Names of the small-table column globals materialized by the last compile
+  /// (PR231 §6.5). The globals are created inside the IR transform, after
+  /// addIRModule, so the materialization responsibility computed from the
+  /// original module does not include them; the engine claims these names as
+  /// exported exactly like the PGO counters, which is what lets the runtime
+  /// resolve each table's stable address and publish later rows into it.
+  /// Empty when no plan is installed (feature OFF) or for a uniform-only plan.
+  ArrayRef<std::string> getLastSmallTableColumnNames() const {
+    return lastSmallTableColumns_;
   }
 
   /// Value-profile capture of the last Instrumented (Tier-1) compile: every
@@ -110,6 +137,16 @@ private:
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
+  /// The existing may_const replacement without re-entering the small-table
+  /// pass. The context overload runs the small-table pass first; the no-context
+  /// overload (phase 4, after `runSmallTablePass(M, EntryName)`) must not run it
+  /// again, or it would clear the recorded column names with an empty entry.
+  void runStructFieldPassImpl(Module &M, const SpecializationContext &ctx);
+
+  /// Run the small-table pass for \p EntryName, if a plan is installed for it.
+  /// Called immediately before the existing struct-field pass in every replace
+  /// round, so all three rounds see the table form and no round can regress it.
+  void runSmallTablePass(Module &M, StringRef EntryName);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call
@@ -141,6 +178,8 @@ private:
   /// ABI compatibility and does not affect the pipeline.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
                                CompileTier tier);
+  void runOptimizationPipeline(Module &M, OptimizationLevel level,
+                               CompileTier tier, StringRef EntryName);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,
@@ -154,6 +193,14 @@ private:
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
+
+  /// Small-table plans (PR231). Empty by default: the feature is OFF and no
+  /// pass is constructed, so the baseline pipeline is unchanged.
+  std::shared_ptr<const EJitSmallTablePlanSet> smallTablePlans_;
+
+  /// Column globals created by the last small-table materialization (PR231);
+  /// the engine claims them in the materialization responsibility.
+  SmallVector<std::string, 8> lastSmallTableColumns_;
 
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.

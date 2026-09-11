@@ -342,7 +342,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline,
+                              ctx.fnName);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -401,7 +402,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier, ctx.fnName);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -413,7 +414,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier, ctx.fnName);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -695,6 +696,8 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
                                             const SpecializationContext &ctx) {
   LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
+  const EJitSmallTablePlan *SmallTablePlan =
+      smallTablePlans_ ? smallTablePlans_->find(ctx.fnName) : nullptr;
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -722,6 +725,17 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
 
       unsigned argIdx = static_cast<unsigned>(IdxC->getZExtValue());
       if (argIdx >= F.arg_size())
+        continue;
+
+      // PR231: a small-table plan builds its row index from the real dynamic
+      // dimension arguments, so those parameters must stay live in the planned
+      // entry. Only the arg indices this entry's plan declares are skipped;
+      // every other ejit_period_arr_ind parameter is substituted exactly as
+      // before, and with no installed plan this is the unmodified baseline.
+      // Callees keep the baseline behavior: their index 0 is a different
+      // parameter, so the plan's arg indices do not describe them.
+      if (SmallTablePlan && F.getName() == ctx.fnName &&
+          SmallTablePlan->isDynamicDimArg(argIdx))
         continue;
 
       for (auto &dim : ctx.dimensions) {
@@ -771,6 +785,20 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
 
 void EJitOptimizer::runStructFieldPass(Module &M,
                                        const SpecializationContext &ctx) {
+  // PR231: the small-table replacement runs immediately before the existing
+  // may_const replacement in this round. An entry with no installed plan is
+  // untouched, so the baseline pipeline is unchanged.
+  runSmallTablePass(M, ctx.fnName);
+  runStructFieldPassImpl(M, ctx);
+}
+
+void EJitOptimizer::runStructFieldPass(Module &M) {
+  SpecializationContext Empty;
+  runStructFieldPassImpl(M, Empty);
+}
+
+void EJitOptimizer::runStructFieldPassImpl(Module &M,
+                                           const SpecializationContext &ctx) {
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
       ctx.boundPointers;
   if (!BoundPointers.empty()) {
@@ -809,9 +837,49 @@ void EJitOptimizer::runStructFieldPass(Module &M,
       structField.run(F, FAM_);
 }
 
-void EJitOptimizer::runStructFieldPass(Module &M) {
-  SpecializationContext Empty;
-  runStructFieldPass(M, Empty);
+void EJitOptimizer::runSmallTablePass(Module &M, StringRef EntryName) {
+  lastSmallTableColumns_.clear();
+  if (EntryName.empty() || !smallTablePlans_ || smallTablePlans_->empty())
+    return;
+  const EJitSmallTablePlan *Plan = smallTablePlans_->find(EntryName);
+  if (!Plan)
+    return;
+
+  std::string Error;
+  if (!EJitSmallTablePass::materialize(M, *Plan, &Error)) {
+    EJIT_DIAG_VERBOSE("small-table SKIP func=%s: %s", EntryName.str().c_str(),
+                      Error.c_str());
+    return;
+  }
+  for (const EJitSmallTableField &Field : Plan->fields)
+    if (!Field.uniformValue && !Field.columnName.empty())
+      lastSmallTableColumns_.push_back(Field.columnName);
+  EJitSmallTablePass Pass(*Plan);
+  bool Changed = false;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      Changed |= !Pass.run(F, FAM_).areAllPreserved();
+  // The pass is run directly, not through a PassManager, so invalidate the
+  // function analyses it may have invalidated by rewriting the entry.
+  if (Changed)
+    if (Function *Entry = M.getFunction(EntryName))
+      FAM_.invalidate(*Entry, PreservedAnalyses::none());
+  const EJitSmallTablePass::Stats &Stats = Pass.getStats();
+  (void)Stats;
+  EJIT_DIAG_VERBOSE("small-table func=%s rows=%llu ready=%llu uniform=%llu "
+                    "sites=%llu table=%llu folded=%llu kept=%llu refused=%llu",
+                    EntryName.str().c_str(),
+                    static_cast<unsigned long long>(Plan->numRows()),
+                    static_cast<unsigned long long>(llvm::count_if(
+                        Plan->rows, [](const EJitSmallTableRow &R) {
+                          return R.ready;
+                        })),
+                    static_cast<unsigned long long>(Plan->uniformFieldCount()),
+                    static_cast<unsigned long long>(Stats.mayConstSites),
+                    static_cast<unsigned long long>(Stats.tableReplaced),
+                    static_cast<unsigned long long>(Stats.uniformFolded),
+                    static_cast<unsigned long long>(Stats.keptOriginal),
+                    static_cast<unsigned long long>(Stats.refusedShape));
 }
 
 FunctionPassManager &
@@ -830,6 +898,13 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             ejit::OptimizationLevel level,
                                             CompileTier tier) {
+  runOptimizationPipeline(M, level, tier, StringRef());
+}
+
+void EJitOptimizer::runOptimizationPipeline(Module &M,
+                                            ejit::OptimizationLevel level,
+                                            CompileTier tier,
+                                            StringRef EntryName) {
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -849,7 +924,10 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
 
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
-  // then fold/propagate/simplify the freshly-constant values.
+  // then fold/propagate/simplify the freshly-constant values. The small-table
+  // pass runs here too: a plan's table loads must survive the last replace
+  // round unchanged, and fields exposed only now still become table reads.
+  runSmallTablePass(M, EntryName);
   runStructFieldPass(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
