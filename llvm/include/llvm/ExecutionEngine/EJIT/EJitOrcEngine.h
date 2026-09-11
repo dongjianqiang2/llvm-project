@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -154,6 +155,19 @@ public:
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);
   const SpecializationContext *getActiveContext() const;
+
+  /// Install the small-table plan set consulted by the JIT pipeline (PR231
+  /// §6.5/§6.6). An empty set (the default) leaves the feature OFF and the
+  /// baseline pipeline unchanged. Installed plans must stay alive until the
+  /// engine is destroyed; the engine holds a shared reference.
+  void setSmallTablePlans(std::shared_ptr<const EJitSmallTablePlanSet> Plans);
+
+  /// Names of the small-table column globals created by the last compile
+  /// (PR231 §6.5), mirroring getLastCounterNames. Empty when the feature is OFF
+  /// or when the installed plan was refused (e.g. a partial plan without the
+  /// runtime row-admission gate). The compile driver resolves each name to
+  /// publish later row values into that table's stable address.
+  ArrayRef<std::string> getLastSmallTableColumnNames() const;
 
   /// PGO: PGOFuncNames captured by the last Tier-1 compile (the suffix of each
   /// __profc_<name> that captureCounterGlobals forced external). The compile

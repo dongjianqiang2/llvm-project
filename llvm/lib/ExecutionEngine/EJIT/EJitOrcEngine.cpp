@@ -182,6 +182,10 @@ struct EJitOrcEngine::Impl {
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
+  /// PR231 small-table plans. Held here so a setter call before or after
+  /// Create() reaches the persistent optimizer, and so the plan set outlives
+  /// every compilation that consults it.
+  std::shared_ptr<const EJitSmallTablePlanSet> smallTablePlans;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
   /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
   /// emitted assembly matches the real JIT output). Null if creation failed.
@@ -820,6 +824,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
   engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  // Apply any small-table plan set installed before the optimizer existed. The
+  // default is empty, so the feature stays OFF unless a caller installs plans.
+  engine->P->optimizer->setSmallTablePlans(engine->P->smallTablePlans);
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -873,6 +880,13 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           }
 
           engine->P->optimizer->runPipeline(M, *ctx);
+
+          // The optimizer's analysis managers are persistent across
+          // compilations, but this module is released once linking finishes.
+          // Drop the cached analyses now, while the IR is still alive: a cached
+          // analysis (e.g. MemorySSA) destroyed at engine teardown would walk
+          // freed IR. The next compilation starts from cleared managers anyway.
+          engine->P->optimizer->clearAnalyses();
 
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
@@ -979,6 +993,15 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             symFlags[engine->P->J->mangleAndIntern("__profd_" + name)] =
                 JITSymbolFlags::Exported;
           }
+          // PR231: the small-table pass also creates globals inside runPipeline
+          // (after addIRModule), so the MR's claim does not include them.
+          // Claiming them as exported lets the runtime resolve a table's stable
+          // address and publish later rows into it (§6.5); without this ORC
+          // rejects the transform's new definitions as unexpected.
+          for (const std::string &name :
+               engine->P->optimizer->getLastSmallTableColumnNames())
+            symFlags[engine->P->J->mangleAndIntern(name)] =
+                JITSymbolFlags::Exported;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
           if (!engine->P->optimizer->getLastMayConstLoadSites().empty())
             symFlags[engine->P->J->mangleAndIntern("__ejit_mayconst_hits")] =
@@ -1263,9 +1286,22 @@ const SpecializationContext *EJitOrcEngine::getActiveContext() const {
   return P->activeCtx;
 }
 
+void EJitOrcEngine::setSmallTablePlans(
+    std::shared_ptr<const EJitSmallTablePlanSet> Plans) {
+  P->smallTablePlans = std::move(Plans);
+  if (P->optimizer)
+    P->optimizer->setSmallTablePlans(P->smallTablePlans);
+}
+
 ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
   if (P->optimizer)
     return P->optimizer->getLastCounterNames();
+  return {};
+}
+
+ArrayRef<std::string> EJitOrcEngine::getLastSmallTableColumnNames() const {
+  if (P->optimizer)
+    return P->optimizer->getLastSmallTableColumnNames();
   return {};
 }
 
