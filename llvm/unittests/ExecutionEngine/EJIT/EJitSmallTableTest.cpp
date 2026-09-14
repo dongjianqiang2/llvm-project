@@ -19,6 +19,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ADT/STLExtras.h"
@@ -463,6 +464,147 @@ std::string badShapesText() {
   )";
 }
 
+//===----------------------------------------------------------------------===//
+// Automatic per-field specialization fixture (spec §4.1 default path)
+//
+// Four authorized fields over one (cell, TRP) domain: `mode` is a genuine
+// invariant of the whole domain, `byCell` varies with the cell axis only,
+// `byTrp` with the TRP axis only, `joint` with both. The required automatic
+// planner must fold the first with no column/payload/load, keep one-axis
+// projections for the next two, and the joint table for the last — with no
+// caller-supplied uniform value anywhere.
+//===----------------------------------------------------------------------===//
+
+constexpr unsigned kAutoCells = 4;
+constexpr unsigned kAutoTrps = 3;
+
+struct alignas(4) AutoElement {
+  int32_t mode;   // offset 0, identical on the whole domain
+  int32_t byCell; // offset 4, differs per cell only
+  int32_t byTrp;  // offset 8, differs per TRP only
+  int32_t joint;  // offset 12, differs jointly
+};
+static_assert(sizeof(AutoElement) == 16, "layout must match the IR type");
+
+AutoElement g_auto[kAutoCells][kAutoTrps];
+AutoElement g_sparse[2][2];
+AutoElement g_one[1][1];
+int32_t g_auto_out[kAutoCells];
+int32_t g_sparse_out[2];
+int32_t g_one_out[1];
+
+/// The exact-float-bits fixture's source and output (see
+/// `AutomaticSolverFoldsExactFloatBits`).
+struct alignas(4) FloatElement {
+  float f;
+  int32_t i;
+};
+FloatElement g_f[2][2];
+int32_t g_f_out[2];
+
+void fillAutoConfig() {
+  for (unsigned C = 0; C < kAutoCells; ++C)
+    for (unsigned T = 0; T < kAutoTrps; ++T) {
+      AutoElement &E = g_auto[C][T];
+      E.mode = 1;
+      E.byCell = static_cast<int32_t>(7 + C);
+      E.byTrp = static_cast<int32_t>(2 + T);
+      E.joint = static_cast<int32_t>(C * 3 + T);
+    }
+  std::memset(g_auto_out, 0, sizeof(g_auto_out));
+}
+
+/// The 2x2 sparse/checkerboard fixture. Default values are the checkerboard
+/// `joint = C*3 + T`; individual tests overwrite it.
+void fillSparseConfig() {
+  for (unsigned C = 0; C < 2; ++C)
+    for (unsigned T = 0; T < 2; ++T) {
+      AutoElement &E = g_sparse[C][T];
+      E.mode = 1;
+      E.byCell = static_cast<int32_t>(7 + C * 2);
+      E.byTrp = 5;
+      E.joint = static_cast<int32_t>(C * 3 + T);
+    }
+  std::memset(g_sparse_out, 0, sizeof(g_sparse_out));
+}
+
+/// One entry over `[Cells x [Trps x %A]]`, whose result is a positional mix of
+/// all four authorized fields plus real dynamic work, so a wrong projected index
+/// or a wrongly folded field changes the observable result.
+int32_t aotAuto(const AutoElement &E, int32_t X) {
+  return E.mode * 1000 + E.byCell * 100 + E.byTrp * 10 + E.joint + X * 3;
+}
+
+std::string autoModuleText(StringRef Entry, StringRef Global, StringRef Out,
+                           unsigned Cells, unsigned Trps) {
+  const std::string CA = Twine(Cells).str();
+  const std::string TA = Twine(Trps).str();
+  std::string Text = moduleTargetHeader();
+  Text += "\n    %A = type { i32, i32, i32, i32 }\n";
+  Text += "    @" + Global.str() + " = external global [" + CA + " x [" + TA +
+          " x %A]]\n";
+  Text += "    @" + Out.str() + " = external global [" + CA + " x i32]\n";
+  Text += "\n    define i32 @" + Entry.str() +
+          "(i32 %cell, i32 %trp, i32 %x) !ejit.metadata !0 {\n";
+  Text += "    entry:\n";
+  Text += "      %row = getelementptr inbounds [" + CA + " x [" + TA +
+          " x %A]], ptr @" + Global.str() +
+          ", i64 0, i32 %cell, i32 %trp\n";
+  Text += "      %p0 = getelementptr inbounds %A, ptr %row, i32 0, i32 0\n";
+  Text += "      %mode = load i32, ptr %p0, align 4, !ejit.may_const !1\n";
+  Text += "      %p1 = getelementptr inbounds %A, ptr %row, i32 0, i32 1\n";
+  Text += "      %bycell = load i32, ptr %p1, align 4, !ejit.may_const !1\n";
+  Text += "      %p2 = getelementptr inbounds %A, ptr %row, i32 0, i32 2\n";
+  Text += "      %bytrp = load i32, ptr %p2, align 4, !ejit.may_const !1\n";
+  Text += "      %p3 = getelementptr inbounds %A, ptr %row, i32 0, i32 3\n";
+  Text += "      %joint = load i32, ptr %p3, align 4, !ejit.may_const !1\n";
+  Text += "      %outp = getelementptr inbounds [" + CA + " x i32], ptr @" +
+          Out.str() + ", i64 0, i32 %cell\n";
+  Text += "      store i32 %x, ptr %outp, align 4\n";
+  Text += "      %m1 = mul i32 %mode, 1000\n";
+  Text += "      %m2 = mul i32 %bycell, 100\n";
+  Text += "      %m3 = mul i32 %bytrp, 10\n";
+  Text += "      %s1 = add i32 %m1, %m2\n";
+  Text += "      %s2 = add i32 %s1, %m3\n";
+  Text += "      %s3 = add i32 %s2, %joint\n";
+  Text += "      %xm = mul i32 %x, 3\n";
+  Text += "      %sum = add i32 %s3, %xm\n";
+  Text += "      %isone = icmp eq i32 %mode, 1\n";
+  Text += "      %res = select i1 %isone, i32 %sum, i32 -1\n";
+  Text += "      ret i32 %res\n";
+  Text += "    }\n\n    !0 = !{!2}\n    !1 = !{}\n";
+  Text += "    !2 = !{!\"ejit_entry\"}\n";
+  return Text;
+}
+
+/// Every (cell, trp) row of \p Cells x \p Trps confirmed ready.
+SmallVector<EJitSmallTableRowKey, 16> autoRows(unsigned Cells, unsigned Trps) {
+  SmallVector<EJitSmallTableRowKey, 16> Rows;
+  for (unsigned C = 0; C < Cells; ++C)
+    for (unsigned T = 0; T < Trps; ++T)
+      Rows.push_back({{C, T}});
+  return Rows;
+}
+
+SmallVector<EJitSmallTableDim, 2> autoDims(unsigned Cells, unsigned Trps) {
+  SmallVector<EJitSmallTableDim, 2> Dims;
+  Dims.push_back({EJitSmallTableDim::Kind::Argument, 0, 0, Cells});
+  Dims.push_back({EJitSmallTableDim::Kind::Argument, 1, 0, Trps});
+  return Dims;
+}
+
+/// A clearly labeled compiler-test readiness provider. Milestone A has no
+/// production configuration completion point (B0), so every A1 test states the
+/// provider explicitly; nothing here claims a product capability.
+EJitSmallTableReadiness testReadiness() {
+  EJitSmallTableReadiness R;
+  R.domainEpoch = 0x5EED20260914ull;
+  R.providerLabel = "test.provider.compiler-boundary";
+  R.coversDeclaredDomain = true;
+  R.borrowedStable = true;
+  return R;
+}
+
 SmallVector<EJitSmallTableDim, 4> planDims() {
   SmallVector<EJitSmallTableDim, 4> Dims;
   Dims.push_back({EJitSmallTableDim::Kind::Argument, 0, 0, kCells});
@@ -669,6 +811,8 @@ protected:
     fillConfig();
     fillUniformConfig();
     fillWidthConfig();
+    fillAutoConfig();
+    fillSparseConfig();
     // Outputs are process-wide; a previous test's stores must not leak into
     // this test's address checks.
     std::memset(g_out, 0, sizeof(g_out));
@@ -677,16 +821,24 @@ protected:
   std::shared_ptr<const EJitSmallTablePlanSet>
   makePlanSet(const Module &M,
               ArrayRef<std::optional<uint64_t>> Contracts = {},
-              ArrayRef<EJitSmallTableRowKey> Rows = {}) {
+              ArrayRef<EJitSmallTableRowKey> Rows = {},
+              EJitSmallTablePlanMode Mode = EJitSmallTablePlanMode::Automatic) {
     std::string Error;
     SmallVector<EJitSmallTableRowKey, 128> DefaultRows = allRows();
     ArrayRef<EJitSmallTableRowKey> UseRows =
         Rows.empty() ? ArrayRef<EJitSmallTableRowKey>(DefaultRows) : Rows;
-    auto Plan = EJitSmallTablePlanner::plan(
-        M, "stab_entry", "g_cfg", planDims(),
-        EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&g_cfg[0][0][0]),
-                             sizeof(g_cfg)},
-        UseRows, Contracts, Error);
+    SmallVector<EJitSmallTableDim, 4> Dims = planDims();
+    EJitSmallTableRequest Req;
+    Req.module = &M;
+    Req.entryName = "stab_entry";
+    Req.sourceVarName = "g_cfg";
+    Req.dims = Dims;
+    Req.source = EJitSmallTableSource{
+        reinterpret_cast<const uint8_t *>(&g_cfg[0][0][0]), sizeof(g_cfg)};
+    Req.authorizedRows = UseRows;
+    Req.uniformContracts = Contracts;
+    Req.mode = Contracts.empty() ? Mode : EJitSmallTablePlanMode::ExplicitContracts;
+    auto Plan = EJitSmallTablePlanner::plan(Req, Error);
     EXPECT_TRUE(Plan.has_value()) << Error;
     auto Set = std::make_shared<EJitSmallTablePlanSet>();
     if (Plan)
@@ -695,7 +847,10 @@ protected:
   }
 
   /// The scalar-width fixture's plan: two argument axes, one fully ready row per
-  /// (cell, phase).
+  /// (cell, phase), explicitly selected pure-table mode (every declared axis
+  /// retained) because these tests pin the width-exact column identity rather
+  /// than the automatic solver. The automatic solver's own width behavior is
+  /// covered by `AutomaticWidthsKeepTheirTypedWidths`.
   ///
   /// The second axis is a plain argument rather than `urem(slot, 4)`: the
   /// planner only accepts the `urem` spelling, and InstCombine canonicalizes a
@@ -711,11 +866,16 @@ protected:
       for (unsigned P = 0; P < kWidthPhases; ++P)
         WRows.push_back({{C, P}});
     std::string Error;
-    auto Plan = EJitSmallTablePlanner::plan(
-        M, "w_entry", "g_width", Dims,
-        EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&g_width[0][0]),
-                             sizeof(g_width)},
-        WRows, {}, Error);
+    EJitSmallTableRequest Req;
+    Req.module = &M;
+    Req.entryName = "w_entry";
+    Req.sourceVarName = "g_width";
+    Req.dims = Dims;
+    Req.source = EJitSmallTableSource{
+        reinterpret_cast<const uint8_t *>(&g_width[0][0]), sizeof(g_width)};
+    Req.authorizedRows = WRows;
+    Req.mode = EJitSmallTablePlanMode::ExplicitContracts;
+    auto Plan = EJitSmallTablePlanner::plan(Req, Error);
     EXPECT_TRUE(Plan.has_value()) << Error;
     auto Set = std::make_shared<EJitSmallTablePlanSet>();
     if (Plan)
@@ -815,6 +975,19 @@ protected:
     Registry.registerArray("cell", "g_u",
                            reinterpret_cast<void *>(&g_u[0][0]), sizeof(g_u));
     Registry.registerStaticVar("gu_out", &gu_out[0]);
+    // The automatic-solver fixtures.
+    Registry.registerArray("cell", "g_auto",
+                           reinterpret_cast<void *>(&g_auto[0][0]),
+                           sizeof(g_auto));
+    Registry.registerStaticVar("g_auto_out", &g_auto_out[0]);
+    Registry.registerArray("cell", "g_sparse",
+                           reinterpret_cast<void *>(&g_sparse[0][0]),
+                           sizeof(g_sparse));
+    Registry.registerStaticVar("g_sparse_out", &g_sparse_out[0]);
+    Registry.registerArray("cell", "g_one",
+                           reinterpret_cast<void *>(&g_one[0][0]),
+                           sizeof(g_one));
+    Registry.registerStaticVar("g_one_out", &g_one_out[0]);
     return Registry;
   }
 };
@@ -857,14 +1030,22 @@ TEST_F(SmallTableTest, PlannerBuildsColumnsAndRowsFromMemory) {
             static_cast<uint64_t>(bitsFromFloat(g_cfg[4][1][3].scale)));
   EXPECT_TRUE(Plan->isConsistent(&Error)) << Error;
 
-  // Condensation: the emitted payload is three scalar columns over 120 rows
-  // instead of the 120 x 1 KiB source elements, and it is bounded well below
-  // the source region the plan was built from.
-  uint64_t TableBytes = 0;
+  // Condensation: the emitted payload is only the scales and the axis products
+  // each field actually needs, instead of one 1 KiB element per row. `mode`
+  // depends on the phase alone, so its column keeps one axis (10 rows) while
+  // `gain` and `scale` differ jointly and keep all three.
+  EXPECT_EQ(Plan->fields[0].retainedAxes.size(), 3u);
+  EXPECT_EQ(Plan->fields[1].retainedAxes.size(), 1u);
+  EXPECT_EQ(Plan->fields[1].retainedAxes[0], 2u);
+  EXPECT_EQ(Plan->fields[1].tableRows, kPhases);
+  EXPECT_EQ(Plan->fields[1].tableBytes, kPhases * 4);
+  EXPECT_EQ(Plan->fields[2].retainedAxes.size(), 3u);
+  uint64_t FullBytes = 0;
   for (const EJitSmallTableField &Field : Plan->fields)
-    TableBytes += Plan->numRows() * Field.accessSize;
-  EXPECT_EQ(TableBytes, kCells * kTrps * kPhases * (4 + 4 + 4));
-  EXPECT_LT(TableBytes, sizeof(g_cfg) / 8);
+    FullBytes += Plan->numRows() * Field.accessSize;
+  EXPECT_EQ(FullBytes, kCells * kTrps * kPhases * (4 + 4 + 4));
+  EXPECT_EQ(Plan->tableBytes(), FullBytes - (Plan->numRows() - kPhases) * 4);
+  EXPECT_LT(Plan->tableBytes(), sizeof(g_cfg) / 8);
 }
 
 TEST_F(SmallTableTest, PlannerRefusesOutOfRegionAndUnknownShape) {
@@ -1466,13 +1647,18 @@ TEST_F(SmallTableTest, JitPartiallyReadyPlanKeepsAotBehavior) {
       }
 }
 
-/// Equality across every visible row is not a contract. Without an explicit
-/// admission contract the planner must keep the column and never fold.
-TEST_F(SmallTableTest, UniformContractIsNeverInferredFromEqualVisibleRows) {
+/// The default mode decides on the proven domain, and the proven domain is the
+/// whole safety argument: equality over three ready rows is a real automatic
+/// constant *for that domain*, but a domain that does not cover the declared
+/// schema can never be lowered executably (spec §4.1 step 1, §5, §6.6). On the
+/// complete domain the same field is genuinely not equal and stays a real
+/// column, so the automatic path never freezes "the rows we happened to see"
+/// for a domain it cannot cover.
+TEST_F(SmallTableTest, AutomaticEqualityIsProvenOnTheDomainNotOnVisibleRows) {
   auto M = parseModule();
   ASSERT_TRUE(M);
-  // Rows (0,0,1..3): all four visible `mode` values are 1 in fillConfig(), so a
-  // naive "they all agree" inference would fold mode to 1.
+  // Rows (0,0,1..3): all three visible `mode` values are 1 in fillConfig(), so
+  // the solver does fold mode for exactly this proven domain.
   SmallVector<EJitSmallTableRowKey, 4> Rows = {{{0, 0, 1}}, {{0, 0, 2}},
                                                {{0, 0, 3}}};
   std::string Error;
@@ -1482,32 +1668,52 @@ TEST_F(SmallTableTest, UniformContractIsNeverInferredFromEqualVisibleRows) {
                            sizeof(g_cfg)},
       Rows, {}, Error);
   ASSERT_TRUE(Plan.has_value()) << Error;
-  EXPECT_EQ(Plan->uniformFieldCount(), 0u);
-  for (const EJitSmallTableField &Field : Plan->fields)
-    EXPECT_FALSE(Field.uniformValue.has_value());
-  for (const EJitSmallTableField &Field : Plan->fields)
-    EXPECT_FALSE(Field.columnName.empty());
+  EXPECT_EQ(Plan->mode, EJitSmallTablePlanMode::Automatic);
+  EXPECT_EQ(Plan->uniformFieldCount(), 1u);
+  ASSERT_EQ(Plan->fields[1].strategy, EJitSmallTableStrategy::Uniform);
+  ASSERT_TRUE(Plan->fields[1].uniformValue.has_value());
+  EXPECT_EQ(*Plan->fields[1].uniformValue, 1u);
+  EXPECT_TRUE(Plan->fields[1].columnName.empty());
+  EXPECT_FALSE(Plan->fields[1].uniformFromContract);
+  // gain and scale differ per phase on this domain, so they keep the axis that
+  // explains the difference rather than a full-dimensional table.
+  EXPECT_EQ(Plan->fields[0].retainedAxes.size(), 1u);
+  EXPECT_EQ(Plan->fields[0].retainedAxes[0], 2u);
+  EXPECT_EQ(Plan->fields[2].retainedAxes.size(), 1u);
 
-  // Lowering that partial plan is refused; the point of this test is the
-  // planner-level refusal to infer a contract, which is checked above.
+  // A plan that does not cover its declared schema is planned but never lowered,
+  // so the folded constant cannot reach a business call: no column global, and
+  // every load keeps its original form.
   Error.clear();
   EXPECT_FALSE(EJitSmallTablePass::materialize(*M, *Plan, &Error));
   EXPECT_NE(Error.find("rows ready"), std::string::npos) << Error;
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_stab_entry_c0"), nullptr);
+  EJitSmallTablePass Pass(*Plan);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("stab_entry"), FAM);
+  EXPECT_EQ(Pass.getStats().uniformFolded, 0u);
+  EXPECT_EQ(Pass.getStats().tableReplaced, 0u);
+  EXPECT_EQ(Pass.getStats().refusedNotReady, 1u);
+  EXPECT_EQ(countLoadsRootedAt(*M->getFunction("stab_entry"), "g_cfg"), 4u);
 
-  // On a complete plan with no contract, every field still stays a real table
-  // column: no equality inference happens anywhere in the pass.
+  // On the complete domain mode is not equal at all (phase 0 and 4 take the
+  // other branch), so the automatic solver keeps a real, phase-indexed column.
   auto FullM = parseModule();
   ASSERT_TRUE(FullM);
   auto FullSet = makePlanSet(*FullM);
   const EJitSmallTablePlan *Full = FullSet->find("stab_entry");
   ASSERT_NE(Full, nullptr);
   EXPECT_EQ(Full->uniformFieldCount(), 0u);
+  EXPECT_EQ(Full->fields[1].strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(Full->fields[1].retainedAxes.size(), 1u);
+  EXPECT_EQ(Full->fields[1].retainedAxes[0], 2u);
+  Error.clear();
   ASSERT_TRUE(EJitSmallTablePass::materialize(*FullM, *Full, &Error)) << Error;
-  EJitSmallTablePass Pass(*Full);
-  FunctionAnalysisManager FAM;
-  Pass.run(*FullM->getFunction("stab_entry"), FAM);
-  EXPECT_EQ(Pass.getStats().uniformFolded, 0u);
-  EXPECT_EQ(Pass.getStats().tableReplaced, 3u);
+  EJitSmallTablePass FullPass(*Full);
+  FunctionAnalysisManager FullFAM;
+  FullPass.run(*FullM->getFunction("stab_entry"), FullFAM);
+  EXPECT_EQ(FullPass.getStats().uniformFolded, 0u);
+  EXPECT_EQ(FullPass.getStats().tableReplaced, 3u);
 }
 
 /// A contract is an explicit caller assertion. It is checked against every row
@@ -1710,7 +1916,10 @@ TEST_F(SmallTableTest, PlannerRefusesOversizedAndDuplicateDomains) {
 TEST_F(SmallTableTest, MaterializeFillsDeclaredSlotsAndRefusesForeignOnes) {
   auto PlanM = parseModule();
   ASSERT_TRUE(PlanM);
-  auto Set = makePlanSet(*PlanM);
+  // This test pins materialize()'s slot handling on the full-dimensional column
+  // shape, so it explicitly selects the comparison mode instead of the
+  // automatic default (which would project `mode` onto the phase axis).
+  auto Set = makePlanSet(*PlanM, {}, {}, EJitSmallTablePlanMode::ExplicitContracts);
   const EJitSmallTablePlan *Plan = Set->find("stab_entry");
   ASSERT_NE(Plan, nullptr);
   const std::string Anchor = "@g_out = external global [6 x [2 x i32]]";
@@ -2291,6 +2500,1180 @@ TEST_F(SmallTableTest, TableIdentityIsPerCompileAndHandedOffByName) {
             static_cast<int32_t>((E3.bits & 1u) + static_cast<uint64_t>(E3.bits) +
                                  I16 + truncateToBits(E3.sub, 9) + E3.live +
                                  static_cast<uint64_t>(g_width_free[0])));
+}
+
+//===----------------------------------------------------------------------===//
+// A1: automatic per-field specialization, axis elimination and the exported
+// admission contract (spec §4.1/§6.6; no caller-supplied uniform value)
+//===----------------------------------------------------------------------===//
+
+/// The dynamic index of the first table load rooted at \p ColumnName, with
+/// integer casts stripped, plus how many dynamic indices the address has.
+const Value *tableLoadIndex(const Function &F, StringRef ColumnName,
+                            unsigned *DynamicCount = nullptr) {
+  for (const Instruction &I : instructions(F)) {
+    const auto *LI = dyn_cast<LoadInst>(&I);
+    if (!LI)
+      continue;
+    if (rootGVOf(LI->getPointerOperand()) == nullptr ||
+        rootGVOf(LI->getPointerOperand())->getName() != ColumnName)
+      continue;
+    SmallVector<const Value *, 4> Dyn;
+    const Value *V = LI->getPointerOperand()->stripPointerCasts();
+    while (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+      for (auto GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP); GTI != GTE;
+           ++GTI) {
+        if (GTI.getStructTypeOrNull())
+          continue;
+        if (!isa<ConstantInt>(GTI.getOperand()))
+          Dyn.push_back(GTI.getOperand());
+      }
+      V = GEP->getPointerOperand()->stripPointerCasts();
+    }
+    if (DynamicCount)
+      *DynamicCount = Dyn.size();
+    if (Dyn.empty())
+      return nullptr;
+    const Value *Idx = Dyn.back();
+    while (const auto *CI = dyn_cast<CastInst>(Idx))
+      Idx = CI->getOperand(0);
+    return Idx;
+  }
+  return nullptr;
+}
+
+/// The typed member values the contract's fields describe, read out of a real
+/// AutoElement (the same masked typed values the planner copies).
+EJitSmallTableMember autoMember(const AutoElement &E,
+                                ArrayRef<uint64_t> Indices) {
+  EJitSmallTableMember M;
+  M.indices.append(Indices.begin(), Indices.end());
+  M.bits.push_back(static_cast<uint32_t>(E.mode));
+  M.bits.push_back(static_cast<uint32_t>(E.byCell));
+  M.bits.push_back(static_cast<uint32_t>(E.byTrp));
+  M.bits.push_back(static_cast<uint32_t>(E.joint));
+  return M;
+}
+
+/// The §4.1 solver on a domain where each strategy case occurs: one field equal
+/// over the whole domain, one that differs per cell only, one per TRP only, one
+/// jointly. No caller-supplied uniform value is involved anywhere.
+TEST_F(SmallTableTest, AutomaticSolverFoldsUniformAndEliminatesAxes) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+
+  EJitSmallTableRequest Req;
+  Req.module = M.get();
+  Req.entryName = "a_entry";
+  Req.sourceVarName = "g_auto";
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  Req.dims = Dims;
+  Req.source = EJitSmallTableSource{
+      reinterpret_cast<const uint8_t *>(&g_auto[0][0]), sizeof(g_auto)};
+  SmallVector<EJitSmallTableRowKey, 16> Rows = autoRows(kAutoCells, kAutoTrps);
+  Req.authorizedRows = Rows;
+  Req.mode = EJitSmallTablePlanMode::Automatic;
+  Req.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Req, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+  ASSERT_EQ(Plan->fields.size(), 4u);
+  EXPECT_TRUE(Plan->allRowsReady());
+  EXPECT_TRUE(Plan->verifyProjections(&Error)) << Error;
+
+  // Field 0 is bit-exactly equal on the proven domain: constant, and NO column,
+  // no payload and no table load (spec §4.1 row 1).
+  const EJitSmallTableField &Mode = Plan->fields[0];
+  EXPECT_EQ(Mode.strategy, EJitSmallTableStrategy::Uniform);
+  ASSERT_TRUE(Mode.uniformValue.has_value());
+  EXPECT_EQ(*Mode.uniformValue, 1u);
+  EXPECT_TRUE(Mode.columnName.empty());
+  EXPECT_TRUE(Mode.retainedAxes.empty());
+  EXPECT_EQ(Mode.tableRows, 0u);
+  EXPECT_EQ(Mode.tableBytes, 0u);
+  EXPECT_FALSE(Mode.uniformFromContract)
+      << "the automatic solver must not be recorded as a caller contract";
+
+  // Field 1 differs with cell only: cell retained, TRP eliminated.
+  const EJitSmallTableField &ByCell = Plan->fields[1];
+  EXPECT_EQ(ByCell.strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(ByCell.retainedAxes.size(), 1u);
+  EXPECT_EQ(ByCell.retainedAxes[0], 0u);
+  EXPECT_EQ(ByCell.tableRows, kAutoCells);
+  EXPECT_EQ(ByCell.tableBytes, kAutoCells * 4);
+  EXPECT_EQ(ByCell.columnName, "__ejit_stab_a_entry_c1");
+
+  // Field 2 differs with TRP only: TRP retained, cell eliminated.
+  const EJitSmallTableField &ByTrp = Plan->fields[2];
+  EXPECT_EQ(ByTrp.strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(ByTrp.retainedAxes.size(), 1u);
+  EXPECT_EQ(ByTrp.retainedAxes[0], 1u);
+  EXPECT_EQ(ByTrp.tableRows, kAutoTrps);
+  EXPECT_EQ(ByTrp.tableBytes, kAutoTrps * 4);
+  EXPECT_EQ(ByTrp.columnName, "__ejit_stab_a_entry_c2");
+
+  // Field 3 differs jointly: both axes kept, no representative row invented.
+  const EJitSmallTableField &Joint = Plan->fields[3];
+  EXPECT_EQ(Joint.strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(Joint.retainedAxes.size(), 2u);
+  EXPECT_EQ(Joint.retainedAxes[0], 0u);
+  EXPECT_EQ(Joint.retainedAxes[1], 1u);
+  EXPECT_EQ(Joint.tableRows, kAutoCells * kAutoTrps);
+
+  // Accounting (§13): three columns over the axis products instead of four full
+  // tables, and the folded field occupies nothing at all.
+  EXPECT_EQ(Plan->tableFieldCount(), 3u);
+  EXPECT_EQ(Plan->uniformFieldCount(), 1u);
+  EXPECT_EQ(Plan->tableBytes(),
+            (kAutoCells + kAutoTrps + kAutoCells * kAutoTrps) * 4);
+  EXPECT_LT(Plan->tableBytes(), Plan->numRows() * 4 * 4);
+
+  // The projected coordinate of the TRP-only field is the real TRP index, and
+  // the cell coordinate does not enter it.
+  EXPECT_EQ(Plan->projectRow(ByTrp, 2 * kAutoTrps + 1), 1u);
+  EXPECT_EQ(Plan->projectRow(ByCell, 2 * kAutoTrps + 1), 2u);
+  EXPECT_EQ(Plan->fieldRowStride(Joint, 0), kAutoTrps);
+  EXPECT_EQ(Plan->fieldRowStride(Joint, 1), 1u);
+
+  // The readiness identity is recorded, never invented.
+  EXPECT_EQ(Plan->mode, EJitSmallTablePlanMode::Automatic);
+  EXPECT_EQ(Plan->readiness.domainEpoch, 0x5EED20260914ull);
+  EXPECT_EQ(Plan->readiness.providerLabel, "test.provider.compiler-boundary");
+  EXPECT_TRUE(Plan->readiness.coversDeclaredDomain);
+  EXPECT_TRUE(Plan->readiness.borrowedStable);
+
+  // Every coordinate of a lowered column carries its own projected value, taken
+  // from the real source rows.
+  ASSERT_TRUE(EJitSmallTablePass::materialize(*M, *Plan, &Error)) << Error;
+  GlobalVariable *ByTrpCol = M->getNamedGlobal("__ejit_stab_a_entry_c2");
+  ASSERT_NE(ByTrpCol, nullptr);
+  EXPECT_EQ(ByTrpCol->getValueType(), ArrayType::get(Type::getInt32Ty(Ctx), 3));
+  for (unsigned T = 0; T < kAutoTrps; ++T)
+    EXPECT_EQ(elementBits(ByTrpCol->getInitializer(), T),
+              static_cast<uint64_t>(g_auto[0][T].byTrp));
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_a_entry_c0"), nullptr)
+      << "the uniform field must not get a column";
+}
+
+/// The IR half: each field is lowered with only its own axes, the uniform field
+/// folds to a constant with no load, and the branch that constant decides really
+/// disappears — checked on real IR through the real optimizer pipeline.
+TEST_F(SmallTableTest, AutomaticSolverLowersEachFieldWithItsOwnAxes) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+
+  EJitSmallTableRequest Req;
+  Req.module = M.get();
+  Req.entryName = "a_entry";
+  Req.sourceVarName = "g_auto";
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  Req.dims = Dims;
+  Req.source = EJitSmallTableSource{
+      reinterpret_cast<const uint8_t *>(&g_auto[0][0]), sizeof(g_auto)};
+  SmallVector<EJitSmallTableRowKey, 16> Rows = autoRows(kAutoCells, kAutoTrps);
+  Req.authorizedRows = Rows;
+  Req.mode = EJitSmallTablePlanMode::Automatic;
+  Req.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Req, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+
+  ASSERT_TRUE(EJitSmallTablePass::materialize(*M, *Plan, &Error)) << Error;
+  EJitSmallTablePass Pass(*Plan);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("a_entry"), FAM);
+
+  Function &F = *M->getFunction("a_entry");
+  EXPECT_EQ(Pass.getStats().uniformFolded, 1u);
+  EXPECT_EQ(Pass.getStats().tableReplaced, 3u);
+  // No authorized load survives on the source object: the folded field has no
+  // load at all and the other three read their own projected column.
+  EXPECT_EQ(countLoadsRootedAt(F, "g_auto"), 0u);
+  EXPECT_EQ(countTableLoads(F, EJitSmallTablePlan::TableGlobalPrefix), 3u);
+  EXPECT_EQ(countTaggedTableLoads(F), 3u);
+
+  // The cell-only column is addressed by the cell argument alone (its TRP axis
+  // was eliminated), and the TRP-only column by the TRP argument alone.
+  EXPECT_EQ(tableLoadIndex(F, "__ejit_stab_a_entry_c1"), F.getArg(0));
+  EXPECT_EQ(tableLoadIndex(F, "__ejit_stab_a_entry_c2"), F.getArg(1));
+  // The joint column keeps the real computed row index, which uses both.
+  unsigned JointDyn = 0;
+  const Value *JointIdx = tableLoadIndex(F, "__ejit_stab_a_entry_c3", &JointDyn);
+  ASSERT_NE(JointIdx, nullptr);
+  EXPECT_EQ(JointDyn, 1u) << "one computed row index, not two raw axes";
+  EXPECT_FALSE(isa<Argument>(JointIdx));
+  EXPECT_GT(F.getArg(0)->getNumUses(), 0u);
+  EXPECT_GT(F.getArg(1)->getNumUses(), 0u);
+
+  // The emitted columns have the projected sizes, not the full domain size.
+  GlobalVariable *CellCol = M->getNamedGlobal("__ejit_stab_a_entry_c1");
+  GlobalVariable *JointCol = M->getNamedGlobal("__ejit_stab_a_entry_c3");
+  ASSERT_NE(CellCol, nullptr);
+  ASSERT_NE(JointCol, nullptr);
+  EXPECT_EQ(CellCol->getValueType(), ArrayType::get(Type::getInt32Ty(Ctx), 4));
+  EXPECT_EQ(JointCol->getValueType(), ArrayType::get(Type::getInt32Ty(Ctx), 12));
+  EXPECT_FALSE(CellCol->isConstant());
+  EXPECT_FALSE(JointCol->isConstant());
+  EXPECT_TRUE(
+      F.hasMetadata("ejit.smalltable.contract"))
+      << "the entry must carry the exported admission contract record";
+
+  // Whole-pipeline proof that the constants fold: the may_const load is gone (it
+  // is the constant), so the `icmp eq %mode, 1` that decided the branch and the
+  // select itself fold away, while the real arguments, store and helper-style
+  // arithmetic stay.
+  auto PipeM = parseAssemblyString(autoModuleText("a_entry", "g_auto",
+                                                  "g_auto_out", kAutoCells,
+                                                  kAutoTrps),
+                                   Err, Ctx);
+  ASSERT_TRUE(PipeM) << "auto module failed to re-parse";
+  PeriodArrayRegistry &Registry = makeRegistry();
+  EJitOptimizer Opt(Registry);
+  auto PipeSet = std::make_shared<EJitSmallTablePlanSet>();
+  PipeSet->add(std::make_shared<const EJitSmallTablePlan>(*Plan));
+  Opt.setSmallTablePlans(PipeSet);
+  SpecializationContext C = baselineCtx("a_entry");
+  Opt.runPipeline(*PipeM, C);
+  Function &PF = *PipeM->getFunction("a_entry");
+  EXPECT_EQ(countLoadsRootedAt(PF, "g_auto"), 0u);
+  for (const Instruction &I : instructions(PF)) {
+    EXPECT_FALSE(isa<SelectInst>(&I))
+        << "the branch the folded constant decides must be gone";
+    if (const auto *IC = dyn_cast<ICmpInst>(&I))
+      EXPECT_NE(IC->getOperand(1), ConstantInt::get(Type::getInt32Ty(Ctx), 1))
+          << "the invariant comparison must have folded";
+  }
+  EXPECT_GT(PF.getArg(0)->getNumUses(), 0u);
+  EXPECT_GT(PF.getArg(1)->getNumUses(), 0u);
+  EXPECT_GT(PF.getArg(2)->getNumUses(), 0u);
+}
+
+/// Real ORC execution of the automatic plan: every (cell, TRP) member and a
+/// range of real x values must match the AOT reference, which is only possible
+/// if each field's projected index is exactly its own axis and the folded
+/// constant is the domain's true value.
+TEST_F(SmallTableTest, JitAutomaticSpecializationMatchesAotEveryRow) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+
+  EJitSmallTableRequest Req;
+  Req.module = M.get();
+  Req.entryName = "a_entry";
+  Req.sourceVarName = "g_auto";
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  Req.dims = Dims;
+  Req.source = EJitSmallTableSource{
+      reinterpret_cast<const uint8_t *>(&g_auto[0][0]), sizeof(g_auto)};
+  SmallVector<EJitSmallTableRowKey, 16> Rows = autoRows(kAutoCells, kAutoTrps);
+  Req.authorizedRows = Rows;
+  Req.mode = EJitSmallTablePlanMode::Automatic;
+  Req.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Req, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(std::move(*Plan)));
+
+  PeriodArrayRegistry &Registry = makeRegistry();
+  std::memset(g_auto_out, 0, sizeof(g_auto_out));
+  auto Engine = compileWithEngine(*M, Set, Registry, 0x57ab20, "a_entry");
+  ASSERT_NE(Engine, nullptr);
+  auto Fn = lookupSealed<int32_t (*)(uint32_t, uint32_t, int32_t)>(
+      *Engine, 0x57ab20, "a_entry");
+  ASSERT_NE(Fn, nullptr);
+
+  // The engine publishes exactly the three projected columns; the folded field
+  // has no table to publish into.
+  ArrayRef<std::string> Names = Engine->getLastSmallTableColumnNames();
+  ASSERT_EQ(Names.size(), 3u);
+  EXPECT_EQ(Names[0], "__ejit_stab_a_entry_c1");
+  EXPECT_EQ(Names[1], "__ejit_stab_a_entry_c2");
+  EXPECT_EQ(Names[2], "__ejit_stab_a_entry_c3");
+
+  for (unsigned C = 0; C < kAutoCells; ++C)
+    for (unsigned T = 0; T < kAutoTrps; ++T)
+      for (int32_t X = -3; X <= 9; ++X) {
+        EXPECT_EQ(Fn(C, T, X), aotAuto(g_auto[C][T], X))
+            << "cell=" << C << " trp=" << T << " x=" << X;
+      }
+  EXPECT_EQ(g_auto_out[0], 9);
+  EXPECT_EQ(g_auto_out[kAutoCells - 1], 9)
+      << "the store still targets the real per-cell output address";
+}
+
+/// Sparse/checkerboard domains: the solver must decide on the COMPLETE proven
+/// domain, deterministically, and must never delete two axes because a single
+/// axis had no comparable neighbour (spec §4.1).
+TEST_F(SmallTableTest, AutomaticSolverUsesTheWholeDomainDeterministically) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("s_entry", "g_sparse",
+                                              "g_sparse_out", 2, 2),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "sparse module failed to parse";
+
+  auto PlanFor = [&](ArrayRef<EJitSmallTableRowKey> Rows,
+                     std::string &Error) {
+    SmallVector<EJitSmallTableDim, 2> Dims = autoDims(2, 2);
+    EJitSmallTableRequest Req;
+    Req.module = M.get();
+    Req.entryName = "s_entry";
+    Req.sourceVarName = "g_sparse";
+    Req.dims = Dims;
+    Req.source = EJitSmallTableSource{
+        reinterpret_cast<const uint8_t *>(&g_sparse[0][0]), sizeof(g_sparse)};
+    Req.authorizedRows = Rows;
+    Req.mode = EJitSmallTablePlanMode::Automatic;
+    Req.readiness = testReadiness();
+    return EJitSmallTablePlanner::plan(Req, Error);
+  };
+
+  // Diagonal domain D = {(0,0) = 7, (1,1) = 9}: {cell} and {TRP} both prove it,
+  // and the deterministic tie-break is the schema axis order, so {cell} wins.
+  // The empty set fails: the values differ, so no vacuous constant is allowed.
+  g_sparse[0][0].joint = 7;
+  g_sparse[1][1].joint = 9;
+  g_sparse[0][1].joint = 11; // outside D, must not affect the decision
+  g_sparse[1][0].joint = 13;
+  SmallVector<EJitSmallTableRowKey, 4> Diagonal = {{{0, 0}}, {{1, 1}}};
+  std::string Error;
+  auto Diag = PlanFor(Diagonal, Error);
+  ASSERT_TRUE(Diag.has_value()) << Error;
+  const EJitSmallTableField &DiagJoint = Diag->fields[3];
+  EXPECT_EQ(DiagJoint.strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(DiagJoint.retainedAxes.size(), 1u);
+  EXPECT_EQ(DiagJoint.retainedAxes[0], 0u)
+      << "equal-size candidates are decided by schema axis order";
+  EXPECT_EQ(DiagJoint.tableRows, 2u);
+  // A field equal on both diagonal rows is a constant inside this controlled
+  // contract, with no payload.
+  EXPECT_EQ(Diag->fields[2].strategy, EJitSmallTableStrategy::Uniform)
+      << "byTrp is 5 on both diagonal rows";
+  EXPECT_EQ(Diag->fields[2].tableBytes, 0u);
+  // The unproven rows stay unready, so the partial plan can never be lowered.
+  EXPECT_FALSE(Diag->allRowsReady());
+
+  // Checkerboard on the complete domain: both single axes fail, so the joint
+  // axes are kept. An implementation that proved each axis "irrelevant"
+  // independently would wrongly delete both.
+  g_sparse[0][0].joint = 7;
+  g_sparse[0][1].joint = 9;
+  g_sparse[1][0].joint = 9;
+  g_sparse[1][1].joint = 7;
+  SmallVector<EJitSmallTableRowKey, 4> Full = autoRows(2, 2);
+  Error.clear();
+  auto Checker = PlanFor(Full, Error);
+  ASSERT_TRUE(Checker.has_value()) << Error;
+  const EJitSmallTableField &CheckerJoint = Checker->fields[3];
+  ASSERT_EQ(CheckerJoint.retainedAxes.size(), 2u);
+  EXPECT_EQ(CheckerJoint.retainedAxes[0], 0u);
+  EXPECT_EQ(CheckerJoint.retainedAxes[1], 1u);
+  EXPECT_EQ(CheckerJoint.tableRows, 4u);
+  EXPECT_TRUE(Checker->allRowsReady());
+  EXPECT_TRUE(Checker->verifyProjections(&Error)) << Error;
+
+  // Lower the checkerboard plan for real and execute it: the projected index
+  // must reproduce the checkerboard exactly.
+  Error.clear();
+  auto JitPlan = PlanFor(Full, Error);
+  ASSERT_TRUE(JitPlan.has_value()) << Error;
+  auto JitM = parseAssemblyString(
+      autoModuleText("s_entry", "g_sparse", "g_sparse_out", 2, 2), Err, Ctx);
+  ASSERT_TRUE(JitM);
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(std::move(*JitPlan)));
+  PeriodArrayRegistry &Registry = makeRegistry();
+  std::memset(g_sparse_out, 0, sizeof(g_sparse_out));
+  auto Engine = compileWithEngine(*JitM, Set, Registry, 0x57ab21, "s_entry");
+  ASSERT_NE(Engine, nullptr);
+  auto Fn = lookupSealed<int32_t (*)(uint32_t, uint32_t, int32_t)>(
+      *Engine, 0x57ab21, "s_entry");
+  ASSERT_NE(Fn, nullptr);
+  for (unsigned C = 0; C < 2; ++C)
+    for (unsigned T = 0; T < 2; ++T)
+      EXPECT_EQ(Fn(C, T, 4), aotAuto(g_sparse[C][T], 4))
+          << "cell=" << C << " trp=" << T;
+
+  // A TRP-only difference on the complete domain keeps the TRP axis and drops
+  // the cell axis.
+  for (unsigned C = 0; C < 2; ++C)
+    for (unsigned T = 0; T < 2; ++T)
+      g_sparse[C][T].joint = static_cast<int32_t>(3 + T);
+  Error.clear();
+  auto ByTrp = PlanFor(Full, Error);
+  ASSERT_TRUE(ByTrp.has_value()) << Error;
+  ASSERT_EQ(ByTrp->fields[3].retainedAxes.size(), 1u);
+  EXPECT_EQ(ByTrp->fields[3].retainedAxes[0], 1u);
+  EXPECT_EQ(ByTrp->fields[3].tableRows, 2u);
+}
+
+/// The default mode is automatic; an explicit comparison mode is distinctly
+/// selected, an empty proven domain can never become a vacuous constant, and a
+/// partially proven domain is planned but never lowered executably.
+TEST_F(SmallTableTest, AutomaticModeRefusesContractsAndUnprovenDomains) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+  const auto *Base = reinterpret_cast<const uint8_t *>(&g_auto[0][0]);
+  SmallVector<EJitSmallTableRowKey, 16> Full = autoRows(kAutoCells, kAutoTrps);
+
+  // The default mode takes no caller contract: mixing would blur the required
+  // default and the comparison primitive.
+  std::vector<std::optional<uint64_t>> Contracts = {uint64_t{1}, std::nullopt,
+                                                    std::nullopt, std::nullopt};
+  std::string Error;
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  EJitSmallTableRequest Auto;
+  Auto.module = M.get();
+  Auto.entryName = "a_entry";
+  Auto.sourceVarName = "g_auto";
+  Auto.dims = Dims;
+  Auto.source = EJitSmallTableSource{Base, sizeof(g_auto)};
+  Auto.authorizedRows = Full;
+  Auto.uniformContracts = Contracts;
+  Auto.mode = EJitSmallTablePlanMode::Automatic;
+  auto Refused = EJitSmallTablePlanner::plan(Auto, Error);
+  EXPECT_FALSE(Refused.has_value());
+  EXPECT_NE(Error.find("automatic mode"), std::string::npos) << Error;
+
+  // An empty proven domain must refuse rather than produce a vacuous constant.
+  Error.clear();
+  SmallVector<EJitSmallTableRowKey, 1> NoRows;
+  Auto.uniformContracts = {};
+  Auto.authorizedRows = NoRows;
+  auto Empty = EJitSmallTablePlanner::plan(Auto, Error);
+  EXPECT_FALSE(Empty.has_value());
+  EXPECT_NE(Error.find("empty"), std::string::npos) << Error;
+
+  // The same schema and rows through the historical entry point select the
+  // explicit comparison mode: the contract is honored there and the mode is
+  // recorded on the plan, so the two modes are never conflated.
+  Error.clear();
+  auto Explicit = EJitSmallTablePlanner::plan(
+      *M, "a_entry", "g_auto", autoDims(kAutoCells, kAutoTrps),
+      EJitSmallTableSource{Base, sizeof(g_auto)}, Full, Contracts, Error);
+  ASSERT_TRUE(Explicit.has_value()) << Error;
+  EXPECT_EQ(Explicit->mode, EJitSmallTablePlanMode::ExplicitContracts);
+  EXPECT_EQ(Explicit->fields[0].strategy, EJitSmallTableStrategy::Uniform);
+  EXPECT_TRUE(Explicit->fields[0].uniformFromContract);
+  // The comparison mode does not infer: every other field keeps all axes.
+  for (unsigned I = 1; I < Explicit->fields.size(); ++I) {
+    EXPECT_EQ(Explicit->fields[I].strategy, EJitSmallTableStrategy::Table);
+    EXPECT_EQ(Explicit->fields[I].retainedAxes.size(), 2u);
+    EXPECT_EQ(Explicit->fields[I].tableRows, kAutoCells * kAutoTrps);
+  }
+
+  // A partially proven automatic plan records the strategies it could prove but
+  // stays non-executable: no column is created and no load is replaced, so the
+  // whole-entry readiness gate survives the new planner.
+  Error.clear();
+  SmallVector<EJitSmallTableRowKey, 4> PartialRows = {{{0, 0}}, {{1, 0}}};
+  auto Partial = EJitSmallTablePlanner::plan(
+      *M, "a_entry", "g_auto", autoDims(kAutoCells, kAutoTrps),
+      EJitSmallTableSource{Base, sizeof(g_auto)}, PartialRows, {}, Error);
+  ASSERT_TRUE(Partial.has_value()) << Error;
+  EXPECT_FALSE(Partial->allRowsReady());
+  EXPECT_FALSE(Partial->domainComplete());
+  EXPECT_EQ(Partial->fields[0].strategy, EJitSmallTableStrategy::Uniform);
+  Error.clear();
+  EXPECT_FALSE(EJitSmallTablePass::materialize(*M, *Partial, &Error));
+  EXPECT_NE(Error.find("rows ready"), std::string::npos) << Error;
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_a_entry_c1"), nullptr);
+  EJitSmallTablePass Pass(*Partial);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("a_entry"), FAM);
+  EXPECT_EQ(Pass.getStats().uniformFolded, 0u);
+  EXPECT_EQ(Pass.getStats().tableReplaced, 0u);
+  EXPECT_EQ(Pass.getStats().refusedNotReady, 1u);
+  EXPECT_EQ(countLoadsRootedAt(*M->getFunction("a_entry"), "g_auto"), 4u)
+      << "an unproven domain keeps every original load";
+}
+
+/// Automatic specialization on the scalar-width fixture: the two fields that are
+/// bit-exactly equal on the whole domain fold with no column (an i1 field and an
+/// i8 field at the same address!), the two that differ per phase keep one-axis
+/// tables with their declared widths, and the ordinary i32 load stays original.
+TEST_F(SmallTableTest, AutomaticWidthsKeepTheirTypedValues) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(widthModuleText(), Err, Ctx);
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kWidthCells, kWidthPhases);
+  SmallVector<EJitSmallTableRowKey, 8> WRows = autoRows(kWidthCells, kWidthPhases);
+
+  EJitSmallTableRequest Req;
+  Req.module = M.get();
+  Req.entryName = "w_entry";
+  Req.sourceVarName = "g_width";
+  Req.dims = Dims;
+  Req.source = EJitSmallTableSource{
+      reinterpret_cast<const uint8_t *>(&g_width[0][0]), sizeof(g_width)};
+  Req.authorizedRows = WRows;
+  Req.mode = EJitSmallTablePlanMode::Automatic;
+  Req.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Req, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+  ASSERT_EQ(Plan->fields.size(), 4u);
+
+  // i1 (0xFE storage byte, low bit clear on every row) folds to the typed i1
+  // value 0 — never to the raw byte.
+  EXPECT_EQ(Plan->fields[0].strategy, EJitSmallTableStrategy::Uniform);
+  EXPECT_EQ(Plan->fields[0].bitWidth, 1u);
+  ASSERT_TRUE(Plan->fields[0].uniformValue.has_value());
+  EXPECT_EQ(*Plan->fields[0].uniformValue, 0u);
+  EXPECT_TRUE(Plan->fields[0].columnName.empty());
+  // i8 at the same address is a different typed value and folds separately to
+  // the full byte.
+  EXPECT_EQ(Plan->fields[1].strategy, EJitSmallTableStrategy::Uniform);
+  EXPECT_EQ(Plan->fields[1].bitWidth, 8u);
+  ASSERT_TRUE(Plan->fields[1].uniformValue.has_value());
+  EXPECT_EQ(*Plan->fields[1].uniformValue, 0xFEu);
+  // i16 and i9 differ per phase: one-axis tables, declared widths preserved.
+  EXPECT_EQ(Plan->fields[2].strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(Plan->fields[2].retainedAxes.size(), 1u);
+  EXPECT_EQ(Plan->fields[2].retainedAxes[0], 1u);
+  EXPECT_EQ(Plan->fields[2].bitWidth, 16u);
+  EXPECT_EQ(Plan->fields[3].strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(Plan->fields[3].retainedAxes.size(), 1u);
+  EXPECT_EQ(Plan->fields[3].retainedAxes[0], 1u);
+  EXPECT_EQ(Plan->fields[3].bitWidth, 9u);
+  EXPECT_EQ(Plan->tableBytes(), (kWidthPhases * 2) + (kWidthPhases * 2));
+
+  // The exported contract keeps the typed width of the folded i1 field: a raw
+  // storage byte (0xFE) is not an i1 value and can never validate as one.
+  EJitSmallTableContract Contract = buildAdmissionContract(*Plan);
+  ASSERT_TRUE(Contract.fields[0].requiredValue.has_value());
+  EXPECT_EQ(*Contract.fields[0].requiredValue, 0u);
+  EJitSmallTableMember RawByte = autoMember(g_auto[0][0], {0, 0});
+  RawByte.indices = {0, 0};
+  RawByte.bits = {0xFEu, 0xFEu, 0x5AFEu, 0x0014u};
+  std::string Why;
+  EXPECT_EQ(validateAdmission(Contract, RawByte, &Why),
+            EJitSmallTableAdmission::Unusable)
+      << Why;
+  EXPECT_NE(Why.find("width"), std::string::npos) << Why;
+
+  ASSERT_TRUE(EJitSmallTablePass::materialize(*M, *Plan, &Error)) << Error;
+  EJitSmallTablePass Pass(*Plan);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("w_entry"), FAM);
+  EXPECT_EQ(Pass.getStats().uniformFolded, 2u);
+  EXPECT_EQ(Pass.getStats().tableReplaced, 2u);
+  EXPECT_EQ(Pass.getStats().keptOriginal, 1u)
+      << "the ordinary live i32 load is not an authorized field";
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_w_entry_c0"), nullptr);
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_w_entry_c1"), nullptr);
+  GlobalVariable *SCol = M->getNamedGlobal("__ejit_stab_w_entry_c2");
+  GlobalVariable *NCol = M->getNamedGlobal("__ejit_stab_w_entry_c3");
+  ASSERT_NE(SCol, nullptr);
+  ASSERT_NE(NCol, nullptr);
+  EXPECT_EQ(SCol->getValueType(),
+            ArrayType::get(Type::getInt16Ty(Ctx), kWidthPhases));
+  EXPECT_EQ(NCol->getValueType(),
+            ArrayType::get(Type::getIntNTy(Ctx, 9), kWidthPhases));
+  for (unsigned P = 0; P < kWidthPhases; ++P) {
+    EXPECT_EQ(elementBits(SCol->getInitializer(), P),
+              truncateToBits(static_cast<uint64_t>(g_width[0][P].bits) |
+                                 (static_cast<uint64_t>(g_width[0][P].pad) << 8),
+                             16));
+    EXPECT_EQ(elementBits(NCol->getInitializer(), P),
+              truncateToBits(g_width[0][P].sub, 9));
+  }
+
+  // Real execution: the folded i1/i8 constants and the per-phase tables must
+  // reproduce every source row.
+  auto JitM = parseAssemblyString(widthModuleText(), Err, Ctx);
+  ASSERT_TRUE(JitM);
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(*Plan));
+  PeriodArrayRegistry &Registry = makeRegistry();
+  auto Engine = compileWithEngine(*JitM, Set, Registry, 0x57ab22, "w_entry");
+  ASSERT_NE(Engine, nullptr);
+  ASSERT_EQ(Engine->getLastSmallTableColumnNames().size(), 2u);
+  auto Fn = lookupSealed<int32_t (*)(uint32_t, uint32_t)>(*Engine, 0x57ab22,
+                                                          "w_entry");
+  ASSERT_NE(Fn, nullptr);
+  for (unsigned Wrap = 0; Wrap < 2; ++Wrap)
+    for (unsigned C = 0; C < kWidthCells; ++C)
+      for (unsigned P = 0; P < kWidthPhases; ++P) {
+        const WidthElement &E = g_width[C][P];
+        const uint64_t I16 = truncateToBits(
+            static_cast<uint64_t>(E.bits) | (static_cast<uint64_t>(E.pad) << 8),
+            16);
+        const uint64_t Expected = (E.bits & 1u) + static_cast<uint64_t>(E.bits) +
+                                  I16 + truncateToBits(E.sub, 9) + E.live +
+                                  static_cast<uint64_t>(g_width_free[0]);
+        EXPECT_EQ(Fn(C, P), static_cast<int32_t>(Expected))
+            << "cell=" << C << " phase=" << P;
+      }
+}
+
+/// The exported admission contract on the compiler contract boundary: a later
+/// member is classified as compatible, extendable, conflicting or unusable using
+/// only the contract's own recorded identity — no module, no plan, and a clearly
+/// labeled test provider standing in for the B0 configuration point.
+TEST_F(SmallTableTest, AdmissionContractValidatesLaterMembers) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+  EJitSmallTableRequest Req;
+  Req.module = M.get();
+  Req.entryName = "a_entry";
+  Req.sourceVarName = "g_auto";
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  Req.dims = Dims;
+  Req.source = EJitSmallTableSource{
+      reinterpret_cast<const uint8_t *>(&g_auto[0][0]), sizeof(g_auto)};
+  SmallVector<EJitSmallTableRowKey, 16> Rows = autoRows(kAutoCells, kAutoTrps);
+  Req.authorizedRows = Rows;
+  Req.mode = EJitSmallTablePlanMode::Automatic;
+  Req.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Req, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+
+  EJitSmallTableContract Contract = buildAdmissionContract(*Plan);
+  EXPECT_NE(Contract.identityHash, 0ull);
+  EXPECT_EQ(Contract.entryName, "a_entry");
+  EXPECT_EQ(Contract.sourceVarName, "g_auto");
+  EXPECT_EQ(Contract.domainEpoch, 0x5EED20260914ull);
+  EXPECT_EQ(Contract.readinessProvider, "test.provider.compiler-boundary");
+  EXPECT_TRUE(Contract.coverageAsserted);
+  EXPECT_TRUE(Contract.borrowedStable);
+  EXPECT_TRUE(Contract.domainComplete);
+  EXPECT_EQ(Contract.declaredRows, kAutoCells * kAutoTrps);
+  EXPECT_EQ(Contract.provenRows, kAutoCells * kAutoTrps);
+  ASSERT_EQ(Contract.fields.size(), 4u);
+  // The contract carries the resource identity of the compressed column, not a
+  // bare symbol name.
+  EXPECT_EQ(Contract.fields[1].retainedAxes.size(), 1u);
+  EXPECT_EQ(Contract.fields[1].resource.symbolName, "__ejit_stab_a_entry_c1");
+  EXPECT_EQ(Contract.fields[1].resource.rows, kAutoCells);
+  EXPECT_EQ(Contract.fields[1].resource.bytes, kAutoCells * 4);
+  EXPECT_EQ(Contract.fields[1].publishedValues.size(), kAutoCells);
+  EXPECT_FALSE(Contract.fields[1].resource.fixedAddress)
+      << "the host x86-64 column stays preemptible (wantDSOLocal)";
+  ASSERT_TRUE(Contract.fields[0].requiredValue.has_value());
+  EXPECT_EQ(*Contract.fields[0].requiredValue, 1u);
+
+  // A member read out of its own storage through the contract's offsets/widths
+  // and compared against the existing obligations. The cold path passes the
+  // registered region base and the member coordinate, exactly like the planner
+  // did when it copied the values.
+  std::string Why;
+  auto Live = readAdmissionMember(
+      Contract,
+      EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&g_auto[0][0]),
+                           sizeof(g_auto)},
+      {2, 1}, Why);
+  ASSERT_TRUE(Live.has_value()) << Why;
+  EXPECT_EQ(Live->bits[1], static_cast<uint32_t>(g_auto[2][1].byCell));
+  EXPECT_EQ(validateAdmission(Contract, *Live, &Why),
+            EJitSmallTableAdmission::Compatible)
+      << Why;
+
+  // A region that cannot hold the member's field access is refused before any
+  // value is read, so a cold path can never dereference past its borrow.
+  Why.clear();
+  EXPECT_FALSE(readAdmissionMember(
+                   Contract,
+                   EJitSmallTableSource{
+                       reinterpret_cast<const uint8_t *>(&g_auto[2][1]),
+                       sizeof(AutoElement)},
+                   {2, 1}, Why)
+                   .has_value());
+  EXPECT_NE(Why.find("member region"), std::string::npos) << Why;
+
+  // A conflicting uniform constant must never reuse the specialized code.
+  AutoElement Changed = g_auto[2][1];
+  Changed.mode = 2;
+  Why.clear();
+  auto BadMode = autoMember(Changed, {2, 1});
+  EXPECT_EQ(validateAdmission(Contract, BadMode, &Why),
+            EJitSmallTableAdmission::Conflict)
+      << Why;
+  EXPECT_NE(Why.find("uniform constant"), std::string::npos) << Why;
+
+  // A conflicting value in an already published projected coordinate is a
+  // conflict even though a full-dimensional table would accept a new row: the
+  // compressed projection is shared (spec §6.6).
+  AutoElement BadCell = g_auto[2][1];
+  BadCell.byCell = 4242;
+  Why.clear();
+  EXPECT_EQ(validateAdmission(Contract, autoMember(BadCell, {2, 1}), &Why),
+            EJitSmallTableAdmission::Conflict)
+      << Why;
+  EXPECT_NE(Why.find("projected value"), std::string::npos) << Why;
+
+  // A member outside the declared schema/capacity cannot be validated at all.
+  Why.clear();
+  EXPECT_EQ(validateAdmission(Contract, autoMember(g_auto[0][0], {9, 0}), &Why),
+            EJitSmallTableAdmission::Unusable)
+      << Why;
+  // A member whose value count does not match the contract cannot be validated.
+  Why.clear();
+  EJitSmallTableMember Short = autoMember(g_auto[0][0], {0, 0});
+  Short.bits.pop_back();
+  EXPECT_EQ(validateAdmission(Contract, Short, &Why),
+            EJitSmallTableAdmission::Unusable)
+      << Why;
+
+  // An unpublished but supported projected coordinate is extendable: only the
+  // runtime may add it (B1), and only with the same contract values.
+  SmallVector<EJitSmallTableRowKey, 4> PartialRows = {{{0, 0}}, {{1, 0}}};
+  Error.clear();
+  auto Partial = EJitSmallTablePlanner::plan(
+      *M, "a_entry", "g_auto", autoDims(kAutoCells, kAutoTrps),
+      EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&g_auto[0][0]),
+                           sizeof(g_auto)},
+      PartialRows, {}, Error);
+  ASSERT_TRUE(Partial.has_value()) << Error;
+  EJitSmallTableContract PartialContract = buildAdmissionContract(*Partial);
+  EXPECT_FALSE(PartialContract.domainComplete);
+  EXPECT_NE(PartialContract.identityHash, Contract.identityHash);
+  Why.clear();
+  EXPECT_EQ(validateAdmission(PartialContract, autoMember(g_auto[2][0], {2, 0}),
+                              &Why),
+            EJitSmallTableAdmission::Extendable)
+      << Why;
+  // ...but its unrelated invariants must still hold during that classification.
+  AutoElement BadPartial = g_auto[2][0];
+  BadPartial.mode = 7;
+  Why.clear();
+  EXPECT_EQ(validateAdmission(PartialContract,
+                              autoMember(BadPartial, {2, 0}), &Why),
+            EJitSmallTableAdmission::Conflict)
+      << Why;
+  EXPECT_STREQ(admissionName(EJitSmallTableAdmission::Extendable), "extendable");
+}
+
+/// §6.6.1 step 3 at the A1 boundary: when a conflicting member appears, only the
+/// field that actually differs recovers an axis; the unrelated invariants stay
+/// constants. The new domain is a new plan/identity, never an edit of the old
+/// contract (production coalesced rebuild and migration are B).
+TEST_F(SmallTableTest, WideningForAConflictingMemberOnlyExpandsThatField) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+  // On cell 0/1 the cell field is constant; it changes at cell 2.
+  g_auto[0][0].byCell = 7;
+  g_auto[1][0].byCell = 7;
+  const auto *Base = reinterpret_cast<const uint8_t *>(&g_auto[0][0]);
+
+  auto PlanFor = [&](ArrayRef<EJitSmallTableRowKey> Rows,
+                     std::string &Error) {
+    return EJitSmallTablePlanner::plan(
+        *M, "a_entry", "g_auto", autoDims(kAutoCells, kAutoTrps),
+        EJitSmallTableSource{Base, sizeof(g_auto)}, Rows, {}, Error);
+  };
+
+  SmallVector<EJitSmallTableRowKey, 4> First = {{{0, 0}}, {{1, 0}}};
+  std::string Error;
+  auto Before = PlanFor(First, Error);
+  ASSERT_TRUE(Before.has_value()) << Error;
+  EXPECT_EQ(Before->fields[1].strategy, EJitSmallTableStrategy::Uniform);
+  ASSERT_TRUE(Before->fields[1].uniformValue.has_value());
+  EXPECT_EQ(*Before->fields[1].uniformValue, 7u);
+  EXPECT_EQ(Before->fields[0].strategy, EJitSmallTableStrategy::Uniform);
+  EXPECT_EQ(Before->fields[2].strategy, EJitSmallTableStrategy::Uniform);
+  EJitSmallTableContract BeforeContract = buildAdmissionContract(*Before);
+
+  // The new member conflicts with the old contract's cell field: it must stay
+  // AOT rather than run the specialized code.
+  std::string Why;
+  EXPECT_EQ(validateAdmission(BeforeContract, autoMember(g_auto[2][0], {2, 0}),
+                              &Why),
+            EJitSmallTableAdmission::Conflict)
+      << Why;
+
+  // A new optimization round over the widened domain: only the cell field
+  // recovers an axis; the other constants stay folded and the joint table keeps
+  // its own axes.
+  SmallVector<EJitSmallTableRowKey, 4> Widened = {{{0, 0}}, {{1, 0}}, {{2, 0}}};
+  Error.clear();
+  auto After = PlanFor(Widened, Error);
+  ASSERT_TRUE(After.has_value()) << Error;
+  EXPECT_EQ(After->fields[1].strategy, EJitSmallTableStrategy::Table);
+  ASSERT_EQ(After->fields[1].retainedAxes.size(), 1u);
+  EXPECT_EQ(After->fields[1].retainedAxes[0], 0u);
+  EXPECT_EQ(After->fields[0].strategy, EJitSmallTableStrategy::Uniform)
+      << "an unrelated invariant must stay a constant";
+  EXPECT_EQ(After->fields[2].strategy, EJitSmallTableStrategy::Uniform)
+      << "an unrelated invariant must stay a constant";
+  EXPECT_FALSE(After->allRowsReady());
+
+  EJitSmallTableContract AfterContract = buildAdmissionContract(*After);
+  EXPECT_NE(AfterContract.identityHash, BeforeContract.identityHash)
+      << "a new domain is a new contract identity, not an edit of the old one";
+  Why.clear();
+  EXPECT_EQ(validateAdmission(AfterContract, autoMember(g_auto[2][0], {2, 0}),
+                              &Why),
+            EJitSmallTableAdmission::Compatible)
+      << Why;
+  // The old contract is unchanged: its recorded constant is still 7.
+  ASSERT_TRUE(BeforeContract.fields[1].requiredValue.has_value());
+  EXPECT_EQ(*BeforeContract.fields[1].requiredValue, 7u);
+}
+
+/// A column symbol name is not shared storage: two compiles with the same
+/// spelling but different obligations must produce different contract
+/// identities, and a contract with no recorded identity validates nothing.
+TEST_F(SmallTableTest, ContractIdentityIsPerCompileNotPerSymbolName) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+  const auto *Base = reinterpret_cast<const uint8_t *>(&g_auto[0][0]);
+
+  auto PlanFor = [&](ArrayRef<EJitSmallTableRowKey> Rows,
+                     std::string &Error) {
+    return EJitSmallTablePlanner::plan(
+        *M, "a_entry", "g_auto", autoDims(kAutoCells, kAutoTrps),
+        EJitSmallTableSource{Base, sizeof(g_auto)}, Rows, {}, Error);
+  };
+  SmallVector<EJitSmallTableRowKey, 16> Full = autoRows(kAutoCells, kAutoTrps);
+  SmallVector<EJitSmallTableRowKey, 4> FirstTwo = {{{0, 0}}, {{1, 0}}};
+  std::string Error;
+  auto FullPlan = PlanFor(Full, Error);
+  ASSERT_TRUE(FullPlan.has_value()) << Error;
+  Error.clear();
+  auto PartialPlan = PlanFor(FirstTwo, Error);
+  ASSERT_TRUE(PartialPlan.has_value()) << Error;
+
+  EJitSmallTableContract A = buildAdmissionContract(*FullPlan);
+  EJitSmallTableContract B = buildAdmissionContract(*PartialPlan);
+  // Same entry, same source global, same symbol spellings for the columns — a
+  // different proven domain is a different admission contract.
+  EXPECT_EQ(A.fields[1].resource.symbolName, B.fields[1].resource.symbolName);
+  EXPECT_NE(A.identityHash, B.identityHash);
+  EXPECT_NE(A.provenRows, B.provenRows);
+  EXPECT_TRUE(A.domainComplete);
+  EXPECT_FALSE(B.domainComplete);
+
+  // Rebuilding the same domain yields the same identity (deterministic), so the
+  // runtime can compare contracts instead of trusting a symbol name.
+  Error.clear();
+  auto Again = PlanFor(Full, Error);
+  ASSERT_TRUE(Again.has_value()) << Error;
+  EXPECT_EQ(buildAdmissionContract(*Again).identityHash, A.identityHash);
+
+  // A contract without an identity cannot validate a member at all.
+  EJitSmallTableContract Anonymous = A;
+  Anonymous.identityHash = 0;
+  std::string Why;
+  EXPECT_EQ(validateAdmission(Anonymous, autoMember(g_auto[0][0], {0, 0}),
+                              &Why),
+            EJitSmallTableAdmission::Unusable)
+      << Why;
+}
+
+/// §13 per-field reporting: the specialization emits one diagnostic per field
+/// (original axes, retained axes, eliminated axes, constant/table strategy and
+/// payload before/after) at the VERBOSE log level, and the same accounting is
+/// observable through the plan API. This test raises the runtime log level for
+/// the duration of one pipeline run so the report is present in the captured
+/// diagnostics log; it asserts the API-visible accounting, since the log text is
+/// the harness's evidence, not a test oracle.
+TEST_F(SmallTableTest, AutomaticPlanReportsPerFieldAxes) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("a_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "auto module failed to parse";
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(
+      *M, "a_entry", "g_auto", autoDims(kAutoCells, kAutoTrps),
+      EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&g_auto[0][0]),
+                           sizeof(g_auto)},
+      autoRows(kAutoCells, kAutoTrps), {}, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+
+  // The per-field report is derived from exactly this accounting.
+  EXPECT_EQ(Plan->uniformFieldCount(), 1u);
+  EXPECT_EQ(Plan->tableFieldCount(), 3u);
+  EXPECT_EQ(Plan->fields[0].tableBytes, 0u);
+  EXPECT_EQ(Plan->fields[1].tableBytes, kAutoCells * 4);
+  EXPECT_EQ(Plan->fields[2].tableBytes, kAutoTrps * 4);
+  EXPECT_EQ(Plan->fields[3].tableBytes, kAutoCells * kAutoTrps * 4);
+  // Optimized-before payload: every field at its full declared-domain size.
+  uint64_t PerRowBytes = 0;
+  for (const EJitSmallTableField &F : Plan->fields)
+    PerRowBytes += F.accessSize;
+  EXPECT_EQ(Plan->numRows() * PerRowBytes, kAutoCells * kAutoTrps * 16);
+
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(*Plan));
+  PeriodArrayRegistry &Registry = makeRegistry();
+  EJitOptimizer Opt(Registry);
+  Opt.setSmallTablePlans(Set);
+  SpecializationContext C = baselineCtx("a_entry");
+  const ejit_log_level_t Saved = ejit_get_log_level();
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  Opt.runPipeline(*M, C);
+  ejit_set_log_level(Saved);
+  EXPECT_EQ(countLoadsRootedAt(*M->getFunction("a_entry"), "g_auto"), 0u);
+}
+
+/// A controlled one-cell/one-TRP domain: the proven domain covers the declared
+/// schema exactly, so every field is a genuine invariant of that closed domain
+/// and folds with no column and no load at all — the §4.1 "single TRP, equal
+/// across the domain" case, on a complete domain, executed through the real ORC
+/// engine.
+TEST_F(SmallTableTest, AutomaticSolverFoldsAClosedSingleMemberDomain) {
+  SMDiagnostic Err;
+  const unsigned One = 1;
+  auto M = parseAssemblyString(
+      autoModuleText("o_entry", "g_one", "g_one_out", One, One), Err, Ctx);
+  ASSERT_TRUE(M) << "single-member module failed to parse";
+  AutoElement &E = g_one[0][0];
+  E.mode = 3;
+  E.byCell = 11;
+  E.byTrp = 13;
+  E.joint = 17;
+  std::memset(g_one_out, 0, sizeof(g_one_out));
+
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(One, One);
+  SmallVector<EJitSmallTableRowKey, 1> Rows;
+  Rows.push_back({{0, 0}});
+  EJitSmallTableRequest Req;
+  Req.module = M.get();
+  Req.entryName = "o_entry";
+  Req.sourceVarName = "g_one";
+  Req.dims = Dims;
+  Req.source = EJitSmallTableSource{
+      reinterpret_cast<const uint8_t *>(&g_one[0][0]), sizeof(g_one)};
+  Req.authorizedRows = Rows;
+  Req.mode = EJitSmallTablePlanMode::Automatic;
+  Req.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Req, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+  ASSERT_EQ(Plan->fields.size(), 4u);
+  EXPECT_TRUE(Plan->allRowsReady())
+      << "the domain covers the whole declared schema";
+  EXPECT_EQ(Plan->uniformFieldCount(), 4u);
+  EXPECT_EQ(Plan->tableFieldCount(), 0u);
+  EXPECT_EQ(Plan->tableBytes(), 0u);
+  for (const EJitSmallTableField &Field : Plan->fields) {
+    EXPECT_EQ(Field.strategy, EJitSmallTableStrategy::Uniform);
+    EXPECT_TRUE(Field.columnName.empty());
+    EXPECT_EQ(Field.tableRows, 0u);
+  }
+  EXPECT_EQ(*Plan->fields[0].uniformValue, 3u);
+  EXPECT_EQ(*Plan->fields[3].uniformValue, 17u);
+
+  ASSERT_TRUE(EJitSmallTablePass::materialize(*M, *Plan, &Error)) << Error;
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_o_entry_c0"), nullptr);
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_o_entry_c1"), nullptr);
+  EJitSmallTablePass Pass(*Plan);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("o_entry"), FAM);
+  EXPECT_EQ(Pass.getStats().uniformFolded, 4u);
+  EXPECT_EQ(Pass.getStats().tableReplaced, 0u);
+  EXPECT_EQ(countLoadsRootedAt(*M->getFunction("o_entry"), "g_one"), 0u)
+      << "no field keeps a load in a fully folded closed domain";
+
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(*Plan));
+  PeriodArrayRegistry &Registry = makeRegistry();
+  auto Engine = compileWithEngine(*M, Set, Registry, 0x57ab23, "o_entry");
+  ASSERT_NE(Engine, nullptr);
+  EXPECT_TRUE(Engine->getLastSmallTableColumnNames().empty())
+      << "a fully folded domain publishes no table";
+  auto Fn = lookupSealed<int32_t (*)(uint32_t, uint32_t, int32_t)>(
+      *Engine, 0x57ab23, "o_entry");
+  ASSERT_NE(Fn, nullptr);
+  EXPECT_EQ(Fn(0, 0, 5), -1)
+      << "mode is 3, so the source's `mode == 1` branch is false; a wrongly "
+         "discovered constant (for example 1) would take the arithmetic path";
+  EXPECT_NE(aotAuto(E, 5), -1) << "the arithmetic path is distinguishable";
+  EXPECT_EQ(g_one_out[0], 5);
+}
+
+/// Exact float bit patterns through the automatic path: a float field that is
+/// bit-identical on the whole domain folds to exactly that bit pattern, so -0.0
+/// stays -0.0 and a NaN payload is preserved (spec §5: floats compare and
+/// construct by bits). The varying integer field still gets its own column.
+TEST_F(SmallTableTest, AutomaticSolverFoldsExactFloatBits) {
+  const std::string Text = moduleTargetHeader() + R"(
+    %F = type { float, i32 }
+    @g_f = external global [2 x [2 x %F]]
+    @g_f_out = external global [2 x i32]
+
+    define i32 @f_entry(i32 %cell, i32 %trp, i32 %x) !ejit.metadata !0 {
+    entry:
+      %row = getelementptr inbounds [2 x [2 x %F]], ptr @g_f, i64 0, i32 %cell, i32 %trp
+      %p0 = getelementptr inbounds %F, ptr %row, i32 0, i32 0
+      %fv = load float, ptr %p0, align 4, !ejit.may_const !1
+      %p1 = getelementptr inbounds %F, ptr %row, i32 0, i32 1
+      %iv = load i32, ptr %p1, align 4, !ejit.may_const !1
+      %outp = getelementptr inbounds [2 x i32], ptr @g_f_out, i64 0, i32 %cell
+      store i32 %x, ptr %outp, align 4
+      %fb = bitcast float %fv to i32
+      %s = add i32 %fb, %iv
+      %xm = mul i32 %x, 7
+      %res = add i32 %s, %xm
+      ret i32 %res
+    }
+
+    !0 = !{!2}
+    !1 = !{}
+    !2 = !{!"ejit_entry"}
+  )";
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(Text, Err, Ctx);
+  ASSERT_TRUE(M) << "float module failed to parse";
+
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(2, 2);
+  SmallVector<EJitSmallTableRowKey, 4> Rows = autoRows(2, 2);
+  auto PlanWith = [&](uint32_t FloatBits, std::string &Error) {
+    for (unsigned C = 0; C < 2; ++C)
+      for (unsigned T = 0; T < 2; ++T) {
+        g_f[C][T].f = floatFromBits(FloatBits);
+        g_f[C][T].i = static_cast<int32_t>(20 + C * 5 + T);
+      }
+    EJitSmallTableRequest Req;
+    Req.module = M.get();
+    Req.entryName = "f_entry";
+    Req.sourceVarName = "g_f";
+    Req.dims = Dims;
+    Req.source = EJitSmallTableSource{
+        reinterpret_cast<const uint8_t *>(&g_f[0][0]), sizeof(g_f)};
+    Req.authorizedRows = Rows;
+    Req.mode = EJitSmallTablePlanMode::Automatic;
+    Req.readiness = testReadiness();
+    return EJitSmallTablePlanner::plan(Req, Error);
+  };
+
+  // -0.0 is a bit pattern, not "zero": it must fold to 0x80000000 exactly.
+  std::string Error;
+  auto NegZero = PlanWith(0x80000000u, Error);
+  ASSERT_TRUE(NegZero.has_value()) << Error;
+  EXPECT_EQ(NegZero->fields[0].strategy, EJitSmallTableStrategy::Uniform);
+  ASSERT_TRUE(NegZero->fields[0].uniformValue.has_value());
+  EXPECT_EQ(*NegZero->fields[0].uniformValue, 0x80000000ull);
+  EXPECT_EQ(NegZero->fields[0].kind, EJitSmallTableKind::Float);
+  EXPECT_TRUE(NegZero->fields[0].columnName.empty());
+  EXPECT_EQ(NegZero->fields[1].strategy, EJitSmallTableStrategy::Table)
+      << "the integer field differs per cell and keeps its own column";
+
+  // A NaN payload survives the fold unchanged; it is never canonicalized.
+  Error.clear();
+  auto Nan = PlanWith(0x7fc00001u, Error);
+  ASSERT_TRUE(Nan.has_value()) << Error;
+  ASSERT_TRUE(Nan->fields[0].uniformValue.has_value());
+  EXPECT_EQ(*Nan->fields[0].uniformValue, 0x7fc00001ull);
+
+  // IR + execution with the NaN domain: the folded constant carries the exact
+  // bit pattern and the compiled entry reproduces the source value.
+  auto JitM = parseAssemblyString(Text, Err, Ctx);
+  ASSERT_TRUE(JitM);
+  ASSERT_TRUE(EJitSmallTablePass::materialize(*JitM, *Nan, &Error)) << Error;
+  EJitSmallTablePass Pass(*Nan);
+  FunctionAnalysisManager FAM;
+  Pass.run(*JitM->getFunction("f_entry"), FAM);
+  EXPECT_EQ(Pass.getStats().uniformFolded, 1u);
+  EXPECT_EQ(Pass.getStats().tableReplaced, 1u);
+  EXPECT_EQ(JitM->getNamedGlobal("__ejit_stab_f_entry_c0"), nullptr);
+  bool SawNanBits = false;
+  for (Instruction &I : instructions(*JitM->getFunction("f_entry")))
+    for (Value *Op : I.operands())
+      if (auto *CF = dyn_cast<ConstantFP>(Op))
+        if (CF->getValueAPF().bitcastToAPInt().getZExtValue() == 0x7fc00001ull)
+          SawNanBits = true;
+  EXPECT_TRUE(SawNanBits) << "the folded float constant must be the exact bits";
+
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(*Nan));
+  PeriodArrayRegistry &Registry = makeRegistry();
+  Registry.registerArray("cell", "g_f",
+                         reinterpret_cast<void *>(&g_f[0][0]), sizeof(g_f));
+  Registry.registerStaticVar("g_f_out", &g_f_out[0]);
+  std::memset(g_f_out, 0, sizeof(g_f_out));
+  auto Engine = compileWithEngine(*JitM, Set, Registry, 0x57ab24, "f_entry");
+  ASSERT_NE(Engine, nullptr);
+  ASSERT_EQ(Engine->getLastSmallTableColumnNames().size(), 1u);
+  auto Fn = lookupSealed<int32_t (*)(uint32_t, uint32_t, int32_t)>(
+      *Engine, 0x57ab24, "f_entry");
+  ASSERT_NE(Fn, nullptr);
+  for (unsigned C = 0; C < 2; ++C)
+    for (unsigned T = 0; T < 2; ++T)
+      for (int32_t X = 0; X < 4; ++X) {
+        const int32_t Expected = static_cast<int32_t>(bitsFromFloat(g_f[C][T].f)) +
+                                 g_f[C][T].i + X * 7;
+        EXPECT_EQ(Fn(C, T, X), Expected) << "cell=" << C << " trp=" << T;
+      }
+  EXPECT_EQ(g_f_out[1], 3);
+}
+
+/// The bounded solver refuses declaratively instead of degrading: a schema with
+/// more declared axes than the bounded search supports is refused with a
+/// diagnostic and every load stays original (spec §4.1 "超出支持范围或预算必须
+/// 显式报告，不影响安全回退").
+TEST_F(SmallTableTest, AutomaticSolverRefusesBeyondItsAxisBudget) {
+  const unsigned kAxes = 9; // MaxSolverAxes is 8
+  std::string Args;
+  std::string GEP;
+  std::string Type = "i32";
+  for (unsigned I = 0; I < kAxes; ++I)
+    Type = "[2 x " + Type + "]";
+  for (unsigned I = 0; I < kAxes; ++I) {
+    Args += ", i32 %a" + Twine(I).str();
+    GEP += ", i32 %a" + Twine(I).str();
+  }
+  std::string Text = moduleTargetHeader() + "\n    @g_nine = external global " +
+                     Type + "\n\n    define i32 @n_entry(" + Args.substr(2) +
+                     ", i32 %x) !ejit.metadata !0 {\n    entry:\n"
+                     "      %p = getelementptr inbounds " + Type +
+                     ", ptr @g_nine, i64 0" + GEP + "\n"
+                     "      %v = load i32, ptr %p, align 4, !ejit.may_const !1\n"
+                     "      %r = add i32 %v, %x\n      ret i32 %r\n    }\n\n"
+                     "    !0 = !{!2}\n    !1 = !{}\n"
+                     "    !2 = !{!\"ejit_entry\"}\n";
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(Text, Err, Ctx);
+  ASSERT_TRUE(M) << "nine-axis module failed to parse";
+
+  static int32_t Nine[2][2][2][2][2][2][2][2][2];
+  std::memset(Nine, 0, sizeof(Nine));
+  SmallVector<EJitSmallTableDim, 9> Dims;
+  SmallVector<EJitSmallTableRowKey, 512> Rows;
+  for (unsigned I = 0; I < kAxes; ++I)
+    Dims.push_back({EJitSmallTableDim::Kind::Argument, I, 0, 2});
+  for (unsigned I = 0; I < 512; ++I) {
+    EJitSmallTableRowKey Key;
+    for (unsigned B = 0; B < kAxes; ++B)
+      Key.indices.push_back((I >> (kAxes - 1 - B)) & 1u);
+    Rows.push_back(Key);
+  }
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(
+      *M, "n_entry", "g_nine", Dims,
+      EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&Nine[0][0][0][0][0]
+                                                                    [0][0][0][0]),
+                           sizeof(Nine)},
+      Rows, {}, Error);
+  EXPECT_FALSE(Plan.has_value());
+  EXPECT_NE(Error.find("bounded solver"), std::string::npos) << Error;
+
+  // Safety fallback: nothing was created and no load changed.
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_n_entry_c0"), nullptr);
+  EXPECT_EQ(countLoadsRootedAt(*M->getFunction("n_entry"), "g_nine"), 1u);
 }
 
 } // namespace

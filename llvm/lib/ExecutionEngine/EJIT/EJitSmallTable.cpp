@@ -409,11 +409,11 @@ Type *scalarTypeForField(LLVMContext &Ctx, const EJitSmallTableField &Field) {
 /// (assertions-on abort, NDEBUG silent truncation) and would make the uniform
 /// contract comparison depend on padding. This is the one place raw memory
 /// becomes a typed value, so the mask lives here.
-uint64_t readScalarBits(const uint8_t *Addr, const EJitSmallTableField &Field,
-                        const DataLayout &DL) {
+uint64_t readScalarBitsOrdered(const uint8_t *Addr, const EJitSmallTableField &Field,
+                               bool LittleEndian) {
   uint64_t Raw = 0;
   const unsigned Bytes = static_cast<unsigned>(Field.accessSize);
-  if (DL.isLittleEndian()) {
+  if (LittleEndian) {
     std::memcpy(&Raw, Addr, Bytes);
   } else {
     for (unsigned I = 0; I < Bytes; ++I)
@@ -422,6 +422,11 @@ uint64_t readScalarBits(const uint8_t *Addr, const EJitSmallTableField &Field,
   if (Field.bitWidth < 64)
     Raw &= maskTrailingOnes<uint64_t>(static_cast<unsigned>(Field.bitWidth));
   return Raw;
+}
+
+uint64_t readScalarBits(const uint8_t *Addr, const EJitSmallTableField &Field,
+                        const DataLayout &DL) {
+  return readScalarBitsOrdered(Addr, Field, DL.isLittleEndian());
 }
 
 Constant *constantFromBits(Type *Ty, const EJitSmallTableField &Field,
@@ -503,10 +508,54 @@ uint64_t EJitSmallTablePlan::sourceElementOffset(uint64_t Row) const {
   return Off;
 }
 
+uint64_t EJitSmallTablePlan::projectRow(const EJitSmallTableField &Field,
+                                        uint64_t Row) const {
+  uint64_t Out = 0;
+  for (unsigned Pos = 0; Pos < Field.retainedAxes.size(); ++Pos) {
+    const unsigned Dim = Field.retainedAxes[Pos];
+    if (Dim >= dims.size())
+      return 0;
+    uint64_t Stride = 1;
+    for (unsigned I = Dim + 1; I < dims.size(); ++I)
+      Stride *= dims[I].extent;
+    const uint64_t Extent = dims[Dim].extent;
+    const uint64_t Index = Extent == 0 ? 0 : (Row / Stride) % Extent;
+    Out += Index * fieldRowStride(Field, Pos);
+  }
+  return Out;
+}
+
+uint64_t EJitSmallTablePlan::fieldRowStride(const EJitSmallTableField &Field,
+                                            unsigned Pos) const {
+  uint64_t Stride = 1;
+  for (unsigned I = Pos + 1; I < Field.retainedAxes.size(); ++I)
+    Stride *= dims[Field.retainedAxes[I]].extent;
+  return Stride;
+}
+
+bool EJitSmallTablePlan::fieldRetainsDim(const EJitSmallTableField &Field,
+                                         unsigned Dim) const {
+  return llvm::is_contained(Field.retainedAxes, Dim);
+}
+
+uint64_t EJitSmallTablePlan::tableBytes() const {
+  uint64_t Bytes = 0;
+  for (const EJitSmallTableField &Field : fields)
+    Bytes += Field.tableBytes;
+  return Bytes;
+}
+
 uint64_t EJitSmallTablePlan::uniformFieldCount() const {
   return static_cast<uint64_t>(
       llvm::count_if(fields, [](const EJitSmallTableField &F) {
-        return F.uniformValue.has_value();
+        return F.strategy == EJitSmallTableStrategy::Uniform;
+      }));
+}
+
+uint64_t EJitSmallTablePlan::tableFieldCount() const {
+  return static_cast<uint64_t>(
+      llvm::count_if(fields, [](const EJitSmallTableField &F) {
+        return F.strategy == EJitSmallTableStrategy::Table;
       }));
 }
 
@@ -518,6 +567,83 @@ bool EJitSmallTablePlan::allRowsReady() const {
 uint64_t EJitSmallTablePlan::readyRowCount() const {
   return static_cast<uint64_t>(
       llvm::count_if(rows, [](const EJitSmallTableRow &R) { return R.ready; }));
+}
+
+bool EJitSmallTablePlan::verifyProjections(std::string *Why) const {
+  auto Fail = [&](const Twine &Msg) {
+    if (Why)
+      *Why = Msg.str();
+    return false;
+  };
+
+  if (dims.empty())
+    return Fail("no dimensions");
+  for (unsigned I = 0; I < dims.size(); ++I)
+    if (dims[I].extent == 0)
+      return Fail("declared extent is zero");
+
+  uint64_t Proven = 0;
+  for (const EJitSmallTableRow &Row : rows)
+    Proven += Row.ready ? 1 : 0;
+  if (Proven == 0)
+    return Fail("the proven dependency domain is empty: a vacuous constant is "
+                "not a proof");
+
+  for (unsigned F = 0; F < fields.size(); ++F) {
+    const EJitSmallTableField &Field = fields[F];
+    if (Field.strategy == EJitSmallTableStrategy::Uniform) {
+      if (!Field.uniformValue)
+        return Fail("uniform field carries no value");
+      for (const EJitSmallTableRow &Row : rows) {
+        if (!Row.ready)
+          continue;
+        if (F >= Row.bits.size())
+          return Fail("row width does not match the field count");
+        if (Row.bits[F] != *Field.uniformValue)
+          return Fail("uniform value is not equal on the proven domain");
+      }
+      continue;
+    }
+
+    // Table field: the retained axes must group the complete proven domain into
+    // bit-exactly equal projected coordinates. This is the final joint
+    // projection proof (spec §4.1 step 4); it is re-run here so a plan whose
+    // retained axes were never verified can never reach code generation.
+    uint64_t TableRows = 1;
+    for (unsigned Dim : Field.retainedAxes) {
+      if (Dim >= dims.size())
+        return Fail("retained axis is outside the declared dimensions");
+      if (TableRows > std::numeric_limits<uint64_t>::max() / dims[Dim].extent)
+        return Fail("retained-axis row count overflow");
+      TableRows *= dims[Dim].extent;
+    }
+    if (TableRows != Field.tableRows)
+      return Fail("retained axes and table row count disagree");
+    if (TableRows == 0 || TableRows > MaxRows)
+      return Fail("projected table row count is out of range");
+    for (unsigned I = 1; I < Field.retainedAxes.size(); ++I)
+      if (Field.retainedAxes[I] <= Field.retainedAxes[I - 1])
+        return Fail("retained axes are not strictly ascending");
+
+    std::vector<char> Seen(TableRows, 0);
+    std::vector<uint64_t> First(TableRows, 0);
+    for (uint64_t Row = 0; Row < rows.size(); ++Row) {
+      if (!rows[Row].ready)
+        continue;
+      if (F >= rows[Row].bits.size())
+        return Fail("row width does not match the field count");
+      const uint64_t Coord = projectRow(Field, Row);
+      if (Coord >= TableRows)
+        return Fail("projected coordinate leaves the table");
+      if (!Seen[Coord]) {
+        Seen[Coord] = 1;
+        First[Coord] = rows[Row].bits[F];
+      } else if (First[Coord] != rows[Row].bits[F]) {
+        return Fail("retained axes do not prove equality on the proven domain");
+      }
+    }
+  }
+  return true;
 }
 
 bool EJitSmallTablePlan::isConsistent(std::string *Why) const {
@@ -570,13 +696,43 @@ bool EJitSmallTablePlan::isConsistent(std::string *Why) const {
     if (Field.sourceOffset > elementBytes ||
         Field.accessSize > elementBytes - Field.sourceOffset)
       return Fail("field lies outside the source element");
-    if (Field.uniformValue)
+
+    if (Field.strategy == EJitSmallTableStrategy::Uniform) {
+      if (!Field.uniformValue)
+        return Fail("uniform field carries no value");
+      if (Field.bitWidth < 64 &&
+          *Field.uniformValue >= (uint64_t{1} << Field.bitWidth))
+        return Fail("uniform value does not fit the field width");
+      if (!Field.retainedAxes.empty())
+        return Fail("uniform field retains an axis");
+      if (Field.tableRows != 0 || Field.tableBytes != 0)
+        return Fail("uniform field has a table payload");
+      if (!Field.columnName.empty())
+        return Fail("uniform field names a table column");
       continue;
+    }
+
+    if (Field.uniformValue)
+      return Fail("table field carries a uniform value");
     if (Field.columnName.empty())
       return Fail("table field has no column name");
-    uint64_t ColumnBytes = 0;
-    if (__builtin_mul_overflow(Rows, Field.accessSize, &ColumnBytes) ||
-        __builtin_add_overflow(Bytes, ColumnBytes, &Bytes))
+    if (Field.retainedAxes.empty())
+      return Fail("table field retains no axis");
+    uint64_t TableRows = 1;
+    for (unsigned Dim : Field.retainedAxes) {
+      if (Dim >= dims.size())
+        return Fail("retained axis is outside the declared dimensions");
+      if (TableRows > std::numeric_limits<uint64_t>::max() / dims[Dim].extent)
+        return Fail("table row count overflow");
+      TableRows *= dims[Dim].extent;
+    }
+    if (TableRows > MaxRows)
+      return Fail("table row count is out of range");
+    if (TableRows != Field.tableRows)
+      return Fail("retained axes and table row count disagree");
+    if (Field.tableBytes != TableRows * Field.accessSize)
+      return Fail("table byte count does not match the retained axes");
+    if (__builtin_add_overflow(Bytes, Field.tableBytes, &Bytes))
       return Fail("table byte count overflow");
   }
   if (Bytes > MaxTableBytes)
@@ -585,7 +741,10 @@ bool EJitSmallTablePlan::isConsistent(std::string *Why) const {
   for (const EJitSmallTableRow &Row : rows)
     if (Row.bits.size() != fields.size())
       return Fail("row width does not match the field count");
-  return true;
+
+  // The final joint projection must hold on the complete original domain before
+  // anything may be materialized (spec §4.1 step 4).
+  return verifyProjections(Why);
 }
 
 //===----------------------------------------------------------------------===//
@@ -702,12 +861,22 @@ EJitSmallTablePlanner::planShape(const Module &M, StringRef EntryName,
   Plan.elementBytes = Shape->ElementBytes;
   Plan.dims.append(Dims.begin(), Dims.end());
   Plan.sourceStrides = Shape->DimStrides;
+  Plan.littleEndian = DL.isLittleEndian();
+  Plan.columnsFixedAddress = wantDSOLocal(M);
   for (unsigned I = 0; I < Sites.size(); ++I) {
     EJitSmallTableField Field;
     Field.sourceOffset = Sites[I].Offset;
     Field.accessSize = Sites[I].AccessSize;
     Field.bitWidth = Sites[I].BitWidth;
     Field.kind = Sites[I].Kind;
+    Field.strategy = EJitSmallTableStrategy::Table;
+    // A shape plan is not solved yet: it describes the widest supported
+    // lowering (every declared axis retained). plan() narrows this per field
+    // once the value domain is known.
+    for (unsigned Dim = 0; Dim < Dims.size(); ++Dim)
+      Field.retainedAxes.push_back(Dim);
+    Field.tableRows = RowCount;
+    Field.tableBytes = RowCount * Field.accessSize;
     Field.columnName = (Twine(EJitSmallTablePlan::TableGlobalPrefix) +
                         EntryName + "_c" + Twine(I))
                            .str();
@@ -719,32 +888,187 @@ EJitSmallTablePlanner::planShape(const Module &M, StringRef EntryName,
   return Plan;
 }
 
+/// Bounded deterministic projection solver (spec §4.1 steps 1-4).
+namespace {
+
+/// Work/memory budget of one field's solver run (§13). Exhaustion is reported
+/// and the plan is refused; it is never silently truncated.
+constexpr uint64_t MaxSolverAxes = 8;
+constexpr uint64_t MaxSolverScratchBytes = 32ull << 20;
+constexpr uint64_t MaxSolverWork = 1ull << 28;
+
+/// One candidate axis set and its accounting under the fixed capacity.
+struct AxisCandidate {
+  SmallVector<unsigned, 2> Axes;
+  uint64_t TableRows = 0;
+  uint64_t Bytes = 0;
+};
+
+/// Deterministic "fewest axes, then fewest allocated bytes, then schema axis
+/// order" ordering of two proven candidates (§4.1 step 3).
+bool candidateWins(const AxisCandidate &L, const AxisCandidate &R) {
+  if (L.Axes.size() != R.Axes.size())
+    return L.Axes.size() < R.Axes.size();
+  if (L.Bytes != R.Bytes)
+    return L.Bytes < R.Bytes;
+  return std::lexicographical_compare(L.Axes.begin(), L.Axes.end(),
+                                      R.Axes.begin(), R.Axes.end());
+}
+
+/// Tests every axis subset of \p Extents against the COMPLETE proven domain and
+/// returns the winning candidate. \p Values is the field's bit-exact typed value
+/// per row (only ready rows are inspected). No density or neighbour threshold is
+/// involved: a candidate either holds for every proven row or it is discarded.
+class ProjectionSolver {
+public:
+  ProjectionSolver(ArrayRef<EJitSmallTableRow> Rows, ArrayRef<uint64_t> Extents,
+                   uint64_t AccessSize)
+      : Rows_(Rows), Extents_(Extents), AccessSize_(AccessSize) {}
+
+  bool solve(ArrayRef<uint64_t> Values, AxisCandidate &Winner,
+             std::string &Error) {
+    const unsigned Dims = static_cast<unsigned>(Extents_.size());
+    if (Dims == 0 || Dims > MaxSolverAxes)
+      return fail("declared axis count is outside the bounded solver", Error);
+    if (!Rows_.empty() && Values.size() != Rows_.size())
+      return fail("field value count does not match the domain", Error);
+
+    bool HaveWinner = false;
+    const uint64_t Masks = uint64_t{1} << Dims;
+    for (uint64_t Mask = 0; Mask < Masks; ++Mask) {
+      SmallVector<unsigned, 2> Axes;
+      for (unsigned I = 0; I < Dims; ++I)
+        if (Mask & (uint64_t{1} << I))
+          Axes.push_back(I);
+
+      uint64_t TableRows = 1;
+      for (unsigned Dim : Axes)
+        TableRows *= Extents_[Dim];
+      if (TableRows > EJitSmallTablePlan::MaxRows)
+        continue; // Capacity refusal: a candidate above the bound never wins.
+      const uint64_t Scratch = TableRows * (sizeof(uint64_t) + sizeof(char));
+      if (Scratch > MaxSolverScratchBytes ||
+          Work_ + Scratch > MaxSolverWork)
+        continue; // Budget refusal, reported if nothing at all survives.
+
+      if (!projectionHolds(Axes, Values, TableRows))
+        continue;
+
+      AxisCandidate Candidate;
+      Candidate.Axes = std::move(Axes);
+      Candidate.TableRows = TableRows;
+      Candidate.Bytes = TableRows * AccessSize_;
+      if (!HaveWinner || candidateWins(Candidate, Winner)) {
+        Winner = std::move(Candidate);
+        HaveWinner = true;
+      }
+    }
+
+    if (!HaveWinner)
+      return fail("no supported safe projection of the proven domain", Error);
+    if (Work_ > MaxSolverWork)
+      return fail("solver work budget exhausted", Error);
+
+    // Step 4: re-verify the chosen R with a fresh full-domain scan, so a
+    // candidate that was never re-proven can not continue into code generation.
+    if (!projectionHolds(Winner.Axes, Values, Winner.TableRows))
+      return fail("final joint projection re-verification failed", Error);
+    return true;
+  }
+
+  uint64_t work() const { return Work_; }
+
+private:
+  bool fail(const char *Message, std::string &Error) {
+    Error = Message;
+    return false;
+  }
+
+  /// Group every proven row by its projection onto \p Axes and require
+  /// bit-exact equality inside each group. \p TableRows is the projected
+  /// cardinality the caller already bounded.
+  bool projectionHolds(ArrayRef<unsigned> Axes, ArrayRef<uint64_t> Values,
+                       uint64_t TableRows) {
+    if (TableRows == 0)
+      return false;
+    std::vector<char> Seen(static_cast<size_t>(TableRows), 0);
+    std::vector<uint64_t> First(static_cast<size_t>(TableRows), 0);
+    Work_ += TableRows;
+    for (uint64_t Row = 0; Row < Rows_.size(); ++Row) {
+      if (!Rows_[Row].ready)
+        continue;
+      ++Work_;
+      const uint64_t Coord = project(Row, Axes);
+      if (Coord >= TableRows)
+        return false;
+      if (!Seen[static_cast<size_t>(Coord)]) {
+        Seen[static_cast<size_t>(Coord)] = 1;
+        First[static_cast<size_t>(Coord)] = Values[static_cast<size_t>(Row)];
+      } else if (First[static_cast<size_t>(Coord)] !=
+                 Values[static_cast<size_t>(Row)]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  uint64_t project(uint64_t Row, ArrayRef<unsigned> Axes) const {
+    uint64_t Out = 0;
+    for (unsigned Pos = 0; Pos < Axes.size(); ++Pos) {
+      const unsigned Dim = Axes[Pos];
+      uint64_t Stride = 1;
+      for (unsigned I = Dim + 1; I < Extents_.size(); ++I)
+        Stride *= Extents_[I];
+      const uint64_t Index = (Row / Stride) % Extents_[Dim];
+      uint64_t OutStride = 1;
+      for (unsigned Q = Pos + 1; Q < Axes.size(); ++Q)
+        OutStride *= Extents_[Axes[Q]];
+      Out += Index * OutStride;
+    }
+    return Out;
+  }
+
+  ArrayRef<EJitSmallTableRow> Rows_;
+  ArrayRef<uint64_t> Extents_;
+  uint64_t AccessSize_ = 0;
+  uint64_t Work_ = 0;
+};
+
+} // namespace
+
 std::optional<EJitSmallTablePlan>
-EJitSmallTablePlanner::plan(const Module &M, StringRef EntryName,
-                            StringRef SourceVarName,
-                            ArrayRef<EJitSmallTableDim> Dims,
-                            const EJitSmallTableSource &Source,
-                            ArrayRef<EJitSmallTableRowKey> AuthorizedRows,
-                            ArrayRef<std::optional<uint64_t>> UniformContracts,
-                            std::string &Error) {
-  auto Plan = planShape(M, EntryName, SourceVarName, Dims, Error);
-  if (!Plan)
-    return std::nullopt;
+EJitSmallTablePlanner::plan(const EJitSmallTableRequest &Req, std::string &Error) {
   auto Fail = [&](const Twine &Msg) -> std::optional<EJitSmallTablePlan> {
     Error = Msg.str();
     return std::nullopt;
   };
 
-  if (!Source.baseAddr || Source.size == 0)
-    return Fail("source region is null or empty");
-  if (!UniformContracts.empty() &&
-      UniformContracts.size() != Plan->fields.size())
+  if (!Req.module)
+    return Fail("no module supplied to the planner");
+
+  auto Plan = planShape(*Req.module, Req.entryName, Req.sourceVarName, Req.dims,
+                        Error);
+  if (!Plan)
+    return std::nullopt;
+
+  const bool ExplicitMode = Req.mode == EJitSmallTablePlanMode::ExplicitContracts;
+  if (!ExplicitMode && !Req.uniformContracts.empty())
+    return Fail("automatic mode does not take caller uniform contracts: the "
+                "default contract is the proven dependency domain");
+  if (!Req.uniformContracts.empty() &&
+      Req.uniformContracts.size() != Plan->fields.size())
     return Fail("uniform contract count does not match the field count");
+
+  if (!Req.source.baseAddr || Req.source.size == 0)
+    return Fail("source region is null or empty");
+
+  Plan->mode = Req.mode;
+  Plan->readiness = Req.readiness;
 
   // Fill only the rows whose member configuration is confirmed ready. A row
   // that is not authorized stays unreachable by contract (§6.5): the runtime
   // must not dispatch its logical slot to this code before the row is ready.
-  for (const EJitSmallTableRowKey &Key : AuthorizedRows) {
+  for (const EJitSmallTableRowKey &Key : Req.authorizedRows) {
     if (Key.indices.size() != Plan->dims.size())
       return Fail("authorized row key has the wrong dimension count");
     uint64_t Row = 0;
@@ -763,52 +1087,151 @@ EJitSmallTablePlanner::plan(const Module &M, StringRef EntryName,
       const EJitSmallTableField &Field = Plan->fields[I];
       uint64_t FieldOff = 0;
       if (__builtin_add_overflow(ElementOff, Field.sourceOffset, &FieldOff) ||
-          FieldOff > Source.size ||
-          Field.accessSize > Source.size - FieldOff)
+          FieldOff > Req.source.size ||
+          Field.accessSize > Req.source.size - FieldOff)
         return Fail("authorized row field access leaves the source region");
-      Plan->rows[Row].bits[I] =
-          readScalarBits(Source.baseAddr + FieldOff, Field, M.getDataLayout());
+      Plan->rows[Row].bits[I] = readScalarBits(Req.source.baseAddr + FieldOff,
+                                               Field, Req.module->getDataLayout());
     }
     Plan->rows[Row].ready = true;
   }
 
-  for (unsigned I = 0; I < Plan->fields.size(); ++I) {
-    if (UniformContracts.empty() || !UniformContracts[I])
-      continue;
-    const EJitSmallTableField &Field = Plan->fields[I];
-    // A contract is a typed bit value of exactly this field's width. A value
-    // with bits above the width is not that typed value (it is a raw storage
-    // byte), so refuse it instead of truncating it silently: the recorded
-    // contract metadata and the folded constant must agree, and whichever
-    // integer width the field has is preserved (spec §5).
-    if (Field.bitWidth < 64 &&
-        *UniformContracts[I] >= (uint64_t{1} << Field.bitWidth))
-      return Fail("uniform admission contract value does not fit the field "
-                  "width");
-    // An explicit admission contract, not an inference from the visible rows:
-    // the caller asserts the invariant, and planning checks every row it can
-    // already read. A contract that no ready row confirms is not a validated
-    // observation, so it is refused rather than recorded and folded blindly.
-    // The row bits were masked to the field width by readScalarBits, so this
-    // comparison is between two typed values of the same width.
-    bool Confirmed = false;
-    for (const EJitSmallTableRow &Row : Plan->rows) {
-      if (!Row.ready)
+  uint64_t ProvenRows = 0;
+  for (const EJitSmallTableRow &Row : Plan->rows)
+    ProvenRows += Row.ready ? 1 : 0;
+
+  SmallVector<uint64_t, 4> Extents;
+  for (const EJitSmallTableDim &Dim : Plan->dims)
+    Extents.push_back(Dim.extent);
+
+  if (ExplicitMode) {
+    // Comparison mode: an explicit caller contract is validated against every
+    // proven row (never inferred, never silently truncated), and every field
+    // without one keeps a table over ALL declared axes — the historical
+    // pure-table shape, deliberately selected rather than defaulted to.
+    for (unsigned I = 0; I < Plan->fields.size(); ++I) {
+      EJitSmallTableField &Field = Plan->fields[I];
+      Field.strategy = EJitSmallTableStrategy::Table;
+      Field.retainedAxes.clear();
+      for (unsigned Dim = 0; Dim < Plan->dims.size(); ++Dim)
+        Field.retainedAxes.push_back(Dim);
+      Field.tableRows = Plan->numRows();
+      Field.tableBytes = Field.tableRows * Field.accessSize;
+      if (Req.uniformContracts.empty() || !Req.uniformContracts[I])
         continue;
-      if (Row.bits[I] != *UniformContracts[I])
-        return Fail("uniform admission contract is violated by an authorized "
-                    "row");
-      Confirmed = true;
+
+      // A contract is a typed bit value of exactly this field's width. A value
+      // with bits above the width is not that typed value (it is a raw storage
+      // byte), so refuse it instead of truncating it silently.
+      if (Field.bitWidth < 64 &&
+          *Req.uniformContracts[I] >= (uint64_t{1} << Field.bitWidth))
+        return Fail("uniform admission contract value does not fit the field "
+                    "width");
+      bool Confirmed = false;
+      for (const EJitSmallTableRow &Row : Plan->rows) {
+        if (!Row.ready)
+          continue;
+        if (Row.bits[I] != *Req.uniformContracts[I])
+          return Fail("uniform admission contract is violated by an authorized "
+                      "row");
+        Confirmed = true;
+      }
+      if (!Confirmed)
+        return Fail("uniform admission contract has no confirmed ready row");
+      Field.strategy = EJitSmallTableStrategy::Uniform;
+      Field.uniformValue = *Req.uniformContracts[I];
+      Field.uniformFromContract = true;
+      Field.columnName.clear();
+      Field.retainedAxes.clear();
+      Field.tableRows = 0;
+      Field.tableBytes = 0;
     }
-    if (!Confirmed)
-      return Fail("uniform admission contract has no confirmed ready row");
-    Plan->fields[I].uniformValue = *UniformContracts[I];
-    Plan->fields[I].columnName.clear();
+  } else {
+    // Required default (§4.1): solve every field independently on the complete
+    // proven domain. The per-field table then keeps only the axes the field
+    // provably varies along, and an all-equal field becomes a constant with no
+    // column, no payload and no load.
+    //
+    // An empty proven domain must never produce a vacuous constant (§4.1
+    // step 1): equality over zero observations proves nothing.
+    if (ProvenRows == 0)
+      return Fail("the proven dependency domain is empty: refusing a vacuous "
+                  "constant");
+    std::vector<uint64_t> Values(Plan->rows.size(), 0);
+    for (unsigned I = 0; I < Plan->fields.size(); ++I) {
+      EJitSmallTableField &Field = Plan->fields[I];
+      for (uint64_t Row = 0; Row < Plan->rows.size(); ++Row)
+        Values[static_cast<size_t>(Row)] = Plan->rows[Row].bits[I];
+
+      ProjectionSolver Solver(Plan->rows, Extents, Field.accessSize);
+      AxisCandidate Winner;
+      std::string SolveError;
+      if (!Solver.solve(Values, Winner, SolveError))
+        return Fail("field " + Twine(I) + ": " + SolveError);
+
+      Field.retainedAxes = Winner.Axes;
+      if (Winner.Axes.empty()) {
+        // The empty candidate only wins when every proven row holds the same
+        // bit-exact typed value, so the first ready row's masked value is that
+        // value. Unready rows are not observations and never supply it.
+        uint64_t UniformValue = 0;
+        bool HaveValue = false;
+        for (uint64_t Row = 0; Row < Plan->rows.size(); ++Row)
+          if (Plan->rows[Row].ready) {
+            UniformValue = Values[static_cast<size_t>(Row)];
+            HaveValue = true;
+            break;
+          }
+        if (!HaveValue)
+          return Fail("the proven dependency domain is empty");
+        Field.strategy = EJitSmallTableStrategy::Uniform;
+        Field.uniformValue = UniformValue;
+        Field.uniformFromContract = false;
+        Field.columnName.clear();
+        Field.tableRows = 0;
+        Field.tableBytes = 0;
+      } else {
+        Field.strategy = EJitSmallTableStrategy::Table;
+        Field.uniformValue.reset();
+        Field.columnName = (Twine(EJitSmallTablePlan::TableGlobalPrefix) +
+                            Plan->entryName + "_c" + Twine(I))
+                               .str();
+        Field.tableRows = Winner.TableRows;
+        Field.tableBytes = Winner.Bytes;
+      }
+    }
   }
 
+  // Final joint-projection re-verification on the complete original domain
+  // (spec §4.1 step 4) and structural self-check before the plan is returned.
+  if (!Plan->verifyProjections(&Error))
+    return std::nullopt;
   if (!Plan->isConsistent(&Error))
     return std::nullopt;
   return Plan;
+}
+
+std::optional<EJitSmallTablePlan>
+EJitSmallTablePlanner::plan(const Module &M, StringRef EntryName,
+                            StringRef SourceVarName,
+                            ArrayRef<EJitSmallTableDim> Dims,
+                            const EJitSmallTableSource &Source,
+                            ArrayRef<EJitSmallTableRowKey> AuthorizedRows,
+                            ArrayRef<std::optional<uint64_t>> UniformContracts,
+                            std::string &Error) {
+  EJitSmallTableRequest Req;
+  Req.module = &M;
+  Req.entryName = EntryName;
+  Req.sourceVarName = SourceVarName;
+  Req.dims = Dims;
+  Req.source = Source;
+  Req.authorizedRows = AuthorizedRows;
+  Req.uniformContracts = UniformContracts;
+  // A caller that supplies contracts selected the comparison mode; a caller
+  // that supplies none gets the required automatic default.
+  Req.mode = UniformContracts.empty() ? EJitSmallTablePlanMode::Automatic
+                                      : EJitSmallTablePlanMode::ExplicitContracts;
+  return plan(Req, Error);
 }
 
 //===----------------------------------------------------------------------===//
@@ -845,10 +1268,10 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
   // must leave the module untouched, and the three replace rounds call this
   // repeatedly.
   for (const EJitSmallTableField &Field : Plan.fields) {
-    if (Field.uniformValue)
+    if (Field.strategy == EJitSmallTableStrategy::Uniform)
       continue;
     Type *ScalarTy = scalarTypeForField(Ctx, Field);
-    ArrayType *TableTy = ArrayType::get(ScalarTy, Plan.numRows());
+    ArrayType *TableTy = ArrayType::get(ScalarTy, Field.tableRows);
     GlobalVariable *Existing = M.getNamedGlobal(Field.columnName);
     if (!Existing)
       continue;
@@ -884,21 +1307,40 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
 
   for (unsigned I = 0; I < Plan.fields.size(); ++I) {
     const EJitSmallTableField &Field = Plan.fields[I];
-    if (Field.uniformValue)
-      continue; // A uniform field has no table payload.
+    if (Field.strategy == EJitSmallTableStrategy::Uniform)
+      continue; // A uniform field has no table payload at all.
 
     Type *ScalarTy = scalarTypeForField(Ctx, Field);
-    ArrayType *TableTy = ArrayType::get(ScalarTy, Plan.numRows());
+    ArrayType *TableTy = ArrayType::get(ScalarTy, Field.tableRows);
     // Validated above: either the table a previous round created, or a
     // pre-declared slot this round defines.
     GlobalVariable *GV = M.getNamedGlobal(Field.columnName);
 
-    SmallVector<Constant *, 32> Elements;
-    Elements.reserve(Plan.rows.size());
-    for (const EJitSmallTableRow &Row : Plan.rows)
-      Elements.push_back(Row.ready
-                             ? constantFromBits(ScalarTy, Field, Row.bits[I], Ctx)
-                             : Constant::getNullValue(ScalarTy));
+    // Fill the field's own projected coordinates. A coordinate the proven
+    // domain does not publish is refused rather than emitted as 0/undef or as a
+    // representative row (spec §5).
+    SmallVector<Constant *, 32> Elements(Field.tableRows,
+                                         Constant::getNullValue(ScalarTy));
+    std::vector<char> Published(static_cast<size_t>(Field.tableRows), 0);
+    for (uint64_t Row = 0; Row < Plan.rows.size(); ++Row) {
+      if (!Plan.rows[Row].ready)
+        continue;
+      const uint64_t Coord = Plan.projectRow(Field, Row);
+      if (Coord >= Field.tableRows) {
+        if (Error)
+          *Error = "projected coordinate leaves the small-table column";
+        return false;
+      }
+      Elements[static_cast<size_t>(Coord)] =
+          constantFromBits(ScalarTy, Field, Plan.rows[Row].bits[I], Ctx);
+      Published[static_cast<size_t>(Coord)] = 1;
+    }
+    if (llvm::any_of(Published, [](char P) { return P == 0; })) {
+      if (Error)
+        *Error = "small-table column has an unpublished projected coordinate: " +
+                 Field.columnName;
+      return false;
+    }
 
     if (!GV) {
       GV = new GlobalVariable(M, TableTy, /*isConstant=*/false,
@@ -913,33 +1355,80 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
     // runtime publishes into (see wantDSOLocal for the host exception).
     GV->setDSOLocal(wantDSOLocal(M));
     GV->setAlignment(DL.getABITypeAlign(ScalarTy));
-    Metadata *ColumnOps[] = {
-        ConstantAsMetadata::get(ConstantInt::get(I64, Plan.numRows())),
-        ConstantAsMetadata::get(ConstantInt::get(I64, ReadyRows)),
-        ConstantAsMetadata::get(ConstantInt::get(I64, Field.sourceOffset)),
-        ConstantAsMetadata::get(ConstantInt::get(I64, Field.accessSize)),
-        ConstantAsMetadata::get(
-            ConstantInt::get(I64, static_cast<uint64_t>(Field.kind)))};
+    SmallVector<Metadata *, 12> ColumnOps;
+    ColumnOps.push_back(
+        ConstantAsMetadata::get(ConstantInt::get(I64, Field.tableRows)));
+    ColumnOps.push_back(ConstantAsMetadata::get(ConstantInt::get(I64, ReadyRows)));
+    ColumnOps.push_back(
+        ConstantAsMetadata::get(ConstantInt::get(I64, Field.sourceOffset)));
+    ColumnOps.push_back(
+        ConstantAsMetadata::get(ConstantInt::get(I64, Field.accessSize)));
+    ColumnOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(I64, static_cast<uint64_t>(Field.kind))));
+    ColumnOps.push_back(
+        ConstantAsMetadata::get(ConstantInt::get(I64, Field.bitWidth)));
+    ColumnOps.push_back(ConstantAsMetadata::get(
+        ConstantInt::get(I64, Field.retainedAxes.size())));
+    for (unsigned Dim : Field.retainedAxes)
+      ColumnOps.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, static_cast<uint64_t>(Dim))));
     GV->setMetadata(MD_SMALL_TABLE_COLUMN, MDNode::get(Ctx, ColumnOps));
   }
 
-  // Record the folded constants of the admission contract on the entry so the
-  // runtime can validate a later member before it is admitted to this code.
+  // Record the admission contract on the entry: the folded constants (§6.6
+  // step 1) and, for every table field, the retained axes and resource shape
+  // the runtime must validate a later member against.
   SmallVector<Metadata *, 4> ContractOps;
+  ContractOps.push_back(
+      MDString::get(Ctx, "ejit.smalltable.contract.v2"));
+  ContractOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(I64, static_cast<uint64_t>(Plan.mode))));
+  ContractOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(I64, Plan.readiness.domainEpoch)));
+  ContractOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(I64, Plan.numRows())));
+  ContractOps.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(I64, ReadyRows)));
+  ContractOps.push_back(
+      MDString::get(Ctx, Plan.readiness.providerLabel.empty()
+                            ? StringRef("<none>")
+                            : StringRef(Plan.readiness.providerLabel)));
   for (const EJitSmallTableField &Field : Plan.fields) {
-    if (!Field.uniformValue)
-      continue;
-    Metadata *Ops[] = {
-        ConstantAsMetadata::get(ConstantInt::get(I64, Field.sourceOffset)),
-        ConstantAsMetadata::get(ConstantInt::get(I64, Field.bitWidth)),
-        ConstantAsMetadata::get(
-            ConstantInt::get(I64, static_cast<uint64_t>(Field.kind))),
-        ConstantAsMetadata::get(ConstantInt::get(I64, *Field.uniformValue))};
+    SmallVector<Metadata *, 12> Ops;
+    if (Field.strategy == EJitSmallTableStrategy::Uniform) {
+      Ops.push_back(MDString::get(Ctx, "uniform"));
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.sourceOffset)));
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.bitWidth)));
+      Ops.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, static_cast<uint64_t>(Field.kind))));
+      Ops.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, *Field.uniformValue)));
+      Ops.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, Field.uniformFromContract ? 1 : 0)));
+    } else {
+      Ops.push_back(MDString::get(Ctx, "table"));
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.sourceOffset)));
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.bitWidth)));
+      Ops.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, static_cast<uint64_t>(Field.kind))));
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.tableRows)));
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.tableBytes)));
+      Ops.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, Field.retainedAxes.size())));
+      for (unsigned Dim : Field.retainedAxes)
+        Ops.push_back(ConstantAsMetadata::get(
+            ConstantInt::get(I64, static_cast<uint64_t>(Dim))));
+    }
     ContractOps.push_back(MDNode::get(Ctx, Ops));
   }
-  if (!ContractOps.empty())
-    if (Function *Entry = M.getFunction(Plan.entryName))
-      Entry->setMetadata(MD_SMALL_TABLE_CONTRACT, MDNode::get(Ctx, ContractOps));
+  if (Function *Entry = M.getFunction(Plan.entryName))
+    Entry->setMetadata(MD_SMALL_TABLE_CONTRACT, MDNode::get(Ctx, ContractOps));
 
   return true;
 }
@@ -1019,7 +1508,7 @@ PreservedAnalyses EJitSmallTablePass::run(Function &F,
   bool Changed = false;
   for (Replacement &R : Replacements) {
     Value *New = nullptr;
-    if (R.Field->uniformValue) {
+    if (R.Field->strategy == EJitSmallTableStrategy::Uniform) {
       IRBuilder<> Builder(R.LI);
       Value *Folded =
           constantFromBits(scalarTypeForField(M->getContext(), *R.Field),
@@ -1035,15 +1524,23 @@ PreservedAnalyses EJitSmallTablePass::run(Function &F,
       IRBuilder<> Builder(R.LI);
       Type *I64 = Builder.getInt64Ty();
       Value *RowIndex = nullptr;
-      for (unsigned I = 0; I < R.DynValues.size(); ++I) {
-        Value *Idx = R.DynValues[I];
+      // Only the field's own retained axes index its table: each eliminated
+      // axis was proven irrelevant over the complete original domain, so it is
+      // not part of this column's address at all.
+      for (unsigned Pos = 0; Pos < R.Field->retainedAxes.size(); ++Pos) {
+        const unsigned Dim = R.Field->retainedAxes[Pos];
+        if (Dim >= R.DynValues.size()) {
+          RowIndex = nullptr;
+          break;
+        }
+        Value *Idx = R.DynValues[Dim];
         if (!Idx->getType()->isIntegerTy()) {
           RowIndex = nullptr;
           break;
         }
         if (Idx->getType() != I64)
           Idx = Builder.CreateZExtOrTrunc(Idx, I64);
-        const uint64_t Stride = plan_.tableRowStride(I);
+        const uint64_t Stride = plan_.fieldRowStride(*R.Field, Pos);
         if (Stride != 1)
           Idx = Builder.CreateMul(Idx, Builder.getInt64(Stride));
         RowIndex = RowIndex ? Builder.CreateAdd(RowIndex, Idx) : Idx;
@@ -1084,3 +1581,286 @@ PreservedAnalyses EJitSmallTablePass::run(Function &F,
                     static_cast<unsigned long long>(stats_.refusedShape));
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
+
+//===----------------------------------------------------------------------===//
+// Exported admission contract (§6.6)
+//===----------------------------------------------------------------------===//
+
+namespace llvm {
+namespace ejit {
+
+namespace {
+
+/// FNV-1a over the contract's obligations. It exists so a runtime can tell two
+/// contracts apart: two compiles using the same symbol spelling are not the same
+/// table resource, and two contracts with the same digest do impose the same
+/// admission obligations.
+uint64_t contractHashStep(uint64_t H, uint64_t Value) {
+  for (unsigned I = 0; I < 8; ++I) {
+    H ^= (Value >> (I * 8)) & 0xFFu;
+    H *= 1099511628211ull;
+  }
+  return H;
+}
+
+uint64_t contractHashString(uint64_t H, StringRef S) {
+  for (char C : S) {
+    H ^= static_cast<unsigned char>(C);
+    H *= 1099511628211ull;
+  }
+  return contractHashStep(H, S.size());
+}
+
+/// Table stride of the retained axis at position \p Pos of a contract field.
+uint64_t contractAxisStride(const EJitSmallTableFieldContract &Field,
+                            const EJitSmallTableContract &Contract,
+                            unsigned Pos) {
+  uint64_t Stride = 1;
+  for (unsigned I = Pos + 1; I < Field.retainedAxes.size(); ++I)
+    Stride *= Contract.dims[Field.retainedAxes[I]].extent;
+  return Stride;
+}
+
+} // namespace
+
+EJitSmallTableContract buildAdmissionContract(const EJitSmallTablePlan &Plan) {
+  EJitSmallTableContract Contract;
+  Contract.entryName = Plan.entryName;
+  Contract.sourceVarName = Plan.sourceVarName;
+  Contract.elementBytes = Plan.elementBytes;
+  Contract.dims.append(Plan.dims.begin(), Plan.dims.end());
+  Contract.sourceStrides.append(Plan.sourceStrides.begin(),
+                                Plan.sourceStrides.end());
+  Contract.declaredRows = Plan.numRows();
+  Contract.provenRows = Plan.readyRowCount();
+  Contract.domainComplete = Plan.domainComplete();
+  Contract.domainEpoch = Plan.readiness.domainEpoch;
+  Contract.readinessProvider = Plan.readiness.providerLabel;
+  Contract.borrowedStable = Plan.readiness.borrowedStable;
+  Contract.coverageAsserted = Plan.readiness.coversDeclaredDomain;
+  Contract.littleEndian = Plan.littleEndian;
+  Contract.mode = Plan.mode;
+
+  for (unsigned I = 0; I < Plan.fields.size(); ++I) {
+    const EJitSmallTableField &Field = Plan.fields[I];
+    EJitSmallTableFieldContract FC;
+    FC.sourceOffset = Field.sourceOffset;
+    FC.accessSize = Field.accessSize;
+    FC.bitWidth = Field.bitWidth;
+    FC.kind = Field.kind;
+    FC.strategy = Field.strategy;
+    FC.retainedAxes = Field.retainedAxes;
+    if (Field.strategy == EJitSmallTableStrategy::Uniform) {
+      FC.requiredValue = Field.uniformValue;
+    } else {
+      FC.resource.symbolName = Field.columnName;
+      FC.resource.elementBits = Field.bitWidth;
+      FC.resource.rows = Field.tableRows;
+      FC.resource.bytes = Field.tableBytes;
+      FC.resource.alignment = Field.accessSize == 0 ? 1 : Field.accessSize;
+      FC.resource.fixedAddress = Plan.columnsFixedAddress;
+      // The published projections: the coordinate of every proven row with the
+      // bit-exact value the emitted column holds there. The plan already proved
+      // that every proven row of one coordinate carries the same value.
+      std::vector<char> Seen(static_cast<size_t>(Field.tableRows), 0);
+      for (uint64_t Row = 0; Row < Plan.rows.size(); ++Row) {
+        if (!Plan.rows[Row].ready)
+          continue;
+        const uint64_t Coord = Plan.projectRow(Field, Row);
+        if (Coord >= Field.tableRows)
+          continue;
+        if (Seen[static_cast<size_t>(Coord)])
+          continue;
+        Seen[static_cast<size_t>(Coord)] = 1;
+        FC.publishedValues.push_back({Coord, Plan.rows[Row].bits[I]});
+      }
+      llvm::sort(FC.publishedValues,
+                 [](const std::pair<uint64_t, uint64_t> &L,
+                    const std::pair<uint64_t, uint64_t> &R) {
+                   return L.first < R.first;
+                 });
+    }
+    Contract.fields.push_back(std::move(FC));
+  }
+
+  uint64_t H = 14695981039346656037ull;
+  H = contractHashString(H, Contract.entryName);
+  H = contractHashString(H, Contract.sourceVarName);
+  H = contractHashStep(H, Contract.elementBytes);
+  H = contractHashStep(H, Contract.declaredRows);
+  H = contractHashStep(H, Contract.provenRows);
+  H = contractHashStep(H, static_cast<uint64_t>(Contract.mode));
+  H = contractHashStep(H, Contract.domainEpoch);
+  H = contractHashStep(H, Contract.littleEndian ? 1 : 0);
+  for (const EJitSmallTableDim &Dim : Contract.dims) {
+    H = contractHashStep(H, static_cast<uint64_t>(Dim.kind));
+    H = contractHashStep(H, Dim.argIndex);
+    H = contractHashStep(H, Dim.modulus);
+    H = contractHashStep(H, Dim.extent);
+  }
+  for (const EJitSmallTableFieldContract &FC : Contract.fields) {
+    H = contractHashStep(H, FC.sourceOffset);
+    H = contractHashStep(H, FC.accessSize);
+    H = contractHashStep(H, FC.bitWidth);
+    H = contractHashStep(H, static_cast<uint64_t>(FC.kind));
+    H = contractHashStep(H, static_cast<uint64_t>(FC.strategy));
+    H = contractHashStep(H, FC.requiredValue.value_or(0));
+    H = contractHashStep(H, FC.requiredValue.has_value() ? 1 : 0);
+    H = contractHashStep(H, FC.retainedAxes.size());
+    for (unsigned Axis : FC.retainedAxes)
+      H = contractHashStep(H, Axis);
+    H = contractHashString(H, FC.resource.symbolName);
+    H = contractHashStep(H, FC.resource.rows);
+    H = contractHashStep(H, FC.resource.bytes);
+    H = contractHashStep(H, FC.publishedValues.size());
+    for (const std::pair<uint64_t, uint64_t> &P : FC.publishedValues) {
+      H = contractHashStep(H, P.first);
+      H = contractHashStep(H, P.second);
+    }
+  }
+  Contract.identityHash = H;
+  return Contract;
+}
+
+std::optional<EJitSmallTableMember>
+readAdmissionMember(const EJitSmallTableContract &Contract,
+                    const EJitSmallTableSource &Source,
+                    ArrayRef<uint64_t> Indices, std::string &Error) {
+  auto Fail = [&](const Twine &Msg) -> std::optional<EJitSmallTableMember> {
+    Error = Msg.str();
+    return std::nullopt;
+  };
+
+  if (!Source.baseAddr || Source.size == 0)
+    return Fail("member region is null or empty");
+  if (Indices.size() != Contract.dims.size())
+    return Fail("member coordinate does not match the contract schema");
+  if (Contract.sourceStrides.size() != Contract.dims.size())
+    return Fail("contract source strides do not match its dimensions");
+
+  uint64_t ElementOff = 0;
+  for (unsigned I = 0; I < Indices.size(); ++I) {
+    if (Indices[I] >= Contract.dims[I].extent)
+      return Fail("member coordinate leaves the declared schema/capacity");
+    uint64_t Add = 0;
+    if (__builtin_mul_overflow(Indices[I], Contract.sourceStrides[I], &Add) ||
+        __builtin_add_overflow(ElementOff, Add, &ElementOff))
+      return Fail("member coordinate address overflow");
+  }
+
+  EJitSmallTableMember Member;
+  Member.indices.append(Indices.begin(), Indices.end());
+  for (const EJitSmallTableFieldContract &FC : Contract.fields) {
+    EJitSmallTableField Field;
+    Field.sourceOffset = FC.sourceOffset;
+    Field.accessSize = FC.accessSize;
+    Field.bitWidth = FC.bitWidth;
+    Field.kind = FC.kind;
+    uint64_t FieldOff = 0;
+    if (__builtin_add_overflow(ElementOff, FC.sourceOffset, &FieldOff) ||
+        FieldOff > Source.size || FC.accessSize > Source.size - FieldOff)
+      return Fail("member field access leaves the member region");
+    Member.bits.push_back(
+        readScalarBitsOrdered(Source.baseAddr + FieldOff, Field,
+                              Contract.littleEndian));
+  }
+  return Member;
+}
+
+const char *admissionName(EJitSmallTableAdmission Admission) {
+  switch (Admission) {
+  case EJitSmallTableAdmission::Compatible:
+    return "compatible";
+  case EJitSmallTableAdmission::Extendable:
+    return "extendable";
+  case EJitSmallTableAdmission::Conflict:
+    return "conflict";
+  case EJitSmallTableAdmission::Unusable:
+    return "unusable";
+  }
+  llvm_unreachable("unknown admission classification");
+}
+
+EJitSmallTableAdmission validateAdmission(const EJitSmallTableContract &Contract,
+                                          const EJitSmallTableMember &Member,
+                                          std::string *Why) {
+  auto Set = [&](const Twine &Msg) {
+    if (Why)
+      *Why = Msg.str();
+  };
+
+  if (Contract.dims.empty())
+    return Set("contract declares no schema"), EJitSmallTableAdmission::Unusable;
+  if (Contract.identityHash == 0)
+    return Set("contract has no identity"), EJitSmallTableAdmission::Unusable;
+  if (Member.indices.size() != Contract.dims.size())
+    return Set("member coordinate does not match the declared schema"),
+           EJitSmallTableAdmission::Unusable;
+  if (Member.bits.size() != Contract.fields.size())
+    return Set("member value count does not match the contract fields"),
+           EJitSmallTableAdmission::Unusable;
+  for (unsigned I = 0; I < Member.indices.size(); ++I)
+    if (Member.indices[I] >= Contract.dims[I].extent)
+      return Set("member coordinate leaves the declared schema/capacity"),
+             EJitSmallTableAdmission::Unusable;
+
+  bool Extendable = false;
+  for (unsigned I = 0; I < Contract.fields.size(); ++I) {
+    const EJitSmallTableFieldContract &FC = Contract.fields[I];
+    const uint64_t Bits = Member.bits[I];
+    // The member value is a typed bit value of exactly the field's width: a raw
+    // wider storage byte is not that typed value.
+    if (FC.bitWidth == 0 || FC.bitWidth > 64)
+      return Set("contract field has no supported width"),
+             EJitSmallTableAdmission::Unusable;
+    if (FC.bitWidth < 64 && Bits >= (uint64_t{1} << FC.bitWidth))
+      return Set("member value does not fit the field width"),
+             EJitSmallTableAdmission::Unusable;
+
+    if (FC.strategy == EJitSmallTableStrategy::Uniform) {
+      if (!FC.requiredValue)
+        return Set("contract uniform field has no required value"),
+               EJitSmallTableAdmission::Unusable;
+      if (Bits != *FC.requiredValue)
+        return Set("a uniform constant differs from the contract"),
+               EJitSmallTableAdmission::Conflict;
+      continue;
+    }
+
+    // Project the member onto the retained axes and require an already
+    // published coordinate to carry exactly this value. A compressed projected
+    // value is shared, so "table fields may differ per row" does not apply here
+    // (spec §6.6).
+    uint64_t Coord = 0;
+    for (unsigned Pos = 0; Pos < FC.retainedAxes.size(); ++Pos) {
+      const unsigned Dim = FC.retainedAxes[Pos];
+      if (Dim >= Contract.dims.size())
+        return Set("contract retained axis is outside the schema"),
+               EJitSmallTableAdmission::Unusable;
+      Coord += Member.indices[Dim] * contractAxisStride(FC, Contract, Pos);
+    }
+    auto It = std::lower_bound(
+        FC.publishedValues.begin(), FC.publishedValues.end(), Coord,
+        [](const std::pair<uint64_t, uint64_t> &P, uint64_t C) {
+          return P.first < C;
+        });
+    if (It != FC.publishedValues.end() && It->first == Coord) {
+      if (It->second != Bits)
+        return Set("a published projected value differs from the contract"),
+               EJitSmallTableAdmission::Conflict;
+      continue;
+    }
+    if (Coord >= FC.resource.rows)
+      return Set("projected coordinate leaves the declared table capacity"),
+             EJitSmallTableAdmission::Unusable;
+    Extendable = true;
+  }
+
+  if (Extendable)
+    return Set("member projects to a supported, not yet published coordinate"),
+           EJitSmallTableAdmission::Extendable;
+  return EJitSmallTableAdmission::Compatible;
+}
+
+} // namespace ejit
+} // namespace llvm

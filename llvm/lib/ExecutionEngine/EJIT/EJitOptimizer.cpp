@@ -883,8 +883,46 @@ bool EJitOptimizer::runSmallTablePass(Module &M, StringRef EntryName) {
       FAM_.invalidate(*Entry, PreservedAnalyses::none());
   const EJitSmallTablePass::Stats &Stats = Pass.getStats();
   (void)Stats;
+  // Per-field accounting (§13): original axes, retained axes, eliminated axes,
+  // the constant/table strategy and the payload before and after specialization.
+  uint64_t PerRowBytes = 0;
+  for (const EJitSmallTableField &F : Plan->fields)
+    PerRowBytes += F.accessSize;
+  const uint64_t OriginalBytes = Plan->numRows() * PerRowBytes;
+  for (unsigned I = 0; I < Plan->fields.size(); ++I) {
+    const EJitSmallTableField &Field = Plan->fields[I];
+    SmallString<32> Retained;
+    SmallString<32> Eliminated;
+    for (unsigned Dim = 0; Dim < Plan->dims.size(); ++Dim) {
+      const std::string One = ("axis" + Twine(Dim)).str();
+      if (Plan->fieldRetainsDim(Field, Dim)) {
+        if (!Retained.empty())
+          Retained += ",";
+        Retained += One;
+      } else {
+        if (!Eliminated.empty())
+          Eliminated += ",";
+        Eliminated += One;
+      }
+    }
+    EJIT_DIAG_VERBOSE(
+        "small-table-field entry=%s field=%u off=%llu access=%llu bits=%llu "
+        "kind=%u strategy=%s retained=[%s] eliminated=[%s] payload=%llu "
+        "payload_before=%llu",
+        EntryName.str().c_str(), I,
+        static_cast<unsigned long long>(Field.sourceOffset),
+        static_cast<unsigned long long>(Field.accessSize),
+        static_cast<unsigned long long>(Field.bitWidth),
+        static_cast<unsigned>(Field.kind),
+        Field.strategy == EJitSmallTableStrategy::Uniform ? "uniform" : "table",
+        Retained.c_str(), Eliminated.c_str(),
+        static_cast<unsigned long long>(Field.tableBytes),
+        static_cast<unsigned long long>(Plan->numRows() * Field.accessSize));
+  }
   EJIT_DIAG_VERBOSE("small-table func=%s rows=%llu ready=%llu uniform=%llu "
-                    "sites=%llu table=%llu folded=%llu kept=%llu refused=%llu",
+                    "table=%llu payload=%llu payload_before=%llu "
+                    "sites=%llu table_sites=%llu folded=%llu kept=%llu "
+                    "refused=%llu",
                     EntryName.str().c_str(),
                     static_cast<unsigned long long>(Plan->numRows()),
                     static_cast<unsigned long long>(llvm::count_if(
@@ -892,6 +930,9 @@ bool EJitOptimizer::runSmallTablePass(Module &M, StringRef EntryName) {
                           return R.ready;
                         })),
                     static_cast<unsigned long long>(Plan->uniformFieldCount()),
+                    static_cast<unsigned long long>(Plan->tableFieldCount()),
+                    static_cast<unsigned long long>(Plan->tableBytes()),
+                    static_cast<unsigned long long>(OriginalBytes),
                     static_cast<unsigned long long>(Stats.mayConstSites),
                     static_cast<unsigned long long>(Stats.tableReplaced),
                     static_cast<unsigned long long>(Stats.uniformFolded),
