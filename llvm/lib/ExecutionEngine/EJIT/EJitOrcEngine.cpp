@@ -186,6 +186,13 @@ struct EJitOrcEngine::Impl {
   /// Create() reaches the persistent optimizer, and so the plan set outlives
   /// every compilation that consults it.
   std::shared_ptr<const EJitSmallTablePlanSet> smallTablePlans;
+  /// PR231 A0: transform-created symbols of the last materialization that the
+  /// module's own MaterializationResponsibility already defined, and which were
+  /// therefore NOT claimed a second time. Non-zero means a prepared module was
+  /// handed to the engine (its own claim owns the table column), which is the
+  /// supported client order; the value is exposed for the regression test that
+  /// pins the ownership rule.
+  uint64_t transformClaimSkips = 0;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
   /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
   /// emitted assembly matches the real JIT output). Null if creation failed.
@@ -875,6 +882,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           if (!ctx)
             return;
 
+          // PR231 A0 regression counter: how many transform-created symbols this
+          // materialization found already owned by the module's own claim (see
+          // the claim-only-what-is-not-already-defined rule below).
+          engine->P->transformClaimSkips = 0;
+
           // Clear stale analysis results from previous compilations
           // (each compilation uses a fresh Module with new IR unit pointers).
           engine->P->optimizer->clearAnalyses();
@@ -997,26 +1009,95 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
         // lookup resolves (compileCold's Tier-1 counter capture, §5.2).
         {
           orc::SymbolFlagsMap symFlags;
+          // PR231 B2: the instrumented (Tier-1) pipeline also creates the
+          // profile version flag as a COMDAT definition, after addIRModule, so
+          // the MR's claim cannot contain it. Without claiming it an Instrumented
+          // module cannot materialize at all on COFF (the symbol is listed as
+          // unmaterializable), which is exactly what stops the common T1
+          // compile. The flag carries no counter state: the counters are the
+          // __profc_/__profd_ globals below.
+          if (!engine->P->optimizer->getLastCounterNames().empty()) {
+            const char *VersionName = "__llvm_profile_raw_version";
+            const char *HookUserName = "__llvm_profile_runtime_user";
+            auto VersionVar = engine->P->J->mangleAndIntern(VersionName);
+            if (!R.getSymbols().count(VersionVar) &&
+                !engine->P->userSymbols.count(VersionName))
+              symFlags[VersionVar] = JITSymbolFlags::Exported;
+            else
+              ++engine->P->transformClaimSkips;
+            // The lowering also synthesizes the runtime-hook user function on
+            // targets that need one (COFF among them). It is created inside the
+            // transform too, so it must be claimed the same way.
+            auto HookUser = engine->P->J->mangleAndIntern(HookUserName);
+            if (!R.getSymbols().count(HookUser) &&
+                !engine->P->userSymbols.count(HookUserName))
+              symFlags[HookUser] = JITSymbolFlags::Exported;
+            else
+              ++engine->P->transformClaimSkips;
+          }
           for (const std::string &name :
                engine->P->optimizer->getLastCounterNames()) {
-            symFlags[engine->P->J->mangleAndIntern("__profc_" + name)] =
-                JITSymbolFlags::Exported;
-            symFlags[engine->P->J->mangleAndIntern("__profd_" + name)] =
-                JITSymbolFlags::Exported;
+            // Same duplicate-claim rule as the small-table columns below: a
+            // counter the module already defines - or that a caller registered
+            // through addUserSymbol, which defines an absolute symbol in this
+            // spec JITDylib - belongs to that existing owner, so it is not
+            // claimed a second time here (that would be a duplicate
+            // defineMaterializing definition).
+            const std::string ProfcName = "__profc_" + name;
+            const std::string ProfdName = "__profd_" + name;
+            auto Profc = engine->P->J->mangleAndIntern(ProfcName);
+            auto Profd = engine->P->J->mangleAndIntern(ProfdName);
+            if (!R.getSymbols().count(Profc) &&
+                !engine->P->userSymbols.count(ProfcName))
+              symFlags[Profc] = JITSymbolFlags::Exported;
+            else
+              ++engine->P->transformClaimSkips;
+            if (!R.getSymbols().count(Profd) &&
+                !engine->P->userSymbols.count(ProfdName))
+              symFlags[Profd] = JITSymbolFlags::Exported;
+            else
+              ++engine->P->transformClaimSkips;
           }
           // PR231: the small-table pass also creates globals inside runPipeline
           // (after addIRModule), so the MR's claim does not include them.
           // Claiming them as exported lets the runtime resolve a table's stable
           // address and publish later rows into it (§6.5); without this ORC
           // rejects the transform's new definitions as unexpected.
+          //
+          // Claim only the columns this module did NOT already define. A client
+          // may hand the engine a module that a previous round already prepared
+          // (materialize() + the pass, or a second compile of the same prepared
+          // module); that module's own claim, computed by addIRModule, already
+          // contains the symbol, and claiming it again is a duplicate definition
+          // (`In defineMaterializing operation, duplicate definition of symbol
+          // '__ejit_stab_...'`). Ownership of an existing definition therefore
+          // stays with the IRMaterializationUnit that declared it; the runtime
+          // still resolves the same stable address through that claim.
           for (const std::string &name :
-               engine->P->optimizer->getLastSmallTableColumnNames())
-            symFlags[engine->P->J->mangleAndIntern(name)] =
-                JITSymbolFlags::Exported;
+               engine->P->optimizer->getLastSmallTableColumnNames()) {
+            auto Interned = engine->P->J->mangleAndIntern(name);
+            // Ownership: a column the module itself defines is already claimed
+            // by its IRMaterializationUnit, and a column the runtime registered
+            // through addUserSymbol is already defined as an absolute symbol in
+            // this JITDylib (the runtime-owned resource form). In both cases
+            // re-claiming it is a duplicate `defineMaterializing` definition, so
+            // the existing owner keeps it.
+            if (R.getSymbols().count(Interned) ||
+                engine->P->userSymbols.count(name)) {
+              ++engine->P->transformClaimSkips;
+              continue;
+            }
+            symFlags[Interned] = JITSymbolFlags::Exported;
+          }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-          if (!engine->P->optimizer->getLastMayConstLoadSites().empty())
-            symFlags[engine->P->J->mangleAndIntern("__ejit_mayconst_hits")] =
-                JITSymbolFlags::Exported;
+          if (!engine->P->optimizer->getLastMayConstLoadSites().empty()) {
+            auto Interned =
+                engine->P->J->mangleAndIntern("__ejit_mayconst_hits");
+            if (!R.getSymbols().count(Interned))
+              symFlags[Interned] = JITSymbolFlags::Exported;
+            else
+              ++engine->P->transformClaimSkips;
+          }
 #endif
           if (!symFlags.empty())
             if (auto Err = R.defineMaterializing(std::move(symFlags)))
@@ -1204,6 +1285,34 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   for (const std::string &n : unresolvedNames)
     EJIT_DIAG_DEBUG("  %s", n.c_str());
 
+  // PR231 B2: a symbol registered through addUserSymbol must be resolvable by
+  // THIS compile even when the reference to it is synthesized by the transform
+  // rather than present in the module as loaded. The scans above can only see
+  // declarations that already exist at addIRModule time, but the instrumented
+  // pipeline creates the profile-runtime hook declaration
+  // (`__llvm_profile_runtime`, referenced by the `__llvm_profile_runtime_user`
+  // function it also creates) while it runs, so on targets that need that hook
+  // (COFF - ELF/Linux returns early in InstrProfilingLowering) the spec
+  // JITDylib had no definition and the whole Tier-1 module failed to
+  // materialize with "Symbols not found: [ __llvm_profile_runtime ]".
+  //
+  // Ownership: a name the module itself DEFINES keeps its own
+  // IRMaterializationUnit claim - defining an absolute symbol for it here
+  // would be a duplicate definition - so only names the module leaves
+  // undefined (or does not mention at all) take the registered address.
+  for (const auto &KV : P->userSymbols) {
+    if (KV.first.empty() || !KV.second)
+      continue;
+    auto Interned = P->J->mangleAndIntern(KV.first);
+    if (globalSymbols.count(Interned))
+      continue;
+    const GlobalValue *ModuleOwned = (*ModuleOrErr)->getNamedValue(KV.first);
+    if (ModuleOwned && !ModuleOwned->isDeclaration())
+      continue;
+    globalSymbols[Interned] = orc::ExecutorSymbolDef(
+        orc::ExecutorAddr::fromPtr(KV.second), JITSymbolFlags::Exported);
+  }
+
   // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
   // and the stack-protector guard/fail) that the AOT symbol collector cannot
   // register because they are never present as IR declarations — the JIT
@@ -1318,6 +1427,10 @@ ArrayRef<std::string> EJitOrcEngine::getLastSmallTableColumnNames() const {
   if (P->optimizer)
     return P->optimizer->getLastSmallTableColumnNames();
   return {};
+}
+
+uint64_t EJitOrcEngine::getTransformClaimSkips() const {
+  return P->transformClaimSkips;
 }
 
 ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {

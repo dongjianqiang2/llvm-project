@@ -169,6 +169,18 @@ public:
   /// publish later row values into that table's stable address.
   ArrayRef<std::string> getLastSmallTableColumnNames() const;
 
+  /// PR231 A0: number of transform-created symbols (small-table columns, PGO
+  /// counters) the last materialization found already owned, and which were
+  /// therefore not claimed a second time. Ownership has two forms: a module that
+  /// already defines the symbol (a prepared module handed to the engine in the
+  /// supported client order) keeps it in its own MaterializationResponsibility
+  /// claim, and a symbol the runtime registered through `addUserSymbol` is
+  /// already defined as an absolute symbol in the spec JITDylib (the
+  /// runtime-owned table resource). Re-claiming either would be a duplicate
+  /// `defineMaterializing` definition. Non-zero is therefore the expected value
+  /// for the runtime-owned form: one skip per table column.
+  uint64_t getTransformClaimSkips() const;
+
   /// PGO: PGOFuncNames captured by the last Tier-1 compile (the suffix of each
   /// __profc_<name> that captureCounterGlobals forced external). The compile
   /// driver looks up __profc_/__profd_ by these names after a Tier-1 compile to

@@ -1243,13 +1243,24 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
   if (!Plan.isConsistent(Error))
     return false;
 
+  const bool RuntimeOwned = Plan.storage == EJitSmallTableStorage::RuntimeOwned;
+  // Runtime-owned storage without the runtime admission gate would emit an
+  // unfilled declaration that an un-validated member could read: refuse the
+  // combination outright instead of trusting the caller.
+  if (RuntimeOwned && !Plan.runtimeRowAdmission) {
+    if (Error)
+      *Error = "runtime-owned small-table storage requires the runtime "
+               "row-admission gate (plan.runtimeRowAdmission)";
+    return false;
+  }
+
   // Spec §5: every row that an optimized read can reach must be initialized
   // and stable, and §5/latest §6.5: a missing row must never be emitted as
   // 0/undef or as a representative cell. Incremental row admission needs the
-  // runtime `tableReady(row)` gate (§6.5), which this milestone does not have,
-  // so a plan with holes must keep the entry on its original loads instead of
-  // producing a table that a business call could read as zeros.
-  if (!Plan.allRowsReady()) {
+  // runtime `tableReady(row)` gate (§6.5); a plan without that gate therefore
+  // keeps the entry on its original loads instead of producing a table that a
+  // business call could read as zeros.
+  if (!Plan.allRowsReady() && !Plan.runtimeRowAdmission) {
     if (Error)
       *Error = "small-table plan has " +
                std::to_string(Plan.readyRowCount()) + " of " +
@@ -1284,8 +1295,10 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
     if (Existing->hasInitializer()) {
       // Only the exact global a previous round created is reusable. A
       // constant or foreign-linkage definition is not a table this pass can
-      // vouch for.
-      if (Existing->isConstant() ||
+      // vouch for. In runtime-owned mode a definition is always foreign: the
+      // runtime's shared resource is registered as an absolute symbol, and a
+      // module definition would shadow it with per-compile storage of its own.
+      if (Existing->isConstant() || RuntimeOwned ||
           Existing->isDSOLocal() != wantDSOLocal(M)) {
         if (Error)
           *Error = "existing small-table global is not a reusable table: " +
@@ -1315,6 +1328,37 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
     // Validated above: either the table a previous round created, or a
     // pre-declared slot this round defines.
     GlobalVariable *GV = M.getNamedGlobal(Field.columnName);
+
+    if (RuntimeOwned) {
+      // The runtime owns one shared, fixed-capacity data resource and binds it
+      // to this symbol in every compile of this code generation (spec §8): the
+      // module declares the column and never allocates or initializes storage.
+      // Publishing validated rows is the runtime's cold-path job (B1).
+      if (!GV)
+        GV = new GlobalVariable(M, TableTy, /*isConstant=*/false,
+                                GlobalValue::ExternalLinkage, /*Initializer=*/nullptr,
+                                Field.columnName);
+      GV->setAlignment(DL.getABITypeAlign(ScalarTy));
+      SmallVector<Metadata *, 12> ColumnOps;
+      ColumnOps.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.tableRows)));
+      ColumnOps.push_back(ConstantAsMetadata::get(ConstantInt::get(I64, 0)));
+      ColumnOps.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.sourceOffset)));
+      ColumnOps.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.accessSize)));
+      ColumnOps.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, static_cast<uint64_t>(Field.kind))));
+      ColumnOps.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64, Field.bitWidth)));
+      ColumnOps.push_back(ConstantAsMetadata::get(
+          ConstantInt::get(I64, Field.retainedAxes.size())));
+      for (unsigned Dim : Field.retainedAxes)
+        ColumnOps.push_back(ConstantAsMetadata::get(
+            ConstantInt::get(I64, static_cast<uint64_t>(Dim))));
+      GV->setMetadata(MD_SMALL_TABLE_COLUMN, MDNode::get(Ctx, ColumnOps));
+      continue;
+    }
 
     // Fill the field's own projected coordinates. A coordinate the proven
     // domain does not publish is refused rather than emitted as 0/undef or as a
@@ -1445,8 +1489,10 @@ PreservedAnalyses EJitSmallTablePass::run(Function &F,
   // Executable lowering requires a plan that covers its whole declared domain;
   // see materialize(). This is the second entry point, so it enforces the same
   // rule: a caller that bypasses materialize() (or holds a stale table) must
-  // not fold a uniform contract or index a table with holes.
-  if (!plan_.allRowsReady()) {
+  // not fold a uniform contract or index a table with holes. A runtime-owned
+  // plan whose rows are gated per member by the runtime is the one exception:
+  // its executable gate is the runtime admission, not the compile-time proof.
+  if (!plan_.allRowsReady() && !plan_.runtimeRowAdmission) {
     if (F.getName() == plan_.entryName)
       ++stats_.refusedNotReady;
     EJIT_DIAG_VERBOSE("small-table run SKIP func=%s: plan not fully ready",

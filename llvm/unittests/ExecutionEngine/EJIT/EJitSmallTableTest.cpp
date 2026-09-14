@@ -21,6 +21,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTableRuntime.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/AsmParser/Parser.h"
@@ -493,6 +494,12 @@ int32_t g_auto_out[kAutoCells];
 int32_t g_sparse_out[2];
 int32_t g_one_out[1];
 
+/// The product-shape fixture (16 cells x 32 TRPs, the stated ceiling for this
+/// entry class): the runtime, planner and resource must not be hardcoded to the
+/// tiny 4x3 test module.
+AutoElement g_big[16][32];
+int32_t g_big_out[16];
+
 /// The exact-float-bits fixture's source and output (see
 /// `AutomaticSolverFoldsExactFloatBits`).
 struct alignas(4) FloatElement {
@@ -526,6 +533,19 @@ void fillSparseConfig() {
       E.joint = static_cast<int32_t>(C * 3 + T);
     }
   std::memset(g_sparse_out, 0, sizeof(g_sparse_out));
+}
+
+/// The 16x32 product-shape fixture (see `g_big`).
+void fillBigConfig() {
+  for (unsigned C = 0; C < 16; ++C)
+    for (unsigned T = 0; T < 32; ++T) {
+      AutoElement &E = g_big[C][T];
+      E.mode = 1;
+      E.byCell = static_cast<int32_t>(7 + C);
+      E.byTrp = static_cast<int32_t>(2 + T);
+      E.joint = static_cast<int32_t>(C * 32 + T);
+    }
+  std::memset(g_big_out, 0, sizeof(g_big_out));
 }
 
 /// One entry over `[Cells x [Trps x %A]]`, whose result is a positional mix of
@@ -813,6 +833,7 @@ protected:
     fillWidthConfig();
     fillAutoConfig();
     fillSparseConfig();
+    fillBigConfig();
     // Outputs are process-wide; a previous test's stores must not leak into
     // this test's address checks.
     std::memset(g_out, 0, sizeof(g_out));
@@ -988,6 +1009,12 @@ protected:
                            reinterpret_cast<void *>(&g_one[0][0]),
                            sizeof(g_one));
     Registry.registerStaticVar("g_one_out", &g_one_out[0]);
+    // The 16x32 product-shape fixture (the runtime must not be hardcoded to
+    // the tiny module).
+    Registry.registerArray("cell", "g_big",
+                           reinterpret_cast<void *>(&g_big[0][0]),
+                           sizeof(g_big));
+    Registry.registerStaticVar("g_big_out", &g_big_out[0]);
     return Registry;
   }
 };
@@ -3676,4 +3703,913 @@ TEST_F(SmallTableTest, AutomaticSolverRefusesBeyondItsAxisBudget) {
   EXPECT_EQ(countLoadsRootedAt(*M->getFunction("n_entry"), "g_nine"), 1u);
 }
 
+//===----------------------------------------------------------------------===//
+// B0/B1/B2: the online runtime over the real planner, pass, ORC engine and real
+// executions.
+//
+// The readiness facts come from `EJitSmallTableHostProvider`, the explicitly
+// labeled HOST adapter ("host-adapter.pr231-not-product"): the product
+// configuration transaction is not available in this local checkout, so every
+// artifact records that label and nothing here is claimed as product readiness.
+// What IS real: the borrow discipline, the shared resource with generation
+// identity, row publication, contract validation, the common instrumented T1,
+// the aggregate sampling session, the frozen bundle with real counter data and
+// the common T2 execution.
+//===----------------------------------------------------------------------===//
+
+class SmallTableRuntimeTest : public SmallTableTest {
+protected:
+  std::shared_ptr<EJitSmallTableHostProvider>
+  hostProvider(uint64_t Epoch, unsigned Cells = kAutoCells,
+               unsigned Trps = kAutoTrps) {
+    auto P = std::make_shared<EJitSmallTableHostProvider>(
+        "g_auto", reinterpret_cast<const void *>(&g_auto[0][0]), sizeof(g_auto),
+        Epoch);
+    for (unsigned C = 0; C < Cells; ++C)
+      for (unsigned T = 0; T < Trps; ++T)
+        P->addReadyMember({C, T}, 0xA000 + C * 16 + T);
+    return P;
+  }
+
+  std::unique_ptr<EJitSmallTableRuntime>
+  makeRuntime(std::shared_ptr<EJitSmallTableReadinessProvider> Provider,
+              EJitSmallTableRuntime::Options Opts = {}) {
+    Config Cfg;
+    auto R = EJitSmallTableRuntime::create(Cfg, makeRegistry(), State,
+                                           std::move(Provider), Opts);
+    if (!R) {
+      ADD_FAILURE() << "runtime create failed: " << toString(R.takeError());
+      return nullptr;
+    }
+    return std::move(*R);
+  }
+
+  std::unique_ptr<Module> parseAutoEntry(StringRef Entry = "a_entry",
+                                         StringRef Global = "g_auto",
+                                         StringRef Out = "g_auto_out") {
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(
+        autoModuleText(Entry, Global, Out, kAutoCells, kAutoTrps), Err, Ctx);
+    if (!M)
+      Err.print("SmallTableRuntimeTest", errs());
+    return M;
+  }
+
+  /// Host stand-in for the profile-runtime HOOK symbol the freestanding product
+  /// image provides (`__llvm_profile_runtime`). InstrProfilingLowering declares
+  /// it (and synthesizes a user function for it) when it instruments a module; a
+  /// declaration created after `addIRModule` is resolved through the engine's
+  /// registered-symbol table, so the runtime registers the stand-in there. It
+  /// carries no counter state: the counters are the real transform-generated
+  /// `__profc_` globals this suite reads back. Harness support only, recorded as
+  /// such in the delivery. The profile version flag needs no stand-in: the
+  /// engine claims that transform-created definition.
+  void addProfileRuntimeHook(EJitSmallTableRuntime &RT) {
+    static uint32_t RuntimeHook = 0;
+    RT.engine().addUserSymbol("__llvm_profile_runtime",
+                              reinterpret_cast<void *>(&RuntimeHook));
+  }
+};
+
+/// B0 fail-closed: with no provider, with a provider that cannot grant the
+/// protected read borrow, with a moved configuration generation, or with no
+/// confirmed-ready member, nothing may be specialized.
+TEST_F(SmallTableRuntimeTest, RuntimeIsFailClosedWithoutProviderOrBorrow) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::string Error;
+
+  // (a) No provider at all: no facts, no borrow, no specialization.
+  auto NoProvider = makeRuntime(nullptr);
+  ASSERT_NE(NoProvider, nullptr);
+  auto R0 = NoProvider->prepare(*M, "a_entry", "g_auto", Dims, Error);
+  EXPECT_FALSE(static_cast<bool>(R0));
+  EXPECT_NE(Error.find("no readiness provider"), std::string::npos) << Error;
+  EXPECT_EQ(NoProvider->plan(), nullptr);
+  EXPECT_EQ(NoProvider->stats().plannedRows, 0u);
+  consumeError(R0.takeError());
+
+  // (b) The product configuration transaction is missing/locked: the adapter
+  //     refuses the borrow and the entry stays AOT for that exact reason.
+  auto P1 = std::make_shared<EJitSmallTableHostProvider>(
+      "g_auto", reinterpret_cast<const void *>(&g_auto[0][0]), sizeof(g_auto),
+      0xE001);
+  P1->addReadyMember({0, 0}, 1);
+  P1->refuseBorrow("product configuration transaction unavailable");
+  auto R1 = makeRuntime(P1);
+  ASSERT_NE(R1, nullptr);
+  auto R1OrErr = R1->prepare(*M, "a_entry", "g_auto", Dims, Error);
+  EXPECT_FALSE(static_cast<bool>(R1OrErr));
+  EXPECT_NE(Error.find("product configuration transaction unavailable"),
+            std::string::npos)
+      << Error;
+  EXPECT_EQ(R1->plan(), nullptr);
+  consumeError(R1OrErr.takeError());
+
+  // (c) A moved configuration generation invalidates the old facts: a stale
+  //     borrow is never taken.
+  auto P2 = std::make_shared<EJitSmallTableHostProvider>(
+      "g_auto", reinterpret_cast<const void *>(&g_auto[0][0]), sizeof(g_auto),
+      0xE002);
+  P2->addReadyMember({0, 0}, 1);
+  P2->invalidateGeneration();
+  auto R2 = makeRuntime(P2);
+  ASSERT_NE(R2, nullptr);
+  auto R2OrErr = R2->prepare(*M, "a_entry", "g_auto", Dims, Error);
+  EXPECT_FALSE(static_cast<bool>(R2OrErr));
+  EXPECT_NE(Error.find("configuration generation moved"), std::string::npos)
+      << Error;
+  EXPECT_EQ(R2->plan(), nullptr);
+  consumeError(R2OrErr.takeError());
+
+  // (d) An epoch-less or member-less fact source is not a proof either.
+  auto P3 = std::make_shared<EJitSmallTableHostProvider>(
+      "g_auto", reinterpret_cast<const void *>(&g_auto[0][0]), sizeof(g_auto),
+      /*Epoch=*/0);
+  P3->addReadyMember({0, 0}, 1);
+  auto R3 = makeRuntime(P3);
+  ASSERT_NE(R3, nullptr);
+  auto R3OrErr = R3->prepare(*M, "a_entry", "g_auto", Dims, Error);
+  EXPECT_FALSE(static_cast<bool>(R3OrErr));
+  EXPECT_NE(Error.find("no domain epoch"), std::string::npos) << Error;
+  consumeError(R3OrErr.takeError());
+
+  auto P4 = std::make_shared<EJitSmallTableHostProvider>(
+      "g_auto", reinterpret_cast<const void *>(&g_auto[0][0]), sizeof(g_auto),
+      0xE004);
+  auto R4 = makeRuntime(P4);
+  ASSERT_NE(R4, nullptr);
+  auto R4OrErr = R4->prepare(*M, "a_entry", "g_auto", Dims, Error);
+  EXPECT_FALSE(static_cast<bool>(R4OrErr));
+  EXPECT_NE(Error.find("confirms no ready member"), std::string::npos) << Error;
+  EXPECT_EQ(R4->plan(), nullptr);
+  consumeError(R4OrErr.takeError());
+
+  // A member whose fields are not all initialized is not ready.
+  auto P5 = std::make_shared<EJitSmallTableHostProvider>(
+      "g_auto", reinterpret_cast<const void *>(&g_auto[0][0]), sizeof(g_auto),
+      0xE005);
+  P5->addReadyMember({0, 0}, 1, /*FieldsInitialized=*/false);
+  auto R5 = makeRuntime(P5);
+  ASSERT_NE(R5, nullptr);
+  auto R5OrErr = R5->prepare(*M, "a_entry", "g_auto", Dims, Error);
+  EXPECT_FALSE(static_cast<bool>(R5OrErr));
+  EXPECT_NE(Error.find("confirms no ready member"), std::string::npos) << Error;
+  consumeError(R5OrErr.takeError());
+}
+
+/// B1 + B2 first half: the runtime plans from provider facts, publishes the
+/// admitted rows into its own resource, binds every column of THIS generation to
+/// that resource, compiles the common instrumented T1 through the real engine
+/// and executes it. A member the provider never confirmed is never admitted and
+/// never consumes sampling budget.
+TEST_F(SmallTableRuntimeTest, RuntimePublishesAdmittedRowsAndCommonT1RunsRealCode) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::shared_ptr<EJitSmallTableHostProvider> Provider = hostProvider(0xE010);
+  auto RT = makeRuntime(Provider);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+
+  std::string Error;
+  auto PlanOrErr = RT->prepare(*M, "a_entry", "g_auto", Dims, Error);
+  ASSERT_TRUE(static_cast<bool>(PlanOrErr)) << Error;
+  const EJitSmallTablePlan *Plan = *PlanOrErr;
+  ASSERT_NE(Plan, nullptr);
+  EXPECT_EQ(RT->providerLabel(), EJitSmallTableHostProvider::Label);
+  EXPECT_EQ(Plan->readiness.providerLabel, EJitSmallTableHostProvider::Label)
+      << "the host adapter must be recorded as such, never as product readiness";
+  EXPECT_EQ(Plan->fields[0].strategy, EJitSmallTableStrategy::Uniform);
+  EXPECT_EQ(Plan->fields[1].strategy, EJitSmallTableStrategy::Table);
+  EXPECT_EQ(RT->resourceGeneration(), 0xE010u);
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u)
+      << "planning must release its protected read borrow";
+
+  auto FnOrErr = RT->compileCommonT1(1, Error);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr)) << Error;
+  auto Fn = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*FnOrErr);
+  ASSERT_NE(Fn, nullptr);
+  EXPECT_EQ(RT->engine().getTransformClaimSkips(), 3u)
+      << "a runtime-owned column is already defined by the runtime absolute "
+         "symbol, so the engine must not claim a second definition of it";
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u)
+      << "row publication must release its protected read borrow";
+  EXPECT_TRUE(RT->sessionOpen());
+  EXPECT_EQ(RT->currentSessionSamples(), 0u)
+      << "opening the session is not a sample";
+
+  // Every admitted (cell, TRP) coordinate was published exactly once per table
+  // field: byCell has kAutoCells rows, byTrp kAutoTrps and joint the product.
+  EXPECT_EQ(RT->stats().publishedRows,
+            static_cast<uint64_t>(kAutoCells + kAutoTrps +
+                                  kAutoCells * kAutoTrps));
+  uint64_t Bits = 0;
+  ASSERT_TRUE(RT->resource()->published(1, 2, &Bits));
+  EXPECT_EQ(Bits, 7u + 2u) << "byCell column row 2 holds cell 2's value";
+  ASSERT_TRUE(RT->resource()->published(2, 1, &Bits));
+  EXPECT_EQ(Bits, 2u + 1u) << "byTrp column row 1 holds TRP 1's value";
+  ASSERT_TRUE(RT->resource()->published(3, 2 * kAutoTrps + 1, &Bits));
+  EXPECT_EQ(Bits, static_cast<uint64_t>(2 * kAutoTrps + 1));
+
+  // Real resource identity: each column of this generation resolves to the
+  // runtime's own resource, not to a same-named foreign table.
+  for (unsigned F = 0; F < Plan->fields.size(); ++F) {
+    if (Plan->fields[F].strategy != EJitSmallTableStrategy::Table)
+      continue;
+    auto AddrOrErr = RT->engine().lookup(1, Plan->fields[F].columnName);
+    ASSERT_TRUE(static_cast<bool>(AddrOrErr))
+        << Plan->fields[F].columnName << ": " << toString(AddrOrErr.takeError());
+    EXPECT_EQ(*AddrOrErr, RT->resource()->columnAddress(F));
+  }
+
+  // Real execution of the common T1 over every admitted row.
+  for (unsigned C = 0; C < kAutoCells; ++C)
+    for (unsigned T = 0; T < kAutoTrps; ++T)
+      for (int32_t X = -2; X <= 5; ++X)
+        EXPECT_EQ(Fn(C, T, X), aotAuto(g_auto[C][T], X))
+            << "cell=" << C << " trp=" << T << " x=" << X;
+
+  // A real admitted execution is a sample: counted, tracked in flight, and the
+  // completion is not stale. The sampling window runs under the protected read
+  // borrow, so the instrumented entry is never called outside the configuration
+  // generation the plan was proven against.
+  EJitSmallTableSampleTicket Ticket;
+  EXPECT_TRUE(RT->enterAdmitted({0, 0}, &Ticket, &Error)) << Error;
+  EXPECT_TRUE(Ticket.valid);
+  EXPECT_TRUE(RT->samplingProtected())
+      << "the sampling window holds the protected read borrow";
+  EXPECT_EQ(Provider->outstandingBorrows(), 1u)
+      << "one borrow for the session, not one per sample";
+  EXPECT_EQ(RT->inFlight(), 1u);
+  EXPECT_EQ(RT->currentSessionSamples(), 1u);
+  EXPECT_EQ(RT->stats().acceptedSamples, 1u);
+  RT->leaveAdmitted(Ticket);
+  EXPECT_EQ(RT->inFlight(), 0u);
+  EXPECT_EQ(RT->stats().staleCallbacks, 0u);
+  EXPECT_TRUE(RT->samplingProtected())
+      << "completing one sample does not end the sampling window";
+  EXPECT_EQ(Provider->outstandingBorrows(), 1u);
+
+  // A coordinate the provider never confirmed ready is not admitted at all, so
+  // the caller must take the AOT path and no budget is consumed.
+  EXPECT_FALSE(RT->admittedMembers().empty());
+  std::string Why;
+  EXPECT_FALSE(RT->enterAdmitted({kAutoCells + 3, 0}, &Ticket, &Why));
+  EXPECT_FALSE(Ticket.valid);
+  EXPECT_NE(Why.find("never admitted"), std::string::npos) << Why;
+  EXPECT_EQ(RT->currentSessionSamples(), 1u)
+      << "a not-admitted execution never consumes sampling budget";
+}
+
+/// B2: ONE common session per code generation with an AGGREGATE budget shared by
+/// the admitted ready members; freezing waits for admitted executions still in
+/// flight; the frozen bundle carries the real identity and synthesized profile
+/// and the common T2 really executes.
+TEST_F(SmallTableRuntimeTest, RuntimeCommonBudgetFreezesBundleAndRunsCommonT2) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::shared_ptr<EJitSmallTableHostProvider> Provider = hostProvider(0xE020);
+  EJitSmallTableRuntime::Options Opts;
+  Opts.sampling.aggregateLimit = 5;
+  Opts.sampling.freezeWaitMillis = 150;
+  auto RT = makeRuntime(Provider, Opts);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+
+  std::string Error;
+  ASSERT_TRUE(static_cast<bool>(RT->prepare(*M, "a_entry", "g_auto", Dims, Error)))
+      << Error;
+  auto FnOrErr = RT->compileCommonT1(1, Error);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr)) << Error;
+  auto Fn = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*FnOrErr);
+  ASSERT_NE(Fn, nullptr);
+  const uint64_t Session = RT->sessionId();
+
+  // Four real samples spread over three DIFFERENT members, then the fifth
+  // admitted execution is left IN FLIGHT: the budget is aggregate across
+  // admitted members, not per member, and a grant is not a completion.
+  const uint64_t Members[3][2] = {{0, 0}, {1, 1}, {3, 2}};
+  for (unsigned I = 0; I < 4; ++I) {
+    EJitSmallTableSampleTicket T;
+    ASSERT_TRUE(RT->enterAdmitted({Members[I % 3][0], Members[I % 3][1]}, &T,
+                                  &Error))
+        << Error;
+    ASSERT_TRUE(T.valid);
+    RT->leaveAdmitted(T);
+    EXPECT_EQ(RT->currentSessionSamples(), I + 1);
+  }
+
+  // A grant is not a completion: freeze must wait for the admitted execution
+  // that is still in flight and refuse rather than read half a sample.
+  EJitSmallTableSampleTicket InFlightTicket;
+  ASSERT_TRUE(RT->enterAdmitted({1, 1}, &InFlightTicket, &Error)) << Error;
+  ASSERT_TRUE(InFlightTicket.valid);
+  EXPECT_EQ(RT->inFlight(), 1u);
+  EXPECT_EQ(RT->currentSessionSamples(), 5u);
+  EXPECT_TRUE(RT->samplingExhausted());
+  EXPECT_EQ(RT->sampleBudget(), 5u);
+  std::string FrozenError;
+  auto TooEarly = RT->freeze(FrozenError);
+  EXPECT_FALSE(static_cast<bool>(TooEarly));
+  EXPECT_NE(FrozenError.find("still in flight"), std::string::npos)
+      << FrozenError;
+  consumeError(TooEarly.takeError());
+  RT->leaveAdmitted(InFlightTicket);
+  EXPECT_EQ(RT->inFlight(), 0u);
+
+  // An execution above the aggregate budget still runs (the specialized code is
+  // correct) but is NOT counted as a sample and is not in flight either.
+  EJitSmallTableSampleTicket Over;
+  EXPECT_TRUE(RT->enterAdmitted({0, 0}, &Over, &Error));
+  EXPECT_FALSE(Over.valid);
+  EXPECT_EQ(RT->currentSessionSamples(), 5u);
+  EXPECT_EQ(RT->inFlight(), 0u);
+
+  auto BundleOrErr = RT->freeze(Error);
+  ASSERT_TRUE(static_cast<bool>(BundleOrErr)) << Error;
+  const EJitSmallTableProfileBundle *B = *BundleOrErr;
+  ASSERT_NE(B, nullptr);
+  EXPECT_EQ(RT->bundle(), B);
+  EXPECT_FALSE(RT->samplingProtected())
+      << "freeze ends the sampling window and releases its read borrow";
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u);
+  EXPECT_EQ(B->entryName, "a_entry");
+  EXPECT_EQ(B->codeGeneration, 1u);
+  EXPECT_EQ(B->domainEpoch, 0xE020u);
+  EXPECT_EQ(B->sessionId, Session);
+  EXPECT_EQ(B->contractHash, RT->contract().identityHash);
+  EXPECT_EQ(B->resourceAddress,
+            reinterpret_cast<uintptr_t>(RT->resource()->base()));
+  EXPECT_EQ(B->resourceGeneration, RT->resourceGeneration());
+  EXPECT_EQ(B->sampleCount, 5u)
+      << "only the real admitted samples of this generation are in the bundle";
+  EXPECT_EQ(B->participatingMembers, 3u);
+  EXPECT_EQ(B->readinessProvider, EJitSmallTableHostProvider::Label);
+  EXPECT_FALSE(B->profileData.empty())
+      << "the bundle must carry a synthesized profile, not a model";
+  EXPECT_FALSE(B->counters.empty())
+      << "the bundle must carry the real Tier-1 counter addresses";
+
+  // The common T2 compiles from that one immutable bundle and really runs. Both
+  // tiers must read the SAME table resource; compileCommonT2 refuses otherwise.
+  auto T2OrErr = RT->compileCommonT2(Error);
+  ASSERT_TRUE(static_cast<bool>(T2OrErr)) << Error;
+  auto T2 = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*T2OrErr);
+  ASSERT_NE(T2, nullptr);
+  for (unsigned C = 0; C < kAutoCells; ++C)
+    for (unsigned T = 0; T < kAutoTrps; ++T)
+      for (int32_t X = -1; X <= 3; ++X)
+        EXPECT_EQ(T2(C, T, X), aotAuto(g_auto[C][T], X))
+            << "T2 cell=" << C << " trp=" << T << " x=" << X;
+  EXPECT_FALSE(RT->sessionOpen()) << "the session is frozen once and for all";
+
+  // A frozen session accepts no further sample, and the bundle stays immutable.
+  EJitSmallTableSampleTicket AfterFreeze;
+  EXPECT_FALSE(RT->enterAdmitted({0, 0}, &AfterFreeze, &Error));
+  auto Again = RT->freeze(Error);
+  ASSERT_TRUE(static_cast<bool>(Again)) << Error;
+  EXPECT_EQ(*Again, B) << "freeze returns the one immutable bundle";
+}
+
+/// B1: a compatible late member joins the SAME session and the SAME generation,
+/// so the common quota is not restarted.
+TEST_F(SmallTableRuntimeTest, RuntimeLateCompatibleMemberKeepsTheSameSession) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::shared_ptr<EJitSmallTableHostProvider> Provider =
+      std::make_shared<EJitSmallTableHostProvider>(
+          "g_auto", reinterpret_cast<const void *>(&g_auto[0][0]), sizeof(g_auto),
+          0xE030);
+  // Every member except (2,1) is confirmed before the first compile, so the
+  // plan's projections already cover (2,1)'s coordinates.
+  for (unsigned C = 0; C < kAutoCells; ++C)
+    for (unsigned T = 0; T < kAutoTrps; ++T) {
+      if (C == 2 && T == 1)
+        continue;
+      Provider->addReadyMember({C, T}, 1);
+    }
+  EJitSmallTableRuntime::Options Opts;
+  Opts.sampling.aggregateLimit = 4;
+  auto RT = makeRuntime(Provider, Opts);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+  std::string Error;
+  ASSERT_TRUE(static_cast<bool>(RT->prepare(*M, "a_entry", "g_auto", Dims, Error)))
+      << Error;
+  auto T1OrErr = RT->compileCommonT1(1, Error);
+  ASSERT_TRUE(static_cast<bool>(T1OrErr)) << Error;
+  auto Fn = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*T1OrErr);
+  ASSERT_NE(Fn, nullptr);
+
+  EJitSmallTableSampleTicket T;
+  ASSERT_TRUE(RT->enterAdmitted({0, 0}, &T, &Error)) << Error;
+  RT->leaveAdmitted(T);
+  const uint64_t SamplesBefore = RT->currentSessionSamples();
+  const uint64_t SessionBefore = RT->sessionId();
+  const uint64_t ResourceBefore = RT->resourceGeneration();
+  const uint64_t ContractBefore = RT->contract().identityHash;
+
+  // The late member is now confirmed ready and validated against the exported
+  // contract. Its byCell coordinate 2 (cell 2) is already published by the rows
+  // that shared that cell, but its joint coordinate belongs to no other member:
+  // the joint table is injective over the proven domain, so exactly one new
+  // projected row must be published. The member is therefore EXTENDABLE, which
+  // still admits it to the SAME generation: nothing is re-planned, no new
+  // resource generation is created, the contract identity is unchanged and the
+  // common quota does not restart.
+  const uint64_t PublishedBeforeLate = RT->stats().publishedRows;
+  Provider->addReadyMember({2, 1}, 2);
+  std::string Why;
+  const EJitSmallTableAdmission Admission = RT->admitMember({2, 1}, &Why);
+  EXPECT_EQ(Admission, EJitSmallTableAdmission::Extendable)
+      << admissionName(Admission) << ": " << Why;
+  EXPECT_EQ(RT->currentSessionSamples(), SamplesBefore);
+  EXPECT_EQ(RT->sessionId(), SessionBefore);
+  EXPECT_EQ(RT->resourceGeneration(), ResourceBefore);
+  EXPECT_EQ(RT->contract().identityHash, ContractBefore);
+  EXPECT_EQ(RT->stats().publishedRows, PublishedBeforeLate + 1)
+      << "an extendable member publishes exactly its own new projected row";
+
+  // Re-admitting the now-published member is COMPATIBLE and republishes
+  // nothing: the coordinate it projects to already carries its value.
+  const uint64_t PublishedAfterLate = RT->stats().publishedRows;
+  EXPECT_EQ(RT->admitMember({2, 1}, &Why), EJitSmallTableAdmission::Compatible)
+      << Why;
+  EXPECT_EQ(RT->stats().publishedRows, PublishedAfterLate)
+      << "a compatible member republishes nothing";
+
+  uint64_t Bits = 0;
+  ASSERT_TRUE(RT->resource()->published(1, 2, &Bits))
+      << "the late member's byCell coordinate is published";
+  EXPECT_EQ(Bits, 7u + 2u);
+
+  // The late member can now dispatch and is counted in the same session.
+  ASSERT_TRUE(RT->enterAdmitted({2, 1}, &T, &Error)) << Error;
+  RT->leaveAdmitted(T);
+  EXPECT_EQ(RT->currentSessionSamples(), SamplesBefore + 1);
+  for (int32_t X = -1; X <= 2; ++X)
+    EXPECT_EQ(Fn(2, 1, X), aotAuto(g_auto[2][1], X));
+
+  // An out-of-schema coordinate is unusable, never published.
+  const uint64_t PublishedBefore = RT->stats().publishedRows;
+  EXPECT_EQ(RT->admitMember({kAutoCells, 0}, &Why),
+            EJitSmallTableAdmission::Unusable);
+  EXPECT_EQ(RT->stats().publishedRows, PublishedBefore);
+}
+
+/// B1: a conflicting member stays AOT; ONE coalesced new generation is prepared
+/// for the union of the known members, only the affected fields widen, the old
+/// members are migrated and the previous resource stays alive until retirement.
+TEST_F(SmallTableRuntimeTest, RuntimeConflictPreparesOneGenerationAndMigratesMembers) {
+  const unsigned Cells = 2;
+  const unsigned Trps = 2;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(
+      autoModuleText("s_entry", "g_sparse", "g_sparse_out", Cells, Trps), Err,
+      Ctx);
+  ASSERT_TRUE(M) << "sparse module failed to parse";
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(Cells, Trps);
+  auto Provider = std::make_shared<EJitSmallTableHostProvider>(
+      "g_sparse", reinterpret_cast<const void *>(&g_sparse[0][0]),
+      sizeof(g_sparse), 0xE040);
+  Provider->addReadyMember({0, 0}, 1);
+  Provider->addReadyMember({0, 1}, 1);
+  EJitSmallTableRuntime::Options Opts;
+  Opts.sampling.aggregateLimit = 8;
+  auto RT = makeRuntime(Provider, Opts);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+
+  std::string Error;
+  auto PlanOrErr = RT->prepare(*M, "s_entry", "g_sparse", Dims, Error);
+  ASSERT_TRUE(static_cast<bool>(PlanOrErr)) << Error;
+  const uint64_t Gen1Contract = RT->contract().identityHash;
+  auto T1OrErr = RT->compileCommonT1(1, Error);
+  ASSERT_TRUE(static_cast<bool>(T1OrErr)) << Error;
+  auto Fn = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*T1OrErr);
+  ASSERT_NE(Fn, nullptr);
+  EXPECT_EQ(RT->plan()->fields[1].strategy, EJitSmallTableStrategy::Uniform)
+      << "both cell-0 rows share byCell";
+  EXPECT_EQ(RT->plan()->fields[2].strategy, EJitSmallTableStrategy::Uniform);
+
+  // A conflicting late member: cell 1 has a different byCell, which the current
+  // generation proved constant. It must stay AOT.
+  Provider->addReadyMember({1, 0}, 2);
+  std::string Why;
+  const uint64_t PublishedBefore = RT->stats().publishedRows;
+  EXPECT_EQ(RT->admitMember({1, 0}, &Why), EJitSmallTableAdmission::Conflict)
+      << Why;
+  EXPECT_EQ(RT->stats().publishedRows, PublishedBefore)
+      << "a conflicting member publishes nothing";
+  EXPECT_FALSE(RT->enterAdmitted({1, 0}, nullptr, &Why))
+      << "a conflicting member must take the AOT path";
+
+  // While an admitted execution is in flight the table generation may not move:
+  // that code may still read the current resource.
+  EJitSmallTableSampleTicket InFlight;
+  ASSERT_TRUE(RT->enterAdmitted({0, 0}, &InFlight, &Error)) << Error;
+  ASSERT_TRUE(InFlight.valid);
+  SmallVector<EJitSmallTableRowKey, 4> Extra;
+  Extra.push_back({{1, 0}});
+  auto Blocked = RT->beginNextGeneration(Extra, Error);
+  EXPECT_FALSE(static_cast<bool>(Blocked));
+  EXPECT_NE(Error.find("still in flight"), std::string::npos) << Error;
+  consumeError(Blocked.takeError());
+  EXPECT_EQ(RT->resourceGeneration(), 0xE040u)
+      << "a refused generation change leaves the live resource in place";
+  RT->leaveAdmitted(InFlight);
+
+  // ONE coalesced generation over the union of the members this runtime knows.
+  auto NextOrErr = RT->beginNextGeneration(Extra, Error);
+  ASSERT_TRUE(static_cast<bool>(NextOrErr)) << Error;
+  EXPECT_EQ(RT->resourceGeneration(), 0xE041u);
+  EXPECT_EQ(RT->stats().generationsPrepared, 1u);
+  EXPECT_GT(RT->stats().migratedRows, 0u);
+  EXPECT_NE(RT->contract().identityHash, Gen1Contract)
+      << "a new generation has its own contract identity";
+  EXPECT_EQ(RT->plan()->fields[1].strategy, EJitSmallTableStrategy::Table)
+      << "the conflicting field widens (per-field solver)";
+  ASSERT_EQ(RT->plan()->fields[1].retainedAxes.size(), 1u);
+  EXPECT_EQ(RT->plan()->fields[1].retainedAxes[0], 0u);
+  EXPECT_EQ(RT->plan()->fields[2].strategy, EJitSmallTableStrategy::Uniform)
+      << "unaffected constants stay folded";
+  EXPECT_FALSE(RT->sessionOpen())
+      << "the previous generation's session is over, never merged forward";
+
+  // The old resource is retained for code that may still dispatch to it.
+  EXPECT_EQ(RT->retainedGenerationCount(), 1u);
+  EXPECT_GT(RT->retainedBytes(), 0u);
+  EXPECT_FALSE(RT->retireGenerationsUpTo(0xE042u))
+      << "retiring above the current generation is refused";
+  EXPECT_EQ(RT->retainedGenerationCount(), 1u);
+
+  // The new generation compiles and serves the migrated old members and the new
+  // one, all against the new resource.
+  auto T1bOrErr = RT->compileCommonT1(2, Error);
+  ASSERT_TRUE(static_cast<bool>(T1bOrErr)) << Error;
+  auto Fn2 = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*T1bOrErr);
+  ASSERT_NE(Fn2, nullptr);
+  uint64_t Bits = 0;
+  ASSERT_TRUE(RT->resource()->published(1, 1, &Bits))
+      << "cell 1's byCell coordinate is published in the new generation";
+  EXPECT_EQ(Bits, 9u);
+  for (unsigned C = 0; C < Cells; ++C)
+    for (unsigned T = 0; T < Trps; ++T) {
+      if (C == 1 && T == 1)
+        continue; // never confirmed ready, stays AOT
+      for (int32_t X = -1; X <= 2; ++X)
+        EXPECT_EQ(Fn2(C, T, X), aotAuto(g_sparse[C][T], X))
+            << "cell=" << C << " trp=" << T << " x=" << X;
+    }
+
+  // Safe migration is complete: the retired generation is released.
+  EXPECT_TRUE(RT->retireGenerationsUpTo(0xE040u));
+  EXPECT_EQ(RT->retainedGenerationCount(), 0u);
+  EXPECT_EQ(RT->retainedBytes(), 0u);
+  EXPECT_EQ(RT->stats().retiredGenerations, 1u);
+  EXPECT_EQ(RT->resourceGeneration(), 0xE041u)
+      << "retirement never frees the live generation";
+}
+
+/// B2 cancel/timeout: the session stops granting tickets, its borrows are gone
+/// and a ticket it granted becomes a stale callback.
+TEST_F(SmallTableRuntimeTest, RuntimeCancelRejectsStaleCallbacksAndStopsDispatch) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::shared_ptr<EJitSmallTableHostProvider> Provider = hostProvider(0xE050);
+  auto RT = makeRuntime(Provider);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+  std::string Error;
+  ASSERT_TRUE(static_cast<bool>(RT->prepare(*M, "a_entry", "g_auto", Dims, Error)))
+      << Error;
+  ASSERT_TRUE(static_cast<bool>(RT->compileCommonT1(1, Error))) << Error;
+  EXPECT_TRUE(RT->sessionOpen());
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u);
+
+  EJitSmallTableSampleTicket Ticket;
+  ASSERT_TRUE(RT->enterAdmitted({0, 0}, &Ticket, &Error)) << Error;
+  ASSERT_TRUE(Ticket.valid);
+  EXPECT_EQ(RT->inFlight(), 1u);
+  EXPECT_TRUE(RT->samplingProtected())
+      << "a real sample runs under the session read borrow";
+  EXPECT_EQ(Provider->outstandingBorrows(), 1u);
+
+  RT->cancel("sampling window timed out");
+  EXPECT_FALSE(RT->sessionOpen());
+  EXPECT_EQ(RT->cancellationReason(), "sampling window timed out");
+  EXPECT_EQ(RT->inFlight(), 0u);
+  EXPECT_FALSE(RT->samplingProtected());
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u)
+      << "cancel releases every borrow the runtime held";
+
+  // The ticket belongs to the cancelled session: its completion is stale, never
+  // merged into whatever session comes next.
+  RT->leaveAdmitted(Ticket);
+  EXPECT_EQ(RT->stats().staleCallbacks, 1u);
+
+  // No new dispatch and no freeze on a cancelled session.
+  EXPECT_FALSE(RT->enterAdmitted({0, 0}, &Ticket, &Error));
+  EXPECT_NE(Error.find("timed out"), std::string::npos) << Error;
+  std::string FreezeError;
+  auto Frozen = RT->freeze(FreezeError, /*Force=*/true);
+  EXPECT_FALSE(static_cast<bool>(Frozen));
+  EXPECT_NE(FreezeError.find("timed out"), std::string::npos) << FreezeError;
+  consumeError(Frozen.takeError());
+  EXPECT_EQ(RT->bundle(), nullptr);
+}
+
+/// B2 fail-closed sampling: the sampling window runs under the configuration
+/// side's protected read borrow. Without one the call is refused and stays on
+/// the AOT path - the specialized code is never entered on an unprotected source
+/// and no budget is consumed. A delayed borrow (transient refusal) is not
+/// permanent: the same session samples normally once it can be granted again.
+TEST_F(SmallTableRuntimeTest, RuntimeSamplingRefusesWithoutAProtectedBorrow) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::shared_ptr<EJitSmallTableHostProvider> Provider = hostProvider(0xE070);
+  auto RT = makeRuntime(Provider);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+  std::string Error;
+  ASSERT_TRUE(static_cast<bool>(RT->prepare(*M, "a_entry", "g_auto", Dims, Error)))
+      << Error;
+  ASSERT_TRUE(static_cast<bool>(RT->compileCommonT1(1, Error))) << Error;
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u)
+      << "planning and publication released their own borrows";
+
+  Provider->refuseBorrow("product configuration transaction unavailable");
+  EJitSmallTableSampleTicket Ticket;
+  std::string Why;
+  EXPECT_FALSE(RT->enterAdmitted({0, 0}, &Ticket, &Why));
+  EXPECT_NE(Why.find("product configuration transaction unavailable"),
+            std::string::npos)
+      << Why;
+  EXPECT_NE(Why.find("protected read borrow"), std::string::npos) << Why;
+  EXPECT_FALSE(Ticket.valid);
+  EXPECT_FALSE(RT->samplingProtected());
+  EXPECT_EQ(RT->currentSessionSamples(), 0u)
+      << "a refused sample never consumes the aggregate budget";
+  EXPECT_EQ(RT->inFlight(), 0u);
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u);
+
+  // A delayed borrow is not a permanent refusal: once the configuration side
+  // can grant it again the same session samples normally, and the refusal did
+  // not poison the runtime.
+  Provider->allowBorrow();
+  EXPECT_TRUE(RT->enterAdmitted({0, 0}, &Ticket, &Why)) << Why;
+  EXPECT_TRUE(Ticket.valid);
+  EXPECT_TRUE(RT->samplingProtected());
+  EXPECT_EQ(Provider->outstandingBorrows(), 1u);
+  EXPECT_EQ(RT->currentSessionSamples(), 1u);
+  RT->leaveAdmitted(Ticket);
+  EXPECT_EQ(RT->inFlight(), 0u);
+}
+
+/// B1/B2: a member whose own values changed after the generation was published
+/// is a conflict on re-validation, so it must stay AOT while the members whose
+/// values did not change keep dispatching. Samples are never treated as proof
+/// that a member stays constant.
+TEST_F(SmallTableRuntimeTest, RuntimeChangedMemberStaysAotOnReValidation) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::shared_ptr<EJitSmallTableHostProvider> Provider = hostProvider(0xE080);
+  auto RT = makeRuntime(Provider);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+  std::string Error;
+  ASSERT_TRUE(static_cast<bool>(RT->prepare(*M, "a_entry", "g_auto", Dims, Error)))
+      << Error;
+  ASSERT_TRUE(static_cast<bool>(RT->compileCommonT1(1, Error))) << Error;
+
+  EJitSmallTableSampleTicket Ticket;
+  EXPECT_TRUE(RT->enterAdmitted({0, 0}, &Ticket, &Error)) << Error;
+  EXPECT_TRUE(Ticket.valid);
+  RT->leaveAdmitted(Ticket);
+  EXPECT_EQ(RT->currentSessionSamples(), 1u);
+
+  // The member's own configuration changes underneath the published generation:
+  // its byCell and joint projections no longer match the published values (the
+  // mode field it still satisfies).
+  const uint64_t PublishedBefore = RT->stats().publishedRows;
+  AutoElement Changed = g_auto[0][0];
+  Changed.byCell = 99;
+  Changed.joint = 999;
+  g_auto[0][0] = Changed;
+
+  std::string Why;
+  EXPECT_EQ(RT->admitMember({0, 0}, &Why), EJitSmallTableAdmission::Conflict)
+      << Why;
+  EXPECT_EQ(RT->stats().publishedRows, PublishedBefore)
+      << "a conflicting member publishes nothing";
+  EXPECT_FALSE(RT->enterAdmitted({0, 0}, &Ticket, &Why))
+      << "the changed member must take the AOT path";
+  EXPECT_FALSE(Ticket.valid);
+  EXPECT_EQ(RT->currentSessionSamples(), 1u)
+      << "an AOT call does not consume sampling budget";
+
+  // An untouched member still validates as compatible and still dispatches in
+  // the same session.
+  EXPECT_EQ(RT->admitMember({1, 1}, &Why), EJitSmallTableAdmission::Compatible)
+      << Why;
+  EXPECT_TRUE(RT->enterAdmitted({1, 1}, &Ticket, &Error)) << Error;
+  EXPECT_TRUE(Ticket.valid);
+  RT->leaveAdmitted(Ticket);
+  EXPECT_EQ(RT->currentSessionSamples(), 2u);
+
+  // The fixture value is restored for the tests that follow this one.
+  g_auto[0][0] = AutoElement{1, 7, 2, 0};
+}
+
+/// B2 product shape: neither the planner nor the runtime is hardcoded to the
+/// tiny fixture. A 16 cell x 32 TRP declared schema (the stated product ceiling
+/// for this entry class) with 6 cells x 20 TRPs actually confirmed ready is
+/// planned, served by ONE common T1, sampled under the DEFAULT aggregate budget
+/// of 64 real admitted executions shared by every ready member, frozen once and
+/// executed as a common T2 against the same table resource.
+TEST_F(SmallTableRuntimeTest,
+       RuntimeServesTheProductShapeDomainUnderTheDefaultAggregateBudget) {
+  constexpr unsigned BigCells = 16;
+  constexpr unsigned BigTrps = 32;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(
+      autoModuleText("b_entry", "g_big", "g_big_out", BigCells, BigTrps), Err,
+      Ctx);
+  ASSERT_TRUE(M) << "product-shape module failed to parse";
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(BigCells, BigTrps);
+
+  // 6 cells x 20 TRPs are confirmed ready; the rest of the schema stays AOT.
+  constexpr unsigned ReadyCells = 6;
+  constexpr unsigned ReadyTrps = 20;
+  auto Provider = std::make_shared<EJitSmallTableHostProvider>(
+      "g_big", reinterpret_cast<const void *>(&g_big[0][0]), sizeof(g_big),
+      0xE060);
+  for (unsigned C = 0; C < ReadyCells; ++C)
+    for (unsigned T = 0; T < ReadyTrps; ++T)
+      Provider->addReadyMember({C, T}, 1);
+
+  auto RT = makeRuntime(Provider);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+  std::string Error;
+  auto PlanOrErr = RT->prepare(*M, "b_entry", "g_big", Dims, Error);
+  ASSERT_TRUE(static_cast<bool>(PlanOrErr)) << Error;
+  const EJitSmallTablePlan *Plan = *PlanOrErr;
+  ASSERT_NE(Plan, nullptr);
+
+  // The declared schema is the product shape, not the admitted subset: each
+  // field keeps exactly its own axes and the resource is sized for the schema.
+  ASSERT_EQ(Plan->fields.size(), 4u);
+  EXPECT_EQ(Plan->fields[1].tableRows, BigCells);
+  EXPECT_EQ(Plan->fields[2].tableRows, BigTrps);
+  EXPECT_EQ(Plan->fields[3].tableRows, BigCells * BigTrps);
+  EXPECT_EQ(Plan->tableBytes(),
+            static_cast<uint64_t>(BigCells + BigTrps + BigCells * BigTrps) *
+                4u);
+  const uint64_t Capacity = RT->resource()->capacityBytes();
+  EXPECT_GE(Capacity, Plan->tableBytes());
+
+  // ONE common T1 for the whole entry/code generation, bound to this
+  // generation resource.
+  auto T1OrErr = RT->compileCommonT1(7, Error);
+  ASSERT_TRUE(static_cast<bool>(T1OrErr)) << Error;
+  auto Fn = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*T1OrErr);
+  ASSERT_NE(Fn, nullptr);
+
+  // Capacity/retention accounting (spec section 8/13): only the coordinates an
+  // admitted ready member projects to are published, and the payload is the
+  // compact scalar columns, not a whole-structure snapshot.
+  EJitSmallTableTableResource::Accounting Acc = RT->resource()->accounting();
+  EXPECT_EQ(Acc.reservedBytes, Capacity);
+  EXPECT_EQ(Acc.allocatedBytes, Capacity);
+  EXPECT_EQ(Acc.payloadBytes, Plan->tableBytes());
+  EXPECT_EQ(Acc.publishedCells,
+            static_cast<uint64_t>(ReadyCells + ReadyTrps +
+                                  ReadyCells * ReadyTrps));
+  EXPECT_EQ(Acc.publishedBytes, Acc.publishedCells * 4u);
+  EXPECT_EQ(RT->retainedBytes(), 0u)
+      << "the first generation retains nothing older";
+
+  // The confirmed policy: ONE aggregate budget of 64 real admitted sample
+  // executions for the entry/code generation, shared by every ready member -
+  // not 64 per member and not a representative-only quota.
+  EXPECT_EQ(RT->sampleBudget(), 64u);
+  for (unsigned I = 0; I < 64; ++I) {
+    EJitSmallTableSampleTicket Ticket;
+    ASSERT_TRUE(RT->enterAdmitted({I % ReadyCells, (I / ReadyCells) % ReadyTrps},
+                                  &Ticket, &Error))
+        << Error;
+    ASSERT_TRUE(Ticket.valid) << "sample " << I << " must be counted";
+    RT->leaveAdmitted(Ticket);
+  }
+  EXPECT_TRUE(RT->samplingExhausted());
+  EXPECT_EQ(RT->currentSessionSamples(), 64u);
+  EXPECT_EQ(RT->inFlight(), 0u);
+
+  // Above the budget the specialized code still runs (it is correct); the
+  // execution is simply not counted as a sample.
+  EJitSmallTableSampleTicket Over;
+  EXPECT_TRUE(RT->enterAdmitted({0, 0}, &Over, &Error));
+  EXPECT_FALSE(Over.valid);
+  EXPECT_EQ(RT->currentSessionSamples(), 64u);
+
+  // Freeze ONE immutable bundle and run the common T2 against the same
+  // resource; every ready member must come back exactly as AOT computes it.
+  auto BundleOrErr = RT->freeze(Error);
+  ASSERT_TRUE(static_cast<bool>(BundleOrErr)) << Error;
+  EXPECT_EQ((*BundleOrErr)->sampleCount, 64u);
+  EXPECT_EQ((*BundleOrErr)->participatingMembers, 64u)
+      << "the one aggregate quota is shared across 64 distinct ready members";
+  EXPECT_FALSE((*BundleOrErr)->counters.empty());
+  auto T2OrErr = RT->compileCommonT2(Error);
+  ASSERT_TRUE(static_cast<bool>(T2OrErr)) << Error;
+  auto T2 = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*T2OrErr);
+  ASSERT_NE(T2, nullptr);
+  for (unsigned C = 0; C < ReadyCells; ++C)
+    for (unsigned T = 0; T < ReadyTrps; ++T)
+      for (int32_t X = -1; X <= 2; ++X)
+        EXPECT_EQ(T2(C, T, X), aotAuto(g_big[C][T], X))
+            << "cell=" << C << " trp=" << T << " x=" << X;
+}
+
+/// A0 regression: a client that materializes the plan into the module BEFORE
+/// handing it to the engine (the supported order, and the one the runtime uses)
+/// leaves the table column owned by that module's own
+/// `MaterializationResponsibility` claim. The engine's transform must not claim
+/// it a second time — that duplicate `defineMaterializing` definition is the
+/// diagnostic the coordinator found in the A1 logs — and the compile must still
+/// resolve and execute the column.
+TEST_F(SmallTableTest, PreparedModuleKeepsOwnershipOfItsTableColumn) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(autoModuleText("o_entry", "g_auto", "g_auto_out",
+                                              kAutoCells, kAutoTrps),
+                               Err, Ctx);
+  ASSERT_TRUE(M) << "ownership module failed to parse";
+
+  EJitSmallTableRequest Req;
+  Req.module = M.get();
+  Req.entryName = "o_entry";
+  Req.sourceVarName = "g_auto";
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  Req.dims = Dims;
+  Req.source = EJitSmallTableSource{
+      reinterpret_cast<const uint8_t *>(&g_auto[0][0]), sizeof(g_auto)};
+  SmallVector<EJitSmallTableRowKey, 16> Rows = autoRows(kAutoCells, kAutoTrps);
+  Req.authorizedRows = Rows;
+  Req.mode = EJitSmallTablePlanMode::Automatic;
+  Req.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Req, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(std::move(*Plan)));
+  const EJitSmallTablePlan *Installed = Set->find("o_entry");
+  ASSERT_NE(Installed, nullptr);
+
+  // Client order: the module itself defines the column before JIT time.
+  std::string MaterializeError;
+  ASSERT_TRUE(
+      EJitSmallTablePass::materialize(*M, *Installed, &MaterializeError))
+      << MaterializeError;
+  const GlobalVariable *Column = M->getNamedGlobal("__ejit_stab_o_entry_c1");
+  ASSERT_NE(Column, nullptr);
+  EXPECT_FALSE(Column->isDeclaration())
+      << "a CompilerEmitted column is defined by this module";
+
+  PeriodArrayRegistry &Registry = makeRegistry();
+  std::memset(g_auto_out, 0, sizeof(g_auto_out));
+  auto Engine = compileWithEngine(*M, Set, Registry, 0x57ab30, "o_entry");
+  ASSERT_NE(Engine, nullptr);
+
+  // Ownership stayed with the module's own claim: the transform skipped the
+  // re-claim instead of emitting a duplicate definition.
+  EXPECT_GE(Engine->getTransformClaimSkips(), 1u)
+      << "a prepared module's column must not be claimed twice";
+
+  auto Fn = lookupSealed<int32_t (*)(uint32_t, uint32_t, int32_t)>(
+      *Engine, 0x57ab30, "o_entry");
+  ASSERT_NE(Fn, nullptr);
+  for (unsigned C = 0; C < kAutoCells; ++C)
+    for (unsigned T = 0; T < kAutoTrps; ++T)
+      for (int32_t X = -1; X <= 3; ++X)
+        EXPECT_EQ(Fn(C, T, X), aotAuto(g_auto[C][T], X))
+            << "cell=" << C << " trp=" << T << " x=" << X;
+
+  // The column is a real, stable address inside this compile.
+  auto ColOrErr = Engine->lookup(0x57ab30, "__ejit_stab_o_entry_c1");
+  ASSERT_TRUE(static_cast<bool>(ColOrErr)) << toString(ColOrErr.takeError());
+  ASSERT_NE(*ColOrErr, nullptr);
+  auto Again = Engine->lookup(0x57ab30, "__ejit_stab_o_entry_c1");
+  ASSERT_TRUE(static_cast<bool>(Again)) << toString(Again.takeError());
+  EXPECT_EQ(*Again, *ColOrErr);
+}
+
 } // namespace
+

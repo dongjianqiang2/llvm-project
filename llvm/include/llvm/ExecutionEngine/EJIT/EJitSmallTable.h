@@ -77,6 +77,22 @@ enum class EJitSmallTablePlanMode : uint8_t {
   ExplicitContracts,
 };
 
+/// How a table field's column storage is owned (spec §8, milestone B1).
+enum class EJitSmallTableStorage : uint8_t {
+  /// Compiler-emitted immutable table: the pass defines the column global with
+  /// the proven values baked in. Correct only when the plan covers its whole
+  /// declared domain, so the executable gate refuses a plan with holes.
+  CompilerEmitted = 0,
+  /// Runtime-owned shared data resource: the pass emits the column as an
+  /// external declaration and never allocates or initializes storage. The
+  /// runtime owns one fixed-capacity region at a stable address, binds the same
+  /// region into every compile of this code generation, and publishes only
+  /// validated, not-yet-published rows into it. Because the executable gate then
+  /// moves to the runtime's per-member admission (no un-admitted member may
+  /// dispatch to this code), a partial proven domain is allowed here.
+  RuntimeOwned = 1,
+};
+
 /// One index dimension of the source period array. The dimension value is
 /// either the real function argument at \p argIndex or `urem(arg, modulus)`.
 /// Nothing here ever carries a witness or representative argument value.
@@ -202,6 +218,15 @@ public:
   /// (AArch64 direct binding) or stay preemptible on the host.
   bool littleEndian = true;
   bool columnsFixedAddress = false;
+  /// True when this plan's executable lowering is gated by the runtime's
+  /// per-member admission instead of by a compile-time whole-domain proof (spec
+  /// §6.5/§6.6, milestone B1). Only a runtime that owns the table resource and
+  /// refuses to dispatch an un-validated member to this code may set it; the
+  /// compiler-side gate stays in force for every plan that does not.
+  bool runtimeRowAdmission = false;
+  /// Storage ownership the pass materializes this plan with. Recorded so a plan
+  /// can never be lowered with storage the runtime did not actually provide.
+  EJitSmallTableStorage storage = EJitSmallTableStorage::CompilerEmitted;
 
   /// Number of rows the emitted table covers (product of the source array
   /// extents). Zero when the plan is malformed.
@@ -472,11 +497,17 @@ public:
 
   explicit EJitSmallTablePass(const EJitSmallTablePlan &plan) : plan_(plan) {}
 
-  /// Create the table globals for \p plan in \p M. Idempotent: an existing
+  /// Create the table storage \p plan declares in \p M. Idempotent: an existing
   /// global of the expected type is reused, so the three replace rounds share
-  /// one table. Returns false (and leaves the module untouched) on refusal,
-  /// including when \p plan has any unready row: without a runtime per-row
-  /// dispatch gate the compiler must keep the original loads.
+  /// one table. The storage form comes from `plan.storage`:
+  ///   * CompilerEmitted: the column is defined with the proven values baked in,
+  ///     and the plan must cover its whole declared domain.
+  ///   * RuntimeOwned: the column is emitted as an external declaration; the
+  ///     runtime binds its own fixed-capacity data resource to that symbol and
+  ///     publishes validated rows. Such a plan must also set
+  ///     `plan.runtimeRowAdmission`, because the executable gate has moved from
+  ///     the compile-time domain proof to the runtime's per-member admission.
+  /// Returns false (and leaves the module untouched) on refusal.
   static bool materialize(Module &M, const EJitSmallTablePlan &plan,
                           std::string *error = nullptr);
 

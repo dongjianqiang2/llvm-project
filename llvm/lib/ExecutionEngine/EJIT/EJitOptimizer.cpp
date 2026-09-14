@@ -641,6 +641,22 @@ void EJitOptimizer::runLightOptPipeline(Module &M) {
 
 void EJitOptimizer::captureCounterGlobals(Module &M) {
   lastCounterNames_.clear();
+  // PR231 B2: a symbol can only be resolved by name if it is emitted GLOBAL.
+  // The instrumentation passes create the counters, the profile version flag and
+  // the runtime-hook user function with hidden visibility (and sometimes local
+  // linkage), and a hidden symbol is emitted LOCAL on COFF, so ORC's claim -
+  // made before the transform created the definition - can never be satisfied
+  // and the whole common Tier-1 module fails to materialize. These symbols exist
+  // precisely to be resolved by name, so linkage and visibility are both fixed
+  // here, after the pipeline and before codegen.
+  auto MakeResolvable = [](GlobalValue *GV) {
+    if (!GV || GV->isDeclaration())
+      return;
+    if (GV->hasLocalLinkage())
+      GV->setLinkage(GlobalValue::ExternalLinkage);
+    if (GV->getVisibility() != GlobalValue::DefaultVisibility)
+      GV->setVisibility(GlobalValue::DefaultVisibility);
+  };
   for (GlobalVariable &GV : M.globals()) {
     StringRef Name = GV.getName();
     bool IsProfc = Name.starts_with("__profc_");
@@ -649,12 +665,15 @@ void EJitOptimizer::captureCounterGlobals(Module &M) {
       continue;
     // Default InternalLinkage is invisible to ORC J->lookup (P0-3): force
     // External so the compile driver can resolve counter addresses by name.
-    if (GV.hasLocalLinkage())
-      GV.setLinkage(GlobalValue::ExternalLinkage);
+    MakeResolvable(&GV);
     if (IsProfc)
       // PGOFuncName = name with the "__profc_" prefix stripped.
       lastCounterNames_.emplace_back(Name.drop_front(strlen("__profc_")).str());
   }
+  // The profile version flag and the runtime-hook user function are created by
+  // the same instrumentation pipeline and are resolvable for the same reason.
+  MakeResolvable(M.getNamedGlobal("__llvm_profile_raw_version"));
+  MakeResolvable(M.getFunction("__llvm_profile_runtime_user"));
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   // Value-profile capture (EJIT_VALUE_PROFILE.md §5.1): every function of the
