@@ -72,6 +72,15 @@ struct EJitSmallTableField {
   /// Bytes the authorized load reads.
   uint64_t accessSize = 0;
   /// Scalar width in bits (integer width, or 32/64 for float/double).
+  ///
+  /// The width is part of the field's identity: an authorized load matches this
+  /// field only when its own scalar width is equal, because an integer column
+  /// preserves the declared width (spec §5). `load i1` and `load i8` at the
+  /// same address therefore occupy two columns, and a column never serves a load
+  /// that would need a cross-width zext/trunc. Values are copied and compared
+  /// masked to this width (the storage padding above it is not part of the
+  /// typed value), and a uniform contract must be a value of exactly this
+  /// width.
   uint64_t bitWidth = 0;
   EJitSmallTableKind kind = EJitSmallTableKind::Integer;
   /// Emitted global name. Empty for a field folded through an explicit

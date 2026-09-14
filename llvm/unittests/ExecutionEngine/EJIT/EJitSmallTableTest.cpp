@@ -17,12 +17,15 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -32,7 +35,9 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
 
 #include "gtest/gtest.h"
 
@@ -88,6 +93,92 @@ extern "C" unsigned enable_rw(unsigned, unsigned long long Va) {
   void *Page = reinterpret_cast<void *>(static_cast<uintptr_t>(Va));
   return ::mprotect(Page, 4096, PROT_READ | PROT_WRITE) == 0 ? 0u : 1u;
 }
+#elif defined(EJIT_SRE_CODE_POOL) && defined(_WIN32)
+// Windows host shim: the counterpart of the POSIX block above, with the same
+// SRE contract (2 MiB-aligned raw memory, real RW<->RX page transitions, 4 KiB
+// granularity) expressed through the real Windows VM API. Test-harness support
+// only: it is compiled into this gtest binary so a Windows host can drive the
+// real ORC engine, and it never contributes to the freestanding product link
+// (which supplies the real strong definitions, see EJitSrePlatform.cpp).
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+extern "C" void *SRE_MemDbgAlloc(unsigned int, unsigned char,
+                                 unsigned long Size, const char *,
+                                 unsigned int) {
+  const size_t Align = static_cast<size_t>(2) << 20;
+  const size_t Need = Size != 0 ? Size : 1;
+  // The product's SRE link places the code pool in a fixed low region of the
+  // image (EJIT_FIXED_CODE_POOL), not wherever the host allocator happens to put
+  // it. On this COFF host that matters for more than address stability: JITLink
+  // lowers the COFF .pdata unwind RVAs (IMAGE_REL_AMD64_ADDR32NB) against a zero
+  // image base, i.e. as 32-bit absolute references, so a pool above 4 GiB cannot
+  // be linked ("relocation target ... is out of range of Pointer32 fixup").
+  // Pools are NO_RECLAIM, so reserve one large low 2 MiB-aligned arena on the
+  // first request and carve committed chunks out of it instead of racing for a
+  // fresh low address per pool; if no low reservation is possible, fall back to
+  // an unconstrained allocation (the caller's link then decides).
+  static uintptr_t ArenaNext = 0;
+  static uintptr_t ArenaEnd = 0;
+  if (ArenaNext == 0 && ArenaEnd == 0) {
+    const size_t Reserve = static_cast<size_t>(256) << 20;
+    for (uintptr_t Base :
+         {uintptr_t{0x40000000}, uintptr_t{0x30000000}, uintptr_t{0x20000000},
+          uintptr_t{0x10000000}, uintptr_t{0x08000000}}) {
+      void *R = ::VirtualAlloc(reinterpret_cast<void *>(Base), Reserve,
+                               MEM_RESERVE, PAGE_READWRITE);
+      if (R) {
+        ArenaNext = reinterpret_cast<uintptr_t>(R);
+        ArenaEnd = ArenaNext + Reserve;
+        break;
+      }
+    }
+  }
+  if (ArenaNext != 0) {
+    const uintptr_t Aligned = (ArenaNext + (Align - 1)) & ~(Align - 1);
+    if (Aligned + Need <= ArenaEnd) {
+      void *P = ::VirtualAlloc(reinterpret_cast<void *>(Aligned), Need,
+                               MEM_COMMIT, PAGE_READWRITE);
+      if (P) {
+        ArenaNext = Aligned + Need;
+        return P;
+      }
+    }
+  }
+  char *Base = static_cast<char *>(
+      ::VirtualAlloc(nullptr, Need + Align, MEM_RESERVE, PAGE_READWRITE));
+  if (!Base)
+    return nullptr;
+  const uintptr_t Aligned =
+      (reinterpret_cast<uintptr_t>(Base) + (Align - 1)) & ~(Align - 1);
+  void *P = ::VirtualAlloc(reinterpret_cast<void *>(Aligned), Need, MEM_COMMIT,
+                           PAGE_READWRITE);
+  if (!P) {
+    ::VirtualFree(Base, 0, MEM_RELEASE);
+    return nullptr;
+  }
+  return P;
+}
+
+extern "C" unsigned split_2m_to_4k(unsigned long long, unsigned long long) {
+  return 0; // Host mappings already have 4 KiB granularity.
+}
+
+extern "C" unsigned enable_ex(unsigned, unsigned long long Va) {
+  void *Page = reinterpret_cast<void *>(static_cast<uintptr_t>(Va));
+  DWORD Old = 0;
+  if (!::VirtualProtect(Page, 4096, PAGE_EXECUTE_READ, &Old))
+    return 1;
+  ::FlushInstructionCache(::GetCurrentProcess(), Page, 4096);
+  return 0;
+}
+
+extern "C" unsigned enable_rw(unsigned, unsigned long long Va) {
+  void *Page = reinterpret_cast<void *>(static_cast<uintptr_t>(Va));
+  DWORD Old = 0;
+  return ::VirtualProtect(Page, 4096, PAGE_READWRITE, &Old) ? 0u : 1u;
+}
 #endif
 
 using namespace llvm;
@@ -117,9 +208,39 @@ static_assert(sizeof(BigElement) == kElementBytes, "element must be 1 KiB");
 BigElement g_cfg[kCells][kTrps][kPhases];
 int32_t g_out[kCells][kTrps];
 
+/// Data-layout fallback for the fixture IR when the host target machine cannot
+/// be queried (it normally is: see moduleTargetHeader()).
 const char *kDataLayout =
     "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:"
     "64-S128";
+
+/// The `target datalayout` / `target triple` header of every module this suite
+/// compiles. The real engine compiles with detectHost()'s target machine
+/// (EJitOrcEngine::Create), and LLJIT rejects a module whose data layout
+/// differs from the JIT's: on the Windows COFF host an ELF `m:e` fixture fails
+/// addIRModule with "Added modules have incompatible data layouts". Deriving
+/// both from the same host target keeps one fixture correct on an ELF and a
+/// COFF host; the two layouts differ only in mangling (`m:e` vs `m:w`) and every
+/// symbol in these tests is a plain C name. This is test-harness support, not a
+/// product behavior.
+std::string moduleTargetHeader() {
+  static const std::string Header = [] {
+    InitializeNativeTarget();
+    const std::string Triple = sys::getDefaultTargetTriple();
+    std::string DL = kDataLayout;
+    auto JTMB = orc::JITTargetMachineBuilder::detectHost();
+    if (!JTMB) {
+      consumeError(JTMB.takeError());
+    } else if (auto HostDL = JTMB->getDefaultDataLayoutForTarget()) {
+      DL = HostDL->getStringRepresentation();
+    } else {
+      consumeError(HostDL.takeError());
+    }
+    return "    target datalayout = \"" + DL + "\"\n    target triple = \"" +
+           Triple + "\"\n";
+  }();
+  return Header;
+}
 
 float floatFromBits(uint32_t Bits) {
   float F = 0.0f;
@@ -208,10 +329,7 @@ int32_t aotUniform(unsigned C, unsigned P, int32_t X) {
 }
 
 std::string uniformModuleText() {
-  return std::string(R"(
-    target datalayout = ")") +
-         kDataLayout + R"("
-    target triple = "x86_64-unknown-linux-gnu"
+  return moduleTargetHeader() + R"(
 
     %U = type { i32, i32, float }
 
@@ -245,10 +363,7 @@ std::string uniformModuleText() {
 }
 
 std::string moduleText() {
-  return std::string(R"(
-    target datalayout = ")") +
-         kDataLayout + R"("
-    target triple = "x86_64-unknown-linux-gnu"
+  return moduleTargetHeader() + R"(
 
     %Big = type { i32, [124 x i32], i32, [124 x i32], float, [3 x i32], i32, i32 }
 
@@ -309,10 +424,7 @@ std::string moduleText() {
 /// address-space load and an `inttoptr`-rooted load, plus one ordinary
 /// may_const load that must still be replaced.
 std::string badShapesText() {
-  return std::string(R"(
-    target datalayout = ")") +
-         kDataLayout + R"("
-    target triple = "x86_64-unknown-linux-gnu"
+  return moduleTargetHeader() + R"(
 
     %Big = type { i32, [124 x i32], i32, [124 x i32], float, [3 x i32], i32, i32 }
     @g_cfg = external global [6 x [2 x [10 x %Big]]]
@@ -419,6 +531,105 @@ unsigned countTaggedTableLoads(const Function &F) {
   return Count;
 }
 
+/// Scalar width N of an integer column: the storage element is the promoted
+/// type, while the typed value is the low N bits.
+uint64_t truncateToBits(uint64_t V, unsigned Bits) {
+  return Bits >= 64 ? V : (V & ((uint64_t{1} << Bits) - 1));
+}
+
+//===----------------------------------------------------------------------===//
+// Scalar-width fixture (R1 F1/F2 regression)
+//
+// One element whose first byte is read through three different integer widths
+// at the same offset (i1, i8, i16) and whose offset 8 is read through a
+// non-byte-aligned width (i9, two bytes of storage). The bytes are deliberately
+// non-canonical: byte 0 is 0xFE, so an i1 read must yield 1 and not 0xFE, an i9
+// read must drop the padding bits above bit 8, and an i8 read must keep them.
+//===----------------------------------------------------------------------===//
+
+constexpr unsigned kWidthCells = 2;
+constexpr unsigned kWidthPhases = 4;
+
+struct alignas(4) WidthElement {
+  uint8_t bits;   // offset 0: load i1, load i8, load i16
+  uint8_t pad;    // offset 1
+  uint16_t small; // offset 2
+  uint16_t sub;   // offset 4, read as i9 through [2 x i8] at offset 4
+  uint32_t live;  // offset 8, ordinary (not may_const)
+  uint32_t pad2;  // offset 12
+};
+static_assert(sizeof(WidthElement) == 16, "layout must match the IR type");
+
+WidthElement g_width[kWidthCells][kWidthPhases];
+int32_t g_width_free[kWidthPhases];
+
+void fillWidthConfig() {
+  for (unsigned C = 0; C < kWidthCells; ++C)
+    for (unsigned P = 0; P < kWidthPhases; ++P) {
+      WidthElement &E = g_width[C][P];
+      // All rows share the low bit of `bits`, so that bit is itself a genuine
+      // per-row invariant an explicit i1 contract can name and be confirmed by;
+      // the padding byte, the i8/i16 views and the i9 view still carry
+      // non-canonical bits that a raw byte copy would leak.
+      E.bits = 0xFE;
+      E.pad = static_cast<uint8_t>(0x5A + P);
+      E.small = static_cast<uint16_t>(0x12FF + P);
+      E.sub = static_cast<uint16_t>(0x0014 + P * 0x20);
+      E.live = static_cast<uint32_t>(0x700 + C * 10 + P);
+      E.pad2 = 0;
+    }
+  // A different value per phase, so a frozen compile-time fold is observable.
+  for (unsigned P = 0; P < kWidthPhases; ++P)
+    g_width_free[P] = static_cast<int32_t>(0x500 + P);
+}
+
+/// One entry over a [2 x [4 x %W]] source. Offset 4 is read as an i9 through a
+/// `[2 x i8]` view, so the load's storage is two bytes while its typed value is
+/// nine bits (the alignment on the GEP is explicit: the source field is 2-byte
+/// aligned and i9's ABI alignment is 1, so a default-aligned i9 load there would
+/// be over-aligned).
+std::string widthModuleText() {
+  return moduleTargetHeader() + R"(
+
+    %W = type { i8, i8, i16, [2 x i8], i32, i32 }
+
+    @g_width = external global [2 x [4 x %W]]
+    @g_width_free = external global [4 x i32], !ejit.metadata !10
+
+    define i32 @w_entry(i32 %cell, i32 %phase) !ejit.metadata !0 {    entry:
+      %row = getelementptr inbounds [2 x [4 x %W]], ptr @g_width, i64 0, i32 %cell, i32 %phase
+      %b0 = getelementptr inbounds %W, ptr %row, i32 0, i32 0
+      %v0 = load i1, ptr %b0, align 1, !ejit.may_const !1
+      %v1 = load i8, ptr %b0, align 1, !ejit.may_const !1
+      %v2 = load i16, ptr %b0, align 2, !ejit.may_const !1
+      %b3 = getelementptr inbounds %W, ptr %row, i32 0, i32 3
+      %v3 = load i9, ptr %b3, align 2, !ejit.may_const !1
+      %livep = getelementptr inbounds %W, ptr %row, i32 0, i32 4
+      %live = load i32, ptr %livep, align 4
+      %fp = getelementptr inbounds [4 x i32], ptr @g_width_free, i64 0, i64 0
+      %free = load i32, ptr %fp, align 4, !ejit.may_const !1
+      %z0 = zext i1 %v0 to i32
+      %z1 = zext i8 %v1 to i32
+      %z2 = zext i16 %v2 to i32
+      %z3 = zext i9 %v3 to i32
+      %a = add i32 %z0, %z1
+      %b = add i32 %a, %z2
+      %c = add i32 %b, %z3
+      %d = add i32 %c, %live
+      %e = add i32 %d, %free
+      ret i32 %e
+    }
+
+    !0 = !{!2, !3}
+    !1 = !{}
+    !2 = !{!"ejit_entry"}
+    !3 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !4 = !{!"ejit_period_arr", !"free", i64 4}
+    !5 = !{!"ejit_may_const_field", i64 0}
+    !10 = !{!4, !5}
+  )";
+}
+
 /// Extract the scalar constant an aggregate element holds, whether the
 /// initializer folded to ConstantDataArray or stayed a ConstantArray.
 uint64_t elementBits(Constant *Aggregate, unsigned Index) {
@@ -457,6 +668,7 @@ protected:
   void SetUp() override {
     fillConfig();
     fillUniformConfig();
+    fillWidthConfig();
     // Outputs are process-wide; a previous test's stores must not leak into
     // this test's address checks.
     std::memset(g_out, 0, sizeof(g_out));
@@ -475,6 +687,35 @@ protected:
         EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&g_cfg[0][0][0]),
                              sizeof(g_cfg)},
         UseRows, Contracts, Error);
+    EXPECT_TRUE(Plan.has_value()) << Error;
+    auto Set = std::make_shared<EJitSmallTablePlanSet>();
+    if (Plan)
+      Set->add(std::make_shared<const EJitSmallTablePlan>(std::move(*Plan)));
+    return Set;
+  }
+
+  /// The scalar-width fixture's plan: two argument axes, one fully ready row per
+  /// (cell, phase).
+  ///
+  /// The second axis is a plain argument rather than `urem(slot, 4)`: the
+  /// planner only accepts the `urem` spelling, and InstCombine canonicalizes a
+  /// power-of-two `urem` into `and`, so the real pipeline's post-InstCombine
+  /// matcher would refuse the axis. That power-of-two modulo/AND gap is the
+  /// deferred R2 item; this fixture deliberately does not depend on it.
+  std::shared_ptr<const EJitSmallTablePlanSet> makeWidthPlanSet(const Module &M) {
+    SmallVector<EJitSmallTableDim, 2> Dims;
+    Dims.push_back({EJitSmallTableDim::Kind::Argument, 0, 0, kWidthCells});
+    Dims.push_back({EJitSmallTableDim::Kind::Argument, 1, 0, kWidthPhases});
+    SmallVector<EJitSmallTableRowKey, 8> WRows;
+    for (unsigned C = 0; C < kWidthCells; ++C)
+      for (unsigned P = 0; P < kWidthPhases; ++P)
+        WRows.push_back({{C, P}});
+    std::string Error;
+    auto Plan = EJitSmallTablePlanner::plan(
+        M, "w_entry", "g_width", Dims,
+        EJitSmallTableSource{reinterpret_cast<const uint8_t *>(&g_width[0][0]),
+                             sizeof(g_width)},
+        WRows, {}, Error);
     EXPECT_TRUE(Plan.has_value()) << Error;
     auto Set = std::make_shared<EJitSmallTablePlanSet>();
     if (Plan)
@@ -557,6 +798,19 @@ protected:
                            reinterpret_cast<void *>(&g_cfg[0][0][0]),
                            sizeof(g_cfg));
     Registry.registerStaticVar("g_out", &g_out[0][0]);
+    // The scalar-width fixture's own source and free/global source. The free
+    // array is what the legacy period-registry fold can resolve, so the
+    // whole-entry readiness test can prove the fold is blocked.
+    Registry.registerArray("cell", "g_width",
+                           reinterpret_cast<void *>(&g_width[0][0]),
+                           sizeof(g_width));
+    Registry.registerStaticVar("g_width_free", &g_width_free[0]);
+    // Also as a period array: the legacy period fold resolves an array base by
+    // its period name, so this is what makes the whole-entry readiness test's
+    // `g_width_free` load foldable in the baseline pipeline.
+    Registry.registerArray("free", "g_width_free",
+                           reinterpret_cast<void *>(&g_width_free[0]),
+                           sizeof(g_width_free));
     // The uniform-contract fixture's own source and output globals.
     Registry.registerArray("cell", "g_u",
                            reinterpret_cast<void *>(&g_u[0][0]), sizeof(g_u));
@@ -805,10 +1059,7 @@ TEST_F(SmallTableTest, PassRefusesVolatileAtomicAndUnsupportedShapes) {
 }
 
 TEST_F(SmallTableTest, PassCoversScalarWidthsAndFloatBits) {
-  std::string Text = std::string(R"(
-    target datalayout = ")") +
-                     kDataLayout + R"("
-    target triple = "x86_64-unknown-linux-gnu"
+  std::string Text = moduleTargetHeader() + R"(
     %W = type { i1, i8, i16, i32, i64, float, double, i32 }
     @g_w = external global [2 x [10 x %W]]
     define i8 @w_entry(i32 %cell, i32 %slotNo) !ejit.metadata !0 {
@@ -1406,10 +1657,7 @@ TEST_F(SmallTableTest, UniformContractFoldsOnFullyReadyPlan) {
 /// A domain that cannot be materialized is refused before anything is
 /// allocated, and a schema with two axes on one argument is not a schema.
 TEST_F(SmallTableTest, PlannerRefusesOversizedAndDuplicateDomains) {
-  std::string Text = std::string(R"(
-    target datalayout = ")") +
-                     kDataLayout + R"("
-    target triple = "x86_64-unknown-linux-gnu"
+  std::string Text = moduleTargetHeader() + R"(
     @g_huge = external global [2000000 x i32]
     define i32 @h_entry(i32 %i) !ejit.metadata !0 {
     entry:
@@ -1609,10 +1857,7 @@ TEST_F(SmallTableTest, PassMatchesBitcastPunnedScalarView) {
 /// inliner already folded into the entry are ordinary entry loads and are
 /// covered by the plan.
 TEST_F(SmallTableTest, NestedCalleeLoadsStayOutsideThePlan) {
-  std::string Text = std::string(R"(
-    target datalayout = ")") +
-                     kDataLayout + R"("
-    target triple = "x86_64-unknown-linux-gnu"
+  std::string Text = moduleTargetHeader() + R"(
     %Big = type { i32, [124 x i32], i32, [124 x i32], float, [3 x i32], i32, i32 }
     @g_cfg = external global [6 x [2 x [10 x %Big]]]
 
@@ -1708,6 +1953,344 @@ TEST_F(SmallTableTest, JitSlotModuloFiveTwoFullWrapsMatchAot) {
           EXPECT_EQ(Fn(C, T, S, X), aotResultMod(C, T, S, X, 5))
               << "cell=" << C << " trp=" << T << " slot=" << S;
         }
+}
+
+//===----------------------------------------------------------------------===//
+// Scalar-width regressions (R1 F1/F2/F3)
+//===----------------------------------------------------------------------===//
+
+/// R1 F1: a sub-byte integer load reads `accessSize` bytes of storage, but its
+/// typed value is the low `bitWidth` bits. The bytes in this fixture are
+/// non-canonical (byte 0 is 0xFE), so before the mask the i1 column element was
+/// built from 0xFE and the i9 column from 0x0014 -> `APInt(1, 254)` /
+/// `APInt(9, 0x114)` aborted the planner under assertions and were silently
+/// truncated under NDEBUG. The masked read is also what makes the emitted
+/// column a faithful copy of the source's typed value.
+TEST_F(SmallTableTest, PlannerMasksSubByteFieldsToTheirWidth) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(widthModuleText(), Err, Ctx);
+  ASSERT_TRUE(M);
+  auto Set = makeWidthPlanSet(*M);
+  const EJitSmallTablePlan *Plan = Set->find("w_entry");
+  ASSERT_NE(Plan, nullptr);
+
+  // Four authorized loads, three of them sharing the same one- or two-byte
+  // storage: i1(off 0), i8(off 0), i16(off 0), i9(off 4); the ordinary live
+  // load at offset 8 stays original. The i16 load at offset 0 covers bytes
+  // 0..1, i.e. the `bits` byte and the `pad` byte (0x5AFE), not the `small`
+  // field at offset 2.
+  ASSERT_EQ(Plan->fields.size(), 4u);
+  EXPECT_EQ(Plan->fields[0].bitWidth, 1u);
+  EXPECT_EQ(Plan->fields[0].accessSize, 1u);
+  EXPECT_EQ(Plan->fields[1].bitWidth, 8u);
+  EXPECT_EQ(Plan->fields[1].accessSize, 1u);
+  EXPECT_EQ(Plan->fields[2].bitWidth, 16u);
+  EXPECT_EQ(Plan->fields[2].accessSize, 2u);
+  EXPECT_EQ(Plan->fields[3].bitWidth, 9u);
+  EXPECT_EQ(Plan->fields[3].accessSize, 2u);
+  EXPECT_EQ(Plan->fields[3].sourceOffset, 4u);
+  EXPECT_TRUE(Plan->allRowsReady());
+
+  // The copied row bits are typed values: the i1 row is 0/1 and the i9 row has
+  // no bit above bit 8. A raw byte copy would carry the padding bits.
+  const uint64_t Row0 = 0;
+  const uint64_t Row1 = 1;
+  EXPECT_EQ(Plan->rows[Row0].bits[0], 0u) << "0xFE & 1";
+  EXPECT_EQ(Plan->rows[Row1].bits[0], 0u) << "the same low bit in every row";
+  EXPECT_EQ(Plan->rows[Row0].bits[1], 0xFEu) << "i8 keeps every bit";
+  EXPECT_EQ(Plan->rows[Row0].bits[2], 0x5AFEu) << "i16 keeps every bit";
+  EXPECT_EQ(Plan->rows[Row0].bits[3], 0x0014u);
+  EXPECT_EQ(Plan->rows[Row1].bits[3], 0x0034u);
+  EXPECT_EQ(Plan->rows[Row1].bits[3], truncateToBits(g_width[0][1].sub, 9));
+
+  std::string Error;
+  ASSERT_TRUE(EJitSmallTablePass::materialize(*M, *Plan, &Error)) << Error;
+  EJitSmallTablePass Pass(*Plan);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("w_entry"), FAM);
+
+  Function &F = *M->getFunction("w_entry");
+  EXPECT_EQ(Pass.getStats().tableReplaced, 4u);
+  EXPECT_EQ(Pass.getStats().keptOriginal, 1u)
+      << "the same-row live i32 load is not a planned field";
+  EXPECT_EQ(countTableLoads(F, EJitSmallTablePlan::TableGlobalPrefix), 4u);
+  EXPECT_EQ(countLoadsRootedAt(F, "g_width"), 1u);
+  EXPECT_EQ(countLoadsRootedAt(F, "g_width_free"), 1u)
+      << "the plan does not cover g_width_free";
+
+  // The emitted i1 and i9 columns hold the masked values, and the i8/i16
+  // columns still hold the full bytes: the widths did not collapse into one
+  // column.
+  GlobalVariable *BCol = M->getNamedGlobal("__ejit_stab_w_entry_c0");
+  GlobalVariable *CCol = M->getNamedGlobal("__ejit_stab_w_entry_c1");
+  GlobalVariable *SCol = M->getNamedGlobal("__ejit_stab_w_entry_c2");
+  GlobalVariable *NCol = M->getNamedGlobal("__ejit_stab_w_entry_c3");
+  ASSERT_NE(BCol, nullptr);
+  ASSERT_NE(CCol, nullptr);
+  ASSERT_NE(SCol, nullptr);
+  ASSERT_NE(NCol, nullptr);
+  EXPECT_EQ(BCol->getValueType(),
+            ArrayType::get(Type::getInt1Ty(Ctx), kWidthCells * kWidthPhases));
+  EXPECT_EQ(CCol->getValueType(),
+            ArrayType::get(Type::getInt8Ty(Ctx), kWidthCells * kWidthPhases));
+  EXPECT_EQ(SCol->getValueType(),
+            ArrayType::get(Type::getInt16Ty(Ctx), kWidthCells * kWidthPhases));
+  EXPECT_EQ(NCol->getValueType(),
+            ArrayType::get(Type::getIntNTy(Ctx, 9), kWidthCells * kWidthPhases));
+  EXPECT_EQ(elementBits(BCol->getInitializer(), 0), 0u);
+  EXPECT_EQ(elementBits(BCol->getInitializer(), 1), 0u);
+  EXPECT_EQ(elementBits(CCol->getInitializer(), 0), 0xFEu);
+  EXPECT_EQ(elementBits(SCol->getInitializer(), 0), 0x5AFEu);
+  EXPECT_EQ(elementBits(NCol->getInitializer(), 0), 0x0014u);
+  EXPECT_EQ(elementBits(NCol->getInitializer(), 1), 0x0034u);
+  // The ninth bit is real: the phase-3 row is 0x74 and stays 9 bits wide.
+  EXPECT_EQ(elementBits(NCol->getInitializer(), 3), 0x0074u);
+}
+
+/// R1 F2: site identity is (offset, accessSize, bitWidth). Before the fix the
+/// planner deduplicated by (offset, accessSize) keeping the first load's width,
+/// so the i8 and i16 loads at offset 0 shared the i1 column and were coerced
+/// with zext: every value became 0 or 1 (silent wrong code, order-dependent
+/// because it depended on which load came first). The three columns must now
+/// carry three different values and the compiled entry must reproduce the
+/// source's typed values exactly.
+TEST_F(SmallTableTest, JitMixedWidthSitesKeepTheirOwnColumns) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(widthModuleText(), Err, Ctx);
+  ASSERT_TRUE(M);
+  auto Set = makeWidthPlanSet(*M);
+
+  PeriodArrayRegistry &Registry = makeRegistry();
+  auto Engine = compileWithEngine(*M, Set, Registry, 0x57ab0a, "w_entry");
+  ASSERT_NE(Engine, nullptr);
+  auto Fn =
+      lookupSealed<int32_t (*)(uint32_t, uint32_t)>(*Engine, 0x57ab0a, "w_entry");
+  ASSERT_NE(Fn, nullptr);
+
+  EXPECT_EQ(g_width_free[0], 0x500);
+  for (unsigned Wrap = 0; Wrap < 2; ++Wrap)
+    for (unsigned C = 0; C < kWidthCells; ++C)
+      for (unsigned P = 0; P < kWidthPhases; ++P) {
+        const WidthElement &E = g_width[C][P];
+        // The JIT reads the typed value of each load: the i1 load is the low
+        // bit, the i8 load the whole byte, the i16 load the two bytes at offset
+        // 0 (bits and pad), the i9 load nine bits; the live field and the
+        // unplanned g_width_free[0] are ordinary loads.
+        const uint64_t I16 = truncateToBits(
+            static_cast<uint64_t>(E.bits) |
+                (static_cast<uint64_t>(E.pad) << 8),
+            16);
+        const uint64_t Expected = (E.bits & 1u) + static_cast<uint64_t>(E.bits) +
+                                  I16 + truncateToBits(E.sub, 9) + E.live +
+                                  static_cast<uint64_t>(g_width_free[0]);
+        EXPECT_EQ(Fn(C, P), static_cast<int32_t>(Expected))
+            << "cell=" << C << " phase=" << P;
+      }
+}
+
+/// R1 F3: the uniform admission contract is a typed bit value of exactly the
+/// field's width. A raw storage byte (0xFE for an i1 field) is not a value of
+/// that type, so it is refused instead of truncated; an in-range value that
+/// every ready row confirms is still accepted and folds to the same masked
+/// typed value the table path would have read.
+TEST_F(SmallTableTest, UniformContractIsRefusedOutsideTheFieldWidth) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(widthModuleText(), Err, Ctx);
+  ASSERT_TRUE(M);
+
+  SmallVector<EJitSmallTableDim, 2> Dims;
+  Dims.push_back({EJitSmallTableDim::Kind::Argument, 0, 0, kWidthCells});
+  Dims.push_back({EJitSmallTableDim::Kind::Argument, 1, 0, kWidthPhases});
+  SmallVector<EJitSmallTableRowKey, 8> WRows;
+  for (unsigned C = 0; C < kWidthCells; ++C)
+    for (unsigned P = 0; P < kWidthPhases; ++P)
+      WRows.push_back({{C, P}});
+  const auto *Base = reinterpret_cast<const uint8_t *>(&g_width[0][0]);
+
+  // 0xFE does not fit an i1 field: 0xFE != 1 as an i1 value, so the contract
+  // must be refused rather than silently truncated to i1 0.
+  std::string Error;
+  std::vector<std::optional<uint64_t>> RawByte = {uint64_t{0xFE}, std::nullopt,
+                                                  std::nullopt, std::nullopt};
+  auto Refused = EJitSmallTablePlanner::plan(
+      *M, "w_entry", "g_width", Dims, EJitSmallTableSource{Base, sizeof(g_width)},
+      WRows, RawByte, Error);
+  EXPECT_FALSE(Refused.has_value());
+  // 0xFE is not the i1 value 1, so the refusal may be reported either as a raw
+  // value that does not fit the field width or as a contract the masked rows
+  // contradict; both are refusals of the same non-typed value and neither is a
+  // silent truncation to i1 0.
+  EXPECT_TRUE(Error.find("width") != std::string::npos ||
+              Error.find("violated") != std::string::npos)
+      << Error;
+
+  // i1 value 0 is in range and every row's masked read confirms it (every
+  // `bits` byte has a clear low bit), so it is admitted and has no table
+  // payload.
+  Error.clear();
+  std::vector<std::optional<uint64_t>> Bool = {uint64_t{0}, std::nullopt,
+                                               std::nullopt, std::nullopt};
+  auto Plan = EJitSmallTablePlanner::plan(
+      *M, "w_entry", "g_width", Dims, EJitSmallTableSource{Base, sizeof(g_width)},
+      WRows, Bool, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+  ASSERT_TRUE(Plan->fields[0].uniformValue.has_value());
+  EXPECT_EQ(*Plan->fields[0].uniformValue, 0u);
+  EXPECT_TRUE(Plan->fields[0].columnName.empty());
+
+  // The folded IR is the i1 typed value the table would have read: the i1 load
+  // is gone and every `zext i1 ... to i32` that consumed it folded to the
+  // 32-bit zero the pass produced from the admitted i1 contract. The raw 0xFE
+  // byte never appears as that value.
+  std::string MErr;
+  ASSERT_TRUE(EJitSmallTablePass::materialize(*M, *Plan, &MErr)) << MErr;
+  EJitSmallTablePass Pass(*Plan);
+  FunctionAnalysisManager FAM;
+  Pass.run(*M->getFunction("w_entry"), FAM);
+  EXPECT_EQ(Pass.getStats().uniformFolded, 1u);
+  EXPECT_EQ(M->getNamedGlobal("__ejit_stab_w_entry_c0"), nullptr)
+      << "a uniform field has no table payload";
+  Function &F = *M->getFunction("w_entry");
+  // InstCombine folds the replaced load's `zext i1 %v0 to i32` into the
+  // constant itself, so the folded value is visible as an i1 operand of the
+  // surviving `zext`/`add`. Look at operands, not at instructions.
+  unsigned FoldedI1 = 0;
+  bool SawRawByte = false;
+  for (Instruction &I : instructions(F))
+    for (Value *Op : I.operands()) {
+      auto *CI = dyn_cast<ConstantInt>(Op);
+      if (!CI)
+        continue;
+      if (CI->getType()->isIntegerTy(1)) {
+        ++FoldedI1;
+        EXPECT_EQ(CI->getZExtValue(), 0u);
+      }
+      if (CI->getZExtValue() == 0xFEu)
+        SawRawByte = true;
+    }
+  EXPECT_GE(FoldedI1, 1u)
+      << "the admitted i1 contract folded to the typed i1 constant";
+  EXPECT_FALSE(SawRawByte)
+      << "the raw 0xFE storage byte must never be the folded value";
+  // The remaining three table columns still exist, and the folded i1 load no
+  // longer roots at g_width.
+  EXPECT_NE(M->getNamedGlobal("__ejit_stab_w_entry_c1"), nullptr);
+  EXPECT_NE(M->getNamedGlobal("__ejit_stab_w_entry_c2"), nullptr);
+  EXPECT_NE(M->getNamedGlobal("__ejit_stab_w_entry_c3"), nullptr);
+  EXPECT_EQ(countLoadsRootedAt(F, "g_width"), 1u) << "only the live i32 load";
+}
+
+//===----------------------------------------------------------------------===//
+// Whole-entry readiness: the legacy fold behind a lowered plan
+//===----------------------------------------------------------------------===//
+
+/// PR231 whole-entry readiness contract. `g_width_free` is a registered period
+/// static variable with a declared may_const field, so the legacy compile-time
+/// fold can and does freeze it. When a small-table plan is lowered for the
+/// entry, the compiled body is shared across the plan's declared domain and the
+/// plan records no contract for that load: keeping the fold would leave a
+/// hidden constant dependency that neither !ejit.smalltable.column nor
+/// !ejit.smalltable.contract describes. The block must therefore keep it as a
+/// real load, and an entry without a lowered plan must keep the baseline fold.
+TEST_F(SmallTableTest, LoweredPlanBlocksTheLegacyFoldItDoesNotDescribe) {
+  // Count the surviving loads rooted at the unplanned global. The legacy fold
+  // replaces the load with a constant read out of the registered array, so a
+  // successful fold leaves no load behind; a blocked fold leaves exactly one.
+  auto CountFreeLoads = [&](bool WithPlan) -> unsigned {
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(widthModuleText(), Err, Ctx);
+    if (!M)
+      return 0;
+    PeriodArrayRegistry &Registry = makeRegistry();
+    EJitOptimizer Opt(Registry);
+    if (WithPlan)
+      Opt.setSmallTablePlans(makeWidthPlanSet(*M));
+    SpecializationContext C = baselineCtx("w_entry");
+    Opt.runPipeline(*M, C);
+    Function &F = *M->getFunction("w_entry");
+    return countLoadsRootedAt(F, "g_width_free");
+  };
+
+  EXPECT_EQ(CountFreeLoads(/*WithPlan=*/false), 0u)
+      << "without a plan the legacy fold must still apply";
+  EXPECT_GE(CountFreeLoads(/*WithPlan=*/true), 1u)
+      << "a lowered plan must not freeze a load it does not describe";
+}
+
+//===----------------------------------------------------------------------===//
+// Per-compile table identity and the uniform-contract handoff (PR231 -> B)
+//===----------------------------------------------------------------------===//
+
+/// The compiler hands B a name, not an address: the column symbol does not exist
+/// before the specialization is materialized, is defined by exactly the compile
+/// that was handed the same name, and stays stable for later row publication
+/// inside that compile. Each compile has its own JITDylib, so the same spelling
+/// is a different object/address in another compile and B must publish into the
+/// address of the compile it is admitting rows to.
+TEST_F(SmallTableTest, TableIdentityIsPerCompileAndHandedOffByName) {
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(widthModuleText(), Err, Ctx);
+  ASSERT_TRUE(M);
+  auto Set = makeWidthPlanSet(*M);
+  const EJitSmallTablePlan *Plan = Set->find("w_entry");
+  ASSERT_NE(Plan, nullptr);
+
+  // The compiler-side handoff: the column names of the lowered plan are exactly
+  // the non-uniform fields (the uniform field has no payload), in plan order.
+  SmallVector<std::string, 4> ExpectedNames;
+  for (const EJitSmallTableField &Field : Plan->fields)
+    if (!Field.uniformValue)
+      ExpectedNames.push_back(Field.columnName);
+  ASSERT_EQ(ExpectedNames.size(), 4u);
+  EXPECT_EQ(ExpectedNames[0], "__ejit_stab_w_entry_c0");
+  EXPECT_TRUE(std::all_of(ExpectedNames.begin(), ExpectedNames.end(),
+                          [](const std::string &N) {
+                            return StringRef(N).starts_with(
+                                EJitSmallTablePlan::TableGlobalPrefix);
+                          }));
+
+  PeriodArrayRegistry &Registry = makeRegistry();
+  auto Engine = compileWithEngine(*M, Set, Registry, 0x57ab0b, "w_entry");
+  ASSERT_NE(Engine, nullptr);
+  ASSERT_EQ(Engine->getLastSmallTableColumnNames().size(), 4u);
+  for (unsigned I = 0; I < 4; ++I)
+    EXPECT_EQ(Engine->getLastSmallTableColumnNames()[I], ExpectedNames[I]);
+
+  // The handed-off name resolves inside this compile, and only inside it: a
+  // different cache key has its own JITDylib, so the same spelling is not a
+  // process-wide symbol the runtime could publish into by name alone.
+  auto Resolved = Engine->lookup(0x57ab0b, ExpectedNames[0]);
+  EXPECT_TRUE(static_cast<bool>(Resolved))
+      << "the just-compiled table must resolve by its handed-off name";
+  if (!Resolved)
+    consumeError(Resolved.takeError());
+  auto Foreign = Engine->lookup(0xDEADBEEF, ExpectedNames[0]);
+  EXPECT_FALSE(static_cast<bool>(Foreign))
+      << "a column name is not a process-wide symbol";
+  if (!Foreign)
+    consumeError(Foreign.takeError());
+
+  auto AddrOrErr = Engine->lookup(0x57ab0b, ExpectedNames[0]);
+  ASSERT_TRUE(static_cast<bool>(AddrOrErr)) << toString(AddrOrErr.takeError());
+  void *TableAddr = *AddrOrErr;
+  EXPECT_NE(TableAddr, nullptr);
+  // Stable within the compile: the runtime's later row publication targets this
+  // one address, not a per-lookup or per-materialization copy.
+  auto AgainOrErr = Engine->lookup(0x57ab0b, ExpectedNames[0]);
+  ASSERT_TRUE(static_cast<bool>(AgainOrErr));
+  EXPECT_EQ(*AgainOrErr, TableAddr);
+  EXPECT_FALSE(errorToBool(Engine->flushPendingCode()));
+
+  auto Fn = lookupSealed<int32_t (*)(uint32_t, uint32_t)>(*Engine, 0x57ab0b,
+                                                         "w_entry");
+  ASSERT_NE(Fn, nullptr);
+  const WidthElement &E3 = g_width[0][3];
+  const uint64_t I16 = truncateToBits(
+      static_cast<uint64_t>(E3.bits) | (static_cast<uint64_t>(E3.pad) << 8), 16);
+  EXPECT_EQ(Fn(0, 3),
+            static_cast<int32_t>((E3.bits & 1u) + static_cast<uint64_t>(E3.bits) +
+                                 I16 + truncateToBits(E3.sub, 9) + E3.live +
+                                 static_cast<uint64_t>(g_width_free[0])));
 }
 
 } // namespace

@@ -788,8 +788,19 @@ void EJitOptimizer::runStructFieldPass(Module &M,
   // PR231: the small-table replacement runs immediately before the existing
   // may_const replacement in this round. An entry with no installed plan is
   // untouched, so the baseline pipeline is unchanged.
-  runSmallTablePass(M, ctx.fnName);
-  runStructFieldPassImpl(M, ctx);
+  //
+  // A *lowered* plan additionally blocks the legacy compile-time fold for that
+  // entry (whole-entry readiness contract): the code produced for a planned
+  // entry is shared across the plan's declared domain, so a value frozen here
+  // from the compile-time configuration would be a dependency that neither the
+  // plan's recorded uniform contract nor its projection contract describes.
+  // With the fold blocked, such loads keep their original dynamic form (spec
+  // §4.2) and the runtime entry gate only has to validate the recordable
+  // contract.
+  const bool SmallTableLowered = runSmallTablePass(M, ctx.fnName);
+  runStructFieldPassImpl(M, ctx,
+                         SmallTableLowered ? StringRef(ctx.fnName)
+                                           : StringRef());
 }
 
 void EJitOptimizer::runStructFieldPass(Module &M) {
@@ -798,7 +809,8 @@ void EJitOptimizer::runStructFieldPass(Module &M) {
 }
 
 void EJitOptimizer::runStructFieldPassImpl(Module &M,
-                                           const SpecializationContext &ctx) {
+                                           const SpecializationContext &ctx,
+                                           StringRef BlockLegacyFoldEntry) {
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
       ctx.boundPointers;
   if (!BoundPointers.empty()) {
@@ -832,24 +844,29 @@ void EJitOptimizer::runStructFieldPassImpl(Module &M,
   }
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
   structField.initFromModule(M);
+  // PR231 whole-entry readiness: a lowered small-table plan for this entry
+  // blocks the legacy compile-time fold here (see runSmallTablePass()); every
+  // other entry and every entry without a plan keeps the baseline behavior.
+  if (!BlockLegacyFoldEntry.empty())
+    structField.blockLegacyConstantFolds(BlockLegacyFoldEntry);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       structField.run(F, FAM_);
 }
 
-void EJitOptimizer::runSmallTablePass(Module &M, StringRef EntryName) {
+bool EJitOptimizer::runSmallTablePass(Module &M, StringRef EntryName) {
   lastSmallTableColumns_.clear();
   if (EntryName.empty() || !smallTablePlans_ || smallTablePlans_->empty())
-    return;
+    return false;
   const EJitSmallTablePlan *Plan = smallTablePlans_->find(EntryName);
   if (!Plan)
-    return;
+    return false;
 
   std::string Error;
   if (!EJitSmallTablePass::materialize(M, *Plan, &Error)) {
     EJIT_DIAG_VERBOSE("small-table SKIP func=%s: %s", EntryName.str().c_str(),
                       Error.c_str());
-    return;
+    return false;
   }
   for (const EJitSmallTableField &Field : Plan->fields)
     if (!Field.uniformValue && !Field.columnName.empty())
@@ -880,6 +897,7 @@ void EJitOptimizer::runSmallTablePass(Module &M, StringRef EntryName) {
                     static_cast<unsigned long long>(Stats.uniformFolded),
                     static_cast<unsigned long long>(Stats.keptOriginal),
                     static_cast<unsigned long long>(Stats.refusedShape));
+  return true;
 }
 
 FunctionPassManager &
@@ -927,8 +945,11 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // then fold/propagate/simplify the freshly-constant values. The small-table
   // pass runs here too: a plan's table loads must survive the last replace
   // round unchanged, and fields exposed only now still become table reads.
-  runSmallTablePass(M, EntryName);
-  runStructFieldPass(M);
+  // A plan lowered in this round blocks the legacy fold for the same entry here
+  // as well, so the last round cannot reintroduce an unrecorded constant.
+  const bool SmallTableLowered = runSmallTablePass(M, EntryName);
+  runStructFieldPassImpl(M, SpecializationContext{},
+                         SmallTableLowered ? EntryName : StringRef());
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);

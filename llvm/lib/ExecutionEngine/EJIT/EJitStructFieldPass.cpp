@@ -1424,6 +1424,20 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       ++mayConstLoads;
 #endif
 
+      // PR231 whole-entry readiness contract: a lowered small-table plan makes
+      // this entry's code shared across the plan's declared domain, so the
+      // legacy compile-time fold must not freeze a value here that the plan
+      // does not record. The load keeps its original dynamic form (spec §4.2);
+      // it is counted, not silently dropped.
+      if (!legacyFoldBlockedEntry_.empty() &&
+          F.getName() == legacyFoldBlockedEntry_) {
+        ++legacyFoldsBlocked_;
+        EJIT_DIAG_VERBOSE("  may_const fold BLOCKED (lowered small-table plan) "
+                          "func=%s",
+                          F.getName().str().c_str());
+        continue;
+      }
+
       Value *PtrOp = LI->getPointerOperand();
 
       // Try each access pattern in order.

@@ -341,13 +341,24 @@ bool supportedScalarType(Type *Ty, uint64_t &BitWidth,
   return false;
 }
 
-/// True when \p Ty reads exactly the storage of \p Field. Besides the declared
-/// scalar type this accepts a same-store-size scalar reinterpretation: the
-/// optimizer routinely rewrites `bitcast (load float)` into `load i32`, and the
-/// table keeps the field's own type, so the load is coerced back at the
-/// replacement site. The store-size equality checked here is what makes the
-/// reinterpretation bit-exact; unsupported, wider, pointer, aggregate and
-/// scalable types are still refused by supportedScalarType().
+/// True when \p Ty reads exactly the storage of \p Field *and* carries the
+/// same scalar width.
+///
+/// Besides the declared scalar type this accepts a same-width scalar
+/// reinterpretation: the optimizer routinely rewrites `bitcast (load float)`
+/// into `load i32`, and the table keeps the field's own type, so the load is
+/// coerced back at the replacement site. Two supported scalars of equal width
+/// are the same bit pattern (integer N vs IEEE float/double N), so that
+/// reinterpretation is bit-exact, and `coerceScalarToLoadType` uses a bitcast
+/// for it.
+///
+/// The width equality is what an integer column must preserve (spec §5
+/// "整数保留位宽"): `i1` and `i8` at the same address are different typed
+/// values, and serving the wider load from a narrower column would either drop
+/// its high bits (zext) or feed the narrower load bits no native load of that
+/// type would see. Sites with different widths therefore get separate columns,
+/// and this predicate is the single gate that keeps a load from being coerced
+/// across widths.
 bool fieldMatchesType(const EJitSmallTableField &Field, Type *Ty,
                       const DataLayout &DL) {
   uint64_t BitWidth = 0;
@@ -357,14 +368,14 @@ bool fieldMatchesType(const EJitSmallTableField &Field, Type *Ty,
   TypeSize Store = DL.getTypeStoreSize(Ty);
   if (Store.isScalable() || Store.getFixedValue() != Field.accessSize)
     return false;
-  return true;
+  return BitWidth == Field.bitWidth;
 }
 
 /// Reinterpret a scalar read from a table column (or a folded contract
-/// constant) as the type the original load had. Both types are supported
-/// scalars with the same store size, so only the view changes and no bit is
-/// lost: integer views use zext/trunc for the i1 <-> i8 case, everything else
-/// is a bitcast (i32 <-> float, i64 <-> double).
+/// constant) as the type the original load had. `findField`/`fieldMatchesType`
+/// guarantee both types are supported scalars of the same bit width, so only
+/// the view changes and no bit is lost: equal-width integer views are the same
+/// type, and integer <-> float/double at equal width is a bitcast.
 Value *coerceScalarToLoadType(IRBuilder<> &Builder, Value *V, Type *LoadTy) {
   Type *From = V->getType();
   if (From == LoadTy)
@@ -389,6 +400,15 @@ Type *scalarTypeForField(LLVMContext &Ctx, const EJitSmallTableField &Field) {
 /// Rebuild the bit pattern of one scalar from raw target-ordered bytes. The
 /// result is the integer the target's LLVM type needs: for integers the value,
 /// for float/double the APFloat bit pattern.
+///
+/// The read is masked to the declared scalar width. A sub-byte integer load
+/// (i1..i7, i9..i15, ...) reads `accessSize` bytes but its typed value is the
+/// low `bitWidth` bits — the target legalizer promotes such a load the same way
+/// — and the storage padding above `bitWidth` is not part of the value. Keeping
+/// those padding bits would hand `APInt(bitWidth, ...)` an out-of-range value
+/// (assertions-on abort, NDEBUG silent truncation) and would make the uniform
+/// contract comparison depend on padding. This is the one place raw memory
+/// becomes a typed value, so the mask lives here.
 uint64_t readScalarBits(const uint8_t *Addr, const EJitSmallTableField &Field,
                         const DataLayout &DL) {
   uint64_t Raw = 0;
@@ -399,6 +419,8 @@ uint64_t readScalarBits(const uint8_t *Addr, const EJitSmallTableField &Field,
     for (unsigned I = 0; I < Bytes; ++I)
       Raw = (Raw << 8) | Addr[I];
   }
+  if (Field.bitWidth < 64)
+    Raw &= maskTrailingOnes<uint64_t>(static_cast<unsigned>(Field.bitWidth));
   return Raw;
 }
 
@@ -632,6 +654,13 @@ EJitSmallTablePlanner::planShape(const Module &M, StringRef EntryName,
   // Discover the authorized may_const scalar fields actually loaded from the
   // source array. The plan must describe the loads that exist; a field that no
   // load names has no reason to occupy a column.
+  //
+  // The site key is (offset, accessSize, bitWidth): an integer column preserves
+  // the load's declared width (spec §5), so `load i1` and `load i8` at the same
+  // address are two different typed values and must not share one column. Two
+  // sites of the same width but different kinds (an `i32` view of a `float`
+  // field, the form InstCombine produces) do share the column, because equal
+  // width makes the reinterpretation bit-exact.
   struct Site {
     uint64_t Offset;
     uint64_t AccessSize;
@@ -654,7 +683,7 @@ EJitSmallTablePlanner::planShape(const Module &M, StringRef EntryName,
       continue;
     if (llvm::any_of(Sites, [&](const Site &S) {
           return S.Offset == Match.FieldOffset &&
-                 S.AccessSize == Match.AccessSize;
+                 S.AccessSize == Match.AccessSize && S.BitWidth == BitWidth;
         }))
       continue;
     Sites.push_back({Match.FieldOffset, Match.AccessSize, BitWidth, Kind});
@@ -746,10 +775,22 @@ EJitSmallTablePlanner::plan(const Module &M, StringRef EntryName,
   for (unsigned I = 0; I < Plan->fields.size(); ++I) {
     if (UniformContracts.empty() || !UniformContracts[I])
       continue;
+    const EJitSmallTableField &Field = Plan->fields[I];
+    // A contract is a typed bit value of exactly this field's width. A value
+    // with bits above the width is not that typed value (it is a raw storage
+    // byte), so refuse it instead of truncating it silently: the recorded
+    // contract metadata and the folded constant must agree, and whichever
+    // integer width the field has is preserved (spec §5).
+    if (Field.bitWidth < 64 &&
+        *UniformContracts[I] >= (uint64_t{1} << Field.bitWidth))
+      return Fail("uniform admission contract value does not fit the field "
+                  "width");
     // An explicit admission contract, not an inference from the visible rows:
     // the caller asserts the invariant, and planning checks every row it can
     // already read. A contract that no ready row confirms is not a validated
     // observation, so it is refused rather than recorded and folded blindly.
+    // The row bits were masked to the field width by readScalarBits, so this
+    // comparison is between two typed values of the same width.
     bool Confirmed = false;
     for (const EJitSmallTableRow &Row : Plan->rows) {
       if (!Row.ready)

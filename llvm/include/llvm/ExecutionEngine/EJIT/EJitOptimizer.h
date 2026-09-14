@@ -141,12 +141,20 @@ private:
   /// pass. The context overload runs the small-table pass first; the no-context
   /// overload (phase 4, after `runSmallTablePass(M, EntryName)`) must not run it
   /// again, or it would clear the recorded column names with an empty entry.
-  void runStructFieldPassImpl(Module &M, const SpecializationContext &ctx);
+  /// \p BlockLegacyFoldEntry, when non-empty, names the entry whose legacy
+  /// compile-time may_const fold must be blocked because a small-table plan was
+  /// lowered for it in this round (PR231 whole-entry readiness contract).
+  void runStructFieldPassImpl(Module &M, const SpecializationContext &ctx,
+                              StringRef BlockLegacyFoldEntry = {});
 
   /// Run the small-table pass for \p EntryName, if a plan is installed for it.
   /// Called immediately before the existing struct-field pass in every replace
   /// round, so all three rounds see the table form and no round can regress it.
-  void runSmallTablePass(Module &M, StringRef EntryName);
+  /// Returns true when a plan was materialized (lowered) for this entry; the
+  /// caller then blocks the legacy compile-time fold for that entry, so the
+  /// compiled code depends only on the plan's recorded contract and on real
+  /// dynamic reads.
+  bool runSmallTablePass(Module &M, StringRef EntryName);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call

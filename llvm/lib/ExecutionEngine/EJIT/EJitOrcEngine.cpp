@@ -734,7 +734,18 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // With Large, the 3 extra movz/movk instructions per global access eaten
   // the specialization savings (fewer BBs / folded branches). Small makes
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
-  JTMBOrErr->setCodeModel(CodeModel::Small);
+  //
+  // COFF host exception: on x86-64 COFF the same Small model lowers every
+  // external global to a 32-bit absolute reference
+  // (IMAGE_REL_AMD64_ADDR32), which JITLink's COFF backend does not implement
+  // (it supports ADDR32NB/REL32*/ADDR64 but not ADDR32) and which the >4 GiB
+  // JIT slab could not satisfy anyway; the Large model uses 64-bit absolute
+  // references there. Same class of host-toolchain constraint as
+  // wantDSOLocal() - the AArch64 product target keeps the Small model.
+  if (JTMBOrErr->getTargetTriple().isOSBinFormatCOFF())
+    JTMBOrErr->setCodeModel(CodeModel::Large);
+  else
+    JTMBOrErr->setCodeModel(CodeModel::Small);
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
@@ -1219,8 +1230,12 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   if (auto Err = P->J->addIRModule(
           *JDOrErr,
           orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(Ctx)))) {
-    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error", cacheKey);
-    return Err;
+    // Carry the ORC error text into the diagnostic: which JD symbol the module
+    // could not claim is the only useful clue when this fails at load time.
+    std::string Reason = toString(std::move(Err));
+    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error: %s", cacheKey,
+              Reason.c_str());
+    return make_error<StringError>(std::move(Reason), inconvertibleErrorCode());
   }
 
   P->specDylibs[cacheKey] = &*JDOrErr;
