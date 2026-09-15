@@ -380,6 +380,9 @@ EJit::EJit(const Config &config) : config_(config) {
 }
 
 EJit::~EJit() {
+  // The small-table normal path must go first: it holds a process-global hook
+  // and a published entry that points into the compile driver's engine.
+  disableSmallTable();
   // Destroy in reverse order (compile driver holds references to other
   // components)
   compileDriver_.reset();
@@ -388,6 +391,57 @@ EJit::~EJit() {
   logger_.reset();
 #endif
   runtimeState_.reset();
+}
+
+Error EJit::enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
+                             EJitSmallTableHost::Options Opts) {
+  if (smallTableHost_) {
+    if (smallTableHost_->facts() == Facts)
+      return Error::success();
+    return make_error<StringError>(
+        "small-table normal path is already enabled on this instance",
+        inconvertibleErrorCode());
+  }
+  if (!Facts)
+    return make_error<StringError>(
+        "small-table normal path needs the product configuration-commit fact "
+        "source; without it readiness cannot be proven and nothing may be "
+        "specialized",
+        inconvertibleErrorCode());
+
+  // The host drives the SAME runtime state and registry the instance's compile
+  // driver uses, so a plan and its table resource belong to this instance.
+  auto HostOrErr = EJitSmallTableHost::create(
+      config_, runtimeState_->getRegistry(), *runtimeState_, std::move(Facts),
+      Opts);
+  if (!HostOrErr)
+    return HostOrErr.takeError();
+  smallTableHost_ = std::move(*HostOrErr);
+
+  // The real retraction path: retiring the shared dispatch cache drains the
+  // registered inline-cache cells and bumps the L0 dispatch epoch, so a call
+  // site that cached a specialized pointer stops reaching a drained generation.
+  smallTableHost_->setInvalidationHook([this]() {
+    clearCache();
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+    if (EJitSharedTaskPool *sp = sharedTaskPool())
+      sp->retireDispatchCache();
+#endif
+  });
+  EJitSmallTableHost::installGlobal(smallTableHost_.get());
+  EJIT_DIAG("small-table normal path enabled: provider=%s",
+            smallTableHost_->runtime().providerLabel().str().c_str());
+  return Error::success();
+}
+
+void EJit::disableSmallTable() {
+  if (!smallTableHost_)
+    return;
+  if (EJitSmallTableHost::global() == smallTableHost_.get())
+    EJitSmallTableHost::installGlobal(nullptr);
+  smallTableHost_->retractPublishedSlots();
+  smallTableHost_->cancel("small-table normal path disabled");
+  smallTableHost_.reset();
 }
 
 void EJit::recordInitError(int code, const std::string &message,

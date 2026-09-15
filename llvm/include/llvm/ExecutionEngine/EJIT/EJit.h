@@ -12,6 +12,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitError.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include <memory>
 #include <string>
@@ -173,6 +174,28 @@ public:
   /// A non-owner facade forwards the request to the compile-owner worker.
   bool printMayConstRanking();
 
+  //===--------------------------------------------------------------------===//
+  // PR231 small-table normal path (default OFF).
+  //
+  // Enabling constructs the one normal-path integration object for THIS
+  // instance, installs it process-wide so every application-facing dispatch
+  // entry consults its publication gate, and installs the instance's real
+  // invalidation path (shared cache/L0/inline-cache retirement) as the host's
+  // retraction hook. Until it is called, no dispatch entry is affected.
+  // `Facts` is the product configuration-commit binding; a null one means the
+  // caller cannot prove readiness and the call fails closed.
+  //===--------------------------------------------------------------------===//
+  Error enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
+                         EJitSmallTableHost::Options Opts = {});
+  /// Tear the small-table normal path down: retract every published slot,
+  /// cancel the session and uninstall the process-wide gate.
+  void disableSmallTable();
+  /// The instance's small-table integration object, or null when disabled.
+  EJitSmallTableHost *smallTableHost() { return smallTableHost_.get(); }
+  const EJitSmallTableHost *smallTableHost() const {
+    return smallTableHost_.get();
+  }
+
 private:
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;
@@ -181,6 +204,7 @@ private:
   std::unique_ptr<EJitLogger> logger_;
 #endif
   std::unique_ptr<EJitCompileDriver> compileDriver_;
+  std::unique_ptr<EJitSmallTableHost> smallTableHost_;
 
   /// Record the first construction-time registration failure (later ones are
   /// ignored so the earliest root cause is reported).

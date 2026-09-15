@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h" // PR231 dispatch gate
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitDimPair layout
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
@@ -659,6 +660,18 @@ ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
   // succeeds.
   if (!gEJIT->activate(periodName, cellIdx))
     return EJIT_ERR_INVALID_PARAM;
+  // PR231: the product's own activation is the lifecycle point at which a
+  // member's coordinate becomes derived-able. The host publishes that member's
+  // logical slot only if the configuration-commit facts already admitted it AND
+  // the table and code are ready; otherwise this activation does not make the
+  // entry usable and the AOT path stays in force. Never a readiness inference:
+  // the admission still comes from the fact source.
+  if (EJitSmallTableHost *Host = gEJIT->smallTableHost()) {
+    std::string Why;
+    const bool Published = Host->onProductActivated(periodName, cellIdx, &Why);
+    EJIT_DIAG_VERBOSE("activate(%s,%u) small-table slot published=%u (%s)",
+                      periodName, cellIdx, Published ? 1u : 0u, Why.c_str());
+  }
   return EJIT_OK;
 }
 
@@ -677,6 +690,13 @@ ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT->deactivate(periodName, cellIdx))
     return EJIT_ERR_INVALID_PARAM; // unknown lifecycle: nothing changed.
   gEJIT->invalidateByPeriod(periodName, cellIdx);
+  // PR231: the deactivated member's logical slot stops being published. Its
+  // published rows and every unrelated member/entry are untouched.
+  if (EJitSmallTableHost *Host = gEJIT->smallTableHost()) {
+    const bool Drained = Host->onProductDeactivated(periodName, cellIdx);
+    EJIT_DIAG_VERBOSE("deactivate(%s,%u) small-table slot drained=%u",
+                      periodName, cellIdx, Drained ? 1u : 0u);
+  }
   return EJIT_OK;
 }
 
@@ -911,6 +931,40 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
 }
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// PR231 small-table normal-path dispatch gate.
+//
+// Every application-facing dispatch API (the generic compile_or_get, the two
+// bound variants and the fixed-dimension 0d..4d fast paths) asks this gate
+// before the taskpool can hand a call site a compiled pointer, fill the
+// per-function inline-cache cell, or write the per-core L0 entry. When a
+// small-table host owns the function index and the row this call belongs to is
+// not admitted, not table-ready or not code-ready, the entry takes the ORIGINAL
+// AOT path: this call never receives a specialized pointer and never caches one.
+//
+// The gate can only ever REFUSE. With no host installed (the feature OFF) it
+// returns true unconditionally, so the baseline path is byte-for-byte the path
+// it was before this hook existed.
+inline bool smallTableAllowsDispatch(uint32_t funcIndex,
+                                     const ejit_dim_pair_t *dims,
+                                     uint32_t numDims) {
+  EJitSmallTableHost *Host = EJitSmallTableHost::global();
+  if (!Host)
+    return true;
+  if (!Host->isBoundTo(funcIndex))
+    return true;
+  SmallVector<uint32_t, 4> Types;
+  SmallVector<uint32_t, 4> Instances;
+  Types.reserve(numDims);
+  Instances.reserve(numDims);
+  for (uint32_t I = 0; I < numDims; ++I) {
+    Types.push_back(dims[I].dimType);
+    Instances.push_back(dims[I].instanceId);
+  }
+  std::string Why;
+  return Host->wouldDispatchCall(Types, Instances, &Why);
+}
+
 static ejit_status_t taskpoolCompileOrGetImpl(
     uint32_t funcIndex, const ejit_dim_pair_t *dims, uint32_t numDims,
     const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount,
@@ -963,6 +1017,18 @@ static ejit_status_t taskpoolCompileOrGetImpl(
           funcIndex, i, dims[i].instanceId);
       return EJIT_ERR_INVALID_PARAM;
     }
+  }
+
+  // PR231: the small-table publication gate. Refusing here (not after the
+  // lookup) is what keeps a call site from receiving -- and caching -- a
+  // specialized pointer for a row that is not admitted/published. Returning
+  // NOT_ACTIVE makes the wrapper take its AOT body, the same handling it
+  // already has for an uninitialized runtime.
+  if (!smallTableAllowsDispatch(funcIndex, dims, numDims)) {
+    EJIT_DIAG("taskpool_compile_or_get func=%u: small-table gate refused, AOT "
+              "path",
+              funcIndex);
+    return EJIT_ERR_NOT_ACTIVE;
   }
 
   // ejit_dim_pair_t and EJitDimPair share the same layout; pass through
@@ -1121,6 +1187,8 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  if (!smallTableAllowsDispatch(funcIndex, nullptr, 0))
+    return EJIT_ERR_NOT_ACTIVE;
   const uint64_t icTok = ejitIcacheBeginResolve();
 
   void *l0Fn = nullptr;
@@ -1168,6 +1236,10 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_INVALID_PARAM;
 
   const EJitDimPair dims[1] = {{dim0, inst0}};
+  if (!smallTableAllowsDispatch(funcIndex,
+                                reinterpret_cast<const ejit_dim_pair_t *>(dims),
+                                1))
+    return EJIT_ERR_NOT_ACTIVE;
   // Per-core L0: steady-state hit with no rwlock, scan, or read token.
   // kEJitNoBucket tells the caller no token was taken.
   void *l0Fn = nullptr;
@@ -1219,6 +1291,10 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_INVALID_PARAM;
 
   const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
+  if (!smallTableAllowsDispatch(funcIndex,
+                                reinterpret_cast<const ejit_dim_pair_t *>(dims),
+                                2))
+    return EJIT_ERR_NOT_ACTIVE;
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
     if (outFn)
@@ -1270,6 +1346,10 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_INVALID_PARAM;
 
   const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
+  if (!smallTableAllowsDispatch(funcIndex,
+                                reinterpret_cast<const ejit_dim_pair_t *>(dims),
+                                3))
+    return EJIT_ERR_NOT_ACTIVE;
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 3, &l0Fn)) {
     if (outFn)
@@ -1325,6 +1405,10 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
 
   const EJitDimPair dims[4] = {
       {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
+  if (!smallTableAllowsDispatch(funcIndex,
+                                reinterpret_cast<const ejit_dim_pair_t *>(dims),
+                                4))
+    return EJIT_ERR_NOT_ACTIVE;
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 4, &l0Fn)) {
     if (outFn)
@@ -1435,6 +1519,115 @@ unsigned ejit_taskpool_pending_count(void) {
     return 0;
   }
   return tp->pendingCount();
+}
+
+//===----------------------------------------------------------------------===//
+// PR231 small-table normal path: the wrapper enter/leave hooks.
+//
+// These are the ABI the AOT wrapper emits around a resolved specialized
+// dispatch. They only ever REFUSE (return null) or account an admitted
+// execution; nothing here decides readiness. With no host installed they are
+// constant-time null/ignore, so the feature being OFF costs a load and a branch
+// on the dispatch path and changes no behavior.
+//===----------------------------------------------------------------------===//
+
+void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
+                      uint32_t numDims, uint64_t *outTicket,
+                      const char **outWhy) {
+  if (outTicket)
+    *outTicket = 0;
+  if (outWhy)
+    *outWhy = "";
+  EJitSmallTableHost *Host = EJitSmallTableHost::global();
+  if (!Host)
+    return nullptr;
+  if (!Host->isBoundTo(funcIndex))
+    return nullptr;
+  // One host drives one entry, so a call for another function index is not this
+  // host's business: refuse rather than publish a foreign row.
+  if (numDims > 0 && !dims)
+    return nullptr;
+
+  SmallVector<uint32_t, 4> Types;
+  SmallVector<uint32_t, 4> Instances;
+  Types.reserve(numDims);
+  Instances.reserve(numDims);
+  for (uint32_t I = 0; I < numDims; ++I) {
+    Types.push_back(dims[I].dimType);
+    Instances.push_back(dims[I].instanceId);
+  }
+  std::string Why;
+  uint64_t Serial = 0;
+  void *Entry = Host->enter(Types, Instances, &Serial, &Why);
+  if (!Entry) {
+    if (outWhy)
+      *outWhy = Why.c_str();
+    return nullptr;
+  }
+  if (outTicket && Serial != 0)
+    *outTicket = Serial;
+  return Entry;
+}
+
+void ejit_stab_leave(uint64_t ticket) {
+  EJitSmallTableHost *Host = EJitSmallTableHost::global();
+  if (!Host || ticket == 0)
+    return;
+  Host->leave(ticket);
+}
+
+void ejit_stab_dispatch(uint32_t funcIndex, const uint32_t *coordinate,
+                        uint32_t numDims, void **outEntry, uint64_t *outTicket,
+                        int *outStatus) {
+  if (outEntry)
+    *outEntry = nullptr;
+  if (outTicket)
+    *outTicket = 0;
+  if (outStatus)
+    *outStatus = EJIT_STAB_NOT_BOUND;
+  EJitSmallTableHost *Host = EJitSmallTableHost::global();
+  if (!Host || !Host->isBoundTo(funcIndex))
+    return;
+  if (!coordinate && numDims != 0)
+    return;
+  if (numDims != Host->dims().size()) {
+    if (outStatus)
+      *outStatus = EJIT_STAB_COORDINATE_UNPROVABLE;
+    return;
+  }
+
+  // The gate is the same one the ordinary dispatch API uses, so a coordinate
+  // handed out here has passed admission, table readiness, code readiness and
+  // slot publication. The real call is the caller's, then `ejit_stab_leave`.
+  SmallVector<uint32_t, 4> Types;
+  SmallVector<uint32_t, 4> Instances;
+  for (unsigned D = 0; D < Host->dims().size(); ++D) {
+    Types.push_back(Host->dimTypes()[D]);
+    Instances.push_back(static_cast<uint32_t>(coordinate[D]));
+  }
+  std::string Why;
+  uint64_t Serial = 0;
+  void *Entry = Host->enter(Types, Instances, &Serial, &Why);
+  if (!Entry) {
+    if (outStatus)
+      *outStatus = EJIT_STAB_AOT;
+    return;
+  }
+  if (outEntry)
+    *outEntry = Entry;
+  if (outTicket && Serial != 0)
+    *outTicket = Serial;
+  if (outStatus)
+    *outStatus = EJIT_STAB_DISPATCHED;
+}
+
+bool ejit_small_table_host_installed(void) {
+  return EJitSmallTableHost::global() != nullptr;
+}
+
+uint64_t ejit_small_table_published_slots(void) {
+  EJitSmallTableHost *Host = EJitSmallTableHost::global();
+  return Host ? Host->publishedSlots() : 0;
 }
 
 ejit_status_t ejit_publish_pending_code(void) {

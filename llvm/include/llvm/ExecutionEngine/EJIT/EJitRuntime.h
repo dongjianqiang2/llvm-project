@@ -299,6 +299,68 @@ void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);
 
+//===----------------------------------------------------------------------===//
+// PR231 small-table normal path: the wrapper enter/leave hooks.
+//
+// The AOT wrapper emits these around a resolved specialized dispatch so that an
+// admitted execution is accounted, and the sampling session's protected read
+// stays held, for the ACTUAL call rather than only for the pointer lookup:
+//
+//   entry = ejit_stab_enter(funcIndex, dims, numDims, &ticket);
+//   if (entry) { result = entry(args...); ejit_stab_leave(ticket); }
+//   else       { ...original AOT body... }
+//
+// `ejit_stab_enter` returns NULL unless tableReady, codeReady, the member's
+// admission and the published logical slot all hold for the row this call
+// belongs to, so the caller can never reach a specialization that was not
+// admitted. With no small-table host installed (the feature OFF) it always
+// returns NULL and the wrapper behaves exactly as before. `ticket` is 0 when
+// the execution ran but was not counted (the aggregate budget is reached):
+// `ejit_stab_leave(0)` is a no-op.
+//
+// `ejit_stab_dispatch` is the same policy applied to a call by MEMBER
+// COORDINATE: the caller gets the specialized entry only after the gate admits
+// the coordinate, and the real call is made by the caller and closed with
+// `ejit_stab_leave`. `ejit_small_table_host_installed` reports whether any of
+// this is active.
+//===----------------------------------------------------------------------===//
+
+/// Outcome of a small-table dispatch request. Mirrors
+/// `EJitSmallTableDispatch`; kept as plain integers so the C ABI does not
+/// depend on the C++ enum's layout.
+#define EJIT_STAB_DISPATCHED 0
+#define EJIT_STAB_NOT_BOUND 1
+#define EJIT_STAB_AOT 2
+#define EJIT_STAB_COORDINATE_UNPROVABLE 3
+#define EJIT_STAB_NO_ENTRY 4
+
+/// Wrapper enter hook. Returns the callable specialized entry when this
+/// execution may run specialized code, else NULL. \p outTicket receives the
+/// execution's ticket for `ejit_stab_leave` (0 when not counted). \p outWhy
+/// optionally receives a fixed diagnostic string (never allocated).
+void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
+                      uint32_t numDims, uint64_t *outTicket,
+                      const char **outWhy);
+
+/// Wrapper leave hook. Idempotent for ticket 0; a ticket whose session is no
+/// longer current is a stale callback: it is rejected and counted, never merged
+/// into another generation.
+void ejit_stab_leave(uint64_t ticket);
+
+/// Coordinate form: ask for the specialized entry of \p coordinate (one index
+/// per declared dimension, outermost first). Writes EJIT_STAB_* to \p outStatus,
+/// the entry to \p outEntry and the ticket to \p outTicket. The caller makes
+/// the real call and then calls `ejit_stab_leave`.
+void ejit_stab_dispatch(uint32_t funcIndex, const uint32_t *coordinate,
+                        uint32_t numDims, void **outEntry, uint64_t *outTicket,
+                        int *outStatus);
+
+/// True while a small-table normal-path host is installed process-wide.
+bool ejit_small_table_host_installed(void);
+
+/// Number of logical slots the installed host currently publishes.
+uint64_t ejit_small_table_published_slots(void);
+
 unsigned ejit_taskpool_pending_count(void);
 
 /// Seal and publish all completed asynchronous specializations staged in the
