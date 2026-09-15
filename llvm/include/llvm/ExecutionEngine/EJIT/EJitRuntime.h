@@ -306,17 +306,28 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 // admitted execution is accounted, and the sampling session's protected read
 // stays held, for the ACTUAL call rather than only for the pointer lookup:
 //
-//   entry = ejit_stab_enter(funcIndex, dims, numDims, &ticket);
-//   if (entry) { result = entry(args...); ejit_stab_leave(ticket); }
-//   else       { ...original AOT body... }
+//   entry = ejit_stab_enter(funcIndex, dims, numDims, &ticket, &why);
+//   if (entry)          { result = entry(args...); ejit_stab_leave(ticket); }
+//   else if (why)       { ...original AOT body... }   // policy applies, refused
+//   else                { ...unchanged dispatch... }  // no policy for this entry
 //
 // `ejit_stab_enter` returns NULL unless tableReady, codeReady, the member's
 // admission and the published logical slot all hold for the row this call
 // belongs to, so the caller can never reach a specialization that was not
-// admitted. With no small-table host installed (the feature OFF) it always
-// returns NULL and the wrapper behaves exactly as before. `ticket` is 0 when
-// the execution ran but was not counted (the aggregate budget is reached):
-// `ejit_stab_leave(0)` is a no-op.
+// admitted. `ticket` is 0 when the execution ran but was not counted (the
+// aggregate budget is reached): `ejit_stab_leave(0)` is a no-op.
+//
+// The THREE answers above are the ABI the wrapper's three dispatch paths depend
+// on. Only a function index a host is actually bound to is under small-table
+// policy; for every other entry the hook answers "no policy" (NULL entry and
+// `*outWhy == NULL`) and the wrapper must keep its ordinary dispatch, because
+// one host bound to one entry must not disable JIT specialization for the rest
+// of the image. `*outWhy != NULL` always means the policy applies and refused.
+// The reason text is a fixed literal (never allocated) and is diagnostic only.
+//
+// With no small-table host installed (the feature OFF) the hook answers "no
+// policy", so a wrapper built with the hooks always keeps its previous behavior
+// when the product has not activated a small table.
 //
 // `ejit_stab_dispatch` is the same policy applied to a call by MEMBER
 // COORDINATE: the caller gets the specialized entry only after the gate admits
@@ -337,7 +348,10 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 /// Wrapper enter hook. Returns the callable specialized entry when this
 /// execution may run specialized code, else NULL. \p outTicket receives the
 /// execution's ticket for `ejit_stab_leave` (0 when not counted). \p outWhy
-/// optionally receives a fixed diagnostic string (never allocated).
+/// receives NULL when no small-table policy owns \p funcIndex (the caller keeps
+/// its unchanged dispatch), or a fixed diagnostic literal when the policy
+/// applies and refused (the caller takes the AOT body). The literal is never
+/// allocated and must not be retained, freed or modified.
 void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
                       uint32_t numDims, uint64_t *outTicket,
                       const char **outWhy);

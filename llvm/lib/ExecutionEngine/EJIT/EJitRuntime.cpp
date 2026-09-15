@@ -1536,17 +1536,29 @@ void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
                       const char **outWhy) {
   if (outTicket)
     *outTicket = 0;
+  // Null outWhy is the wrapper's third answer: "no small-table policy owns this
+  // function index". The wrapper then keeps its UNCHANGED dispatch -- it must
+  // not take the AOT path, or one host bound to one entry would disable
+  // specialization for every other entry of the image (the dispatch gate in
+  // `smallTableAllowsDispatch` deliberately leaves a foreign funcIndex alone
+  // for the same reason). A non-null reason means the policy applies and
+  // refused, and the wrapper takes its AOT body. The text is diagnostic only:
+  // it is a literal, not a per-call allocation, so a C caller must not retain,
+  // free or modify it.
   if (outWhy)
-    *outWhy = "";
+    *outWhy = nullptr;
   EJitSmallTableHost *Host = EJitSmallTableHost::global();
   if (!Host)
     return nullptr;
   if (!Host->isBoundTo(funcIndex))
     return nullptr;
-  // One host drives one entry, so a call for another function index is not this
-  // host's business: refuse rather than publish a foreign row.
-  if (numDims > 0 && !dims)
+  // From here on the policy applies to this function index: every remaining
+  // early return is a refusal, so it must answer with a non-null reason.
+  if (numDims > 0 && !dims) {
+    if (outWhy)
+      *outWhy = "the call carries no dimensions";
     return nullptr;
+  }
 
   SmallVector<uint32_t, 4> Types;
   SmallVector<uint32_t, 4> Instances;
@@ -1561,7 +1573,7 @@ void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
   void *Entry = Host->enter(Types, Instances, &Serial, &Why);
   if (!Entry) {
     if (outWhy)
-      *outWhy = Why.c_str();
+      *outWhy = "refused";
     return nullptr;
   }
   if (outTicket && Serial != 0)
