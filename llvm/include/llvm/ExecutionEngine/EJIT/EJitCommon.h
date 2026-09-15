@@ -134,6 +134,17 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
     "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
+// PR231 normal-path small-table hooks. `ejit_stab_enter(i32 funcIndex,
+// ptr dims, i32 numDims, ptr outTicket, ptr outWhy)` returns the callable
+// specialized entry only when tableReady, codeReady, the member's admission and
+// its published logical slot all hold for this call's row, and records the
+// execution as in flight; `ejit_stab_leave(i64 ticket)` closes it. The wrapper
+// emits them around a resolved specialized dispatch so in-flight accounting and
+// the sampling session's protected read cover the ACTUAL call. Both are emitted
+// only under -ejit-small-table-hooks (default off), so the baseline AOT wrapper
+// is byte-for-byte unchanged when the feature is off.
+constexpr const char *FN_STAB_ENTER = "ejit_stab_enter";
+constexpr const char *FN_STAB_LEAVE = "ejit_stab_leave";
 constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
 constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
     "ejit_taskpool_trace_wrapper";

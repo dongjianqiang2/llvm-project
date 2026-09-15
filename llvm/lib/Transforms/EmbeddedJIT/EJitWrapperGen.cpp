@@ -56,6 +56,20 @@ using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
 
+// PR231: emit the small-table enter/leave hooks around a resolved specialized
+// dispatch. OFF by default: the baseline wrapper (and its frame-less inline-cache
+// dispatcher) is unchanged unless the product builds with this enabled. When it
+// is on, a resolved specialization is called under `ejit_stab_enter`/`_leave`, so
+// the runtime accounts the ACTUAL execution (aggregate sampling budget, in-flight
+// drain before freeze, generation retirement) and the sampling session's
+// protected read covers the call rather than only the pointer lookup. The hook
+// returns null for a row that is not admitted and published, in which case the
+// wrapper takes its AOT body exactly as it does for an uninitialized runtime.
+cl::opt<bool> EnableEJitSmallTableHooks(
+    "ejit-small-table-hooks", cl::init(false), cl::Hidden,
+    cl::desc("Emit the PR231 small-table ejit_stab_enter/ejit_stab_leave hooks "
+             "around a resolved specialized dispatch (default off)"));
+
 // Emit fixed-dimension taskpool fast-path C ABI calls
 // (ejit_taskpool_compile_or_get_Nd, N = dim count) for entries with <= 2 dims
 // (0-2 dims fit in 8 integer arg registers, no stack spill). Entries with > 2
@@ -604,6 +618,19 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   M.getOrInsertFunction(
       FN_TASKPOOL_RELEASE_READ,
       FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
+  // PR231 small-table hooks (emitted only under -ejit-small-table-hooks):
+  //   ptr ejit_stab_enter(i32 funcIndex, ptr dims, i32 numDims, ptr outTicket,
+  //                       ptr outWhy)
+  //   void ejit_stab_leave(i64 ticket)
+  auto *StabI64Ty = Type::getInt64Ty(Ctx);
+  if (EnableEJitSmallTableHooks) {
+    M.getOrInsertFunction(
+        FN_STAB_ENTER,
+        FunctionType::get(PtrTy, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
+    M.getOrInsertFunction(
+        FN_STAB_LEAVE,
+        FunctionType::get(Type::getVoidTy(Ctx), {StabI64Ty}, false));
+  }
   // With -ejit-inline-cache the wrapper reads its per-function
   // @__ejit_icache_fn_<name> slot directly (one atomic load + null-check +
   // indirect call) - no ejit_icache_try call, no per-call guards.
@@ -1116,6 +1143,50 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Dst->splice(Dst->end(), &OrigEntry, OrigEntry.begin(), OrigEntry.end());
       OrigEntry.replaceAllUsesWith(Dst);
       OrigEntry.eraseFromParent();
+    };
+
+    // PR231: call `ejit_stab_enter` for the row this call belongs to and, when
+    // it refuses, take the AOT path instead of the specialized one. Emitted only
+    // under -ejit-small-table-hooks; the enter hook is the ONLY thing that can
+    // turn a resolved specialization into a refused one, and a refusal is never
+    // a silent fall-through to the JIT code.
+    //
+    // Returns the ticket value (i64, 0 when the execution is not counted). On
+    // refusal it branches to \p RefuseBB.
+    //
+    // NOT CALLED YET: the three call sites (the compile_or_get dispatch block,
+    // the inline-cache hit path and the frame-less dispatcher) are the next
+    // action recorded in RESULT.md section 6. The flag defaults to off, so the
+    // emitted wrapper is byte-for-byte the previous one in every current build;
+    // these helpers exist so that turning the flag on is the only change needed.
+    [[maybe_unused]] auto emitStabEnter = [&](IRBuilder<> &B,
+                                              BasicBlock *RefuseBB,
+                                              BasicBlock *AdmittedBB,
+                                              Value *FuncIdx, Value *DimsPtr,
+                                              unsigned NumDims) -> Value * {
+      if (!EnableEJitSmallTableHooks)
+        return nullptr;
+      Value *TicketAlloca =
+          B.CreateAlloca(I64Ty, nullptr, "ejit_stab_ticket");
+      B.CreateStore(ConstantInt::get(I64Ty, 0), TicketAlloca);
+      Value *WhyAlloca = B.CreateAlloca(PtrTy, nullptr, "ejit_stab_why");
+      Value *Entered = B.CreateCall(
+          M.getFunction(FN_STAB_ENTER),
+          {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, NumDims),
+           B.CreatePointerCast(TicketAlloca, PtrTy),
+           B.CreatePointerCast(WhyAlloca, PtrTy)},
+          "ejit_stab_entry");
+      B.CreateCondBr(B.CreateIsNotNull(Entered), AdmittedBB, RefuseBB);
+      B.SetInsertPoint(AdmittedBB);
+      return B.CreateLoad(I64Ty, TicketAlloca, "ejit_stab_ticket_v");
+    };
+
+    /// Close an execution opened by emitStabEnter. A zero ticket is a no-op in
+    /// the runtime, so it is always safe to emit.
+    [[maybe_unused]] auto emitStabLeave = [&](IRBuilder<> &B, Value *Ticket) {
+      if (!EnableEJitSmallTableHooks || !Ticket)
+        return;
+      B.CreateCall(M.getFunction(FN_STAB_LEAVE), {Ticket});
     };
 
     if (EmitIcacheProbe) {
