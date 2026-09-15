@@ -1184,17 +1184,21 @@ TEST_F(SmallTableHostTest, LifecycleBoundaryPublishesAndDrainsOneMember) {
 // 7. The entry matrix and separate byte accounting
 //===----------------------------------------------------------------------===//
 
-TEST_F(SmallTableHostTest, SixByTwentyEntryMatrixSharesTheTableContract) {
-  // The workload shape the plan asks for: 6 cells x 20 TRPs, driven through the
-  // normal request/dispatch API by several entries that share one configured
-  // table. The declared shape stays 16x32; the window is a WINDOW of it, never a
-  // hardcoded capacity.
+TEST_F(SmallTableHostTest, SixEntriesBySixCellsByTwentyTrpsShareTheTableContract) {
+  // The workload shape the plan asks for, stated explicitly: 6 entries x 6 cells
+  // x 20 TRPs, driven through the normal request/dispatch API by several entries
+  // that share one configured table. The declared shape stays 16x32; the window
+  // is a WINDOW of it, never a hardcoded capacity.
   //
-  // Entry count is bounded by the wrapper ABI, not by choice: each entry needs
-  // its own lifecycle dimension pair, and `EJitLifecycleRegistry` has exactly
-  // `kEJitMaxDimTypes` (8) dimType slots process-wide, so at most four entries
-  // can carry two dimensions each. That bound is reported, not worked around.
-  constexpr unsigned kEntries = 4;
+  // The first 4 entries each own a DISTINCT lifecycle pair, which is what fills
+  // the 8 process-global dimType slots (`kEJitMaxDimTypes`); the last 2 entries
+  // SHARE pairs 0 and 1, so they consume no new dimType slot. The supported
+  // entry count is therefore not 4 and not a dimType limit: the binding limit is
+  // the set of distinct lifecycle names, and the entry count itself is bounded
+  // by the entry registry (`EJitFuncRegistry`), which the shared entries are
+  // registered in below. Bounds are reported, not worked around.
+  constexpr unsigned kEntries = 4;      // entries that own a distinct pair
+  constexpr unsigned kSharedEntries = 2; // extra entries over existing pairs
   constexpr unsigned kMatrixWindowCells = 6;
 
   std::vector<std::unique_ptr<EJitSmallTableHost>> Hosts;
@@ -1307,6 +1311,75 @@ TEST_F(SmallTableHostTest, SixByTwentyEntryMatrixSharesTheTableContract) {
   OS.flush();
   RecordProperty("matrix_accounting", Report);
   std::cout << "[ PR231 matrix accounting ]\n" << Report;
+
+  // The entry-registration mechanism, investigated rather than assumed: the
+  // first 4 entries above each own two lifecycle names, which is what fills the 8
+  // process-global dimType slots. Entries that SHARE a lifecycle pair consume no
+  // new dimType slot, so the supported entry count is not 4: two more entries
+  // over pairs 0 and 1 are registered, planned, published and dispatched over the
+  // SAME 6 x 20 window here, for 6 entries x 6 cells x 20 TRPs in total.
+  EXPECT_EQ(EJitLifecycleRegistry::instance().count(), kEntries * 2u)
+      << "four distinct pairs fill the 8 process-global dimType slots";
+  for (unsigned E = 0; E < kSharedEntries; ++E) {
+    const unsigned Pair = E % kEntries;
+    const std::string Entry = "m_entry_shared_" + std::to_string(E);
+    auto M = parseHost(Entry, "g_matrix", "g_matrix_out", kCeilingCells,
+                       kCeilingTrps);
+    ASSERT_TRUE(M) << Entry;
+    auto F = std::make_shared<EJitSmallTableHostFactSource>(
+        "g_matrix", &g_matrix[0][0], sizeof(g_matrix), 0x6F00 + E);
+    for (unsigned C = 0; C < kMatrixWindowCells; ++C)
+      for (unsigned T = 0; T < kMatrixTrps; ++T)
+        F->addReadyMember({C, T}, 0x6F00 + E * 256 + C * 32 + T);
+    Config Cfg;
+    auto H = EJitSmallTableHost::create(Cfg, State.getRegistry(), State, F,
+                                        EJitSmallTableHost::Options{});
+    ASSERT_TRUE(static_cast<bool>(H)) << toString(H.takeError());
+    auto HostPtr = std::move(*H);
+    EJitSmallTableHost::EntryRequest Req;
+    Req.module = M.get();
+    Req.entryName = Entry;
+    Req.funcIndex = EJitFuncRegistry::instance().resolveAssign(Entry);
+    Req.sourceVarName = "g_matrix";
+    SmallVector<EJitSmallTableDim, 2> D =
+        hostDims(kCeilingCells, kCeilingTrps);
+    Req.dims = D;
+    // The SAME lifecycle names as an earlier entry: no new dimType slot.
+    std::vector<std::string> P = {CellPeriods[Pair], TrpPeriods[Pair]};
+    Req.dimPeriodNames = P;
+    Req.codeGeneration = 99 + E;
+    const uint32_t DimTypeSlotsBefore =
+        EJitLifecycleRegistry::instance().count();
+    std::string Why;
+    Error ReqErr =
+        HostPtr->requestEntry(Req, reinterpret_cast<void *>(&aotFocusEntry), Why);
+    ASSERT_FALSE(static_cast<bool>(ReqErr))
+        << Entry << ": " << toString(std::move(ReqErr)) << " (" << Why << ")";
+    EXPECT_NE(Req.funcIndex, kEJitInvalidFuncIndex)
+        << "the ENTRY registry, not the dimType registry, bounds entry count";
+    EXPECT_EQ(EJitLifecycleRegistry::instance().count(), DimTypeSlotsBefore)
+        << "an entry sharing another entry's lifecycle pair must consume no new "
+           "dimType slot";
+    ASSERT_TRUE(HostPtr->driveSampling(4096, 1) > 0) << Entry;
+    ASSERT_FALSE(static_cast<bool>(HostPtr->publishGeneration(Why)))
+        << Entry << ": " << Why;
+    EXPECT_EQ(HostPtr->dimTypes()[0],
+              EJitLifecycleRegistry::instance().lookup(CellPeriods[Pair]));
+    EXPECT_EQ(HostPtr->dimTypes()[1],
+              EJitLifecycleRegistry::instance().lookup(TrpPeriods[Pair]));
+    EXPECT_EQ(HostPtr->publishedSlots(), kMatrixWindowCells * kMatrixTrps);
+    // The same 6 x 20 window through the shared entry's own dispatch.
+    for (unsigned C = 0; C < kMatrixWindowCells; ++C)
+      for (unsigned T = 0; T < kMatrixTrps; ++T) {
+        const uint32_t DS[2] = {HostPtr->dimTypes()[0], HostPtr->dimTypes()[1]};
+        const uint32_t IS[2] = {C, T};
+        const auto R = HostPtr->dispatch(DS, IS, 2);
+        ASSERT_EQ(R.status, EJitSmallTableDispatch::Dispatched)
+            << Entry << ": " << R.why;
+        EXPECT_EQ(R.value, aotResult(g_matrix[C][T], 2))
+            << Entry << " cell=" << C << " trp=" << T;
+      }
+  }
 }
 
 } // namespace
