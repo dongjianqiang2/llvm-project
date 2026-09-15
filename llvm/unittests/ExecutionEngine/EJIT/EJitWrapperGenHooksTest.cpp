@@ -518,9 +518,9 @@ private:
     orc::SymbolMap Syms;
     auto &ES = J.getExecutionSession();
     auto Add = [&](StringRef Name, const void *Addr) {
-      Syms[ES.intern(Name)] = orc::JITEvaluatedSymbol(
-          pointerToJITTargetAddress(Addr), orc::JITSymbolFlags::Exported |
-                                               orc::JITSymbolFlags::Callable);
+      Syms[ES.intern(Name)] = JITEvaluatedSymbol(
+          pointerToJITTargetAddress(Addr),
+          JITSymbolFlags::Exported | JITSymbolFlags::Callable);
     };
     // The module's own globals.
     Add("g_wrap", static_cast<const void *>(&g_wrap[0].mode));
