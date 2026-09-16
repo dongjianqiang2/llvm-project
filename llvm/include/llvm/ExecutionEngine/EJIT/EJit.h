@@ -142,6 +142,11 @@ public:
   const EJitSharedTaskPool *sharedTaskPool() const;
 #endif
 
+  /// Access the compile driver (for the C ABI's read-only diagnostics entry
+  /// points). May be null if the driver was not constructed.
+  EJitCompileDriver *compileDriver() { return compileDriver_.get(); }
+  const EJitCompileDriver *compileDriver() const { return compileDriver_.get(); }
+
   /// Access the module loader (for funcIndex → funcName resolution in
   /// diagnostics). Always constructed; valid for the lifetime of the instance.
   EJitModuleLoader &moduleLoader() { return *moduleLoader_; }

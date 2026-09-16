@@ -6,6 +6,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitPreservedScalar.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -31,6 +33,11 @@ using namespace llvm::ejit;
 #define DEBUG_TYPE "ejit-struct-field"
 
 void EJitStructFieldPass::initFromModule(Module &M) {
+  // A pass instance may be reused after the previous module was destroyed.
+  // Never preserve keys that point into old IR across a rebuild.
+  mapsBuilt_ = false;
+  gvPeriodMap_.clear();
+  mayConstFieldMap_.clear();
   EJIT_DIAG_VERBOSE("struct-field initFromModule module=%s globals=%zu",
                     M.getName().str().c_str(), M.global_size());
   // Build GV period map.
@@ -82,6 +89,7 @@ void EJitStructFieldPass::initFromModule(Module &M) {
 
   initBoundArgumentPropagation(M);
   initFreeDimAssumptions(M);
+  initPreservedDimensions(M);
   mapsBuilt_ = true;
 #ifdef EJIT_DIAG_ENABLE
   EJIT_DIAG_DEBUG("struct-field initFromModule module=%s globals=%zu "
@@ -1787,6 +1795,387 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
 }
 #endif
 
+// The preserved-dimension policy never falls back to the legacy pointer-base
+// or absolute-address patterns. A failed proof costs a fold, not correctness.
+void EJitStructFieldPass::setPreservedDimensions(
+    const SpecializationContext &Ctx) {
+  preserveDimensions_ = true;
+  mapsBuilt_ = false;
+  boundRootFunction_ = Ctx.fnName;
+  preservedDimensions_.clear();
+  preservedContextValid_ = Ctx.dimensions.size() <= EJIT_ICACHE_MAX_DIMS;
+  if (!preservedContextValid_)
+    return;
+  for (const auto &Dim : Ctx.dimensions)
+    preservedDimensions_.emplace_back(Dim.periodName, Dim.cellIdx);
+}
+
+std::optional<uint8_t>
+EJitStructFieldPass::preservedInstance(StringRef Period) const {
+  std::optional<uint8_t> Result;
+  for (const auto &Dim : preservedDimensions_) {
+    if (Dim.first != Period)
+      continue;
+    if (Result)
+      return std::nullopt;
+    Result = Dim.second;
+  }
+  return Result;
+}
+
+void EJitStructFieldPass::initPreservedDimensions(Module &M) {
+  preservedArgs_.clear();
+  preservedLoadArgs_.clear();
+  preservedFunctions_.clear();
+  if (!preserveDimensions_ || !preservedContextValid_)
+    return;
+
+  // Cold-path inference has a finite budget. Exhaustion retains the loads;
+  // it must never re-enable legacy whole-parameter/pointer-base replacement.
+  constexpr unsigned MaxFunctions = 256, MaxCalls = 4096, MaxArgs = 1024;
+  Function *Root = M.getFunction(boundRootFunction_);
+  if (!Root || Root->isDeclaration() || !Root->use_empty() ||
+      preservedDimensions_.size() > EJIT_ICACHE_MAX_DIMS ||
+      M.size() > MaxFunctions)
+    return;
+  MDNode *MD = Root->getMetadata(MD_EJIT_METADATA);
+  if (!hasMDStringEntry(MD, TAG_EJIT_ENTRY))
+    return;
+  for (const auto &Dim : preservedDimensions_)
+    if (Dim.first.empty() || !preservedInstance(Dim.first))
+      return;
+
+  DenseMap<const Function *, SmallVector<CallBase *, 4>> Callers;
+  SmallVector<CallBase *, 32> Calls;
+  unsigned NumArgs = 0;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (F.arg_size() > MaxArgs - NumArgs)
+      return;
+    NumArgs += F.arg_size();
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (Calls.size() == MaxCalls)
+            return;
+          Calls.push_back(CB);
+          if (Function *Callee = getDirectCallee(*CB))
+            Callers[Callee].push_back(CB);
+        }
+  }
+
+  // Seed only the selected entry. A same-named period in another function is
+  // not proof of the actual argument arriving along an edge into that function.
+  SmallVector<StringRef, 4> SeenPeriods;
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    if (!Sub || Sub->getNumOperands() < 3)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      continue;
+    auto *Period = dyn_cast<MDString>(Sub->getOperand(1));
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (!Period || !Idx || Idx->getValue().getActiveBits() > 32 ||
+        Idx->getZExtValue() >= Root->arg_size()) {
+      preservedArgs_.clear();
+      return;
+    }
+    auto Instance = preservedInstance(Period->getString());
+    if (!Instance)
+      continue;
+    Argument *Arg = Root->getArg(static_cast<unsigned>(Idx->getZExtValue()));
+    if (!Arg->getType()->isIntegerTy() || preservedArgs_.count(Arg) ||
+        is_contained(SeenPeriods, Period->getString()) || freeDimArgs_.count(Arg) ||
+        APInt(8, *Instance).getActiveBits() >
+            Arg->getType()->getIntegerBitWidth()) {
+      preservedArgs_.clear();
+      return;
+    }
+    SeenPeriods.push_back(Period->getString());
+    preservedArgs_[Arg] = *Instance;
+  }
+
+  // Establish a closed direct-call region. Address-taken or external helpers,
+  // other entry boundaries, and callers outside the region are not evidence.
+  // A referenced/recursive root is conservatively rejected above as well.
+  preservedFunctions_.insert(Root);
+  bool Changed;
+  do {
+    Changed = false;
+    for (CallBase *CB : Calls) {
+      Function *Callee = getDirectCallee(*CB);
+      if (!Callee || Callee->isDeclaration() || !Callee->hasLocalLinkage() ||
+          Callee->hasAddressTaken() || Callee->isVarArg() ||
+          hasMDStringEntry(Callee->getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY) ||
+          !preservedFunctions_.count(CB->getFunction()))
+        continue;
+      Changed |= preservedFunctions_.insert(Callee).second;
+    }
+  } while (Changed);
+  do {
+    Changed = false;
+    SmallVector<const Function *, 8> Invalid;
+    for (const Function *F : preservedFunctions_) {
+      if (F == Root)
+        continue;
+      for (CallBase *CB : Callers[F])
+        if (!preservedFunctions_.count(CB->getFunction())) {
+          Invalid.push_back(F);
+          break;
+        }
+    }
+    for (const Function *F : Invalid)
+      Changed |= preservedFunctions_.erase(F);
+  } while (Changed);
+
+  // Admit a formal only if every incoming edge proves the same integer value.
+  // This monotone process never invents a value for an unknown/recursive cycle.
+  // PR223 free_dim witnesses may authorize a LOAD evaluation, never this proof.
+  unsigned EdgeEvaluationsLeft = 16384;
+  do {
+    Changed = false;
+    for (const Function *F : preservedFunctions_) {
+      if (F == Root)
+        continue;
+      for (const Argument &Arg : F->args()) {
+        if (!Arg.getType()->isIntegerTy() || preservedArgs_.count(&Arg))
+          continue;
+        std::optional<APInt> Expected;
+        bool Valid = !Callers[F].empty();
+        for (CallBase *CB : Callers[F]) {
+          if (!EdgeEvaluationsLeft) {
+            preservedArgs_.clear();
+            preservedFunctions_.clear();
+            return;
+          }
+          --EdgeEvaluationsLeft;
+          if (Arg.getArgNo() >= CB->arg_size() ||
+              CB->getArgOperand(Arg.getArgNo())->getType() != Arg.getType()) {
+            Valid = false;
+            break;
+          }
+          auto Actual = evalWithAssumed(CB->getArgOperand(Arg.getArgNo()),
+                                        preservedArgs_, 0);
+          if (!Actual || Actual->getActiveBits() > 64 ||
+              (Expected && *Expected != *Actual)) {
+            Valid = false;
+            break;
+          }
+          Expected = std::move(Actual);
+        }
+        if (Valid && Expected) {
+          preservedArgs_[&Arg] = Expected->getZExtValue();
+          Changed = true;
+        }
+      }
+    }
+  } while (Changed);
+
+  preservedLoadArgs_ = preservedArgs_;
+  for (const auto &Arg : freeDimArgs_)
+    if (preservedFunctions_.count(Arg.first->getParent()))
+      preservedLoadArgs_.try_emplace(Arg.first, Arg.second);
+}
+
+// Checked displacement calculation for the preserved policy. Negative steps
+// are deliberately unsupported: an out-of-bounds intermediate inbounds GEP
+// must not be laundered by a later negative GEP. No source IR is changed.
+static std::optional<std::pair<const Value *, uint64_t>>
+getPreservedOffset(const Value *Ptr, const DataLayout &DL,
+                   const AssumedArgMap &Assumed) {
+  if (DL.getPointerSizeInBits(0) != 64 || DL.getIndexSizeInBits(0) != 64 ||
+      DL.isNonIntegralAddressSpace(0))
+    return std::nullopt;
+  APInt Total(64, 0);
+  for (unsigned Depth = 0; Ptr && Depth != 16; ++Depth) {
+    if (!Ptr->getType()->isPointerTy() ||
+        Ptr->getType()->getPointerAddressSpace() != 0)
+      return std::nullopt;
+    if (isa<GlobalVariable>(Ptr) || isa<Argument>(Ptr))
+      return std::make_pair(Ptr, Total.getZExtValue());
+    if (const auto *Cast = dyn_cast<BitCastOperator>(Ptr)) {
+      Ptr = Cast->getOperand(0);
+      continue;
+    }
+    const auto *GEP = dyn_cast<GEPOperator>(Ptr);
+    if (!GEP || GEP->getNumIndices() > 16)
+      return std::nullopt;
+    for (auto TI = gep_type_begin(GEP), TE = gep_type_end(GEP); TI != TE; ++TI) {
+      auto Index = evalWithAssumed(TI.getOperand(), Assumed, 0);
+      if (!Index || TI.isVector() || Index->isNegative() ||
+          !Index->isSignedIntN(64))
+        return std::nullopt;
+      APInt Part(64, 0);
+      if (TI.isStruct()) {
+        if (Index->getActiveBits() > 32 ||
+            Index->getZExtValue() >= TI.getStructType()->getNumElements())
+          return std::nullopt;
+        uint64_t Offset = DL.getStructLayout(TI.getStructType())->getElementOffset(
+            static_cast<unsigned>(Index->getZExtValue()));
+        if (Offset > INT64_MAX)
+          return std::nullopt;
+        Part = APInt(64, Offset);
+      } else {
+        if (!TI.getIndexedType()->isSized())
+          return std::nullopt;
+        TypeSize Stride = TI.getSequentialElementStride(DL);
+        if (Stride.isScalable() || Stride.getFixedValue() > INT64_MAX)
+          return std::nullopt;
+        bool Overflow = false;
+        Part = Index->sextOrTrunc(64).smul_ov(
+            APInt(64, Stride.getFixedValue()), Overflow);
+        if (Overflow)
+          return std::nullopt;
+      }
+      bool Overflow = false;
+      Total = Total.sadd_ov(Part, Overflow);
+      if (Overflow)
+        return std::nullopt;
+    }
+    Ptr = GEP->getPointerOperand();
+  }
+  return std::nullopt;
+}
+
+static Constant *readPreservedConstant(const uint8_t *Data, uint64_t Size,
+                                        uint64_t Offset, Type *Ty,
+                                        const DataLayout &DL) {
+  if (!(Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 64) &&
+      !Ty->isFloatTy() && !Ty->isDoubleTy())
+    return nullptr;
+  const unsigned Bytes = DL.getTypeStoreSize(Ty).getFixedValue();
+  uint64_t Bits;
+  if (!llvm::ejit::detail::readPreservedScalar(Data, Size, Offset, Bytes,
+                                  DL.isLittleEndian(), Bits))
+    return nullptr;
+  if (Ty->isIntegerTy())
+    return ConstantInt::get(Ty, APInt(Ty->getIntegerBitWidth(), Bits));
+  const fltSemantics &Semantics =
+      Ty->isFloatTy() ? APFloat::IEEEsingle() : APFloat::IEEEdouble();
+  return ConstantFP::get(Ty->getContext(),
+                         APFloat(Semantics, APInt(Bytes * 8, Bits)));
+}
+
+Constant *EJitStructFieldPass::tryReplacePreservedLoad(LoadInst *LI,
+                                                     const DataLayout &DL) {
+  auto Reject = [](const char *Reason) -> Constant * {
+    (void)Reason;
+    EJIT_DIAG_VERBOSE("preserved-dim load kept: %s", Reason);
+    return nullptr;
+  };
+  if (!preservedFunctions_.count(LI->getFunction()) || LI->isVolatile() ||
+      LI->isAtomic())
+    return nullptr;
+  bool Authorized = isMayConstLoad(LI, mayConstFieldMap_, DL);
+  for (const BoundPointerState &State : boundStates_)
+    Authorized |= isBoundMayConstLoad(LI, State.boundArguments,
+                                      State.mayConstFields, DL,
+                                      preservedLoadArgs_);
+  if (!Authorized)
+    return nullptr;
+  Type *Ty = LI->getType();
+  if (!(Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 64) &&
+      !Ty->isFloatTy() && !Ty->isDoubleTy())
+    return Reject("unsupported-scalar-type");
+  auto Address =
+      getPreservedOffset(LI->getPointerOperand(), DL, preservedLoadArgs_);
+  if (!Address)
+    return Reject("unknown-or-unbounded-address");
+  const uint64_t Offset = Address->second;
+  const uint64_t Bytes = DL.getTypeStoreSize(Ty).getFixedValue();
+
+  if (const auto *GV = dyn_cast<GlobalVariable>(Address->first)) {
+    auto It = gvPeriodMap_.find(GV);
+    if (It == gvPeriodMap_.end() ||
+        !isMayConstLoad(LI, mayConstFieldMap_, DL))
+      return nullptr;
+    const GVPeriodInfo &Info = It->second;
+    auto Instance = preservedInstance(Info.periodName);
+    if (!Instance)
+      return Reject("missing-lifecycle-dependency");
+    unsigned PeriodTags = 0;
+    for (const MDOperand &Op : GV->getMetadata(MD_EJIT_METADATA)->operands())
+      if (auto *Sub = dyn_cast<MDNode>(Op.get()))
+        if (Sub->getNumOperands() >= 2)
+          if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0)))
+            PeriodTags += Tag->getString() == TAG_EJIT_PERIOD_ARR ||
+                          Tag->getString() == TAG_EJIT_PERIOD;
+    if (PeriodTags != 1 || !GV->getValueType()->isSized() ||
+        GV->getValueType()->isPointerTy())
+      return Reject("ambiguous-or-unbounded-registration");
+    TypeSize Extent = DL.getTypeAllocSize(GV->getValueType());
+    if (Extent.isScalable() || Extent.getFixedValue() > INT64_MAX)
+      return Reject("unsupported-object-extent");
+    const uint8_t *Base = nullptr;
+    if (Info.isArray) {
+      auto *AT = dyn_cast<ArrayType>(GV->getValueType());
+      const auto *Registered = registry_.getArrayInfo(GV->getName().str());
+      if (!AT || !Registered || Registered->periodName != Info.periodName ||
+          AT->getNumElements() != Info.arraySize ||
+          Registered->arraySize != Info.arraySize)
+        return Reject("registration-shape-mismatch");
+      TypeSize Stride = DL.getTypeAllocSize(AT->getElementType());
+      if (Stride.isScalable() ||
+          !detail::fitsPreservedElement(Offset, Bytes, Stride.getFixedValue(),
+                                        Info.arraySize, *Instance))
+        return Reject("untracked-element-or-out-of-bounds");
+      Base = static_cast<const uint8_t *>(Registered->baseAddr);
+    } else {
+      if (*Instance != 0)
+        return Reject("untracked-static-instance");
+      Base = static_cast<const uint8_t *>(
+          registry_.getStaticVarAddr(GV->getName().str()));
+    }
+    return readPreservedConstant(Base, Extent.getFixedValue(), Offset, Ty, DL);
+  }
+
+  // Keep existing bounded borrowed views. This phase adds no delayed/group
+  // borrows and retains no object beyond the existing compile callback.
+  const auto *Arg = dyn_cast<Argument>(Address->first);
+  Function *Root = LI->getModule()->getFunction(boundRootFunction_);
+  if (!Arg || !Root)
+    return nullptr;
+  for (const BoundPointerState &State : boundStates_) {
+    auto It = State.boundArguments.find(Arg);
+    if (It == State.boundArguments.end())
+      continue;
+    unsigned Descriptors = 0;
+    for (const auto &View : boundPointers_)
+      Descriptors += View.argIndex == State.view.argIndex;
+    unsigned Contracts = 0;
+    for (const MDOperand &Op : Root->getMetadata(MD_EJIT_METADATA)->operands())
+      if (auto *Sub = dyn_cast<MDNode>(Op.get()))
+        if (Sub->getNumOperands() >= 3) {
+          auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+          auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+          if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && Idx &&
+              Idx->getValue().getActiveBits() <= 32)
+            Contracts += Idx->getZExtValue() == State.view.argIndex;
+        }
+    if (Descriptors != 1 || Contracts != 1)
+      return Reject("ambiguous-bound-contract");
+    MDNode *BoundMD = getBoundArgumentMetadata(*Root, State.view.argIndex);
+    if (!BoundMD)
+      return Reject("missing-bound-contract");
+    auto *Period = dyn_cast<MDString>(BoundMD->getOperand(1));
+    auto *Size = mdconst::dyn_extract<ConstantInt>(BoundMD->getOperand(3));
+    auto Instance = Period ? preservedInstance(Period->getString()) : std::nullopt;
+    if (!Instance || State.view.periodInstance != *Instance)
+      return Reject("missing-bound-lifecycle-dependency");
+    if (!Size || Size->getValue().getActiveBits() > 32 ||
+        !Size->getZExtValue() || Size->getZExtValue() > State.view.size ||
+        It->second > UINT64_MAX - Offset ||
+        !isBoundMayConstLoad(LI, State.boundArguments, State.mayConstFields,
+                             DL, preservedLoadArgs_))
+      return nullptr;
+    return readPreservedConstant(State.view.rawPtr, Size->getZExtValue(),
+                                  It->second + Offset, Ty, DL);
+  }
+  return nullptr;
+}
+
 PreservedAnalyses
 EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();
@@ -1826,6 +2215,22 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 #ifdef EJIT_DIAG_ENABLE
       ++totalLoads;
 #endif
+
+      if (preserveDimensions_) {
+#ifdef EJIT_DIAG_ENABLE
+        bool IsMayConst = isMayConstLoad(LI, mayConstFieldMap_, DL);
+        for (const BoundPointerState &State : boundStates_)
+          IsMayConst |= isBoundMayConstLoad(
+              LI, State.boundArguments, State.mayConstFields, DL,
+              preservedLoadArgs_);
+        mayConstLoads += IsMayConst;
+#endif
+        if (Constant *C = tryReplacePreservedLoad(LI, DL))
+          replacements.push_back({LI, C});
+        // Failure must not enter a legacy pattern that freezes a pointer base
+        // or reads an unbounded pointee. Only a proven load result may change.
+        continue;
+      }
 
       // A pointer-form period global is itself the root needed to reach nested
       // may_const fields. It has no may_const marker of its own, but replacing

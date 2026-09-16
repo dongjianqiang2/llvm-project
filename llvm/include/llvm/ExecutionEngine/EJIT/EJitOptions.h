@@ -46,9 +46,26 @@ struct Config {
   /// (~640 KB stripped runtime, P0-1) is incurred whenever the PGO component
   /// libs are linked, regardless of this flag; this flag only gates behavior.
   bool enablePgo = false;
+  /// Representative-PGO group sharing (V1, default OFF). When on, the compile
+  /// driver groups the cells of one candidate identity, elects ONE legal
+  /// representative per group generation, keeps non-representatives on their
+  /// AOT fallback until the group's immutable profile bundle is published, and
+  /// lets a member reuse the group's physical Tier-2 only after the emitter's
+  /// exact final-identity compare. Requires enablePgo (Async + normal online
+  /// PGO). Profile audit diagnostics may remain enabled alongside PGO; with
+  /// PGO off, the opt-in is rejected before any group/queue side effect.
+  bool enableRepresentativeSharing = false;
+  /// No-progress bound in ejit_taskpool_trace_now units (host nanoseconds,
+  /// SRE cycle counter ticks). Deployments must configure their clock scale.
+  uint64_t representativeIdleTimeoutTicks = 5000000000ULL;
+  /// Number of new sampling rounds allowed after timeout of the first round.
+  uint32_t representativeMaxReelections = 2;
+  /// Failed member final transforms may retry this many times after the first.
+  uint32_t representativeMaxFinalRetries = 2;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   /// Build-option-gated runtime sampling. This reuses the temporary
   /// instrumented tier but does not require profile-guided optimization.
+  /// With enablePgo, diagnostics accompany normal PGOUse, not audit-only mode.
   bool enableProfileAudit = true;
 #else
   bool enableProfileAudit = false;

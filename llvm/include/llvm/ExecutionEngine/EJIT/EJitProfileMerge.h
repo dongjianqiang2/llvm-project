@@ -30,6 +30,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,10 @@
 
 namespace llvm {
 namespace ejit {
+
+/// Forward declaration: only a pointer to the fixed-layout Tier-2 request is
+/// needed here, so this header stays independent of the queue header/layout.
+struct EJitCompileRequest;
 
 /// A Tier-1 captured counter reference: the PGO function name (suffix of
 /// __profc_<pgoName>) and the raw addresses of the counter/data globals that
@@ -96,6 +101,86 @@ struct PgoValueFunction {
   uint32_t numScalarSites = 0;
 };
 
+/// Exact schema captured with a representative Tier-1 and checked before a
+/// frozen profile is consumed by another logical member. The PGO name is kept
+/// alongside both hashes because neither hash is accepted as proof of equality.
+struct PgoFunctionSchema {
+  std::string pgoName;
+  uint64_t funcHash = 0;
+  uint64_t pgoNameHash = 0;
+  uint32_t numCounters = 0;
+  uint32_t numIcSites = 0;
+  uint32_t numMemSites = 0;
+  uint32_t numScalarSites = 0;
+};
+
+enum class ProfileSnapshotQuality : uint8_t {
+  Complete,
+  ApproximateInFlight,
+  EdgeOnly,
+  ValueDataDropped,
+};
+
+/// Quality of the observed Tier-1 dispatch boundary carried by a profile
+/// bundle. It is deliberately separate from the snapshot quality: the snapshot
+/// says how complete the collected profile is, this says whether the dispatch
+/// window that produced it was actually observed.
+enum class T1DispatchObservationQuality : uint8_t {
+  /// No trustworthy observation (legacy/tokenless mode, non-shared pool, or a
+  /// request whose identity no longer matches the profile). count/quotaEnd are
+  /// reported as 0; the configured threshold is never substituted.
+  Unavailable = 0,
+  /// The observed dispatch count reached the admission limit and the final
+  /// allowed dispatch was observed. quotaEnd holds the frozen timestamp, or 0
+  /// when no clock was configured (timestamp unknown).
+  FrozenAtQuota = 1,
+  /// The count was observed but admission had not closed when the bundle was
+  /// built (in-flight/approximate window). quotaEnd is 0: the boundary is not
+  /// known yet and must not be inferred from the compile time.
+  PartialOpenQuota = 2,
+};
+
+/// Immutable handoff from one representative sampling session to every Tier-2
+/// consumer in its candidate group. Ownership is shared and const after
+/// construction; no consumer borrows the representative's temporary vectors.
+struct EJitProfileBundle {
+  uint64_t groupId = 0;
+  uint64_t groupGeneration = 0;
+  uint64_t profileEpoch = 0;
+  uint64_t samplingSessionId = 0;
+  uint64_t representativeLogicalKey = 0;
+  uint64_t representativeAttemptToken = 0;
+  /// Observed real Tier-1 dispatches for the representative attempt: only a
+  /// granted Tier-1 pointer return counts. 0 when unavailable.
+  uint64_t actualDispatchCount = 0;
+  /// Timestamp of the final allowed dispatch (the end of dispatch admission).
+  /// 0 means unknown; it is never the Tier-2 queue or compile time.
+  uint64_t quotaEnd = 0;
+  /// When the bounded snapshot finished (schema validated). A deliberately
+  /// different instant from quotaEnd: queue wait and compilation are not part
+  /// of the dispatch window.
+  uint64_t freezeCompletedAt = 0;
+  /// Admission quota the observed count was measured against (0 = unavailable).
+  uint64_t dispatchLimit = 0;
+  /// Whether actualDispatchCount/quotaEnd are real observations.
+  T1DispatchObservationQuality dispatchQuality =
+      T1DispatchObservationQuality::Unavailable;
+  ProfileSnapshotQuality quality = ProfileSnapshotQuality::ApproximateInFlight;
+  bool hasEdgeProfile = false;
+  bool valueProfileEnabled = false;
+  bool valueProfileComplete = false;
+  std::string indexedProfile;
+  std::vector<PgoScalarSite> scalarSites;
+  std::vector<PgoFunctionSchema> schema;
+  struct VerifiedTarget {
+    uintptr_t address = 0;
+    uint64_t pgoNameHash = 0;
+  };
+  std::vector<VerifiedTarget> verifiedTargets;
+};
+
+using EJitFrozenProfileBundle = std::shared_ptr<const EJitProfileBundle>;
+
 /// Synthesize an indexed profile buffer from captured Tier-1 counters.
 /// Returns an empty string on failure (caller skips Tier-2 / falls back to
 /// Tier-1). Reads the __llvm_profile_data layout via InstrProfData.inc
@@ -104,6 +189,13 @@ struct PgoValueFunction {
 /// buffer carries the value profile records (edge + value in one profile).
 std::string synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters,
                                     ArrayRef<PgoValueSite> valueSites);
+
+/// Capture the exact counter/value-site schema paired with a Tier-1 object.
+/// Returns false on malformed runtime data; callers must not freeze a bundle
+/// when this validation fails.
+bool readProfileSchema(ArrayRef<PgoCounterRef> counters,
+                       ArrayRef<PgoValueFunction> valueFunctions,
+                       std::vector<PgoFunctionSchema> &schema);
 
 /// Edge-only convenience overload (no value profile data).
 inline std::string synthesizeProfileBuffer(ArrayRef<PgoCounterRef> counters) {
@@ -146,6 +238,50 @@ bool aggregateValueSamples(ArrayRef<EJitVpSiteSample> samples,
                            SmallVectorImpl<PgoScalarSite> &scalarSites);
 
 #endif // EJIT_SRE_PGO_VALUE_PROFILE
+
+/// The representative Tier-1 attempt identity of one profile session: captured
+/// from the real Tier-1 compile request when the Instrumented tier is compiled
+/// and later validated against the physical Tier-2 request before its frozen
+/// dispatch observation is allowed into the profile bundle.
+struct Tier1ProfileAttemptIdentity {
+  uint64_t representativeAttemptToken = 0;
+  uint32_t generation = 0;
+};
+
+/// Production capture used by EJitCompileDriver::compileCold for the
+/// Instrumented tier. A null request (non-shared/legacy compile) captures the
+/// zero identity, which makes applyT1DispatchObservation() report Unavailable
+/// rather than attach an observation to the wrong session.
+Tier1ProfileAttemptIdentity
+captureTier1ProfileAttemptIdentity(const EJitCompileRequest *Tier1Request);
+
+/// Apply the frozen observed Tier-1 dispatch metadata carried by a Tier-2
+/// request to \p Bundle (experimental sharing contract, ABI v21).
+///
+/// The observation is accepted only when it belongs to the exact attempt and
+/// generation that produced the profile: \p Request must carry attemptToken
+/// \p expectedAttemptToken (nonzero) and generation \p expectedGeneration, the
+/// same identity the caller resolved from its Tier-1 sampling session. A stale
+/// request (cancel/replace, generation change, or a request built before the
+/// observation existed) therefore reports Unavailable with count 0 and
+/// quotaEnd 0 instead of attaching another session's numbers. A malformed
+/// count > limit is rejected the same way.
+///
+/// On success actualDispatchCount is the observed count (never the configured
+/// threshold), dispatchLimit is the admission quota, and dispatchQuality is
+/// FrozenAtQuota when the count reached the limit (quotaEnd then holds the
+/// frozen timestamp, 0 = unknown clock) or PartialOpenQuota otherwise.
+void applyT1DispatchObservation(EJitProfileBundle &Bundle,
+                                const EJitCompileRequest *Request,
+                                uint64_t expectedAttemptToken,
+                                uint32_t expectedGeneration);
+
+/// Overload of the call above with the captured Tier-1 identity; the driver
+/// uses this form so the whole chain (real Tier-1 request -> recorded identity
+/// -> physical Tier-2 request -> bundle) is one production call pair.
+void applyT1DispatchObservation(
+    EJitProfileBundle &Bundle, const EJitCompileRequest *Request,
+    const Tier1ProfileAttemptIdentity &Tier1Attempt);
 
 } // namespace ejit
 } // namespace llvm

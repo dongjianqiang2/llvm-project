@@ -15,6 +15,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -57,7 +60,17 @@ bool mockCompile(void * /*ctx*/, const EJitCompileRequest &req, void **outFn) {
   return true;
 }
 
+// Deliberate production-compiler failure used by the request-attempt stale
+// callback matrix. Returning false forces the worker's CompileFailure path so
+// the attempt, dedup claim and borrow/publication events all settle together.
+bool mockCompileAlwaysFail(void * /*ctx*/, const EJitCompileRequest & /*req*/,
+                           void **outFn) {
+  *outFn = nullptr;
+  return false;
+}
+
 struct BoundPointerLog {
+  uint32_t calls = 0;
   uint32_t argIndex = 0;
   uint32_t size = 0;
   uint32_t value = 0;
@@ -67,6 +80,7 @@ struct BoundPointerLog {
 bool mockCompileBoundPointer(void *ctx, const EJitCompileRequest &req,
                              void **outFn) {
   auto *log = static_cast<BoundPointerLog *>(ctx);
+  ++log->calls;
   log->boundCount = req.boundCount;
   if (req.boundCount == 1) {
     const auto &Bound = req.boundPointers[0];
@@ -467,6 +481,25 @@ protected:
     EJitCoreId::resetForTest();
   }
 
+  // Ordinary hits retain code forever in NO_RECLAIM. Representative sampling
+  // has a separate lifetime contract and is checked by its execution tests.
+  void expectOrdinaryHitToken(const EJitSharedTaskPool::CompileOrGetResult &Hit) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    EXPECT_FALSE(Hit.hasReadToken);
+    EXPECT_EQ(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    expectNoReaders();
+#else
+    EXPECT_TRUE(Hit.hasReadToken);
+    ASSERT_LT(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    EXPECT_GT(state_->buckets[Hit.bucketIndex].readers.loadAcquire(), 0u);
+#endif
+  }
+
+  void expectNoReaders() {
+    for (uint32_t B = 0; B < kEJitSharedCacheBuckets; ++B)
+      EXPECT_EQ(state_->buckets[B].readers.loadAcquire(), 0u) << "bucket " << B;
+  }
+
   // Register a test-local stand-in for the wrapper's @__ejit_icache_fn_<name>
   // cell table. \p missFn non-null models a SENTINEL-form slot (NumDims <= 2,
   // timing off): the table is defined pre-filled with &MissFn and the runtime
@@ -479,12 +512,17 @@ protected:
 
   // Bring up a single owner on core 0 with the mock compiler and (by default)
   // no injected worker (the test drives pollOne()).
-  void bringUpOwner(EJitSharedTaskPool &pool, bool codeSharing = false) {
+  void bringUpOwner(EJitSharedTaskPool &pool, bool codeSharing = false,
+                    bool requestAttempts = false, bool pgoEnabled = false) {
     EJitCoreId::setCurrentForTest(0);
     pool.bind(state_.get());
     pool.setCompiler(&mockCompile, nullptr);
     pool.setMode(EJitCompileMode::Async);
     pool.setCodeSharingEnabled(codeSharing);
+    if (pgoEnabled)
+      pool.setPgoEnabled(true, 1);
+    if (requestAttempts)
+      ASSERT_TRUE(pool.setRequestAttemptsEnabled(true));
     ASSERT_EQ(pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
   }
 
@@ -1668,11 +1706,9 @@ TEST_F(SharedTaskPoolTest, PublishLookupAndReadTokenRelease) {
   auto hit = owner.compileOrGet(11, d0, 1, codeFor(11));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(11));
-  EXPECT_TRUE(hit.hasReadToken);
-  // A held read token keeps readers > 0.
-  EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  expectOrdinaryHitToken(hit);
   owner.releaseRead(hit.bucketIndex);
-  EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  expectNoReaders();
 }
 
 //===----------------------------------------------------------------------===//
@@ -2285,8 +2321,9 @@ TEST_F(SharedTaskPoolTest, CodeSharingOnReturnsSamePointerToPeer) {
   auto peerHit = peer.compileOrGet(61, nullptr, 0, codeFor(61));
   ASSERT_EQ(peerHit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(peerHit.fnPtr, codeFor(61)); // same pointer cross-core
-  EXPECT_TRUE(peerHit.hasReadToken);
+  expectOrdinaryHitToken(peerHit);
   peer.releaseRead(peerHit.bucketIndex);
+  expectNoReaders();
 }
 
 // 七.7 — a request whose generation has been superseded is dropped at the
@@ -2466,8 +2503,9 @@ TEST_F(SharedTaskPoolTest, FourKPeerSplitsOnceSealsSinglePage) {
   auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(1));
-  EXPECT_TRUE(hit.hasReadToken);
+  expectOrdinaryHitToken(hit);
   owner.releaseRead(hit.bucketIndex);
+  expectNoReaders();
 
   ASSERT_EQ(fourK.splits.size(), 1u);
   EXPECT_EQ(fourK.splits[0].first, range.poolBase);
@@ -3137,8 +3175,18 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // requests; v14 introduced bound-pointer transport, and v15 adds
   // per-version post-publish reuse tracking; v16 adds near/far placement.
   // v17 adds explicit batch publish state.
-  // v18 replaces the inline bound-pointer payload with borrowed descriptors.
-  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
+  // v18 replaced the inline bound-pointer payload with borrowed descriptors;
+  // v19 adds non-reusable request attempts and exact dedup claims; v20 binds
+  // each published cache slot to the exact originating attempt; v21 records the
+  // observed real Tier-1 dispatch boundary (count/limit/quotaEnd) in the slot
+  // and carries it through the Tier-2 request; v22 adds the per-bucket
+  // observationLock that serializes the observed admission commit with every
+  // publish/cancel/reset of the same bucket's observation identity. The v22
+  // word lives in the bucket header padding, so the blob size and every slot
+  // offset stay unchanged.
+  EXPECT_EQ(kEJitSharedAbiVersion, 22u);
+  EXPECT_EQ(offsetof(EJitSharedCacheBucket, observationLock), 12u);
+  EXPECT_EQ(offsetof(EJitSharedCacheBucket, slots), 16u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -3377,11 +3425,8 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(1));
-  EXPECT_TRUE(fast.hasReadToken);
+  expectOrdinaryHitToken(fast);
   EXPECT_FALSE(fast.readyButNotShareable);
-  // A held read token keeps readers > 0 (same ownership contract as
-  // compileOrGet — the caller must release through releaseRead).
-  EXPECT_GT(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
 
   EJitSharedDiagnostics after;
   owner.getDiagnostics(after);
@@ -3391,7 +3436,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_EQ(after.pendingCount, 0u);
 
   owner.releaseRead(fast.bucketIndex);
-  EXPECT_EQ(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+  expectNoReaders();
 }
 
 // 2/ A true miss is NOT terminal on the fast path (no enqueue), and the slow
@@ -3508,8 +3553,9 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitEvenWhenModeOff) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(30));
-  EXPECT_TRUE(fast.hasReadToken);
+  expectOrdinaryHitToken(fast);
   owner.releaseRead(fast.bucketIndex);
+  expectNoReaders();
 }
 
 //===----------------------------------------------------------------------===//
@@ -3540,9 +3586,9 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   EXPECT_TRUE(h0.fastPathTerminal);
   EXPECT_EQ(h0.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h0.fnPtr, codeFor(1));
-  EXPECT_TRUE(h0.hasReadToken);
-  EXPECT_GT(state_->buckets[h0.bucketIndex].readers.loadAcquire(), 0u);
+  expectOrdinaryHitToken(h0);
   owner.releaseRead(h0.bucketIndex);
+  expectNoReaders();
 
   // 1D
   EJitDimPair d1[1] = {dim(0, 1)};
@@ -3550,8 +3596,9 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   auto h1 = owner.tryCacheHit1D(2, 0, 1);
   ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h1.fnPtr, codeFor(2));
-  EXPECT_TRUE(h1.hasReadToken);
+  expectOrdinaryHitToken(h1);
   owner.releaseRead(h1.bucketIndex);
+  expectNoReaders();
 
   // 2D
   EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
@@ -3560,6 +3607,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h2.fnPtr, codeFor(3));
   owner.releaseRead(h2.bucketIndex);
+  expectNoReaders();
 
   // 3D
   EJitDimPair d3[3] = {dim(0, 1), dim(1, 2), dim(2, 3)};
@@ -3568,6 +3616,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h3.fnPtr, codeFor(4));
   owner.releaseRead(h3.bucketIndex);
+  expectNoReaders();
 
   // 4D
   EJitDimPair d4[4] = {dim(0, 1), dim(1, 2), dim(2, 3), dim(3, 4)};
@@ -3576,6 +3625,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h4.fnPtr, codeFor(5));
   owner.releaseRead(h4.bucketIndex);
+  expectNoReaders();
 
   // Cache hits do not enqueue/dedup.
   EJitSharedDiagnostics d;
@@ -3668,8 +3718,9 @@ TEST_F(SharedTaskPoolTest, FixedDimServesHitEvenWhenModeOff) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(40));
-  EXPECT_TRUE(fast.hasReadToken);
+  expectOrdinaryHitToken(fast);
   owner.releaseRead(fast.bucketIndex);
+  expectNoReaders();
 }
 
 // readyButNotShareable: a peer core that may not read the pointer gets a clean
@@ -6203,6 +6254,40 @@ struct PgoRecorder {
   std::vector<uint32_t> t2Gen;  // generation per Tier-2 compile
   std::vector<uint32_t> t2Ver0; // versions[0] per Tier-2 compile
 };
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+// Force one completed publish epoch between resolveMatchedSlot() and the
+// outer cacheLookupSeq() stability check. This models a writer that raced the
+// load-only reader while keeping the slot contents unchanged, so the probe can
+// distinguish a discarded quota charge from a committed legacy hit.
+struct LegacySeqlockRetryControl {
+  EJitSharedTaskPoolState *state = nullptr;
+  uint32_t callbacks = 0;
+  bool forced = false;
+};
+void forceOneLegacySeqlockRetry(void *ctx, uint32_t bucketIndex) {
+  auto *control = static_cast<LegacySeqlockRetryControl *>(ctx);
+  ++control->callbacks;
+  if (control->forced || !control->state)
+    return;
+  control->forced = true;
+  // A real publish advances odd/even; advance by two here because the test
+  // hook runs after the slot resolve and must leave a stable, changed epoch
+  // for the retry to observe.
+  control->state->buckets[bucketIndex].publishSeq.fetchAdd(2);
+}
+
+// Exhaust every bounded NO_RECLAIM lookup attempt. This is intentionally a
+// deterministic writer epoch bump, not a timing race: the hook runs after the
+// slot resolve and leaves a changed, stable epoch for the outer reader check.
+void forceEveryLegacySeqlockRetry(void *ctx, uint32_t bucketIndex) {
+  auto *control = static_cast<LegacySeqlockRetryControl *>(ctx);
+  ++control->callbacks;
+  if (control->state)
+    control->state->buckets[bucketIndex].publishSeq.fetchAdd(2);
+}
+#endif
+
 bool mockCompileRecordPgo(void *ctx, const EJitCompileRequest &req,
                           void **outFn) {
   auto *r = static_cast<PgoRecorder *>(ctx);
@@ -6486,10 +6571,22 @@ TEST_F(SharedTaskPoolTest, ConcurrentPeersCapTier1AtConfiguredSampleCount) {
             EJitCompileOrGetStatus::EnqueuedPending);
   ASSERT_TRUE(owner.pollOne());
 
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  struct UnexpectedCall {
+    EJitSharedTaskPool::CompileOrGetResult result;
+    uint32_t call = 0;
+    uint64_t hits = 0, dispatches = 0, quotaEnd = 0;
+    uint32_t active = 0, pending = 0;
+  } observations[kThreads][kCallsPerThread];
+  uint32_t observationCount[kThreads] = {};
+  void *const tier1Pointer = reinterpret_cast<void *>(slot->fnPtr.loadAcquire());
+
   std::atomic<uint32_t> ready{0};
   std::atomic<bool> go{false};
   std::atomic<uint32_t> tier1Calls{0};
   std::atomic<uint32_t> aotCalls{0};
+  std::atomic<uint32_t> deferredCalls{0};
   std::atomic<uint32_t> unexpected{0};
   std::vector<std::thread> peers;
   for (uint32_t thread = 0; thread < kThreads; ++thread) {
@@ -6500,15 +6597,42 @@ TEST_F(SharedTaskPoolTest, ConcurrentPeersCapTier1AtConfiguredSampleCount) {
         std::this_thread::yield();
       for (uint32_t call = 0; call < kCallsPerThread; ++call) {
         auto result = owner.compileOrGet(5, nullptr, 0, codeFor(5));
-        if (result.status == EJitCompileOrGetStatus::CacheHit) {
+        const bool validDeferral =
+            result.status == EJitCompileOrGetStatus::PgoAdmissionDeferred &&
+            result.fnPtr == codeFor(5) && !result.hasReadToken &&
+            result.bucketIndex == 0 && !result.readyButNotShareable &&
+            !result.fastPathTerminal;
+        bool record = false;
+        if (result.status == EJitCompileOrGetStatus::CacheHit &&
+            result.fnPtr == tier1Pointer) {
           tier1Calls.fetch_add(1, std::memory_order_relaxed);
-          if (result.hasReadToken)
-            owner.releaseRead(result.bucketIndex);
         } else if (result.status == EJitCompileOrGetStatus::AlreadyPending &&
-                   result.fnPtr == codeFor(5)) {
+                   result.fnPtr == codeFor(5) && !result.hasReadToken) {
           aotCalls.fetch_add(1, std::memory_order_relaxed);
-        } else
+        } else if (validDeferral) {
+          // An exhausted bounded lookup can miss the active T1 slot. Existing
+          // PGO admission then explicitly defers this call to AOT, not to T1.
+          aotCalls.fetch_add(1, std::memory_order_relaxed);
+          deferredCalls.fetch_add(1, std::memory_order_relaxed);
+          record = true;
+        } else {
           unexpected.fetch_add(1, std::memory_order_relaxed);
+          record = true;
+        }
+        if (result.hasReadToken)
+          owner.releaseRead(result.bucketIndex);
+        if (record) {
+          // Each peer owns its records. Print only after join, without I/O or
+          // extra synchronization in the contended lookup path.
+          auto &observation = observations[thread][observationCount[thread]++];
+          observation.result = result;
+          observation.call = call;
+          observation.hits = slot->hitCount.loadRelaxed();
+          observation.dispatches = slot->t1DispatchCount.loadRelaxed();
+          observation.quotaEnd = slot->t1QuotaEnd.loadRelaxed();
+          observation.active = state_->pgoActiveFunctionCount.loadAcquire();
+          observation.pending = owner.pendingCount();
+        }
       }
     });
   }
@@ -6518,11 +6642,34 @@ TEST_F(SharedTaskPoolTest, ConcurrentPeersCapTier1AtConfiguredSampleCount) {
   for (auto &peer : peers)
     peer.join();
 
+  for (uint32_t thread = 0; thread < kThreads; ++thread)
+    for (uint32_t i = 0; i < observationCount[thread]; ++i) {
+      const auto &observation = observations[thread][i];
+      const auto &result = observation.result;
+      std::fprintf(stderr,
+                   "LEGACY_CONCURRENT_RESULT thread=%u call=%u status=%u "
+                   "fnPtr=%p hasReadToken=%u bucket=%u terminal=%u "
+                   "unshareable=%u hits=%llu dispatches=%llu quotaEnd=%llu "
+                   "active=%u pending=%u finalGrants=%u finalAot=%u\n",
+                   thread, observation.call, static_cast<unsigned>(result.status),
+                   result.fnPtr, static_cast<unsigned>(result.hasReadToken),
+                   result.bucketIndex,
+                   static_cast<unsigned>(result.fastPathTerminal),
+                   static_cast<unsigned>(result.readyButNotShareable),
+                   static_cast<unsigned long long>(observation.hits),
+                   static_cast<unsigned long long>(observation.dispatches),
+                   static_cast<unsigned long long>(observation.quotaEnd),
+                   observation.active, observation.pending, tier1Calls.load(),
+                   aotCalls.load());
+    }
+
   EXPECT_EQ(tier1Calls.load(), kThreshold);
   EXPECT_EQ(aotCalls.load(), kThreads * kCallsPerThread - kThreshold);
   EXPECT_EQ(unexpected.load(), 0u);
-  EJitSharedCacheSlot *slot = findReadySlot(5);
-  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(tier1Calls.load() + aotCalls.load() + unexpected.load(),
+            kThreads * kCallsPerThread);
+  EXPECT_LE(deferredCalls.load(), aotCalls.load());
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), deferredCalls.load());
   EXPECT_EQ(slot->hitCount.loadRelaxed(), kThreshold);
   EXPECT_EQ(slot->tier.loadRelaxed(),
             static_cast<uint8_t>(kEJitTierInstrumented));
@@ -6532,6 +6679,468 @@ TEST_F(SharedTaskPoolTest, ConcurrentPeersCapTier1AtConfiguredSampleCount) {
   ASSERT_TRUE(owner.pollOne());
   EXPECT_EQ(rec.tier2, 1);
 }
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+// Drive the exact cold-peer interleaving from the coordinator's independent
+// reproducer.  The hook is placed after peerPrepareSlot() has revalidated the
+// old pointer; the nested owner lookup consumes the final legacy grant and can
+// optionally publish Tier-2 through the real queue worker.
+struct LegacyColdPublishControl {
+  EJitSharedTaskPool *owner = nullptr;
+  uint32_t funcIndex = 0;
+  EJitDimPair dims[2] = {};
+  uint32_t numDims = 0;
+  bool consumeOther = true;
+  bool publishTier2 = false;
+  unsigned callbacks = 0;
+  bool polled = false;
+  EJitSharedTaskPool::CompileOrGetResult otherHit;
+};
+
+void consumeLegacyQuotaAfterColdRevalidation(void *ctx, uint32_t) {
+  auto &Control = *static_cast<LegacyColdPublishControl *>(ctx);
+  ++Control.callbacks;
+  // The nested lookup must not recursively invoke this interleaving hook.
+  Control.owner->setSeqlockRetryHookForTest(nullptr, nullptr);
+  const uint32_t PeerCore = EJitCoreId::current();
+  if (Control.consumeOther) {
+    EJitCoreId::setCurrentForTest(0);
+    const EJitDimPair *Dims = Control.numDims ? Control.dims : nullptr;
+    Control.otherHit = Control.owner->compileOrGet(
+        Control.funcIndex, Dims, Control.numDims, codeFor(Control.funcIndex));
+    if (Control.publishTier2)
+      Control.polled = Control.owner->pollOne();
+  }
+  EJitCoreId::setCurrentForTest(PeerCore);
+}
+
+class LegacyColdPublishIdentityTest : public SharedTaskPoolTest {
+protected:
+  enum class LookupKind : uint8_t { Generic, Fixed1D, Fixed2D };
+
+  void checkColdLookup(LookupKind Kind, bool PublishTier2,
+                       bool PrepareSucceeds, bool ConsumeOther = true) {
+    constexpr uint32_t FuncIndex = 5;
+    EJitSharedTaskPool Owner;
+    PgoRecorder Compiled;
+    PrepareLog Prepare;
+    Prepare.succeed = PrepareSucceeds;
+    EJitCoreId::setCurrentForTest(0);
+    Owner.bind(state_.get());
+    Owner.setCompiler(&mockCompileRecordPgo, &Compiled);
+    Owner.setPrepareCodeCallback(&mockPrepareCode, &Prepare);
+    Owner.setMode(EJitCompileMode::Async);
+    Owner.setCodeSharingEnabled(true);
+    Owner.setPgoEnabled(true, 1);
+    ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+    LegacyColdPublishControl Control;
+    Control.owner = &Owner;
+    Control.funcIndex = FuncIndex;
+    Control.consumeOther = ConsumeOther;
+    Control.publishTier2 = PublishTier2;
+    if (Kind != LookupKind::Generic) {
+      Control.numDims = Kind == LookupKind::Fixed1D ? 1u : 2u;
+      Control.dims[0] = dim(1, 4);
+      if (Control.numDims == 2)
+        Control.dims[1] = dim(2, 7);
+      for (uint32_t I = 0; I < Control.numDims; ++I)
+        ASSERT_TRUE(Owner.setInstanceEnabled(Control.dims[I].dimType,
+                                             Control.dims[I].instanceId,
+                                             true));
+    }
+    const EJitDimPair *Dims = Control.numDims ? Control.dims : nullptr;
+    ASSERT_EQ(Owner.compileOrGet(FuncIndex, Dims, Control.numDims,
+                                 codeFor(FuncIndex))
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    EJitSharedCacheSlot *Slot = findReadySlot(FuncIndex);
+    ASSERT_NE(Slot, nullptr);
+    const void *OldT1 = reinterpret_cast<void *>(Slot->fnPtr.loadAcquire());
+    ASSERT_NE(OldT1, nullptr);
+    ASSERT_EQ(Slot->hitCount.loadRelaxed(), 0u);
+
+    Owner.setSeqlockRetryHookForTest(&consumeLegacyQuotaAfterColdRevalidation,
+                                     &Control);
+    EJitCoreId::setCurrentForTest(21);
+    EJitSharedTaskPool::CompileOrGetResult LateHit;
+    switch (Kind) {
+    case LookupKind::Generic:
+      LateHit = Owner.compileOrGet(FuncIndex, Dims, Control.numDims,
+                                   codeFor(FuncIndex));
+      break;
+    case LookupKind::Fixed1D:
+      LateHit = Owner.tryCacheHit1D(FuncIndex, Control.dims[0].dimType,
+                                    Control.dims[0].instanceId);
+      break;
+    case LookupKind::Fixed2D:
+      LateHit = Owner.tryCacheHit2D(
+          FuncIndex, Control.dims[0].dimType, Control.dims[0].instanceId,
+          Control.dims[1].dimType, Control.dims[1].instanceId);
+      break;
+    }
+    Owner.setSeqlockRetryHookForTest(nullptr, nullptr);
+    EJitCoreId::setCurrentForTest(0);
+
+    ASSERT_EQ(Control.callbacks, 1u);
+    ASSERT_EQ(Prepare.cores.size(), 1u);
+    if (ConsumeOther)
+      ASSERT_EQ(Control.otherHit.status, EJitCompileOrGetStatus::CacheHit);
+    ASSERT_EQ(Control.polled, PublishTier2);
+    ASSERT_EQ(Compiled.tier2, PublishTier2 ? 1 : 0);
+    if (PublishTier2) {
+      ASSERT_EQ(Slot->tier.loadRelaxed(),
+                static_cast<uint8_t>(kEJitTierPgoUse));
+      ASSERT_NE(reinterpret_cast<void *>(Slot->fnPtr.loadAcquire()), OldT1);
+      // Publishing Tier-2 starts a fresh slot session; the late old lookup
+      // must not charge this replacement's legacy counter.
+      ASSERT_EQ(Slot->hitCount.loadRelaxed(), 0u);
+    } else {
+      ASSERT_EQ(Slot->tier.loadRelaxed(),
+                static_cast<uint8_t>(kEJitTierInstrumented));
+    }
+
+    const unsigned OldT1Grants =
+        (ConsumeOther && Control.otherHit.status ==
+                             EJitCompileOrGetStatus::CacheHit &&
+         Control.otherHit.fnPtr == OldT1 ? 1u : 0u) +
+        (LateHit.status == EJitCompileOrGetStatus::CacheHit &&
+                 LateHit.fnPtr == OldT1
+             ? 1u
+             : 0u);
+    EXPECT_EQ(OldT1Grants, ConsumeOther ? 1u : 0u)
+        << "a late cold lookup must not bypass the closed legacy T1 quota";
+    if (PublishTier2 || (ConsumeOther && PrepareSucceeds)) {
+      EXPECT_EQ(LateHit.status, EJitCompileOrGetStatus::AlreadyPending);
+      // The generic compileOrGet() surfaces the caller's fallback pointer on
+      // a non-hit terminal; fixed-dimension fast entries leave fnPtr empty.
+      // In either case status, rather than fnPtr, proves that no old T1 grant
+      // escaped the closed quota.
+      if (Kind == LookupKind::Generic)
+        EXPECT_EQ(LateHit.fnPtr, codeFor(FuncIndex));
+      else
+        EXPECT_EQ(LateHit.fnPtr, nullptr);
+    }
+    if (!PrepareSucceeds) {
+      EXPECT_EQ(LateHit.status, EJitCompileOrGetStatus::OffMode);
+      EXPECT_EQ(LateHit.fnPtr, codeFor(FuncIndex));
+      EXPECT_EQ(Slot->hitCount.loadRelaxed(), 1u);
+    }
+  }
+};
+
+TEST_F(LegacyColdPublishIdentityTest,
+       ClosedQuotaWithoutPublishDoesNotGrantOldT1) {
+  checkColdLookup(LookupKind::Generic, /*PublishTier2=*/false,
+                  /*PrepareSucceeds=*/true);
+}
+
+TEST_F(LegacyColdPublishIdentityTest,
+       ColdRevalidatedLookupRejectsRepublishedOldT1) {
+  checkColdLookup(LookupKind::Generic, /*PublishTier2=*/true,
+                  /*PrepareSucceeds=*/true);
+}
+
+TEST_F(LegacyColdPublishIdentityTest,
+       FixedDimensionColdRevalidatedLookupRejectsRepublishedOldT1) {
+  checkColdLookup(LookupKind::Fixed1D, /*PublishTier2=*/true,
+                  /*PrepareSucceeds=*/true);
+}
+
+TEST_F(LegacyColdPublishIdentityTest,
+       FixedTwoDimensionColdRevalidatedLookupRejectsRepublishedOldT1) {
+  checkColdLookup(LookupKind::Fixed2D, /*PublishTier2=*/true,
+                  /*PrepareSucceeds=*/true);
+}
+
+TEST_F(LegacyColdPublishIdentityTest,
+       FailedColdPreparationStillConsumesNoT1Grant) {
+  checkColdLookup(LookupKind::Generic, /*PublishTier2=*/false,
+                  /*PrepareSucceeds=*/false, /*ConsumeOther=*/false);
+}
+
+struct LegacyBucketPrepareControl {
+  bool succeed = false;
+  std::atomic<bool> reached{false};
+};
+
+bool prepareForLegacyBucketTest(void *Ctx, const void *) {
+  auto &Control = *static_cast<LegacyBucketPrepareControl *>(Ctx);
+  Control.reached.store(true, std::memory_order_release);
+  return Control.succeed;
+}
+
+class LegacyColdBucketLockTest : public SharedTaskPoolTest {
+protected:
+  enum class LookupKind { Generic, Fixed0D, Fixed1D, Fixed2D };
+
+  void checkBucketExclusion(bool PrepareSucceeds, LookupKind Kind) {
+    constexpr uint32_t FuncIndex = 5;
+    EJitSharedTaskPool Owner;
+    PgoRecorder Compiled;
+    LegacyBucketPrepareControl Prepare;
+    Prepare.succeed = PrepareSucceeds;
+    EJitCoreId::setCurrentForTest(0);
+    Owner.bind(state_.get());
+    Owner.setCompiler(&mockCompileRecordPgo, &Compiled);
+    Owner.setPrepareCodeCallback(&prepareForLegacyBucketTest, &Prepare);
+    Owner.setMode(EJitCompileMode::Async);
+    Owner.setCodeSharingEnabled(true);
+    Owner.setPgoEnabled(true, 1);
+    ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+    const uint32_t NumDims = Kind == LookupKind::Fixed2D ? 2u :
+                            Kind == LookupKind::Fixed1D ? 1u : 0u;
+    const EJitDimPair Dims[] = {dim(1, 4), dim(2, 7)};
+    for (uint32_t I = 0; I < NumDims; ++I)
+      ASSERT_TRUE(Owner.setInstanceEnabled(Dims[I].dimType,
+                                          Dims[I].instanceId, true));
+    ASSERT_EQ(Owner.compileOrGet(FuncIndex, Dims, NumDims, codeFor(FuncIndex))
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    auto *Slot = findReadySlot(FuncIndex);
+    ASSERT_NE(Slot, nullptr);
+    uint32_t Bucket = kEJitSharedCacheBuckets;
+    for (uint32_t B = 0; B < kEJitSharedCacheBuckets; ++B)
+      for (uint32_t S = 0; S < kEJitSharedCacheSlots; ++S)
+        if (&state_->buckets[B].slots[S] == Slot)
+          Bucket = B;
+    ASSERT_LT(Bucket, kEJitSharedCacheBuckets);
+    ASSERT_NE(Bucket, 0u);
+    ASSERT_EQ(Slot->hitCount.loadRelaxed(), 0u);
+    Prepare.reached.store(false, std::memory_order_relaxed);
+    std::atomic<bool> Completed{false};
+    EJitSharedTaskPool::CompileOrGetResult Result;
+
+    // Hold the actual slot's publication lock, not the default bucket0 lock.
+    // Release and join before assertions so a failed test cannot strand a peer.
+    state_->buckets[Bucket].observationLock.storeRelease(1);
+    std::thread Peer([&] {
+      EJitCoreId::setCurrentForTest(21);
+      switch (Kind) {
+      case LookupKind::Generic:
+        Result = Owner.compileOrGet(FuncIndex, Dims, NumDims, codeFor(FuncIndex));
+        break;
+      case LookupKind::Fixed0D:
+        Result = Owner.tryCacheHit0D(FuncIndex);
+        break;
+      case LookupKind::Fixed1D:
+        Result = Owner.tryCacheHit1D(FuncIndex, Dims[0].dimType,
+                                    Dims[0].instanceId);
+        break;
+      case LookupKind::Fixed2D:
+        Result = Owner.tryCacheHit2D(FuncIndex, Dims[0].dimType,
+                                    Dims[0].instanceId, Dims[1].dimType,
+                                    Dims[1].instanceId);
+        break;
+      }
+      Completed.store(true, std::memory_order_release);
+    });
+    const auto Deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(500);
+    while (!Completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < Deadline)
+      std::this_thread::yield();
+    const bool Reached = Prepare.reached.load(std::memory_order_acquire);
+    const bool Escaped = Completed.load(std::memory_order_acquire);
+    const uint64_t ChargedWhileLocked = Slot->hitCount.loadRelaxed();
+    state_->buckets[Bucket].observationLock.storeRelease(0);
+    Peer.join();
+    EJitCoreId::setCurrentForTest(0);
+
+    ASSERT_TRUE(Reached);
+    EXPECT_FALSE(Escaped);
+    EXPECT_EQ(ChargedWhileLocked, 0u);
+    EXPECT_EQ(Slot->hitCount.loadRelaxed(), 1u);
+    if (!PrepareSucceeds) {
+      EXPECT_NE(Result.status, EJitCompileOrGetStatus::CacheHit);
+      EXPECT_TRUE(Result.readyButNotShareable);
+      EXPECT_FALSE(Result.hasReadToken);
+      EXPECT_EQ(Owner.pendingCount(), 0u);
+      EXPECT_EQ(Compiled.tier2, 0);
+    }
+  }
+};
+
+TEST_F(LegacyColdBucketLockTest, SuccessfulPrepareWaitsForActualBucket) {
+  checkBucketExclusion(true, LookupKind::Generic);
+}
+
+TEST_F(LegacyColdBucketLockTest, FailedPrepareWaitsForActualBucket) {
+  checkBucketExclusion(false, LookupKind::Generic);
+}
+
+TEST_F(LegacyColdBucketLockTest, FailedFixed0DPrepareWaitsForActualBucket) {
+  checkBucketExclusion(false, LookupKind::Fixed0D);
+}
+
+TEST_F(LegacyColdBucketLockTest, FailedFixed1DPrepareWaitsForActualBucket) {
+  checkBucketExclusion(false, LookupKind::Fixed1D);
+}
+
+TEST_F(LegacyColdBucketLockTest, FailedFixed2DPrepareWaitsForActualBucket) {
+  checkBucketExclusion(false, LookupKind::Fixed2D);
+}
+
+TEST_F(SharedTaskPoolTest,
+       NoReclaimLegacySeqlockRetryDoesNotConsumeHitCountQuota) {
+  constexpr uint32_t kThreshold = 2;
+  EJitSharedTaskPool owner;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &rec);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, kThreshold);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  // Publish one instrumented Tier-1 slot. The subsequent calls are ordinary
+  // legacy hits (request-attempt/representative admission is disabled).
+  ASSERT_EQ(owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+
+  LegacySeqlockRetryControl control{state_.get()};
+  owner.setSeqlockRetryHookForTest(&forceOneLegacySeqlockRetry, &control);
+  auto first = owner.compileOrGet(5, nullptr, 0, codeFor(5));
+  owner.setSeqlockRetryHookForTest(nullptr, nullptr);
+
+  // The forced retry discarded its first resolve. Exactly one accepted lookup
+  // charges hitCount, returns one Tier-1 grant, and performs one simulated
+  // Tier-1 dispatch. No Tier-2 work is armed yet.
+  ASSERT_GE(control.callbacks, 2u);
+  EXPECT_TRUE(control.forced);
+  EXPECT_EQ(first.status, EJitCompileOrGetStatus::CacheHit);
+  ASSERT_NE(first.fnPtr, nullptr);
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 1u);
+  EXPECT_EQ(owner.pendingCount(), 0u);
+  uint32_t grantedT1 = first.status == EJitCompileOrGetStatus::CacheHit ? 1 : 0;
+  uint32_t executedT1 = first.fnPtr ? 1 : 0;
+
+  // The next accepted lookup reaches the threshold exactly once, returns the
+  // final real Tier-1 grant, and arms one Tier-2 request for the owner worker.
+  auto second = owner.compileOrGet(5, nullptr, 0, codeFor(5));
+  EXPECT_EQ(second.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(second.fnPtr, first.fnPtr);
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), kThreshold);
+  EXPECT_EQ(owner.pendingCount(), 1u);
+  grantedT1 += second.status == EJitCompileOrGetStatus::CacheHit ? 1 : 0;
+  executedT1 += second.fnPtr ? 1 : 0;
+  EXPECT_EQ(grantedT1, kThreshold);
+  EXPECT_EQ(executedT1, kThreshold);
+
+  // The Tier-2 worker consumes the single frozen quota and resets legacy
+  // hitCount on the publish; this distinguishes a real freeze from a lost
+  // charge that only made the old test report tier1Calls=63.
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(rec.tier1, 1);
+  EXPECT_EQ(rec.tier2, 1);
+  EXPECT_EQ(slot->tier.loadRelaxed(), static_cast<uint8_t>(kEJitTierPgoUse));
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), 0u);
+  EXPECT_EQ(owner.pendingCount(), 0u);
+}
+
+TEST_F(SharedTaskPoolTest,
+       NoReclaimExhaustedSeqlockReturnsExplicitAdmissionFallback) {
+  constexpr uint32_t kThreshold = 64;
+  EJitSharedTaskPool owner;
+  PgoRecorder rec;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &rec);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, kThreshold);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  EJitSharedCacheSlot *slot = findReadySlot(5);
+  ASSERT_NE(slot, nullptr);
+  uint32_t bucketIndex = kEJitSharedCacheBuckets;
+  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s)
+      if (&state_->buckets[b].slots[s] == slot)
+        bucketIndex = b;
+  ASSERT_LT(bucketIndex, kEJitSharedCacheBuckets);
+
+  const uint32_t seqBefore =
+      state_->buckets[bucketIndex].publishSeq.loadAcquire();
+  const uint64_t hitsBefore = slot->hitCount.loadRelaxed();
+  const uint64_t dispatchesBefore = slot->t1DispatchCount.loadRelaxed();
+  const uint64_t quotaEndBefore = slot->t1QuotaEnd.loadRelaxed();
+  const uint32_t pendingBefore = owner.pendingCount();
+  const uint32_t activeBefore = state_->pgoActiveFunctionCount.loadAcquire();
+  const uint64_t deferredBefore = state_->pgoDeferredMisses.loadRelaxed();
+  ASSERT_EQ(hitsBefore, 0u);
+  ASSERT_EQ(dispatchesBefore, 0u);
+  ASSERT_EQ(slot->t1DispatchLimit.loadRelaxed(), 0u)
+      << "legacy publish has no observed-dispatch quota";
+  ASSERT_EQ(pendingBefore, 0u);
+  ASSERT_EQ(activeBefore, 1u);
+
+  LegacySeqlockRetryControl control{state_.get()};
+  owner.setSeqlockRetryHookForTest(&forceEveryLegacySeqlockRetry, &control);
+  auto result = owner.compileOrGet(5, nullptr, 0, codeFor(5));
+  owner.setSeqlockRetryHookForTest(nullptr, nullptr);
+
+  const bool returnedGrant =
+      result.status == EJitCompileOrGetStatus::CacheHit && result.fnPtr;
+  const bool simulatedExecution = returnedGrant;
+  std::fprintf(stderr,
+               "NRC_STATUS_PROBE status=%u fnPtr=%p hasReadToken=%u "
+               "bucketIndex=%u fastPathTerminal=%u readyButNotShareable=%u "
+               "callbacks=%u seq=%u->%u hitCount=%llu t1Dispatch=%llu "
+               "t1Limit=%llu quotaEnd=%llu pending=%u active=%u "
+               "deferred=%llu->%llu returnedGrant=%u simulatedExecution=%u\n",
+               static_cast<unsigned>(result.status), result.fnPtr,
+               static_cast<unsigned>(result.hasReadToken),
+               static_cast<unsigned>(result.bucketIndex),
+               static_cast<unsigned>(result.fastPathTerminal),
+               static_cast<unsigned>(result.readyButNotShareable),
+               control.callbacks, seqBefore,
+               state_->buckets[bucketIndex].publishSeq.loadAcquire(),
+               static_cast<unsigned long long>(slot->hitCount.loadRelaxed()),
+               static_cast<unsigned long long>(slot->t1DispatchCount.loadRelaxed()),
+               static_cast<unsigned long long>(slot->t1DispatchLimit.loadRelaxed()),
+               static_cast<unsigned long long>(slot->t1QuotaEnd.loadRelaxed()),
+               owner.pendingCount(),
+               state_->pgoActiveFunctionCount.loadAcquire(),
+               static_cast<unsigned long long>(deferredBefore),
+               static_cast<unsigned long long>(state_->pgoDeferredMisses.loadRelaxed()),
+               static_cast<unsigned>(returnedGrant),
+               static_cast<unsigned>(simulatedExecution));
+
+  // Four exhausted load-only attempts become one explicit slow-path PGO
+  // admission deferral. The caller receives its AOT fallback and no returned
+  // pointer is counted as a Tier-1 grant or simulated execution.
+  EXPECT_EQ(control.callbacks, 4u);
+  EXPECT_EQ(result.status, EJitCompileOrGetStatus::PgoAdmissionDeferred);
+  EXPECT_EQ(result.fnPtr, codeFor(5));
+  EXPECT_FALSE(result.hasReadToken);
+  EXPECT_EQ(result.bucketIndex, 0u);
+  EXPECT_FALSE(result.readyButNotShareable);
+  EXPECT_FALSE(result.fastPathTerminal);
+  EXPECT_EQ(state_->buckets[bucketIndex].publishSeq.loadAcquire(),
+            seqBefore + 8u);
+  EXPECT_EQ(slot->hitCount.loadRelaxed(), hitsBefore)
+      << "discarded seqlock resolves must not charge legacy hotness";
+  EXPECT_EQ(slot->t1DispatchCount.loadRelaxed(), dispatchesBefore)
+      << "AOT fallback is not a returned Tier-1 grant";
+  EXPECT_EQ(slot->t1QuotaEnd.loadRelaxed(), quotaEndBefore);
+  EXPECT_EQ(owner.pendingCount(), pendingBefore);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), activeBefore);
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), deferredBefore + 1u);
+  EXPECT_EQ(rec.tier1, 1);
+  EXPECT_EQ(rec.tier2, 0);
+}
+#endif
 
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
 // (3) NO_RECLAIM: two DISTINCT identities each trigger Tier-2; the second
@@ -6686,6 +7295,12 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
     }
   }
   ASSERT_TRUE(full) << "expected the shared queue to reach capacity";
+  EJitSharedDiagnostics fullDiag;
+  pool.getDiagnostics(fullDiag);
+  EXPECT_EQ(fullDiag.queueDepth,
+            static_cast<uint32_t>(kEJitSharedQueueSlots));
+  EXPECT_EQ(pool.pendingCount(), kEJitSharedQueueSlots)
+      << "every physically queued filler must own a dedup claim";
   pool.setPgoEnabled(true, 1);
 
   // A hit on the target arms Tier-2, but the enqueue fails (queue full) and the
@@ -6697,6 +7312,10 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
       << "queue-full Tier-2 must roll back its in-flight claim";
   if (hit.hasReadToken)
     pool.releaseRead(hit.bucketIndex);
+  pool.getDiagnostics(fullDiag);
+  EXPECT_EQ(fullDiag.queueDepth,
+            static_cast<uint32_t>(kEJitSharedQueueSlots))
+      << "failed Tier-2 enqueue must leave the physical queue unchanged";
 
   // Free a few queue slots (keep most fillers queued so the target's Tier-1
   // slot is not evicted by a full recompile storm before we retry).
@@ -6989,5 +7608,624 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
             static_cast<uint32_t>(EJitSharedInitState::Ready));
   EXPECT_FALSE(owner.asyncServiceAvailable());
 }
+
+TEST_F(SharedTaskPoolTest,
+       RequestAttemptSettlesThreeEventsOnRealTier1Tier2Path) {
+  BoundPointerLog log;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileBoundPointer, &log);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint32_t value = 0x12345678u;
+  EJitBoundPtrDescriptor bound{&value, sizeof(value), 2};
+  uint64_t token = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(80, nullptr, 0, codeFor(80), &bound, 1, &token).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_NE(token, 0u);
+  EXPECT_EQ(state_->inFlight[80].loadAcquire(), token);
+
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_TRUE(snapshot.live);
+  EXPECT_NE(snapshot.flags & EJitAttemptSamplingPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptPublicationPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptQueueOwned, 0u);
+
+  ASSERT_TRUE(owner.pollOne()); // Tier-1 publishes; sampling continues.
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_NE(snapshot.flags & EJitAttemptWaitingProfile, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptSamplingPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptPublicationPending, 0u);
+
+  auto hit = owner.compileOrGet(80, nullptr, 0, codeFor(80), &bound, 1);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+  ASSERT_EQ(owner.pendingCount(), 1u);
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_NE(snapshot.flags & EJitAttemptQueueOwned, 0u);
+
+  ASSERT_TRUE(owner.pollOne()); // Tier-2 publishes and settles all events.
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_FALSE(snapshot.live);
+  EXPECT_TRUE(snapshot.retained);
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Published);
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(owner.retainedRequestAttemptCount(), 1u);
+  EXPECT_EQ(log.calls, 2u);
+  EXPECT_EQ(log.rawPtr, &value);
+  EXPECT_EQ(log.value, value);
+}
+
+TEST_F(SharedTaskPoolTest,
+       CancelReissueAndDelayedOldQueueCallbackPreserveNewAttempt) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 2);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t r1 = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(81, nullptr, 0, codeFor(81), nullptr, 0, &r1).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.cancelRequestAttempt(r1));
+  EXPECT_TRUE(owner.cancelRequestAttempt(r1)); // duplicate is idempotent
+  EXPECT_EQ(state_->inFlight[81].loadAcquire(), 0u);
+
+  uint64_t r2 = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(81, nullptr, 0, codeFor(81), nullptr, 0, &r2).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_NE(r1, r2);
+  EXPECT_EQ(state_->inFlight[81].loadAcquire(), r2);
+
+  ASSERT_TRUE(owner.pollOne()); // delayed R1 callback/queue ownership
+  EXPECT_EQ(state_->inFlight[81].loadAcquire(), r2);
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(r2, snapshot));
+  EXPECT_TRUE(snapshot.live);
+  EXPECT_EQ(snapshot.flags & EJitAttemptCancelRequested, 0u);
+
+  ASSERT_TRUE(owner.pollOne()); // R2 Tier-1
+  ASSERT_TRUE(owner.cancelRequestAttempt(r2));
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  ASSERT_TRUE(owner.requestAttemptStatus(r1, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Cancelled);
+  ASSERT_TRUE(owner.requestAttemptStatus(r2, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Cancelled);
+}
+
+TEST_F(SharedTaskPoolTest, RequestAttemptQueueFailureRollsBackEveryOwner) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  // Make the first ring cell look full without filling the attempt table.
+  state_->ring[0].sequence.storeRelaxed(UINT32_MAX);
+  EXPECT_EQ(owner.compileOrGet(82, nullptr, 0, codeFor(82)).status,
+            EJitCompileOrGetStatus::QueueFullFallback);
+  EXPECT_EQ(state_->inFlight[82].loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EXPECT_EQ(owner.retainedRequestAttemptCount(), 1u);
+}
+
+TEST_F(SharedTaskPoolTest,
+       BorrowCanEndBeforeCancelAndPendingPublishCannotResurrectAttempt) {
+  BatchPublishCtx batch;
+  batch.tier1ReadyImmediately = true;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockBatchCompile, &batch);
+  owner.setCodeBatchCallbacks(&mockBatchReady, &mockBatchFlush, &batch);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(83, nullptr, 0, codeFor(83), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto hit = owner.tryCacheHit0D(83);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+  ASSERT_TRUE(owner.pollOne()); // Tier-2 linked, still RW/NX.
+  ASSERT_EQ(owner.pendingPublishCount(), 1u);
+
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.flags & EJitAttemptBorrowPending, 0u);
+  EXPECT_NE(snapshot.flags & EJitAttemptPublicationPending, 0u);
+  ASSERT_TRUE(owner.cancelRequestAttempt(token));
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+
+  // A later flush sees the stale token and drops the linked result.
+  EXPECT_FALSE(owner.flushCodeBatch());
+  EXPECT_EQ(findReadySlot(83), nullptr);
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Cancelled);
+}
+
+TEST_F(SharedTaskPoolTest, ShutdownAcknowledgesQueuedBorrowAndAllEvents) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(84, nullptr, 0, codeFor(84), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  owner.ownerShutdown();
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.terminalReason, EJitRequestAttemptReason::Shutdown);
+}
+
+TEST_F(SharedTaskPoolTest, AttemptTokenExhaustionFailsClosedWithoutAdmission) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  state_->nextAttemptToken.storeRelaxed(UINT64_MAX);
+  EXPECT_EQ(owner.compileOrGet(85, nullptr, 0, codeFor(85)).status,
+            EJitCompileOrGetStatus::QueueFullFallback);
+  EXPECT_EQ(owner.pendingCount(), 0u);
+  EXPECT_EQ(state_->inFlight[85].loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+}
+
+TEST_F(SharedTaskPoolTest, StaleGenerationSettlesOnlyItsAttempt) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(86, nullptr, 0, codeFor(86), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  state_->generation.fetchAdd(1);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  EJitSharedTaskPool::RequestAttemptSnapshot snapshot;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, snapshot));
+  EXPECT_EQ(snapshot.terminalReason,
+            EJitRequestAttemptReason::GenerationChanged);
+}
+
+// Request-attempt callbacks can arrive after cancellation, generation change,
+// queue rejection, compiler failure, or owner shutdown. Each terminal reason
+// must settle its own token exactly once, release dedup/borrow ownership, and
+// remain queryable without allowing a later identity retry to be corrupted.
+TEST_F(SharedTaskPoolTest,
+       RequestAttemptStaleCallbackMatrixSettlesEveryTerminalReason) {
+  // Queued cancellation leaves a stale callback in the ring; the replacement
+  // same-identity request must survive it and publish normally.
+  {
+    EJitSharedTaskPool owner;
+    bringUpOwner(owner, false, true, true);
+    uint64_t oldToken = 0;
+    ASSERT_EQ(owner.compileOrGet(100, nullptr, 0, codeFor(100), nullptr, 0,
+                                 &oldToken)
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.cancelRequestAttempt(oldToken));
+    uint64_t newToken = 0;
+    ASSERT_EQ(owner.compileOrGet(100, nullptr, 0, codeFor(100), nullptr, 0,
+                                 &newToken)
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_NE(oldToken, newToken);
+    ASSERT_TRUE(owner.pollOne()); // stale old queue callback
+    ASSERT_TRUE(owner.pollOne()); // replacement reaches its final worker state
+    EJitSharedTaskPool::RequestAttemptSnapshot S;
+    ASSERT_TRUE(owner.requestAttemptStatus(oldToken, S));
+    EXPECT_EQ(S.terminalReason, EJitRequestAttemptReason::Cancelled);
+    ASSERT_TRUE(owner.requestAttemptStatus(newToken, S));
+    EXPECT_TRUE(S.live);
+    EXPECT_EQ(S.terminalReason, EJitRequestAttemptReason::None);
+    EXPECT_EQ(owner.liveRequestAttemptCount(), 1u);
+    ASSERT_TRUE(owner.cancelRequestAttempt(newToken));
+    owner.ownerShutdown();
+  }
+
+  // A queued request superseded by a generation bump must settle only its own
+  // token and leave no dedup claim behind.
+  {
+    EJitSharedTaskPool owner;
+    bringUpOwner(owner, false, true, true);
+    uint64_t token = 0;
+    ASSERT_EQ(owner.compileOrGet(101, nullptr, 0, codeFor(101), nullptr, 0,
+                                 &token)
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    const uint32_t G = state_->generation.loadAcquire();
+    state_->generation.storeRelease(G + 1);
+    ASSERT_TRUE(owner.pollOne());
+    EJitSharedTaskPool::RequestAttemptSnapshot S;
+    ASSERT_TRUE(owner.requestAttemptStatus(token, S));
+    EXPECT_EQ(S.terminalReason, EJitRequestAttemptReason::GenerationChanged);
+    EXPECT_EQ(state_->inFlight[101].loadAcquire(), 0u);
+    EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+    owner.ownerShutdown();
+  }
+
+  // A physical ring-full rejection settles the producer token immediately;
+  // there is no stale queue callback left to resurrect it.
+  {
+    EJitSharedTaskPool owner;
+    bringUpOwner(owner, false, true, true);
+    state_->ring[0].sequence.storeRelaxed(UINT32_MAX);
+    uint64_t token = 0;
+    const uint64_t nextBefore = state_->nextAttemptToken.loadAcquire();
+    EXPECT_EQ(owner.compileOrGet(102, nullptr, 0, codeFor(102), nullptr, 0,
+                                 &token)
+                  .status,
+              EJitCompileOrGetStatus::QueueFullFallback);
+    // Queue failure is reported before the public out-token is copied; the
+    // monotonic allocator still records the attempted token in history.
+    token = state_->nextAttemptToken.loadAcquire();
+    ASSERT_EQ(token, nextBefore + 1);
+    EJitSharedTaskPool::RequestAttemptSnapshot S;
+    ASSERT_TRUE(owner.requestAttemptStatus(token, S));
+    EXPECT_EQ(S.terminalReason, EJitRequestAttemptReason::QueueFailure);
+    EXPECT_FALSE(S.live);
+    EXPECT_EQ(state_->inFlight[102].loadAcquire(), 0u);
+    owner.ownerShutdown();
+  }
+
+  // A real worker compiler failure settles CompileFailure and frees the
+  // request-attempt table entry for a later request.
+  {
+    EJitSharedTaskPool owner;
+    EJitCoreId::setCurrentForTest(0);
+    owner.bind(state_.get());
+    owner.setCompiler(&mockCompileAlwaysFail, nullptr);
+    owner.setMode(EJitCompileMode::Async);
+    owner.setPgoEnabled(true, 1);
+    ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+    ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+    uint64_t token = 0;
+    ASSERT_EQ(owner.compileOrGet(103, nullptr, 0, codeFor(103), nullptr, 0,
+                                 &token)
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+    EJitSharedTaskPool::RequestAttemptSnapshot S;
+    ASSERT_TRUE(owner.requestAttemptStatus(token, S));
+    EXPECT_EQ(S.terminalReason, EJitRequestAttemptReason::CompileFailure);
+    EXPECT_FALSE(S.live);
+    EXPECT_EQ(state_->inFlight[103].loadAcquire(), 0u);
+    owner.ownerShutdown();
+  }
+
+  // Shutdown joins the worker/queue owner and settles every still-queued
+  // borrow/publication event before private state is torn down.
+  {
+    EJitSharedTaskPool owner;
+    bringUpOwner(owner, false, true, true);
+    uint64_t token = 0;
+    ASSERT_EQ(owner.compileOrGet(104, nullptr, 0, codeFor(104), nullptr, 0,
+                                 &token)
+                  .status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    owner.ownerShutdown();
+    EJitSharedTaskPool::RequestAttemptSnapshot S;
+    ASSERT_TRUE(owner.requestAttemptStatus(token, S));
+    EXPECT_EQ(S.terminalReason, EJitRequestAttemptReason::Shutdown);
+    EXPECT_FALSE(S.live);
+    EXPECT_EQ(owner.liveRequestAttemptCount(), 0u);
+  }
+}
+
+TEST_F(SharedTaskPoolTest, RequestAttemptsRejectUnsupportedModesBeforeState) {
+  EJitSharedTaskPool noPgo;
+  EJitCoreId::setCurrentForTest(0);
+  noPgo.bind(state_.get());
+  noPgo.setCompiler(&mockCompile, nullptr);
+  noPgo.setMode(EJitCompileMode::Async);
+  ASSERT_TRUE(noPgo.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(noPgo.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_EQ(noPgo.compileOrGet(87, nullptr, 0, codeFor(87)).status,
+            EJitCompileOrGetStatus::OffMode);
+  EXPECT_EQ(noPgo.liveRequestAttemptCount(), 0u);
+  noPgo.setPgoEnabled(true, 1); // live policy mutation is rejected
+  EXPECT_EQ(state_->pgoEnabled.loadAcquire(), 0u);
+  noPgo.ownerShutdown();
+
+  // Re-init with both prerequisites enabled, then prove Sync cannot be
+  // published over the immutable request-attempt policy.
+  EJitSharedTaskPool supported;
+  supported.bind(state_.get());
+  supported.setCompiler(&mockCompile, nullptr);
+  supported.setMode(EJitCompileMode::Async);
+  supported.setPgoEnabled(true, 1);
+  ASSERT_TRUE(supported.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(supported.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  supported.setSharedMode(EJitCompileMode::Sync);
+  EXPECT_EQ(supported.getSharedMode(), EJitCompileMode::Async);
+  EXPECT_FALSE(supported.publishSharedMode(EJitCompileMode::Sync,
+                                           state_->generation.loadAcquire()));
+}
+
+TEST_F(SharedTaskPoolTest,
+       ThousandsOfCompletedAttemptsDoNotConsumeLiveCapacity) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  constexpr uint32_t count = 1000;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t func = 1000 + i;
+    ASSERT_EQ(owner.compileOrGet(func, nullptr, 0, codeFor(func)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+    auto hit = owner.tryCacheHit0D(func);
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      owner.releaseRead(hit.bucketIndex);
+    ASSERT_TRUE(owner.pollOne());
+    ASSERT_EQ(owner.liveRequestAttemptCount(), 0u);
+  }
+  EXPECT_EQ(owner.retainedRequestAttemptCount(),
+            kEJitSharedRequestHistoryCapacity);
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadRelaxed(), count);
+}
+
+TEST_F(SharedTaskPoolTest, CancelledPublishedTier1AllowsSameIdentityRetry) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t oldToken = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(90, nullptr, 0, codeFor(90), nullptr, 0, &oldToken)
+          .status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.cancelRequestAttempt(oldToken));
+  EXPECT_EQ(findReadySlot(90), nullptr);
+
+  uint64_t newToken = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(90, nullptr, 0, codeFor(90), nullptr, 0, &newToken)
+          .status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_NE(newToken, 0u);
+  EXPECT_NE(newToken, oldToken);
+}
+
+struct AttemptIdentityLog {
+  std::vector<EJitCompileRequest> requests;
+};
+
+bool recordAttemptCompile(void *ctx, const EJitCompileRequest &req,
+                          void **outFn) {
+  static_cast<AttemptIdentityLog *>(ctx)->requests.push_back(req);
+  *outFn = codeFor(req.funcIndex);
+  return true;
+}
+
+TEST_F(SharedTaskPoolTest, OldCellCannotClaimAnotherCellAttempt) {
+  AttemptIdentityLog log;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&recordAttemptCompile, &log);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_TRUE(owner.setInstanceEnabled(0, 0, true));
+  ASSERT_TRUE(owner.setInstanceEnabled(0, 1, true));
+
+  EJitDimPair cell0 = dim(0, 0);
+  EJitDimPair cell1 = dim(0, 1);
+  uint32_t value0 = 11;
+  uint32_t value1 = 22;
+  EJitBoundPtrDescriptor bound0{&value0, sizeof(value0), 2};
+  EJitBoundPtrDescriptor bound1{&value1, sizeof(value1), 2};
+  uint64_t r1 = 0;
+  uint64_t r2 = 0;
+  ASSERT_EQ(
+      owner.compileOrGet(91, &cell0, 1, codeFor(91), &bound0, 1, &r1).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.cancelRequestAttempt(r1));
+  ASSERT_EQ(
+      owner.compileOrGet(91, &cell1, 1, codeFor(91), &bound1, 1, &r2).status,
+      EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  auto oldHit = owner.tryCacheHit1D(91, 0, 0);
+  if (oldHit.hasReadToken)
+    owner.releaseRead(oldHit.bucketIndex);
+  EXPECT_FALSE(owner.pollOne());
+  for (const EJitCompileRequest &req : log.requests) {
+    if (req.attemptToken != r2)
+      continue;
+    ASSERT_EQ(req.numDims, 1u);
+    EXPECT_EQ(req.dims[0].instanceId, 1u);
+    ASSERT_EQ(req.boundCount, 1u);
+    EXPECT_EQ(req.boundPointers[0].rawPtr, &value1);
+  }
+  EJitSharedTaskPool::RequestAttemptSnapshot status;
+  ASSERT_TRUE(owner.requestAttemptStatus(r2, status));
+  EXPECT_TRUE(status.live);
+}
+
+struct CancelDuringReady {
+  EJitSharedTaskPool *pool;
+  uint64_t token;
+  bool cancelled = false;
+};
+
+bool cancelAttemptDuringReady(void *ctx, const void *) {
+  CancelDuringReady &cancel = *static_cast<CancelDuringReady *>(ctx);
+  cancel.cancelled = cancel.pool->cancelRequestAttempt(cancel.token);
+  return true;
+}
+
+TEST_F(SharedTaskPoolTest, CancelBeforeReadyCommitPreventsTier2Publication) {
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_TRUE(owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  uint64_t token = 0;
+  ASSERT_EQ(owner.compileOrGet(92, nullptr, 0, codeFor(92), nullptr, 0, &token)
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto hit = owner.tryCacheHit0D(92);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+
+  CancelDuringReady cancel{&owner, token};
+  owner.setCodeBatchCallbacks(
+      &cancelAttemptDuringReady, +[](void *) { return true; }, &cancel);
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_TRUE(cancel.cancelled);
+  EXPECT_EQ(findReadySlot(92), nullptr);
+  EJitSharedTaskPool::RequestAttemptSnapshot status;
+  ASSERT_TRUE(owner.requestAttemptStatus(token, status));
+  EXPECT_EQ(status.terminalReason, EJitRequestAttemptReason::Cancelled);
+}
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+struct VpSessionCompilerProbe {
+  uint64_t sessionId = 0;
+};
+
+bool compileWithVpSession(void *Ctx, const EJitCompileRequest &Req,
+                          void **OutFn) {
+  auto &Probe = *static_cast<VpSessionCompilerProbe *>(Ctx);
+  Probe.sessionId = ejitVpCreateSession(Req.attemptToken);
+  *OutFn = Probe.sessionId ? codeFor(Req.funcIndex) : nullptr;
+  return *OutFn != nullptr;
+}
+
+void retireVpSessionOnLifecycleDrop(void *Ctx, const EJitCompileRequest &Req) {
+  auto &Probe = *static_cast<VpSessionCompilerProbe *>(Ctx);
+  EXPECT_EQ(decodeReqTier(Req.funcIndex), kEJitTierPgoUse);
+  ejitVpEndSession(Probe.sessionId);
+  std::vector<EJitVpSiteSample> Discarded;
+  EXPECT_TRUE(ejitVpTakeSessionSnapshot(Probe.sessionId, Discarded));
+  Probe.sessionId = 0;
+}
+
+TEST_F(SharedTaskPoolTest, TokenlessStaleTier2ReleasesVpSessions) {
+  gEJitVpState.magic.storeRelaxed(0);
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  VpSessionCompilerProbe Probe;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&compileWithVpSession, &Probe);
+  Owner.setPgoLifecycleDropCallback(&retireVpSessionOnLifecycleDrop, &Probe);
+  Owner.setPgoEnabled(true, 64);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(state_->requestAttemptsEnabled.loadAcquire(), 0u);
+  ASSERT_TRUE(Owner.setInstanceEnabled(0, 0, true));
+  const EJitDimPair Cell = dim(0, 0);
+  for (unsigned I = 0; I <= kEJitVpMaxSessions; ++I) {
+    ASSERT_EQ(Owner.compileOrGet(90, &Cell, 1, codeFor(90)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    ASSERT_NE(Probe.sessionId, 0u) << "iteration=" << I;
+    for (unsigned Hit = 0; Hit < 64; ++Hit) {
+      auto Result = Owner.tryCacheHit1D(90, 0, 0);
+      ASSERT_NE(Result.fnPtr, nullptr);
+      if (Result.hasReadToken)
+        Owner.releaseRead(Result.bucketIndex);
+    }
+    ASSERT_TRUE(Owner.setInstanceEnabled(0, 0, false));
+    ASSERT_TRUE(Owner.setInstanceEnabled(0, 0, true));
+    ASSERT_TRUE(Owner.pollOne());
+    EXPECT_EQ(Probe.sessionId, 0u);
+  }
+}
+
+TEST_F(SharedTaskPoolTest, CancelledPublishedT1ClosesExactVpSession) {
+  gEJitVpState.magic.storeRelaxed(0);
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  VpSessionCompilerProbe Probe;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&compileWithVpSession, &Probe);
+  Owner.setPgoEnabled(true, 64);
+  ASSERT_TRUE(Owner.setRequestAttemptsEnabled(true));
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  for (unsigned I = 0; I < kEJitVpMaxSessions; ++I) {
+    uint64_t Token = 0;
+    ASSERT_EQ(
+        Owner.compileOrGet(90, nullptr, 0, codeFor(90), nullptr, 0, &Token)
+            .status,
+        EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(Owner.pollOne());
+    ASSERT_NE(Probe.sessionId, 0u);
+    ASSERT_TRUE(Owner.cancelRequestAttempt(Token));
+    ASSERT_EQ(Owner.liveRequestAttemptCount(), 0u);
+  }
+
+  unsigned OpenSessions = 0;
+  for (const EJitVpSessionSlot &Slot : gEJitVpState.sessions)
+    OpenSessions += (Slot.gate.loadAcquire() & 1u) != 0;
+  EXPECT_EQ(OpenSessions, 0u);
+  const uint64_t Replacement = ejitVpCreateSession();
+  ASSERT_NE(Replacement, 0u);
+  ejitVpEndSession(Replacement);
+  std::vector<EJitVpSiteSample> Discarded;
+  EXPECT_TRUE(ejitVpTakeSessionSnapshot(Replacement, Discarded));
+}
+#endif
 
 } // namespace

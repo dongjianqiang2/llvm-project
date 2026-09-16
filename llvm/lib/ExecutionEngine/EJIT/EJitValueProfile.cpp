@@ -87,20 +87,26 @@ std::optional<ScalarSite> findSite(Loop &L) {
   return ScalarSite{BI, Bound};
 }
 
-FunctionCallee getRecordScalarFn(Module &M) {
+FunctionCallee getRecordScalarFn(Module &M, bool SessionAware) {
   LLVMContext &Ctx = M.getContext();
-  auto *FT = FunctionType::get(Type::getVoidTy(Ctx),
-                               {Type::getInt64Ty(Ctx), Type::getInt32Ty(Ctx),
-                                Type::getInt64Ty(Ctx)},
-                               false);
-  return M.getOrInsertFunction("ejit_vp_record_scalar", FT);
+  SmallVector<Type *, 4> Args;
+  if (SessionAware)
+    Args.push_back(Type::getInt64Ty(Ctx));
+  Args.push_back(Type::getInt64Ty(Ctx));
+  Args.push_back(Type::getInt32Ty(Ctx));
+  Args.push_back(Type::getInt64Ty(Ctx));
+  auto *FT = FunctionType::get(Type::getVoidTy(Ctx), Args, false);
+  return M.getOrInsertFunction(SessionAware ? "ejit_vp_record_scalar_session"
+                                            : "ejit_vp_record_scalar",
+                               FT);
 }
 
 } // namespace
 
 void ejit::runValueProfileOnFunction(
     Function &F, FunctionAnalysisManager &FAM, EJitValueProfileMode Mode,
-    function_ref<void(StringRef, uint32_t)> OnFunctionSites) {
+    function_ref<void(StringRef, uint32_t)> OnFunctionSites,
+    uint64_t SamplingSessionId) {
   if (F.isDeclaration())
     return;
 
@@ -137,12 +143,17 @@ void ejit::runValueProfileOnFunction(
         if (DominatesPH)
           InsertPt = PH->getTerminator();
       }
-      FunctionCallee Callee = getRecordScalarFn(M);
+      FunctionCallee Callee = getRecordScalarFn(M, SamplingSessionId != 0);
       IRBuilder<> B(InsertPt);
       Value *Zext =
           B.CreateZExtOrTrunc(S->bound, B.getInt64Ty(), "ejit.vp.bound");
-      B.CreateCall(Callee,
-                   {B.getInt64(FuncHash), B.getInt32(SiteIdx), Zext});
+      SmallVector<Value *, 4> Args;
+      if (SamplingSessionId != 0)
+        Args.push_back(B.getInt64(SamplingSessionId));
+      Args.push_back(B.getInt64(FuncHash));
+      Args.push_back(B.getInt32(SiteIdx));
+      Args.push_back(Zext);
+      B.CreateCall(Callee, Args);
       LLVM_DEBUG(dbgs() << "ejit-value-profile: instrument " << F.getName()
                         << " site=" << SiteIdx
                         << " bound=" << *S->bound << "\n");

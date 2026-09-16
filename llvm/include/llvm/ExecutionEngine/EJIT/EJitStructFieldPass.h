@@ -11,6 +11,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
@@ -25,7 +26,10 @@
 #endif
 
 namespace llvm {
+class LoadInst;
 namespace ejit {
+
+struct SpecializationContext;
 
 struct GVPeriodInfo {
   std::string periodName;
@@ -70,7 +74,13 @@ public:
                                     : std::numeric_limits<uint32_t>::max()});
   }
 
-  /// Pre-build GV metadata maps from the Module (call once before run()).
+  /// Opt-in load-only policy for the version-sharing phase-1 experiment.
+  /// Retain only identity values, not IR pointers. Call initFromModule after
+  /// this method and after any inline/clone/cleanup that changes the module.
+  /// This does not enable profile or physical-code sharing.
+  void setPreservedDimensions(const SpecializationContext &Ctx);
+
+  /// Rebuild the metadata and assumption maps from the current module.
   void initFromModule(Module &M);
 
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
@@ -99,6 +109,16 @@ private:
   PeriodArrayRegistry &registry_;
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;
   std::string boundRootFunction_;
+
+  bool preserveDimensions_ = false;
+  bool preservedContextValid_ = false;
+  SmallVector<std::pair<std::string, uint8_t>, 4> preservedDimensions_;
+  AssumedArgMap preservedArgs_;
+  AssumedArgMap preservedLoadArgs_;
+  SmallPtrSet<const Function *, 16> preservedFunctions_;
+  std::optional<uint8_t> preservedInstance(StringRef Period) const;
+  void initPreservedDimensions(Module &M);
+  Constant *tryReplacePreservedLoad(LoadInst *LI, const DataLayout &DL);
 
   struct BoundPointerState {
     EJitBoundPointerView view;

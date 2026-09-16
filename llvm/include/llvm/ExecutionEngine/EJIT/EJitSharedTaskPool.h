@@ -329,6 +329,84 @@ public:
                                    void **outFn);
   using PublishCallback = void (*)(void *ctx, const EJitCompileRequest &req,
                                    bool published);
+  /// Owner notification for a terminal queued Tier-2 lifecycle drop.
+  using PgoLifecycleDropCallback = void (*)(void *ctx,
+                                            const EJitCompileRequest &req);
+  /// In-flight sampling admission for one async PGO request (representative
+  /// sharing). Asked BEFORE admitPgoFunction() takes the per-function profiling
+  /// slot, so a represented member whose group already owns its ONE
+  /// representative sampling session is deferred with no profiling admission,
+  /// no queue entry and no side effect. Unset (the default) keeps the legacy
+  /// path: every async PGO miss takes its own admission.
+  enum class SamplingAdmission : uint8_t {
+    Grant, ///< take the ordinary per-function PGO admission.
+    Deny,  ///< stay on the AOT fallback; the group owns the sampling session.
+    /// This member owns no sampling session of its own, but its group has
+    /// already published the shared profile: the pool must ask the wake-up
+    /// callback for the member's Tier-2 request and enqueue that INSTEAD of a
+    /// private Tier-1. No sampling admission is granted.
+    WakeTier2,
+    Classify, ///< worker prefix/schema work, without sampling admission.
+  };
+  using SamplingAdmissionCallback = SamplingAdmission (*)(
+      void *ctx, uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims);
+  void setSamplingAdmissionCallback(SamplingAdmissionCallback fn, void *ctx) {
+    samplingAdmissionFn_ = fn;
+    samplingAdmissionCtx_ = ctx;
+  }
+  using CandidateClassifyCallback = bool (*)(void *, const EJitCompileRequest &);
+  void setCandidateClassifyCallback(CandidateClassifyCallback fn, void *ctx) {
+    candidateClassifyFn_ = fn;
+    candidateClassifyCtx_ = ctx;
+  }
+  /// Representative-group WAKE-UP: asked for a represented member that owns no
+  /// Tier-1 slot at all (its sampling admission was denied), so the ordinary
+  /// slot-armed Tier-2 claim can never fire for it. The callback fills \p Out
+  /// with the member's Tier-2 request - the group's frozen observation plus this
+  /// member's own function/dims identity - and returns true, which makes the
+  /// pool claim and enqueue that compile immediately. A false return leaves the
+  /// request on the wrapper's AOT fallback.
+  ///
+  /// This is the ONLY way a member with no sampling session of its own reaches
+  /// PGOUse, and it grants no sampling admission: the request is a Tier-2
+  /// (kEJitTierPgoUse) that consumes the already published group bundle.
+  using RepresentativeWakeCallback = bool (*)(void *ctx, uint32_t funcIndex,
+                                              const EJitDimPair *dims,
+                                              uint32_t numDims,
+                                              EJitCompileRequest &Out);
+  void setRepresentativeWakeCallback(RepresentativeWakeCallback fn, void *ctx) {
+    representativeWakeFn_ = fn;
+    representativeWakeCtx_ = ctx;
+  }
+  /// Fired from the ONE committed-return point (classifyHit) for a REAL granted
+  /// Tier-1 dispatch, after the admission CAS/freeze and before the pointer is
+  /// handed back. This is the production bookkeeping hook for a representative
+  /// group quota: a denied or abandoned lookup never reaches it, so a group can
+  /// never count a dispatch it did not grant. Unset by default (legacy pools do
+  /// no extra work per dispatch).
+  struct DispatchObservation {
+    uint32_t funcIndex = 0;
+    /// Exact publish identity the dispatch was attributed to.
+    uint64_t attemptToken = 0;
+    uint32_t generation = 0;
+    /// Observed count AFTER this admission (the slot's own CAS result), never
+    /// the configured threshold.
+    uint64_t count = 0;
+    uint64_t limit = 0;
+    /// Timestamp of the final allowed dispatch; 0 = unknown clock.
+    uint64_t quotaEnd = 0;
+    /// True only for the dispatch that closed the quota.
+    bool closedQuota = false;
+    /// Slot coordinates of the dispatch (for owner-side diagnostics only; -1
+    /// sentinel values mean the build carries no bucket index).
+    uint32_t bucketIndex = kEJitSharedCacheBuckets;
+    uint32_t slotIndex = kEJitSharedCacheSlots;
+  };
+  using DispatchObserver = void (*)(void *ctx, const DispatchObservation &obs);
+  void setDispatchObserver(DispatchObserver fn, void *ctx) {
+    dispatchObserverFn_ = fn;
+    dispatchObserverCtx_ = ctx;
+  }
   /// Owner-private physical-code release callback for an overwritten/retired
   /// pointer. Optional; a purely logical drop happens when unset.
   using ReleaseCallback = void (*)(void *ctx, void *oldFn);
@@ -459,6 +537,16 @@ public:
     /// mapping or the C ABI.
     bool fastPathTerminal = false;
   };
+
+  struct RequestAttemptSnapshot {
+    uint64_t token = 0;
+    uint32_t generation = 0;
+    uint32_t funcIndex = 0;
+    uint32_t flags = 0;
+    EJitRequestAttemptReason terminalReason = EJitRequestAttemptReason::None;
+    bool live = false;
+    bool retained = false;
+  };
   static_assert(kEJitSharedCacheBuckets < 255,
                 "bucketIndex is a uint8_t: the bucket count and its sentinel "
                 "must fit in a byte");
@@ -512,6 +600,10 @@ public:
   void setPublishCallback(PublishCallback fn, void *ctx) {
     publishFn_ = fn;
     publishCtx_ = ctx;
+  }
+  void setPgoLifecycleDropCallback(PgoLifecycleDropCallback fn, void *ctx) {
+    pgoLifecycleDropFn_ = fn;
+    pgoLifecycleDropCtx_ = ctx;
   }
   void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
     mayConstRankingFn_ = fn;
@@ -704,6 +796,21 @@ public:
     workerIdle_ = fn;
     workerIdleCtx_ = ctx;
   }
+  /// Injectable timestamp source for the observed Tier-1 dispatch boundary
+  /// (quotaEnd). Unset (the default) means the boundary has no trustworthy
+  /// timestamp: the observation records the count and reports the timestamp as
+  /// unknown (0) instead of fabricating one. Owner-private configuration, like
+  /// the other callbacks; the driver wires the production trace clock.
+  using OwnerMaintenanceFn = bool (*)(void *ctx);
+  void setOwnerMaintenanceCallback(OwnerMaintenanceFn fn, void *ctx) {
+    ownerMaintenanceFn_ = fn;
+    ownerMaintenanceCtx_ = ctx;
+  }
+  using TraceClockFn = uint64_t (*)(void *ctx);
+  void setTraceClock(TraceClockFn fn, void *ctx) {
+    traceClockFn_ = fn;
+    traceClockCtx_ = ctx;
+  }
   /// Owner publishes this digest of its funcIndex/dimType registration mapping
   /// into the shared state; a peer attaching to a Ready blob compares its own
   /// digest and cleanly fails (FingerprintMismatch) on any divergence, so a
@@ -715,6 +822,15 @@ public:
   /// I/D-cache coherent for cross-core execution (spec §11 fnPtr
   /// prerequisites).
   void setCodeSharingEnabled(bool enabled) { codeSharingEnabled_ = enabled; }
+  /// Enable the experimental request-attempt protocol before init. The shared
+  /// value is immutable while Ready so peers cannot observe a mixed policy.
+  bool setRequestAttemptsEnabled(bool enabled) {
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return false;
+    requestAttemptsEnabled_ = enabled;
+    return true;
+  }
   /// Owner-only PRE-INIT configuration: the mode the owner publishes into the
   /// shared state during init(). After the blob is Ready this only stages the
   /// desired mode; use setSharedMode() to change the live cross-core mode.
@@ -725,9 +841,19 @@ public:
   /// slot's hitCount; the hit that crosses \p threshold arms a one-shot
   /// Tier-2 (PGOUse) lazy recompile via enqueue. \p threshold 0 disables
   /// the trigger (hits are still counted).
+  uint32_t tier2Threshold() const {
+    return state_ ? state_->tier2Threshold.loadAcquire()
+                  : tier2Threshold_.loadRelaxed();
+  }
+
   void setPgoEnabled(
       bool enable, uint32_t threshold,
       uint32_t maxConcurrentProfiles = EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES) {
+    if (state_ &&
+        state_->initState.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+        state_->requestAttemptsEnabled.loadAcquire() != 0)
+      return;
     maxConcurrentProfiles = std::max(
         1u, std::min(maxConcurrentProfiles, kEJitSharedMaxConcurrentProfiles));
     pgoEnabled_.storeRelaxed(enable ? 1 : 0);
@@ -755,6 +881,7 @@ public:
   }
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING
+  void failNextTier2QueuePushForTest() { failTier2QueuePush_.storeRelease(1); }
   void setPgoAdmissionTestHook(TestHookFn fn, void *ctx) {
     pgoAdmissionTestHook_ = fn;
     pgoAdmissionTestHookCtx_ = ctx;
@@ -772,7 +899,8 @@ public:
   /// Return true when this miss may start a staged PGO function. Only one
   /// specialization of a funcIndex may own admission at a time; later versions
   /// stay on AOT until the current Tier-2 finishes.
-  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
+  bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted,
+                        uint64_t attemptToken = 0);
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -787,6 +915,11 @@ public:
   ///   * If the blob is not yet initialized, only stage configuredMode_ so the
   ///     owner publishes the desired mode during init().
   void setSharedMode(EJitCompileMode mode) {
+    if (state_ &&
+        state_->initState.loadAcquire() ==
+            static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+        state_->requestAttemptsEnabled.loadAcquire() != 0)
+      return;
     configuredMode_ = mode;
     if (state_ && state_->initState.loadAcquire() ==
                       static_cast<uint32_t>(EJitSharedInitState::Ready))
@@ -798,6 +931,8 @@ public:
   /// caller learns the switch did not take. Returns false without writing then.
   bool publishSharedMode(EJitCompileMode mode, uint32_t gen) {
     if (!state_)
+      return false;
+    if (state_->requestAttemptsEnabled.loadAcquire() != 0)
       return false;
     if (state_->initState.loadAcquire() !=
             static_cast<uint32_t>(EJitSharedInitState::Ready) ||
@@ -875,7 +1010,8 @@ public:
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                   uint32_t numDims, void *fallback,
                                   const EJitBoundPtrDescriptor *boundPointers,
-                                  uint32_t boundCount);
+                                  uint32_t boundCount,
+                                  uint64_t *outAttemptToken = nullptr);
 
   /// Source-compatible single-pointer entry point. A zero size means no bound
   /// pointer; a nonzero size borrows the pointed-to object through compilation.
@@ -930,6 +1066,22 @@ public:
                                    uint32_t inst2, uint32_t dim3,
                                    uint32_t inst3);
   void releaseRead(uint32_t bucketIndex);
+
+  /// Cold request-lifecycle controls. They are connected to the same records
+  /// carried by real queue entries; no separate test-only state machine exists.
+  bool cancelRequestAttempt(
+      uint64_t token,
+      EJitRequestAttemptReason reason = EJitRequestAttemptReason::Cancelled);
+  bool requestAttemptStatus(uint64_t token, RequestAttemptSnapshot &out) const;
+  /// Owner acknowledgement after the last compiler read of a logical source.
+  bool completeRequestBorrow(uint64_t token);
+  /// Keep only the source borrow after successful no-code prefix classification.
+  void finishCandidateClassification(uint64_t token);
+  enum class BorrowScopeStatus { Invalid, Pending, Complete };
+  BorrowScopeStatus instanceBorrowStatus(uint32_t dimType, uint32_t instanceId,
+                                         uint32_t generation, uint32_t version) const;
+  uint32_t liveRequestAttemptCount() const;
+  uint32_t retainedRequestAttemptCount() const;
   /// Drive one end of a period-value mutation window for a lifecycle instance.
   ///
   /// The shared `enabled` bit is the JIT compile gate and is CAS'd, so only the
@@ -964,6 +1116,23 @@ public:
   /// truth the compile gate (compileCold) and ejit_is_active consult. Returns
   /// false for an out-of-range dimType/instanceId (never reads out of bounds).
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
+
+  /// The ENABLED bit alone (not the activate bit): whether the lifecycle
+  /// instance currently exists for this build. Representative-group member
+  /// legality (an inactive cell may not be elected or join as a waiter) is
+  /// decided from this, so a disabled cell never becomes a group member. The
+  /// query is read-only and never touches the queue or the caches.
+  bool isInstanceEnabledPublic(uint32_t dimType, uint32_t instanceId) const {
+    return isInstanceEnabled(dimType, instanceId);
+  }
+
+  /// The live lifecycle version of one instance (the same value the producer
+  /// path stamps into a request). A caller that has to BUILD a request outside
+  /// compileOrGet (the representative-group wake-up) must carry the current
+  /// version, otherwise the worker's version checkpoints discard it.
+  uint32_t instanceVersionPublic(uint32_t dimType, uint32_t instanceId) const {
+    return instanceVersion(dimType, instanceId);
+  }
 
   //--- per-function inline cache (multi-version direct-indexed) --------------
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
@@ -1065,6 +1234,19 @@ public:
   void setIcacheFillMidpointForTest(IcacheFillMidpointHook fn, void *ctx) {
     icacheFillMidpointHook_ = fn;
     icacheFillMidpointCtx_ = ctx;
+  }
+#endif
+
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  /// Test-only hook fired inside the NO_RECLAIM seqlock lookups AFTER a
+  /// matched-slot resolve and BEFORE the outer publishSeq stability check, so a
+  /// single-threaded test can force exactly one retry where a racing publish
+  /// would (used to prove an abandoned retry consumes no observed dispatch).
+  /// Receives the bucket index.
+  using SeqRetryHook = void (*)(void *ctx, uint32_t bucketIndex);
+  void setSeqlockRetryHookForTest(SeqRetryHook fn, void *ctx) {
+    seqlockRetryHook_ = fn;
+    seqlockRetryHookCtx_ = ctx;
   }
 #endif
 
@@ -1182,6 +1364,51 @@ private:
     /// The matching hit crossed the Tier-2 threshold. The caller decides
     /// whether to enqueue immediately or attach bound descriptors first.
     bool tier2Arm = false;
+    /// Exact slot coordinates and originating attempt observed while the
+    /// bucket snapshot was valid. The cold enqueue path reacquires the bucket
+    /// lock and validates all identity fields before claiming Tier-2. Filled by
+    /// the resolve path and by peerPrepareSlot() (from the re-validated slot,
+    /// so a cold peer's final admission carries the real identity instead of
+    /// zeroes).
+    uint32_t tier2BucketIndex = 0;
+    uint32_t tier2SlotIndex = 0;
+    uint64_t tier2AttemptToken = 0;
+    /// Experimental sharing contract (v21): the resolved slot is a live
+    /// Instrumented publish with an active observed-dispatch quota. The
+    /// admission commit and the Tier-2 arm decision are deferred to the single
+    /// committed-return point (classifyHit) so that only a real granted Tier-1
+    /// dispatch consumes quota. t1SlotAttemptToken/t1SlotGeneration are the
+    /// exact publish identity captured with fnPtr; the commit refuses to
+    /// attribute a dispatch when the slot no longer carries it (NO_RECLAIM can
+    /// legally republish between the resolve and the commit).
+    bool t1Observation = false;
+    uint64_t t1SlotAttemptToken = 0;
+    uint32_t t1SlotGeneration = 0;
+    /// Captured from the slot while the bucket snapshot was valid: the frozen
+    /// observation to carry into the Tier-2 request.
+    uint64_t t1DispatchCount = 0;
+    uint64_t t1QuotaEnd = 0;
+    uint64_t t1DispatchLimit = 0;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    /// Legacy hitCount accounting deferred until the NO_RECLAIM seqlock
+    /// validation accepts this lookup.  A retry must not charge hotness or
+    /// Tier-1 quota for the discarded resolve snapshot.
+    bool legacyHitCountPending = false;
+    /// Settlement coordinates survive failed preparation independently of
+    /// Tier-2 eligibility; a clean fallback must not arm a recompile.
+    uint32_t legacyBucketIndex = kEJitSharedCacheBuckets;
+    uint32_t legacySlotIndex = kEJitSharedCacheSlots;
+    /// Exact publish identity captured with a deferred legacy lookup.  The
+    /// NO_RECLAIM cold path may span a publish after it revalidates its
+    /// pointer, so commitLegacyHit() must serialize against publication and
+    /// fail closed when this identity is no longer current.  The pointer is
+    /// retained by the NO_RECLAIM code pool and is therefore safe to compare.
+    uint64_t legacySlotAttemptToken = 0;
+    uint32_t legacySlotGeneration = 0;
+    uint64_t legacySlotIdentityHash = 0;
+    void *legacySlotFnPtr = nullptr;
+    uint8_t legacySlotTier = 0;
+#endif
   };
 
   // shared cache helpers (POD table in the shared blob)
@@ -1241,18 +1468,12 @@ private:
   /// by cacheLookup() and all fixed-dimension specializations.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
-  /// Submit Tier-2 from an identity/version-validated slot while its bucket
-  /// read lock is held. This preserves the exact slot snapshot without
-  /// enlarging the 16-byte CompileOrGetResult hot-path return value.
+  /// Reacquire the arming slot's bucket, validate its complete identity and
+  /// originating attempt as one snapshot, then claim Tier-2 on the cold path.
   void
-  enqueueTier2FromSlot(const EJitSharedCacheSlot &slot,
-                       const EJitBoundPtrDescriptor *boundPointers = nullptr,
-                       uint32_t boundCount = 0);
-  void
-  enqueueTier2ForIdentity(uint32_t funcIndex, const EJitDimPair *dims,
-                          uint32_t numDims,
-                          const EJitBoundPtrDescriptor *boundPointers = nullptr,
-                          uint32_t boundCount = 0);
+  enqueueTier2FromLookup(const SharedLookup &lookup,
+                         const EJitBoundPtrDescriptor *boundPointers = nullptr,
+                         uint32_t boundCount = 0);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
@@ -1266,8 +1487,81 @@ private:
   /// cache-hit counter is incremented exactly once and the semantics stay
   /// identical. Does NOT perform the Ready or instance-enabled checks (the
   /// callers do those first).
-  CompileOrGetResult classifyHit(const SharedLookup &Hit,
-                                 bool enqueueTier2 = true);
+  ///
+  /// This is also the single committed-return point for the experimental
+  /// observed Tier-1 dispatch contract (v21): the admission commit happens here
+  /// because every shareability/pointer/peer-preparation gate has already
+  /// passed AND every NO_RECLAIM seqlock retry has already been discarded by
+  /// the caller. A lookup abandoned by a seqlock retry therefore never reaches
+  /// this commit. \p boundPointers/\p boundCount are attached when a deferred
+  /// Tier-2 claim has to be made.
+  CompileOrGetResult
+  classifyHit(const SharedLookup &Hit,
+              const EJitBoundPtrDescriptor *boundPointers = nullptr,
+              uint32_t boundCount = 0);
+
+  /// Outcome of committing one committed Tier-1 lookup against the observed
+  /// dispatch quota.
+  enum class T1DispatchOutcome : uint8_t {
+    NotApplicable,   ///< not a live observed Tier-1 publish.
+    Admitted,        ///< a real dispatch was granted below the limit.
+    FinalAdmitted,   ///< the last allowed dispatch; quotaEnd was frozen.
+    Exhausted,       ///< quota already closed; no Tier-1 dispatch granted.
+    IdentityChanged, ///< slot republished since the resolve snapshot.
+  };
+  /// Commit one granted Tier-1 dispatch for \p Hit. Increments the slot's
+  /// observed count by CAS while it is below the frozen limit, freezes
+  /// quotaEnd exactly once on the dispatch that reaches the limit, and updates
+  /// the diagnostic progress quarter. Never fabricates a count for a rejected
+  /// lookup: only the committed-return path calls this.
+  ///
+  /// Exclusion: the identity re-check, the CAS and the freeze run as one
+  /// critical section against cachePublish()/cancelRequestAttempt(). The token
+  /// build relies on the bucket read token the committed lookup already holds;
+  /// NO_RECLAIM takes the separate leaf bucket observationLock (ABI v22), which
+  /// does not set writeFlag or bump publishSeq, so a granted dispatch never
+  /// invalidates a concurrent load-only lookup. The lock is released before the
+  /// Tier-2 enqueue (which takes the bucket writeFlag and then the
+  /// observationLock again, in that fixed order).
+  T1DispatchOutcome admitObservedT1Dispatch(const SharedLookup &Hit);
+
+  /// Body of admitObservedT1Dispatch() executed under the observation exclusion
+  /// of the build (caller guarantees no republish can interleave).
+  T1DispatchOutcome admitObservedT1DispatchLocked(const SharedLookup &Hit);
+
+  /// Snapshot the observed Tier-1 dispatch identity/quota of a matched cache
+  /// slot into \p R (experimental sharing contract, ABI v21). Returns true only
+  /// for a live Instrumented publish that carries a nonzero observed-dispatch
+  /// limit while the observed contract is armed; the fields are an
+  /// informational snapshot, the commit re-reads the slot. Shared by the
+  /// resolve path and the cold peer-preparation path so a real granted dispatch
+  /// is counted exactly once on either path.
+  bool captureT1Observation(const EJitSharedCacheSlot &Slot,
+                            SharedLookup &R) const;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  /// Commit one legacy identity-hit charge after cacheLookupSeq has accepted
+  /// its publish sequence.  Keeping this after the outer validation prevents
+  /// a discarded resolve from consuming hitCount/quota.
+  void commitLegacyHit(SharedLookup &Hit);
+#endif
+
+  /// Timestamp source for the observed dispatch boundary. 0 when unconfigured
+  /// (the caller reports the timestamp as unknown).
+  uint64_t traceNow() const {
+    return traceClockFn_ ? traceClockFn_(traceClockCtx_) : 0;
+  }
+
+  /// Fire the optional NO_RECLAIM test hook at the exact point where a racing
+  /// publish would invalidate a seqlock read (after the matched-slot resolve,
+  /// before the outer publishSeq stability check). Compiled out of production.
+  void fireSeqlockRetryHook(uint32_t bucketIndex) {
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+    if (seqlockRetryHook_)
+      seqlockRetryHook_(seqlockRetryHookCtx_, bucketIndex);
+#else
+    (void)bucketIndex;
+#endif
+  }
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info,
                                  bool pgoClearExclusive = false);
@@ -1293,6 +1587,11 @@ private:
     uint32_t funcIndex = 0;
     uint32_t numDims = 0;
     uint32_t generation = 0;
+    /// Exact logical attempt that published the snapshotted fn. The observation
+    /// identity of a successful cold preparation is pinned to THIS token (not a
+    /// load-only re-read), so a republish during the platform preparation makes
+    /// the commit fail closed instead of attributing old code to a replacement.
+    uint64_t attemptToken = 0;
     EJitDimPair dims[4] = {};
     uint32_t versions[4] = {};
     uintptr_t codeStart = 0;
@@ -1329,14 +1628,33 @@ private:
   bool versionsCurrent(const EJitCompileRequest &req) const;
 
   // queue/dedup helpers
+  EJitCompileOrGetStatus enqueueRepresentativeWake(EJitCompileRequest &req);
   bool queuePush(const EJitCompileRequest &req);
   bool queuePop(EJitCompileRequest &out);
-  /// Claim the in-flight slot for \p funcIndex at generation \p gen: CAS
-  /// 0->gen.
-  EJitDedupResult dedupMark(uint32_t funcIndex, uint32_t gen);
-  /// Release the in-flight slot ONLY if it still holds \p gen: CAS gen->0. A
-  /// stale worker (older gen) therefore cannot clear a newer generation's bit.
-  void dedupClear(uint32_t funcIndex, uint32_t gen);
+  /// Claim the in-flight slot for \p funcIndex with \p claim: CAS 0->claim.
+  /// The claim is the exact attempt token when request attempts are enabled,
+  /// otherwise it is the owner generation.
+  EJitDedupResult dedupMark(uint32_t funcIndex, uint64_t claim);
+  /// Release the in-flight slot only when it still holds \p claim. An old
+  /// worker or callback therefore cannot clear a newer attempt's claim.
+  void dedupClear(uint32_t funcIndex, uint64_t claim);
+
+  uint64_t beginRequestAttempt(const EJitCompileRequest &req,
+                               bool samplingPending);
+  bool markRequestAttemptQueued(uint64_t token);
+  bool beginRequestAttemptCompile(uint64_t token);
+  void endRequestAttemptCompile(uint64_t token, bool finalRead);
+  void settleRequestAttemptSampling(uint64_t token,
+                                    EJitRequestAttemptReason reason);
+  void settleRequestAttemptPublication(uint64_t token, bool published,
+                                       EJitRequestAttemptReason reason);
+  void markRequestAttemptWaitingProfile(uint64_t token);
+  void acknowledgeRequestAttemptQueueDrop(uint64_t token,
+                                          EJitRequestAttemptReason reason);
+  void cancelAttemptsForInstance(uint32_t dimType, uint32_t instanceId);
+  void cancelAllRequestAttempts(uint32_t generation,
+                                EJitRequestAttemptReason reason);
+  bool requestAttemptCanPublish(uint64_t token) const;
 
   /// Compile one dequeued request through the two version checkpoints and the
   /// commit-gated publish. The Tier-2 aarch64 exclusive-monitor workaround
@@ -1356,7 +1674,8 @@ private:
   /// completion and terminal worker failures call this; transient queue-full
   /// leaves ownership intact so the next hit can retry.
   void finishPgoFunction(uint32_t funcIndex, bool completed,
-                         const char *reason = nullptr);
+                         const char *reason = nullptr,
+                         uint64_t attemptToken = 0);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -1367,8 +1686,18 @@ private:
   EJitSharedTaskPoolState *state_ = nullptr;
   CompileCallback compileFn_ = nullptr;
   void *compileCtx_ = nullptr;
+  CandidateClassifyCallback candidateClassifyFn_ = nullptr;
+  void *candidateClassifyCtx_ = nullptr;
+  SamplingAdmissionCallback samplingAdmissionFn_ = nullptr;
+  void *samplingAdmissionCtx_ = nullptr;
+  RepresentativeWakeCallback representativeWakeFn_ = nullptr;
+  void *representativeWakeCtx_ = nullptr;
+  DispatchObserver dispatchObserverFn_ = nullptr;
+  void *dispatchObserverCtx_ = nullptr;
   PublishCallback publishFn_ = nullptr;
   void *publishCtx_ = nullptr;
+  PgoLifecycleDropCallback pgoLifecycleDropFn_ = nullptr;
+  void *pgoLifecycleDropCtx_ = nullptr;
   ReleaseCallback releaseFn_ = nullptr;
   void *releaseCtx_ = nullptr;
   PrepareCodeCallback prepareCodeFn_ = nullptr;
@@ -1394,9 +1723,16 @@ private:
   void *workerCtx_ = nullptr;
   WorkerIdleFn workerIdle_ = nullptr;
   void *workerIdleCtx_ = nullptr;
+  OwnerMaintenanceFn ownerMaintenanceFn_ = nullptr;
+  void *ownerMaintenanceCtx_ = nullptr;
+  TraceClockFn traceClockFn_ = nullptr;
+  void *traceClockCtx_ = nullptr;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
+  EJitAtomicU32 failTier2QueuePush_{0};
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
+  SeqRetryHook seqlockRetryHook_ = nullptr;
+  void *seqlockRetryHookCtx_ = nullptr;
 #endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
@@ -1405,6 +1741,7 @@ private:
   uint64_t regFingerprint_ = 0;
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
+  bool requestAttemptsEnabled_ = false;
   bool isOwner_ = false;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;

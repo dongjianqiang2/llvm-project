@@ -73,7 +73,8 @@ enum class EJitValueProfileMode : uint8_t {
 /// Tier-1 records and the Tier-2 transform agree.
 void runValueProfileOnFunction(
     Function &F, FunctionAnalysisManager &FAM, EJitValueProfileMode Mode,
-    function_ref<void(StringRef, uint32_t)> OnFunctionSites = nullptr);
+    function_ref<void(StringRef, uint32_t)> OnFunctionSites = nullptr,
+    uint64_t SamplingSessionId = 0);
 
 /// Tier-2 guarded scalar/loop-bound specialization (EJIT_VALUE_PROFILE.md
 /// §7.2). Consumes \p sites (the merged side table) and the !ejit.vp metadata

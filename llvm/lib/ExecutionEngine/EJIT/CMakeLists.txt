@@ -19,6 +19,12 @@ if(EJIT_FREESTANDING)
   endif()
 endif()
 
+# Phase 1 only: preserve real dimensions while folding authorized scalar
+# loads. Does NOT enable version grouping, shared profiles, or physical reuse.
+# Leave OFF until the focused tests pass on the intended toolchain.
+option(EJIT_EXPERIMENTAL_PRESERVED_DIMS
+  "EJIT phase-1 experiment: load-only specialization with real dimensions" OFF)
+
 #===-- Online-PGO value profiling (guarded specialization) ----------------===#
 # Runtime value collector + Tier-1 instrumentation hooks + Tier-2 guarded
 # scalar specialization (EJIT_VALUE_PROFILE.md). DEFAULT OFF: with the option
@@ -101,6 +107,8 @@ set(EJIT_SOURCES
   EJitRuntime.cpp
   EJitRegistryTable.c
   EJitOrcEngine.cpp
+  EJitPreparedCode.cpp
+  EJitRepresentativeGroup.cpp
   EJitLinkDiagPlugin.cpp
   EJitLinkOptimizationPlugin.cpp
   EJitLibcallStubs.cpp
@@ -196,6 +204,10 @@ add_llvm_component_library(LLVMEJIT
   # ejit_minimal target below (see §6.5 of EJIT_LIBRARY_TRIMMING.md).
   # ExecutionEngine is not listed — it's already pulled by OrcJIT.
 )
+
+if(EJIT_EXPERIMENTAL_PRESERVED_DIMS)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_EXPERIMENTAL_PRESERVED_DIMS)
+endif()
 
 if(EJIT_SRE_TASKPOOL_NO_RECLAIM)
   target_compile_definitions(LLVMEJIT PRIVATE

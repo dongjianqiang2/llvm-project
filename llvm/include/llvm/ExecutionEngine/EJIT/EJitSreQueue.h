@@ -52,11 +52,19 @@ struct EJitDimPair {
   uint32_t instanceId;
 };
 
+constexpr uint32_t kEJitMaxRequestDims = 4u;
+
 struct EJitCompileRequest {
   uint32_t funcIndex;
   uint32_t numDims;
-  EJitDimPair dims[4];
-  uint32_t versions[4];
+  EJitDimPair dims[kEJitMaxRequestDims];
+  uint32_t versions[kEJitMaxRequestDims];
+  // Nonzero only for the experimental version-reuse request lifecycle. This
+  // token identifies one logical attempt across its Tier-1 queue item, the
+  // later Tier-2 queue item, delayed publication, cancellation and callbacks.
+  // It is never reused, so an old callback cannot settle a newer attempt for
+  // the same function/generation.
+  uint64_t attemptToken;
   uintptr_t fallbackPtr;
   // Shared-taskpool owner generation captured at enqueue time. A worker drops a
   // request whose generation no longer equals the shared state's generation
@@ -65,16 +73,32 @@ struct EJitCompileRequest {
   // fixed-width scalar accessed by value, never byte-parsed.
   uint32_t generation;
   // Borrowed bound objects. The queue copies only these descriptors; it never
-  // owns, frees, or dereferences the pointed-to bytes. The compile callback
-  // must finish reading them before returning.
+  // owns, frees, or dereferences the pointed-to bytes. The default protocol
+  // ends the borrow when the compile callback returns. The opt-in request-
+  // attempt protocol can retain the descriptors across Tier-1/Tier-2, and
+  // explicitly acknowledges the final compiler read before releasing them.
   uint32_t boundCount;
   EJitBoundPtrDescriptor boundPointers[kEJitMaxBoundPointers];
+  // Frozen observed Tier-1 dispatch metadata (v21, experimental sharing
+  // contract). Captured from the published Tier-1 slot under the bucket lock
+  // when this Tier-2 request is built, and re-captured identically from the
+  // same frozen slot on a queue-full retry. All zero when the observation is
+  // unavailable (legacy/tokenless mode, non-shared pool, or a request that was
+  // not armed by a Tier-1 slot). t1QuotaEnd is the timestamp of the final
+  // allowed dispatch; 0 means unknown, never the compile time. These fields do
+  // not affect request routing.
+  uint64_t t1DispatchCount;
+  uint64_t t1QuotaEnd;
+  uint64_t t1DispatchLimit;
 };
 
-// Size is stable per pointer width and independent of pointee size: 200 bytes
-// on 64-bit targets and 164 bytes on 32-bit targets.
+// Size is stable per pointer width and independent of pointee size. Some
+// 32-bit ABIs align uint64_t to 8 bytes and therefore add tail padding.
+// v21 added the three 64-bit observed-dispatch fields (208 -> 232 on 64-bit).
 static_assert(
-    sizeof(EJitCompileRequest) == (sizeof(uintptr_t) == 8 ? 200u : 164u),
+    sizeof(EJitCompileRequest) ==
+        (sizeof(uintptr_t) == 8 ? 232u
+                                : (alignof(uint64_t) == 8 ? 200u : 196u)),
     "EJitCompileRequest size must stay fixed and payload-independent");
 static_assert(alignof(EJitCompileRequest) <= 8,
               "EJitCompileRequest alignment must stay <= 8 bytes");
@@ -101,6 +125,14 @@ constexpr uint32_t kEJitTierMask = 0x3u << kEJitTierShift;
 constexpr uint32_t kEJitTierBaseline = 0;
 constexpr uint32_t kEJitTierInstrumented = 1;
 constexpr uint32_t kEJitTierPgoUse = 2;
+// Worker-only prefix/schema classification. Never emits executable code.
+constexpr uint32_t kEJitTierCandidate = 3;
+
+/// Real Tier-1 dispatches ONE representative sampling session of a
+/// representative-PGO group may consume (the group quota, and the default
+/// online-PGO Tier-2 trigger threshold). Named once so the product admission
+/// path and the group policy cannot drift apart.
+constexpr uint32_t kEJitRepresentativeDispatchQuota = 64;
 
 /// Encode a tier (CompileTier value) into funcIndex's top 2 bits.
 inline uint32_t encodeReqTier(uint32_t funcIndex, uint32_t tier) {

@@ -17,6 +17,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
@@ -70,8 +73,21 @@ namespace {
 // symbol, no arch-specific instruction in this layer).
 inline void cpuRelax() { __asm__ __volatile__("" ::: "memory"); }
 
-// Bound pointers are transport-only. Once the compile callback has returned,
-// no owner-private publication/retry state should retain or expose them.
+void requestAttemptLock(EJitSharedTaskPoolState *State) {
+  uint32_t Expected = 0;
+  while (!State->attemptLock.compareExchange(Expected, 1)) {
+    Expected = 0;
+    cpuRelax();
+  }
+}
+
+void requestAttemptUnlock(EJitSharedTaskPoolState *State) {
+  State->attemptLock.storeRelease(0);
+}
+
+// Publication state never carries borrowed pointers. The opt-in logical
+// attempt record retains its own descriptor copy until the last compiler read
+// is acknowledged; the publish request itself is safe to keep or retry.
 EJitCompileRequest requestForPublication(const EJitCompileRequest &Req) {
   EJitCompileRequest Published = Req;
   Published.boundCount = 0;
@@ -111,6 +127,11 @@ constexpr uint32_t kEJitFixedWorkerCore = kEJitInvalidCoreId;
 // monotonic per-bucket publishSeq (odd while writing, even when done) that the
 // reader uses to detect and discard a read that raced a publish. The default
 // (token) build is unchanged: publishSeq is never touched.
+//
+// The observed-dispatch admission commit does NOT take this writer lock (ABI
+// v22): it uses the separate leaf observationLock below, which the load-only
+// reader never reads, so granting a dispatch cannot invalidate a concurrent
+// lookup. writeFlag/publishSeq remain reserved for real publishes/cancels.
 //===----------------------------------------------------------------------===//
 bool bucketTryRead(EJitSharedCacheBucket &b) {
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
@@ -189,7 +210,65 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
   b.writeFlag.storeRelease(0);
 }
 
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+//===----------------------------------------------------------------------===//
+// Observation exclusion for the observed Tier-1 dispatch contract (ABI v22).
+//
+// A NO_RECLAIM lookup holds no read token, so the bucket writer lock cannot
+// serialize the admission commit: taking it sets writeFlag and bumps
+// publishSeq, which is exactly the state a concurrent load-only reader uses to
+// discard its read (R1R-1). observationLock is a separate word that reader
+// never reads, so an admitted dispatch invalidates no lookup. It serializes the
+// observation identity of one bucket:
+//
+//   * admission (admitObservedT1Dispatch): identity re-check + count CAS +
+//     quotaEnd freeze as ONE critical section;
+//   * cachePublish: the target-slot identity/observation writes through
+//     state=Ready;
+//   * cancelRequestAttempt / cacheDropPending / cacheStage{BatchRequest,
+//     Pending}: every reset or rewrite of a slot's identity/observation fields;
+//   * enqueueTier2FromLookup: the coherent count/quotaEnd read.
+//
+// Lock order: bucket writeFlag -> observationLock. observationLock is a LEAF: a
+// holder performs bounded atomic field work only and never acquires another
+// lock, so a waiter spins for a bounded duration and admission cannot deadlock
+// against a publish/cancel that holds writeFlag. The default token build never
+// takes it (the committed lookup holds the bucket read token and publish/cancel
+// drain readers), so the word stays 0 there.
+//===----------------------------------------------------------------------===//
+void bucketObservationLock(EJitSharedCacheBucket &b) {
+  uint32_t expected = 0;
+  while (!b.observationLock.compareExchange(expected, 1)) {
+    expected = 0;
+    cpuRelax();
+  }
+}
+void bucketObservationUnlock(EJitSharedCacheBucket &b) {
+  b.observationLock.storeRelease(0);
+}
+#endif
+
 constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
+
+static bool slotIdentityMatches(const EJitSharedCacheSlot &s,
+                                uint32_t funcIndex, const EJitDimPair *dims,
+                                uint32_t numDims) {
+  if (s.funcIndex != funcIndex || s.numDims != numDims)
+    return false;
+  for (uint32_t i = 0; i < numDims; ++i)
+    if (s.dims[i].dimType != dims[i].dimType ||
+        s.dims[i].instanceId != dims[i].instanceId)
+      return false;
+  return true;
+}
+
+static bool slotVersionsMatch(const EJitSharedCacheSlot &Slot,
+                              const uint32_t *Versions, uint32_t NumDims) {
+  for (uint32_t I = 0; I < NumDims; ++I)
+    if (Slot.versions[I] != Versions[I])
+      return false;
+  return true;
+}
 
 /// Mixing constant shared by hashIdentity() and every unrolled fixed-dimension
 /// lookup (cacheLookupNd / cacheLookupSeqNd). Kept here so the NO_RECLAIM
@@ -932,8 +1011,10 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   // checkpoints, which DISCARD a finished compile when it moves, and nothing
   // re-enqueues a dropped compile. An unconditional bump would let N cores
   // activating the same instance at startup stall the JIT permanently.
-  if (flipped)
+  if (flipped) {
     state_->version[dimType][instanceId].fetchAdd(1);
+    cancelAttemptsForInstance(dimType, instanceId);
+  }
   // Latch on the first enable of ANY instance: this brackets the init→activate
   // window during which instanceDisabled hits are tallied separately
   // (instanceDisabledPreActivate) for diagnosing the pre-activate fallback
@@ -962,6 +1043,7 @@ uint32_t EJitSharedTaskPool::setAllInstancesEnabled(uint32_t dimType,
     ++flippedCount;
     // As in setInstanceEnabled: version[] moves only on a real transition.
     state_->version[dimType][i].fetchAdd(1);
+    cancelAttemptsForInstance(dimType, i);
   }
   // ONE epoch bump and ONE drain: both are global, so doing them per instance
   // was pure amplification.
@@ -986,7 +1068,7 @@ bool EJitSharedTaskPool::versionsCurrent(const EJitCompileRequest &req) const {
 // impossible (spec §11 generation-aware dedup).
 //===----------------------------------------------------------------------===//
 EJitDedupResult EJitSharedTaskPool::dedupMark(uint32_t funcIndex,
-                                              uint32_t gen) {
+                                              uint64_t claim) {
   // PGO: Tier-2 requests pack the tier into the top 2 bits of funcIndex
   // (encodeReqTier).  Strip them before using funcIndex as an array index,
   // otherwise Tier-1 and Tier-2 requests for the same function would map
@@ -994,13 +1076,13 @@ EJitDedupResult EJitSharedTaskPool::dedupMark(uint32_t funcIndex,
   funcIndex = stripReqTier(funcIndex);
   if (funcIndex >= kEJitSharedMaxFuncIndex)
     return EJitDedupResult::InvalidFuncIndex;
-  uint32_t expected = 0;
-  if (state_->inFlight[funcIndex].compareExchange(expected, gen))
+  uint64_t expected = 0;
+  if (state_->inFlight[funcIndex].compareExchange(expected, claim))
     return EJitDedupResult::Claimed;
   return EJitDedupResult::AlreadyPending;
 }
 
-void EJitSharedTaskPool::dedupClear(uint32_t funcIndex, uint32_t gen) {
+void EJitSharedTaskPool::dedupClear(uint32_t funcIndex, uint64_t claim) {
   // PGO: Tier-2 requests carry the tier in funcIndex's top 2 bits
   // (encodeReqTier). dedupMark strips them before indexing, so dedupClear MUST
   // strip identically \u2014 otherwise an encoded Tier-2 funcIndex indexes out
@@ -1012,14 +1094,536 @@ void EJitSharedTaskPool::dedupClear(uint32_t funcIndex, uint32_t gen) {
   // CAS gen->0: only clears the slot if it still holds OUR generation. A stale
   // worker whose generation was superseded (or whose slot was re-claimed by a
   // new generation after an owner re-init) fails this CAS and clears nothing.
-  uint32_t expected = gen;
-  state_->inFlight[funcIndex].compareExchange(expected, 0u);
+  uint64_t expected = claim;
+  state_->inFlight[funcIndex].compareExchange(expected, uint64_t{0});
+}
+
+namespace {
+constexpr uint32_t kAttemptPendingEvents = EJitAttemptSamplingPending |
+                                           EJitAttemptBorrowPending |
+                                           EJitAttemptPublicationPending;
+
+EJitSharedRequestAttempt *findAttemptLocked(EJitSharedTaskPoolState *State,
+                                            uint64_t Token) {
+  if (!Token)
+    return nullptr;
+  for (EJitSharedRequestAttempt &A : State->requestAttempts)
+    if (A.token.loadRelaxed() == Token)
+      return &A;
+  return nullptr;
+}
+
+bool attemptIdentityMatchesLocked(const EJitSharedRequestAttempt &Attempt,
+                                  const EJitCompileRequest &Req) {
+  if (Attempt.generation.loadRelaxed() != Req.generation ||
+      Attempt.funcIndex.loadRelaxed() != stripReqTier(Req.funcIndex) ||
+      Attempt.numDims != Req.numDims)
+    return false;
+  for (uint32_t I = 0; I < Req.numDims; ++I)
+    if (Attempt.dims[I].dimType != Req.dims[I].dimType ||
+        Attempt.dims[I].instanceId != Req.dims[I].instanceId ||
+        Attempt.versions[I] != Req.versions[I])
+      return false;
+  return true;
+}
+
+void retireAttemptLocked(EJitSharedTaskPoolState *State,
+                         EJitSharedRequestAttempt &A) {
+  const uint32_t Write = State->attemptHistoryWrite.loadRelaxed();
+  EJitSharedRequestAttemptHistory &H =
+      State->requestHistory[Write % kEJitSharedRequestHistoryCapacity];
+  H.generation.storeRelaxed(A.generation.loadRelaxed());
+  H.funcIndex.storeRelaxed(A.funcIndex.loadRelaxed());
+  H.terminalReason.storeRelaxed(A.terminalReason.loadRelaxed());
+  H.token.storeRelease(A.token.loadRelaxed());
+  State->attemptHistoryWrite.storeRelaxed(Write + 1);
+  const uint32_t Count = State->attemptHistoryCount.loadRelaxed();
+  if (Count < kEJitSharedRequestHistoryCapacity)
+    State->attemptHistoryCount.storeRelaxed(Count + 1);
+
+  A.boundCount = 0;
+  for (EJitBoundPtrDescriptor &Bound : A.boundPointers)
+    Bound = {};
+  A.flags.storeRelaxed(0);
+  A.token.storeRelease(0);
+  const uint32_t Live = State->attemptLiveCount.loadRelaxed();
+  if (Live)
+    State->attemptLiveCount.storeRelaxed(Live - 1);
+}
+
+void maybeRetireAttemptLocked(EJitSharedTaskPoolState *State,
+                              EJitSharedRequestAttempt &A) {
+  if ((A.flags.loadRelaxed() & kAttemptPendingEvents) == 0)
+    retireAttemptLocked(State, A);
+}
+} // namespace
+
+uint64_t EJitSharedTaskPool::beginRequestAttempt(const EJitCompileRequest &Req,
+                                                 bool SamplingPending) {
+  if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
+    return 0;
+
+  uint64_t Last = state_->nextAttemptToken.loadRelaxed();
+  for (;;) {
+    if (Last == UINT64_MAX)
+      return 0;
+    if (state_->nextAttemptToken.compareExchange(Last, Last + 1))
+      break;
+  }
+  const uint64_t Token = Last + 1;
+
+  requestAttemptLock(state_);
+  // Deactivation and scope completion must exclude a producer that observed
+  // enabled before the transition but tries to acquire its borrow afterwards.
+  if (samplingAdmissionFn_) {
+    if (Req.numDims > kEJitMaxRequestDims ||
+        Req.generation != state_->generation.loadAcquire()) {
+      requestAttemptUnlock(state_);
+      return 0;
+    }
+    for (uint32_t I = 0; I < Req.numDims; ++I)
+      if (Req.dims[I].dimType >= kEJitSharedDimTypes ||
+          Req.dims[I].instanceId >= kEJitSharedInstances ||
+          state_->enabled[Req.dims[I].dimType][Req.dims[I].instanceId].loadAcquire() == 0 ||
+          Req.versions[I] != instanceVersion(Req.dims[I].dimType, Req.dims[I].instanceId)) {
+        requestAttemptUnlock(state_);
+        return 0;
+      }
+  }
+  EJitSharedRequestAttempt *Free = nullptr;
+  for (EJitSharedRequestAttempt &A : state_->requestAttempts)
+    if (A.token.loadRelaxed() == 0) {
+      Free = &A;
+      break;
+    }
+  if (!Free) {
+    requestAttemptUnlock(state_);
+    return 0;
+  }
+
+  Free->generation.storeRelaxed(Req.generation);
+  Free->funcIndex.storeRelaxed(stripReqTier(Req.funcIndex));
+  uint32_t Flags = EJitAttemptBorrowPending | EJitAttemptPublicationPending |
+                   EJitAttemptQueueOwned;
+  if (SamplingPending)
+    Flags |= EJitAttemptSamplingPending;
+  Free->flags.storeRelaxed(Flags);
+  Free->terminalReason.storeRelaxed(
+      static_cast<uint32_t>(EJitRequestAttemptReason::None));
+  Free->numDims = Req.numDims;
+  Free->boundCount = Req.boundCount;
+  for (uint32_t I = 0; I < kEJitSharedMaxDims; ++I) {
+    Free->dims[I] = I < Req.numDims ? Req.dims[I] : EJitDimPair{};
+    Free->versions[I] = I < Req.numDims ? Req.versions[I] : 0;
+  }
+  for (uint32_t I = 0; I < kEJitMaxBoundPointers; ++I)
+    Free->boundPointers[I] =
+        I < Req.boundCount ? Req.boundPointers[I] : EJitBoundPtrDescriptor{};
+  Free->token.storeRelease(Token);
+  state_->attemptLiveCount.storeRelaxed(state_->attemptLiveCount.loadRelaxed() +
+                                        1);
+  requestAttemptUnlock(state_);
+  return Token;
+}
+
+bool EJitSharedTaskPool::markRequestAttemptQueued(uint64_t Token) {
+  if (!Token)
+    return true;
+  requestAttemptLock(state_);
+  EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token);
+  if (!A || (A->flags.loadRelaxed() & EJitAttemptCancelRequested)) {
+    requestAttemptUnlock(state_);
+    return false;
+  }
+  uint32_t Flags = A->flags.loadRelaxed();
+  Flags &= ~EJitAttemptWaitingProfile;
+  Flags |= EJitAttemptQueueOwned;
+  A->flags.storeRelaxed(Flags);
+  requestAttemptUnlock(state_);
+  return true;
+}
+
+bool EJitSharedTaskPool::completeRequestBorrow(uint64_t Token) {
+  if (!state_ || !Token) return false;
+  requestAttemptLock(state_);
+  EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token);
+  const bool Pending = A && (A->flags.loadRelaxed() & EJitAttemptBorrowPending);
+  if (Pending) {
+    A->flags.storeRelaxed(A->flags.loadRelaxed() & ~EJitAttemptBorrowPending);
+    A->boundCount = 0;
+    for (auto &D : A->boundPointers) D = EJitBoundPtrDescriptor{};
+    maybeRetireAttemptLocked(state_, *A);
+  }
+  requestAttemptUnlock(state_);
+  return Pending;
+}
+
+void EJitSharedTaskPool::finishCandidateClassification(uint64_t Token) {
+  if (!state_ || !Token) return;
+  requestAttemptLock(state_);
+  if (auto *A = findAttemptLocked(state_, Token)) {
+    uint32_t Flags = A->flags.loadRelaxed();
+    Flags &= ~(EJitAttemptQueueOwned | EJitAttemptCompileActive |
+               EJitAttemptPublicationPending | EJitAttemptSamplingPending |
+               EJitAttemptWaitingProfile);
+    if (Flags & EJitAttemptCancelRequested) Flags &= ~EJitAttemptBorrowPending;
+    A->flags.storeRelaxed(Flags);
+    maybeRetireAttemptLocked(state_, *A);
+  }
+  requestAttemptUnlock(state_);
+}
+
+EJitSharedTaskPool::BorrowScopeStatus EJitSharedTaskPool::instanceBorrowStatus(
+    uint32_t Dim, uint32_t Inst, uint32_t Generation, uint32_t Version) const {
+  if (!state_ || Dim >= kEJitSharedDimTypes || Inst >= kEJitSharedInstances ||
+      !state_->requestAttemptsEnabled.loadAcquire()) return BorrowScopeStatus::Invalid;
+  auto Current = [&] {
+    return state_->generation.loadAcquire() == Generation &&
+           state_->version[Dim][Inst].loadAcquire() == Version &&
+           state_->enabled[Dim][Inst].loadAcquire() == 0;
+  };
+  requestAttemptLock(state_);
+  if (!Current()) {
+    requestAttemptUnlock(state_);
+    return BorrowScopeStatus::Invalid;
+  }
+  bool Pending = false;
+  for (const auto &A : state_->requestAttempts) {
+    if (!A.token.loadRelaxed() ||
+        !(A.flags.loadRelaxed() & (EJitAttemptBorrowPending | EJitAttemptCompileActive)))
+      continue;
+    for (uint32_t I = 0; I < A.numDims; ++I)
+      if (A.dims[I].dimType == Dim && A.dims[I].instanceId == Inst) Pending = true;
+  }
+  const bool StillCurrent = Current();
+  requestAttemptUnlock(state_);
+  return !StillCurrent ? BorrowScopeStatus::Invalid : Pending ? BorrowScopeStatus::Pending
+                                                            : BorrowScopeStatus::Complete;
+}
+
+bool EJitSharedTaskPool::beginRequestAttemptCompile(uint64_t Token) {
+  if (!Token)
+    return true;
+  requestAttemptLock(state_);
+  EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token);
+  if (!A) {
+    requestAttemptUnlock(state_);
+    return false;
+  }
+  uint32_t Flags = A->flags.loadRelaxed() & ~EJitAttemptQueueOwned;
+  if (Flags & EJitAttemptCancelRequested) {
+    Flags &= ~EJitAttemptBorrowPending;
+    A->flags.storeRelaxed(Flags);
+    maybeRetireAttemptLocked(state_, *A);
+    requestAttemptUnlock(state_);
+    return false;
+  }
+  A->flags.storeRelaxed(Flags | EJitAttemptCompileActive);
+  requestAttemptUnlock(state_);
+  return true;
+}
+
+void EJitSharedTaskPool::endRequestAttemptCompile(uint64_t Token,
+                                                  bool FinalRead) {
+  if (!Token)
+    return;
+  requestAttemptLock(state_);
+  if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token)) {
+    uint32_t Flags = A->flags.loadRelaxed() & ~EJitAttemptCompileActive;
+    if (FinalRead || (Flags & EJitAttemptCancelRequested))
+      Flags &= ~EJitAttemptBorrowPending;
+    A->flags.storeRelaxed(Flags);
+    maybeRetireAttemptLocked(state_, *A);
+  }
+  requestAttemptUnlock(state_);
+}
+
+void EJitSharedTaskPool::settleRequestAttemptSampling(
+    uint64_t Token, EJitRequestAttemptReason Reason) {
+  if (!Token)
+    return;
+  requestAttemptLock(state_);
+  if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token)) {
+    uint32_t Flags = A->flags.loadRelaxed();
+    Flags &= ~(EJitAttemptSamplingPending | EJitAttemptHoldsAdmission);
+    A->flags.storeRelaxed(Flags);
+    if (Reason != EJitRequestAttemptReason::None &&
+        A->terminalReason.loadRelaxed() ==
+            static_cast<uint32_t>(EJitRequestAttemptReason::None))
+      A->terminalReason.storeRelaxed(static_cast<uint32_t>(Reason));
+    maybeRetireAttemptLocked(state_, *A);
+  }
+  requestAttemptUnlock(state_);
+}
+
+void EJitSharedTaskPool::settleRequestAttemptPublication(
+    uint64_t Token, bool Published, EJitRequestAttemptReason Reason) {
+  if (!Token)
+    return;
+  requestAttemptLock(state_);
+  if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token)) {
+    uint32_t Flags = A->flags.loadRelaxed();
+    if (Published && (Flags & EJitAttemptCancelRequested)) {
+      requestAttemptUnlock(state_);
+      return;
+    }
+    Flags &= ~EJitAttemptPublicationPending;
+    A->flags.storeRelaxed(Flags);
+    A->terminalReason.storeRelaxed(static_cast<uint32_t>(Reason));
+    maybeRetireAttemptLocked(state_, *A);
+  }
+  requestAttemptUnlock(state_);
+}
+
+void EJitSharedTaskPool::markRequestAttemptWaitingProfile(uint64_t Token) {
+  if (!Token)
+    return;
+  requestAttemptLock(state_);
+  if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token)) {
+    uint32_t Flags = A->flags.loadRelaxed();
+    Flags &= ~(EJitAttemptQueueOwned | EJitAttemptCompileActive);
+    Flags |= EJitAttemptWaitingProfile;
+    A->flags.storeRelaxed(Flags);
+  }
+  requestAttemptUnlock(state_);
+}
+
+bool EJitSharedTaskPool::cancelRequestAttempt(uint64_t Token,
+                                              EJitRequestAttemptReason Reason) {
+  if (!state_ || !Token)
+    return false;
+  EJitCompileRequest Identity{};
+  requestAttemptLock(state_);
+  EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token);
+  if (!A) {
+    requestAttemptUnlock(state_);
+    return false;
+  }
+  Identity.funcIndex = A->funcIndex.loadRelaxed();
+  Identity.numDims = A->numDims;
+  Identity.generation = A->generation.loadRelaxed();
+  for (uint32_t I = 0; I < Identity.numDims; ++I) {
+    Identity.dims[I] = A->dims[I];
+    Identity.versions[I] = A->versions[I];
+  }
+  requestAttemptUnlock(state_);
+
+  const uint64_t Key =
+      hashIdentity(Identity.funcIndex, Identity.dims, Identity.numDims);
+  EJitSharedCacheBucket &Bucket =
+      state_->buckets[Key % kEJitSharedCacheBuckets];
+  // Publication takes the same locks in this order. Whichever operation owns
+  // the bucket first wins the commit decision: cancellation either marks the
+  // attempt before publication, or retracts the exact slot just committed.
+  bucketWrite(Bucket, /*pgoClearExclusive=*/true);
+  bool HeldAdmission = false;
+  uint32_t FuncIndex = 0;
+  requestAttemptLock(state_);
+  A = findAttemptLocked(state_, Token);
+  if (!A) {
+    requestAttemptUnlock(state_);
+    bucketWriteRelease(Bucket);
+    return false;
+  }
+  uint32_t Flags = A->flags.loadRelaxed();
+  HeldAdmission = (Flags & EJitAttemptHoldsAdmission) != 0;
+  FuncIndex = A->funcIndex.loadRelaxed();
+  Flags |= EJitAttemptCancelRequested;
+  Flags &= ~(EJitAttemptPublicationPending | EJitAttemptWaitingProfile);
+  if (!HeldAdmission)
+    Flags &= ~EJitAttemptSamplingPending;
+  if ((Flags & (EJitAttemptQueueOwned | EJitAttemptCompileActive)) == 0)
+    Flags &= ~EJitAttemptBorrowPending;
+  A->flags.storeRelaxed(Flags);
+  A->terminalReason.storeRelaxed(static_cast<uint32_t>(Reason));
+
+  // Observation exclusion (v22): writeFlag alone no longer excludes a committed
+  // admission (which takes the leaf observationLock without writeFlag), so the
+  // identity/observation reset below must hold that same lock.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(Bucket);
+#endif
+  for (EJitSharedCacheSlot &Slot : Bucket.slots) {
+    if (Slot.state.loadRelaxed() !=
+            static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+        Slot.attemptToken != Token || Slot.generation != Identity.generation ||
+        !slotIdentityMatches(Slot, Identity.funcIndex, Identity.dims,
+                             Identity.numDims) ||
+        !slotVersionsMatch(Slot, Identity.versions, Identity.numDims))
+      continue;
+    // The code pool retains physical ownership. In NO_RECLAIM this is required
+    // for load-only readers; in the reclaiming build it also avoids freeing T1
+    // profile storage while a cancelled Tier-2 compiler may still be reading.
+    Slot.state.storeRelaxed(
+        static_cast<uint32_t>(EJitSharedSlotState::Publishing));
+    Slot.fnPtr.storeRelaxed(0);
+    Slot.attemptToken = 0;
+    Slot.identityHash = 0;
+    Slot.executableCoreMask.storeRelaxed(0);
+    Slot.state.storeRelease(static_cast<uint32_t>(EJitSharedSlotState::Empty));
+    state_->dispatchEpoch.fetchAdd(1);
+    break;
+  }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(Bucket);
+#endif
+  if (!HeldAdmission)
+    maybeRetireAttemptLocked(state_, *A);
+  requestAttemptUnlock(state_);
+  bucketWriteRelease(Bucket);
+
+  dedupClear(FuncIndex, Token);
+  if (HeldAdmission)
+    finishPgoFunction(FuncIndex, false, "request-cancelled", Token);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // The token is stored in shared collector state, so cancellation from a
+  // peer core closes only its exact session without touching owner-private
+  // driver maps. The owner services the bounded drain before slot reuse.
+  ejitVpCancelAttempt(Token);
+#endif
+  return true;
+}
+
+void EJitSharedTaskPool::acknowledgeRequestAttemptQueueDrop(
+    uint64_t Token, EJitRequestAttemptReason Reason) {
+  if (!Token)
+    return;
+  requestAttemptLock(state_);
+  if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token)) {
+    A->flags.storeRelaxed(A->flags.loadRelaxed() & ~EJitAttemptQueueOwned);
+  }
+  requestAttemptUnlock(state_);
+  (void)cancelRequestAttempt(Token, Reason);
+}
+
+bool EJitSharedTaskPool::requestAttemptStatus(
+    uint64_t Token, RequestAttemptSnapshot &Out) const {
+  Out = {};
+  if (!state_ || !Token)
+    return false;
+  requestAttemptLock(state_);
+  if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token)) {
+    Out.token = Token;
+    Out.generation = A->generation.loadRelaxed();
+    Out.funcIndex = A->funcIndex.loadRelaxed();
+    Out.flags = A->flags.loadRelaxed();
+    Out.terminalReason =
+        static_cast<EJitRequestAttemptReason>(A->terminalReason.loadRelaxed());
+    Out.live = true;
+    requestAttemptUnlock(state_);
+    return true;
+  }
+  for (const EJitSharedRequestAttemptHistory &H : state_->requestHistory)
+    if (H.token.loadRelaxed() == Token) {
+      Out.token = Token;
+      Out.generation = H.generation.loadRelaxed();
+      Out.funcIndex = H.funcIndex.loadRelaxed();
+      Out.terminalReason =
+          static_cast<EJitRequestAttemptReason>(H.terminalReason.loadRelaxed());
+      Out.retained = true;
+      requestAttemptUnlock(state_);
+      return true;
+    }
+  requestAttemptUnlock(state_);
+  return false;
+}
+
+uint32_t EJitSharedTaskPool::liveRequestAttemptCount() const {
+  return state_ ? state_->attemptLiveCount.loadAcquire() : 0;
+}
+
+uint32_t EJitSharedTaskPool::retainedRequestAttemptCount() const {
+  return state_ ? state_->attemptHistoryCount.loadAcquire() : 0;
+}
+
+bool EJitSharedTaskPool::requestAttemptCanPublish(uint64_t Token) const {
+  if (!Token)
+    return true;
+  requestAttemptLock(state_);
+  EJitSharedRequestAttempt *A = findAttemptLocked(state_, Token);
+  const bool CanPublish =
+      A && (A->flags.loadRelaxed() &
+            (EJitAttemptCancelRequested | EJitAttemptPublicationPending)) ==
+               EJitAttemptPublicationPending;
+  requestAttemptUnlock(state_);
+  return CanPublish;
+}
+
+void EJitSharedTaskPool::cancelAttemptsForInstance(uint32_t DimType,
+                                                   uint32_t InstanceId) {
+  if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
+    return;
+  uint64_t Tokens[kEJitSharedRequestAttemptCapacity] = {};
+  uint32_t Count = 0;
+  requestAttemptLock(state_);
+  for (EJitSharedRequestAttempt &A : state_->requestAttempts) {
+    const uint64_t Token = A.token.loadRelaxed();
+    if (!Token)
+      continue;
+    for (uint32_t I = 0; I < A.numDims; ++I)
+      if (A.dims[I].dimType == DimType && A.dims[I].instanceId == InstanceId) {
+        Tokens[Count++] = Token;
+        break;
+      }
+  }
+  requestAttemptUnlock(state_);
+  for (uint32_t I = 0; I < Count; ++I)
+    (void)cancelRequestAttempt(Tokens[I],
+                               EJitRequestAttemptReason::LifecycleChanged);
+}
+
+void EJitSharedTaskPool::cancelAllRequestAttempts(
+    uint32_t Generation, EJitRequestAttemptReason Reason) {
+  if (!state_ || state_->requestAttemptsEnabled.loadAcquire() == 0)
+    return;
+  uint64_t Tokens[kEJitSharedRequestAttemptCapacity] = {};
+  uint32_t Count = 0;
+  requestAttemptLock(state_);
+  for (EJitSharedRequestAttempt &A : state_->requestAttempts)
+    if (A.token.loadRelaxed() != 0 && A.generation.loadRelaxed() == Generation)
+      Tokens[Count++] = A.token.loadRelaxed();
+  requestAttemptUnlock(state_);
+  for (uint32_t I = 0; I < Count; ++I) {
+    (void)cancelRequestAttempt(Tokens[I], Reason);
+    if (Reason == EJitRequestAttemptReason::Shutdown)
+      acknowledgeRequestAttemptQueueDrop(Tokens[I], Reason);
+  }
 }
 
 //===----------------------------------------------------------------------===//
 // MPSC queue helpers (Vyukov, §3.3) over the shared ring.
 //===----------------------------------------------------------------------===//
+EJitCompileOrGetStatus EJitSharedTaskPool::enqueueRepresentativeWake(
+    EJitCompileRequest &Req) {
+  if (state_->requestAttemptsEnabled.loadAcquire()) {
+    // A waiting member owns a real final-read/publication attempt, without a
+    // personal sampling event. Deactivation can now cancel queued/active reads.
+    Req.attemptToken = beginRequestAttempt(Req, /*SamplingPending=*/false);
+    if (!Req.attemptToken) return EJitCompileOrGetStatus::QueueFullFallback;
+  }
+  const uint64_t Claim = Req.attemptToken ? Req.attemptToken : Req.generation;
+  if (dedupMark(Req.funcIndex, Claim) != EJitDedupResult::Claimed) {
+    acknowledgeRequestAttemptQueueDrop(Req.attemptToken, EJitRequestAttemptReason::Cancelled);
+    return EJitCompileOrGetStatus::AlreadyPending;
+  }
+  if (queuePush(Req)) {
+    EJIT_STAT_INC(state_->counters.asyncEnqueues);
+    return EJitCompileOrGetStatus::EnqueuedPending;
+  }
+  dedupClear(Req.funcIndex, Claim);
+  acknowledgeRequestAttemptQueueDrop(Req.attemptToken, EJitRequestAttemptReason::QueueFailure);
+  EJIT_STAT_INC(state_->counters.queueFull);
+  return EJitCompileOrGetStatus::QueueFullFallback;
+}
+
 bool EJitSharedTaskPool::queuePush(const EJitCompileRequest &req) {
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse) {
+    uint32_t Armed = 1;
+    if (failTier2QueuePush_.compareExchange(Armed, 0))
+      return false; // exercise the production queue-full rollback/retry path
+  }
+#endif
   constexpr uint32_t mask = kEJitSharedQueueSlots - 1;
   uint32_t pos = state_->enqueuePos.loadRelaxed();
   EJitSharedQueueCell *cell;
@@ -1076,18 +1680,6 @@ uint64_t EJitSharedTaskPool::hashIdentity(uint32_t funcIndex,
     key *= 0x9e3779b97f4a7c15ULL;
   }
   return key;
-}
-
-static bool slotIdentityMatches(const EJitSharedCacheSlot &s,
-                                uint32_t funcIndex, const EJitDimPair *dims,
-                                uint32_t numDims) {
-  if (s.funcIndex != funcIndex || s.numDims != numDims)
-    return false;
-  for (uint32_t i = 0; i < numDims; ++i)
-    if (s.dims[i].dimType != dims[i].dimType ||
-        s.dims[i].instanceId != dims[i].instanceId)
-      return false;
-  return true;
 }
 
 bool EJitSharedTaskPool::isPublishedTier2(uint32_t funcIndex, void *fnPtr,
@@ -1240,10 +1832,13 @@ EJitSharedTaskPool::cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
     // Validate that the scan + resolve observed a single stable publish epoch.
     // A cold peer preparation (coldPrepared) re-validates itself and may
     // legally span a publish, so it is exempt from the outer seq re-check.
-    if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
+    fireSeqlockRetryHook(bucket);
+    if ((hit.fnPtr || hit.legacyHitCountPending) && !hit.coldPrepared &&
+        !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue; // publish raced the read -> retry
     }
+    commitLegacyHit(hit);
     return hit; // validated hit (noTokenHit) or clean miss
   }
   return R; // repeated contention -> clean fallback to the slow path
@@ -1288,10 +1883,13 @@ EJitSharedTaskPool::cacheLookupSeq0D(uint32_t funcIndex) {
       hit = resolveMatchedSlot(B, bucket, s);
       break;
     }
-    if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
+    fireSeqlockRetryHook(bucket);
+    if ((hit.fnPtr || hit.legacyHitCountPending) && !hit.coldPrepared &&
+        !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue;
     }
+    commitLegacyHit(hit);
     return hit;
   }
   return R;
@@ -1332,10 +1930,13 @@ EJitSharedTaskPool::cacheLookupSeq1D(uint32_t funcIndex, uint32_t dim0,
       hit = resolveMatchedSlot(B, bucket, s);
       break;
     }
-    if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
+    fireSeqlockRetryHook(bucket);
+    if ((hit.fnPtr || hit.legacyHitCountPending) && !hit.coldPrepared &&
+        !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue;
     }
+    commitLegacyHit(hit);
     return hit;
   }
   return R;
@@ -1383,10 +1984,13 @@ EJitSharedTaskPool::cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
       hit = resolveMatchedSlot(B, bucket, s);
       break;
     }
-    if (hit.fnPtr && !hit.coldPrepared && !bucketSeqStable(B, seq0)) {
+    fireSeqlockRetryHook(bucket);
+    if ((hit.fnPtr || hit.legacyHitCountPending) && !hit.coldPrepared &&
+        !bucketSeqStable(B, seq0)) {
       cpuRelax();
       continue;
     }
+    commitLegacyHit(hit);
     return hit;
   }
   return R;
@@ -1419,69 +2023,143 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     uint8_t slotTier = Slot.tier.loadRelaxed();
     if (slotTier < kEJitTierPgoUse) {
       uint32_t threshold = state_->tier2Threshold.loadAcquire();
-      uint64_t sampleIndex = 0;
-      if (slotTier == kEJitTierInstrumented && threshold) {
-        // Cap Tier-1 execution at the requested number of root samples. A
-        // plain fetchAdd lets peer cores overshoot, and continuing to dispatch
-        // Tier-1 while a large Tier-2 waits/compiles keeps every instrumented
-        // function in that module doing atomic counter updates for no benefit.
+      // Experimental sharing contract (v21): when this published Tier-1 slot
+      // carries an observed-dispatch quota, the admission boundary is the real
+      // granted-dispatch count, committed at the single granted-return point
+      // (classifyHit). hitCount keeps its legacy identity-hit/hotness meaning
+      // and no longer decides the boundary in this mode. Rejected lookups (no
+      // shareable pointer, failed peer preparation, seqlock retry) therefore
+      // consume no quota.
+      if (captureT1Observation(Slot, R)) {
+        // Legacy hotness/stats: unchanged raw identity-hit semantics, capped
+        // at the configured threshold exactly like the legacy path.
         uint64_t observed = Slot.hitCount.loadRelaxed();
         while (observed < threshold &&
                !Slot.hitCount.compareExchange(observed, observed + 1)) {
         }
-        if (observed >= threshold) {
-          // Retry the enqueue on every saturated lookup if a previous attempt
-          // lost to queue pressure. dedupMark makes the normal pending case a
-          // cheap no-op. The slot and Tier-1 code remain intact because Tier-2
-          // profile synthesis still reads their counter storage.
+        if (R.t1DispatchCount >= R.t1DispatchLimit) {
+          // The observed quota is already closed: grant no Tier-1 dispatch and
+          // keep the Tier-2 retry armed (a previous enqueue may have lost to
+          // queue pressure). The slot and Tier-1 code stay intact because the
+          // profile snapshot still reads their counter storage.
+          R.t1Observation = false;
           R.slot = &Slot;
           R.tier2Arm = true;
+          R.tier2BucketIndex = bucket;
+          R.tier2SlotIndex = slotIndex;
+          R.tier2AttemptToken = Slot.attemptToken;
 #ifndef EJIT_SRE_TASKPOOL_NO_RECLAIM
           bucketReadRelease(B);
 #endif
           R.pgoSamplingComplete = true;
           return R;
         }
-        sampleIndex = observed + 1;
+        // Admission is still open. Hand the exact publish identity and the
+        // frozen observation to the committed-return point; only that point may
+        // grant the dispatch, freeze the boundary, or claim Tier-2.
+        R.tier2BucketIndex = bucket;
+        R.tier2SlotIndex = slotIndex;
+        R.tier2AttemptToken = Slot.attemptToken;
       } else {
-        sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
-      }
-      uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
-      if (slotTier == kEJitTierInstrumented && threshold) {
-        const uint32_t encoded = Slot.funcIndex + 1;
-        for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
-          if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
-            admissionSlot = i;
-            break;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+        // The load-only reader has not yet passed its outer publishSeq check.
+        // Defer the legacy hitCount/quota charge until cacheLookupSeq accepts
+        // this snapshot; a racing publish must discard the whole resolve.
+        R.slot = &Slot;
+        R.tier2BucketIndex = bucket;
+        R.tier2SlotIndex = slotIndex;
+        R.tier2AttemptToken = Slot.attemptToken;
+        R.legacyBucketIndex = bucket;
+        R.legacySlotIndex = slotIndex;
+        R.legacySlotAttemptToken = Slot.attemptToken;
+        R.legacySlotGeneration = Slot.generation;
+        R.legacySlotIdentityHash = Slot.identityHash;
+        R.legacySlotFnPtr =
+            reinterpret_cast<void *>(Slot.fnPtr.loadAcquire());
+        R.legacySlotTier = Slot.tier.loadRelaxed();
+        // Once a prior accepted legacy hit has closed the capped counter, keep
+        // the old terminal AOT/re-arm behavior. This avoids another peer
+        // preparation attempt and lets the next lookup enqueue the exact
+        // slot's Tier-2 request after the failed-preparation retry path.
+        if (slotTier == kEJitTierInstrumented && threshold &&
+            Slot.hitCount.loadRelaxed() >= threshold) {
+          R.tier2Arm = true;
+          R.pgoSamplingComplete = true;
+          return R;
+        }
+        R.legacyHitCountPending = true;
+#else
+        uint64_t sampleIndex = 0;
+        if (slotTier == kEJitTierInstrumented && threshold) {
+          // Cap Tier-1 execution at the requested number of root samples. A
+          // plain fetchAdd lets peer cores overshoot, and continuing to dispatch
+          // Tier-1 while a large Tier-2 waits/compiles keeps every instrumented
+          // function in that module doing atomic counter updates for no benefit.
+          uint64_t observed = Slot.hitCount.loadRelaxed();
+          while (observed < threshold &&
+                 !Slot.hitCount.compareExchange(observed, observed + 1)) {
+          }
+          if (observed >= threshold) {
+            // Retry the enqueue on every saturated lookup if a previous attempt
+            // lost to queue pressure. dedupMark makes the normal pending case a
+            // cheap no-op. The slot and Tier-1 code remain intact because Tier-2
+            // profile synthesis still reads their counter storage.
+            R.slot = &Slot;
+            R.tier2Arm = true;
+            R.tier2BucketIndex = bucket;
+            R.tier2SlotIndex = slotIndex;
+            R.tier2AttemptToken = Slot.attemptToken;
+#ifndef EJIT_SRE_TASKPOOL_NO_RECLAIM
+            bucketReadRelease(B);
+#endif
+            R.pgoSamplingComplete = true;
+            return R;
+          }
+          sampleIndex = observed + 1;
+        } else {
+          sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
+        }
+        uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
+        if (slotTier == kEJitTierInstrumented && threshold) {
+          const uint32_t encoded = Slot.funcIndex + 1;
+          for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+            if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
+              admissionSlot = i;
+              break;
+            }
           }
         }
-      }
-      if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
-        uint32_t quarter = static_cast<uint32_t>(
-            std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
-        uint32_t oldQuarter =
-            state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
-        while (quarter > oldQuarter &&
-               !state_->pgoProgressQuarters[admissionSlot].compareExchange(
-                   oldQuarter, quarter)) {
+        if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
+          uint32_t quarter = static_cast<uint32_t>(
+              std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
+          uint32_t oldQuarter =
+              state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
+          while (quarter > oldQuarter &&
+                 !state_->pgoProgressQuarters[admissionSlot].compareExchange(
+                     oldQuarter, quarter)) {
+          }
+          if (quarter > oldQuarter)
+            EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
+                      static_cast<unsigned long long>(sampleIndex), threshold);
         }
-        if (quarter > oldQuarter)
-          EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
-                    static_cast<unsigned long long>(sampleIndex), threshold);
-      }
-      // >= (not ==): if the enqueue fails (queue full / already pending),
-      // the next hit can still arm — a transient failure is not fatal (§7).
-      if (threshold && sampleIndex >= threshold) {
-        // Preserve the fixed slot address even when this producer cannot read
-        // the cross-core code pointer. tryCacheHit() performs the deferred
-        // enqueue after lookup so a bound call can attach its descriptors.
-        R.slot = &Slot;
-        R.tier2Arm = true;
-        if (slotTier == kEJitTierInstrumented && sampleIndex == threshold)
-          EJIT_DIAG("PGO sampling complete func=%u: %llu/%u; routing AOT "
-                    "until Tier-2 publish",
-                    Slot.funcIndex,
-                    static_cast<unsigned long long>(sampleIndex), threshold);
+        // >= (not ==): if the enqueue fails (queue full / already pending),
+        // the next hit can still arm — a transient failure is not fatal (§7).
+        if (threshold && sampleIndex >= threshold) {
+          // Preserve the fixed slot address even when this producer cannot read
+          // the cross-core code pointer. tryCacheHit() performs the deferred
+          // enqueue after lookup so a bound call can attach its descriptors.
+          R.slot = &Slot;
+          R.tier2Arm = true;
+          R.tier2BucketIndex = bucket;
+          R.tier2SlotIndex = slotIndex;
+          R.tier2AttemptToken = Slot.attemptToken;
+          if (slotTier == kEJitTierInstrumented && sampleIndex == threshold)
+            EJIT_DIAG("PGO sampling complete func=%u: %llu/%u; routing AOT "
+                      "until Tier-2 publish",
+                      Slot.funcIndex,
+                      static_cast<unsigned long long>(sampleIndex), threshold);
+        }
+#endif
       }
     }
   }
@@ -1553,53 +2231,294 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // Cold: this core has never prepared this code. Preserve the Tier-2 signal
   // across the out-of-line execute-permission preparation; the producer may
   // need to attach bound descriptors before enqueueing the recompile.
+  // peerPrepareSlot() re-validates the slot under the build's bucket exclusion
+  // and fills the exact publish coordinates into the lookup it returns, so the
+  // deferred claim (including the final observed admission) survives this path
+  // unchanged.
   SharedLookup Prepared = peerPrepareSlot(B, bucket, slotIndex);
-  Prepared.tier2Arm = R.tier2Arm;
+  // R2R-01: only a real prepared hit may carry the deferred arm. A failed
+  // preparation returns a clean fallback with the DEFAULT coordinates (bucket
+  // 0 / slot 0); propagating tier2Arm there would claim an unrelated Ready
+  // entry in bucket 0 on a documented failure path (legacy attempts-OFF). The
+  // saturated legacy lookup re-arms on its next identity hit, so dropping this
+  // one signal loses no retry, and no quota is consumed.
+  const bool PreparedHit =
+      Prepared.fnPtr != nullptr &&
+      Prepared.tier2BucketIndex < kEJitSharedCacheBuckets &&
+      Prepared.tier2SlotIndex < kEJitSharedCacheSlots;
+  Prepared.tier2Arm = R.tier2Arm && PreparedHit;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // A successful cold preparation already carries its validated slot in
+  // Prepared. Keep the deferred legacy charge attached to the result even
+  // when preparation fails: legacy identity hotness still advances, but the
+  // failed result must drop any Tier-2 arm (the next identity hit will re-arm
+  // against the exact slot, R2R-01).
+  if (R.legacyHitCountPending) {
+    Prepared.slot = R.slot;
+    Prepared.legacyHitCountPending = true;
+    Prepared.legacyBucketIndex = R.legacyBucketIndex;
+    Prepared.legacySlotIndex = R.legacySlotIndex;
+    Prepared.legacySlotAttemptToken = R.legacySlotAttemptToken;
+    Prepared.legacySlotGeneration = R.legacySlotGeneration;
+    Prepared.legacySlotIdentityHash = R.legacySlotIdentityHash;
+    Prepared.legacySlotFnPtr = R.legacySlotFnPtr;
+    Prepared.legacySlotTier = R.legacySlotTier;
+  }
+#endif
   return Prepared;
 }
 
-void EJitSharedTaskPool::enqueueTier2ForIdentity(
-    uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
-    const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
-  if (state_->mode.loadAcquire() !=
-      static_cast<uint32_t>(EJitCompileMode::Async))
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+void EJitSharedTaskPool::commitLegacyHit(SharedLookup &Hit) {
+  if (!Hit.legacyHitCountPending || !Hit.slot)
     return;
+  Hit.legacyHitCountPending = false;
+  EJitSharedCacheSlot &Slot = *Hit.slot;
+  const bool FailedPeerPreparation = Hit.readyButNotShareable && !Hit.fnPtr;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // The cold peer path deliberately skips the outer publishSeq check after it
+  // revalidates its pointer.  A writer can therefore publish a replacement
+  // between that revalidation and this deferred legacy charge.  Serialize the
+  // identity check with cachePublish()/cacheDropPending()/cancelAttempt() so a
+  // stale lookup cannot be returned as another Tier-1 grant or charge the
+  // replacement slot's counter.
+  EJitSharedCacheBucket *ObservationBucket = nullptr;
+  if (Hit.legacyBucketIndex < kEJitSharedCacheBuckets &&
+      Hit.legacySlotIndex < kEJitSharedCacheSlots &&
+      Hit.slot == &state_->buckets[Hit.legacyBucketIndex]
+                       .slots[Hit.legacySlotIndex]) {
+    ObservationBucket = &state_->buckets[Hit.legacyBucketIndex];
+    bucketObservationLock(*ObservationBucket);
+  }
+  auto unlockObservation = [&] {
+    if (ObservationBucket)
+      bucketObservationUnlock(*ObservationBucket);
+  };
+  const bool IdentityMatches =
+      ObservationBucket &&
+      Slot.state.loadAcquire() ==
+          static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+      Slot.generation == Hit.legacySlotGeneration &&
+      Slot.attemptToken == Hit.legacySlotAttemptToken &&
+      Slot.identityHash == Hit.legacySlotIdentityHash &&
+      reinterpret_cast<void *>(Slot.fnPtr.loadAcquire()) ==
+          Hit.legacySlotFnPtr &&
+      Slot.tier.loadRelaxed() == Hit.legacySlotTier;
+  if (!IdentityMatches) {
+    // The old pointer is retained in NO_RECLAIM, but its publish identity is no
+    // longer current.  Fail closed as an AOT/AlreadyPending terminal and drop
+    // every deferred arm so no replacement slot can be charged or enqueued.
+    Hit.fnPtr = nullptr;
+    Hit.noTokenHit = false;
+    Hit.hasReadToken = false;
+    Hit.bucketIndex = kEJitSharedCacheBuckets;
+    Hit.slot = nullptr;
+    Hit.tier2Arm = false;
+    Hit.tier2BucketIndex = 0;
+    Hit.tier2SlotIndex = 0;
+    Hit.tier2AttemptToken = 0;
+    Hit.pgoSamplingComplete = true;
+    unlockObservation();
+    return;
+  }
+#endif
+  if (!state_->pgoEnabled.loadAcquire() ||
+      Slot.tier.loadRelaxed() >= kEJitTierPgoUse) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    unlockObservation();
+#endif
+    return;
+  }
+
+  const uint32_t threshold = state_->tier2Threshold.loadAcquire();
+  uint64_t sampleIndex = 0;
+  if (Slot.tier.loadRelaxed() == kEJitTierInstrumented && threshold) {
+    // Charge only after the seqlock reader accepted its snapshot. The CAS is
+    // still capped, so concurrent legacy readers cannot overshoot the quota.
+    uint64_t observed = Slot.hitCount.loadRelaxed();
+    while (observed < threshold &&
+           !Slot.hitCount.compareExchange(observed, observed + 1)) {
+    }
+    if (observed >= threshold) {
+      if (!FailedPeerPreparation) {
+        Hit.tier2Arm = true;
+        Hit.tier2AttemptToken = Slot.attemptToken;
+        Hit.pgoSamplingComplete = true;
+      }
+      // resolveMatchedSlot() used to return before the fnPtr gate when the
+      // legacy quota was already closed. Mirror that terminal AOT result here
+      // so a post-seqlock commit cannot hand back one extra Tier-1 dispatch.
+      if (!FailedPeerPreparation) {
+        Hit.fnPtr = nullptr;
+        Hit.noTokenHit = false;
+        Hit.bucketIndex = kEJitSharedCacheBuckets;
+      }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+      unlockObservation();
+#endif
+      return;
+    }
+    sampleIndex = observed + 1;
+  } else {
+    sampleIndex = Slot.hitCount.fetchAdd(1) + 1;
+  }
+
+  uint32_t admissionSlot = kEJitSharedMaxConcurrentProfiles;
+  if (Slot.tier.loadRelaxed() == kEJitTierInstrumented && threshold) {
+    const uint32_t encoded = Slot.funcIndex + 1;
+    for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+      if (state_->pgoActiveFunctions[i].loadAcquire() == encoded) {
+        admissionSlot = i;
+        break;
+      }
+    }
+  }
+  if (admissionSlot != kEJitSharedMaxConcurrentProfiles) {
+    uint32_t quarter = static_cast<uint32_t>(
+        std::min<uint64_t>(4, (sampleIndex * 4) / threshold));
+    uint32_t oldQuarter =
+        state_->pgoProgressQuarters[admissionSlot].loadRelaxed();
+    while (quarter > oldQuarter &&
+           !state_->pgoProgressQuarters[admissionSlot].compareExchange(
+               oldQuarter, quarter)) {
+    }
+    if (quarter > oldQuarter)
+      EJIT_DIAG("PGO profile progress func=%u: %llu/%u", Slot.funcIndex,
+                static_cast<unsigned long long>(sampleIndex), threshold);
+  }
+  if (threshold && sampleIndex >= threshold && !FailedPeerPreparation) {
+    Hit.tier2Arm = true;
+    Hit.tier2AttemptToken = Slot.attemptToken;
+    if (Slot.tier.loadRelaxed() == kEJitTierInstrumented &&
+        sampleIndex == threshold)
+      EJIT_DIAG("PGO sampling complete func=%u: %llu/%u; routing AOT until "
+                "Tier-2 publish",
+                Slot.funcIndex, static_cast<unsigned long long>(sampleIndex),
+                threshold);
+  }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  unlockObservation();
+#endif
+}
+#endif
+
+void EJitSharedTaskPool::enqueueTier2FromLookup(
+    const SharedLookup &Lookup, const EJitBoundPtrDescriptor *boundPointers,
+    uint32_t boundCount) {
+  if (state_->mode.loadAcquire() !=
+          static_cast<uint32_t>(EJitCompileMode::Async) ||
+      Lookup.tier2BucketIndex >= kEJitSharedCacheBuckets ||
+      Lookup.tier2SlotIndex >= kEJitSharedCacheSlots)
+    return;
+
+  EJitSharedCacheBucket &Bucket = state_->buckets[Lookup.tier2BucketIndex];
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // The normal NO_RECLAIM lookup is load-only. Take the cold writer lock so
+  // cancellation/publication cannot change the slot while Tier-2 is claimed.
+  bucketWrite(Bucket, /*pgoClearExclusive=*/true);
+#else
+  // A normal hit may still hold its original read token. A second read token
+  // safely nests here and lets cancellation wait without self-deadlocking.
+  if (!bucketTryRead(Bucket))
+    return;
+#endif
+  EJitSharedCacheSlot &Slot = Bucket.slots[Lookup.tier2SlotIndex];
+  const bool TrackAttempt = state_->requestAttemptsEnabled.loadAcquire() != 0;
+  if (Slot.state.loadRelaxed() !=
+          static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+      Slot.tier.loadRelaxed() >= kEJitTierPgoUse ||
+      (TrackAttempt && Slot.tier.loadRelaxed() != kEJitTierInstrumented) ||
+      Slot.attemptToken != Lookup.tier2AttemptToken) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    bucketWriteRelease(Bucket);
+#else
+    bucketReadRelease(Bucket);
+#endif
+    return;
+  }
 
   EJitCompileRequest T2{};
-  T2.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
-  T2.numDims = numDims;
-  T2.generation = state_->generation.loadAcquire();
-  for (uint32_t i = 0; i < numDims && i < 4; ++i) {
-    T2.dims[i] = dims[i];
-    T2.versions[i] = instanceVersion(dims[i].dimType, dims[i].instanceId);
+  T2.funcIndex = encodeReqTier(Slot.funcIndex, kEJitTierPgoUse);
+  T2.numDims = Slot.numDims;
+  T2.generation = Slot.generation;
+  for (uint32_t I = 0; I < T2.numDims; ++I) {
+    T2.dims[I] = Slot.dims[I];
+    T2.versions[I] = Slot.versions[I];
   }
-  T2.boundCount = boundCount;
-  for (uint32_t i = 0; i < boundCount; ++i)
-    T2.boundPointers[i] = boundPointers[i];
-
-  if (dedupMark(T2.funcIndex, T2.generation) != EJitDedupResult::Claimed)
+  // Experimental sharing contract (v21): carry the frozen observed dispatch
+  // boundary of THIS exact published attempt into the Tier-2 request. Validated
+  // under the bucket lock, then read under the bucket observationLock (v22, the
+  // same exclusion the admission commit uses for its count CAS + quotaEnd
+  // freeze), so a closed-quota lookup can only capture the frozen pair and a
+  // reusable slot address cannot supply another attempt's observation. The
+  // lock is released before requestAttemptLock/queuePush below (leaf-first lock
+  // order). A queue-full retry rebuilds the request from the same frozen
+  // fields, so count/quotaEnd survive unchanged. All zero when the slot carries
+  // no observation (legacy mode or a Tier-2 publish).
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(Bucket);
+#endif
+  T2.t1DispatchCount = Slot.t1DispatchCount.loadRelaxed();
+  T2.t1QuotaEnd = Slot.t1QuotaEnd.loadRelaxed();
+  T2.t1DispatchLimit = Slot.t1DispatchLimit.loadRelaxed();
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(Bucket);
+#endif
+  bool Claimed = false;
+  if (TrackAttempt) {
+    T2.attemptToken = Slot.attemptToken;
+    requestAttemptLock(state_);
+    EJitSharedRequestAttempt *A = findAttemptLocked(state_, T2.attemptToken);
+    const uint32_t Required = EJitAttemptSamplingPending |
+                              EJitAttemptWaitingProfile |
+                              EJitAttemptHoldsAdmission;
+    if (A && attemptIdentityMatchesLocked(*A, T2) &&
+        (A->flags.loadRelaxed() &
+         (Required | EJitAttemptCancelRequested | EJitAttemptQueueOwned |
+          EJitAttemptCompileActive)) == Required &&
+        dedupMark(T2.funcIndex, T2.attemptToken) == EJitDedupResult::Claimed) {
+      T2.boundCount = A->boundCount;
+      for (uint32_t I = 0; I < T2.boundCount; ++I)
+        T2.boundPointers[I] = A->boundPointers[I];
+      uint32_t Flags = A->flags.loadRelaxed();
+      Flags &= ~EJitAttemptWaitingProfile;
+      A->flags.storeRelaxed(Flags | EJitAttemptQueueOwned);
+      Claimed = true;
+    }
+    requestAttemptUnlock(state_);
+  } else {
+    T2.boundCount = boundCount;
+    for (uint32_t I = 0; I < boundCount; ++I)
+      T2.boundPointers[I] = boundPointers[I];
+    Claimed =
+        dedupMark(T2.funcIndex, T2.generation) == EJitDedupResult::Claimed;
+  }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketWriteRelease(Bucket);
+#else
+  bucketReadRelease(Bucket);
+#endif
+  if (!Claimed)
     return;
+
+  const uint64_t Claim = T2.attemptToken ? T2.attemptToken : T2.generation;
   if (queuePush(T2)) {
     EJIT_STAT_INC(state_->counters.asyncEnqueues);
     EJIT_DIAG_VERBOSE("shared taskpool PGO Tier-2 enqueued func=%u gen=%u",
-                      funcIndex, T2.generation);
+                      stripReqTier(T2.funcIndex), T2.generation);
     return;
   }
 
-  dedupClear(T2.funcIndex, T2.generation);
+  dedupClear(T2.funcIndex, Claim);
+  markRequestAttemptWaitingProfile(T2.attemptToken);
   EJIT_STAT_INC(state_->counters.queueFull);
-  EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full", funcIndex);
-}
-
-void EJitSharedTaskPool::enqueueTier2FromSlot(
-    const EJitSharedCacheSlot &Slot,
-    const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
-  enqueueTier2ForIdentity(Slot.funcIndex, Slot.dims, Slot.numDims,
-                          boundPointers, boundCount);
+  EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full",
+            stripReqTier(T2.funcIndex));
 }
 
 bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
-                                          bool &newlyAdmitted) {
+                                          bool &newlyAdmitted,
+                                          uint64_t attemptToken) {
   newlyAdmitted = false;
   const uint32_t encoded = funcIndex + 1;
   uint32_t expected = 0;
@@ -1632,9 +2551,29 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
   }
 
   state_->pgoProgressQuarters[freeSlot].storeRelaxed(0);
+  state_->pgoActiveAttemptTokens[freeSlot].storeRelaxed(attemptToken);
   state_->pgoActiveFunctions[freeSlot].storeRelease(encoded);
   state_->pgoActiveFunctionCount.storeRelease(activeCount + 1);
   state_->pgoAdmissionLock.storeRelease(0);
+  if (attemptToken) {
+    bool Cancelled = false;
+    requestAttemptLock(state_);
+    if (EJitSharedRequestAttempt *A = findAttemptLocked(state_, attemptToken)) {
+      uint32_t Flags = A->flags.loadRelaxed();
+      Cancelled = (Flags & EJitAttemptCancelRequested) != 0;
+      if (!Cancelled)
+        A->flags.storeRelaxed(Flags | EJitAttemptHoldsAdmission);
+    } else {
+      Cancelled = true;
+    }
+    requestAttemptUnlock(state_);
+    if (Cancelled) {
+      finishPgoFunction(funcIndex, false, "cancelled-during-admission",
+                        attemptToken);
+      newlyAdmitted = false;
+      return false;
+    }
+  }
   newlyAdmitted = true;
   EJIT_DIAG("PGO profile start func=%u: 0/%u (active=%u/%u)", funcIndex,
             state_->tier2Threshold.loadRelaxed(), activeCount + 1, maxActive);
@@ -1642,7 +2581,8 @@ bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
 }
 
 void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed,
-                                           const char *reason) {
+                                           const char *reason,
+                                           uint64_t attemptToken) {
   const uint32_t encoded = funcIndex + 1;
   uint32_t expected = 0;
   while (!state_->pgoAdmissionLock.compareExchange(expected, 1))
@@ -1650,7 +2590,9 @@ void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed,
 
   uint32_t slot = kEJitSharedMaxConcurrentProfiles;
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i)
-    if (state_->pgoActiveFunctions[i].loadRelaxed() == encoded) {
+    if (state_->pgoActiveFunctions[i].loadRelaxed() == encoded &&
+        (!attemptToken ||
+         state_->pgoActiveAttemptTokens[i].loadRelaxed() == attemptToken)) {
       slot = i;
       break;
     }
@@ -1659,10 +2601,14 @@ void EJitSharedTaskPool::finishPgoFunction(uint32_t funcIndex, bool completed,
     return;
   }
   state_->pgoProgressQuarters[slot].storeRelaxed(0);
+  state_->pgoActiveAttemptTokens[slot].storeRelaxed(0);
   state_->pgoActiveFunctions[slot].storeRelease(0);
   uint32_t activeCount = state_->pgoActiveFunctionCount.loadRelaxed();
   state_->pgoActiveFunctionCount.storeRelease(activeCount - 1);
   state_->pgoAdmissionLock.storeRelease(0);
+  settleRequestAttemptSampling(attemptToken,
+                               completed ? EJitRequestAttemptReason::None
+                                         : EJitRequestAttemptReason::Cancelled);
   if (completed) {
     uint64_t done = state_->pgoCompletedFunctions.fetchAdd(1) + 1;
     EJIT_DIAG("PGO profile complete func=%u: completed=%llu deferred=%llu",
@@ -1699,6 +2645,7 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   Snap.funcIndex = Slot.funcIndex;
   Snap.numDims = Slot.numDims;
   Snap.generation = Slot.generation;
+  Snap.attemptToken = Slot.attemptToken;
   for (uint32_t i = 0; i < Snap.numDims && i < 4; ++i) {
     Snap.dims[i] = Slot.dims[i];
     Snap.versions[i] = Slot.versions[i];
@@ -1763,6 +2710,34 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
     S2.executableCoreMask.fetchOr(CoreBit);
   R.fnPtr = Snap.fn;
   R.slot = &S2;
+  // Exact validated publish identity of the code we are handing back: the
+  // deferred Tier-2 claim (the final observed admission, or a closed-quota /
+  // legacy retry) re-validates THIS attempt under the bucket lock. The cold
+  // path returns a different SharedLookup than resolveMatchedSlot's snapshot,
+  // so the coordinates must be filled here or the final real dispatch reaches
+  // classifyHit with zero coordinates and its Tier-2 request is silently
+  // dropped (R2-PR230-01).
+  R.tier2BucketIndex = Snap.bucket;
+  R.tier2SlotIndex = Snap.slotIndex;
+  R.tier2AttemptToken = Snap.attemptToken;
+  // Observed Tier-1 dispatch contract (v21): a cold peer preparation that
+  // succeeds hands back a real Tier-1 pointer, so it must be counted at the
+  // committed-return point like the owner/memoized paths. Re-snapshot the
+  // RE-VALIDATED slot identity (not the pre-drop snapshot) so a dispatch can
+  // never be attributed to a publish that replaced the slot during the
+  // platform preparation. A failed preparation returns above without this, so
+  // it consumes no quota.
+  (void)captureT1Observation(S2, R);
+  // Pin the observation identity to the SNAPSHOT publish whose pointer is
+  // returned. captureT1Observation re-reads the load-only slot, so in
+  // NO_RECLAIM a republish landing between the re-validation and the capture
+  // could supply the replacement attempt's token/count. The commit re-checks
+  // this identity under the bucket writer lock and fails closed
+  // (IdentityChanged) instead of attributing the old code's dispatch to the
+  // replacement (R1-3); the token build's read lock already excludes that
+  // republish.
+  R.t1SlotAttemptToken = Snap.attemptToken;
+  R.t1SlotGeneration = Snap.generation;
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   // NO_RECLAIM: this cold path already fully re-validated
   // identity/versions/fnPtr above under a load-only re-read, so it hands back a
@@ -2314,12 +3289,19 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
     return EJitPublishStatus::Failed;
   }
 
+  // Observation exclusion (v22): a staged target is reset to Pending with a new
+  // identity, so an in-flight admission commit on a reused slot address must be
+  // serialized with it.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Publishing));
   Target->funcIndex = FuncIndex;
   Target->numDims = req.numDims;
   Target->generation = req.generation;
   Target->identityHash = Key;
+  Target->attemptToken = req.attemptToken;
   for (uint32_t I = 0; I < 4; ++I) {
     Target->dims[I] = I < req.numDims ? req.dims[I] : EJitDimPair{0, 0};
     Target->versions[I] = I < req.numDims ? req.versions[I] : 0;
@@ -2333,6 +3315,9 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
   Target->fnPtr.storeRelease(0);
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Pending));
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
   bucketWriteRelease(B);
   return EJitPublishStatus::Published;
 }
@@ -2382,6 +3367,11 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
     return EJitPublishStatus::Failed;
   }
 
+  // Observation exclusion (v22): the target may be a Ready victim, so the
+  // identity rewrite must not interleave with an admission commit.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   void *OldFn = reinterpret_cast<void *>(Target->fnPtr.loadAcquire());
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Publishing));
@@ -2389,6 +3379,7 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
   Target->numDims = req.numDims;
   Target->generation = req.generation;
   Target->identityHash = Key;
+  Target->attemptToken = req.attemptToken;
   for (uint32_t I = 0; I < req.numDims; ++I) {
     Target->dims[I] = req.dims[I];
     Target->versions[I] = req.versions[I];
@@ -2403,6 +3394,9 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
   Target->state.storeRelease(
       static_cast<uint32_t>(EJitSharedSlotState::Pending));
   state_->dispatchEpoch.fetchAdd(1);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
   bucketWriteRelease(B);
 
   if (releaseFn_ && OldFn && OldFn != fnPtr)
@@ -2417,6 +3411,11 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
   EJitSharedCacheBucket &B =
       state_->buckets[static_cast<uint32_t>(Key % kEJitSharedCacheBuckets)];
   bucketWrite(B);
+  // Observation exclusion (v22): drop the staged identity under the same leaf
+  // lock as admission/publish, so a reused slot address is never half-reset.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   for (uint32_t S = 0; S < kEJitSharedCacheSlots; ++S) {
     EJitSharedCacheSlot &Slot = B.slots[S];
     if (Slot.state.loadAcquire() !=
@@ -2429,6 +3428,7 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
         static_cast<uint32_t>(EJitSharedSlotState::Publishing));
     Slot.fnPtr.storeRelease(0);
     Slot.identityHash = 0;
+    Slot.attemptToken = 0;
     Slot.executableCoreMask.storeRelease(0);
     Slot.codeStart = 0;
     Slot.codeSize = 0;
@@ -2439,6 +3439,9 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
     state_->dispatchEpoch.fetchAdd(1);
     break;
   }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
   bucketWriteRelease(B);
 }
 
@@ -2505,6 +3508,31 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     return EJitPublishStatus::Failed;
   }
 
+  bool AttemptLocked = false;
+  if (req.attemptToken) {
+    requestAttemptLock(state_);
+    AttemptLocked = true;
+    EJitSharedRequestAttempt *Attempt =
+        findAttemptLocked(state_, req.attemptToken);
+    const uint32_t Flags =
+        Attempt ? Attempt->flags.loadRelaxed() : EJitAttemptCancelRequested;
+    if (!Attempt || !attemptIdentityMatchesLocked(*Attempt, req) ||
+        (Flags &
+         (EJitAttemptCancelRequested | EJitAttemptPublicationPending)) !=
+            EJitAttemptPublicationPending) {
+      requestAttemptUnlock(state_);
+      bucketWriteRelease(B);
+      return EJitPublishStatus::Failed;
+    }
+  }
+
+  // Observation exclusion (v22): this writes the slot's identity and its
+  // observed quota (including the state=Ready publish), so it must not
+  // interleave with an admission commit that validated the previous publish.
+  // Lock order: writeFlag -> (requestAttemptLock) -> observationLock (leaf).
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationLock(B);
+#endif
   void *oldFn = reinterpret_cast<void *>(target->fnPtr.loadAcquire());
 
   target->state.storeRelease(
@@ -2513,6 +3541,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   target->numDims = req.numDims;
   target->generation = req.generation; // the request's generation, not curGen
   target->identityHash = key;
+  target->attemptToken = req.attemptToken;
   for (uint32_t i = 0; i < req.numDims; ++i) {
     target->dims[i] = req.dims[i];
     target->versions[i] = req.versions[i];
@@ -2566,6 +3595,20 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   // slots (§4 repeat-trigger).  Under the write lock + before state=Ready.
   target->hitCount.storeRelaxed(0);
   target->tier.storeRelaxed(static_cast<uint8_t>(tier));
+  // Experimental sharing contract (v21): bind the observed-dispatch quota to
+  // THIS exact published attempt. Only a Tier-1 publish under the request-
+  // attempt protocol carries an observation; every other publish leaves the
+  // limit at 0 (legacy behavior), so the bundle can never report a count or a
+  // quota-end time that was not observed. Written under the write lock before
+  // state=Ready, with the token/generation written just above.
+  const bool ObserveT1 =
+      tier == kEJitTierInstrumented &&
+      state_->requestAttemptsEnabled.loadAcquire() != 0 &&
+      state_->pgoEnabled.loadAcquire() != 0;
+  target->t1DispatchLimit.storeRelaxed(
+      ObserveT1 ? state_->tier2Threshold.loadAcquire() : 0u);
+  target->t1DispatchCount.storeRelaxed(0);
+  target->t1QuotaEnd.storeRelaxed(0);
   target->postPublishSeen.storeRelaxed(0);
   const uint32_t OwnerCore = state_->ownerCoreId.loadAcquire();
   target->executableCoreMask.storeRelease(
@@ -2573,6 +3616,11 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   target->state.storeRelease(static_cast<uint32_t>(EJitSharedSlotState::Ready));
   // Published a new fnPtr, or evicted the slot that held one.
   state_->dispatchEpoch.fetchAdd(1);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bucketObservationUnlock(B);
+#endif
+  if (AttemptLocked)
+    requestAttemptUnlock(state_);
   bucketWriteRelease(B);
 
   // Release the slot's PREVIOUS code OUTSIDE the bucket lock (the callback may
@@ -2602,7 +3650,13 @@ void EJitSharedTaskPool::releaseRead(uint32_t bucketIndex) {
               (void *)state_, bucketIndex, kEJitSharedCacheBuckets);
     return;
   }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // Only opt-in representative T1 admissions return a real bucket token.
+  // Stable T2 and ordinary NO_RECLAIM hits retain the sentinel/no-op path.
+  state_->buckets[bucketIndex].readers.fetchSub(1);
+#else
   bucketReadRelease(state_->buckets[bucketIndex]);
+#endif
 }
 
 //===----------------------------------------------------------------------===//
@@ -2618,7 +3672,8 @@ namespace {
 // setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
 void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
                        uint32_t pgoEnabled, uint32_t tier2Threshold,
-                       uint32_t pgoMaxConcurrentProfiles) {
+                       uint32_t pgoMaxConcurrentProfiles,
+                       bool requestAttemptsEnabled, uint64_t nextAttemptToken) {
   for (uint32_t d = 0; d < kEJitSharedDimTypes; ++d)
     for (uint32_t i = 0; i < kEJitSharedInstances; ++i) {
       st->enabled[d][i].storeRelaxed(0);
@@ -2632,6 +3687,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->pgoActiveFunctionCount.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
     st->pgoActiveFunctions[i].storeRelaxed(0);
+    st->pgoActiveAttemptTokens[i].storeRelaxed(0);
     st->pgoProgressQuarters[i].storeRelaxed(0);
   }
   st->pgoCompletedFunctions.storeRelaxed(0);
@@ -2681,6 +3737,35 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   st->icacheReleasersWired.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
+  st->requestAttemptsEnabled.storeRelaxed(requestAttemptsEnabled ? 1u : 0u);
+  st->attemptLock.storeRelaxed(0);
+  st->attemptLiveCount.storeRelaxed(0);
+  st->attemptHistoryWrite.storeRelaxed(0);
+  st->attemptHistoryCount.storeRelaxed(0);
+  st->nextAttemptToken.storeRelaxed(nextAttemptToken);
+  for (uint32_t I = 0; I < kEJitSharedRequestAttemptCapacity; ++I) {
+    EJitSharedRequestAttempt &A = st->requestAttempts[I];
+    A.token.storeRelaxed(0);
+    A.generation.storeRelaxed(0);
+    A.funcIndex.storeRelaxed(0);
+    A.flags.storeRelaxed(0);
+    A.terminalReason.storeRelaxed(0);
+    A.numDims = 0;
+    A.boundCount = 0;
+    for (uint32_t D = 0; D < kEJitSharedMaxDims; ++D) {
+      A.dims[D] = {};
+      A.versions[D] = 0;
+    }
+    for (EJitBoundPtrDescriptor &Bound : A.boundPointers)
+      Bound = {};
+  }
+  for (uint32_t I = 0; I < kEJitSharedRequestHistoryCapacity; ++I) {
+    EJitSharedRequestAttemptHistory &H = st->requestHistory[I];
+    H.token.storeRelaxed(0);
+    H.generation.storeRelaxed(0);
+    H.funcIndex.storeRelaxed(0);
+    H.terminalReason.storeRelaxed(0);
+  }
   for (uint32_t i = 0; i < kEJitSharedQueueSlots; ++i) {
     st->ring[i].sequence.storeRelaxed(i); // Vyukov initial sequence = index
   }
@@ -2753,6 +3838,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
     st->buckets[b].writeFlag.storeRelaxed(0);
     st->buckets[b].readers.storeRelaxed(0);
     st->buckets[b].publishSeq.storeRelaxed(0); // even => no publish in flight
+    // Observed-dispatch exclusion (ABI v22): a reused blob must never inherit a
+    // held observation lock from an aborted generation.
+    st->buckets[b].observationLock.storeRelaxed(0);
     for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
       EJitSharedCacheSlot &Slot = st->buckets[b].slots[s];
       Slot.state.storeRelaxed(
@@ -2765,6 +3853,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
         Slot.versions[i] = 0;
       }
       Slot.identityHash = 0;
+      Slot.attemptToken = 0;
       Slot.fnPtr.storeRelaxed(0);
       Slot.executableCoreMask.storeRelaxed(0);
       // Executable-range metadata (ABI v5): cleared so a stale range from an
@@ -2788,6 +3877,12 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       Slot.hitCount.storeRelaxed(0);
       Slot.tier.storeRelaxed(0);
       Slot.postPublishSeen.storeRelaxed(0);
+      // Observed Tier-1 dispatch boundary (ABI v21): cleared so a re-init
+      // cannot attribute a prior generation's dispatches or quota-end time to
+      // a new attempt that reuses this slot address.
+      Slot.t1DispatchLimit.storeRelaxed(0);
+      Slot.t1DispatchCount.storeRelaxed(0);
+      Slot.t1QuotaEnd.storeRelaxed(0);
     }
   }
 }
@@ -2844,10 +3939,16 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       pendingBatchCompiles_.clear();
       pendingPublishes_.clear();
       autoTier2PublishPending_ = false;
+      uint64_t NextAttemptToken = 0;
+      if (state_->magic == kEJitSharedAbiMagic &&
+          state_->abiVersion == kEJitSharedAbiVersion &&
+          state_->structSize == sizeof(EJitSharedTaskPoolState))
+        NextAttemptToken = state_->nextAttemptToken.loadRelaxed();
       initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
                         pgoEnabled_.loadRelaxed(),
                         tier2Threshold_.loadRelaxed(),
-                        pgoMaxConcurrentProfiles_.loadRelaxed());
+                        pgoMaxConcurrentProfiles_.loadRelaxed(),
+                        requestAttemptsEnabled_, NextAttemptToken);
       // Empty the shared cell table for the new generation: after a re-init
       // that skipped ownerShutdown the cells hold pointers into the previous
       // generation's code, and a cell carries no epoch to invalidate against.
@@ -2994,6 +4095,11 @@ void EJitSharedTaskPool::ownerShutdown() {
       static_cast<uint32_t>(EJitSharedInitState::Stopping));
   if (workerStop_)
     workerStop_(workerCtx_); // soft-stop + JOIN (no use-after-free).
+  // The join acknowledges that no queued or active compiler callback from this
+  // generation can still read borrowed objects. Settle every remaining event
+  // before owner-private queues and the engine are destroyed.
+  cancelAllRequestAttempts(state_->generation.loadAcquire(),
+                           EJitRequestAttemptReason::Shutdown);
   // A failed enable_ex may leave linked, non-executable objects queued after
   // the worker's final flush attempt. Drop their owner-private metadata before
   // destroying the engine; shared Pending slots were already drained above.
@@ -3021,11 +4127,244 @@ void EJitSharedTaskPool::ownerShutdown() {
 //===----------------------------------------------------------------------===//
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Observed Tier-1 dispatch admission (v21, experimental sharing contract).
+//
+// The ONLY place a real Tier-1 dispatch is counted. classifyHit() is reached
+// once per committed lookup, after every shareability/pointer/peer-preparation
+// gate and after the NO_RECLAIM seqlock validated the read, so a lookup that
+// was rejected or abandoned consumes no quota and a seqlock retry cannot
+// double-count. The CAS caps the count at the frozen limit; the dispatch that
+// reaches the limit freezes quotaEnd exactly once.
+//
+// Attempt isolation: the identity re-check, the admission CAS and the quotaEnd
+// freeze must form ONE critical section with respect to cachePublish() /
+// cancelRequestAttempt(), otherwise a replacement attempt can absorb a stale
+// count or be stamped with the previous attempt's timestamp (R1-1/R2-PR230-02).
+// The token build already has that exclusion: the committed lookup holds the
+// bucket read token, and a publish drains readers. NO_RECLAIM holds no token and
+// must NOT take the bucket writer lock: that sets writeFlag and bumps
+// publishSeq, which is exactly what invalidates a concurrent load-only reader
+// (R1R-1). It takes the separate leaf observationLock instead (ABI v22), which
+// every publish/cancel/reset of the same bucket also takes around its identity
+// writes. The lock is released before the Tier-2 enqueue (which takes writeFlag
+// and then observationLock in that order), so there is no lock upgrade and no
+// reacquisition deadlock.
+//===----------------------------------------------------------------------===//
+bool EJitSharedTaskPool::captureT1Observation(const EJitSharedCacheSlot &Slot,
+                                              SharedLookup &R) const {
+  // Active only while the observed contract is armed (online PGO with a
+  // nonzero threshold), for a slot that is still a live Instrumented publish
+  // carrying an observed quota. A Tier-2 publish, a legacy tokenless publish
+  // and a PGO-off pool all leave t1DispatchLimit at 0, so they keep the
+  // legacy identity-hit behavior and never report an observed dispatch.
+  if (!state_ || state_->pgoEnabled.loadAcquire() == 0 ||
+      state_->tier2Threshold.loadAcquire() == 0 ||
+      Slot.tier.loadRelaxed() != kEJitTierInstrumented ||
+      Slot.t1DispatchLimit.loadRelaxed() == 0)
+    return false;
+  R.t1Observation = true;
+  R.t1SlotAttemptToken = Slot.attemptToken;
+  R.t1SlotGeneration = Slot.generation;
+  R.t1DispatchCount = Slot.t1DispatchCount.loadRelaxed();
+  R.t1QuotaEnd = Slot.t1QuotaEnd.loadRelaxed();
+  R.t1DispatchLimit = Slot.t1DispatchLimit.loadRelaxed();
+  return true;
+}
+
+EJitSharedTaskPool::T1DispatchOutcome
+EJitSharedTaskPool::admitObservedT1Dispatch(const SharedLookup &Hit) {
+  if (!Hit.t1Observation || !Hit.slot)
+    return T1DispatchOutcome::NotApplicable;
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  // No read token exists in this build, so take the bucket observationLock: the
+  // identity re-check, the admission CAS and the freeze below cannot be
+  // interleaved by a cancel/republish of the same slot address, and unlike the
+  // writer lock this leaves writeFlag/publishSeq untouched, so a concurrent
+  // load-only lookup is never invalidated by a granted dispatch (R1R-1). The
+  // observation snapshot always carries the exact coordinates of the publish it
+  // was captured from (resolveMatchedSlot/peerPrepareSlot); a hit without them
+  // cannot be committed safely and is reported as a changed identity, so the
+  // pointer is still returned but nothing is attributed.
+  if (Hit.tier2BucketIndex >= kEJitSharedCacheBuckets ||
+      Hit.tier2SlotIndex >= kEJitSharedCacheSlots)
+    return T1DispatchOutcome::IdentityChanged;
+  EJitSharedCacheBucket &Bucket = state_->buckets[Hit.tier2BucketIndex];
+  bucketObservationLock(Bucket);
+  const T1DispatchOutcome Outcome = admitObservedT1DispatchLocked(Hit);
+  if (samplingAdmissionFn_ &&
+      (Outcome == T1DispatchOutcome::Admitted ||
+       Outcome == T1DispatchOutcome::FinalAdmitted))
+    Bucket.readers.fetchAdd(1);
+  // The increment precedes unlock: a concurrent quota-closed request cannot
+  // enqueue a freeze which observes zero before the final writer is pinned.
+  bucketObservationUnlock(Bucket);
+  return Outcome;
+#else
+  // The committed lookup holds the bucket read token across this call, and a
+  // publish/cancel drains readers, so the identity is already exact here.
+  return admitObservedT1DispatchLocked(Hit);
+#endif
+}
+
+EJitSharedTaskPool::T1DispatchOutcome
+EJitSharedTaskPool::admitObservedT1DispatchLocked(const SharedLookup &Hit) {
+  EJitSharedCacheSlot &Slot = *Hit.slot;
+  // Exact-identity guard, evaluated INSIDE the observation exclusion (read token
+  // in the token build, bucket observationLock in NO_RECLAIM): the slot cannot
+  // be republished between this check and the CAS/freeze below, so a dispatch is
+  // never attributed to a replacement attempt and a stale attempt never writes
+  // into the replacement's counter or timestamp. The pointer itself is still
+  // safe to return (NO_RECLAIM never frees code).
+  //
+  // The guard re-checks the exact pointer being returned AND the publish
+  // identity snapshotted with it, so a NO_RECLAIM republish that landed during
+  // the cold peer preparation (mixed pointer/token snapshot) fails closed
+  // instead of counting old code against the replacement attempt (R1-3).
+  const uint64_t Limit = Slot.t1DispatchLimit.loadAcquire();
+  if (Limit == 0 || Slot.attemptToken != Hit.t1SlotAttemptToken ||
+      Slot.generation != Hit.t1SlotGeneration ||
+      Slot.tier.loadRelaxed() != kEJitTierInstrumented ||
+      reinterpret_cast<void *>(Slot.fnPtr.loadAcquire()) != Hit.fnPtr)
+    return T1DispatchOutcome::IdentityChanged;
+  uint64_t Cur = Slot.t1DispatchCount.loadAcquire();
+  for (;;) {
+    if (Cur >= Limit)
+      return T1DispatchOutcome::Exhausted;
+    if (Slot.t1DispatchCount.compareExchange(Cur, Cur + 1))
+      break;
+  }
+  const uint64_t Admitted = Cur + 1;
+  // Diagnostic progress quarter for this real admission (the legacy path
+  // updated it from the identity-hit counter; the observed count is the honest
+  // progress signal under the sharing contract).
+  const uint32_t Encoded = Slot.funcIndex + 1;
+  for (uint32_t I = 0; I < kEJitSharedMaxConcurrentProfiles; ++I) {
+    if (state_->pgoActiveFunctions[I].loadAcquire() != Encoded)
+      continue;
+    const uint32_t Quarter = static_cast<uint32_t>(
+        std::min<uint64_t>(4, (Admitted * 4) / Limit));
+    uint32_t Old = state_->pgoProgressQuarters[I].loadRelaxed();
+    while (Quarter > Old &&
+           !state_->pgoProgressQuarters[I].compareExchange(Old, Quarter)) {
+    }
+    if (Quarter > Old)
+      EJIT_DIAG("PGO profile progress func=%u: %llu/%llu", Slot.funcIndex,
+                static_cast<unsigned long long>(Admitted),
+                static_cast<unsigned long long>(Limit));
+    break;
+  }
+  if (Admitted == Limit) {
+    // The final allowed dispatch freezes the admission boundary exactly once:
+    // the CAS above never admits another dispatch past the limit, no later
+    // lookup can rewrite this timestamp, and the exclusion above keeps a
+    // replacement attempt from being stamped with it. The clock is injectable;
+    // when none is configured the timestamp stays 0 (unknown) rather than
+    // fabricated. It is a local timestamp source called under the exclusion, so
+    // it must not block on another core's cache admission; test clock gates use
+    // bounded waits for exactly that reason.
+    //
+    // Visibility: NO_RECLAIM freezes under the bucket observationLock and
+    // enqueueTier2FromLookup() re-reads the frozen fields under that same lock,
+    // so a closed-quota lookup either claims after this store (carrying the
+    // value) or before the CAS (impossible: it only arms at the limit). The
+    // token build holds only a shared read token, so a concurrent closed-quota
+    // claim may still win the Tier-2 dedup between the CAS and this store and
+    // queue a request with quotaEnd 0; that is reported as an unknown timestamp
+    // (FrozenAtQuota + quotaEnd 0), never as a queue/compile time and never as
+    // another attempt's value.
+    Slot.t1QuotaEnd.storeRelease(traceNow());
+    EJIT_DIAG("PGO sampling complete func=%u: observed %llu/%llu; routing AOT "
+              "until Tier-2 publish",
+              Slot.funcIndex, static_cast<unsigned long long>(Admitted),
+              static_cast<unsigned long long>(Limit));
+    return T1DispatchOutcome::FinalAdmitted;
+  }
+  return T1DispatchOutcome::Admitted;
+}
+
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::classifyHit(const SharedLookup &Hit, bool enqueueTier2) {
+EJitSharedTaskPool::classifyHit(const SharedLookup &Hit,
+                                const EJitBoundPtrDescriptor *boundPointers,
+                                uint32_t boundCount) {
   CompileOrGetResult R;
-  if (enqueueTier2 && Hit.tier2Arm && Hit.slot)
-    enqueueTier2FromSlot(*Hit.slot);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  bool SamplingToken = false;
+#endif
+  // Experimental observed Tier-1 dispatch contract (v21): commit the granted
+  // real dispatch before any pointer is handed back. A lookup whose quota is
+  // already closed falls back to AOT instead of executing more Tier-1 code.
+  if (Hit.fnPtr && Hit.t1Observation) {
+    const auto Outcome = admitObservedT1Dispatch(Hit);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    SamplingToken = samplingAdmissionFn_ &&
+                   (Outcome == T1DispatchOutcome::Admitted ||
+                    Outcome == T1DispatchOutcome::FinalAdmitted);
+#endif
+    switch (Outcome) {
+    case T1DispatchOutcome::Exhausted:
+      // Lost the final admission to a racing core (or the quota closed between
+      // the resolve and this commit): grant no Tier-1 pointer, fall back to
+      // AOT. No result pointer is handed back, so a read token this lookup
+      // still holds must be released here. The queue-full retry is owned by
+      // every later closed-quota lookup (resolveMatchedSlot arms it), so this
+      // path deliberately does not build a Tier-2 request from a snapshot that
+      // may predate the frozen boundary timestamp.
+      if (Hit.hasReadToken)
+        releaseRead(Hit.bucketIndex);
+      R.status = EJitCompileOrGetStatus::AlreadyPending;
+      R.fastPathTerminal = true;
+      return R;
+    case T1DispatchOutcome::FinalAdmitted:
+      // The last allowed dispatch freezes the boundary AND claims Tier-2.
+      enqueueTier2FromLookup(Hit, boundPointers, boundCount);
+      // The dispatch that closed the quota: the observer sees the frozen
+      // boundary the same way the Tier-2 request does.
+      if (dispatchObserverFn_ && Hit.slot) {
+        DispatchObservation Obs;
+        Obs.funcIndex = Hit.slot->funcIndex;
+        Obs.attemptToken = Hit.t1SlotAttemptToken;
+        Obs.generation = Hit.t1SlotGeneration;
+        Obs.count = Hit.slot->t1DispatchCount.loadAcquire();
+        Obs.limit = Hit.t1DispatchLimit;
+        Obs.quotaEnd = Hit.slot->t1QuotaEnd.loadAcquire();
+        Obs.closedQuota = true;
+        Obs.bucketIndex = Hit.tier2BucketIndex;
+        Obs.slotIndex = Hit.tier2SlotIndex;
+        dispatchObserverFn_(dispatchObserverCtx_, Obs);
+      }
+      break;
+    case T1DispatchOutcome::NotApplicable:
+    case T1DispatchOutcome::Admitted:
+      // A real granted dispatch below the limit.
+      if (dispatchObserverFn_ && Hit.slot) {
+        DispatchObservation Obs;
+        Obs.funcIndex = Hit.slot->funcIndex;
+        Obs.attemptToken = Hit.t1SlotAttemptToken;
+        Obs.generation = Hit.t1SlotGeneration;
+        Obs.count = Hit.slot->t1DispatchCount.loadAcquire();
+        Obs.limit = Hit.t1DispatchLimit;
+        Obs.bucketIndex = Hit.tier2BucketIndex;
+        Obs.slotIndex = Hit.tier2SlotIndex;
+        dispatchObserverFn_(dispatchObserverCtx_, Obs);
+      }
+      break;
+    case T1DispatchOutcome::IdentityChanged:
+      if (samplingAdmissionFn_) {
+        if (Hit.hasReadToken)
+          releaseRead(Hit.bucketIndex);
+        R.status = EJitCompileOrGetStatus::AlreadyPending;
+        R.fastPathTerminal = true;
+        return R; // no unpinned old-session execution in representative mode
+      }
+      // IdentityChanged: the slot was republished; the validated pointer is
+      // still returned (NO_RECLAIM never frees it), but the dispatch is not
+      // attributed to the replacement's observation.
+      break;
+    }
+  }
+  if (Hit.tier2Arm)
+    enqueueTier2FromLookup(Hit, boundPointers, boundCount);
   if (Hit.hasReadToken && Hit.fnPtr) {
     if (Hit.slot)
       markPostPublishSeen(*Hit.slot);
@@ -3047,8 +4386,8 @@ EJitSharedTaskPool::classifyHit(const SharedLookup &Hit, bool enqueueTier2) {
     EJIT_STAT_INC(state_->counters.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
     R.fnPtr = Hit.fnPtr;
-    R.bucketIndex = Hit.bucketIndex; // == kEJitSharedCacheBuckets (sentinel)
-    R.hasReadToken = false;
+    R.bucketIndex = SamplingToken ? Hit.tier2BucketIndex : Hit.bucketIndex;
+    R.hasReadToken = SamplingToken;
     R.fastPathTerminal = true;
     return R;
   }
@@ -3109,15 +4448,10 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
 #else
   SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
 #endif
-  if (Hit.tier2Arm && Hit.slot) {
-    if (boundCount)
-      enqueueTier2ForIdentity(funcIndex, dims, numDims, boundPointers,
-                              boundCount);
-    else
-      enqueueTier2FromSlot(*Hit.slot);
-    Hit.tier2Arm = false;
-  }
-  return classifyHit(Hit, /*enqueueTier2=*/false);
+  // classifyHit() owns the deferred Tier-2 claim (attaching this call's bound
+  // descriptors) and, under the observed-dispatch contract, the admission
+  // commit that decides whether this lookup may grant the Tier-1 pointer.
+  return classifyHit(Hit, boundPointers, boundCount);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3242,11 +4576,12 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
 #endif
 }
 
-EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
-                                 uint32_t numDims, void *fallback,
-                                 const EJitBoundPtrDescriptor *boundPointers,
-                                 uint32_t boundCount) {
+EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::compileOrGet(
+    uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+    void *fallback, const EJitBoundPtrDescriptor *boundPointers,
+    uint32_t boundCount, uint64_t *outAttemptToken) {
+  if (outAttemptToken)
+    *outAttemptToken = 0;
   EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p",
                     funcIndex, numDims, fallback);
   // Parameter check already done by the C API layer.
@@ -3271,11 +4606,36 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
+  const bool TrackAttempt = state_->requestAttemptsEnabled.loadAcquire() != 0;
+  if (TrackAttempt && (state_->mode.loadAcquire() !=
+                           static_cast<uint32_t>(EJitCompileMode::Async) ||
+                       state_->pgoEnabled.loadAcquire() == 0)) {
+    EJIT_DIAG("shared request attempts require Async + online PGO func=%u",
+              funcIndex);
+    R.status = EJitCompileOrGetStatus::OffMode;
+    return R;
+  }
   // Batched baseline compilation releases the coarse per-function in-flight
   // claim after installing an exact-identity Pending marker. Coalesce only an
   // identical request here so another cell/TRP version of the same function
   // can still enter the batch.
   if (cacheHasPending(funcIndex, dims, numDims)) {
+    // A coalesced request still has to reach the group: a non-representative
+    // member whose FIRST attempt was coalesced by the representative's pending
+    // Tier-1 must still be recorded as a waiter of the group generation (its
+    // later wake-up is what turns it into a shared-code consumer).
+    if (state_->pgoEnabled.loadAcquire() != 0 && samplingAdmissionFn_ &&
+        samplingAdmissionFn_(samplingAdmissionCtx_, funcIndex, dims, numDims) ==
+            SamplingAdmission::WakeTier2) {
+      // The member's group already published: enqueue its Tier-2 rather than
+      // reporting a coalesced Tier-1 it must not run.
+      EJitCompileRequest Wake{};
+      if (representativeWakeFn_ &&
+          representativeWakeFn_(representativeWakeCtx_, funcIndex, dims, numDims, Wake)) {
+        R.status = enqueueRepresentativeWake(Wake);
+        return R;
+      }
+    }
     EJIT_STAT_INC(state_->counters.alreadyPending);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
@@ -3398,33 +4758,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // ever started.
   const bool pgoForRequest = state_->pgoEnabled.loadAcquire() != 0;
   const uint32_t gen = state_->generation.loadAcquire();
-  switch (dedupMark(funcIndex, gen)) {
-  case EJitDedupResult::AlreadyPending:
-    EJIT_STAT_INC(state_->counters.alreadyPending);
-    EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending",
-                      funcIndex);
-    R.status = EJitCompileOrGetStatus::AlreadyPending;
-    return R;
-  case EJitDedupResult::InvalidFuncIndex:
-    EJIT_DIAG("shared taskpool reject func=%u: out of range", funcIndex);
-    R.status = EJitCompileOrGetStatus::InvalidParam;
-    return R;
-  case EJitDedupResult::Claimed:
-    break;
-  }
-
-  bool newlyAdmitted = false;
-  if (pgoForRequest && !admitPgoFunction(funcIndex, newlyAdmitted)) {
-    // All profiling slots are occupied. Keep this miss on the AOT fallback
-    // and do not add work to the compiler queue.
-    dedupClear(funcIndex, gen);
-    R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
-    return R;
-  }
-#ifdef EJIT_SRE_TASKPOOL_TESTING
-  if (pgoForRequest && pgoAdmissionTestHook_)
-    pgoAdmissionTestHook_(pgoAdmissionTestHookCtx_);
-#endif
   EJitCompileRequest Req{};
   Req.funcIndex = pgoForRequest
                       ? encodeReqTier(funcIndex, kEJitTierInstrumented)
@@ -3439,9 +4772,108 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   Req.boundCount = boundCount;
   for (uint32_t i = 0; i < boundCount; ++i)
     Req.boundPointers[i] = boundPointers[i];
+  if (TrackAttempt) {
+    Req.attemptToken = beginRequestAttempt(Req, pgoForRequest);
+    if (!Req.attemptToken) {
+      EJIT_DIAG("shared request attempt unavailable func=%u: capacity/token",
+                funcIndex);
+      R.status = EJitCompileOrGetStatus::QueueFullFallback;
+      return R;
+    }
+  }
+  const uint64_t Claim = Req.attemptToken ? Req.attemptToken : gen;
+  switch (dedupMark(funcIndex, Claim)) {
+  case EJitDedupResult::AlreadyPending:
+    acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
+                                       EJitRequestAttemptReason::Cancelled);
+    EJIT_STAT_INC(state_->counters.alreadyPending);
+    EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending",
+                      funcIndex);
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    return R;
+  case EJitDedupResult::InvalidFuncIndex:
+    acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
+                                       EJitRequestAttemptReason::Cancelled);
+    EJIT_DIAG("shared taskpool reject func=%u: out of range", funcIndex);
+    R.status = EJitCompileOrGetStatus::InvalidParam;
+    return R;
+  case EJitDedupResult::Claimed:
+    break;
+  }
+
+  bool newlyAdmitted = false;
+  // Representative sharing: ask the owner-owned group registry FIRST. A member
+  // whose candidate group already owns its ONE representative sampling session
+  // is deferred here, so it never takes a personal PGO admission, never claims
+  // the per-function in-flight slot and never enters the queue. The hook is
+  // unset by default, so a pool without representative sharing keeps the exact
+  // legacy path.
+  if (pgoForRequest && samplingAdmissionFn_) {
+    const SamplingAdmission Admission =
+        samplingAdmissionFn_(samplingAdmissionCtx_, funcIndex, dims, numDims);
+    if (Admission == SamplingAdmission::Classify) {
+      Req.funcIndex = encodeReqTier(funcIndex, kEJitTierCandidate);
+      if (candidateClassifyFn_ && versionsCurrent(Req) && queuePush(Req)) {
+        EJIT_STAT_INC(state_->counters.asyncEnqueues);
+        R.status = EJitCompileOrGetStatus::EnqueuedPending;
+        return R;
+      }
+      dedupClear(funcIndex, Claim);
+      acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
+                                         EJitRequestAttemptReason::QueueFailure);
+      R.status = EJitCompileOrGetStatus::QueueFullFallback;
+      return R;
+    }
+    if (Admission == SamplingAdmission::WakeTier2) {
+      // A represented member with NO sampling session of its own whose group has
+      // already published the shared profile. It must not compile a private
+      // Tier-1: the wake-up callback supplies its Tier-2 request, which consumes
+      // the group bundle. No sampling admission is taken.
+      dedupClear(funcIndex, Claim);
+      acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
+                                         EJitRequestAttemptReason::Cancelled);
+      EJitCompileRequest Wake{};
+      if (representativeWakeFn_ &&
+          representativeWakeFn_(representativeWakeCtx_, funcIndex, dims, numDims, Wake)) {
+        R.status = enqueueRepresentativeWake(Wake);
+        return R;
+      }
+      EJIT_DIAG("shared taskpool representative-defer func=%u: group owns the "
+                "sampling session",
+                funcIndex);
+      R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
+      return R;
+    }
+    if (Admission == SamplingAdmission::Deny) {
+      dedupClear(funcIndex, Claim);
+      acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
+                                         EJitRequestAttemptReason::Cancelled);
+      EJIT_DIAG("shared taskpool representative-defer func=%u: group owns the "
+                "sampling session",
+                funcIndex);
+      R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
+      return R;
+    }
+  }
+  if (pgoForRequest &&
+      !admitPgoFunction(funcIndex, newlyAdmitted, Req.attemptToken)) {
+    // All profiling slots are occupied. Keep this miss on the AOT fallback
+    // and do not add work to the compiler queue.
+    dedupClear(funcIndex, Claim);
+    acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
+                                       EJitRequestAttemptReason::Cancelled);
+    R.status = EJitCompileOrGetStatus::PgoAdmissionDeferred;
+    return R;
+  }
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (pgoForRequest && pgoAdmissionTestHook_)
+    pgoAdmissionTestHook_(pgoAdmissionTestHookCtx_);
+#endif
   if (!versionsCurrent(Req) || state_->generation.loadAcquire() != gen) {
-    dedupClear(funcIndex, gen);
-    if (newlyAdmitted)
+    dedupClear(funcIndex, Claim);
+    acknowledgeRequestAttemptQueueDrop(
+        Req.attemptToken, EJitRequestAttemptReason::LifecycleChanged);
+    if (newlyAdmitted && !Req.attemptToken)
       finishPgoFunction(funcIndex, /*completed=*/false,
                         "lifecycle-changed-during-admission");
     EJIT_DIAG(
@@ -3451,8 +4883,10 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   }
   if (!queuePush(Req)) {
-    dedupClear(funcIndex, gen); // queue full → roll back the in-flight slot.
-    if (newlyAdmitted)
+    dedupClear(funcIndex, Claim); // queue full -> roll back in-flight.
+    acknowledgeRequestAttemptQueueDrop(Req.attemptToken,
+                                       EJitRequestAttemptReason::QueueFailure);
+    if (newlyAdmitted && !Req.attemptToken)
       finishPgoFunction(funcIndex, /*completed=*/false, "tier1-queue-full");
     EJIT_STAT_INC(state_->counters.queueFull);
     EJIT_DIAG("shared taskpool fallback func=%u: queue full", funcIndex);
@@ -3460,7 +4894,11 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   }
   EJIT_STAT_INC(state_->counters.asyncEnqueues);
-  EJIT_DIAG_VERBOSE("shared taskpool enqueued func=%u gen=%u", funcIndex, gen);
+  if (outAttemptToken)
+    *outAttemptToken = Req.attemptToken;
+  EJIT_DIAG_VERBOSE("shared taskpool enqueued func=%u gen=%u attempt=%llu",
+                    funcIndex, gen,
+                    static_cast<unsigned long long>(Req.attemptToken));
   R.status = EJitCompileOrGetStatus::EnqueuedPending;
   return R;
 }
@@ -3580,9 +5018,10 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
     bool HasRange =
         Ready && codeRangeFn_ && codeRangeFn_(codeRangeCtx_, P.fn, &Info);
     EJitPublishStatus PS =
-        Ready ? cachePublish(P.req, P.fn, HasRange ? &Info : nullptr,
-                             Tier == kEJitTierPgoUse)
-              : EJitPublishStatus::Failed;
+        Ready && requestAttemptCanPublish(P.req.attemptToken)
+            ? cachePublish(P.req, P.fn, HasRange ? &Info : nullptr,
+                           Tier == kEJitTierPgoUse)
+            : EJitPublishStatus::Failed;
     if (PS == EJitPublishStatus::Published) {
       ++Published;
       EJIT_STAT_INC(state_->counters.asyncCompiles);
@@ -3594,9 +5033,16 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
                   FuncIndex, state_->tier2Threshold.loadAcquire());
       } else if (Tier == kEJitTierPgoUse) {
         EJIT_STAT_INC(state_->counters.tier2Compiles);
-        finishPgoFunction(FuncIndex, /*completed=*/true);
+        finishPgoFunction(FuncIndex, /*completed=*/true, nullptr,
+                          P.req.attemptToken);
+        settleRequestAttemptPublication(P.req.attemptToken, true,
+                                        EJitRequestAttemptReason::Published);
+      } else {
+        settleRequestAttemptPublication(P.req.attemptToken, true,
+                                        EJitRequestAttemptReason::Published);
       }
-    } else if (Tier == kEJitTierPgoUse && PS == EJitPublishStatus::Failed) {
+    } else if (Tier == kEJitTierPgoUse && PS == EJitPublishStatus::Failed &&
+               requestAttemptCanPublish(P.req.attemptToken)) {
       // The linked Tier-2 code is already executable, but publishing the
       // replacement pointer failed transiently. Keep both the owner-private
       // result and the PGO admission; the live shared slot still points at
@@ -3613,7 +5059,12 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
         publishFn_(publishCtx_, P.req, false);
       if (P.req.generation == state_->generation.loadAcquire() &&
           (Tier == kEJitTierInstrumented || Tier == kEJitTierPgoUse))
-        finishPgoFunction(FuncIndex, /*completed=*/false);
+        finishPgoFunction(FuncIndex, /*completed=*/false, nullptr,
+                          P.req.attemptToken);
+      (void)cancelRequestAttempt(
+          P.req.attemptToken, PS == EJitPublishStatus::VersionMismatch
+                                  ? EJitRequestAttemptReason::LifecycleChanged
+                                  : EJitRequestAttemptReason::PublishFailure);
       if (releaseFn_)
         releaseFn_(releaseCtx_, P.fn);
       if (PS == EJitPublishStatus::VersionMismatch)
@@ -3623,7 +5074,8 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
     }
     // Staged entries clear this at staging time; unstaged overflow/failure
     // entries retain it until here. Generation-aware CAS makes both safe.
-    dedupClear(P.req.funcIndex, P.req.generation);
+    dedupClear(P.req.funcIndex,
+               P.req.attemptToken ? P.req.attemptToken : P.req.generation);
   }
   [[maybe_unused]] const size_t Total = pendingPublishes_.size();
   pendingPublishes_.swap(Retry);
@@ -3785,15 +5237,22 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   // worker.
   const uint32_t tier = decodeReqTier(req.funcIndex);
   const uint32_t realFuncIndex = stripReqTier(req.funcIndex);
+  const uint64_t Claim = req.attemptToken ? req.attemptToken : req.generation;
   const bool pgoClearExclusive = tier == kEJitTierPgoUse;
   auto dropBatchRequestMarker = [&] {
     if (hasBatchRequestMarker)
       cacheDropPending(req, nullptr);
   };
+  auto isMemberTier2 = [&]() {
+    RequestAttemptSnapshot Status;
+    return samplingAdmissionFn_ && tier == kEJitTierPgoUse &&
+           requestAttemptStatus(req.attemptToken, Status) &&
+           !(Status.flags & EJitAttemptHoldsAdmission);
+  };
   auto finishPgoOnFailure = [&]() {
     if (tier == kEJitTierInstrumented) {
       finishPgoFunction(realFuncIndex, /*completed=*/false,
-                        "tier1-compile-or-publish-failed");
+                        "tier1-compile-or-publish-failed", req.attemptToken);
     } else if (tier == kEJitTierPgoUse) {
       // Tier-1 is still published and instrumented. Retain admission so a
       // later hit retries Tier-2 instead of freeing this admission slot while
@@ -3804,13 +5263,52 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   };
   EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u",
                     req.funcIndex, req.numDims, req.generation);
+  if (!beginRequestAttemptCompile(req.attemptToken)) {
+    dropBatchRequestMarker();
+    dedupClear(req.funcIndex, Claim);
+    return;
+  }
+  // Representative quota closes on admission, before the caller executes.
+  // Drain its bucket's read tokens BEFORE reading instrumentation storage.
+  // No bucket/group lock is held: the last admitted caller must be able to
+  // release its token. Closed-quota lookups cannot admit another T1 writer.
+  // Legacy online PGO and stable T2 hits retain their existing behavior.
+  // A replacement T1 can reuse the old logical key's emitter/storage. In
+  // NO_RECLAIM cancellation retracts the slot before root execution returns,
+  // so the replacement must also wait for its sampling execution tokens.
+  if (samplingAdmissionFn_ &&
+      (tier == kEJitTierInstrumented ||
+       (tier == kEJitTierPgoUse && req.t1DispatchLimit &&
+        req.t1DispatchCount >= req.t1DispatchLimit))) {
+    const uint32_t Bucket = static_cast<uint32_t>(
+        hashIdentity(realFuncIndex, req.dims, req.numDims) %
+        kEJitSharedCacheBuckets);
+    while (state_->buckets[Bucket].readers.loadAcquire() != 0 &&
+           req.generation == state_->generation.loadAcquire() &&
+           versionsCurrent(req) &&
+           state_->initState.loadAcquire() ==
+               static_cast<uint32_t>(EJitSharedInitState::Ready))
+      workerIdle(1);
+    if (state_->initState.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedInitState::Ready)) {
+      dropBatchRequestMarker();
+      dedupClear(req.funcIndex, Claim);
+      endRequestAttemptCompile(req.attemptToken, false);
+      return; // owner shutdown settles the attempt after joining this worker
+    }
+  }
   // Checkpoint 0 (spec §11): generation guard. A request enqueued under an
   // earlier generation (owner re-init in between) is dropped before compiling.
   // dedupClear is generation-aware, so this never clears a NEW generation's
   // in-flight slot for the same funcIndex.
   if (req.generation != state_->generation.loadAcquire()) {
+    if (tier == kEJitTierPgoUse && pgoLifecycleDropFn_)
+      pgoLifecycleDropFn_(pgoLifecycleDropCtx_, req);
     dropBatchRequestMarker();
-    dedupClear(req.funcIndex, req.generation);
+    dedupClear(req.funcIndex, Claim);
+    (void)cancelRequestAttempt(req.attemptToken,
+                               EJitRequestAttemptReason::GenerationChanged);
+    endRequestAttemptCompile(req.attemptToken, true);
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile drop func=%u: generation changed",
               req.funcIndex);
@@ -3818,23 +5316,53 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   }
   // Checkpoint 1: invalidated before compile started.
   if (!versionsCurrent(req)) {
+    if (tier == kEJitTierPgoUse && pgoLifecycleDropFn_)
+      pgoLifecycleDropFn_(pgoLifecycleDropCtx_, req);
     dropBatchRequestMarker();
-    dedupClear(req.funcIndex, req.generation);
+    dedupClear(req.funcIndex, Claim);
     if (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse)
       finishPgoFunction(realFuncIndex, /*completed=*/false,
-                        "version-changed-before-compile");
+                        "version-changed-before-compile", req.attemptToken);
+    (void)cancelRequestAttempt(req.attemptToken,
+                               EJitRequestAttemptReason::LifecycleChanged);
+    endRequestAttemptCompile(req.attemptToken, true);
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG(
         "shared worker compile drop func=%u: version changed before compile",
         req.funcIndex);
     return;
   }
+  if (tier == kEJitTierCandidate) {
+    // Prefix classification borrows the request through ordinary worker
+    // ownership, but never admits PGO, links T1 or publishes a callable slot.
+    const bool Classified = candidateClassifyFn_ &&
+                           candidateClassifyFn_(candidateClassifyCtx_, req);
+    dedupClear(req.funcIndex, Claim);
+    if (Classified) {
+      // Prefix completion is not logical source completion: waiters may read
+      // the registered configuration again in their final PGOUse transform.
+      finishCandidateClassification(req.attemptToken);
+    } else {
+      (void)cancelRequestAttempt(req.attemptToken, EJitRequestAttemptReason::CompileFailure);
+      endRequestAttemptCompile(req.attemptToken, true);
+    }
+    return;
+  }
   void *fn = nullptr;
   bool ok = compileFn_ && compileFn_(compileCtx_, req, &fn);
   if (!ok || !fn) {
     dropBatchRequestMarker();
-    dedupClear(req.funcIndex, req.generation);
-    finishPgoOnFailure();
+    dedupClear(req.funcIndex, Claim);
+    const bool MemberTier2 = isMemberTier2();
+    if (!MemberTier2) finishPgoOnFailure();
+    if (tier == kEJitTierPgoUse && !MemberTier2) {
+      endRequestAttemptCompile(req.attemptToken, false);
+      markRequestAttemptWaitingProfile(req.attemptToken);
+    } else {
+      (void)cancelRequestAttempt(req.attemptToken,
+                                 EJitRequestAttemptReason::CompileFailure);
+      endRequestAttemptCompile(req.attemptToken, true);
+    }
     EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile failed func=%u ok=%u fn=%p", req.funcIndex,
               static_cast<unsigned>(ok), fn);
@@ -3852,15 +5380,20 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   // Checkpoint 2: a generation bump OR a toggle during compilation invalidates
   // the result.
   if (req.generation != state_->generation.loadAcquire() ||
-      !versionsCurrent(req)) {
+      !versionsCurrent(req) || !requestAttemptCanPublish(req.attemptToken)) {
     dropBatchRequestMarker();
     if (publishFn_)
       publishFn_(publishCtx_, PublishReq, false);
-    dedupClear(req.funcIndex, req.generation);
+    dedupClear(req.funcIndex, Claim);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
       finishPgoFunction(realFuncIndex, /*completed=*/false,
-                        "version-changed-after-compile");
+                        "version-changed-after-compile", req.attemptToken);
+    (void)cancelRequestAttempt(
+        req.attemptToken, req.generation == state_->generation.loadAcquire()
+                              ? EJitRequestAttemptReason::LifecycleChanged
+                              : EJitRequestAttemptReason::GenerationChanged);
+    endRequestAttemptCompile(req.attemptToken, true);
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     EJIT_STAT_INC(state_->counters.compileFailed);
@@ -3876,6 +5409,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // compile queue empty and seals the batch. Keep only owner-private state
       // and retain the in-flight claim.
       pendingPublishes_.push_back({PublishReq, fn});
+      endRequestAttemptCompile(req.attemptToken, true);
       autoTier2PublishPending_ = true;
       EJIT_DIAG_DEBUG("PGO Tier-2 linked pending queue-drain publish func=%u "
                       "fn=%p pending=%zu",
@@ -3888,8 +5422,11 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
       // replacing the AOT path with an NX pointer.
       if (publishFn_)
         publishFn_(publishCtx_, PublishReq, false);
-      dedupClear(req.funcIndex, req.generation);
+      dedupClear(req.funcIndex, Claim);
       finishPgoOnFailure();
+      (void)cancelRequestAttempt(req.attemptToken,
+                                 EJitRequestAttemptReason::PublishFailure);
+      endRequestAttemptCompile(req.attemptToken, true);
       if (releaseFn_)
         releaseFn_(releaseCtx_, fn);
       EJIT_STAT_INC(state_->counters.publishFailed);
@@ -3900,7 +5437,8 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     EJitPublishStatus Staged = cacheStagePending(PublishReq, fn);
     if (Staged == EJitPublishStatus::Published) {
       pendingPublishes_.push_back({PublishReq, fn});
-      dedupClear(req.funcIndex, req.generation);
+      dedupClear(req.funcIndex, Claim);
+      endRequestAttemptCompile(req.attemptToken, true);
       EJIT_DIAG_DEBUG("shared worker batch staged func=%u fn=%p pending=%zu",
                       req.funcIndex, fn, pendingPublishes_.size());
       return;
@@ -3912,6 +5450,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     // victim. Keep the result owner-private with its coarse in-flight claim;
     // the explicit publish call seals all code and then inserts this identity.
     pendingPublishes_.push_back({PublishReq, fn});
+    endRequestAttemptCompile(req.attemptToken, true);
     EJIT_DIAG_VERBOSE(
         "shared worker batch retained unstaged func=%u pending=%zu",
         req.funcIndex, pendingPublishes_.size());
@@ -3925,14 +5464,24 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     EJIT_STAT_INC(state_->counters.asyncCompiles);
     if (publishFn_)
       publishFn_(publishCtx_, PublishReq, true);
-    dedupClear(req.funcIndex, req.generation);
+    dedupClear(req.funcIndex, Claim);
     if (tier == kEJitTierInstrumented) {
+      endRequestAttemptCompile(req.attemptToken, false);
+      markRequestAttemptWaitingProfile(req.attemptToken);
       EJIT_STAT_INC(state_->counters.tier1Compiles);
       EJIT_DIAG("PGO Tier-1 published func=%u: collecting 0/%u hits",
                 realFuncIndex, state_->tier2Threshold.loadAcquire());
     } else if (tier == kEJitTierPgoUse) {
+      endRequestAttemptCompile(req.attemptToken, true);
       EJIT_STAT_INC(state_->counters.tier2Compiles);
-      finishPgoFunction(realFuncIndex, /*completed=*/true);
+      finishPgoFunction(realFuncIndex, /*completed=*/true, nullptr,
+                        req.attemptToken);
+      settleRequestAttemptPublication(req.attemptToken, true,
+                                      EJitRequestAttemptReason::Published);
+    } else {
+      endRequestAttemptCompile(req.attemptToken, true);
+      settleRequestAttemptPublication(req.attemptToken, true,
+                                      EJitRequestAttemptReason::Published);
     }
     publishCodePoolStats();
     EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex,
@@ -3941,11 +5490,14 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   case EJitPublishStatus::VersionMismatch:
     if (publishFn_)
       publishFn_(publishCtx_, PublishReq, false);
-    dedupClear(req.funcIndex, req.generation);
+    dedupClear(req.funcIndex, Claim);
     if (req.generation == state_->generation.loadAcquire() &&
         (tier == kEJitTierInstrumented || tier == kEJitTierPgoUse))
       finishPgoFunction(realFuncIndex, /*completed=*/false,
-                        "version-mismatch-at-publish");
+                        "version-mismatch-at-publish", req.attemptToken);
+    (void)cancelRequestAttempt(req.attemptToken,
+                               EJitRequestAttemptReason::LifecycleChanged);
+    endRequestAttemptCompile(req.attemptToken, true);
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     EJIT_STAT_INC(state_->counters.compileFailed);
@@ -3956,8 +5508,16 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   case EJitPublishStatus::Failed:
     if (publishFn_)
       publishFn_(publishCtx_, PublishReq, false);
-    dedupClear(req.funcIndex, req.generation);
-    finishPgoOnFailure();
+    dedupClear(req.funcIndex, Claim);
+    if (!isMemberTier2()) finishPgoOnFailure();
+    if (tier == kEJitTierPgoUse && !isMemberTier2()) {
+      endRequestAttemptCompile(req.attemptToken, false);
+      markRequestAttemptWaitingProfile(req.attemptToken);
+    } else {
+      (void)cancelRequestAttempt(req.attemptToken,
+                                 EJitRequestAttemptReason::PublishFailure);
+      endRequestAttemptCompile(req.attemptToken, true);
+    }
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     EJIT_STAT_INC(state_->counters.publishFailed);
@@ -3982,7 +5542,10 @@ bool EJitSharedTaskPool::pollOne() {
   if (codeReadyFn_ && codeBatchFlushFn_ &&
       decodeReqTier(Req.funcIndex) == kEJitTierBaseline) {
     if (pendingBatchCompiles_.size() >= kEJitSharedQueueSlots) {
-      dedupClear(Req.funcIndex, Req.generation);
+      dedupClear(Req.funcIndex,
+                 Req.attemptToken ? Req.attemptToken : Req.generation);
+      acknowledgeRequestAttemptQueueDrop(
+          Req.attemptToken, EJitRequestAttemptReason::QueueFailure);
       EJIT_STAT_INC(state_->counters.queueFull);
       EJIT_DIAG("shared worker batch backlog full func=%u capacity=%u",
                 stripReqTier(Req.funcIndex), kEJitSharedQueueSlots);
@@ -3992,7 +5555,8 @@ bool EJitSharedTaskPool::pollOne() {
         cacheStageBatchRequest(Req) == EJitPublishStatus::Published;
     pendingBatchCompiles_.push_back({Req, Marked});
     if (Marked)
-      dedupClear(Req.funcIndex, Req.generation);
+      dedupClear(Req.funcIndex,
+                 Req.attemptToken ? Req.attemptToken : Req.generation);
     EJIT_DIAG_VERBOSE(
         "shared worker batch queued func=%u dims=%u marker=%u requests=%zu",
         stripReqTier(Req.funcIndex), Req.numDims, static_cast<unsigned>(Marked),
@@ -4030,6 +5594,9 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
   switch (static_cast<EJitSharedInitState>(st)) {
   case EJitSharedInitState::Ready:
     workerConsumeLoops_.fetchAdd(1);
+    // A replenished compile queue must not starve cold-session cancellation.
+    if (ownerMaintenanceFn_ && ownerMaintenanceFn_(ownerMaintenanceCtx_))
+      return EJitWorkerStep::Consumed;
     // Explicit publication must not starve behind a continuously replenished
     // compile queue or diagnostics. serviceCodeBatchRequest() snapshots and
     // drains the work that predates the request before publishing it.

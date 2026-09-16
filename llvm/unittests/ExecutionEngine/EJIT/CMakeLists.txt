@@ -17,6 +17,8 @@ add_llvm_unittest(EJITTests
   EJitOrcEngineHeaderTest.cpp
   EJitRuntimeTest.cpp
   EJitFieldOffsetTest.cpp
+  EJitPreservedDimsTest.cpp
+  EJitPreparedCodeTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
   EJitVpMergeTest.cpp
@@ -124,19 +126,26 @@ add_custom_target(check-ejit-taskpool
 # Cross-core SHARED taskpool tests: compile the shared sources directly with the
 # shared-taskpool macros so they build and run independently of LLVMEJIT and need
 # no real SRE platform symbols. Many cores are simulated in one host process via
-# the injectable EJitCoreId; no real thread is required. Only LLVMSupport is
-# linked (the gtest harness).
+# the injectable EJitCoreId; no real thread is required. Only LLVMSupport and
+# LLVMProfileData are linked (the gtest harness plus the production ProfileBundle
+# mapping helper exercised by EJitObservedT1DispatchTest.cpp); OrcJIT/EJIT are
+# never pulled in.
 set(EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
-set(LLVM_LINK_COMPONENTS Support)
+set(LLVM_LINK_COMPONENTS Support ProfileData)
 add_llvm_unittest(EJITSharedTaskPoolTests
   EJitSharedTaskPoolTest.cpp
+  EJitObservedT1DispatchTest.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
   # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
   # two sources above). Needed when the global EJIT_DIAG_ENABLE is ON: without
   # it the test binary fails to link, since this target deliberately links only
-  # LLVMSupport and never the full LLVMEJIT (which carries EJitLogger.cpp).
+  # LLVMSupport/LLVMProfileData and never the full LLVMEJIT (which carries
+  # EJitLogger.cpp).
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  # The production Tier-2 request -> ProfileBundle mapping helper
+  # (applyT1DispatchObservation) under test; it has no ORC/JIT dependency.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitProfileMerge.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
@@ -221,6 +230,85 @@ add_custom_target(check-ejit-shared-taskpool
   COMMAND $<TARGET_FILE:EJITSharedTaskPoolTests>
   DEPENDS EJITSharedTaskPoolTests
   COMMENT "Running EmbeddedJIT cross-core shared taskpool unit tests"
+  USES_TERMINAL
+  )
+
+# Representative-PGO group integration: REAL online PGO on the host. Compiles
+# the group lifecycle component together with the real optimizer, profile merge,
+# prepared-code emitter and the shared taskpool so the test can run an
+# Instrumented Tier-1 (64 real dispatches through the production pool), read the
+# live __profc_/__profd_ counters, freeze the immutable ProfileBundle from the
+# real queued Tier-2 request, and let every member consume it through PGOUse
+# before one physical Tier-2 object is shared. It needs a native target and
+# JITLink/OrcJIT; the EJIT sources are compiled directly (never libLLVMEJIT) so
+# the target's macro set stays visible to the compiler.
+set(EJIT_REPGROUP_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS
+  Analysis
+  AsmParser
+  Core
+  ExecutionEngine
+  Instrumentation
+  JITLink
+  OrcJIT
+  OrcShared
+  Passes
+  ProfileData
+  Support
+  TargetParser
+  )
+add_llvm_unittest(EJitRepresentativeGroupTests
+  EJitRepresentativeGroupPgoTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitRepresentativeGroup.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitOptimizer.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitStructFieldPass.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitPreparedCode.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitProfileMerge.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitRuntimeState.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitModuleLoader.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
+  # sources above); this target links no LLVMEJIT, which normally carries
+  # EJitLogger.cpp.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_REPGROUP_LINK_COMPONENTS_SAVED}")
+foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
+  if(TARGET LLVM${ejit_target}AsmParser)
+    target_link_libraries(EJitRepresentativeGroupTests PRIVATE
+      LLVM${ejit_target}AsmParser)
+  endif()
+endforeach()
+
+# Same icache geometry/feature macros as the production LLVMEJIT (the EJIT
+# sources are compiled into this target, so diverging values would silently test
+# different geometry).
+target_compile_definitions(EJitRepresentativeGroupTests PRIVATE
+  EJIT_SRE_TASKPOOL
+  EJIT_SRE_SHARED_TASKPOOL
+  EJIT_SRE_TASKPOOL_TESTING
+  EJIT_STATS_ENABLE
+  EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
+  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
+  EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}
+  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+  EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS}
+  EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}
+  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=3
+  EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
+  )
+if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+  target_compile_definitions(EJitRepresentativeGroupTests PRIVATE
+    EJIT_SRE_SHARED_CODE_POINTERS)
+endif()
+
+add_custom_target(check-ejit-representative-group
+  COMMAND $<TARGET_FILE:EJitRepresentativeGroupTests>
+  DEPENDS EJitRepresentativeGroupTests
+  COMMENT "Running EmbeddedJIT representative-PGO group integration tests"
   USES_TERMINAL
   )
 

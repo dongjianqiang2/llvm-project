@@ -14,9 +14,9 @@
 //
 //    * producers (the shared Tier-1 machine code) pick the active half from
 //      shard.generation (one ACQUIRE load) and update ONLY their own core's
-//      cells with RELAXED RMWs. Those lines are core-private (one writer), so
-//      the hot path performs no CAS, no lock, and no cross-core write to a
-//      shared cache line (EJIT_VALUE_PROFILE.md §3.2).
+//      cells with RELAXED RMWs. Those payload lines remain core-private. A
+//      session-aware producer also acquires/releases the bounded session gate
+//      so retirement cannot reuse its identity while the write is in flight.
 //    * the collector (the single owner worker, pre Tier-2) flips each shard's
 //      generation (ACQ_REL), drains a bounded straggler window, then copies a
 //      retired half only after its registered writer count reaches zero. A
@@ -91,7 +91,10 @@ static_assert(kEJitVpMaxCores >= 1 && kEJitVpMaxCores <= 256,
 // taskpool blob; bump abiVersion on any layout change.
 //===----------------------------------------------------------------------===//
 constexpr uint32_t kEJitVpAbiMagic = 0x5650524Fu; // "VPRO"
-constexpr uint32_t kEJitVpAbiVersion = 2u;
+constexpr uint32_t kEJitVpAbiVersion = 7u;
+constexpr uint32_t kEJitVpMaxSessions = 16u;
+constexpr uint64_t kEJitVpLegacySessionId = ~uint64_t(0);
+constexpr uint32_t kEJitVpMaxProfdBindings = 256u;
 
 /// Our value-site kinds. 0/1 mirror LLVM's IPVK_IndirectCallTarget /
 /// IPVK_MemOPSize; kind 2 is the EJIT-only scalar/loop-bound site that travels
@@ -138,8 +141,12 @@ struct EJitVpCandidate {
 
 /// One site of one payload half: K candidates + a window total.
 struct EJitVpSite {
-  EJitAtomicU64 siteKey; ///< ejitVpSiteKey(funcHash, kind, siteIdx); 0 = free
-  EJitAtomicU64 total;   ///< records observed in this window
+  EJitAtomicU64 siteKey; ///< session-mixed storage key; 0 = free
+  EJitAtomicU64 samplingSessionId;
+  EJitAtomicU64 functionIdentity;
+  EJitAtomicU32 kind;
+  EJitAtomicU32 siteIndex;
+  EJitAtomicU64 total; ///< records observed in this window
   EJitVpCandidate cand[kEJitVpK];
 };
 
@@ -163,6 +170,28 @@ struct alignas(kEJitVpCacheLine) EJitVpShard {
 /// only by the single owner worker (cold path: merge + Tier-2 transform);
 /// read by any core through ejit_vp_get_stats with relaxed loads. Living in
 /// the shared blob keeps the view consistent cross-core on SRE.
+struct EJitVpSessionSlot {
+  EJitAtomicU64 samplingSessionId;   ///< zero means unused/reusable
+  EJitAtomicU64 requestAttemptToken; ///< exact logical cancellation owner
+  /// Bit zero admits producers; each admitted producer adds two. Ending a
+  /// session atomically clears bit zero, after which gate==0 proves no reader
+  /// can still cross into a reused slot.
+  EJitAtomicU64 gate;
+  /// 0 normal, 1 incomplete T2 freeze retained, 2 terminal discard/cancel.
+  /// State 2 is monotonic until the slot is exclusively retired.
+  EJitAtomicU32 retireState;
+  uint32_t reserved;
+};
+
+struct EJitVpProfdBinding {
+  /// Even and stable while the address/session pair may be consumed. Writers
+  /// bracket replacement with odd/even increments so readers cannot combine
+  /// fields from different bindings.
+  EJitAtomicU64 sequence;
+  EJitAtomicUPtr profdAddr;
+  EJitAtomicU64 samplingSessionId;
+};
+
 struct EJitVpStats {
   EJitAtomicU64 merges;            ///< Tier-2 value-profile merges performed
   EJitAtomicU64 icValueSites;      ///< indirect-call value sites merged
@@ -195,14 +224,20 @@ struct alignas(kEJitVpCacheLine) EJitVpSharedState {
   EJitAtomicU32 structSize;
   uint32_t headerReserved; // write-once, never read by peers
   /// Global collection gate (read-mostly). Set once PGO+Tier-1 collection is
-  /// armed; per-record cost is ONE acquire load of a shared, read-only line.
+  /// armed; this is the first fast rejection before ABI/session lookup.
   EJitAtomicU32 armed;
+  uint32_t headerAlignPad;
+  /// Monotonic high-water mark. Retired IDs are never accepted again even
+  /// though their bounded active slot is safely reused after snapshot drain.
+  EJitAtomicU64 lastIssuedSessionId;
   uint32_t shardStride;  ///< sizeof(EJitVpShard), for cross-core validation
   uint32_t sitesPerCore; ///< kEJitVpSitesPerCore
   uint32_t k;            ///< kEJitVpK
   uint32_t maxCores;     ///< kEJitVpMaxCores
   uint32_t drainTicks;   ///< kEJitVpDrainTicks
   uint32_t headerPad[3];
+  EJitVpSessionSlot sessions[kEJitVpMaxSessions];
+  EJitVpProfdBinding profdBindings[kEJitVpMaxProfdBindings];
   /// Merge/transform counters (cold path; single worker writer).
   EJitVpStats stats;
   EJitVpShard shards[kEJitVpMaxCores];
@@ -226,11 +261,13 @@ static_assert(
     "magic must be the first word so a foreign/zero blob is rejected");
 
 // Explicit, computable memory bound (EJIT_VALUE_PROFILE.md §3.1):
-//   perCoreBytes = align64(header) + 2 * sites * 8 * (2 + 2K)
+//   perCoreBytes = align64(header) + 2 * sites * sizeof(EJitVpSite)
 //   totalBytes   = maxCores * perCoreBytes
-// Defaults (K=2, sites=64, cores=32): 6,272 B/core => ~200 KB total.
+// Defaults (K=2, sites=64, cores=32): 6,272 B/core => ~200 KB of shards,
+// plus the fixed session registry, profd bindings, header, and statistics.
 constexpr uint64_t kEJitVpPerCoreBytes =
-    kEJitVpCacheLine + 2u * kEJitVpSitesPerCore * 8u * (2u + 2u * kEJitVpK);
+    kEJitVpCacheLine +
+    2u * kEJitVpSitesPerCore * static_cast<uint64_t>(sizeof(EJitVpSite));
 constexpr uint64_t kEJitVpTotalBytes = kEJitVpMaxCores * kEJitVpPerCoreBytes;
 static_assert(kEJitVpPerCoreBytes >= sizeof(EJitVpShard),
               "per-core memory bound must cover the shard layout");
@@ -238,6 +275,7 @@ static_assert(kEJitVpPerCoreBytes >= sizeof(EJitVpShard),
 /// One site sample copied out of a snapshot (top-K by count, descending).
 struct EJitVpSiteSample {
   uint64_t siteKey = 0;
+  uint64_t samplingSessionId = 0;
   uint64_t total = 0;
   uint64_t values[kEJitVpK] = {0};
   uint64_t counts[kEJitVpK] = {0};
@@ -246,8 +284,9 @@ struct EJitVpSiteSample {
 //===----------------------------------------------------------------------===//
 // Runtime record functions. These are the symbols the instrumented Tier-1
 // machine code calls; the compile driver registers them as JIT user symbols.
-// All three are allocation-free, lock-free, and touch only the calling core's
-// private shard lines after two acquire loads (armed + generation).
+// All three are allocation-free and lock-free. Session-aware records perform
+// bounded registry lookup before touching only the calling core's shard lines;
+// official LLVM hooks also perform a bounded profd-binding lookup.
 //===----------------------------------------------------------------------===//
 
 /// LLVM InstrProfiling lowering hook for indirect-call target value sites.
@@ -265,6 +304,9 @@ extern "C" void __llvm_profile_instrument_memop(uint64_t value, void *data,
 /// EJIT scalar/loop-bound value site (kind 2, side table).
 extern "C" void ejit_vp_record_scalar(uint64_t funcHash, uint32_t siteIdx,
                                       uint64_t value);
+extern "C" void ejit_vp_record_scalar_session(uint64_t samplingSessionId,
+                                              uint64_t funcHash,
+                                              uint32_t siteIdx, uint64_t value);
 
 //===----------------------------------------------------------------------===//
 // Cold-path collector API (compile driver / merge). Runs on the single owner
@@ -280,6 +322,20 @@ bool ejitVpEnsureInitialized();
 /// Arm / disarm the global collection gate. Records are no-ops while disarmed.
 void ejitVpSetArmed(bool armed);
 bool ejitVpIsArmed();
+
+/// Allocate and arm an exact session without affecting other collecting groups.
+/// Explicit IDs must increase monotonically; retired IDs can never be reopened.
+/// ejitVpCreateSession is the production allocator and safely reuses only fully
+/// drained inactive slots. Exhaustion fails before Tier-1 code generation.
+bool ejitVpBeginSession(uint64_t samplingSessionId);
+uint64_t ejitVpCreateSession(uint64_t requestAttemptToken = 0);
+void ejitVpEndSession(uint64_t samplingSessionId,
+                      bool preserveForRetry = false);
+/// Close only the session owned by an exact request-attempt token. Safe from
+/// any producer core; draining remains an owner cold-path responsibility.
+void ejitVpCancelAttempt(uint64_t requestAttemptToken);
+bool ejitVpSessionDiscarded(uint64_t samplingSessionId);
+bool ejitVpBindProfileData(uint64_t samplingSessionId, uintptr_t profdAddr);
 
 /// Per-kind site count of one function, used to recompute the function's exact
 /// site keys (the stored key is a mixed hash, so reset/merge probe by
@@ -302,6 +358,11 @@ void ejitVpResetFunction(uint64_t nameHash,
 /// not initialized (ABI mismatch included). Appends one sample per non-empty
 /// site observed.
 bool ejitVpTakeSnapshot(std::vector<EJitVpSiteSample> &out);
+
+/// Snapshot and clear only one exact session. Other active sessions remain in
+/// both payload halves and are delivered by their own later snapshot.
+bool ejitVpTakeSessionSnapshot(uint64_t samplingSessionId,
+                               std::vector<EJitVpSiteSample> &out);
 
 /// Merge-side observability bump (owner worker, cold path).
 void ejitVpBumpMergeCounts(uint64_t icSites, uint64_t memopSites,

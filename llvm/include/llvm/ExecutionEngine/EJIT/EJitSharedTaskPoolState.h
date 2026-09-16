@@ -77,6 +77,12 @@
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
+#ifndef EJIT_SRE_REQUEST_ATTEMPT_CAPACITY
+#define EJIT_SRE_REQUEST_ATTEMPT_CAPACITY 256u
+#endif
+#ifndef EJIT_SRE_REQUEST_HISTORY_CAPACITY
+#define EJIT_SRE_REQUEST_HISTORY_CAPACITY 64u
+#endif
 namespace llvm {
 namespace ejit {
 
@@ -84,7 +90,7 @@ namespace ejit {
 // Fixed capacities and the cache-line size used to avoid false sharing.
 //===----------------------------------------------------------------------===//
 /// Max dims in one identity; matches EJitSharedCacheSlot::dims.
-constexpr uint32_t kEJitSharedMaxDims = 4u;
+constexpr uint32_t kEJitSharedMaxDims = kEJitMaxRequestDims;
 constexpr uint32_t kEJitSharedDimTypes = 8u;
 constexpr uint32_t kEJitSharedInstances = 256u;
 /// Max runtime-writable ranges carried per cache slot (v9). Kept in lockstep
@@ -111,6 +117,14 @@ static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
                       kEJitSharedMaxConcurrentProfiles,
               "EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES must be in [1, 16]");
 constexpr uint32_t kEJitSharedDumpNameBytes = EJIT_SRE_SHARED_DUMP_NAME_BYTES;
+constexpr uint32_t kEJitSharedRequestAttemptCapacity =
+    EJIT_SRE_REQUEST_ATTEMPT_CAPACITY;
+constexpr uint32_t kEJitSharedRequestHistoryCapacity =
+    EJIT_SRE_REQUEST_HISTORY_CAPACITY;
+static_assert(kEJitSharedRequestAttemptCapacity != 0,
+              "request-attempt table must have at least one live slot");
+static_assert(kEJitSharedRequestHistoryCapacity != 0,
+              "request-attempt history must have at least one slot");
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -169,6 +183,52 @@ enum class EJitCodeBatchRequestState : uint32_t {
   Failed = 4,
 };
 
+enum EJitRequestAttemptFlag : uint32_t {
+  EJitAttemptSamplingPending = 1u << 0,
+  EJitAttemptBorrowPending = 1u << 1,
+  EJitAttemptPublicationPending = 1u << 2,
+  EJitAttemptQueueOwned = 1u << 3,
+  EJitAttemptCompileActive = 1u << 4,
+  EJitAttemptCancelRequested = 1u << 5,
+  EJitAttemptWaitingProfile = 1u << 6,
+  EJitAttemptHoldsAdmission = 1u << 7,
+};
+
+enum class EJitRequestAttemptReason : uint32_t {
+  None = 0,
+  Published = 1,
+  Cancelled = 2,
+  QueueFailure = 3,
+  CompileFailure = 4,
+  LifecycleChanged = 5,
+  GenerationChanged = 6,
+  Shutdown = 7,
+  PublishFailure = 8,
+};
+
+/// One live logical request. All fields are read or written while attemptLock
+/// is held; token is cleared last when the record is retired.
+struct EJitSharedRequestAttempt {
+  EJitAtomicU64 token;
+  EJitAtomicU32 generation;
+  EJitAtomicU32 funcIndex;
+  EJitAtomicU32 flags;
+  EJitAtomicU32 terminalReason;
+  uint32_t numDims;
+  EJitDimPair dims[kEJitSharedMaxDims];
+  uint32_t versions[kEJitSharedMaxDims];
+  uint32_t boundCount;
+  EJitBoundPtrDescriptor boundPointers[kEJitMaxBoundPointers];
+};
+
+/// Bounded diagnostic tombstone. It never occupies a live-attempt slot.
+struct EJitSharedRequestAttemptHistory {
+  EJitAtomicU64 token;
+  EJitAtomicU32 generation;
+  EJitAtomicU32 funcIndex;
+  EJitAtomicU32 terminalReason;
+};
+
 //===----------------------------------------------------------------------===//
 // EJitSharedWritableRange: one runtime-writable extent of a published code
 // allocation (e.g. the Tier-1 __profc_ counters). Plain fixed-width scalars so
@@ -190,6 +250,9 @@ struct EJitSharedCacheSlot {
   EJitDimPair dims[4];   ///< identity
   uint32_t versions[4];  ///< per-instance version snapshot at publish
   uint64_t identityHash; ///< hash(funcIndex, dims) — fast reject before compare
+  /// Exact logical attempt that published this slot, or zero when the
+  /// request-attempt protocol is disabled. Written under the bucket lock.
+  uint64_t attemptToken;
   EJitAtomicUPtr fnPtr;  ///< compiled function pointer (cross-core read gated)
   /// Bit N means core N has successfully installed execute permission for this
   /// code address. Core ids >= 64 are supported but cannot be memoized here,
@@ -247,6 +310,38 @@ struct EJitSharedCacheSlot {
   /// that has not been reused after publish. The ABI field is always present;
   /// it is meaningful only when EJIT_STATS_ENABLE updates it.
   EJitAtomicU8 postPublishSeen;
+
+  /// Observed real Tier-1 dispatch boundary (v21, experimental sharing
+  /// contract). These fields belong to the exact attempt that published this
+  /// slot: they are (re)written under the bucket write lock before state=Ready,
+  /// together with attemptToken/generation, and reset to zero by a publish that
+  /// does not carry an observation. They are meaningful only while the slot's
+  /// attemptToken is nonzero (request attempts enabled).
+  ///
+  /// Admission (identity re-check + count CAS + quotaEnd freeze) is serialized
+  /// with every such write by the bucket observationLock (v22): the token build
+  /// already excludes publish/cancel through its read token, while the
+  /// NO_RECLAIM load-only reader holds none, so it needs that separate word.
+  ///
+  /// `t1DispatchLimit` is the admission quota copied from the shared Tier-2
+  /// threshold at publish time; 0 means "no trustworthy observation" (legacy
+  /// mode, PGO off, or a Tier-2 publish) and selects the legacy behavior.
+  EJitAtomicU32 t1DispatchLimit;
+  /// Number of Tier-1 dispatches actually GRANTED for this published code. A
+  /// dispatch is granted only when a live Tier-1 pointer is really handed back,
+  /// so identity hits rejected for shareability, a null pointer, a failed peer
+  /// preparation, or a seqlock retry never increment it. Incremented by CAS so
+  /// the limit is never exceeded.
+  EJitAtomicU64 t1DispatchCount;
+  /// Timestamp of the final allowed dispatch (the one that reaches the limit),
+  /// frozen exactly once under the same bucket observationLock as the count CAS
+  /// (the token build uses its bucket read token, which already excludes
+  /// publish/cancel), so a replacement attempt can never be stamped by its
+  /// predecessor. 0 means the timestamp is unknown/unobserved; it is never the
+  /// Tier-2 queue or compile time. The admission boundary itself is
+  /// `t1DispatchCount >= t1DispatchLimit`, so a missing clock never re-opens
+  /// admission.
+  EJitAtomicU64 t1QuotaEnd;
 };
 
 //===----------------------------------------------------------------------===//
@@ -267,6 +362,17 @@ struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {
   /// counter). Only bumped in a NO_RECLAIM build; stays 0 otherwise, so the
   /// default token path is byte-for-byte unchanged.
   EJitAtomicU32 publishSeq;
+  /// Leaf exclusion for the observed Tier-1 dispatch contract (ABI v22). The
+  /// admission commit (identity re-check + count CAS + quotaEnd freeze) and
+  /// every publish/cancel/reset that rewrites a slot's observation identity
+  /// take this lock. It is a separate word the load-only reader never reads, so
+  /// taking it neither sets writeFlag nor bumps publishSeq: a granted observed
+  /// dispatch no longer invalidates a concurrent seqlock read (R1R-1). Lock
+  /// order: writeFlag -> observationLock, and it is a leaf (never held while
+  /// acquiring any other lock). It reuses the header padding, so every field
+  /// offset and sizeof() are unchanged. Unused (always 0) in the default token
+  /// build, where the bucket read token already excludes publish/cancel.
+  EJitAtomicU32 observationLock;
   EJitSharedCacheSlot slots[kEJitSharedCacheSlots];
 };
 
@@ -515,6 +621,7 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 pgoMaxActiveFunctions;
   EJitAtomicU32 pgoActiveFunctionCount;
   EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
+  EJitAtomicU64 pgoActiveAttemptTokens[kEJitSharedMaxConcurrentProfiles];
   /// Last logged progress quarter for each admission slot: 0..4.
   EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
   EJitAtomicU64 pgoCompletedFunctions;
@@ -530,12 +637,24 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
                                       ///< with stats off the acquire-load gate
                                       ///< on the disabled path is compiled out.
 
-  //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
-  //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen
-  //    and a dedupClear CASes gen->0, so a stale worker from an earlier
-  //    generation can never clear a slot a newer generation re-claimed for the
-  //    same funcIndex (spec §11 generation-aware dedup).
-  alignas(kEJitSharedCacheLine) EJitAtomicU32 inFlight[kEJitSharedMaxFuncIndex];
+  //--- flat dedup slots (own cache line). Each slot stores the exact claim
+  //    (0 = free): the request-attempt token when that protocol is enabled,
+  //    otherwise the owner generation. Release uses a matching CAS, so an old
+  //    worker or callback cannot clear a newer claim for the same funcIndex.
+  alignas(kEJitSharedCacheLine) EJitAtomicU64 inFlight[kEJitSharedMaxFuncIndex];
+
+  //--- version-reuse logical request attempts (cold path, ABI v20)
+  alignas(kEJitSharedCacheLine) EJitAtomicU32 requestAttemptsEnabled;
+  EJitAtomicU32 attemptLock;
+  EJitAtomicU32 attemptLiveCount;
+  EJitAtomicU32 attemptHistoryWrite;
+  EJitAtomicU32 attemptHistoryCount;
+  /// Monotonic and deliberately preserved across owner re-initialization.
+  /// UINT64_MAX is terminal exhaustion; it never wraps back to an old token.
+  EJitAtomicU64 nextAttemptToken;
+  EJitSharedRequestAttempt requestAttempts[kEJitSharedRequestAttemptCapacity];
+  EJitSharedRequestAttemptHistory
+      requestHistory[kEJitSharedRequestHistoryCapacity];
 
   //--- MPSC queue: head and tail on SEPARATE cache lines (false-sharing), ring
   //    storage on its own.
@@ -621,6 +740,13 @@ static_assert(alignof(EJitSharedTaskPoolState) == kEJitSharedCacheLine,
 static_assert(
     alignof(EJitSharedCacheBucket) == kEJitSharedCacheLine,
     "cache buckets must be cache-line aligned to avoid false sharing");
+// The v22 observationLock MUST stay in the bucket header padding: it may not
+// move the slot array or change the shared blob size (the ABI bump is for the
+// new exclusion semantics, not for a layout change).
+static_assert(offsetof(EJitSharedCacheBucket, observationLock) == 12,
+              "observationLock must reuse the bucket header padding");
+static_assert(offsetof(EJitSharedCacheBucket, slots) == 16,
+              "observationLock must not move the bucket slot array");
 static_assert(
     offsetof(EJitSharedTaskPoolState, magic) == 0,
     "magic must be the first word so a foreign/zero blob is rejected");
