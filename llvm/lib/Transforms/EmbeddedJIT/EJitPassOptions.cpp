@@ -69,3 +69,8 @@ cl::opt<unsigned> EJitExternalizeMinInsts(
     cl::desc("Externalize non-entry closure helpers with at least this many "
              "raw-IR instructions from the extracted bitcode (0 = no size "
              "floor; see jit_design_doc/EJIT_BITCODE_SLIMMING.md)"));
+
+cl::opt<bool> EJitForceInlineHintedHelpers(
+    "ejit-force-inline-hinted-helpers", cl::init(false), cl::Hidden,
+    cl::desc("Promote eligible local inlinehint helpers to alwaysinline only "
+             "in extracted EJIT bitcode (requires an NDEBUG compiler build)"));
