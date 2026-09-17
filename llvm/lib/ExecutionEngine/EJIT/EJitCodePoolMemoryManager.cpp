@@ -26,10 +26,10 @@ using WrapperFunctionCall = orc::shared::WrapperFunctionCall;
 namespace {
 constexpr size_t kMaxBatchedCompactAlign = 64;
 
-/// One contiguous executable segment of a finalized allocation (the only kind
-/// of memory that needs execute permission). An allocation may contain several
-/// (non-contiguous) executable segments and any number of non-executable
-/// (read-only / writable / GOT) segments, which are NEVER sealed RX.
+/// One contiguous executable segment of a finalized allocation. An allocation
+/// may contain several (non-contiguous) executable segments plus non-executable
+/// ones. Only these ranges are sealed; a writable segment never shares their
+/// pages (see the layout gate in allocate()).
 struct ExecSegRange {
   uintptr_t Addr = 0;
   uint64_t Size = 0;
@@ -229,7 +229,16 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   EJitCodePoolManager &Pool = *SelectedPool;
   BasicLayout BL(G);
 
-  bool ExecOnly = true;
+  // Gate compact layout on there being no WRITABLE segment, not on the
+  // allocation being exec-only. enable_ex and enable_rw are transitions between
+  // two states, not additive grants (RW->RX drops W; RX->RW drops X), so Exec +
+  // Write on one page cannot yield RWX — it breaks one side instead: sealing
+  // strips the data's W, a peer's enable_rw strips the code's X. Only that mix
+  // needs page isolation. A read-only segment is never written after finalize,
+  // so it is indifferent to which state its page ends in and can pack with the
+  // code; gating on Exec cost every specialization carrying a jump table,
+  // constant pool or string literal its compact layout.
+  bool NoWritableSeg = true;
   bool HasSegments = false;
   bool FitsCompactAlign = true;
   size_t SegmentCount = 0;
@@ -243,13 +252,13 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
     const size_t SegmentAlign = KV.second.Alignment.value();
     if (SegmentAlign > MaxSegmentAlign)
       MaxSegmentAlign = SegmentAlign;
-    if ((KV.first.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None)
-      ExecOnly = false;
+    if ((KV.first.getMemProt() & orc::MemProt::Write) != orc::MemProt::None)
+      NoWritableSeg = false;
     if (SegmentAlign > CompactAlignLimit)
       FitsCompactAlign = false;
   }
-  const bool Compact =
-      Pool.usesBatchedPageSeal() && HasSegments && ExecOnly && FitsCompactAlign;
+  const bool Compact = Pool.usesBatchedPageSeal() && HasSegments &&
+                       NoWritableSeg && FitsCompactAlign;
   const size_t CompactAlign = MaxSegmentAlign > Pool.codeAlignment()
                                   ? MaxSegmentAlign
                                   : Pool.codeAlignment();
@@ -266,13 +275,14 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
   [[maybe_unused]] const char *Placement = FarPool_ == &Pool ? "far" : "near";
   EJIT_DIAG_DEBUG(
       "allocate: graph=%s pool=%s total=%llu layoutAlign=%zu compact=%u "
-      "batched=%u segments=%zu execOnly=%u fitsAlign=%u maxAlign=%zu "
+      "batched=%u segments=%zu noWritable=%u fitsAlign=%u maxAlign=%zu "
       "configuredAlign=%zu compactAlignLimit=%zu",
       G.getName().c_str(), Placement, static_cast<unsigned long long>(Total),
       LayoutAlign, static_cast<unsigned>(Compact),
       static_cast<unsigned>(Pool.usesBatchedPageSeal()), SegmentCount,
-      static_cast<unsigned>(ExecOnly), static_cast<unsigned>(FitsCompactAlign),
-      MaxSegmentAlign, Pool.codeAlignment(), CompactAlignLimit);
+      static_cast<unsigned>(NoWritableSeg),
+      static_cast<unsigned>(FitsCompactAlign), MaxSegmentAlign,
+      Pool.codeAlignment(), CompactAlignLimit);
 
   void *Slab = nullptr;
   if (Total > 0) {
@@ -305,18 +315,17 @@ void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
       ExecutorAddr::fromPtr(SlabBytes + SegsSizes->StandardSegs);
 
   // Collect the EXECUTABLE segments' assigned ranges as we lay out the slab.
-  // Only segments whose permission includes Exec need execute permission; the
-  // (page-aligned) layout guarantees an executable segment never shares a 4KiB
-  // page with a writable/read-only one, so sealing these ranges never flips a
-  // data/GOT page to RX. An allocation may have several executable segments.
+  // ONLY these are sealed, rounded out to whole pages, so a read-only segment
+  // packed beside the code is sealed only where it shares one of those pages;
+  // anything past them stays RW/NX. Both are fine — it is never written after
+  // finalize. An allocation may have several executable segments.
   //
   // In parallel, collect the RUNTIME-WRITABLE segments (Write but NOT Exec):
   // these are the pages the JIT function writes at runtime (e.g. the Tier-1
   // __profc_ counters). A peer core must enable_rw exactly these before it may
   // execute the code; read-only data (e.g. __profd_) is deliberately excluded
-  // because a peer reads it fine from an RX page. The same page-aligned layout
-  // guarantees a writable segment never shares a 4KiB page with an executable
-  // one, so making these RW on a peer never touches a code page (no RWX).
+  // because a peer reads it fine either way. The gate above keeps writable
+  // segments off every code page, so enable_rw never strips a code page's X.
   std::vector<ExecSegRange> ExecRanges;
   std::vector<EJitWritableRange> WritableRanges;
   for (auto &KV : BL.segments()) {

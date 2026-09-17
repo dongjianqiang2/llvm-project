@@ -412,6 +412,29 @@ std::unique_ptr<LinkGraph> makeTextAndDataGraph(uint64_t TextVAddr,
   return G;
 }
 
+// A graph with one executable (__text, R+X) section and one READ-ONLY
+// (__const, R) section — the shape of a specialization carrying a jump table,
+// constant pool or string literal. Separate AllocGroups, but unlike the
+// writable case nothing requires them to be page-isolated. Text content comes
+// from BigCode so callers can request a multi-page code segment.
+std::unique_ptr<LinkGraph> makeTextAndRodataGraph(uint64_t TextVAddr,
+                                                  uint64_t RodataVAddr,
+                                                  size_t TextSize = 64,
+                                                  size_t RodataSize = 64) {
+  auto G = std::make_unique<LinkGraph>(
+      "g", std::make_shared<orc::SymbolStringPool>(),
+      Triple("x86_64-unknown-linux-gnu"), SubtargetFeatures(),
+      getGenericEdgeKindName);
+  auto &Text =
+      G->createSection("__text", orc::MemProt::Read | orc::MemProt::Exec);
+  G->createContentBlock(Text, ArrayRef<char>(BigCode, TextSize),
+                        orc::ExecutorAddr(TextVAddr), 16, 0);
+  auto &Rodata = G->createSection("__const", orc::MemProt::Read);
+  G->createContentBlock(Rodata, ArrayRef<char>(BigCode, RodataSize),
+                        orc::ExecutorAddr(RodataVAddr), 16, 0);
+  return G;
+}
+
 // Returns the assigned address of the first block whose owning section's
 // executable bit matches WantExec (after allocate() has applied the layout).
 void *blockAddrByExec(LinkGraph &G, bool WantExec) {
@@ -574,8 +597,8 @@ TEST(EJitCodePoolMemMgr4K, SealsAndRecordsOnlyExecutableSegment) {
 // The finalized executable range carries the allocation's RUNTIME-WRITABLE data
 // extent (the __data / __profc_ segment) so a peer core can enable_rw exactly
 // those pages before executing. The writable range must be page-disjoint from
-// the code (no shared 4K page) — the guarantee that makes per-core enable_rw
-// safe (never RWX).
+// the code (no shared 4K page): enable_rw is RX->RW, so a shared page would
+// lose execute permission and the code on it would stop being callable.
 TEST(EJitCodePoolMemMgr4K, FinalizedRangeCarriesWritableDataExtent) {
   MockSre4K M;
   EJitCodePoolManager Pool(
@@ -1130,6 +1153,203 @@ TEST(EJitCodePoolMemMgrBatch, SixtyFourAlignedPureCodeStaysCompact) {
   EXPECT_EQ(M.SealCalls, 1u);
   cantFail(MM.deallocate(std::move(FA0)));
   cantFail(MM.deallocate(std::move(FA1)));
+}
+
+// A read-only segment must not cost the allocation its compact layout. Under
+// the old exec-only predicate these two 64-byte segments were laid out 4KiB
+// apart, consuming two pages for 128 bytes of content.
+TEST(EJitCodePoolMemMgrBatch, ReadOnlyDataPacksCompactlyWithCode) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndRodataGraph(0x1000, 0x2000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrByExec(*G, /*WantExec=*/true);
+  void *RodataAddr = blockAddrByExec(*G, /*WantExec=*/false);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(RodataAddr, nullptr);
+
+  auto pageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  // BL.segments() iteration order is unspecified, so assert on the distance
+  // rather than on which of the two comes first.
+  EXPECT_EQ(pageOf(TextAddr), pageOf(RodataAddr));
+  const uintptr_t T = reinterpret_cast<uintptr_t>(TextAddr);
+  const uintptr_t R = reinterpret_cast<uintptr_t>(RodataAddr);
+  EXPECT_EQ(T > R ? T - R : R - T, 64u);
+
+  auto FA = cantFail(IFA->finalize());
+  EXPECT_EQ(M.SealCalls, 0u); // batched: nothing sealed before flush
+  cantFail(Pool.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 1u); // one shared page
+
+  // Sharing the page does not widen the recorded executable range.
+  EJitCompiledCodeInfo Info{};
+  EXPECT_TRUE(Pool.findRange(TextAddr, Info));
+  EXPECT_EQ(Info.fnPtr, TextAddr);
+  EXPECT_FALSE(Pool.findRange(RodataAddr, Info));
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// Safety guard for the predicate above: a writable segment must still force the
+// page-aligned layout even in batched mode. Sharing a page with code breaks one
+// side or the other — sealing strips the data's write permission, and a peer's
+// enable_rw (RX->RW) strips the code's execute permission.
+TEST(EJitCodePoolMemMgrBatch, WritableDataStaysPageIsolatedFromCode) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndDataGraph(0x1000, 0x2000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  void *TextAddr = blockAddrByExec(*G, /*WantExec=*/true);
+  void *DataAddr = blockAddrByExec(*G, /*WantExec=*/false);
+  ASSERT_NE(TextAddr, nullptr);
+  ASSERT_NE(DataAddr, nullptr);
+
+  auto pageOf = [](void *P) {
+    return reinterpret_cast<uintptr_t>(P) &
+           ~static_cast<uintptr_t>(kFourKiB - 1);
+  };
+  EXPECT_NE(pageOf(TextAddr), pageOf(DataAddr));
+
+  auto FA = cantFail(IFA->finalize());
+  cantFail(Pool.flushPendingRanges());
+  // Only the code page is ever sealed.
+  for (uintptr_t Sealed : M.SealedPages)
+    EXPECT_NE(Sealed, pageOf(DataAddr));
+
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// Compact packing must not let a later allocation land on an already-sealed
+// page: the batch's final page is partly unused, and flushPendingRanges
+// advances the pool's bump tail past it. Exercised with a code segment that
+// crosses a page boundary plus a read-only segment.
+TEST(EJitCodePoolMemMgrBatch, SealedPageNotReusedAfterCrossPageMixedAlloc) {
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto pageOf = [](uintptr_t A) { return A & ~static_cast<uintptr_t>(kFourKiB - 1); };
+
+  auto G0 = makeTextAndRodataGraph(0x1000, 0x8000, /*TextSize=*/5000,
+                                   /*RodataSize=*/64);
+  auto IFA0 = cantFail(MM.allocate(nullptr, *G0));
+  auto TextAddr = reinterpret_cast<uintptr_t>(blockAddrByExec(*G0, true));
+  auto RodataAddr = reinterpret_cast<uintptr_t>(blockAddrByExec(*G0, false));
+  ASSERT_NE(TextAddr, 0u);
+  ASSERT_NE(RodataAddr, 0u);
+
+  // Compact: the whole allocation fits in alignTo(5000,16) + alignTo(64,16),
+  // whichever order BL.segments() emitted the two in. The page-aligned layout
+  // would need 8192 + 64 for the same content.
+  const uintptr_t Lo = TextAddr < RodataAddr ? TextAddr : RodataAddr;
+  const uintptr_t HiEnd = TextAddr + 5000 > RodataAddr + 64 ? TextAddr + 5000
+                                                            : RodataAddr + 64;
+  EXPECT_LE(HiEnd - Lo, 5072u);
+  EXPECT_NE(pageOf(TextAddr), pageOf(TextAddr + 5000 - 1)); // code spans 2 pages
+
+  auto FA0 = cantFail(IFA0->finalize());
+  cantFail(Pool.flushPendingRanges());
+  // The two pages the code covers are sealed, and the .rodata shares one of
+  // them rather than sitting on a page of its own.
+  EXPECT_EQ(M.SealCalls, 2u);
+  ASSERT_EQ(M.SealedPages.size(), 2u);
+  bool RodataOnSealedPage = false;
+  for (uintptr_t Sealed : M.SealedPages)
+    RodataOnSealedPage |= Sealed == pageOf(RodataAddr);
+  EXPECT_TRUE(RodataOnSealedPage);
+
+  // The next allocation must not be handed any sealed page.
+  auto G1 = makeCodeGraph(64, 0x20000);
+  auto IFA1 = cantFail(MM.allocate(nullptr, *G1));
+  auto NextAddr = reinterpret_cast<uintptr_t>(firstBlockAddr(*G1));
+  for (uintptr_t Sealed : M.SealedPages)
+    EXPECT_NE(pageOf(NextAddr), Sealed);
+  EXPECT_GE(NextAddr, HiEnd);
+
+  auto FA1 = cantFail(IFA1->finalize());
+  cantFail(Pool.flushPendingRanges());
+  cantFail(MM.deallocate(std::move(FA0)));
+  cantFail(MM.deallocate(std::move(FA1)));
+}
+
+// Same compact read-only packing on the fixed code-segment pool
+// (needsEnableRw=true), where the slab starts RX and allocate() must flip it to
+// RW before writing.
+TEST(EJitCodePoolMemMgrBatch, FixedRwPoolResealsEveryPageOfCompactRodataAlloc) {
+  constexpr size_t kRegion = kTwoMiB;
+  void *Region = testAlignedAlloc(kTwoMiB, kRegion);
+  ASSERT_NE(Region, nullptr);
+  std::unique_ptr<void, void (*)(void *)> Guard(Region, testAlignedFree);
+
+  MockSre4K M;
+  auto O = fourKMemMgrOpts();
+  O.fixedBase = reinterpret_cast<uintptr_t>(Region);
+  O.fixedSize = kRegion;
+  O.needsEnableRw = true;
+  O.minCodeAlign = 16;
+  O.batchedPageSeal = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *V) { return M.seal(V); },
+      [&M](void *B, size_t S) { return M.split(B, S); },
+      [&M](void *V) { return M.enableRw(V); });
+  EJitCodePoolMemoryManager MM(Pool, kFourKiB);
+
+  auto G = makeTextAndRodataGraph(0x1000, 0x2000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  auto TextAddr = reinterpret_cast<uintptr_t>(blockAddrByExec(*G, true));
+  auto RodataAddr = reinterpret_cast<uintptr_t>(blockAddrByExec(*G, false));
+  ASSERT_NE(TextAddr, 0u);
+  ASSERT_NE(RodataAddr, 0u);
+  ASSERT_GT(M.RwEnableCalls, 0u); // RX slab flipped to RW before the write
+
+  auto pageOf = [](uintptr_t A) { return A & ~static_cast<uintptr_t>(kFourKiB - 1); };
+  EXPECT_EQ(pageOf(TextAddr), pageOf(RodataAddr));
+  EXPECT_EQ(TextAddr > RodataAddr ? TextAddr - RodataAddr
+                                  : RodataAddr - TextAddr,
+            64u);
+
+  auto FA = cantFail(IFA->finalize());
+  cantFail(Pool.flushPendingRanges());
+
+  // No writable segment, so nothing may stay RW: every page made writable for
+  // this allocation is sealed again.
+  EJitCompiledCodeInfo Info{};
+  ASSERT_TRUE(Pool.findRange(reinterpret_cast<void *>(TextAddr), Info));
+  EXPECT_EQ(Info.writableCount, 0u);
+  for (uintptr_t Rw : M.RwEnabledPages) {
+    bool Resealed = false;
+    for (uintptr_t Sealed : M.SealedPages)
+      Resealed |= Sealed == Rw;
+    EXPECT_TRUE(Resealed) << "page 0x" << std::hex << Rw << " left writable";
+  }
+
+  cantFail(MM.deallocate(std::move(FA)));
 }
 
 // In batched-seal mode, fnSize capture flows through the pending path
