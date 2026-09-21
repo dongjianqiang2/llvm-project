@@ -1,16 +1,14 @@
 /**
  * EJIT 优化等级测试 — L1 / L2 / L3
  *
- * NOTE: the L1/L2/L3 optimizer tiers have been collapsed into a single fixed
- * pipeline. optLevel is still accepted (ABI compatibility) but no longer selects
- * a pipeline — every level runs the full specialization and must produce the
- * same correct result. This test therefore verifies that JIT compilation
- * succeeds and the result is correct for whichever level is passed.
+ * optLevel selects both the post-specialization IR simplification pipeline and
+ * the corresponding LLVM machine-code optimization level. This test verifies
+ * that JIT compilation succeeds and preserves the result at every level.
  *
  * 每个等级独立进程 (EJitRegistrationStore 只能 consume 一次)。
  *
  * 用法:
- *   ./ejit_opt_level L1|L2|L3   # all run the same collapsed pipeline
+ *   ./ejit_opt_level L1|L2|L3
  *
  * 编译:
  *   build/bin/clang -O2 -c ejit_test/ejit_opt_level_test.c -o /tmp/opt_level.o
