@@ -26,6 +26,27 @@ add_llvm_unittest(EJITTests
   PARTIAL_SOURCES_INTENDED
   )
 
+if(EJIT_VERIFY_SUBSTITUTION)
+  target_sources(EJITTests PRIVATE EJitVerifyTest.cpp)
+  target_compile_definitions(EJITTests PRIVATE EJIT_VERIFY_SUBSTITUTION)
+
+  # Keep the verifier runtime regressions independently buildable. EJITTests
+  # also carries code-pool/PGO configuration dependencies that are unrelated
+  # to this diagnostic store and can otherwise prevent the focused suite from
+  # compiling in a verifier-only host configuration.
+  set(EJIT_VERIFY_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
+  set(LLVM_LINK_COMPONENTS Support)
+  add_llvm_unittest(EJITVerifyTests
+    EJitVerifyTest.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitVerify.cpp
+
+    PARTIAL_SOURCES_INTENDED
+    )
+  set(LLVM_LINK_COMPONENTS "${EJIT_VERIFY_LINK_COMPONENTS_SAVED}")
+  target_compile_definitions(EJITVerifyTests PRIVATE
+    EJIT_VERIFY_SUBSTITUTION)
+endif()
+
 # The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
 # matching the LLVMEJIT build; without these definitions they compile to empty
 # translation units.

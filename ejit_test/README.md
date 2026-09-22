@@ -61,6 +61,41 @@ The compiled list must contain both cell instances. The latest function dump
 (cell 2) must have no loads for `algorithm` or `scale`, while the `runtimeBias`
 load remains.
 
+`ejit_verify_subst_sre_multicore_test.c` is the verifier-specific board
+example. It uses exactly one compile worker on `core[6]` and exactly one
+workload/owner on `core[16]`, never six workers or sixteen owners. After a board
+reset, run `test_ejit_period(0,0,0,0)` on core 6 and then core 16 for the
+positive case. The mode-1 rerun deliberately initializes worker `stableField`
+to 0 while the workload copy is 4 and must report the disagreement; it is not
+a verifier false-positive case.
+
+The positive case prints each core's private `g_cfg` address and values, waits
+for a newly published ready specialization, preserves `volatileField=7` after
+compile, and checks two emitted sites. Its exact twelve checks and five
+mismatches apply only to the one cold compile and six instrumented calls in
+that phase. The warm-cache phase after reset intentionally expects checks with
+zero new emissions, matching the `emitted since reset` counter contract.
+
+Manual SRE compile (from `ejit_test`, using the target clang) is:
+
+```text
+../../clang -c -O2 ejit_verify_subst_sre_multicore_test.c \
+  -o ../ejit_verify_subst_sre_multicore_test.o \
+  -fno-PIC -fno-omit-frame-pointer -fno-exceptions \
+  -DLLVM_ENABLE_EH=OFF -DLLVM_ENABLE_RTTI=OFF -mno-outline-atomics \
+  -fno-threadsafe-statics -fstack-protector-strong \
+  -I<llvm>/llvm/include/ -I<llvm>/ejit_test/
+```
+
+Add the object to the SRE image link with a runtime built using
+`EJIT_VERIFY_SUBSTITUTION` and keep `EJIT_SRE_PGO_BRANCH_AUDIT=ON`. A queue
+drain alone is not readiness: the example requires a completed compile and a
+published ready entry. Board logs must include core IDs, private addresses and
+values, the verifier's `verify emit ... identity=... frozen=...` worker-side
+evidence, and the target mapping/placement evidence before hardware
+conclusions are made. The emit line identifies the compiler candidate; it does
+not prove that the target code and workload share backing storage.
+
 ### External Dependency Tests (not in build.sh)
 
 | Test | Dependency | Description |

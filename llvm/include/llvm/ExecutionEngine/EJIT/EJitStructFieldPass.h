@@ -49,26 +49,47 @@ using AssumedArgMap = DenseMap<const Argument *, uint64_t>;
 /// replaces the loads with LLVM constants.
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
+  /// \p verify selects the diagnostic mode described in EJitVerify.h: keep
+  /// each may_const load and check it at run time instead of substituting it.
   EJitStructFieldPass(PeriodArrayRegistry &reg,
                       ArrayRef<EJitBoundPointerView> boundPointers,
-                      StringRef boundRootFunction = {})
+                      StringRef boundRootFunction = {}, bool verify = false)
       : registry_(reg),
         boundPointers_(boundPointers.begin(), boundPointers.end()),
-        boundRootFunction_(boundRootFunction.str()) {}
+        boundRootFunction_(boundRootFunction.str()), verify_(verify) {}
 
   /// Compatibility constructor for direct pass users. The data pointer is
   /// borrowed for the duration of the pass and is never copied or freed.
   EJitStructFieldPass(PeriodArrayRegistry &reg, const uint8_t *rawPtr = nullptr,
                       uint32_t rawSize = 0, uint32_t boundArgIndex = 0,
                       StringRef boundRootFunction = {},
-                      std::optional<uint8_t> boundPeriodInstance = std::nullopt)
-      : registry_(reg), boundRootFunction_(boundRootFunction.str()) {
+                      std::optional<uint8_t> boundPeriodInstance = std::nullopt,
+                      bool verify = false)
+      : registry_(reg), boundRootFunction_(boundRootFunction.str()),
+        verify_(verify) {
     if (rawPtr && rawSize)
       boundPointers_.push_back({rawPtr, rawSize, boundArgIndex,
                                 boundPeriodInstance
                                     ? *boundPeriodInstance
                                     : std::numeric_limits<uint32_t>::max()});
   }
+
+  /// Preserve the verifier's pre-multi-pointer signature: without this, the
+  /// bool would bind to the StringRef parameter of the constructor above.
+  EJitStructFieldPass(PeriodArrayRegistry &reg, const uint8_t *rawPtr,
+                      uint32_t rawSize, uint32_t boundArgIndex, bool verify)
+      : EJitStructFieldPass(reg, rawPtr, rawSize, boundArgIndex, StringRef(),
+                            std::nullopt, verify) {}
+
+  /// Keep string literals from selecting the legacy bool overload above.
+  EJitStructFieldPass(PeriodArrayRegistry &reg, const uint8_t *rawPtr,
+                      uint32_t rawSize, uint32_t boundArgIndex,
+                      const char *boundRootFunction,
+                      std::optional<uint8_t> boundPeriodInstance = std::nullopt,
+                      bool verify = false)
+      : EJitStructFieldPass(reg, rawPtr, rawSize, boundArgIndex,
+                            StringRef(boundRootFunction), boundPeriodInstance,
+                            verify) {}
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
@@ -115,6 +136,10 @@ private:
   /// initFreeDimAssumptions().
   AssumedArgMap freeDimArgs_;
   void initFreeDimAssumptions(Module &M);
+
+  /// Unread without EJIT_VERIFY_SUBSTITUTION; kept in the interface so callers
+  /// need no #ifdef.
+  [[maybe_unused]] bool verify_ = false;
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;
