@@ -160,6 +160,56 @@ typedef struct {
   char funcName[128];
 } ejit_error_t;
 
+/// Substitution-verifier counters (ejit_init_verify). A non-zero `mismatches`
+/// means at least one ejit_may_const field changed after the JIT read it —
+/// that field is not safe to freeze.
+typedef struct {
+  uint64_t sites;      ///< instrumented may_const load sites emitted
+  uint64_t checks;     ///< instrumented loads executed
+  uint64_t mismatches; ///< executions where memory != the frozen value
+} ejit_verify_stats_t;
+
+/// Longest site name kept per record, including the terminator. Must match
+/// llvm::ejit::kVerifySiteNameMax.
+#define EJIT_VERIFY_SITE_NAME_MAX 64
+
+/// One instrumented may_const access, named "<func>:<global>+<byteOffset>".
+/// The totals say something diverged; this says which field did — and without
+/// EJIT_DIAG_ENABLE it is the only form that says so.
+typedef struct {
+  char site[EJIT_VERIFY_SITE_NAME_MAX];
+  uint64_t checks;      ///< executions of this site
+  uint64_t mismatches;  ///< executions where memory != the frozen value
+  uint64_t lastFrozen;  ///< frozen value at the most recent mismatch
+  uint64_t lastActual;  ///< memory value at the most recent mismatch
+} ejit_verify_site_t;
+
+/// The five entry points below are DEFINED only under EJIT_VERIFY_SUBSTITUTION;
+/// linking them otherwise is an undefined reference. They are declared
+/// unconditionally because a caller cannot see the runtime's build flags —
+/// test for the symbol at build time (ejit_test/build.sh reads CMakeCache)
+/// rather than calling one to find out.
+
+/// Initialize with the may_const substitution verifier enabled: keep the marked
+/// loads and check them against what would have been frozen, instead of
+/// freezing them (EJitVerify.h). Additive entry point for the same reason as
+/// ejit_init_pgo — `ejit_config_t` keeps its original layout, so an old
+/// caller's struct is never over-read. Specialization is disabled while on:
+/// the loads survive, so nothing folds. Plain ejit_init() never verifies.
+ejit_status_t ejit_init_verify(const ejit_config_t *config);
+
+/// Always 1 where defined at all.
+int ejit_verify_available(void);
+
+void ejit_verify_get_stats(ejit_verify_stats_t *out);
+
+/// Copy up to \p max per-site records into \p out, returning the number
+/// written (ordered by first execution). Sites past the runtime's fixed table
+/// capacity are counted in the totals but have no record.
+size_t ejit_verify_get_sites(ejit_verify_site_t *out, size_t max);
+
+void ejit_verify_reset_stats(void);
+
 // Initialization
 ejit_status_t ejit_init(const ejit_config_t *config);
 /// Initialize with online PGO enabled (Tier-1 instrumentation + lazy Tier-2

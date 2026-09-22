@@ -53,6 +53,11 @@ struct Config {
 #else
   bool enableProfileAudit = false;
 #endif
+  /// Diagnostic: instead of freezing may_const values, keep the loads and
+  /// check them against what would have been frozen (EJitVerify.h). Every
+  /// mismatch names a field that must not be ejit_may_const. Disables
+  /// specialization while on — the loads survive, so nothing folds.
+  bool verifySubstitution = false;
 };
 
 } // namespace ejit
