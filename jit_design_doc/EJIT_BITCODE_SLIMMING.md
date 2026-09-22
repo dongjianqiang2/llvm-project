@@ -73,7 +73,24 @@ PASS1(`EJitRegisterBitcodePass`)按**传递闭包**提取:从所有 `ejit_entry`
 
 ### 4.1 分类放在内联后
 
-inliner 的 cost 分析就是"哪些函数值得保留函数体"的决策;内联后仍带定义且有调用点存活的函数,天然是外链化候选。**不在提取前重复实现大小/热度启发式**,也不做强制内联(违背 noinline 标注意图,且重新制造 JIT/AOT 分歧)。
+inliner 的 cost 分析就是"哪些函数值得保留函数体"的决策;内联后仍带定义且有调用点存活的函数,天然是外链化候选。**不在提取前重复实现大小/热度启发式**。默认不做强制内联;只有显式开启 §4.1.1 的 JIT-only 开关时,才会提升符合严格条件的 `inlinehint` helper,且始终尊重 `noinline`。
+
+#### 4.1.1 可选的 JIT-only inlinehint 提升
+
+`-mllvm -ejit-force-inline-hinted-helpers` 默认关闭。开启后, PASS1 只在
+提取出来的 bitcode clone 中把合适的 local `inlinehint` helper 提升为
+`alwaysinline`,再进入现有 preopt inliner。原始 AOT module 的函数属性、调用和
+代码生成保持不变;T1/T2 共用同一份已处理 bitcode。
+
+该开关不会覆盖 `noinline`、`optnone`、`naked`,也不处理 `ejit_entry`、周期
+lifecycle、声明、变参、取地址或直接递归函数。无法合法内联的调用仍按原有
+外链注册路径处理。它只扩大显式 `inline` helper 的 JIT 特化面,不会把所有
+closure helper 隐式内联,也不会扩大 bound-pointer 的跨函数传播契约。
+
+这项能力依赖 `NDEBUG` 构建中启用的 extracted-bitcode preoptimization;
+assertions/debug compiler 开启该选项会明确报错,不会静默无效。应用该开关需
+重编 LLVM/Clang 以及受影响的业务包;只重编 LLVMEJIT 库不会改变已嵌入的
+bitcode。
 
 ### 4.2 无 may_const 豁免
 

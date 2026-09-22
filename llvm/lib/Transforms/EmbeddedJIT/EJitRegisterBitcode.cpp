@@ -54,6 +54,7 @@ extern cl::opt<bool> EJitWarnUnusedDim;
 extern cl::opt<bool> EJitReportMayConst;
 extern cl::opt<unsigned> EJitWarnFewMayConst;
 extern cl::opt<unsigned> EJitExternalizeMinInsts;
+extern cl::opt<bool> EJitForceInlineHintedHelpers;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
 
@@ -95,6 +96,53 @@ static std::string ejitRegistrationKey(const Module &M, const Function &F) {
 
 static bool isEjitEntryFunction(const Function &F) {
   return hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY);
+}
+
+#ifdef NDEBUG
+static bool participatesInDirectRecursion(const Function &Root) {
+  SmallVector<const Function *, 8> Worklist{&Root};
+  SmallPtrSet<const Function *, 8> Visited;
+  while (!Worklist.empty()) {
+    const Function *Current = Worklist.pop_back_val();
+    if (!Visited.insert(Current).second)
+      continue;
+    for (const BasicBlock &BB : *Current)
+      for (const Instruction &I : BB)
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          if (const auto *Callee = dyn_cast<Function>(
+                  CB->getCalledOperand()->stripPointerCasts())) {
+            if (Callee == &Root)
+              return true;
+            if (!Callee->isDeclaration())
+              Worklist.push_back(Callee);
+          }
+  }
+  return false;
+}
+#endif
+
+static void forceInlineHintedHelpers(Module &M) {
+  if (!EJitForceInlineHintedHelpers)
+    return;
+#ifndef NDEBUG
+  M.getContext().emitError(
+      "-ejit-force-inline-hinted-helpers requires an NDEBUG compiler build "
+      "with extracted-bitcode pre-optimization enabled");
+#else
+  for (Function &F : M.functions()) {
+    if (F.isDeclaration() || !F.hasLocalLinkage() || F.isVarArg() ||
+        !F.hasFnAttribute(Attribute::InlineHint) ||
+        F.hasFnAttribute(Attribute::AlwaysInline) ||
+        F.hasFnAttribute(Attribute::NoInline) ||
+        F.hasFnAttribute(Attribute::OptimizeNone) ||
+        F.hasFnAttribute(Attribute::Naked) || isEjitEntryFunction(F) ||
+        hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_PERIOD_LC) ||
+        F.hasAddressTaken() || participatesInDirectRecursion(F))
+      continue;
+    F.removeFnAttr(Attribute::InlineHint);
+    F.addFnAttr(Attribute::AlwaysInline);
+  }
+#endif
 }
 
 static void collectEntryFunctions(Module &M,
@@ -879,6 +927,7 @@ static std::string extractAndSerialize(Module &M,
   // InstCombine + Mem2Reg + SimplifyCFG folds constant chains, promotes
   // allocas, and cleans up dead branches before serialization.
   logEJitGlobalMeta("extract-after-clone", *Extracted);
+  forceInlineHintedHelpers(*Extracted);
   preOptimizeBitcode(*Extracted);
   logEJitGlobalMeta("extract-after-preOpt", *Extracted);
 
