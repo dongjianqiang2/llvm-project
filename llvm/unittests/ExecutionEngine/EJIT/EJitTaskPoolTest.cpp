@@ -155,8 +155,11 @@ TEST(EJitTaskPoolLayout, RequestIsFlatPod) {
   EXPECT_LE(alignof(EJitCompileRequest), 8u);
   // The fixed request carries descriptors only; its size is independent of
   // every pointee's payload size. See the cross-pointer-width assertion in
-  // EJitSreQueue.h.
-  EXPECT_EQ(sizeof(EJitCompileRequest), sizeof(uintptr_t) == 8 ? 200u : 164u);
+  // EJitSreQueue.h (v21 added the three observed-dispatch words).
+  EXPECT_EQ(sizeof(EJitCompileRequest),
+            sizeof(uintptr_t) == 8
+                ? 232u
+                : (alignof(uint64_t) == 8 ? 200u : 196u));
 }
 
 //===----------------------------------------------------------------------===//

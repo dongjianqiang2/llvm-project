@@ -11,6 +11,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitReuseDiagnostics.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
@@ -21,6 +22,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -50,6 +52,96 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+EJitReuseDiagnosticStore &llvm::ejit::reuseDiagnosticStore() {
+  static EJitReuseDiagnosticStore Store;
+  return Store;
+}
+
+void llvm::ejit::printReuseDiagnostic(const EJitReuseDiagnostic &R, bool ShowDetails) {
+  if (R.frozen.available || StringRef(R.reason) == "PREFIX_IR_DIFF") {
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu frozen_available=%u frozen_compared=%u frozen_different=%u "
+                  "shown=%u incomplete=%u (recorded substitutions, not verifier)",
+                  (unsigned long long)R.sequence, R.frozen.available ? 1u : 0u,
+                  R.frozen.compared, R.frozen.different,
+                  ShowDetails && R.level >= 2 ? R.frozen.shown : 0,
+                  R.frozen.incomplete ? 1u : 0u);
+    if (ShowDetails && R.level >= 2)
+      for (unsigned I = 0; I < R.frozen.shown; ++I) {
+        const auto &D = R.frozen.differences[I];
+        EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu MAYCONST_VALUE_DIFF site=%llu "
+                      "origin=%s peer_frozen=%s request_frozen=%s",
+                      (unsigned long long)R.sequence,
+                      (unsigned long long)D.site, D.origin, D.peer, D.request);
+      }
+  }
+  EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu entry=%s func=%u stage=%s reason=%s "
+                "action=%s generation=%u attempt=%llu group=%llu group_gen=%llu "
+                "peer_group=%llu peer_code=%llu repeats=%llu truncated=%u detail=%s",
+                (unsigned long long)R.sequence, R.entry, R.identity.funcIndex,
+                R.stage, R.reason, R.action, R.identity.generation,
+                (unsigned long long)R.identity.attemptToken,
+                (unsigned long long)R.identity.groupId,
+                (unsigned long long)R.identity.groupGeneration,
+                (unsigned long long)R.peerGroup, (unsigned long long)R.peerCode,
+                (unsigned long long)R.repeats, unsigned(R.truncated), R.detail);
+  for (unsigned I = 0; I < R.identity.numDims && I < kEJitMaxRequestDims; ++I)
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu dim=%u instance=%u version=%u",
+                  (unsigned long long)R.sequence, R.identity.dims[I].dimType,
+                  R.identity.dims[I].instanceId, R.identity.versions[I]);
+  if (ShowDetails && R.level >= 2 && (R.left[0] || R.right[0])) {
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu first_diff_line=%u byte=%llu "
+                  "left(peer)=%s", (unsigned long long)R.sequence, R.diffLine,
+                  (unsigned long long)R.diffOffset, R.left);
+    EJIT_DIAG_RAW("[REUSE_DIAG] seq=%llu right(request)=%s",
+                  (unsigned long long)R.sequence, R.right);
+  }
+}
+
+void llvm::ejit::recordReuseDiagnostic(EJitReuseDiagnostic R) {
+  // Retain details now, but avoid automatically streaming IR to the console.
+  // The explicit print API shows the retained pair without needing a rerun.
+  if (reuseDiagnosticStore().record(R)) printReuseDiagnostic(R, false);
+}
+
+Error llvm::ejit::detail::normalizeJitModuleTarget(
+    Module &M, const Triple &Target, const DataLayout &Layout) {
+  const Triple Source = M.getTargetTriple();
+  auto Incompatible = [&]() {
+    return make_error<StringError>(
+        "EJIT target mismatch: module triple=" + Source.str() +
+            " layout=" + M.getDataLayoutStr() + "; jit triple=" +
+            Target.str() + " layout=" + Layout.getStringRepresentation(),
+        inconvertibleErrorCode());
+  };
+  if (!M.getDataLayout().isDefault() && M.getDataLayout() != Layout)
+    return Incompatible();
+  if (!Source.empty() && Source.str() != Target.str()) {
+    // Existing SRE AOT bitcode is produced with a Linux GNU triple, but the
+    // executor uses bare-metal ELF. Do not generalize this to arbitrary OS,
+    // architecture, endianness, ILP32 or calling-convention conversions.
+    const bool SreProducer = Source.getArch() == Triple::aarch64_be &&
+        Target.getArch() == Triple::aarch64_be &&
+        Source.getSubArch() == Target.getSubArch() &&
+        Source.isOSLinux() && Source.getEnvironment() == Triple::GNU &&
+        Source.getEnvironmentName() == "gnu" &&
+        Target.getOS() == Triple::UnknownOS &&
+        Target.getEnvironment() == Triple::UnknownEnvironment &&
+        Source.isOSBinFormatELF() && Target.isOSBinFormatELF() &&
+        !M.getDataLayout().isDefault() && Layout.isBigEndian() &&
+        Layout.getPointerSizeInBits() == 64;
+    if (!SreProducer) return Incompatible();
+    for (const GlobalVariable &GV : M.globals())
+      if (GV.isThreadLocal()) return Incompatible();
+    for (const Function &F : M)
+      if (F.getCallingConv() != CallingConv::C) return Incompatible();
+  }
+  // Do this BEFORE optimization and final identity capture in ALL routes.
+  // The emitter's exact target check remains unchanged.
+  M.setTargetTriple(Target);
+  M.setDataLayout(Layout);
+  return Error::success();
+}
 
 #define DEBUG_TYPE "ejit-orc-engine"
 
@@ -168,6 +260,10 @@ struct EJitOrcEngine::Impl {
   std::unique_ptr<EJitCodePoolManager> farCodePool;
 #endif
   std::unique_ptr<orc::LLJIT> J;
+  /// Owner-side prepared-code emitter (representative sharing). Declared AFTER
+  /// J so it is destroyed BEFORE the LLJIT it links into: a successful emitter
+  /// JD is owned by the LLJIT, so the emitter must not outlive it.
+  std::unique_ptr<EJitPreparedCodeEmitter> preparedEmitter;
   PeriodArrayRegistry *periodReg = nullptr;
   EJitRuntimeState *runtimeState = nullptr;
   const SpecializationContext *activeCtx = nullptr;
@@ -730,7 +826,14 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // With Large, the 3 extra movz/movk instructions per global access eaten
   // the specialization savings (fewer BBs / folded branches). Small makes
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
-  JTMBOrErr->setCodeModel(CodeModel::Small);
+  // Native COFF can bind globals anywhere in the 64-bit process. Small's
+  // absolute ADDR32 references are not supported by RuntimeDyldCOFFX86_64
+  // and cannot address registered host objects outside the low 4 GiB.
+  // Keep the board's AArch64 Small model; use full addresses on Win64.
+  const Triple &JITTriple = JTMBOrErr->getTargetTriple();
+  JTMBOrErr->setCodeModel(JITTriple.isOSBinFormatCOFF() &&
+                                 JITTriple.getArch() == Triple::x86_64
+                             ? CodeModel::Large : CodeModel::Small);
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
@@ -819,7 +922,13 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
-  engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  // Physical representative sharing requires raw dimension arguments to stay
+  // live. Only may_const load results may specialize; freezing the cell itself
+  // would make otherwise equivalent members different executable programs.
+  if (config.enableRepresentativeSharing)
+    engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg, true);
+  else
+    engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -856,10 +965,6 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           const SpecializationContext *ctx = engine->P->activeCtx;
           if (!ctx)
             return;
-
-          // Clear stale analysis results from previous compilations
-          // (each compilation uses a fresh Module with new IR unit pointers).
-          engine->P->optimizer->clearAnalyses();
 
           // Dump pre-optimization IR (before the JIT pipeline runs).
           if (!engine->P->dumpJITDir.empty()) {
@@ -964,6 +1069,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
                           std::move(ModuleIR), std::move(ModuleAsm));
             }
           }
+
+          // Analysis results contain pointers into M. Clear them before this
+          // transform returns and ORC is allowed to destroy the module; doing
+          // this at the start of the next transform is already too late.
+          engine->P->optimizer->clearAnalyses();
         });
         // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
         // Gen creates them inside runPipeline (after addIRModule), so the
@@ -997,24 +1107,18 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   return engine;
 }
 
-Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
-                                       const std::string &origFnName) {
-  EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
-                    origFnName.c_str(), bitcodeData.size());
-  auto Ctx = std::make_unique<LLVMContext>();
-  auto Buf = MemoryBuffer::getMemBuffer(
-      bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"));
-  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
-  if (!ModuleOrErr) {
-    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
-    return ModuleOrErr.takeError();
-  }
+namespace {
 
+/// The module normalizations the ORC route applies BEFORE addIRModule. Shared
+/// with the owner-side prepared-code route so the IR whose identity is compared
+/// is produced by exactly the same steps that ORC would have linked.
+void normalizeModuleForJIT(Module &M, const std::string &origFnName,
+                           const SpecializationContext *Ctx) {
   // Do this before addIRModule so ORC's materialization-unit symbol claims
   // match the definitions that codegen will actually emit.
-  isolateSpecializationEntry(**ModuleOrErr, origFnName);
+  isolateSpecializationEntry(M, origFnName);
 
-  Triple TT((*ModuleOrErr)->getTargetTriple());
+  Triple TT(M.getTargetTriple());
   if (TT.isAArch64() && TT.isOSBinFormatELF()) {
     // External-symbol access from JIT specializations. The JIT slab is
     // SRE_MemAlloc'd ~2-3GB from the main binary's .text/.data - beyond the
@@ -1028,20 +1132,20 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     //     reaches the slab). Clearing them forced a per-global GOT load (62 GOT
     //     loads / ~1700c on DlschCcScheduler vs 0 in AOT) for no reach benefit,
     //     since ADRP already reaches. So globals are NOT cleared.
-    for (Function &F : (*ModuleOrErr)->functions()) {
+    for (Function &F : M.functions()) {
       if (F.isDeclaration() && !F.isIntrinsic())
         F.setDSOLocal(false);
     }
   }
 
-  // ejit_entry functions may have internal linkage (e.g. declared `static` in
-  // source). ORC's IR layer excludes local-linkage symbols from the JITDylib
-  // symbol table (Layer.cpp: hasLocalLinkage() skip), so a static entry is
-  // invisible to lookup ("symbol not found", no materialization). The function
-  // being compiled (origFnName) is the JIT lookup target — force it to
-  // external linkage so ORC registers and can materialize it. Spec JITDylibs
-  // are isolated, so this cannot collide with other specializations.
-  if (Function *EntryF = (*ModuleOrErr)->getFunction(origFnName))
+  // ejit_entry functions may have internal linkage (static in source). ORC's IR
+  // layer excludes local-linkage symbols from the JITDylib symbol table
+  // (Layer.cpp: hasLocalLinkage() skip), so a static entry is invisible to
+  // lookup ("symbol not found", no materialization). The function being
+  // compiled (origFnName) is the JIT lookup target - force it to external
+  // linkage so ORC registers and can materialize it. Spec JITDylibs are
+  // isolated, so this cannot collide with other specializations.
+  if (Function *EntryF = M.getFunction(origFnName))
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
@@ -1057,12 +1161,217 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   // IPSCCP) so the EMITTED symbol is global again - a claimed-but-local
   // symbol would link as a null absolute (same claim discipline as the
   // __profc_* counters, §5.2).
-  if (P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented) {
-    for (Function &F : (**ModuleOrErr).functions())
+  if (Ctx && Ctx->tier == CompileTier::Instrumented) {
+    for (Function &F : M.functions())
       if (!F.isDeclaration() && !F.isIntrinsic() && F.hasLocalLinkage())
         F.setLinkage(GlobalValue::ExternalLinkage);
   }
 #endif
+}
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+/// Resolve the effective bindings of every REFERENCED external declaration of
+/// \p M through the same resolution environment loadBitcodeModule defines
+/// symbols from: the period-array registry (array bases / static vars), the
+/// registered user symbols and the SRE libcall table. Returns false with
+/// \p Missing set when a referenced symbol has no binding, so the caller can
+/// fall back to the ordinary ORC route instead of sharing code with an
+/// unresolved external. An unreferenced declaration needs no binding.
+bool collectEffectiveBindings(
+    Module &M, PeriodArrayRegistry &Reg,
+    const std::map<std::string, void *> &UserSymbols,
+    std::vector<EJitCodeBinding> &Out, std::string &Missing) {
+  auto Libcall = [](StringRef Name) -> void * {
+    for (const LibcallSymbol &LCS : getLibcallSymbols())
+      if (Name == LCS.name)
+        return LCS.addr;
+    return nullptr;
+  };
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.isDeclaration() || GV.getName().empty() || GV.use_empty())
+      continue;
+    const std::string Name = GV.getName().str();
+    void *Addr = nullptr;
+    if (const auto *Info = Reg.getArrayInfo(Name))
+      Addr = Info->baseAddr;
+    else
+      Addr = Reg.getStaticVarAddr(Name);
+    if (!Addr) {
+      auto It = UserSymbols.find(Name);
+      if (It != UserSymbols.end())
+        Addr = It->second;
+    }
+    if (!Addr)
+      Addr = Libcall(Name);
+    if (!Addr) {
+      Missing = "data:" + Name;
+      return false;
+    }
+    Out.push_back({Name, reinterpret_cast<uint64_t>(Addr), /*callable=*/false});
+  }
+  for (Function &F : M.functions()) {
+    if (!F.isDeclaration() || F.isIntrinsic() || F.getName().empty() ||
+        F.use_empty())
+      continue;
+    const std::string Name = F.getName().str();
+    void *Addr = nullptr;
+    auto It = UserSymbols.find(Name);
+    if (It != UserSymbols.end())
+      Addr = It->second;
+    if (!Addr)
+      Addr = Libcall(Name);
+    if (!Addr) {
+      Missing = "function:" + Name;
+      return false;
+    }
+    Out.push_back({Name, reinterpret_cast<uint64_t>(Addr), /*callable=*/true});
+  }
+  // The backend can lower intrinsics (not external IR declarations) to
+  // memcpy/memset and other libcalls. The bare shared JD has no process search
+  // fallback: include the same concrete libcall environment as the ordinary
+  // route in both the compared identity and the physical link bindings.
+  for (const LibcallSymbol &LCS : getLibcallSymbols()) {
+    const bool Callable = StringRef(LCS.name) != "__stack_chk_guard";
+    auto It = llvm::find_if(Out, [&](const EJitCodeBinding &B) {
+      return B.name == LCS.name;
+    });
+    EJitCodeBinding Binding{LCS.name, reinterpret_cast<uint64_t>(LCS.addr), Callable};
+    if (It == Out.end()) Out.push_back(std::move(Binding));
+    else *It = std::move(Binding); // ordinary load route gives libcalls precedence
+  }
+  return true;
+}
+
+#endif
+} // namespace
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+Expected<EJitCandidateResult> EJitOrcEngine::classifyCandidate(
+    StringRef Bitcode, SpecializationContext Ctx,
+    EJitCandidateDirectory &Directory, const EJitCodeIdentityScope &Scope) {
+  auto Owner = std::make_unique<LLVMContext>();
+  auto Buffer = MemoryBuffer::getMemBuffer(Bitcode, "candidate.bc");
+  auto Parsed = parseBitcodeFile(Buffer->getMemBufferRef(), *Owner);
+  if (!Parsed) return Parsed.takeError();
+  Module &M = **Parsed;
+  if (auto Err = detail::normalizeJitModuleTarget(
+          M, P->J->getTargetTriple(), P->J->getDataLayout()))
+    return std::move(Err);
+  Ctx.tier = CompileTier::Instrumented;
+  Ctx.samplingSessionId = 0; // no runtime collector or private T1 is allocated
+  normalizeModuleForJIT(M, Ctx.fnName, &Ctx);
+  std::vector<EJitCodeBinding> Bindings;
+  std::string Missing;
+  if (!collectEffectiveBindings(M, *P->periodReg, P->userSymbols, Bindings, Missing))
+    return make_error<StringError>("candidate binding unavailable: " + Missing,
+                                   inconvertibleErrorCode());
+  EJitCodeIdentityScope BindingScope = Scope;
+  BindingScope.bindingGeneration = EJitBindingGeneration(Bindings);
+  const unsigned DiagLevel = reuseDiagnosticStore().levelFor(Scope.entry);
+  EJitCandidateCapture Capture(Directory, BindingScope, Bindings,
+      EJitIdentityDiagnosticOptions{DiagLevel != 0, DiagLevel >= 2 ? 256u : 0u});
+  Ctx.candidateCapture = &Capture;
+  P->optimizer->clearAnalyses();
+  P->optimizer->runPipeline(M, Ctx);
+  P->optimizer->clearAnalyses();
+  return Capture.takeResult();
+}
+
+Expected<std::unique_ptr<EJitPreparedCode>> EJitOrcEngine::prepareFinalCode(
+    StringRef bitcodeData, uint64_t cacheKey, const std::string &origFnName,
+    const EJitCodeIdentityScope &Scope) {
+  const SpecializationContext *Ctx = P->activeCtx;
+  if (!Ctx)
+    return make_error<StringError>("no active specialization context",
+                                   inconvertibleErrorCode());
+  if (!P->J)
+    return make_error<StringError>("no LLJIT for prepared code",
+                                   inconvertibleErrorCode());
+  auto CtxOwner = std::make_unique<LLVMContext>();
+  auto Buf = MemoryBuffer::getMemBuffer(
+      bitcodeData, ("prep_" + std::to_string(cacheKey) + ".bc"));
+  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *CtxOwner);
+  if (!ModuleOrErr)
+    return ModuleOrErr.takeError();
+  Module &M = **ModuleOrErr;
+
+  // The identity and the linked object must describe the same target. ORC only
+  // fills the DataLayout (LLJIT::applyDataLayout) and never the triple, while
+  // EJitPreparedCode::create requires both, so pin both explicitly to the
+  // engine's target BEFORE the pipeline runs.
+  if (auto Err = detail::normalizeJitModuleTarget(
+          M, P->J->getTargetTriple(), P->J->getDataLayout()))
+    return std::move(Err);
+
+  normalizeModuleForJIT(M, origFnName, Ctx);
+
+  // The REAL pipeline, identical to the ORC transform layer's, with this
+  // engine's active context (profile bundle, tier, dimensions, bound pointers).
+  P->optimizer->clearAnalyses();
+  P->optimizer->runPipeline(M, *Ctx);
+  P->optimizer->clearAnalyses();
+  if (verifyModule(M))
+    return make_error<StringError>("prepared module failed verification",
+                                   inconvertibleErrorCode());
+
+  std::vector<EJitCodeBinding> Bindings;
+  std::string Missing;
+  if (!collectEffectiveBindings(M, *P->periodReg, P->userSymbols, Bindings,
+                                Missing))
+    return make_error<StringError>("unresolved effective binding: " + Missing,
+                                   inconvertibleErrorCode());
+
+  EJitCodeIdentityScope BindingScope = Scope;
+  BindingScope.bindingGeneration = EJitBindingGeneration(Bindings);
+  return EJitPreparedCode::create(
+      orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(CtxOwner)),
+      BindingScope, Bindings);
+}
+
+EJitPreparedCodeEmitter *EJitOrcEngine::preparedEmitter() {
+  if (!P->J)
+    return nullptr;
+  if (!P->preparedEmitter) {
+    // A process-wide owner epoch keeps the physical JITDylib names unique even
+    // when several engines exist in one process (the emitter rejects a name
+    // collision instead of merging two owners' code).
+    static EJitAtomicU32 NextOwnerEpoch{0};
+    uint32_t Epoch = NextOwnerEpoch.fetchAdd(1) + 1;
+    P->preparedEmitter =
+        std::make_unique<EJitPreparedCodeEmitter>(*P->J, Epoch);
+  }
+  return P->preparedEmitter.get();
+}
+
+EJitPreparedCodeEmitter::Stats EJitOrcEngine::preparedEmitterStats() const {
+  if (!P->preparedEmitter)
+    return {};
+  return P->preparedEmitter->stats();
+}
+#endif // EJIT_SRE_SHARED_TASKPOOL
+
+Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
+                                       const std::string &origFnName) {
+  EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
+                    origFnName.c_str(), bitcodeData.size());
+  auto Ctx = std::make_unique<LLVMContext>();
+  auto Buf = MemoryBuffer::getMemBuffer(
+      bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"));
+  auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
+  if (!ModuleOrErr) {
+    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
+    return ModuleOrErr.takeError();
+  }
+
+  if (auto Err = detail::normalizeJitModuleTarget(
+          **ModuleOrErr, P->J->getTargetTriple(), P->J->getDataLayout()))
+    return Err;
+
+  // Do this before addIRModule so ORC's materialization-unit symbol claims
+  // match the definitions that codegen will actually emit. Shared with the
+  // owner-side prepared-code route (normalizeModuleForJIT) so the two can never
+  // diverge.
+  normalizeModuleForJIT(**ModuleOrErr, origFnName, P->activeCtx);
 
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
@@ -1181,6 +1490,20 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   for (const LibcallSymbol &LCS : getLibcallSymbols())
     globalSymbols[P->J->mangleAndIntern(LCS.name)] = orc::ExecutorSymbolDef(
         orc::ExecutorAddr::fromPtr(LCS.addr), JITSymbolFlags::Exported);
+
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Gen introduces these declarations after loadBitcodeModule's symbol scan.
+  // Bind the registered collector hooks before materialization, even though
+  // the uninstrumented input has no references to them yet.
+  for (const char *Name : {"__llvm_profile_instrument_target",
+                           "__llvm_profile_instrument_memop",
+                           "ejit_vp_record_scalar", "ejit_vp_record_scalar_session"}) {
+    auto It = P->userSymbols.find(Name);
+    if (It != P->userSymbols.end())
+      globalSymbols[P->J->mangleAndIntern(Name)] = orc::ExecutorSymbolDef(
+          orc::ExecutorAddr::fromPtr(It->second), JITSymbolFlags::Exported);
+  }
+#endif
 
   // Define all collected symbols in the spec JITDylib before loading the
   // IR module so the JIT linker can resolve external references.

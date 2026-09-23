@@ -17,6 +17,9 @@ DUMP_APIS = (
     "ejit_dump_func",
     "ejit_print_dumped",
     "ejit_print_dumped_module",
+    "ejit_reuse_diag_print",
+    "ejit_reuse_diag_config",
+    "ejit_reuse_diag_reset",
 )
 
 
@@ -110,7 +113,7 @@ def main():
     clang = find_tool("clang")
     ar = find_tool("llvm-ar", "ar")
     nm = find_tool("llvm-nm", "nm")
-    ld = find_tool("ld.lld")
+    ld = find_tool("ld.lld", "ld.lld-18", "ld.lld-17")
     lipo = load_lipo()
     with tempfile.TemporaryDirectory(prefix="ejit-lipo-roots-") as directory:
         root = Path(directory)
@@ -131,6 +134,12 @@ def main():
             )
         if "deliberately_unrooted" in complete_symbols:
             raise AssertionError("gc-merge retained an unrooted control symbol")
+        merged = root / "complete_merged.o"
+        lipo.doit_merge(SimpleNamespace(
+            input=str(complete_gc), output=str(merged),
+            build_dir=str(root / "empty-build"), ld=str(ld)))
+        if set(DUMP_APIS) - defined_symbols(nm, merged):
+            raise AssertionError("diagnostic APIs lost in final merge.ld output")
 
         minimal = build_archive(root, clang, ar, (), "minimal")
         minimal_gc, _ = gc_merge(lipo, root, minimal, ar, nm, ld, "minimal")
@@ -139,6 +148,9 @@ def main():
             raise AssertionError("mandatory ejit_init root was discarded")
         if set(DUMP_APIS) & minimal_symbols:
             raise AssertionError("gc-merge fabricated missing optional symbols")
+        undefined = run([nm, "-u", minimal_gc]).stdout
+        if any(symbol in undefined for symbol in DUMP_APIS):
+            raise AssertionError("missing optional API introduced an undefined symbol")
 
     print("lipo GC-root regression: PASS")
 

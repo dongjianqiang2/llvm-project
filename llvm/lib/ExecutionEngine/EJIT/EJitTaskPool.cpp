@@ -690,6 +690,8 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
                     req.numDims);
   // Checkpoint 1 (§5.3): drop a request invalidated before compilation started.
   if (!versionsMatch(req)) {
+    if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse && pgoLifecycleDropFn_)
+      pgoLifecycleDropFn_(pgoLifecycleDropCtx_, req);
     queue_.release(req.funcIndex);
     EJIT_STAT_INC(counters_.compileFailed);
     EJIT_DIAG("worker compile drop func=%u: version changed before compile",

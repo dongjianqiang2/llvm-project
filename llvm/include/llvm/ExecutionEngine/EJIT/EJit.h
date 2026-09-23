@@ -88,6 +88,8 @@ public:
 
   /// Register a user-defined external symbol for JIT resolution.
   /// Required for bare-metal where dlsym is unavailable.
+  /// In a taskpool build this is accepted only before registration freezes;
+  /// post-init calls are rejected without mutating the worker's map.
   void registerSymbol(const std::string &name, void *addr);
 
   /// Manual registration of bitcode / period arrays / static vars.
@@ -141,6 +143,11 @@ public:
   EJitSharedTaskPool *sharedTaskPool();
   const EJitSharedTaskPool *sharedTaskPool() const;
 #endif
+
+  /// Access the compile driver (for the C ABI's read-only diagnostics entry
+  /// points). May be null if the driver was not constructed.
+  EJitCompileDriver *compileDriver() { return compileDriver_.get(); }
+  const EJitCompileDriver *compileDriver() const { return compileDriver_.get(); }
 
   /// Access the module loader (for funcIndex → funcName resolution in
   /// diagnostics). Always constructed; valid for the lifetime of the instance.

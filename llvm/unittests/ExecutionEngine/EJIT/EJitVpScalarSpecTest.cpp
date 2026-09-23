@@ -115,6 +115,21 @@ std::vector<int32_t> runViaJit(std::unique_ptr<Module> M,
 
 } // namespace
 
+TEST(EJitVpScalarSpec, InstrumentationCarriesExactSamplingSession) {
+  LLVMContext Ctx;
+  std::unique_ptr<Module> M = parseModule(Ctx, kLoopBoundIR);
+  ASSERT_TRUE(M);
+  Analyses A;
+  Function &F = *M->getFunction("hot");
+  runValueProfileOnFunction(F, A.FAM, EJitValueProfileMode::Instrument, nullptr,
+                            0x1234u);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  const std::string IR = irToString(*M);
+  EXPECT_NE(IR.find("@ejit_vp_record_scalar_session(i64 4660"),
+            std::string::npos);
+  EXPECT_EQ(IR.find("call void @ejit_vp_record_scalar("), std::string::npos);
+}
+
 TEST(EJitVpScalarSpec, GuardedVersioningPreservesSemantics) {
   LLVMContext Ctx;
   std::unique_ptr<Module> Orig = parseModule(Ctx, kLoopBoundIR);

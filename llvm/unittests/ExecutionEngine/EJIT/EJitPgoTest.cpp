@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
@@ -25,7 +26,9 @@
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
@@ -33,41 +36,26 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
-#if defined(_WIN32) && defined(EJIT_SRE_CODE_POOL)
-#include <windows.h>
-#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
 
-#if defined(_WIN32) && defined(EJIT_SRE_CODE_POOL)
-// Host implementations of the SRE memory primitives for the real ORC stress
-// test. These perform actual Windows virtual-memory allocation and RW->RX page
-// protection; Windows mappings are already backed by 4 KiB pages, so the SRE
-// large-page split operation has no additional host action.
-extern "C" void *SRE_MemDbgAlloc(unsigned int, unsigned char,
-                                 unsigned long Size, const char *,
-                                 unsigned int) {
-  return ::VirtualAlloc(nullptr, Size, MEM_RESERVE | MEM_COMMIT,
-                        PAGE_READWRITE);
-}
+// TestMain.cpp provides the executable path used by LLVM's child-process
+// tests. The parent process owns the timeout; the child owns all EJIT state.
+extern const char *TestMainArgv0;
 
-extern "C" unsigned split_2m_to_4k(unsigned long long, unsigned long long) {
-  return 0;
-}
-
-extern "C" unsigned enable_ex(unsigned, unsigned long long Va) {
-  DWORD OldProtect = 0;
-  void *Page = reinterpret_cast<void *>(static_cast<uintptr_t>(Va));
-  if (!::VirtualProtect(Page, 4096, PAGE_EXECUTE_READ, &OldProtect))
-    return static_cast<unsigned>(::GetLastError());
-  return ::FlushInstructionCache(::GetCurrentProcess(), Page, 4096) ? 0u : 1u;
-}
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT 1u
+#endif
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS 100u
 #endif
 
 static void markEJitEntry(Function &F) {
@@ -78,6 +66,86 @@ static void markEJitEntry(Function &F) {
 
 namespace {
 constexpr uint32_t RealCompileStressFunctions = 20;
+constexpr uint32_t RealCompileStressThrottleCalls =
+    RealCompileStressFunctions * 2u + 1u;
+constexpr uint64_t RealCompileStressThrottleMilliseconds =
+    static_cast<uint64_t>(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT) *
+    static_cast<uint64_t>(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS);
+// Leave ten seconds for process startup, ORC setup, and the actual compiles
+// after accounting for every configured scheduling delay.
+constexpr unsigned RealCompileStressChildTimeoutSeconds =
+    10u + static_cast<unsigned>(
+              (RealCompileStressThrottleCalls *
+                   RealCompileStressThrottleMilliseconds +
+               999u) /
+              1000u);
+constexpr char RealCompileStressChildEnv[] = "EJIT_REAL_ORC_TWENTY_CHILD";
+constexpr char RealCompileStressForceHangEnv[] =
+    "EJIT_REAL_ORC_TWENTY_FORCE_HANG";
+constexpr char RealCompileStressFilter[] =
+    "EJitPgo.RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive";
+
+static void setEnvironment(StringRef Name, StringRef Value) {
+#if defined(_WIN32)
+  (void)_putenv_s(Name.str().c_str(), Value.str().c_str());
+#else
+  (void)setenv(Name.str().c_str(), Value.str().c_str(), 1);
+#endif
+}
+
+static void clearEnvironment(StringRef Name) {
+#if defined(_WIN32)
+  (void)_putenv_s(Name.str().c_str(), "");
+#else
+  (void)unsetenv(Name.str().c_str());
+#endif
+}
+
+class ScopedEnvironment {
+public:
+  ScopedEnvironment(StringRef Name, StringRef Value)
+      : name_(Name.str()), hadValue_(std::getenv(name_.c_str()) != nullptr) {
+    if (hadValue_)
+      previousValue_ = std::getenv(name_.c_str());
+    setEnvironment(name_, Value);
+  }
+
+  ~ScopedEnvironment() {
+    if (hadValue_)
+      setEnvironment(name_, previousValue_);
+    else
+      clearEnvironment(name_);
+  }
+
+private:
+  std::string name_;
+  std::string previousValue_;
+  bool hadValue_;
+};
+
+static int executeRealCompileStressChild(unsigned TimeoutSeconds,
+                                         bool ForceHang,
+                                         std::string &Error,
+                                         bool &ExecutionFailed) {
+  std::string Executable =
+      sys::fs::getMainExecutable(TestMainArgv0, nullptr);
+  if (Executable.empty()) {
+    Error = "could not resolve the EJIT test executable";
+    ExecutionFailed = true;
+    return -1;
+  }
+
+  SmallVector<StringRef, 2> Args;
+  Args.push_back(StringRef(Executable));
+  std::string FilterArg = "--gtest_filter=";
+  FilterArg += RealCompileStressFilter;
+  Args.push_back(StringRef(FilterArg));
+  ScopedEnvironment ChildMode(RealCompileStressChildEnv, "1");
+  ScopedEnvironment HangMode(RealCompileStressForceHangEnv,
+                             ForceHang ? "1" : "0");
+  return sys::ExecuteAndWait(Executable, Args, std::nullopt, {}, TimeoutSeconds,
+                             0, &Error, &ExecutionFailed);
+}
 
 struct RealCompileStressCtx {
   EJitOrcEngine *engine = nullptr;
@@ -184,6 +252,35 @@ static uint32_t applyStressArithmetic(uint32_t Value, uint32_t Func) {
 } // namespace
 
 TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
+#if !defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  GTEST_SKIP() << "requires EJIT_CODE_POOL_BATCHED_PUBLISH";
+#else
+  if (!std::getenv(RealCompileStressChildEnv)) {
+    std::string Error;
+    bool ExecutionFailed = false;
+    const int RC = executeRealCompileStressChild(
+        RealCompileStressChildTimeoutSeconds, /*ForceHang=*/false, Error,
+        ExecutionFailed);
+    ASSERT_FALSE(ExecutionFailed) << Error;
+    EXPECT_EQ(RC, 0)
+        << "real ORC worker child failed or exceeded the configured "
+        << RealCompileStressChildTimeoutSeconds << " second process budget";
+    RecordProperty("child_timeout_seconds",
+                   RealCompileStressChildTimeoutSeconds);
+    RecordProperty("configured_throttle_calls", RealCompileStressThrottleCalls);
+    RecordProperty("configured_throttle_ms",
+                   RealCompileStressThrottleMilliseconds);
+    return;
+  }
+
+  if (const char *ForceHang = std::getenv(RealCompileStressForceHangEnv);
+      ForceHang && StringRef(ForceHang) == "1") {
+    // The parent timeout test kills this child at a process boundary. This
+    // deliberately exercises the same hard-stop path as a stuck worker.
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+    return;
+  }
+
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
 
@@ -230,7 +327,8 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   Pool.setMode(EJitCompileMode::Async);
   RealHostDelayCtx Delay{Shared.get(), &Compile};
   Pool.setWorkerIdleHook(&realHostPlatformDelay, &Delay);
-  ASSERT_EQ(Pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  const auto InitResult = Pool.init();
+  ASSERT_EQ(InitResult, EJitSharedTaskPool::InitResult::BecameOwner);
 
   for (uint32_t Func = 0; Func != RealCompileStressFunctions; ++Func)
     ASSERT_EQ(Pool.compileOrGet(Func, nullptr, 0,
@@ -285,7 +383,7 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 1);
   EXPECT_TRUE(Compile.published.load(std::memory_order_acquire));
   // 20 queue-consume gaps + 20 real ORC compile gaps + one post-publish gap.
-  EXPECT_EQ(Delay.throttleCalls.load(), 41u);
+  EXPECT_EQ(Delay.throttleCalls.load(), RealCompileStressThrottleCalls);
   EXPECT_GE(static_cast<uint64_t>(Elapsed),
             Delay.totalThrottleMilliseconds.load());
   EXPECT_GT(Heartbeats.load(), RealCompileStressFunctions);
@@ -303,8 +401,27 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   RecordProperty("worker_wait_calls", Delay.waitCalls.load());
   RecordProperty("worker_throttle_ms", Delay.totalThrottleMilliseconds.load());
   RecordProperty("elapsed_ms", Elapsed);
+  RecordProperty("configured_throttle_calls", RealCompileStressThrottleCalls);
+  RecordProperty("configured_throttle_ms",
+                 RealCompileStressThrottleMilliseconds);
+  RecordProperty("child_timeout_seconds", RealCompileStressChildTimeoutSeconds);
   RecordProperty("heartbeat_count", Heartbeats.load());
   RecordProperty("heartbeat_max_gap_us", MaxHeartbeatGapUs.load());
+#endif
+}
+
+TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleTimeoutIsProcessBounded) {
+#if !defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  GTEST_SKIP() << "requires EJIT_CODE_POOL_BATCHED_PUBLISH";
+#else
+  std::string Error;
+  bool ExecutionFailed = false;
+  const int RC = executeRealCompileStressChild(
+      /*TimeoutSeconds=*/2, /*ForceHang=*/true, Error, ExecutionFailed);
+  ASSERT_FALSE(ExecutionFailed) << Error;
+  EXPECT_EQ(RC, -2)
+      << "forced child hang must terminate through LLVM's process timeout";
+#endif
 }
 
 static std::string findCapturedPgoName(const EJitOptimizer &Opt,

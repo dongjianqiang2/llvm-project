@@ -430,14 +430,20 @@ TEST(EJitVpPipeline, Tier1CaptureToTier2GuardedSpecialization) {
                                /*numScalarSites=*/1}};
   EJitVpSiteSample samples[] = {
       {ejitVpSiteKey(layout.nameRef, kEJitVpIndirectCall, 0),
+       /*samplingSessionId=*/0,
        1000,
        {kFakeAddr, 0},
        {990, 0}},
       {ejitVpSiteKey(layout.nameRef, kEJitVpMemOpSize, 0),
+       /*samplingSessionId=*/0,
        1000,
        {64, 0},
        {990, 0}},
-      {ejitVpSiteKey(entryHash, kEJitVpScalar, 0), 1000, {100, 0}, {990, 0}},
+      {ejitVpSiteKey(entryHash, kEJitVpScalar, 0),
+       /*samplingSessionId=*/0,
+       1000,
+       {100, 0},
+       {990, 0}},
   };
 
   SmallVector<PgoValueSite, 4> valueSites;

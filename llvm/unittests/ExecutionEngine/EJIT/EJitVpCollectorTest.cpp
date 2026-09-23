@@ -39,6 +39,20 @@ void resetVpStateForTest() {
   gEJitVpState.structSize.storeRelaxed(0);
   gEJitVpState.headerReserved = 0;
   gEJitVpState.armed.storeRelaxed(0);
+  gEJitVpState.headerAlignPad = 0;
+  gEJitVpState.lastIssuedSessionId.storeRelaxed(0);
+  for (uint32_t i = 0; i < kEJitVpMaxSessions; ++i) {
+    gEJitVpState.sessions[i].samplingSessionId.storeRelaxed(0);
+    gEJitVpState.sessions[i].requestAttemptToken.storeRelaxed(0);
+    gEJitVpState.sessions[i].gate.storeRelaxed(0);
+    gEJitVpState.sessions[i].retireState.storeRelaxed(0);
+    gEJitVpState.sessions[i].reserved = 0;
+  }
+  for (uint32_t i = 0; i < kEJitVpMaxProfdBindings; ++i) {
+    gEJitVpState.profdBindings[i].sequence.storeRelaxed(0);
+    gEJitVpState.profdBindings[i].profdAddr.storeRelaxed(0);
+    gEJitVpState.profdBindings[i].samplingSessionId.storeRelaxed(0);
+  }
   for (uint32_t c = 0; c < kEJitVpMaxCores; ++c) {
     gEJitVpState.shards[c].generation.storeRelaxed(0);
     gEJitVpState.shards[c].writers[0].storeRelaxed(0);
@@ -47,6 +61,10 @@ void resetVpStateForTest() {
       for (uint32_t s = 0; s < kEJitVpSitesPerCore; ++s) {
         EJitVpSite &site = gEJitVpState.shards[c].payload[h].sites[s];
         site.siteKey.storeRelaxed(0);
+        site.samplingSessionId.storeRelaxed(0);
+        site.functionIdentity.storeRelaxed(0);
+        site.kind.storeRelaxed(0);
+        site.siteIndex.storeRelaxed(0);
         site.total.storeRelaxed(0);
         for (uint32_t i = 0; i < kEJitVpK; ++i) {
           site.cand[i].value.storeRelaxed(0);
@@ -193,9 +211,12 @@ TEST_F(VpCollectorTest, BusyRetiredHalfIsRecoveredNextSnapshot) {
 
   EJitVpShard &shard = gEJitVpState.shards[0];
   const uint64_t key = ejitVpSiteKey(0x51u, kEJitVpScalar, 0);
-  EJitVpSite &site =
-      shard.payload[0].sites[key & (kEJitVpSitesPerCore - 1u)];
+  EJitVpSite &site = shard.payload[0].sites[key & (kEJitVpSitesPerCore - 1u)];
   site.siteKey.storeRelaxed(key);
+  site.samplingSessionId.storeRelaxed(1);
+  site.functionIdentity.storeRelaxed(0x51u);
+  site.kind.storeRelaxed(kEJitVpScalar);
+  site.siteIndex.storeRelaxed(0);
   site.total.storeRelaxed(1);
   site.cand[0].value.storeRelaxed(77);
   site.cand[0].count.storeRelaxed(1);
@@ -203,7 +224,7 @@ TEST_F(VpCollectorTest, BusyRetiredHalfIsRecoveredNextSnapshot) {
   // Model a producer that remains registered beyond the bounded drain.
   shard.writers[0].storeRelaxed(1);
   std::vector<EJitVpSiteSample> snap;
-  ASSERT_TRUE(ejitVpTakeSnapshot(snap));
+  EXPECT_FALSE(ejitVpTakeSnapshot(snap));
   EXPECT_TRUE(snap.empty());
 
   // Recover the skipped half before reusing it once the producer leaves.
@@ -253,8 +274,10 @@ TEST_F(VpCollectorTest, InstrumentTargetFlatIndexSplit) {
     ejitVpSetArmed(true);
     __llvm_profile_instrument_target(value, &profd, flat);
     std::vector<EJitVpSiteSample> snap;
-    if (!ejitVpTakeSnapshot(snap) || snap.size() != 1)
+    if (!ejitVpTakeSnapshot(snap) || snap.size() != 1) {
+      ADD_FAILURE() << "legacy official snapshot size=" << snap.size();
       return std::optional<EJitVpSiteSample>();
+    }
     return std::optional<EJitVpSiteSample>(snap[0]);
   };
 
@@ -281,6 +304,247 @@ TEST_F(VpCollectorTest, InstrumentTargetFlatIndexSplit) {
   std::vector<EJitVpSiteSample> snap;
   ASSERT_TRUE(ejitVpTakeSnapshot(snap));
   EXPECT_TRUE(snap.empty());
+}
+
+TEST_F(VpCollectorTest, ExactSessionsSnapshotIndependently) {
+  ASSERT_TRUE(ejitVpBeginSession(101));
+  ASSERT_TRUE(ejitVpBeginSession(202));
+  ejit_vp_record_scalar_session(101, 0x77u, 0, 11);
+  ejit_vp_record_scalar_session(202, 0x77u, 0, 22);
+
+  std::vector<EJitVpSiteSample> first;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(101, first));
+  ASSERT_EQ(first.size(), 1u);
+  EXPECT_EQ(first[0].samplingSessionId, 101u);
+  EXPECT_EQ(first[0].values[0], 11u);
+
+  std::vector<EJitVpSiteSample> second;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(202, second));
+  ASSERT_EQ(second.size(), 1u);
+  EXPECT_EQ(second[0].samplingSessionId, 202u);
+  EXPECT_EQ(second[0].values[0], 22u);
+}
+
+TEST_F(VpCollectorTest, EndedSessionDropsLateWritesWithoutStoppingPeer) {
+  ASSERT_TRUE(ejitVpBeginSession(301));
+  ASSERT_TRUE(ejitVpBeginSession(302));
+  ejit_vp_record_scalar_session(301, 0x88u, 0, 1);
+  ejitVpEndSession(301);
+  ejit_vp_record_scalar_session(301, 0x88u, 0, 99);
+  ejit_vp_record_scalar_session(302, 0x88u, 0, 7);
+
+  std::vector<EJitVpSiteSample> old;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(301, old));
+  ASSERT_EQ(old.size(), 1u);
+  EXPECT_EQ(old[0].total, 1u);
+  EXPECT_EQ(old[0].values[0], 1u);
+
+  std::vector<EJitVpSiteSample> peer;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(302, peer));
+  ASSERT_EQ(peer.size(), 1u);
+  EXPECT_EQ(peer[0].values[0], 7u);
+}
+
+TEST_F(VpCollectorTest, ProfileDataBindingRoutesOfficialKindsToSession) {
+  FakeProfd profd;
+  profd.nameRef = 0xBEEFu;
+  profd.numValueSites[0] = 1;
+  profd.numValueSites[1] = 1;
+  ASSERT_TRUE(ejitVpBeginSession(401));
+  ASSERT_TRUE(ejitVpBindProfileData(401, reinterpret_cast<uintptr_t>(&profd)));
+  __llvm_profile_instrument_memop(0xCAFEu, &profd, 0);
+  __llvm_profile_instrument_memop(64, &profd, 1);
+  std::vector<EJitVpSiteSample> snap;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(401, snap));
+  ASSERT_EQ(snap.size(), 2u);
+  for (const EJitVpSiteSample &sample : snap)
+    EXPECT_EQ(sample.samplingSessionId, 401u);
+}
+
+TEST_F(VpCollectorTest, SessionCapacityFailsWithoutReusingOldIdentity) {
+  for (uint64_t i = 1; i <= kEJitVpMaxSessions; ++i) {
+    ASSERT_TRUE(ejitVpBeginSession(500 + i));
+    ejitVpEndSession(500 + i);
+  }
+  EXPECT_FALSE(ejitVpBeginSession(9999));
+  // A late writer for the first retired identity cannot be redirected to 9999.
+  ejit_vp_record_scalar_session(501, 1, 0, 42);
+  std::vector<EJitVpSiteSample> snap;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(501, snap));
+  EXPECT_TRUE(snap.empty());
+}
+
+TEST_F(VpCollectorTest, SequentialSessionsReuseRetiredSlots) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  for (uint64_t I = 0; I < 120; ++I) {
+    const uint64_t SessionId = ejitVpCreateSession();
+    ASSERT_NE(SessionId, 0u) << "sequential session " << I;
+    ejit_vp_record_scalar_session(SessionId, 0x123456u, 0, I + 1);
+    ejitVpEndSession(SessionId);
+    std::vector<EJitVpSiteSample> Samples;
+    ASSERT_TRUE(ejitVpTakeSessionSnapshot(SessionId, Samples));
+    ASSERT_EQ(Samples.size(), 1u);
+    EXPECT_EQ(Samples[0].samplingSessionId, SessionId);
+  }
+}
+
+TEST_F(VpCollectorTest, FourConcurrentSessionsCanRunInRepeatedWaves) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  for (uint64_t Wave = 0; Wave < 30; ++Wave) {
+    uint64_t Sessions[4] = {};
+    for (uint32_t I = 0; I < 4; ++I) {
+      Sessions[I] = ejitVpCreateSession();
+      ASSERT_NE(Sessions[I], 0u);
+      EJitCoreId::setCurrentForTest(I);
+      ejit_vp_record_scalar_session(Sessions[I], 0xABC000u + Sessions[I], 0,
+                                    Sessions[I]);
+    }
+    EJitCoreId::resetForTest();
+    for (uint64_t SessionId : Sessions) {
+      ejitVpEndSession(SessionId);
+      std::vector<EJitVpSiteSample> Samples;
+      ASSERT_TRUE(ejitVpTakeSessionSnapshot(SessionId, Samples));
+      ASSERT_EQ(Samples.size(), 1u);
+      EXPECT_EQ(Samples[0].samplingSessionId, SessionId);
+    }
+  }
+}
+
+TEST_F(VpCollectorTest, RetiredSessionCannotReopenOrAcceptLateWrites) {
+  ASSERT_TRUE(ejitVpBeginSession(101));
+  ejit_vp_record_scalar_session(101, 0x123456u, 0, 11);
+  ejitVpEndSession(101);
+  std::vector<EJitVpSiteSample> First;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(101, First));
+  ASSERT_FALSE(First.empty());
+
+  EXPECT_FALSE(ejitVpBeginSession(101));
+  ejit_vp_record_scalar_session(101, 0x123456u, 0, 999);
+  std::vector<EJitVpSiteSample> Late;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(101, Late));
+  EXPECT_TRUE(Late.empty());
+}
+
+TEST_F(VpCollectorTest, LegacyRecordsStayOutsideProductionSessionOne) {
+  ASSERT_TRUE(ejitVpBeginSession(1));
+  ejitVpSetArmed(true);
+  ejit_vp_record_scalar(0x123456u, 0, 999);
+  std::vector<EJitVpSiteSample> Production;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(1, Production));
+  EXPECT_TRUE(Production.empty());
+
+  std::vector<EJitVpSiteSample> Legacy;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(kEJitVpLegacySessionId, Legacy));
+  ASSERT_EQ(Legacy.size(), 1u);
+  EXPECT_EQ(Legacy[0].samplingSessionId, kEJitVpLegacySessionId);
+}
+
+TEST_F(VpCollectorTest, RetiringSessionReleasesProfileBindings) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  FakeProfd Profds[kEJitVpMaxProfdBindings + 1] = {};
+  const uint64_t FirstSession = ejitVpCreateSession();
+  ASSERT_NE(FirstSession, 0u);
+  for (uint32_t I = 0; I < kEJitVpMaxProfdBindings; ++I)
+    ASSERT_TRUE(ejitVpBindProfileData(FirstSession,
+                                      reinterpret_cast<uintptr_t>(&Profds[I])));
+  EXPECT_FALSE(ejitVpBindProfileData(
+      FirstSession,
+      reinterpret_cast<uintptr_t>(&Profds[kEJitVpMaxProfdBindings])));
+  ejitVpEndSession(FirstSession);
+  std::vector<EJitVpSiteSample> Discarded;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(FirstSession, Discarded));
+
+  const uint64_t NextSession = ejitVpCreateSession();
+  ASSERT_NE(NextSession, 0u);
+  EXPECT_TRUE(ejitVpBindProfileData(
+      NextSession,
+      reinterpret_cast<uintptr_t>(&Profds[kEJitVpMaxProfdBindings])));
+}
+
+TEST_F(VpCollectorTest, FailedCancellationRetirementIsServicedOnPressure) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  gEJitVpState.shards[1].writers[0].storeRelaxed(1);
+  for (unsigned I = 0; I < kEJitVpMaxSessions; ++I) {
+    const uint64_t SessionId = ejitVpCreateSession();
+    ASSERT_NE(SessionId, 0u);
+    ejitVpEndSession(SessionId);
+    std::vector<EJitVpSiteSample> Discarded;
+    EXPECT_FALSE(ejitVpTakeSessionSnapshot(SessionId, Discarded));
+  }
+  gEJitVpState.shards[1].writers[0].storeRelease(0);
+  EXPECT_NE(ejitVpCreateSession(), 0u);
+}
+
+TEST_F(VpCollectorTest, PreservedFreezeIsNotScavengedUnderPressure) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  uint64_t Preserved = ejitVpCreateSession();
+  ASSERT_NE(Preserved, 0u);
+  ejitVpEndSession(Preserved, true);
+  for (unsigned I = 1; I < kEJitVpMaxSessions; ++I)
+    ASSERT_NE(ejitVpCreateSession(), 0u);
+  EXPECT_EQ(ejitVpCreateSession(), 0u);
+  std::vector<EJitVpSiteSample> Samples;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(Preserved, Samples));
+  EXPECT_NE(ejitVpCreateSession(), 0u);
+}
+
+TEST_F(VpCollectorTest, RetryAccumulatorPreservesPartiallyDrainedSamples) {
+  const uint64_t SessionId = ejitVpCreateSession();
+  ASSERT_NE(SessionId, 0u);
+  EJitCoreId::setCurrentForTest(0);
+  ejit_vp_record_scalar_session(SessionId, 0x123456u, 0, 11);
+  EJitCoreId::setCurrentForTest(1);
+  ejit_vp_record_scalar_session(SessionId, 0x123456u, 0, 22);
+  EJitCoreId::resetForTest();
+
+  gEJitVpState.shards[1].writers[0].storeRelaxed(1);
+  ejitVpEndSession(SessionId, true);
+  std::vector<EJitVpSiteSample> Pending;
+  EXPECT_FALSE(ejitVpTakeSessionSnapshot(SessionId, Pending));
+  ASSERT_FALSE(Pending.empty());
+
+  // CompileDriver retains this exact-session accumulator across a bounded T2
+  // retry instead of destroying already-drained samples.
+  gEJitVpState.shards[1].writers[0].storeRelease(0);
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(SessionId, Pending));
+  uint64_t Total = 0;
+  for (const EJitVpSiteSample &Sample : Pending)
+    Total += Sample.total;
+  EXPECT_EQ(Total, 2u);
+}
+
+TEST_F(VpCollectorTest, ExactAttemptCancellationClosesOnlyItsSession) {
+  const uint64_t First = ejitVpCreateSession(1001);
+  const uint64_t Second = ejitVpCreateSession(1002);
+  ASSERT_NE(First, 0u);
+  ASSERT_NE(Second, 0u);
+  ejitVpCancelAttempt(1001);
+  ejit_vp_record_scalar_session(First, 0xAAu, 0, 1);
+  ejit_vp_record_scalar_session(Second, 0xBBu, 0, 2);
+
+  std::vector<EJitVpSiteSample> FirstSamples;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(First, FirstSamples));
+  EXPECT_TRUE(FirstSamples.empty());
+  std::vector<EJitVpSiteSample> SecondSamples;
+  ASSERT_TRUE(ejitVpTakeSessionSnapshot(Second, SecondSamples));
+  ASSERT_EQ(SecondSamples.size(), 1u);
+  EXPECT_EQ(SecondSamples[0].values[0], 2u);
+}
+
+TEST_F(VpCollectorTest, LateFreezeCannotUndoTerminalCancellation) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  gEJitVpState.shards[1].writers[0].storeRelaxed(1);
+  for (uint64_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    const uint64_t SessionId = ejitVpCreateSession(9000 + I);
+    ASSERT_NE(SessionId, 0u);
+    ejitVpCancelAttempt(9000 + I);
+    // Models an already-running T2 reaching its preserve request after cancel.
+    ejitVpEndSession(SessionId, true);
+    std::vector<EJitVpSiteSample> Pending;
+    EXPECT_FALSE(ejitVpTakeSessionSnapshot(SessionId, Pending));
+  }
+  gEJitVpState.shards[1].writers[0].storeRelease(0);
+  EXPECT_NE(ejitVpCreateSession(), 0u);
 }
 
 TEST_F(VpCollectorTest, PhysicalProducerCoreIdsFitDefaultShardRange) {
@@ -313,9 +577,8 @@ TEST_F(VpCollectorTest, AbiMismatchRefused) {
 TEST_F(VpCollectorTest, MemoryBoundDocumented) {
   // The computable bound from the header must cover the actual layout.
   EXPECT_GE(kEJitVpPerCoreBytes, sizeof(EJitVpShard));
-  EXPECT_LE(kEJitVpPerCoreBytes, kEJitVpCacheLine + 2u * kEJitVpSitesPerCore *
-                                                        8u *
-                                                        (2u + 2u * kEJitVpK));
+  EXPECT_EQ(kEJitVpPerCoreBytes,
+            kEJitVpCacheLine + 2u * kEJitVpSitesPerCore * sizeof(EJitVpSite));
   EXPECT_EQ(kEJitVpTotalBytes, kEJitVpMaxCores * kEJitVpPerCoreBytes);
 }
 

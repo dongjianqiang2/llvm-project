@@ -224,4 +224,31 @@ TEST(EJitVpMerge, InventoryReadsNumValueSites) {
   EXPECT_EQ(funcs[0].numScalarSites, 0u); // patched by the driver from capture
 }
 
+TEST(EJitVpMerge, ProfileSchemaCapturesExactIdentityAndRejectsDrift) {
+  FakeProfd pd;
+  pd.nameRef = 0x1234u;
+  pd.funcHash = 0xABCDu;
+  pd.numCounters = 2;
+  pd.numValueSites[0] = 3;
+  pd.numValueSites[1] = 5;
+  uint64_t counters[2] = {1, 2};
+  PgoCounterRef refs[] = {{"exact_name", reinterpret_cast<uintptr_t>(counters),
+                           reinterpret_cast<uintptr_t>(&pd)}};
+  PgoValueFunction funcs[] = {{0xABCDu, 0x1234u, 3, 5, 7}};
+  std::vector<PgoFunctionSchema> schema;
+  ASSERT_TRUE(readProfileSchema(refs, funcs, schema));
+  ASSERT_EQ(schema.size(), 1u);
+  EXPECT_EQ(schema[0].pgoName, "exact_name");
+  EXPECT_EQ(schema[0].funcHash, 0xABCDu);
+  EXPECT_EQ(schema[0].pgoNameHash, 0x1234u);
+  EXPECT_EQ(schema[0].numCounters, 2u);
+  EXPECT_EQ(schema[0].numIcSites, 3u);
+  EXPECT_EQ(schema[0].numMemSites, 5u);
+  EXPECT_EQ(schema[0].numScalarSites, 7u);
+
+  funcs[0].numMemSites = 4;
+  EXPECT_FALSE(readProfileSchema(refs, funcs, schema));
+  EXPECT_TRUE(schema.empty());
+}
+
 #endif // EJIT_SRE_PGO_VALUE_PROFILE

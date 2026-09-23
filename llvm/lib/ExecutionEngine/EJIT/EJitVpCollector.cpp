@@ -52,30 +52,126 @@ static inline uint16_t vpLoadU16(const void *p) {
                          __ATOMIC_RELAXED);
 }
 
+static bool ejitVpAbiValid() {
+  const EJitVpSharedState &State = gEJitVpState;
+  return State.magic.loadAcquire() == kEJitVpAbiMagic &&
+         State.abiVersion.loadAcquire() == kEJitVpAbiVersion &&
+         State.structSize.loadAcquire() == sizeof(EJitVpSharedState);
+}
+
+namespace {
+constexpr uint64_t kVpGateOpen = 1u;
+constexpr uint64_t kVpGateRef = 2u;
+constexpr uint64_t kVpGateTransition = uint64_t(1) << 63;
+constexpr uint32_t kVpRetireNormal = 0u;
+constexpr uint32_t kVpRetirePreserve = 1u;
+constexpr uint32_t kVpRetireDiscard = 2u;
+} // namespace
+
+static bool ejitVpSessionActive(uint64_t SessionId) {
+  if (SessionId == 0)
+    return false;
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    const EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+    if (Slot.samplingSessionId.loadAcquire() == SessionId)
+      return (Slot.gate.loadAcquire() & kVpGateOpen) != 0;
+  }
+  return false;
+}
+
+static EJitVpSessionSlot *ejitVpAcquireSession(uint64_t SessionId) {
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+    if (Slot.samplingSessionId.loadAcquire() != SessionId)
+      continue;
+    uint64_t Gate = Slot.gate.loadAcquire();
+    do {
+      if (!(Gate & kVpGateOpen) || (Gate & kVpGateTransition))
+        break;
+      if (Slot.gate.compareExchange(Gate, Gate + kVpGateRef)) {
+        if (Slot.samplingSessionId.loadAcquire() == SessionId)
+          return &Slot;
+        Slot.gate.fetchSub(kVpGateRef);
+        break;
+      }
+    } while (true);
+  }
+  return nullptr;
+}
+
+#ifdef EJIT_VP_BINDING_LOOKUP_TEST_HOOK
+extern "C" void ejitVpBindingLookupTestHook();
+#endif
+
+static uint64_t ejitVpSessionForProfd(uintptr_t ProfdAddr) {
+  for (uint32_t I = 0; I < kEJitVpMaxProfdBindings; ++I) {
+    const EJitVpProfdBinding &Binding = gEJitVpState.profdBindings[I];
+    for (unsigned Attempt = 0; Attempt < 3; ++Attempt) {
+      const uint64_t Before = Binding.sequence.loadAcquire();
+      if (Before & 1u)
+        continue;
+      const uintptr_t Address = Binding.profdAddr.loadAcquire();
+      if (Address != ProfdAddr)
+        break;
+#ifdef EJIT_VP_BINDING_LOOKUP_TEST_HOOK
+      ejitVpBindingLookupTestHook();
+#endif
+      const uint64_t SessionId = Binding.samplingSessionId.loadAcquire();
+      const uint64_t After = Binding.sequence.loadAcquire();
+      if (Before == After && !(After & 1u))
+        return SessionId;
+    }
+  }
+  return 0;
+}
+
+static void ejitVpPublishBinding(EJitVpProfdBinding &Binding,
+                                 uint64_t SessionId, uintptr_t ProfdAddr) {
+  Binding.sequence.fetchAdd(1);
+  Binding.samplingSessionId.storeRelaxed(SessionId);
+  Binding.profdAddr.storeRelaxed(ProfdAddr);
+  Binding.sequence.fetchAdd(1);
+}
+
+static uint64_t ejitVpStorageKey(uint64_t SessionId, uint64_t FunctionIdentity,
+                                 uint32_t Kind, uint32_t SiteIdx) {
+  return ejitVpSiteKey(FunctionIdentity ^ (SessionId * 0x9E3779B97F4A7C15ULL),
+                       Kind, SiteIdx);
+}
+
 //===----------------------------------------------------------------------===//
-// Hot-path record primitive. After the armed gate (one acquire load) and the
-// ABI gate (three loads of the same shared line), every access below is a
-// RELAXED RMW on the CALLING core's private shard line: no CAS, no lock, no
-// cross-core write to a shared cache line.
+// Hot-path record primitive. Production sessions acquire a bounded shared
+// session gate before entering the calling core's shard; the payload updates
+// themselves remain relaxed operations on that core's private shard lines.
 //===----------------------------------------------------------------------===//
-static inline void ejitVpRecord(uint64_t value, uint64_t functionIdentity,
-                                uint32_t kind, uint32_t siteIdx) {
+static inline void ejitVpRecord(uint64_t value, uint64_t samplingSessionId,
+                                uint64_t functionIdentity, uint32_t kind,
+                                uint32_t siteIdx) {
   EJitVpSharedState &st = gEJitVpState;
-  if (st.armed.loadAcquire() == 0)
+  if (samplingSessionId == 0 && st.armed.loadAcquire() == 0)
     return;
-  // ABI validation on the hot path is three acquire loads of the header line
-  // (already shared for the armed read above); a mismatched/foreign blob must
-  // never be written through an out-of-bounds layout.
-  if (st.magic.loadAcquire() != kEJitVpAbiMagic ||
-      st.abiVersion.loadAcquire() != kEJitVpAbiVersion ||
-      st.structSize.loadAcquire() != sizeof(EJitVpSharedState))
+  // Validate the ABI before reading session tables whose offsets changed in
+  // v3. A foreign blob must never be indexed through this build's layout.
+  if (!ejitVpAbiValid())
     return;
+  EJitVpSessionSlot *SessionSlot = nullptr;
+  if (samplingSessionId == 0)
+    samplingSessionId = kEJitVpLegacySessionId;
+  else {
+    SessionSlot = ejitVpAcquireSession(samplingSessionId);
+    if (!SessionSlot)
+      return;
+  }
   const uint32_t core = EJitCoreId::current();
-  if (core >= st.maxCores)
+  if (core >= st.maxCores) {
+    if (SessionSlot)
+      SessionSlot->gate.fetchSub(kVpGateRef);
     return;
+  }
 
   EJitVpShard &shard = st.shards[core];
-  const uint64_t key = ejitVpSiteKey(functionIdentity, kind, siteIdx);
+  const uint64_t key =
+      ejitVpStorageKey(samplingSessionId, functionIdentity, kind, siteIdx);
 
   // Register in a half before writing it, then recheck generation. Once the
   // collector flips generation and observes writers[retired] == 0, no producer
@@ -98,8 +194,16 @@ static inline void ejitVpRecord(uint64_t value, uint64_t functionIdentity,
 
   // Direct-mapped site table: a different key displaces the slot wholesale
   // (bounded approximation, documented in EJIT_VALUE_PROFILE.md §3.2).
-  if (site.siteKey.loadRelaxed() != key) {
+  if (site.siteKey.loadRelaxed() != key ||
+      site.samplingSessionId.loadRelaxed() != samplingSessionId ||
+      site.functionIdentity.loadRelaxed() != functionIdentity ||
+      site.kind.loadRelaxed() != kind ||
+      site.siteIndex.loadRelaxed() != siteIdx) {
     site.siteKey.storeRelaxed(key);
+    site.samplingSessionId.storeRelaxed(samplingSessionId);
+    site.functionIdentity.storeRelaxed(functionIdentity);
+    site.kind.storeRelaxed(kind);
+    site.siteIndex.storeRelaxed(siteIdx);
     site.total.storeRelaxed(0);
     for (uint32_t i = 0; i < kEJitVpK; ++i) {
       site.cand[i].value.storeRelaxed(0);
@@ -131,6 +235,8 @@ static inline void ejitVpRecord(uint64_t value, uint64_t functionIdentity,
   }
   site.total.fetchAddRelaxed(1);
   shard.writers[half].fetchSub(1);
+  if (SessionSlot)
+    SessionSlot->gate.fetchSub(kVpGateRef);
 }
 
 //===----------------------------------------------------------------------===//
@@ -142,16 +248,21 @@ extern "C" void __llvm_profile_instrument_target(uint64_t value, void *data,
                                                  uint32_t index) {
   if (!data)
     return;
+  if (!ejitVpAbiValid())
+    return;
   const uint8_t *d = static_cast<const uint8_t *>(data);
   const uint64_t nameRef = vpLoadU64(d + kProfdNameRefOff);
+  uint64_t session = ejitVpSessionForProfd(reinterpret_cast<uintptr_t>(data));
+  if (session == 0 && gEJitVpState.lastIssuedSessionId.loadAcquire() != 0)
+    return;
   const uint32_t nsIC = vpLoadU16(d + kProfdNumValueSitesOff + 0);
   const uint32_t nsMem = vpLoadU16(d + kProfdNumValueSitesOff + 2);
   if (index < nsIC) {
-    ejitVpRecord(value, nameRef, kEJitVpIndirectCall, index);
+    ejitVpRecord(value, session, nameRef, kEJitVpIndirectCall, index);
     return;
   }
   if (index - nsIC < nsMem) {
-    ejitVpRecord(value, nameRef, kEJitVpMemOpSize, index - nsIC);
+    ejitVpRecord(value, session, nameRef, kEJitVpMemOpSize, index - nsIC);
     return;
   }
   // Out of range (vtable sites / layout drift): drop rather than misattribute.
@@ -164,7 +275,14 @@ extern "C" void __llvm_profile_instrument_memop(uint64_t value, void *data,
 
 extern "C" void ejit_vp_record_scalar(uint64_t funcHash, uint32_t siteIdx,
                                       uint64_t value) {
-  ejitVpRecord(value, funcHash, kEJitVpScalar, siteIdx);
+  ejitVpRecord(value, 0, funcHash, kEJitVpScalar, siteIdx);
+}
+
+extern "C" void ejit_vp_record_scalar_session(uint64_t samplingSessionId,
+                                              uint64_t funcHash,
+                                              uint32_t siteIdx,
+                                              uint64_t value) {
+  ejitVpRecord(value, samplingSessionId, funcHash, kEJitVpScalar, siteIdx);
 }
 
 //===----------------------------------------------------------------------===//
@@ -182,6 +300,8 @@ bool ejit::ejitVpEnsureInitialized() {
   // before it is armed (armed starts 0).
   st.headerReserved = 0;
   st.armed.storeRelease(0);
+  st.headerAlignPad = 0;
+  st.lastIssuedSessionId.storeRelaxed(0);
   st.shardStride = static_cast<uint32_t>(sizeof(EJitVpShard));
   st.sitesPerCore = kEJitVpSitesPerCore;
   st.k = kEJitVpK;
@@ -189,6 +309,18 @@ bool ejit::ejitVpEnsureInitialized() {
   st.drainTicks = kEJitVpDrainTicks;
   for (uint32_t i = 0; i < 3; ++i)
     st.headerPad[i] = 0;
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    st.sessions[I].samplingSessionId.storeRelaxed(0);
+    st.sessions[I].requestAttemptToken.storeRelaxed(0);
+    st.sessions[I].gate.storeRelaxed(0);
+    st.sessions[I].retireState.storeRelaxed(kVpRetireNormal);
+    st.sessions[I].reserved = 0;
+  }
+  for (uint32_t I = 0; I < kEJitVpMaxProfdBindings; ++I) {
+    st.profdBindings[I].sequence.storeRelaxed(0);
+    st.profdBindings[I].samplingSessionId.storeRelaxed(0);
+    st.profdBindings[I].profdAddr.storeRelaxed(0);
+  }
   for (uint32_t c = 0; c < kEJitVpMaxCores; ++c) {
     st.shards[c].generation.storeRelaxed(0);
     st.shards[c].writers[0].storeRelaxed(0);
@@ -197,6 +329,10 @@ bool ejit::ejitVpEnsureInitialized() {
       for (uint32_t s = 0; s < kEJitVpSitesPerCore; ++s) {
         EJitVpSite &site = st.shards[c].payload[h].sites[s];
         site.siteKey.storeRelaxed(0);
+        site.samplingSessionId.storeRelaxed(0);
+        site.functionIdentity.storeRelaxed(0);
+        site.kind.storeRelaxed(0);
+        site.siteIndex.storeRelaxed(0);
         site.total.storeRelaxed(0);
         for (uint32_t i = 0; i < kEJitVpK; ++i) {
           site.cand[i].value.storeRelaxed(0);
@@ -229,38 +365,192 @@ bool ejit::ejitVpIsArmed() {
   return ejitVpEnsureInitialized() && gEJitVpState.armed.loadAcquire() != 0;
 }
 
-void ejit::ejitVpResetFunction(uint64_t nameHash,
-                               ArrayRef<EJitVpKindSiteCount> siteCounts) {
+static bool ejitVpAllocateSessionSlot(uint64_t SessionId,
+                                      uint64_t RequestAttemptToken = 0) {
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+    if (Slot.samplingSessionId.loadAcquire() != 0)
+      continue;
+    // Claim the free slot with a closed reference. A concurrent stale cancel
+    // may also transiently reference a free slot, so zero ID alone is not a
+    // sufficient reuse condition.
+    uint64_t FreeGate = 0;
+    if (!Slot.gate.compareExchange(FreeGate, kVpGateTransition))
+      continue;
+    Slot.retireState.storeRelaxed(kVpRetireNormal);
+    Slot.requestAttemptToken.storeRelaxed(RequestAttemptToken);
+    Slot.samplingSessionId.storeRelease(SessionId);
+    Slot.gate.storeRelease(kVpGateOpen);
+    return true;
+  }
+  return false;
+}
+
+bool ejit::ejitVpBeginSession(uint64_t SessionId) {
+  if (!SessionId || SessionId == kEJitVpLegacySessionId ||
+      !ejitVpEnsureInitialized())
+    return false;
+  uint64_t Last = gEJitVpState.lastIssuedSessionId.loadAcquire();
+  do {
+    if (SessionId <= Last)
+      return false;
+  } while (!gEJitVpState.lastIssuedSessionId.compareExchange(Last, SessionId));
+  return ejitVpAllocateSessionSlot(SessionId);
+}
+
+uint64_t ejit::ejitVpCreateSession(uint64_t RequestAttemptToken) {
   if (!ejitVpEnsureInitialized())
+    return 0;
+  const uint64_t SessionId = gEJitVpState.lastIssuedSessionId.fetchAdd(1) + 1;
+  if (SessionId == 0 || SessionId == kEJitVpLegacySessionId)
+    return 0;
+  if (ejitVpAllocateSessionSlot(SessionId, RequestAttemptToken))
+    return SessionId;
+
+  // Capacity pressure services failed cancellation/abort retirements. A T2
+  // freeze that owns partial samples marks its slot retained and is never
+  // scavenged here.
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+    const uint64_t OldId = Slot.samplingSessionId.loadAcquire();
+    if (!OldId || (Slot.gate.loadAcquire() & kVpGateOpen) != 0 ||
+        Slot.retireState.loadAcquire() == kVpRetirePreserve)
+      continue;
+    std::vector<EJitVpSiteSample> Discarded;
+    (void)ejitVpTakeSessionSnapshot(OldId, Discarded);
+    if (ejitVpAllocateSessionSlot(SessionId, RequestAttemptToken))
+      return SessionId;
+  }
+  return 0;
+}
+
+static bool ejitVpPinSessionSlot(EJitVpSessionSlot &Slot) {
+  uint64_t Gate = Slot.gate.loadAcquire();
+  do {
+    if (Gate & kVpGateTransition)
+      return false;
+  } while (!Slot.gate.compareExchange(Gate, Gate + kVpGateRef));
+  return true;
+}
+
+static void ejitVpCloseSessionGate(EJitVpSessionSlot &Slot) {
+  uint64_t Gate = Slot.gate.loadAcquire();
+  while ((Gate & kVpGateOpen) &&
+         !Slot.gate.compareExchange(Gate, Gate & ~kVpGateOpen)) {
+  }
+}
+
+void ejit::ejitVpEndSession(uint64_t SessionId, bool PreserveForRetry) {
+  if (!SessionId || !ejitVpEnsureInitialized())
     return;
-  // Bound the total site count defensively: the direct-mapped table only has
-  // kEJitVpSitesPerCore slots per core, and probing more keys than slots would
-  // simply revisit the same slots (each extra round zeroes a displaced key's
-  // slot too - still safe). Clamp to a sane upper bound.
-  for (uint32_t c = 0; c < kEJitVpMaxCores; ++c) {
-    for (uint32_t h = 0; h < 2; ++h) {
-      for (const EJitVpKindSiteCount &sc : siteCounts) {
-        if (sc.kind >= kEJitVpKindCount || sc.count == 0)
-          continue;
-        for (uint32_t idx = 0; idx < sc.count; ++idx) {
-          const uint64_t key = ejitVpSiteKey(nameHash, sc.kind, idx);
-          EJitVpSite &site =
-              gEJitVpState.shards[c]
-                  .payload[h]
-                  .sites[key &
-                         (static_cast<uint64_t>(kEJitVpSitesPerCore) - 1u)];
-          if (site.siteKey.loadRelaxed() != key)
-            continue;
-          site.siteKey.storeRelaxed(0);
-          site.total.storeRelaxed(0);
-          for (uint32_t i = 0; i < kEJitVpK; ++i) {
-            site.cand[i].value.storeRelaxed(0);
-            site.cand[i].count.storeRelaxed(0);
-          }
-        }
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+    if (Slot.samplingSessionId.loadAcquire() != SessionId ||
+        !ejitVpPinSessionSlot(Slot))
+      continue;
+    if (Slot.samplingSessionId.loadAcquire() == SessionId) {
+      if (PreserveForRetry) {
+        uint32_t State = kVpRetireNormal;
+        (void)Slot.retireState.compareExchange(State, kVpRetirePreserve);
+      } else {
+        Slot.retireState.storeRelease(kVpRetireDiscard);
       }
+      ejitVpCloseSessionGate(Slot);
+      Slot.gate.fetchSub(kVpGateRef);
+      return;
+    }
+    Slot.gate.fetchSub(kVpGateRef);
+  }
+}
+
+#ifdef EJIT_VP_CANCEL_TEST_HOOK
+extern "C" void ejitVpCancelTestHook();
+#endif
+
+void ejit::ejitVpCancelAttempt(uint64_t RequestAttemptToken) {
+  if (!RequestAttemptToken || !ejitVpEnsureInitialized())
+    return;
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+    if (Slot.requestAttemptToken.loadAcquire() != RequestAttemptToken)
+      continue;
+#ifdef EJIT_VP_CANCEL_TEST_HOOK
+    ejitVpCancelTestHook();
+#endif
+
+    // Hold a closed or active slot across the token recheck. Exclusive
+    // retirement and allocation both reject a live reference.
+    if (!ejitVpPinSessionSlot(Slot))
+      continue;
+    if (Slot.requestAttemptToken.loadAcquire() == RequestAttemptToken) {
+      Slot.retireState.storeRelease(kVpRetireDiscard);
+      ejitVpCloseSessionGate(Slot);
+      Slot.gate.fetchSub(kVpGateRef);
+      return;
+    }
+    Slot.gate.fetchSub(kVpGateRef);
+  }
+}
+
+bool ejit::ejitVpSessionDiscarded(uint64_t SessionId) {
+  if (!SessionId || !ejitVpEnsureInitialized())
+    return true;
+  for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+    const EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+    if (Slot.samplingSessionId.loadAcquire() == SessionId)
+      return Slot.retireState.loadAcquire() == kVpRetireDiscard;
+  }
+  // A driver-side partial accumulator for an ID no longer present in the
+  // bounded registry has no remaining retry owner and is safe to erase.
+  return true;
+}
+
+bool ejit::ejitVpBindProfileData(uint64_t SessionId, uintptr_t ProfdAddr) {
+  if (!SessionId || !ProfdAddr || !ejitVpSessionActive(SessionId))
+    return false;
+  for (uint32_t I = 0; I < kEJitVpMaxProfdBindings; ++I) {
+    EJitVpProfdBinding &Binding = gEJitVpState.profdBindings[I];
+    const uintptr_t Existing = Binding.profdAddr.loadAcquire();
+    if (Existing == ProfdAddr)
+      return Binding.samplingSessionId.loadAcquire() == SessionId;
+    if (Existing == 0) {
+      ejitVpPublishBinding(Binding, SessionId, ProfdAddr);
+      return true;
     }
   }
+  return false;
+}
+
+void ejit::ejitVpResetFunction(uint64_t NameHash,
+                               ArrayRef<EJitVpKindSiteCount> SiteCounts) {
+  if (!ejitVpEnsureInitialized())
+    return;
+  for (uint32_t C = 0; C < kEJitVpMaxCores; ++C)
+    for (uint32_t H = 0; H < 2; ++H)
+      for (uint32_t S = 0; S < kEJitVpSitesPerCore; ++S) {
+        EJitVpSite &Site = gEJitVpState.shards[C].payload[H].sites[S];
+        if (Site.functionIdentity.loadRelaxed() != NameHash)
+          continue;
+        bool Matches = false;
+        for (const EJitVpKindSiteCount &Count : SiteCounts)
+          if (Site.kind.loadRelaxed() == Count.kind &&
+              Site.siteIndex.loadRelaxed() < Count.count) {
+            Matches = true;
+            break;
+          }
+        if (!Matches)
+          continue;
+        Site.siteKey.storeRelaxed(0);
+        Site.samplingSessionId.storeRelaxed(0);
+        Site.functionIdentity.storeRelaxed(0);
+        Site.kind.storeRelaxed(0);
+        Site.siteIndex.storeRelaxed(0);
+        Site.total.storeRelaxed(0);
+        for (uint32_t I = 0; I < kEJitVpK; ++I) {
+          Site.cand[I].value.storeRelaxed(0);
+          Site.cand[I].count.storeRelaxed(0);
+        }
+      }
 }
 
 //===----------------------------------------------------------------------===//
@@ -273,15 +563,22 @@ static void ejitVpDrain() {
 }
 
 static void ejitVpCollectAndClear(EJitVpPayload &payload,
-                                  std::vector<EJitVpSiteSample> &out) {
+                                  std::vector<EJitVpSiteSample> &out,
+                                  uint64_t onlySession = 0) {
   for (uint32_t s = 0; s < kEJitVpSitesPerCore; ++s) {
     EJitVpSite &site = payload.sites[s];
     const uint64_t key = site.siteKey.loadRelaxed();
     if (key == 0)
       continue;
+    const uint64_t SessionId = site.samplingSessionId.loadRelaxed();
+    if (onlySession != 0 && SessionId != onlySession)
+      continue;
 
     EJitVpSiteSample sample;
-    sample.siteKey = key;
+    sample.siteKey =
+        ejitVpSiteKey(site.functionIdentity.loadRelaxed(),
+                      site.kind.loadRelaxed(), site.siteIndex.loadRelaxed());
+    sample.samplingSessionId = SessionId;
     sample.total = site.total.loadRelaxed();
     for (uint32_t i = 0; i < kEJitVpK; ++i) {
       sample.values[i] = site.cand[i].value.loadRelaxed();
@@ -289,6 +586,10 @@ static void ejitVpCollectAndClear(EJitVpPayload &payload,
     }
 
     site.siteKey.storeRelaxed(0);
+    site.samplingSessionId.storeRelaxed(0);
+    site.functionIdentity.storeRelaxed(0);
+    site.kind.storeRelaxed(0);
+    site.siteIndex.storeRelaxed(0);
     site.total.storeRelaxed(0);
     for (uint32_t i = 0; i < kEJitVpK; ++i) {
       site.cand[i].value.storeRelaxed(0);
@@ -303,9 +604,11 @@ static void ejitVpCollectAndClear(EJitVpPayload &payload,
   }
 }
 
-bool ejit::ejitVpTakeSnapshot(std::vector<EJitVpSiteSample> &out) {
+static bool ejitVpTakeSnapshotImpl(uint64_t OnlySession,
+                                   std::vector<EJitVpSiteSample> &out) {
   if (!ejitVpEnsureInitialized())
     return false;
+  bool Complete = true;
 
   // Flip every core's generation: producers observing the new value write the
   // OTHER half from now on. fetchAdd(1) = release on the flip, acquire of prior
@@ -322,9 +625,10 @@ bool ejit::ejitVpTakeSnapshot(std::vector<EJitVpSiteSample> &out) {
     // generation flip makes it visible to producers.
     if (shard.writers[next].loadAcquire() != 0) {
       retired[c] = 2u;
+      Complete = false;
       continue;
     }
-    ejitVpCollectAndClear(shard.payload[next], out);
+    ejitVpCollectAndClear(shard.payload[next], out, OnlySession);
     retired[c] = shard.generation.fetchAdd(1) & 1u;
   }
 
@@ -336,11 +640,65 @@ bool ejit::ejitVpTakeSnapshot(std::vector<EJitVpSiteSample> &out) {
     if (retired[c] > 1u)
       continue;
     EJitVpShard &shard = gEJitVpState.shards[c];
-    if (shard.writers[retired[c]].loadAcquire() != 0)
+    if (shard.writers[retired[c]].loadAcquire() != 0) {
+      Complete = false;
       continue;
-    ejitVpCollectAndClear(shard.payload[retired[c]], out);
+    }
+    ejitVpCollectAndClear(shard.payload[retired[c]], out, OnlySession);
   }
-  return true;
+  EJitVpSessionSlot *RetiringSlot = nullptr;
+  if (Complete && OnlySession != 0 && OnlySession != kEJitVpLegacySessionId) {
+    for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+      EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+      if (Slot.samplingSessionId.loadAcquire() != OnlySession)
+        continue;
+      uint64_t FreeGate = 0;
+      if (!Slot.gate.compareExchange(FreeGate, kVpGateTransition))
+        Complete = false;
+      else if (Slot.samplingSessionId.loadAcquire() == OnlySession)
+        RetiringSlot = &Slot;
+      else
+        Slot.gate.storeRelease(0);
+      break;
+    }
+  }
+  if (Complete && OnlySession != 0 && OnlySession != kEJitVpLegacySessionId) {
+    for (uint32_t I = 0; I < kEJitVpMaxProfdBindings; ++I) {
+      EJitVpProfdBinding &Binding = gEJitVpState.profdBindings[I];
+      if (Binding.samplingSessionId.loadAcquire() != OnlySession)
+        continue;
+      ejitVpPublishBinding(Binding, 0, 0);
+    }
+    if (RetiringSlot) {
+      RetiringSlot->retireState.storeRelaxed(kVpRetireNormal);
+      RetiringSlot->requestAttemptToken.storeRelaxed(0);
+      RetiringSlot->samplingSessionId.storeRelease(0);
+      RetiringSlot->gate.storeRelease(0);
+    }
+  }
+  return Complete;
+}
+
+bool ejit::ejitVpTakeSnapshot(std::vector<EJitVpSiteSample> &out) {
+  return ejitVpTakeSnapshotImpl(0, out);
+}
+
+bool ejit::ejitVpTakeSessionSnapshot(uint64_t SamplingSessionId,
+                                     std::vector<EJitVpSiteSample> &out) {
+  if (!SamplingSessionId)
+    return false;
+  if (SamplingSessionId != kEJitVpLegacySessionId)
+    for (uint32_t I = 0; I < kEJitVpMaxSessions; ++I) {
+      EJitVpSessionSlot &Slot = gEJitVpState.sessions[I];
+      if (Slot.samplingSessionId.loadAcquire() == SamplingSessionId &&
+          ejitVpPinSessionSlot(Slot)) {
+        if (Slot.samplingSessionId.loadAcquire() == SamplingSessionId)
+          ejitVpCloseSessionGate(Slot);
+        Slot.gate.fetchSub(kVpGateRef);
+        break;
+      }
+    }
+  return ejitVpTakeSnapshotImpl(SamplingSessionId, out);
 }
 
 void ejit::ejitVpBumpMergeCounts(uint64_t icSites, uint64_t memopSites,

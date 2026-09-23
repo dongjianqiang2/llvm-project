@@ -317,6 +317,8 @@ public:
                                    void **outFn);
   using PublishCallback = void (*)(void *ctx, const EJitCompileRequest &req,
                                    bool published);
+  using PgoLifecycleDropCallback = void (*)(void *ctx,
+                                            const EJitCompileRequest &req);
 
   struct CompileOrGetResult {
     EJitCompileOrGetStatus status = EJitCompileOrGetStatus::CompileFailed;
@@ -348,6 +350,10 @@ public:
   void setPublishCallback(PublishCallback fn, void *ctx) {
     publishFn_ = fn;
     publishCtx_ = ctx;
+  }
+  void setPgoLifecycleDropCallback(PgoLifecycleDropCallback fn, void *ctx) {
+    pgoLifecycleDropFn_ = fn;
+    pgoLifecycleDropCtx_ = ctx;
   }
 
   /// Install the optional physical-code release callback used when publish
@@ -454,6 +460,8 @@ private:
   void *compileCtx_ = nullptr;
   PublishCallback publishFn_ = nullptr;
   void *publishCtx_ = nullptr;
+  PgoLifecycleDropCallback pgoLifecycleDropFn_ = nullptr;
+  void *pgoLifecycleDropCtx_ = nullptr;
   // Value-initialized: EJitAtomic now has a trivial default ctor (so the shared
   // state blob needs no dynamic init / .init_array), so this heap-resident
   // counters block zeroes itself explicitly rather than via the atomic ctor.

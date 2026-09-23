@@ -48,9 +48,12 @@ struct EJitVpFunctionInfo {
 class EJitOptimizer {
 public:
   EJitOptimizer(PeriodArrayRegistry &reg);
+  /// Fixed cold-path policy, explicit for focused testing of both modes.
+  /// This is not a runtime version-sharing enable/switch API.
+  EJitOptimizer(PeriodArrayRegistry &reg, bool PreserveDimensions);
 
   /// Run the full JIT specialization pipeline:
-  ///   1. Parameter substitution (ejit_period_arr_ind → constants)
+  ///   1. Parameter substitution, or analysis-only dim values in preserved mode
   ///   2. InstCombine (fold GEP chains from substituted params)
   ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
   ///   4. StructFieldPass (may_const loads → runtime constants)
@@ -146,7 +149,9 @@ private:
   /// constant-index GEPs, then does a final cleanup. `level` is accepted for
   /// ABI compatibility and does not affect the pipeline.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
-                               CompileTier tier);
+                               CompileTier tier,
+                               const SpecializationContext &ctx =
+                                   SpecializationContext());
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,
@@ -160,6 +165,7 @@ private:
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
+  const bool preserveDimensions_;
 
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.

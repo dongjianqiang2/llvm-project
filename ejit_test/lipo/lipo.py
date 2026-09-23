@@ -356,7 +356,9 @@ def doit_gc_merge(args):
     # Optional roots are retained only when the input runtime defines them, so
     # taskpool-OFF archives do not acquire unresolved taskpool symbols.
     ejit_api = [
-        "ejit_init", "ejit_init_pgo", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
+        "ejit_init", "ejit_init_pgo", "ejit_init_representative",
+        "ejit_representative_get_stats", "ejit_representative_deactivate_begin",
+        "ejit_representative_borrow_status", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
         "ejit_activate_all", "ejit_deactivate_all", "ejit_is_active",
         "ejit_get_stats",
         "ejit_register_symbol", "ejit_register_bitcode",
@@ -389,6 +391,7 @@ def doit_gc_merge(args):
         "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
         "ejit_print_dumped_module", "ejit_dump_all",
         "ejit_print_mayconst_ranking",
+        "ejit_reuse_diag_print", "ejit_reuse_diag_config", "ejit_reuse_diag_reset",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
         # runtime, so gc-merge's --gc-sections would discard it without this GC

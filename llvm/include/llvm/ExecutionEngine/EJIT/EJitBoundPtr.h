@@ -26,9 +26,11 @@ namespace ejit {
 /// Maximum number of bound pointer parameters carried by one request.
 constexpr uint32_t kEJitMaxBoundPointers = 8u;
 
-/// Fixed-layout transport descriptor. The pointer is borrowed and is valid
-/// only until the compile callback returns; it is never dereferenced by queue,
-/// deduplication, retry, or publication code.
+/// Fixed-layout transport descriptor. Under the default protocol the pointer
+/// is borrowed only until the compile callback returns. The opt-in shared
+/// request-attempt protocol extends that borrow through the attempt's final
+/// compiler read. Queue, deduplication, retry and publication code never
+/// dereference it.
 struct EJitBoundPtrDescriptor {
   const void *rawPtr;
   uint32_t size;

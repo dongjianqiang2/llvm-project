@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
@@ -43,6 +44,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -166,7 +168,9 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
   {
     LLVMContext Ctx;
     Module M("nested_entries", Ctx);
-    M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    // This test executes the generated function, so its IR must target the
+    // host running the test rather than assuming an x86_64 build machine.
+    M.setTargetTriple(Triple(sys::getDefaultTargetTriple()));
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *FT = FunctionType::get(I32, {I32}, false);
     auto EntryMD = [&]() {
@@ -212,6 +216,9 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
       Engine->loadBitcodeModule(Bitcode, Ctx.cacheKey, Ctx.fnName)));
   auto FnOrErr = Engine->lookup(Ctx.cacheKey, Ctx.fnName);
   ASSERT_TRUE(static_cast<bool>(FnOrErr));
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+  ASSERT_FALSE(errorToBool(Engine->flushPendingCode()));
+#endif
   Engine->setActiveContext(nullptr);
 
   using FnTy = int (*)(int);
@@ -227,6 +234,9 @@ TEST(EJitOrcEngine, NestedEntryResolvesThroughRegisteredWrapper) {
       Engine->loadBitcodeModule(Bitcode, Ctx.cacheKey, Ctx.fnName)));
   FnOrErr = Engine->lookup(Ctx.cacheKey, Ctx.fnName);
   ASSERT_TRUE(static_cast<bool>(FnOrErr));
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+  ASSERT_FALSE(errorToBool(Engine->flushPendingCode()));
+#endif
   Engine->setActiveContext(nullptr);
   Fn = reinterpret_cast<FnTy>(*FnOrErr);
   EXPECT_EQ(Fn(5), 6);
@@ -257,6 +267,7 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
 // here because it conflicts with the local extern "C" test declarations further
 // down (which intentionally use a private signature for the C API).
 static constexpr int kEjitStatusOk = 0;             // EJIT_OK
+static constexpr int kEjitStatusInvalidParam = -1;  // EJIT_ERR_INVALID_PARAM
 static constexpr int kEjitStatusCompileFailed = -3; // EJIT_ERR_COMPILE_FAILED
 
 //===----------------------------------------------------------------------===//
@@ -883,6 +894,84 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
 }
 #endif // EJIT_SRE_TASKPOOL
 
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+TEST(EJit, PublicSymbolRegistrationFollowsFreezeContract) {
+  int OriginalValue = 7;
+  int ReplacementValue = 9;
+  const char *Symbol = "public_registration_contract_value";
+#ifdef EJIT_SRE_TASKPOOL
+  EJitRegistrationStore::instance().registerSymbol(Symbol, &OriginalValue);
+#endif
+  EJit ejit(Config{});
+  ASSERT_FALSE(ejit.initFailed());
+  ASSERT_NE(ejit.compileDriver(), nullptr);
+  const size_t Before =
+      ejit.compileDriver()->stagedUserSymbolCountForTest();
+
+  std::string Bitcode;
+  {
+    LLVMContext Ctx;
+    Module M("public_registration_contract", Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *Value = new GlobalVariable(M, I32, false,
+        GlobalValue::ExternalLinkage, nullptr, Symbol);
+    auto *F = Function::Create(FunctionType::get(I32, false),
+        GlobalValue::ExternalLinkage, "read_public_binding", M);
+    F->setMetadata(MD_EJIT_METADATA,
+                   MDNode::get(Ctx, {MDNode::get(
+                       Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY))}));
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    B.CreateRet(B.CreateLoad(I32, Value));
+    raw_string_ostream OS(Bitcode);
+    WriteBitcodeToFile(M, OS);
+  }
+  using ReadValue = int (*)();
+  ReadValue Published = nullptr;
+  auto CompileAndRead = [&](uint64_t Key) {
+    ASSERT_TRUE(ejit.compileDriver()->ensureJitEngine());
+    auto *Engine = ejit.compileDriver()->getJitEngine();
+    SpecializationContext Ctx;
+    Ctx.fnName = "read_public_binding";
+    Ctx.cacheKey = Key;
+    Engine->setActiveContext(&Ctx);
+    auto LoadError = Engine->loadBitcodeModule(Bitcode, Key, Ctx.fnName);
+    if (LoadError) {
+      Engine->setActiveContext(nullptr);
+      FAIL() << toString(std::move(LoadError));
+    }
+    auto Fn = Engine->lookup(Key, Ctx.fnName);
+    Engine->setActiveContext(nullptr);
+    if (!Fn)
+      FAIL() << toString(Fn.takeError());
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+    auto FlushError = Engine->flushPendingCode();
+    if (FlushError)
+      FAIL() << toString(std::move(FlushError));
+#endif
+    Published = reinterpret_cast<ReadValue>(*Fn);
+    EXPECT_EQ(Published(), OriginalValue);
+  };
+
+#ifdef EJIT_SRE_TASKPOOL
+  ASSERT_TRUE(ejit.registrationFrozen());
+  CompileAndRead(0xc101);
+  ASSERT_NE(Published, nullptr);
+  auto OriginalCode = Published;
+  ejit.registerSymbol(Symbol, &ReplacementValue);
+  EXPECT_EQ(ejit.compileDriver()->stagedUserSymbolCountForTest(), Before);
+  CompileAndRead(0xc102);
+  EXPECT_EQ(OriginalCode(), OriginalValue);
+#else
+  // Legacy EJit keeps the public C++ registration phase open after
+  // construction; this is the pre-freeze half of the contract.
+  ASSERT_FALSE(ejit.registrationFrozen());
+  ejit.registerSymbol(Symbol, &OriginalValue);
+  EXPECT_EQ(ejit.compileDriver()->stagedUserSymbolCountForTest(), Before + 1);
+  CompileAndRead(0xc101);
+#endif
+}
+#endif // EJIT_SRE_TASKPOOL_TESTING
+
 //===----------------------------------------------------------------------===//
 // C API tests with runtime-dynamic cellIdx (T3-21)
 //===----------------------------------------------------------------------===//
@@ -914,6 +1003,7 @@ extern void ejit_invalidate(const char *, uint32_t);
 extern void ejit_clear_cache(void);
 extern void ejit_register_period_array(const char *, const char *, void *,
                                        uint64_t);
+extern void ejit_register_symbol(const char *, void *);
 extern void ejit_register_bitcode(const char *, const uint8_t *, uint64_t);
 extern void ejit_register_static_var(const char *, void *);
 extern void ejit_register_lifecycle(const char *, uint32_t *);
@@ -1183,6 +1273,13 @@ TEST(EJitCApiTaskpool, SingleBoundRejectsEmptyObject) {
 // ejit_init; post-init register_* calls are rejected and mutate nothing.
 TEST(EJitCApiTaskpool, RegistrationFrozenAfterInit) {
   resetTaskpoolRegState();
+  int PreInitSymbol = 7;
+  ejit_register_symbol("pre_init_symbol", &PreInitSymbol);
+  auto Staged = EJitRegistrationStore::instance().consume();
+  ASSERT_EQ(Staged.userSymbols.size(), 1u);
+  EXPECT_EQ(Staged.userSymbols[0].name, "pre_init_symbol");
+  EXPECT_EQ(Staged.userSymbols[0].addr, &PreInitSymbol);
+  ejit_register_symbol("pre_init_symbol", &PreInitSymbol);
   ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   // A period registered AFTER init is rejected (frozen): the name is therefore
   // not a registered period, so activate cannot find it.
@@ -1190,9 +1287,17 @@ TEST(EJitCApiTaskpool, RegistrationFrozenAfterInit) {
   ejit_register_period_array("post_period", "arr", arr, 8); // frozen no-op
   EXPECT_NE(ejit_activate("post_period", 0), EJIT_OK_C);
   EXPECT_FALSE(ejit_is_active("post_period", 0));
+  auto PeriodError = EJitRegistrationStore::instance().consumeError();
+  EXPECT_EQ(PeriodError.code, kEjitStatusInvalidParam);
+  EXPECT_EQ(PeriodError.funcName, "post_period");
   // Bitcode / static-var registration after init is likewise frozen (no crash,
   // no mutation). The void ABI cannot return a status; the key invariant is
   // that nothing observable changes.
+  int symbol = 0;
+  ejit_register_symbol("post_symbol", &symbol);
+  auto SymbolError = EJitRegistrationStore::instance().consumeError();
+  EXPECT_EQ(SymbolError.code, kEjitStatusInvalidParam);
+  EXPECT_EQ(SymbolError.funcName, "post_symbol");
   const uint8_t bc[] = {1, 2, 3, 4};
   ejit_register_bitcode("post_fn", bc, sizeof(bc));
   int sv = 0;
@@ -1265,7 +1370,15 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                             &missFnStandIn);
   ejit_register_icache_slot("guarded_c_fn", &guardedCells[0], 1, nullptr);
 
-  EJit ejit(Config{});
+  // This test pins the C-ABI sentinel/guarded registration contract itself.
+  // Keep it out of the profile window: in an audit build Config{} enables the
+  // default profile-audit mode, whose icacheFill guard must reject the fake
+  // unpublished pointers used below. The audit/PGO rejection and real Tier-2
+  // fill are covered by SharedPgoInlineCacheWaitsForTier2.
+  Config TestConfig;
+  TestConfig.enablePgo = false;
+  TestConfig.enableProfileAudit = false;
+  EJit ejit(TestConfig);
   ASSERT_FALSE(ejit.initFailed());
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
@@ -3991,7 +4104,7 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   auto AuditSites = sp.collectMayConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u)
       << "audit must recognize metadata-marked may_const loads";
-  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
+  EXPECT_EQ(AuditSites.front().globalName, "g_plain");
   EXPECT_TRUE(AuditSites.front().hasFieldOffset);
 #endif
   auto PA = sp.run(*F, H.FAM);

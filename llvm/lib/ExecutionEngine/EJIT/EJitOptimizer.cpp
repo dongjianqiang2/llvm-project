@@ -8,6 +8,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitPreparedCode.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
@@ -72,7 +73,19 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 }
 #endif
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
+namespace {
+#ifdef EJIT_EXPERIMENTAL_PRESERVED_DIMS
+constexpr bool DefaultPreservedDimensions = true;
+#else
+constexpr bool DefaultPreservedDimensions = false;
+#endif
+} // namespace
+
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
+    : EJitOptimizer(reg, DefaultPreservedDimensions) {}
+
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, bool PreserveDimensions)
+    : registry_(reg), preserveDimensions_(PreserveDimensions) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
@@ -126,13 +139,17 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
 }
 
 void EJitOptimizer::clearAnalyses() {
+  MAM_.clear();
+  CGAM_.clear();
   FAM_.clear();
   LAM_.clear();
-  CGAM_.clear();
-  MAM_.clear();
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
+  if (ctx.candidateCapture) {
+    EJitStructFieldPass::tagFrozenSites(M);
+    ctx.candidateCapture->frozen.captured = true;
+  }
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
@@ -166,8 +183,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #endif
 
-  // Phase 1 - specialize (common to all tiers): turn the period index and
-  // every may_const field into a compile-time constant.
+  // Phase 1 is common to Gen/Use. In preserved mode, period values exist
+  // only in the load evaluator; the real arguments remain in executable IR.
   applyBoundPointerFacts(M, ctx);
   preReplacePeriodIndices(M, ctx);
   runInstCombine(M);
@@ -232,6 +249,14 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     // Gen/Use prefix (identical to Tier-2) so the CFG - and thus the PGO
     // hash - matches. No mainFPM_: Tier-1 is temporary, lightly optimized.
     runLightOptPipeline(M);
+    if (ctx.candidateCapture)
+      ctx.candidateCapture->capturePrefix(M);
+    // Provenance has been copied out; do not carry diagnostics into PGO schema
+    // or emitted code. Canonical identity also strips it defensively.
+    for (Function &F : M)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          I.setMetadata(FrozenSiteMD, nullptr);
     ModulePassManager GenMPM;
     GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
     // Tier-1 machine code is SHARED and executed concurrently by multiple cores
@@ -257,13 +282,66 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     if (EnableValueProfile) {
       for (Function &F : M.functions())
         if (!F.isDeclaration())
-          runValueProfileOnFunction(F, FAM_, EJitValueProfileMode::Instrument,
-                                    [this](StringRef name, uint32_t count) {
-                                      recordScalarSiteCount(name, count);
-                                    });
+          runValueProfileOnFunction(
+              F, FAM_, EJitValueProfileMode::Instrument,
+              [this](StringRef name, uint32_t count) {
+                recordScalarSiteCount(name, count);
+              },
+              ctx.samplingSessionId);
     }
 #endif
     captureCounterGlobals(M);
+    // Complete the candidate only after extracting the schema produced by
+    // this exact prefix. This is still IR-only work; the caller can skip ORC
+    // emission when the result joins an existing representative group.
+    if (ctx.candidateCapture) {
+      std::vector<PgoFunctionSchema> Schema;
+      for (StringRef PgoName : lastCounterNames_) {
+        std::string ProfcName = ("__profc_" + PgoName).str();
+        std::string ProfdName = ("__profd_" + PgoName).str();
+        auto *Profc = M.getGlobalVariable(ProfcName, true);
+        auto *Profd = M.getGlobalVariable(ProfdName, true);
+        auto *Counters = Profc ? dyn_cast<ArrayType>(Profc->getValueType())
+                               : nullptr;
+        auto *Data = Profd
+                         ? dyn_cast_or_null<ConstantStruct>(
+                               Profd->getInitializer())
+                         : nullptr;
+        if (!Counters || !Data || Data->getNumOperands() < 8) {
+          Schema.clear();
+          break;
+        }
+        auto *NameHash = dyn_cast<ConstantInt>(Data->getOperand(0));
+        auto *FuncHash = dyn_cast<ConstantInt>(Data->getOperand(1));
+        auto *ValueSites = dyn_cast<Constant>(Data->getOperand(7));
+        auto *IcSites = ValueSites
+                            ? dyn_cast_or_null<ConstantInt>(
+                                  ValueSites->getAggregateElement(0u))
+                            : nullptr;
+        auto *MemSites = ValueSites
+                             ? dyn_cast_or_null<ConstantInt>(
+                                   ValueSites->getAggregateElement(1u))
+                             : nullptr;
+        if (!NameHash || !FuncHash || !IcSites || !MemSites) {
+          Schema.clear();
+          break;
+        }
+        PgoFunctionSchema S;
+        S.pgoName = PgoName.str();
+        S.funcHash = FuncHash->getZExtValue();
+        S.pgoNameHash = NameHash->getZExtValue();
+        S.numCounters = static_cast<uint32_t>(Counters->getNumElements());
+        S.numIcSites = static_cast<uint32_t>(IcSites->getZExtValue());
+        S.numMemSites = static_cast<uint32_t>(MemSites->getZExtValue());
+        for (const EJitVpFunctionInfo &Info : lastVpFunctions_)
+          if (Info.pgoHash == S.pgoNameHash) {
+            S.numScalarSites = Info.numScalarSites;
+            break;
+          }
+        Schema.push_back(std::move(S));
+      }
+      ctx.candidateCapture->complete(Schema);
+    }
     EJIT_DIAG_VERBOSE(
         "pipeline done (Tier-1) func=%s key=0x%016lx counters=%zu",
         ctx.fnName.c_str(), ctx.cacheKey, lastCounterNames_.size());
@@ -343,7 +421,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline, ctx);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -402,7 +480,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier, ctx);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -414,7 +492,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier, ctx);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -781,6 +859,8 @@ void EJitOptimizer::applyBoundPointerFacts(Module &M,
 
 void EJitOptimizer::preReplacePeriodIndices(Module &M,
                                             const SpecializationContext &ctx) {
+  if (preserveDimensions_)
+    return;
   LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
   for (Function &F : M.functions()) {
@@ -883,7 +963,9 @@ void EJitOptimizer::runStructFieldPass(Module &M,
             }
           }
         for (const auto &Dim : ctx.dimensions)
-          if (Dim.periodName == BoundPeriodName) {
+          if (Dim.periodName == BoundPeriodName &&
+              (!preserveDimensions_ ||
+               View.periodInstance == std::numeric_limits<uint32_t>::max())) {
             View.periodInstance = Dim.cellIdx;
             break;
           }
@@ -891,10 +973,19 @@ void EJitOptimizer::runStructFieldPass(Module &M,
     }
   }
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
+  if (ctx.candidateCapture)
+    structField.frozenCapture = &ctx.candidateCapture->frozen;
+  if (preserveDimensions_)
+    structField.setPreservedDimensions(ctx);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       structField.run(F, FAM_);
+  // This pass is invoked directly, not through a pass manager. Its load RAUW
+  // invalidates cached function AND module/call-graph results. Keep analysis
+  // registration but discard cached IR results before the next pipeline step.
+  if (preserveDimensions_)
+    clearAnalyses();
 }
 
 void EJitOptimizer::runStructFieldPass(Module &M) {
@@ -917,7 +1008,8 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             ejit::OptimizationLevel level,
-                                            CompileTier tier) {
+                                            CompileTier tier,
+                                            const SpecializationContext &ctx) {
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -938,7 +1030,10 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M);
+  if (preserveDimensions_)
+    runStructFieldPass(M, ctx);
+  else
+    runStructFieldPass(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);
