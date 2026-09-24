@@ -3,7 +3,7 @@
 ; Hand-written IR bypasses Clang Sema, so wrapper generation must enforce the
 ; same eight-descriptor limit before emitting a runtime-rejected _bound_v call.
 
-; CHECK: error: ejit-wrapper-gen: function has 9 ejit_bound_ptr parameters; at most 8 are supported
+; CHECK: error: {{.*}}in function too_many_bound_ptrs{{.*}}ejit-wrapper-gen: function has 9 ejit_bound_ptr parameters (argument indices 1, 2, 3, 4, 5, 6, 7, 8, 9); at most 8 are supported
 
 define i32 @too_many_bound_ptrs(i32 %cell, ptr %p0, ptr %p1, ptr %p2,
                                  ptr %p3, ptr %p4, ptr %p5, ptr %p6,

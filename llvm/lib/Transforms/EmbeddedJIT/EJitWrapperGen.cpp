@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "EJitDiagnostics.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -31,6 +32,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <limits>
@@ -653,10 +655,23 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       if (!PI.PeriodName.empty())
         DimTypeGlobals.emplace(PI.PeriodName, nullptr);
   if (DimTypeGlobals.size() > kEJitMaxDimTypes) {
+    // No single function to anchor at; name the offending lifecycles instead.
+    std::string Names;
+    unsigned N = 0;
+    for (const auto &KV : DimTypeGlobals) {
+      if (N++ >= 8) {
+        Names += ", ...";
+        break;
+      }
+      if (N > 1)
+        Names += ", ";
+      Names += ("'" + KV.first + "'");
+    }
     Ctx.emitError("ejit-wrapper-gen: module references " +
                   Twine(DimTypeGlobals.size()) +
                   " distinct lifecycle dimensions but at most " +
-                  Twine(kEJitMaxDimTypes) + " are supported (spec §5.1)");
+                  Twine(kEJitMaxDimTypes) + " are supported (spec §5.1): " +
+                  Names);
     return PreservedAnalyses::all();
   }
   for (auto &KV : DimTypeGlobals)
@@ -731,18 +746,25 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     unsigned DimCount = PeriodInds.size();
 
     if (BoundPtrs.size() > MAX_BOUND_PTR_PARAMS) {
-      F->getContext().emitError("ejit-wrapper-gen: function has " +
-                                Twine(BoundPtrs.size()) +
-                                " ejit_bound_ptr parameters; at most " +
-                                Twine(MAX_BOUND_PTR_PARAMS) + " are supported");
+      std::string Idxs;
+      for (unsigned K = 0; K < BoundPtrs.size(); ++K) {
+        if (K)
+          Idxs += ", ";
+        Idxs += Twine(BoundPtrs[K].ArgIndex).str();
+      }
+      emitFunctionError(*F, "ejit-wrapper-gen",
+                        "function has " + Twine(BoundPtrs.size()) +
+                            " ejit_bound_ptr parameters (argument indices " +
+                            Idxs + "); at most " + Twine(MAX_BOUND_PTR_PARAMS) +
+                            " are supported");
       continue;
     }
 
     if (DimCount > EJIT_ICACHE_MAX_DIMS) {
-      F->getContext().emitError("ejit-wrapper-gen: more than "
-                                + Twine(EJIT_ICACHE_MAX_DIMS) +
-                                " ejit_period_arr_ind dimensions are not "
-                                "supported");
+      emitFunctionError(*F, "ejit-wrapper-gen",
+                        "function declares " + Twine(DimCount) +
+                            " ejit_period_arr_ind dimensions; at most " +
+                            Twine(EJIT_ICACHE_MAX_DIMS) + " are supported");
       continue;
     }
 
@@ -753,35 +775,60 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // arg indices/types must be in range. The dimType slot itself is resolved
     // at runtime via the global, never baked here.
     bool Invalid = false;
-    SmallVector<StringRef, 4> SeenNames;
+    // Period name -> ArgIndex of its first occurrence, so a duplicate can
+    // report both argument positions.
+    SmallVector<std::pair<StringRef, unsigned>, 4> SeenNames;
     unsigned ArgCount = F->arg_size();
     for (unsigned I = 0; I < DimCount; ++I) {
       auto GIt = DimTypeGlobals.find(PeriodInds[I].PeriodName);
       if (PeriodInds[I].PeriodName.empty() || GIt == DimTypeGlobals.end()) {
-        F->getContext().emitError("ejit-wrapper-gen: invalid period name in "
-                                  "ejit_period_arr_ind: " +
-                                  PeriodInds[I].PeriodName);
+        emitFunctionError(*F, "ejit-wrapper-gen",
+                          "ejit_period_arr_ind dimension " + Twine(I) +
+                              " has an empty or unknown period name "
+                              "(argument " +
+                              Twine(PeriodInds[I].ArgIndex) + ")");
         Invalid = true;
         break;
       }
-      if (llvm::is_contained(SeenNames, StringRef(PeriodInds[I].PeriodName))) {
-        F->getContext().emitError("ejit-wrapper-gen: duplicated lifecycle "
-                                  "dimension in ejit_period_arr_ind metadata");
+      auto *First = llvm::find_if(SeenNames, [&](const auto &Seen) {
+        return Seen.first == PeriodInds[I].PeriodName;
+      });
+      if (First != SeenNames.end()) {
+        emitFunctionError(*F, "ejit-wrapper-gen",
+                          "duplicated lifecycle dimension '" +
+                              PeriodInds[I].PeriodName +
+                              "' in ejit_period_arr_ind metadata (arguments " +
+                              Twine(First->second) + " and " +
+                              Twine(PeriodInds[I].ArgIndex) +
+                              "); each lifecycle may be indexed by only one "
+                              "parameter");
         Invalid = true;
         break;
       }
-      SeenNames.push_back(PeriodInds[I].PeriodName);
+      SeenNames.emplace_back(PeriodInds[I].PeriodName,
+                             PeriodInds[I].ArgIndex);
 
       if (PeriodInds[I].ArgIndex >= ArgCount) {
-        F->getContext().emitError("ejit-wrapper-gen: ejit_period_arr_ind "
-                                  "argument index out of range");
+        emitFunctionError(*F, "ejit-wrapper-gen",
+                          "ejit_period_arr_ind dimension " + Twine(I) + " ('" +
+                              PeriodInds[I].PeriodName +
+                              "') references argument " +
+                              Twine(PeriodInds[I].ArgIndex) +
+                              " but the function has only " + Twine(ArgCount) +
+                              " arguments");
         Invalid = true;
         break;
       }
       Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
       if (!ArgVal->getType()->isIntegerTy()) {
-        F->getContext().emitError("ejit-wrapper-gen: ejit_period_arr_ind "
-                                  "argument must be an integer type");
+        std::string TyStr;
+        raw_string_ostream TyOS(TyStr);
+        TyOS << *ArgVal->getType();
+        emitFunctionError(*F, "ejit-wrapper-gen",
+                          "ejit_period_arr_ind dimension " + Twine(I) + " ('" +
+                              PeriodInds[I].PeriodName + "') argument " +
+                              Twine(PeriodInds[I].ArgIndex) +
+                              " has non-integer type " + TyStr);
         Invalid = true;
         break;
       }
@@ -795,16 +842,40 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           llvm::count_if(PeriodInds, [&](const PeriodArrIndInfo &I) {
             return I.PeriodName == BoundPtr.PeriodName;
           });
-      if (BoundPtr.ArgIndex >= ArgCount ||
-          !F->getArg(BoundPtr.ArgIndex)->getType()->isPointerTy() ||
-          BoundPtr.PointeeSize == 0 ||
-          BoundPtr.PointeeSize > std::numeric_limits<uint32_t>::max() ||
-          MatchingDims != 1) {
-        F->getContext().emitError(
-            "ejit-wrapper-gen: invalid ejit_bound_ptr metadata");
-        Invalid = true;
-        break;
+      if (BoundPtr.ArgIndex < ArgCount &&
+          F->getArg(BoundPtr.ArgIndex)->getType()->isPointerTy() &&
+          BoundPtr.PointeeSize != 0 &&
+          BoundPtr.PointeeSize <= std::numeric_limits<uint32_t>::max() &&
+          MatchingDims == 1)
+        continue;
+      std::string Reason;
+      if (BoundPtr.ArgIndex >= ArgCount) {
+        Reason = ("argument index " + Twine(BoundPtr.ArgIndex) +
+                  " is out of range (the function has " + Twine(ArgCount) + ")")
+                     .str();
+      } else if (!F->getArg(BoundPtr.ArgIndex)->getType()->isPointerTy()) {
+        std::string TyStr;
+        raw_string_ostream TyOS(TyStr);
+        TyOS << *F->getArg(BoundPtr.ArgIndex)->getType();
+        Reason = "argument " + Twine(BoundPtr.ArgIndex).str() +
+                 " has non-pointer type " + TyStr;
+      } else if (BoundPtr.PointeeSize == 0) {
+        Reason = "pointee size is zero";
+      } else if (BoundPtr.PointeeSize >
+                 std::numeric_limits<uint32_t>::max()) {
+        Reason = ("pointee size " + Twine(BoundPtr.PointeeSize) +
+                  " exceeds the 32-bit metadata field")
+                     .str();
+      } else {
+        Reason = "there is no matching ejit_period_arr_ind('" +
+                 BoundPtr.PeriodName + "') dimension";
       }
+      emitFunctionError(*F, "ejit-wrapper-gen",
+                        "invalid ejit_bound_ptr metadata for period '" +
+                            BoundPtr.PeriodName + "' (argument " +
+                            Twine(BoundPtr.ArgIndex) + "): " + Reason);
+      Invalid = true;
+      break;
     }
 
     if (Invalid)
