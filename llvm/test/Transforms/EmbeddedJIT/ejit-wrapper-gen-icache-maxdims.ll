@@ -3,7 +3,7 @@
 ; which the inline cache mirrors as EJIT_ICACHE_MAX_DIMS.)
 
 ; RUN: not opt -passes=ejit-wrapper-gen -ejit-inline-cache -S %s 2>&1 | FileCheck %s
-; CHECK: error: ejit-wrapper-gen: more than 4 ejit_period_arr_ind dimensions are not supported
+; CHECK: error: {{.*}}in function five_dim_entry{{.*}}ejit-wrapper-gen: function declares 5 ejit_period_arr_ind dimensions; at most 4 are supported
 
 define i32 @five_dim_entry(i32 %a, i32 %b, i32 %c, i32 %d, i32 %e) !ejit.metadata !0 {
 entry:
