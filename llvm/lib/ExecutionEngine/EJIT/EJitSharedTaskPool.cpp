@@ -1163,6 +1163,59 @@ bool EJitSharedTaskPool::isPublishedTier2(uint32_t funcIndex, void *fnPtr,
 #endif
 }
 
+uint32_t EJitSharedTaskPool::classifyTier2PC(uintptr_t PC) {
+  if (!state_ || !PC)
+    return 0;
+  for (auto &B : state_->buckets) {
+    auto Classify = [&]() -> uint32_t {
+      const uint32_t Gen = state_->generation.loadAcquire();
+      for (auto &Slot : B.slots) {
+        if (Slot.state.loadAcquire() !=
+                static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+            Slot.generation != Gen ||
+            Slot.tier.loadRelaxed() != kEJitTierPgoUse ||
+            Slot.numDims > kEJitSharedMaxDims)
+          continue;
+        bool Current = true;
+        for (uint32_t I = 0; I < Slot.numDims; ++I)
+          Current &=
+              Slot.versions[I] ==
+              instanceVersion(Slot.dims[I].dimType, Slot.dims[I].instanceId);
+        if (!Current)
+          continue;
+        if (Slot.codeStart && PC >= Slot.codeStart &&
+            PC - Slot.codeStart < Slot.codeSize)
+          return 1;
+        if (Slot.cold.valid() && PC >= Slot.cold.codeStart &&
+            PC - Slot.cold.codeStart < Slot.cold.codeSize)
+          return 2;
+      }
+      return 0;
+    };
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    for (unsigned Attempt = 0; Attempt != 4; ++Attempt) {
+      uint32_t Seq;
+      if (!bucketSeqBegin(B, Seq))
+        continue;
+      const auto Kind = Classify();
+      if (!bucketSeqStable(B, Seq))
+        continue;
+      if (Kind)
+        return Kind;
+      break;
+    }
+#else
+    if (!bucketTryRead(B))
+      continue;
+    const auto Kind = Classify();
+    bucketReadRelease(B);
+    if (Kind)
+      return Kind;
+#endif
+  }
+  return 0;
+}
+
 EJitSharedTaskPool::SharedLookup
 EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                                 uint32_t numDims) {
@@ -1726,6 +1779,7 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   Snap.codeSize = Slot.codeSize;
   Snap.poolBase = Slot.poolBase;
   Snap.poolSize = Slot.poolSize;
+  Snap.cold = Slot.cold;
   // Snapshot the runtime-writable extents too: the per-core enable_rw must run
   // with NO bucket lock held (like the split/seal below). Keep the raw count so
   // prepareExecForCurrentCore stays the single authority that rejects an
@@ -2109,6 +2163,28 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
 
 bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
                                                    uint32_t self) {
+  if (R.cold.empty())
+    return prepareSingleExecForCurrentCore(R, self);
+  // Reject malformed companions before changing any permissions. The cold
+  // pool must be independent of the entire hot pool, including its data.
+  if (!fourKSeal_ || !R.cold.valid() || R.poolBase == 0 || R.poolSize == 0 ||
+      R.poolSize > UINTPTR_MAX - R.poolBase ||
+      !(R.cold.poolBase >= R.poolBase + R.poolSize ||
+        R.poolBase >= R.cold.poolBase + R.cold.poolSize))
+    return false;
+  PeerCodeRange Cold;
+  Cold.fn = reinterpret_cast<void *>(R.cold.codeStart);
+  Cold.codeStart = R.cold.codeStart;
+  Cold.codeSize = R.cold.codeSize;
+  Cold.poolBase = R.cold.poolBase;
+  Cold.poolSize = R.cold.poolSize;
+  // The caller records its prepared bit only after both preparations succeed.
+  return prepareSingleExecForCurrentCore(R, self) &&
+         prepareSingleExecForCurrentCore(Cold, self);
+}
+
+bool EJitSharedTaskPool::prepareSingleExecForCurrentCore(const PeerCodeRange &R,
+                                                         uint32_t self) {
   EJIT_DIAG_VERBOSE("prepareExec: core=%u fn=%p codeStart=0x%llx codeSize=%llu "
                     "poolBase=0x%llx fourK=%u",
                     self, R.fn, static_cast<unsigned long long>(R.codeStart),
@@ -2345,6 +2421,7 @@ EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
   }
   Target->codeStart = 0;
   Target->codeSize = 0;
+  Target->cold = {};
   Target->poolBase = 0;
   Target->poolSize = 0;
   Target->poolId = 0;
@@ -2414,6 +2491,7 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
   }
   Target->codeStart = 0;
   Target->codeSize = 0;
+  Target->cold = {};
   Target->poolBase = 0;
   Target->poolSize = 0;
   Target->poolId = 0;
@@ -2451,6 +2529,7 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
     Slot.executableCoreMask.storeRelease(0);
     Slot.codeStart = 0;
     Slot.codeSize = 0;
+    Slot.cold = {};
     Slot.poolBase = 0;
     Slot.poolSize = 0;
     Slot.poolId = 0;
@@ -2477,6 +2556,17 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     return EJitPublishStatus::InvalidParam;
   }
   uint32_t tier = decodeReqTier(req.funcIndex);
+  if (info && !info->cold.empty()) {
+    const auto &Cold = info->cold;
+    if (tier != kEJitTierPgoUse || !fourKSeal_ || !Cold.valid() ||
+        info->poolKind != EJitCodePoolKind::Near ||
+        info->codeSize == 0 ||
+        info->poolBase == 0 || info->poolSize == 0 ||
+        info->poolSize > UINTPTR_MAX - info->poolBase ||
+        !(Cold.poolBase >= info->poolBase + info->poolSize ||
+          info->poolBase >= Cold.poolBase + Cold.poolSize))
+      return EJitPublishStatus::InvalidParam;
+  }
   uint32_t fidx = stripReqTier(req.funcIndex);
   uint64_t key = hashIdentity(fidx, req.dims, req.numDims);
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
@@ -2544,6 +2634,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   if (info && info->codeSize != 0) {
     target->codeStart = info->codeStart;
     target->codeSize = info->codeSize;
+    target->cold = info->cold;
     target->poolBase = info->poolBase;
     target->poolSize = info->poolSize;
     target->poolId = info->poolId;
@@ -2568,6 +2659,7 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   } else {
     target->codeStart = 0;
     target->codeSize = 0;
+    target->cold = {};
     target->poolBase = 0;
     target->poolSize = 0;
     target->poolId = 0;
@@ -2742,6 +2834,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   };
   ClearPoolDetail(st->codePoolStats.near);
   ClearPoolDetail(st->codePoolStats.far);
+  ClearPoolDetail(st->codePoolStats.cold);
   // Per-core, per-pool 4K split readiness (ABI v5). MUST be cleared on every
   // (re)initialization: a stale splitDone bit from an earlier generation would
   // otherwise make a peer skip split_2m_to_4k for a pool the new generation
@@ -2790,6 +2883,7 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
       // earlier generation can never be read back after a re-init.
       Slot.codeStart = 0;
       Slot.codeSize = 0;
+      Slot.cold = {};
       Slot.poolBase = 0;
       Slot.poolSize = 0;
       Slot.poolId = 0;
@@ -3516,6 +3610,7 @@ void EJitSharedTaskPool::publishCodePoolStats() {
   };
   PublishDetail(state_->codePoolStats.near, s.near);
   PublishDetail(state_->codePoolStats.far, s.far);
+  PublishDetail(state_->codePoolStats.cold, s.cold);
 }
 
 void EJitSharedTaskPool::compilePendingBatchRequests() {
@@ -3792,6 +3887,7 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
   };
   ReadDetail(state_->codePoolStats.near, out->near);
   ReadDetail(state_->codePoolStats.far, out->far);
+  ReadDetail(state_->codePoolStats.cold, out->cold);
   return true;
 }
 

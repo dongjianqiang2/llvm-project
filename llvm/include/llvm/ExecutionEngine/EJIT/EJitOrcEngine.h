@@ -36,6 +36,7 @@ struct EJitTieredCodePoolStats {
   EJitCodePoolManager::Stats total;
   EJitCodePoolManager::Stats near;
   EJitCodePoolManager::Stats far;
+  EJitCodePoolManager::Stats cold;
 };
 #endif
 
@@ -197,6 +198,7 @@ public:
   bool findCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
   bool isCodeReady(const void *FnPtr) const;
   Error flushPendingCode();
+  bool findPendingCodeRange(const void *FnPtr, EJitCompiledCodeInfo &Out) const;
 #endif
 
 private:

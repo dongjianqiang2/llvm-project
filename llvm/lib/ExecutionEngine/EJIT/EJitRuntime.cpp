@@ -1955,6 +1955,12 @@ void ejit_taskpool_print_compiled() {
                         name.empty() ? "<unknown>" : name.c_str(), Tier,
                         slot.numDims, dims, fn, PoolKind, PostPublishSeen);
         }
+        if (!slot.cold.empty()) {
+          EJIT_DIAG_RAW("compiled cold: funcIdx=%u hot=%p cold_start=0x%llx cold_size=%llu",
+                        slot.funcIndex, fn,
+                        (unsigned long long)slot.cold.codeStart,
+                        (unsigned long long)slot.cold.codeSize);
+        }
         ejitDiagPrintThrottle();
       },
       &printCtx);
@@ -2066,6 +2072,23 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
     return EJIT_ERR_DISABLED;
   }
   return EJIT_OK;
+}
+
+uint32_t ejit_taskpool_classify_tier2_pc(uintptr_t pc) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT)
+    if (auto *Pool = gEJIT->sharedTaskPool())
+      return Pool->classifyTier2PC(pc);
+#endif
+  return 0;
+}
+
+ejit_status_t ejit_get_cold_code_pool_stats(ejit_code_pool_stats_t *out) {
+  if (!out)
+    return EJIT_ERR_INVALID_PARAM;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  return gEJIT->getColdCodePoolStats(out) ? EJIT_OK : EJIT_ERR_DISABLED;
 }
 
 ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out) {

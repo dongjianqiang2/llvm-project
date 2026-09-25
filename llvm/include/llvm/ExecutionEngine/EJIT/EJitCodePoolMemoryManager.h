@@ -26,6 +26,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
 #include "llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h"
+#include <functional>
 
 namespace llvm {
 namespace ejit {
@@ -35,9 +36,19 @@ namespace ejit {
 /// the pool manager). The referenced pool manager must outlive this object.
 class EJitCodePoolMemoryManager : public jitlink::JITLinkMemoryManager {
 public:
+  // Cold selector authorizes only controlled Tier-2 JITDylibs.
+  using PoolSelector =
+      std::function<EJitCodePoolManager *(const jitlink::JITLinkDylib *)>;
+  using ColdRangeRecorder =
+      std::function<void(uintptr_t, uint64_t, const EJitColdCodeRange &)>;
+
   EJitCodePoolMemoryManager(EJitCodePoolManager &Pool, size_t PageSize);
   EJitCodePoolMemoryManager(EJitCodePoolManager &NearPool,
                             EJitCodePoolManager &FarPool, size_t PageSize);
+  EJitCodePoolMemoryManager(EJitCodePoolManager &NearPool,
+                            EJitCodePoolManager &FarPool, size_t PageSize,
+                            PoolSelector ColdSelector,
+                            ColdRangeRecorder RecordCold);
 
   void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
                 OnAllocatedFunction OnAllocated) override;
@@ -59,6 +70,8 @@ private:
 
   EJitCodePoolManager &NearPool_;
   EJitCodePoolManager *FarPool_ = nullptr;
+  PoolSelector ColdSelector_;
+  ColdRangeRecorder RecordCold_;
   size_t PageSize_;
 };
 

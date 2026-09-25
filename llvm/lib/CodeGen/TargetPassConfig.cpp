@@ -1282,10 +1282,15 @@ void TargetPassConfig::addMachinePasses() {
     }
   }
 
+#endif
+
+#if !defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL) || defined(EJIT_T2_MFS)
   if (TM->Options.EnableMachineFunctionSplitter ||
       EnableMachineFunctionSplitter)
     addPass(createMachineFunctionSplitterPass());
+#endif
 
+#ifndef EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
   if (SplitStaticData || TM->Options.EnableStaticDataPartitioning) {
     addPass(createStaticDataSplitterPass());
     addPass(createStaticDataAnnotatorPass());

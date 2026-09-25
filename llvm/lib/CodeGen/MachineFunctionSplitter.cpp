@@ -109,6 +109,12 @@ static bool isColdBlock(const MachineBasicBlock &MBB,
                         const MachineBlockFrequencyInfo *MBFI,
                         ProfileSummaryInfo *PSI) {
   std::optional<uint64_t> Count = MBFI->getBlockProfileCount(&MBB);
+#ifdef EJIT_T2_MFS
+  if (MBB.getParent()->getFunction().hasFnAttribute("ejit-mfs-zero-count-only"))
+    return (PSI->hasInstrumentationProfile() ||
+            PSI->hasCSInstrumentationProfile()) &&
+           Count && *Count == 0;
+#endif
   // For instrumentation profiles and sample profiles, we use different ways
   // to judge whether a block is cold and should be split.
   if (PSI->hasInstrumentationProfile() || PSI->hasCSInstrumentationProfile()) {
@@ -129,6 +135,20 @@ static bool isColdBlock(const MachineBasicBlock &MBB,
 }
 
 bool MachineFunctionSplitter::runOnMachineFunction(MachineFunction &MF) {
+#ifdef EJIT_T2_MFS
+  if (MF.getFunction().hasFnAttribute("ejit-mfs-disabled"))
+    return false;
+  // Static EH splitting and sample/missing/synthetic profiles cannot establish
+  // an observed zero count under the EJIT product policy.
+  if (MF.getFunction().hasFnAttribute("ejit-mfs-zero-count-only")) {
+    auto Entry = MF.getFunction().getEntryCount();
+    auto &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
+    if (SplitAllEHCode || !Entry || Entry->isSynthetic() ||
+        Entry->getCount() == 0 ||
+        !(PSI.hasInstrumentationProfile() || PSI.hasCSInstrumentationProfile()))
+      return false;
+  }
+#endif
   // Do not split functions when -basic-block-sections=all is specified.
   if (MF.getTarget().getBBSectionsType() == llvm::BasicBlockSection::All)
     return false;

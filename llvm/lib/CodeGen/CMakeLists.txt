@@ -287,6 +287,11 @@ add_llvm_component_library(LLVMCodeGen
   TransformUtils
   )
 
+if(EJIT_T2_MFS)
+  set_property(SOURCE MachineFunctionSplitter.cpp TargetPassConfig.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS EJIT_T2_MFS)
+endif()
+
 add_subdirectory(SelectionDAG)
 add_subdirectory(AsmPrinter)
 add_subdirectory(MIRParser)

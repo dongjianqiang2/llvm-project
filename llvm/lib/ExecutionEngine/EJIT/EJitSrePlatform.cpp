@@ -25,6 +25,7 @@
 #ifdef EJIT_SRE_CODE_POOL
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
+#include "llvm/ExecutionEngine/EJIT/EJitColdReservation.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h" // seal/split granule contract
 
@@ -130,6 +131,18 @@ extern const unsigned char __ejit_code_end[];
 }
 #endif
 
+#ifdef EJIT_T2_MFS
+extern "C" {
+#ifndef EJIT_FREESTANDING
+extern const unsigned char __ejit_cold_start[] __attribute__((weak));
+extern const unsigned char __ejit_cold_end[] __attribute__((weak));
+#else
+extern const unsigned char __ejit_cold_start[];
+extern const unsigned char __ejit_cold_end[];
+#endif
+}
+#endif
+
 namespace {
 /// Make newly-written JIT code in [Va, Va + Size) observable to instruction
 /// fetch. On AArch64 the I-cache does not snoop D-cache writes, so code
@@ -183,12 +196,15 @@ unsigned sealAndSyncCache(uintptr_t Va, size_t Size) {
 } // namespace
 
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
-llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
+llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement,
+                                  uintptr_t ColdBase, size_t ColdSize) {
   EJitCodePoolManager::Options Opts;
   Opts.kind = Placement == EJitCodePoolPlacement::NearFixed
                   ? EJitCodePoolKind::Near
                   : EJitCodePoolKind::Far;
-  Opts.poolSize = static_cast<size_t>(kSrePoolSize);
+  if (ColdBase)
+    Opts.kind = EJitCodePoolKind::Cold;
+  Opts.poolSize = ColdBase ? ColdSize : static_cast<size_t>(kSrePoolSize);
   Opts.poolAlign = k2MiB; // large-page / split granularity
   Opts.minCodeAlign = 64;
 #ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
@@ -220,11 +236,13 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   // every compile). A fixed region gives a stable JIT address range and, when
   // placed within +-128MiB of .text, lets codegen use direct bl/adrp.
   if (Placement == EJitCodePoolPlacement::NearFixed) {
-    uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
-    uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
+    uintptr_t FBase =
+        ColdBase ? ColdBase : reinterpret_cast<uintptr_t>(__ejit_code_start);
+    uintptr_t FEnd = ColdBase ? ColdBase + ColdSize
+                              : reinterpret_cast<uintptr_t>(__ejit_code_end);
     uintptr_t AlignedBase = (FBase + (static_cast<uintptr_t>(k2MiB) - 1)) &
                             ~(static_cast<uintptr_t>(k2MiB) - 1);
-    if (FEnd > AlignedBase && (FEnd - AlignedBase) >= kSrePoolSize) {
+    if (FEnd > AlignedBase && (FEnd - AlignedBase) >= Opts.poolSize) {
       Opts.fixedBase = AlignedBase;
       Opts.fixedSize = FEnd - AlignedBase;
       EJIT_DIAG(
@@ -322,6 +340,39 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
                                                EnableRw);
 }
 
+std::unique_ptr<llvm::ejit::EJitCodePoolManager>
+llvm::ejit::makeSreColdCodePoolManager() {
+#if defined(EJIT_T2_MFS) && defined(EJIT_FIXED_CODE_POOL)
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(__ejit_cold_start);
+  const uintptr_t End = reinterpret_cast<uintptr_t>(__ejit_cold_end);
+  const uintptr_t NearBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
+  const uintptr_t NearEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
+  uintptr_t AlignedBase = 0, AlignedEnd = 0;
+  if (const char *Reason = alignColdReservation(
+          Base, End, NearBase, NearEnd, AlignedBase, AlignedEnd)) {
+    EJIT_DIAG("make cold pool: rejected reason=%s cold=[0x%llx,0x%llx) "
+              "near=[0x%llx,0x%llx)", Reason,
+              static_cast<unsigned long long>(Base),
+              static_cast<unsigned long long>(End),
+              static_cast<unsigned long long>(NearBase),
+              static_cast<unsigned long long>(NearEnd));
+    return nullptr;
+  }
+  EJIT_DIAG("make cold pool: reserved=[0x%llx,0x%llx) "
+            "aligned=[0x%llx,0x%llx) usable=%llu headSlack=%llu tailSlack=%llu",
+            static_cast<unsigned long long>(Base),
+            static_cast<unsigned long long>(End),
+            static_cast<unsigned long long>(AlignedBase),
+            static_cast<unsigned long long>(AlignedEnd),
+            static_cast<unsigned long long>(AlignedEnd - AlignedBase),
+            static_cast<unsigned long long>(AlignedBase - Base),
+            static_cast<unsigned long long>(End - AlignedEnd));
+  return makeSreCodePoolManager(EJitCodePoolPlacement::NearFixed,
+                                AlignedBase, AlignedEnd - AlignedBase);
+#else
+  return nullptr;
+#endif
+}
 bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {
 #if !defined(EJIT_SRE_ENABLE_EX) || defined(EJIT_CODE_POOL_4K_SEAL)
   EJIT_DIAG("prepareSreCode: unsupported config (FnPtr=%p), clean fallback",

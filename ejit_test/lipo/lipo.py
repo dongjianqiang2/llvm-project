@@ -375,6 +375,7 @@ def doit_gc_merge(args):
         "ejit_print_version",
     ]
     optional_api = [
+        "ejit_get_cold_code_pool_stats",
         "ejit_register_lifecycle", "ejit_register_funcindex",
         "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
         "ejit_taskpool_compile_or_get_bound_v",
@@ -385,7 +386,8 @@ def doit_gc_merge(args):
         "ejit_taskpool_set_instance_enabled", "ejit_taskpool_pending_count",
         "ejit_publish_pending_code",
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
-        "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",
+        "ejit_taskpool_print_compiled", "ejit_taskpool_classify_tier2_pc",
+        "ejit_taskpool_trace_now",
         "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
         "ejit_print_dumped_module", "ejit_dump_all",
         "ejit_print_mayconst_ranking",

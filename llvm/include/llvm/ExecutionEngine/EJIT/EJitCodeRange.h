@@ -36,8 +36,35 @@ enum class EJitCodePoolKind : uint32_t {
   Unknown = 0,
   Near = 1,
   Far = 2,
+  Cold = 3,
 };
 
+// Diagnostic ID in its own Cold pool-kind namespace; near/far retain spec5 IDs.
+constexpr uint32_t kEJitColdPoolId = 0u;
+
+/// One optional executable companion in the dedicated cold pool. This is a
+/// bounded extent, never the enclosing interval between hot and cold code.
+/// Plain fields keep the shared slot trivially constructible. All-zero means
+/// absent; partially initialized descriptors are invalid.
+struct EJitColdCodeRange {
+  uintptr_t codeStart;
+  uint64_t codeSize;
+  uintptr_t poolBase;
+  uint64_t poolSize;
+  uint32_t poolId;
+
+  bool empty() const {
+    return codeStart == 0 && codeSize == 0 && poolBase == 0 && poolSize == 0 &&
+           poolId == 0;
+  }
+
+  bool valid() const {
+    return codeStart != 0 && codeSize != 0 && poolBase != 0 && poolSize != 0 &&
+           poolId == kEJitColdPoolId && codeStart >= poolBase &&
+           poolSize <= UINTPTR_MAX - poolBase && codeSize <= poolSize &&
+           codeStart - poolBase <= poolSize - codeSize;
+  }
+};
 /// Maximum number of runtime-writable ranges carried with one finalized
 /// compilation. A finalized allocation normally has a single writable data
 /// segment (the Tier-1 __profc_ counters); the small fixed bound leaves head
@@ -97,6 +124,9 @@ struct EJitCompiledCodeInfo {
   /// Placement class of the owning pool. Near is the fixed .text.ejit region;
   /// Far is the dynamic SRE_MemDbgAlloc region used by temporary Tier-1 code.
   EJitCodePoolKind poolKind = EJitCodePoolKind::Unknown;
+  /// MFS companion, executable only after independent owner/peer preparation.
+  /// codeStart/codeSize above continue to describe only the hot extent.
+  EJitColdCodeRange cold = {};
 };
 
 } // namespace ejit

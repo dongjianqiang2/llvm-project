@@ -17,6 +17,8 @@ DUMP_APIS = (
     "ejit_dump_func",
     "ejit_print_dumped",
     "ejit_print_dumped_module",
+    "ejit_get_cold_code_pool_stats",
+    "ejit_taskpool_classify_tier2_pc",
 )
 
 
@@ -110,7 +112,7 @@ def main():
     clang = find_tool("clang")
     ar = find_tool("llvm-ar", "ar")
     nm = find_tool("llvm-nm", "nm")
-    ld = find_tool("ld.lld")
+    ld = find_tool("ld.lld", "ld.lld-18", "ld.lld-17")
     lipo = load_lipo()
     with tempfile.TemporaryDirectory(prefix="ejit-lipo-roots-") as directory:
         root = Path(directory)
@@ -139,6 +141,9 @@ def main():
             raise AssertionError("mandatory ejit_init root was discarded")
         if set(DUMP_APIS) & minimal_symbols:
             raise AssertionError("gc-merge fabricated missing optional symbols")
+        undefined = run([nm, "-u", minimal_gc]).stdout
+        if any(symbol in undefined for symbol in DUMP_APIS):
+            raise AssertionError("optional roots introduced undefined symbols")
 
     print("lipo GC-root regression: PASS")
 

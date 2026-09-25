@@ -252,6 +252,14 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
 endif()
 
+if(EJIT_T2_MFS)
+  set_property(SOURCE
+    EJitOptimizer.cpp
+    EJitOrcEngine.cpp
+    EJitSrePlatform.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS EJIT_T2_MFS)
+endif()
+
 # EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
 # Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
 # the AOT -mllvm -print-ejit-icache-dim-size value (both from the top-level CMake

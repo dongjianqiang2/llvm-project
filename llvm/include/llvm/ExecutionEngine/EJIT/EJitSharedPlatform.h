@@ -108,7 +108,9 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v18: the old inline payload is replaced by a fixed table of borrowed
 /// raw bound-pointer descriptors; no pointee bytes or ownership cross the
 /// shared queue.
-constexpr uint32_t kEJitSharedAbiVersion = 18u;
+/// v26: spec5 v18 plus MFS cold companion ranges and cold statistics.
+/// Distinct from spec4 v23 and the independent PR230 v24/v25 layouts.
+constexpr uint32_t kEJitSharedAbiVersion = 26u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
