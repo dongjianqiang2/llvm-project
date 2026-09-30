@@ -9,6 +9,23 @@ if(EJIT_DEFAULT_TARGET_TRIPLE)
   message(STATUS "EmbeddedJIT: forcing target triple = ${EJIT_DEFAULT_TARGET_TRIPLE}")
 endif()
 
+#===-- JIT target tuning (EJitTarget.h) -----------------------------------===#
+# The AOT bitcode is compiled for a generic core; the JIT can tune for the one
+# it runs on. EJIT_TARGET_CPU: empty = detect from MIDR_EL1 on hosted Linux and
+# do nothing in freestanding builds; "detect" = read the ID registers directly
+# in any build (freestanding: only when the worker runs at EL1 or above, the
+# read traps below it); "none" = leave the AOT subtarget untouched; anything
+# else = that tune CPU, with no register read.
+# EJIT_TARGET_FEATURES: empty = tune only (default), "detect" = add the
+# features the worker core's ID registers report (freestanding: needs
+# EJIT_TARGET_CPU=detect), "+a,+b" = add exactly those. Features enable
+# instructions in code every core runs, so only use them when all cores match
+# the worker core.
+set(EJIT_TARGET_CPU "" CACHE STRING
+  "EmbeddedJIT tune CPU (empty = detect when hosted, detect, none, or a name)")
+set(EJIT_TARGET_FEATURES "" CACHE STRING
+  "EmbeddedJIT extra target features (empty = none, detect, or +a,+b)")
+
 #===-- Freestanding configuration -----------------------------------------===#
 # EJIT_FREESTANDING option is defined in top-level llvm/CMakeLists.txt.
 if(EJIT_FREESTANDING)
@@ -110,6 +127,7 @@ set(EJIT_SOURCES
   EJitRegistrationStore.cpp
   EJitStructFieldPass.cpp
   EJitOptimizer.cpp
+  EJitTarget.cpp
   EJitPassBuilder.cpp
   EJitProfileMerge.cpp
   EJitCodePool.cpp
@@ -209,6 +227,12 @@ if(EJIT_DEFAULT_TARGET_TRIPLE)
   target_compile_definitions(LLVMEJIT PUBLIC
     EJIT_DEFAULT_TRIPLE="${EJIT_DEFAULT_TARGET_TRIPLE}")
 endif()
+
+# JIT target tuning: EJitTarget.cpp is the only reader, so changing either
+# value rebuilds that one file.
+set_property(SOURCE EJitTarget.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+  EJIT_TARGET_CPU="${EJIT_TARGET_CPU}"
+  EJIT_TARGET_FEATURES="${EJIT_TARGET_FEATURES}")
 
 #===-- Online-PGO value profiling definitions (after the LLVMEJIT target
 #     exists) -------------------------------------------------------------===#

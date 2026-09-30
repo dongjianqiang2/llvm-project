@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitTarget.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
@@ -64,6 +65,9 @@ public:
   /// Clear all cached analysis results. Must be called between compilations
   /// to avoid dangling pointers to IR units from previous modules.
   void clearAnalyses();
+
+  /// Tune CPU and features added to every compiled function (EJitTarget.h).
+  void setJitTarget(EJitJitTarget target) { jitTarget_ = std::move(target); }
 
   /// PGO counter global names captured during the last Instrumented (Tier-1)
   /// compile (PGOFuncName suffix of each __profc_<name>). Empty for
@@ -160,6 +164,7 @@ private:
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
+  EJitJitTarget jitTarget_;
 
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.

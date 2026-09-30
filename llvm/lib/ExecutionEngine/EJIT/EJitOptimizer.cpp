@@ -166,6 +166,10 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #endif
 
+  // Phase 0 - retarget from the AOT compile's generic subtarget to the core
+  // this runs on, before any pass consults TTI.
+  applyJitTarget(M, jitTarget_);
+
   // Phase 1 - specialize (common to all tiers): turn the period index and
   // every may_const field into a compile-time constant.
   applyBoundPointerFacts(M, ctx);
