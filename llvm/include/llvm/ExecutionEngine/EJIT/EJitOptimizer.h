@@ -88,6 +88,11 @@ public:
   }
 #endif
 
+  /// The switch-case arms the last runPipeline built.
+  const EJitSwitchCaseDecision &getLastSwitchCase() const {
+    return lastSwitchCase_;
+  }
+
   /// Record the scalar/loop-bound value-site count the Tier-1 instrumentation
   /// created in \p funcName (called by the value-profile instrumentation pass
   /// before captureCounterGlobals merges the counts into lastVpFunctions_).
@@ -116,6 +121,17 @@ private:
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
+
+  /// The bound-pointer views a StructFieldPass run for \p ctx reads through,
+  /// each stamped with its period instance.
+  SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers>
+  boundPointerViews(Module &M, const SpecializationContext &ctx);
+
+#ifdef EJIT_SWITCH_CASE
+  /// Switch-case arms for an entry with an ejit_runtime_dim parameter
+  /// (EJIT_SWITCH_CASE.md). Runs between phases 1c and 1d.
+  void runSwitchCase(Module &M, const SpecializationContext &ctx);
+#endif
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call
@@ -193,6 +209,7 @@ private:
   // scalarSiteCountsByFunc_ before capture; captureCounterGlobals merges them.
   SmallVector<EJitVpFunctionInfo, 8> lastVpFunctions_;
   StringMap<uint32_t> scalarSiteCountsByFunc_;
+  EJitSwitchCaseDecision lastSwitchCase_;
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   SmallVector<EJitMayConstLoadSite, 16> lastMayConstLoadSites_;

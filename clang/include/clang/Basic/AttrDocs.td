@@ -9573,6 +9573,32 @@ would merge slots that share a buffer element but hold different values.
   }];
 }
 
+def EjitRuntimeDimDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+EmbeddedJIT: lets the JIT specialize ``ejit_may_const`` data selected through a
+parameter it cannot fold. In ``g_cellCfg[cell].slot[slotNo % 3]``, with
+``slotNo`` marked ``ejit_runtime_dim``, the JIT clones the code that needs
+``slotNo % 3`` once per value of it, behind a ``switch``; any other value runs
+the original code. ``slotNo`` itself is never substituted.
+
+The attribute asserts nothing about the data, and the parameter is not a
+specialization dimension: it is not part of the cache key.
+
+The parameter must be an integer of at most 32 bits, on an ``ejit_entry``
+function with no other ``ejit_runtime_dim`` parameter, and cannot also be
+``ejit_period_arr_ind`` or ``ejit_free_dim``. The optional argument overrides
+the build's maximum number of arms. Without ``EJIT_SWITCH_CASE`` the attribute
+is diagnosed and ignored.
+
+.. code-block:: c
+
+  __attribute__((ejit_entry))
+  int process(__attribute__((ejit_period_arr_ind("cell"))) unsigned char cell,
+              __attribute__((ejit_runtime_dim)) unsigned slotNo);
+  }];
+}
+
 def EjitBoundPtrDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{

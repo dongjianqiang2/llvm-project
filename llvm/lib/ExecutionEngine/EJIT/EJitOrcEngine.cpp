@@ -1275,6 +1275,12 @@ ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {
   return {};
 }
 
+EJitSwitchCaseDecision EJitOrcEngine::getLastSwitchCase() const {
+  if (P->optimizer)
+    return P->optimizer->getLastSwitchCase();
+  return {};
+}
+
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 ArrayRef<EJitMayConstLoadSite> EJitOrcEngine::getLastMayConstLoadSites() const {
   if (P->optimizer)

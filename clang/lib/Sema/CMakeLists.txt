@@ -117,3 +117,10 @@ add_clang_library(clangSema
   clangLex
   clangSupport
   )
+
+# EmbeddedJIT switch-case mode (declared in llvm/CMakeLists.txt); without it,
+# ejit_runtime_dim is dropped with a warning.
+if(EJIT_SWITCH_CASE)
+  set_property(SOURCE SemaEJIT.cpp APPEND PROPERTY
+    COMPILE_DEFINITIONS EJIT_SWITCH_CASE)
+endif()
