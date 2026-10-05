@@ -70,6 +70,10 @@ constexpr const char *TAG_EJIT_BOUND_PTR = "ejit_bound_ptr";
 // the may_const data behind it does not depend on, so PASS6 may evaluate an
 // address at a fixed witness of 0 instead of failing on a non-constant index.
 constexpr const char *TAG_EJIT_FREE_DIM = "ejit_free_dim";
+// {tag, "", i32 argIndex, i32 maxArms}, maxArms 0 for the build default. Like
+// TAG_EJIT_FREE_DIM it is not a dimension: only the JIT's switch-case step
+// (EJIT_SWITCH_CASE.md) reads it.
+constexpr const char *TAG_EJIT_RUNTIME_DIM = "ejit_runtime_dim";
 constexpr const char *TAG_EJIT_PERIOD_ARR = "ejit_period_arr";
 constexpr const char *TAG_EJIT_PERIOD = "ejit_period";
 constexpr const char *TAG_EJIT_MAY_CONST_FIELD = "ejit_may_const_field";
@@ -170,6 +174,8 @@ constexpr unsigned EJIT_CTOR_PRIORITY = 65535;
 constexpr unsigned MAX_PERIOD_ARR_IND_PARAMS = 4;
 constexpr unsigned MAX_PERIOD_ARR_SIZE = 100;
 constexpr unsigned MAX_BOUND_PTR_PARAMS = kEJitMaxBoundPointers;
+// Upper bound on ejit_runtime_dim(n).
+constexpr unsigned MAX_RUNTIME_DIM_ARMS = 255;
 
 //===----------------------------------------------------------------------===//
 // Metadata utility functions (shared across AOT passes)

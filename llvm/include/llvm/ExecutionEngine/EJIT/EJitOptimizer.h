@@ -117,6 +117,17 @@ private:
   void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
 
+  /// The bound-pointer views a StructFieldPass run for \p ctx reads through,
+  /// each stamped with its period instance.
+  SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers>
+  boundPointerViews(Module &M, const SpecializationContext &ctx);
+
+#ifdef EJIT_SWITCH_CASE
+  /// Switch-case arms for an entry with an ejit_runtime_dim parameter
+  /// (EJIT_SWITCH_CASE.md). Runs between phases 1c and 1d.
+  void runSwitchCase(Module &M, const SpecializationContext &ctx);
+#endif
+
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call
   /// site passes the period dims (and values derived from them) as ordinary

@@ -212,6 +212,13 @@ ALL_TESTS=(
   ejit_sentinel_smoke_test
 )
 
+# Switch-case test: without EJIT_SWITCH_CASE, clang ignores ejit_runtime_dim.
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && \
+   grep -q "^EJIT_SWITCH_CASE:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+  ALL_TESTS+=(ejit_switch_case_test)
+  echo "Switch-case:    EJIT_SWITCH_CASE=ON (ejit_switch_case_test enabled)"
+fi
+
 # Per-test compile flags (e.g. for disabling global constructors)
 declare -A COMPILE_FLAGS
 COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false"
@@ -222,6 +229,8 @@ COMPILE_FLAGS[ejit_fixed_dim_test]=""
 # Sentinel-wrapper smoke: icache ON so the wrapper takes the branchless
 # (NumDims <= 2, cell table defined pre-filled with &MissFn) form.
 COMPILE_FLAGS[ejit_sentinel_smoke_test]="-mllvm -ejit-inline-cache"
+# The switch-case design assumes the inline cache is on (EJIT_SWITCH_CASE.md §1.3).
+COMPILE_FLAGS[ejit_switch_case_test]="-mllvm -ejit-inline-cache"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.

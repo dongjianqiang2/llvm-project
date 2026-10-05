@@ -124,6 +124,27 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
     }
   }
 
+  // ejit_runtime_dim: {tag, "", argIdx, maxArms}. Sema only attaches it when
+  // built with EJIT_SWITCH_CASE.
+  for (unsigned I = 0; I < FD->getNumParams(); ++I) {
+    const ParmVarDecl *PD = FD->getParamDecl(I);
+    if (const auto *RDAttr = PD->getAttr<EjitRuntimeDimAttr>()) {
+      std::optional<unsigned> ArgNo = irArg(I);
+      if (!ArgNo) {
+        diagnoseUnmappable(PD, "ejit_runtime_dim");
+        continue;
+      }
+      Entries.push_back(llvm::MDNode::get(Ctx, {
+          llvm::MDString::get(Ctx, TAG_EJIT_RUNTIME_DIM),
+          llvm::MDString::get(Ctx, ""),
+          llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), *ArgNo)),
+          llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt32Ty(Ctx), RDAttr->getMaxArms()))
+      }));
+    }
+  }
+
   // ejit_bound_ptr (on pointer parameters). The pointee size is part of the
   // metadata so the wrapper can build a fixed borrowed descriptor at the
   // compile slow path. The runtime never takes ownership of the pointee.

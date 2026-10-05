@@ -9,6 +9,9 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#ifdef EJIT_SWITCH_CASE
+#include "llvm/ExecutionEngine/EJIT/EJitSwitchCase.h"
+#endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
 #endif
@@ -179,6 +182,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   //   (c) Replace the may_const loads with their runtime constant values.
   runStructFieldPass(M, ctx);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
+#ifdef EJIT_SWITCH_CASE
+  //   (c') Switch-case arms on an ejit_runtime_dim (EJIT_SWITCH_CASE.md §4.3);
+  //       1d-1f then fold each arm like the rest.
+  runSwitchCase(M, ctx);
+#endif
   //   (d) Push the constants across call edges. Wherever the AOT inliner kept
   //       a call, the callee still re-derives cell addressing and re-tests
   //       guards from its arguments — which phases 1a-1c just made constant at
@@ -857,8 +865,8 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
   MPM.run(M, MAM_);
 }
 
-void EJitOptimizer::runStructFieldPass(Module &M,
-                                       const SpecializationContext &ctx) {
+SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers>
+EJitOptimizer::boundPointerViews(Module &M, const SpecializationContext &ctx) {
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
       ctx.boundPointers;
   if (!BoundPointers.empty()) {
@@ -890,12 +898,38 @@ void EJitOptimizer::runStructFieldPass(Module &M,
       }
     }
   }
-  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
+  return BoundPointers;
+}
+
+void EJitOptimizer::runStructFieldPass(Module &M,
+                                       const SpecializationContext &ctx) {
+  EJitStructFieldPass structField(registry_, boundPointerViews(M, ctx),
+                                  ctx.fnName);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       structField.run(F, FAM_);
 }
+
+#ifdef EJIT_SWITCH_CASE
+void EJitOptimizer::runSwitchCase(Module &M, const SpecializationContext &ctx) {
+  Function *Root = M.getFunction(ctx.fnName);
+  if (!Root || Root->isDeclaration() || !getEJitRuntimeDim(*Root))
+    return;
+  // Arms change the CFG that Tier-1 and Tier-2 number profile sites on (§10).
+  if (ctx.tier != CompileTier::Baseline) {
+    EJIT_DIAG("rtdim func=%s path=none declined=online-pgo-tier-%d",
+              ctx.fnName.c_str(), static_cast<int>(ctx.tier));
+    return;
+  }
+  // Configured like phase 1c, so the keys selected are the ones 1f folds.
+  EJitStructFieldPass Resolver(registry_, boundPointerViews(M, ctx),
+                               ctx.fnName);
+  Resolver.initFromModule(M);
+  llvm::ejit::runSwitchCase(*Root, Resolver, FAM_,
+                            EJitSwitchCaseLimits::fromBuild());
+}
+#endif
 
 void EJitOptimizer::runStructFieldPass(Module &M) {
   SpecializationContext Empty;
