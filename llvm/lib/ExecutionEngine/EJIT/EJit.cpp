@@ -434,13 +434,44 @@ Error EJit::enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
   return Error::success();
 }
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+EJitSharedTaskPool::OwnerControlResult
+EJit::runControlOnOwnerAndWait(std::function<void()> Work, uint32_t WaitRounds) {
+  return compileDriver_
+             ? compileDriver_->sharedTaskPool()->runControlOnOwnerAndWait(
+                   std::move(Work), WaitRounds)
+             : EJitSharedTaskPool::OwnerControlResult{};
+}
+
+bool EJit::abortFunctionPgoOnOwner(uint32_t FuncIndex) {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // Old instrumented calls can still write process-global VP sites. A fresh
+  // physical JD alone does not give those sites an execution-generation lease.
+  EJIT_DIAG("small-table handoff refused func=%u: VP generation bridge missing",
+            FuncIndex);
+  return false;
+#else
+  return compileDriver_ &&
+         compileDriver_->sharedTaskPool()->abortFunctionPgoOnOwner(FuncIndex) &&
+         compileDriver_->abortFunctionPgoOnOwner(FuncIndex);
+#endif
+}
+#endif
+
 void EJit::disableSmallTable() {
   if (!smallTableHost_)
     return;
-  if (EJitSmallTableHost::global() == smallTableHost_.get())
-    EJitSmallTableHost::installGlobal(nullptr);
-  smallTableHost_->retractPublishedSlots();
-  smallTableHost_->cancel("small-table normal path disabled");
+  // The host performs the logical teardown itself (uninstall the global gate,
+  // retract every published slot, cancel the session and close every entered
+  // execution for sampling/admission). If a real execution is STILL inside its
+  // table, destroying the host here would free the resource whose raw column
+  // addresses that call is reading, so ownership moves to the process-global
+  // retired-owner registry and the object lives until its last execution
+  // returns. `ejit_stab_leave` delivers that completion to the retained owner.
+  if (!smallTableHost_->beginOwnerTeardown()) {
+    EJitSmallTableHost::adoptRetired(std::move(smallTableHost_));
+    return;
+  }
   smallTableHost_.reset();
 }
 

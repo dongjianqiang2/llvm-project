@@ -397,6 +397,16 @@ Type *scalarTypeForField(LLVMContext &Ctx, const EJitSmallTableField &Field) {
   llvm_unreachable("unknown small-table scalar kind");
 }
 
+ArrayType *columnTypeForField(LLVMContext &Ctx, const EJitSmallTableField &Field,
+                              EJitSmallTableStorage Storage) {
+  // Runtime storage packs exactly accessSize bytes per row. A typed array has
+  // the scalar's allocation stride, which can exceed its store size (i17: 4/3,
+  // i33: 8/5). Its declaration must not promise bytes the runtime never owns.
+  if (Storage == EJitSmallTableStorage::RuntimeOwned)
+    return ArrayType::get(Type::getInt8Ty(Ctx), Field.tableBytes);
+  return ArrayType::get(scalarTypeForField(Ctx, Field), Field.tableRows);
+}
+
 /// Rebuild the bit pattern of one scalar from raw target-ordered bytes. The
 /// result is the integer the target's LLVM type needs: for integers the value,
 /// for float/double the APFloat bit pattern.
@@ -414,7 +424,11 @@ uint64_t readScalarBitsOrdered(const uint8_t *Addr, const EJitSmallTableField &F
   uint64_t Raw = 0;
   const unsigned Bytes = static_cast<unsigned>(Field.accessSize);
   if (LittleEndian) {
-    std::memcpy(&Raw, Addr, Bytes);
+    // Source byte order belongs to the target contract, not the host executing
+    // the planner/admission decoder. A partial memcpy into a uint64_t is also
+    // incorrect for narrow little-endian fields on a big-endian host.
+    for (unsigned I = 0; I < Bytes; ++I)
+      Raw |= static_cast<uint64_t>(Addr[I]) << (8 * I);
   } else {
     for (unsigned I = 0; I < Bytes; ++I)
       Raw = (Raw << 8) | Addr[I];
@@ -1243,6 +1257,12 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
   if (!Plan.isConsistent(Error))
     return false;
 
+  if (Plan.littleEndian != M.getDataLayout().isLittleEndian()) {
+    if (Error)
+      *Error = "small-table plan byte order does not match module data layout";
+    return false;
+  }
+
   const bool RuntimeOwned = Plan.storage == EJitSmallTableStorage::RuntimeOwned;
   // Runtime-owned storage without the runtime admission gate would emit an
   // unfilled declaration that an un-validated member could read: refuse the
@@ -1281,14 +1301,19 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
   for (const EJitSmallTableField &Field : Plan.fields) {
     if (Field.strategy == EJitSmallTableStrategy::Uniform)
       continue;
-    Type *ScalarTy = scalarTypeForField(Ctx, Field);
-    ArrayType *TableTy = ArrayType::get(ScalarTy, Field.tableRows);
+    ArrayType *TableTy = columnTypeForField(Ctx, Field, Plan.storage);
     GlobalVariable *Existing = M.getNamedGlobal(Field.columnName);
     if (!Existing)
       continue;
     if (Existing->getValueType() != TableTy) {
       if (Error)
         *Error = "existing small-table global has a different type: " +
+                 Field.columnName;
+      return false;
+    }
+    if (RuntimeOwned && Existing->isConstant()) {
+      if (Error)
+        *Error = "runtime-owned small-table column is not a mutable declaration: " +
                  Field.columnName;
       return false;
     }
@@ -1324,7 +1349,7 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
       continue; // A uniform field has no table payload at all.
 
     Type *ScalarTy = scalarTypeForField(Ctx, Field);
-    ArrayType *TableTy = ArrayType::get(ScalarTy, Field.tableRows);
+    ArrayType *TableTy = columnTypeForField(Ctx, Field, Plan.storage);
     // Validated above: either the table a previous round created, or a
     // pre-declared slot this round defines.
     GlobalVariable *GV = M.getNamedGlobal(Field.columnName);
@@ -1338,7 +1363,7 @@ bool EJitSmallTablePass::materialize(Module &M, const EJitSmallTablePlan &Plan,
         GV = new GlobalVariable(M, TableTy, /*isConstant=*/false,
                                 GlobalValue::ExternalLinkage, /*Initializer=*/nullptr,
                                 Field.columnName);
-      GV->setAlignment(DL.getABITypeAlign(ScalarTy));
+      GV->setAlignment(Align(1));
       SmallVector<Metadata *, 12> ColumnOps;
       ColumnOps.push_back(
           ConstantAsMetadata::get(ConstantInt::get(I64, Field.tableRows)));
@@ -1486,6 +1511,35 @@ PreservedAnalyses EJitSmallTablePass::run(Function &F,
   Module *M = F.getParent();
   if (!M)
     return PreservedAnalyses::all();
+  if (plan_.littleEndian != M->getDataLayout().isLittleEndian()) {
+    EJIT_DIAG_VERBOSE("small-table run SKIP func=%s: plan byte order does not "
+                      "match module data layout", F.getName().str().c_str());
+    return PreservedAnalyses::all();
+  }
+  const bool RuntimeOwned =
+      plan_.storage == EJitSmallTableStorage::RuntimeOwned;
+  if (RuntimeOwned) {
+    if (!plan_.runtimeRowAdmission) {
+      EJIT_DIAG_VERBOSE("small-table run SKIP func=%s: runtime storage has no "
+                        "row-admission gate", F.getName().str().c_str());
+      return PreservedAnalyses::all();
+    }
+    // A direct pass caller can bypass materialize(). Preflight every runtime
+    // column before any uniform fold or replacement, not midway through edits.
+    for (const EJitSmallTableField &Field : plan_.fields) {
+      if (Field.isUniform())
+        continue;
+      GlobalVariable *Table = M->getNamedGlobal(Field.columnName);
+      if (!Table || Table->getValueType() !=
+                        columnTypeForField(M->getContext(), Field, plan_.storage) ||
+          Table->hasInitializer() || Table->isConstant() ||
+          Table->getLinkage() != GlobalValue::ExternalLinkage) {
+        EJIT_DIAG_VERBOSE("small-table run SKIP func=%s: invalid runtime column %s",
+                          F.getName().str().c_str(), Field.columnName.c_str());
+        return PreservedAnalyses::all();
+      }
+    }
+  }
   // Executable lowering requires a plan that covers its whole declared domain;
   // see materialize(). This is the second entry point, so it enforces the same
   // rule: a caller that bypasses materialize() (or holds a stale table) must
@@ -1595,11 +1649,22 @@ PreservedAnalyses EJitSmallTablePass::run(Function &F,
         ++stats_.keptOriginal;
         continue;
       }
-      Value *Ptr = Builder.CreateInBoundsGEP(
-          Table->getValueType(), Table, {Builder.getInt64(0), RowIndex});
+      Value *Ptr;
+      if (RuntimeOwned) {
+        // Match the runtime's exact packed row stride, not the LLVM scalar's
+        // allocation size. The load keeps its original scalar type/bit width.
+        Value *ByteOffset = RowIndex;
+        if (R.Field->accessSize != 1)
+          ByteOffset = Builder.CreateMul(RowIndex,
+                                         Builder.getInt64(R.Field->accessSize));
+        Ptr = Builder.CreateInBoundsGEP(Builder.getInt8Ty(), Table, ByteOffset);
+      } else {
+        Ptr = Builder.CreateInBoundsGEP(
+            Table->getValueType(), Table, {Builder.getInt64(0), RowIndex});
+      }
       Type *FieldTy = scalarTypeForField(M->getContext(), *R.Field);
       auto *NewLoad = Builder.CreateLoad(FieldTy, Ptr);
-      NewLoad->setAlignment(DL.getABITypeAlign(FieldTy));
+      NewLoad->setAlignment(RuntimeOwned ? Align(1) : DL.getABITypeAlign(FieldTy));
       NewLoad->setDebugLoc(R.LI->getDebugLoc());
       // Positive provenance tag (§9): environment names the plan source while
       // the load deliberately stays outside may_const authorization.
@@ -1703,7 +1768,10 @@ EJitSmallTableContract buildAdmissionContract(const EJitSmallTablePlan &Plan) {
       FC.resource.elementBits = Field.bitWidth;
       FC.resource.rows = Field.tableRows;
       FC.resource.bytes = Field.tableBytes;
-      FC.resource.alignment = Field.accessSize == 0 ? 1 : Field.accessSize;
+      // Access size is not alignment (3/5/6/7 bytes are not even powers of
+      // two). A plan does not carry the module's ABI alignment, so export the
+      // universally valid byte guarantee rather than guessing a stronger one.
+      FC.resource.alignment = 1;
       FC.resource.fixedAddress = Plan.columnsFixedAddress;
       // The published projections: the coordinate of every proven row with the
       // bit-exact value the emitted column holds there. The plan already proved

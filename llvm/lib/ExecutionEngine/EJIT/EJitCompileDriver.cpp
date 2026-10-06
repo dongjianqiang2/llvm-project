@@ -1,12 +1,15 @@
 //===-- EJitCompileDriver.cpp - Compilation Scheduler ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#include "EJitWrapperRuntimeTestAccess.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ProfileData/InstrProf.h"
 #include <cassert>
+#include <cstring>
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
@@ -27,6 +30,23 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+bool EJitWrapperRuntimeTestAccess::driverCounters(
+    const EJitCompileDriver &Driver, uint64_t CacheKey,
+    SmallVectorImpl<EJitWrapperCounterView> &Out) {
+  Out.clear();
+  auto I = Driver.tier1Counters_.find(CacheKey);
+  if (I == Driver.tier1Counters_.end() || I->second.empty())
+    return false;
+  for (const auto &Counter : I->second) {
+    if (Counter.pgoName.empty() || !Counter.profcAddr || !Counter.profdAddr) {
+      Out.clear();
+      return false;
+    }
+    Out.push_back({Counter.pgoName, Counter.profcAddr, Counter.profdAddr});
+  }
+  return true;
+}
 
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
@@ -684,7 +704,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
   jitEngine_->setActiveContext(&ctx);
 
-  if (auto Err = jitEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
+  if (auto Err = jitEngine_->loadBitcodeModule(
+          bitcode, cacheKey, funcName,
+          handedOffFunctions_.count(funcIdx) != 0)) {
     jitEngine_->setActiveContext(nullptr);
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: load bitcode module failed",
               cacheKey, funcName.c_str());
@@ -728,7 +750,24 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       auto profc = jitEngine_->lookup(cacheKey, "__profc_" + name);
       auto profd = jitEngine_->lookup(cacheKey, "__profd_" + name);
       if (profc && profd) {
-        counters.push_back({name, reinterpret_cast<uintptr_t>(*profc),
+        // Symbol suffixes have been cleaned for linkage. Internal function
+        // profile names retain the module/source qualifier used by Gen; only
+        // that canonical name can identify the record later consumed by Use.
+        std::string ProfileName =
+            jitEngine_->getCounterProfileName(name).str();
+        uint64_t NameRef = 0;
+        std::memcpy(&NameRef, *profd, sizeof(NameRef));
+        if (ProfileName.empty() ||
+            NameRef != IndexedInstrProf::ComputeHash(ProfileName)) {
+          EJIT_DIAG("compileCold Tier-1 counter rejected key=0x%016lx "
+                    "symbol=%s canonical=%s NameRef=0x%016llx",
+                    cacheKey, name.c_str(), ProfileName.c_str(),
+                    static_cast<unsigned long long>(NameRef));
+          counters.clear();
+          return nullptr; // no guessed name or partial valid-looking profile
+        }
+        counters.push_back({std::move(ProfileName),
+                            reinterpret_cast<uintptr_t>(*profc),
                             reinterpret_cast<uintptr_t>(*profd)});
       } else {
         if (!profc)
@@ -810,6 +849,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       ejitVpEnsureInitialized();
       ejitVpSetArmed(true);
       ++vpRoundsActive_;
+      ++vpLiveRounds_[cacheKey];
     }
     EJIT_DIAG_DEBUG("VP capture key=0x%016lx: %zu function(s), %zu verified "
                     "target(s)",
@@ -923,11 +963,76 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
   const uint32_t tier = decodeReqTier(req.funcIndex);
   const bool consumesRound = (tier == kEJitTierPgoUse && published) ||
                              (tier == kEJitTierInstrumented && !published);
-  if (consumesRound && vpRoundsActive_ > 0 && --vpRoundsActive_ == 0)
-    ejitVpSetArmed(false);
+  if (consumesRound) {
+    const uint32_t FuncIndex = stripReqTier(req.funcIndex);
+    const auto &Meta = loader_.getOrCacheFuncMeta(FuncIndex);
+    uint64_t Key = static_cast<uint64_t>(FuncIndex) << 32;
+    for (unsigned I = 0; I < Meta.dimCount && I < 4; ++I)
+      for (unsigned J = 0; J < req.numDims; ++J)
+        if (req.dims[J].dimType == Meta.dimTypes[I])
+          Key |= uint64_t(req.dims[J].instanceId & 255u) << (I * 8);
+    auto Live = vpLiveRounds_.find(Key);
+    if (Live != vpLiveRounds_.end() && Live->second) {
+      if (--Live->second == 0)
+        vpLiveRounds_.erase(Live);
+      if (vpRoundsActive_ && --vpRoundsActive_ == 0)
+        ejitVpSetArmed(false);
+    }
+  }
 #else
   (void)req;
   (void)published;
 #endif
+}
+#endif
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+bool EJitCompileDriver::abortFunctionPgoOnOwner(uint32_t FuncIndex) {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  EJIT_DIAG("ordinary profile abort refused func=%u: live VP generation bridge "
+            "is not installed", FuncIndex);
+  return false;
+#endif
+  if (!sharedPool_.isCurrentOwnerWorker())
+    return false;
+  handedOffFunctions_.insert(FuncIndex);
+  auto Belongs = [&](uint64_t Key) {
+    return static_cast<uint32_t>(Key >> 32) == FuncIndex;
+  };
+  for (auto I = tier1Counters_.begin(); I != tier1Counters_.end();)
+    if (Belongs(I->first))
+      I = tier1Counters_.erase(I);
+    else
+      ++I;
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  for (auto I = tier1MayConst_.begin(); I != tier1MayConst_.end();)
+    if (Belongs(I->first))
+      I = tier1MayConst_.erase(I);
+    else
+      ++I;
+  if (hasPendingTier1MayConstKey_ && Belongs(pendingTier1MayConstKey_)) {
+    hasPendingTier1MayConstKey_ = false;
+    pendingTier1MayConstKey_ = 0;
+  }
+#endif
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  for (auto I = tier1Vp_.begin(); I != tier1Vp_.end();)
+    if (Belongs(I->first))
+      I = tier1Vp_.erase(I);
+    else
+      ++I;
+  for (auto I = vpLiveRounds_.begin(); I != vpLiveRounds_.end();)
+    if (Belongs(I->first)) {
+      assert(vpRoundsActive_ >= I->second && "live VP round accounting");
+      vpRoundsActive_ -= I->second;
+      I = vpLiveRounds_.erase(I);
+    } else
+      ++I;
+  if (vpRoundsActive_ == 0)
+    ejitVpSetArmed(false);
+#endif
+  EJIT_DIAG("ordinary PGO bookkeeping aborted func=%u; physical JDs retained",
+            FuncIndex);
+  return true;
 }
 #endif

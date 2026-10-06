@@ -31,6 +31,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -174,7 +175,7 @@ EJitSmallTableTableResource::create(const EJitSmallTablePlan &Plan,
   };
 
   auto Res = std::unique_ptr<EJitSmallTableTableResource>(
-      new EJitSmallTableTableResource());
+      new EJitSmallTableTableResource(Plan.littleEndian));
   Res->generation_ = Generation;
 
   uint64_t Offset = 0;
@@ -263,13 +264,16 @@ EJitSmallTableTableResource::publish(unsigned FieldIndex, uint64_t Coordinate,
   if (!base_)
     return PublishResult::Conflict;
   // The stored value is the typed bit pattern masked to the field width; the
-  // element bytes are the field's own access size (little-endian on the host and
-  // on the product AArch64 target).
+  // element bytes are the field's own access size, serialized in the plan's
+  // target byte order. Neither the compiling host nor later plan mutations
+  // determine the representation of this resource.
   uint8_t *Dst = base_ + C->offset + Coordinate * C->elementBytes;
   std::memset(Dst, 0, static_cast<size_t>(C->elementBytes));
   const unsigned Bytes = static_cast<unsigned>(C->elementBytes);
-  for (unsigned B = 0; B < Bytes; ++B)
-    Dst[B] = static_cast<uint8_t>((Bits >> (8 * B)) & 0xff);
+  for (unsigned B = 0; B < Bytes; ++B) {
+    const unsigned BitOffset = 8 * (littleEndian_ ? B : Bytes - 1 - B);
+    Dst[B] = static_cast<uint8_t>((Bits >> BitOffset) & 0xff);
+  }
   Slot.first = true;
   Slot.second = Bits;
   return PublishResult::Stored;
@@ -340,6 +344,15 @@ Expected<std::unique_ptr<EJitSmallTableRuntime>>
 EJitSmallTableRuntime::create(
     const Config &Cfg, PeriodArrayRegistry &Registry, EJitRuntimeState &State,
     std::shared_ptr<EJitSmallTableReadinessProvider> Provider, Options Opts) {
+#if defined(EJIT_FREESTANDING) && defined(EJIT_FIXED_CODE_POOL)
+  // Each Engine currently creates its own manager starting at the SAME linker
+  // reservation. A second common Engine could overwrite ordinary code still
+  // executing. Do not claim board readiness until a shared allocation domain
+  // or explicitly disjoint reservations are supplied by the product binding.
+  return make_error<StringError>(
+      "small-table fixed code pool requires a non-overlapping allocation domain",
+      inconvertibleErrorCode());
+#endif
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, Registry, State);
   if (!EngineOrErr)
     return EngineOrErr.takeError();
@@ -493,9 +506,9 @@ EJitSmallTableRuntime::beginNextGeneration(
     return Refuse("beginNextGeneration before prepare");
   if (pendingGeneration_)
     return Refuse("a prepared generation has not been compiled yet");
-  if (inFlight_ != 0)
-    return Refuse("an admitted member execution is still in flight: refusing to "
-                  "replace the table generation it may still read");
+  if (sessionInFlight_ != 0)
+    return Refuse("an admitted sampling execution is still in flight: refusing "
+                  "to replace the table generation it may still read");
   if (!provider_ || !provider_->epochCurrent(domainEpoch_))
     return Refuse("configuration generation moved: prepare a fresh runtime");
 
@@ -546,6 +559,9 @@ EJitSmallTableRuntime::beginNextGeneration(
   // declarations.
   if (sourceBitcode_.empty())
     return Refuse("no captured source module to re-plan");
+  // A module's destructor still uses its LLVMContext. On the second rebuild
+  // the previous parsed module must die BEFORE replacing its context.
+  generationModule_.reset();
   generationContext_ = std::make_unique<LLVMContext>();
   auto Buf = MemoryBuffer::getMemBuffer(sourceBitcode_, "small-table-source",
                                         /*RequiresNullTerminator=*/false);
@@ -680,6 +696,10 @@ EJitSmallTableRuntime::beginNextGeneration(
   // The previous generation's session is over: its samples belong to the old
   // contract/resource identity and can never be merged into a new one.
   cancel("table generation changed: a new generation is being prepared");
+  sessionSamples_ = 0;
+  sampleKeys_.clear();
+  bundle_.reset();
+  frozen_ = false;
   return plan_.get();
 }
 
@@ -690,18 +710,128 @@ bool EJitSmallTableRuntime::retireGenerationsUpTo(uint64_t Generation) {
   // above-current request is refused rather than obeyed.
   if (Generation > resource_->generation())
     return false;
-  if (inFlight_ != 0)
-    return false;
-  for (auto It = retained_.begin(); It != retained_.end();) {
-    if ((*It)->generation() <= Generation) {
-      retainedBytes_ -= (*It)->capacityBytes();
-      It = retained_.erase(It);
-      stats_.retiredGenerations++;
-    } else {
-      ++It;
-    }
-  }
+  // PHYSICAL PROTECTION (spec §7): a generation whose columns a real execution
+  // is still reading is not freed here. Its retirement is recorded and the
+  // storage is released by `releaseReader` when the last reader of that
+  // generation leaves. `inFlight_` alone is NOT the criterion: a cancelled
+  // session zeroes the logical in-flight bookkeeping while the execution that
+  // already loaded the compiled address is still inside it.
+  freeRetainedUpTo(Generation);
   return true;
+}
+
+void EJitSmallTableRuntime::freeRetainedUpTo(uint64_t Generation) {
+  for (auto It = retained_.begin(); It != retained_.end();) {
+    const uint64_t G = (*It)->generation();
+    if (G > Generation) {
+      ++It;
+      continue;
+    }
+    if (physicalReaders(G) != 0) {
+      // A real execution is inside this generation. Keep the storage (and its
+      // bytes in the retention accounting) and remember that it must go as soon
+      // as that reader returns.
+      if (retired_.find(G) == retired_.end()) {
+        retired_[G] = physicalReaders(G);
+        stats_.deferredRetirements++;
+      }
+      ++It;
+      continue;
+    }
+    retainedBytes_ -= (*It)->capacityBytes();
+    It = retained_.erase(It);
+    stats_.retiredGenerations++;
+  }
+}
+
+void EJitSmallTableRuntime::freeIfUnread(uint64_t Generation) {
+  if (physicalReaders(Generation) != 0 ||
+      retired_.find(Generation) == retired_.end())
+    return;
+  for (auto It = retained_.begin(); It != retained_.end(); ++It) {
+    if ((*It)->generation() != Generation)
+      continue;
+    retainedBytes_ -= (*It)->capacityBytes();
+    retained_.erase(It);
+    stats_.retiredGenerations++;
+    break;
+  }
+  if (retired_.erase(Generation) != 0)
+    stats_.reclaimedAfterReaders++;
+}
+
+uint64_t EJitSmallTableRuntime::reclaimRetiredGenerations() {
+  uint64_t Released = 0;
+  // Collect first: `freeIfUnread` erases from `retired_`.
+  std::vector<uint64_t> Due;
+  for (const auto &Entry : retired_)
+    if (physicalReaders(Entry.first) == 0)
+      Due.push_back(Entry.first);
+  for (uint64_t G : Due) {
+    freeIfUnread(G);
+    ++Released;
+  }
+  return Released;
+}
+
+uint64_t EJitSmallTableRuntime::physicalReaders(uint64_t Generation) const {
+  auto It = readers_.find(Generation);
+  return It == readers_.end() ? 0 : It->second;
+}
+
+std::vector<uint64_t> EJitSmallTableRuntime::physicallyReadGenerations() const {
+  std::vector<uint64_t> Out;
+  for (const auto &Entry : readers_)
+    if (Entry.second != 0)
+      Out.push_back(Entry.first);
+  return Out;
+}
+
+uint64_t EJitSmallTableRuntime::pendingRetireBytes() const {
+  uint64_t Bytes = 0;
+  for (const auto &Entry : retired_)
+    for (const std::unique_ptr<EJitSmallTableTableResource> &R : retained_)
+      if (R->generation() == Entry.first)
+        Bytes += R->capacityBytes();
+  return Bytes;
+}
+
+void EJitSmallTableRuntime::acquireReader(uint64_t Generation) {
+  ++readers_[Generation];
+}
+
+void EJitSmallTableRuntime::releaseReader(uint64_t Generation) {
+  auto It = readers_.find(Generation);
+  if (It == readers_.end())
+    return;
+  if (It->second > 0)
+    --It->second;
+  if (It->second == 0)
+    readers_.erase(It);
+  // A generation whose retirement waited for exactly this reader can now go.
+  freeIfUnread(Generation);
+}
+
+void EJitSmallTableRuntime::releaseSessionBorrowIfDrained() {
+  if (!sessionOpen_ && sessionInFlight_ == 0 && sessionBorrow_) {
+    sessionBorrow_->release();
+    sessionBorrow_.reset();
+  }
+  for (auto It = retiredSessionBorrows_.begin();
+       It != retiredSessionBorrows_.end();) {
+    const uint64_t Session = It->first;
+    const bool StillExecuting = std::any_of(
+        samplingExecutions_.begin(), samplingExecutions_.end(),
+        [Session](const auto &Execution) {
+          return Execution.second.sessionId == Session;
+        });
+    if (StillExecuting) {
+      ++It;
+      continue;
+    }
+    It->second->release();
+    It = retiredSessionBorrows_.erase(It);
+  }
 }
 
 EJitSmallTableAdmission
@@ -932,19 +1062,62 @@ Expected<void *> EJitSmallTableRuntime::compileCommonT1(uint64_t CodeGeneration,
   // Capture the real Tier-1 counter addresses for the later profile synthesis.
   counterNames_.clear();
   counterAddrs_.clear();
+  if (engine_->getLastCounterNames().empty()) {
+    engine_->setActiveContext(nullptr);
+    Error = "common T1 emitted no profile counters; refusing a profile-free session";
+    cancel(Error);
+    return make_error<StringError>(Error, inconvertibleErrorCode());
+  }
+  if (beforeCounterCaptureForTesting_) {
+    // Consume the test callback once, before any session can open. The normal
+    // loop below still performs every real ORC lookup and handles its errors.
+    auto BeforeCapture = std::move(beforeCounterCaptureForTesting_);
+    beforeCounterCaptureForTesting_ = nullptr;
+    BeforeCapture(*engine_, CodeGeneration, engine_->getLastCounterNames());
+  }
+  auto FailCapture = [&](std::string Detail) -> Expected<void *> {
+    engine_->setActiveContext(nullptr);
+    counterNames_.clear();
+    counterAddrs_.clear();
+    Error = "incomplete common T1 profile counter capture: " + Detail;
+    cancel(Error);
+    return make_error<StringError>(Error, inconvertibleErrorCode());
+  };
   for (const std::string &Name : engine_->getLastCounterNames()) {
     auto Profc = engine_->lookup(CodeGeneration, "__profc_" + Name);
     auto Profd = engine_->lookup(CodeGeneration, "__profd_" + Name);
     if (Profc && Profd) {
-      counterNames_.push_back(Name);
+      // ORC's legal symbol suffix is not an internal function's PGO lookup
+      // name: e.g. "_string__helper" versus "<string>;helper". Preserve the
+      // exact canonical name captured by lowering, and verify it against the
+      // real emitted metadata before allowing ANY sampling session to open.
+      StringRef ProfileName = engine_->getCounterProfileName(Name);
+      if (ProfileName.empty() || !*Profc || !*Profd)
+        return FailCapture("missing canonical profile name or counter address "
+                           "for symbol suffix " + Name);
+      const auto *Data =
+          reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(*Profd);
+      const uint64_t NameHash = IndexedInstrProf::ComputeHash(ProfileName);
+      if (Data->NameRef != NameHash)
+        return FailCapture("canonical profile name hash does not match __profd_" +
+                           Name + " NameRef for " + ProfileName.str());
+      if (llvm::any_of(counterNames_, [&](const std::string &Existing) {
+            return StringRef(Existing) == ProfileName;
+          }))
+        return FailCapture("duplicate canonical profile name " +
+                           ProfileName.str());
+      counterNames_.push_back(ProfileName.str());
       counterAddrs_.push_back(
           {reinterpret_cast<uintptr_t>(*Profc),
            reinterpret_cast<uintptr_t>(*Profd)});
     } else {
+      std::string Missing;
       if (!Profc)
-        consumeError(Profc.takeError());
+        Missing = "__profc_" + Name + ": " + toString(Profc.takeError());
       if (!Profd)
-        consumeError(Profd.takeError());
+        Missing += (Missing.empty() ? std::string() : "; ") +
+                   "__profd_" + Name + ": " + toString(Profd.takeError());
+      return FailCapture(std::move(Missing));
     }
   }
   engine_->setActiveContext(nullptr);
@@ -959,6 +1132,7 @@ Expected<void *> EJitSmallTableRuntime::compileCommonT1(uint64_t CodeGeneration,
   frozen_ = false;
   bundle_.reset();
   sessionSamples_ = 0;
+  sessionInFlight_ = 0;
   sampleKeys_.clear();
   pendingGeneration_ = false;
   return *FnOrErr;
@@ -975,6 +1149,13 @@ bool EJitSmallTableRuntime::enterAdmitted(ArrayRef<uint64_t> Indices,
     stats_.aotRefusals++;
     return false;
   };
+
+#ifndef EJIT_FREESTANDING
+  // Serialize quota admission with ticket creation and completion. Rejecting
+  // above-quota T1 before obtaining a borrow also prevents real profile
+  // counters from accumulating unbounded calls after bookkeeping reached64.
+  std::lock_guard<std::mutex> Guard(mutex_);
+#endif
 
   if (!sessionOpen_ || frozen_)
     return Refuse(cancellationReason_.empty() ? "no open sampling session"
@@ -997,15 +1178,11 @@ bool EJitSmallTableRuntime::enterAdmitted(ArrayRef<uint64_t> Indices,
       *Class != EJitSmallTableAdmission::Extendable)
     return Refuse("member admission is not compatible with the specialized code");
 
-  // Budget exhaustion stops COUNTING, it does not stop the (already correct)
-  // specialized code from running: the caller may still dispatch. A member that
-  // is not ready or not admitted never reaches this point, so it never consumes
-  // budget (spec §10).
-  if (samplingExhausted() || !sessionOpen_) {
-    if (Why)
-      *Why = "aggregate sampling budget reached; this execution is not counted";
-    return true;
-  }
+  if (samplingExhausted())
+    return Refuse("aggregate sampling budget reached; use AOT until T2 publishes");
+
+  if (!Ticket)
+    return Refuse("a real execution requires a completion ticket");
 
   // The sampling window itself runs under the protected read borrow: the
   // instrumented entry may still read the source region for fields the plan did
@@ -1026,21 +1203,25 @@ bool EJitSmallTableRuntime::enterAdmitted(ArrayRef<uint64_t> Indices,
     }
   }
 
-#ifndef EJIT_FREESTANDING
-  std::lock_guard<std::mutex> Guard(mutex_);
-  if (!sessionOpen_)
-    return true;
-#endif
+  if (nextTicketSerial_ == std::numeric_limits<uint64_t>::max())
+    return Refuse("sampling execution ticket space exhausted");
   const uint64_t Serial = nextTicketSerial_++;
+  // Every actual admitted T1 remains protected until its real leave, including
+  // the last quota member while freeze or cancellation arrives.
   stats_.acceptedSamples++;
   sessionSamples_++;
-  inFlight_++;
-  if (Ticket) {
-    Ticket->sessionId = sessionId_;
-    Ticket->serial = Serial;
-    Ticket->valid = true;
-  }
   sampleKeys_.push_back(std::vector<uint64_t>(Indices.begin(), Indices.end()));
+  inFlight_++;
+  sessionInFlight_++;
+  const uint64_t Generation = resourceGeneration();
+  samplingExecutions_.emplace(Serial, SamplingExecution{sessionId_, Generation});
+  acquireReader(Generation);
+  Ticket->sessionId = sessionId_;
+  Ticket->serial = Serial;
+  Ticket->valid = true;
+  Ticket->counted = true;
+  if (Why)
+    Why->clear();
   return true;
 }
 
@@ -1049,10 +1230,29 @@ void EJitSmallTableRuntime::leaveAdmitted(
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Guard(mutex_);
 #endif
+  auto It = samplingExecutions_.find(Ticket.serial);
+  if (!Ticket.valid || It == samplingExecutions_.end() ||
+      It->second.sessionId != Ticket.sessionId) {
+    stats_.staleCallbacks++;
+    return;
+  }
+  const SamplingExecution Execution = It->second;
+  samplingExecutions_.erase(It);
+  // `inFlight_` is the PHYSICAL count of executions that were entered and have
+  // not returned. A cancellation stops new samples from being counted but never
+  // zeroes this: while it is non-zero a real call is still inside the table and
+  // inside the sampling window's protected read, so both are retained.
   if (inFlight_ > 0)
     --inFlight_;
-  if (Ticket.valid && Ticket.sessionId != sessionId_)
+  if (Execution.sessionId == sessionId_ && sessionInFlight_ > 0)
+    --sessionInFlight_;
+  if (Execution.sessionId != sessionId_)
     stats_.staleCallbacks++;
+  releaseReader(Execution.resourceGeneration);
+  // The window's protected read is released only once no real execution is
+  // still reading the source region it guarded (§6.1.1: cancel/failure releases
+  // the borrow, and the release cannot precede the last real reader).
+  releaseSessionBorrowIfDrained();
 #ifndef EJIT_FREESTANDING
   inFlightCV_.notify_all();
 #endif
@@ -1077,25 +1277,29 @@ EJitSmallTableRuntime::freeze(std::string &Error, bool Force) {
   // A granted dispatch is not a completed sample: wait for every admitted
   // execution that is still in flight before reading the counters (spec §10).
 #ifdef EJIT_FREESTANDING
-  if (options_.sampling.waitForInFlightOnFreeze && inFlight_ != 0) {
-    Error = "admitted executions are still in flight and this build has no "
-            "blocking wait; refusing to freeze an incomplete sample";
+  if (sessionInFlight_ != 0) {
+    Error = "admitted sampling executions are still in flight and this build "
+            "has no blocking wait; refusing to freeze an incomplete sample";
     return make_error<StringError>(Error, inconvertibleErrorCode());
   }
 #else
-  if (options_.sampling.waitForInFlightOnFreeze) {
+  {
     std::unique_lock<std::mutex> Lock(mutex_);
-    bool Drained = inFlight_ == 0;
-    if (!Drained) {
+    bool Drained = sessionInFlight_ == 0;
+    if (!Drained && options_.sampling.waitForInFlightOnFreeze) {
       const auto Deadline =
           options_.sampling.freezeWaitMillis == 0
               ? std::chrono::milliseconds(30000)
               : std::chrono::milliseconds(options_.sampling.freezeWaitMillis);
       Drained = inFlightCV_.wait_for(
-          Lock, Deadline, [this] { return inFlight_ == 0; });
+          Lock, Deadline, [this] { return sessionInFlight_ == 0; });
     }
     if (!Drained) {
-      Error = "admitted executions are still in flight after the freeze wait";
+      Error = options_.sampling.waitForInFlightOnFreeze
+                  ? "admitted executions are still in flight after the freeze "
+                    "wait"
+                  : "admitted executions are still in flight; refusing to "
+                    "freeze a session whose real executions have not returned";
       return make_error<StringError>(Error, inconvertibleErrorCode());
     }
   }
@@ -1143,8 +1347,11 @@ EJitSmallTableRuntime::freeze(std::string &Error, bool Force) {
   frozen_ = true;
   // The sampling window is over: the bundle is immutable and the protected read
   // borrow that guarded the window is released (a failed freeze above leaves the
-  // session running and keeps it).
-  sessionBorrow_.reset();
+  // session running and keeps it). Freezing required the session's own
+  // `sessionInFlight_ == 0`. `inFlight_` may still be non-zero for executions a
+  // cancel gave up on: those are not this (or any) session's samples, and the
+  // borrow is retained for them until their own real return.
+  releaseSessionBorrowIfDrained();
   return bundle_.get();
 }
 
@@ -1209,14 +1416,26 @@ Expected<void *> EJitSmallTableRuntime::compileCommonT2(std::string &Error) {
 void EJitSmallTableRuntime::cancel(StringRef Reason) {
   cancellationReason_ = Reason.empty() ? std::string("cancelled") : Reason.str();
   // A cancelled session is no longer the current one: a ticket it granted is a
-  // stale callback, never a completion of the session that follows.
+  // stale callback, never a completion of the session that follows. The ticket
+  // serial moves so a completion that arrives later can be RECOGNIZED as stale
+  // while still being accounted against its OWN (old) session.
+  // Park this session's protected read independently of a replacement session.
+  // A new session must obtain its own borrow even while old calls still run.
+  if (sessionBorrow_ && sessionInFlight_ != 0)
+    retiredSessionBorrows_.emplace(sessionId_, std::move(sessionBorrow_));
   if (sessionOpen_)
     sessionId_++;
   sessionOpen_ = false;
-  inFlight_ = 0;
-  // Cancel/timeout/failure releases the sampling window's protected read borrow
-  // exactly once (spec §6.1.1: cancel and failure must release the borrow).
-  sessionBorrow_.reset();
+  // The cancelled session gave up its samples: they can never be merged, so the
+  // session's own barrier drops. The PHYSICAL count does not: the calls are
+  // still running and their generations stay retained.
+  sessionInFlight_ = 0;
+  // Logical cancellation is not physical completion: `inFlight_` is the real
+  // count of entered-and-not-returned executions and is decremented by their
+  // own `leaveAdmitted`. An execution that was cancelled mid-flight therefore
+  // keeps its generation retained, and the sampling window's protected read is
+  // released only when the last of them returns.
+  releaseSessionBorrowIfDrained();
 #ifndef EJIT_FREESTANDING
   inFlightCV_.notify_all();
 #endif

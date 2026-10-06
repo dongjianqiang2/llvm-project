@@ -110,6 +110,8 @@ set(EJIT_SOURCES
   EJitRegistrationStore.cpp
   EJitStructFieldPass.cpp
   EJitSmallTable.cpp
+  EJitSmallTableRuntime.cpp
+  EJitSmallTableHost.cpp
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
   EJitProfileMerge.cpp

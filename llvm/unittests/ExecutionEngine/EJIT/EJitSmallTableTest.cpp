@@ -18,9 +18,12 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
+#include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableRuntime.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ADT/STLExtras.h"
@@ -35,7 +38,9 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -45,6 +50,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -3190,8 +3196,9 @@ TEST_F(SmallTableTest, AdmissionContractValidatesLaterMembers) {
   EXPECT_EQ(Contract.fields[1].resource.rows, kAutoCells);
   EXPECT_EQ(Contract.fields[1].resource.bytes, kAutoCells * 4);
   EXPECT_EQ(Contract.fields[1].publishedValues.size(), kAutoCells);
-  EXPECT_FALSE(Contract.fields[1].resource.fixedAddress)
-      << "the host x86-64 column stays preemptible (wantDSOLocal)";
+  EXPECT_EQ(Contract.fields[1].resource.fixedAddress,
+            Triple(M->getTargetTriple()).isAArch64())
+      << "AArch64 columns bind directly; x86-64 columns stay preemptible";
   ASSERT_TRUE(Contract.fields[0].requiredValue.has_value());
   EXPECT_EQ(*Contract.fields[0].requiredValue, 1u);
 
@@ -3704,6 +3711,396 @@ TEST_F(SmallTableTest, AutomaticSolverRefusesBeyondItsAxisBudget) {
 }
 
 //===----------------------------------------------------------------------===//
+// Target byte order, independent of the machine running these tests.
+// Literal source/column bytes prevent a host-native memcpy or a reversed
+// numeric expectation from accidentally making either target order pass.
+//===----------------------------------------------------------------------===//
+
+struct EndianScalarCase {
+  unsigned bitWidth;
+  unsigned bytes;
+  uint64_t values[2];
+  uint8_t little[2][8];
+  uint8_t big[2][8];
+};
+
+const EndianScalarCase EndianScalars[] = {
+    {8, 1, {0xd6, 0xa5}, {{0xd6}, {0xa5}}, {{0xd6}, {0xa5}}},
+    {16, 2, {0xa1b2, 0xc3d4}, {{0xb2, 0xa1}, {0xd4, 0xc3}},
+     {{0xa1, 0xb2}, {0xc3, 0xd4}}},
+    {32, 4, {0x89abcdef, 0x10203040},
+     {{0xef, 0xcd, 0xab, 0x89}, {0x40, 0x30, 0x20, 0x10}},
+     {{0x89, 0xab, 0xcd, 0xef}, {0x10, 0x20, 0x30, 0x40}}},
+    {64, 8, {0x0123456789abcdefULL, 0xfedcba9876543210ULL},
+     {{0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01},
+      {0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe}},
+     {{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef},
+      {0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10}}},
+    {9, 2, {0x1a5, 0x102}, {{0xa5, 0x01}, {0x02, 0x01}},
+     {{0x01, 0xa5}, {0x01, 0x02}}},
+    {17, 3, {0x1a2b3, 0x10002},
+     {{0xb3, 0xa2, 0x01}, {0x02, 0x00, 0x01}},
+     {{0x01, 0xa2, 0xb3}, {0x01, 0x00, 0x02}}},
+    {33, 5, {0x1a2b3c4d5ULL, 0x102030405ULL},
+     {{0xd5, 0xc4, 0xb3, 0xa2, 0x01}, {0x05, 0x04, 0x03, 0x02, 0x01}},
+     {{0x01, 0xa2, 0xb3, 0xc4, 0xd5}, {0x01, 0x02, 0x03, 0x04, 0x05}}},
+    {1, 1, {0, 1}, {{0}, {1}}, {{0}, {1}}},
+    {7, 1, {0x65, 0x72}, {{0x65}, {0x72}}, {{0x65}, {0x72}}},
+};
+
+EJitSmallTablePlan endianResourcePlan(bool Little) {
+  EJitSmallTablePlan Plan;
+  Plan.entryName = "endian_resource";
+  Plan.sourceVarName = "g_endian_resource";
+  Plan.littleEndian = Little;
+  Plan.storage = EJitSmallTableStorage::RuntimeOwned;
+  Plan.runtimeRowAdmission = true;
+  Plan.dims.push_back({EJitSmallTableDim::Kind::Argument, 0, 0, 2});
+  Plan.readiness = {17, "test.literal-byte-order.not-product", true, true};
+  Plan.rows.resize(2);
+  for (EJitSmallTableRow &Row : Plan.rows)
+    Row.ready = true;
+  for (unsigned I = 0; I < std::size(EndianScalars); ++I) {
+    const EndianScalarCase &Scalar = EndianScalars[I];
+    EJitSmallTableField Field;
+    Field.sourceOffset = Plan.elementBytes;
+    Field.accessSize = Scalar.bytes;
+    Field.bitWidth = Scalar.bitWidth;
+    Field.retainedAxes = {0};
+    Field.tableRows = 2;
+    Field.tableBytes = 2 * Scalar.bytes;
+    Field.columnName = "__ejit_stab_endian_resource_c" + std::to_string(I);
+    Plan.fields.push_back(std::move(Field));
+    Plan.elementBytes += Scalar.bytes;
+    for (unsigned Row = 0; Row < 2; ++Row)
+      Plan.rows[Row].bits.push_back(Scalar.values[Row]);
+  }
+  Plan.sourceStrides.push_back(Plan.elementBytes);
+  return Plan;
+}
+
+TEST(SmallTableTableResourceTest, PublicationUsesDeclaredTargetByteOrder) {
+  using Result = EJitSmallTableTableResource::PublishResult;
+  for (bool Little : {true, false}) {
+    SCOPED_TRACE(Little ? "LE target" : "BE target");
+    auto Plan = endianResourcePlan(Little);
+    std::string Error;
+    ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+    auto Resource = EJitSmallTableTableResource::create(Plan, 19, 82, Error);
+    ASSERT_NE(Resource, nullptr) << Error;
+    EXPECT_EQ(Resource->generation(), 19u);
+    EXPECT_EQ(Resource->capacityBytes(), 82u);
+    EXPECT_EQ(Resource->accounting().payloadBytes, 54u);
+    EXPECT_EQ(Resource->accounting().publishedCells, 0u);
+    const std::vector<uint8_t> Zero(Resource->capacityBytes(), 0);
+    EXPECT_EQ(std::vector<uint8_t>(Resource->base(),
+                                  Resource->base() + Resource->capacityBytes()),
+              Zero);
+    for (unsigned Field = 0; Field < std::size(EndianScalars); ++Field) {
+      const EndianScalarCase &Scalar = EndianScalars[Field];
+      auto *Column = static_cast<uint8_t *>(Resource->columnAddress(Field));
+      ASSERT_NE(Column, nullptr);
+      for (unsigned Row = 0; Row < 2; ++Row) {
+        SCOPED_TRACE("width=" + std::to_string(Scalar.bitWidth) +
+                     " row=" + std::to_string(Row));
+        uint64_t Bits = UINT64_MAX;
+        EXPECT_FALSE(Resource->published(Field, Row, &Bits));
+        EXPECT_EQ(Bits, UINT64_MAX) << "unknown rows never fabricate a value";
+        ASSERT_EQ(Resource->publish(Field, Row, Scalar.values[Row]),
+                  Result::Stored);
+        const uint8_t *Address = Column + Row * Scalar.bytes;
+        const uint8_t *Expected = Little ? Scalar.little[Row] : Scalar.big[Row];
+        const std::vector<uint8_t> ExpectedBytes(Expected, Expected + Scalar.bytes);
+        EXPECT_EQ(std::vector<uint8_t>(Address, Address + Scalar.bytes),
+                  ExpectedBytes);
+        ASSERT_TRUE(Resource->published(Field, Row, &Bits));
+        EXPECT_EQ(Bits, Scalar.values[Row]);
+        EXPECT_EQ(Resource->publish(Field, Row, Scalar.values[Row]),
+                  Result::AlreadySame);
+        EXPECT_EQ(Resource->publish(Field, Row, Scalar.values[Row] ^ 1),
+                  Result::Conflict);
+        EXPECT_EQ(std::vector<uint8_t>(Address, Address + Scalar.bytes),
+                  ExpectedBytes) << "a conflict cannot overwrite immutable bytes";
+      }
+      const std::vector<std::pair<uint64_t, uint64_t>> ExpectedValues = {
+          {0, Scalar.values[0]}, {1, Scalar.values[1]}};
+      EXPECT_EQ(Resource->publishedValues(Field), ExpectedValues);
+      EXPECT_EQ(Resource->publish(Field, 2, 0), Result::OutOfRange);
+      EXPECT_FALSE(Resource->published(Field, 2, nullptr));
+    }
+    EXPECT_EQ(Resource->publish(99, 0, 0), Result::NotATable);
+    const auto Accounting = Resource->accounting();
+    EXPECT_EQ(Accounting.reservedBytes, 82u);
+    EXPECT_EQ(Accounting.allocatedBytes, 82u);
+    EXPECT_EQ(Accounting.payloadBytes, 54u);
+    EXPECT_EQ(Accounting.publishedBytes, 54u);
+    EXPECT_EQ(Accounting.publishedCells, 18u);
+  }
+}
+
+TEST(SmallTableTableResourceTest, EachResourceSnapshotsItsPlanByteOrder) {
+  auto Plan = endianResourcePlan(false);
+  std::string Error;
+  ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+  auto Big = EJitSmallTableTableResource::create(Plan, 31, 82, Error);
+  ASSERT_NE(Big, nullptr) << Error;
+  Plan.littleEndian = true;
+  auto Little = EJitSmallTableTableResource::create(Plan, 32, 82, Error);
+  ASSERT_NE(Little, nullptr) << Error;
+  // Neither resource may retain the caller's mutable plan or share the last
+  // plan's byte-order setting. Mutation happens before either publication.
+  Plan.littleEndian = false;
+  ASSERT_EQ(Big->publish(1, 1, 0xc3d4),
+            EJitSmallTableTableResource::PublishResult::Stored);
+  ASSERT_EQ(Little->publish(1, 1, 0xc3d4),
+            EJitSmallTableTableResource::PublishResult::Stored);
+  const auto *B = static_cast<const uint8_t *>(Big->columnAddress(1));
+  const auto *L = static_cast<const uint8_t *>(Little->columnAddress(1));
+  ASSERT_NE(B, nullptr);
+  ASSERT_NE(L, nullptr);
+  EXPECT_EQ(B[2], 0xc3);
+  EXPECT_EQ(B[3], 0xd4);
+  EXPECT_EQ(L[2], 0xd4);
+  EXPECT_EQ(L[3], 0xc3);
+  EXPECT_EQ(B[0], 0u);
+  EXPECT_EQ(B[1], 0u);
+  EXPECT_EQ(L[0], 0u);
+  EXPECT_EQ(L[1], 0u);
+  EXPECT_EQ(Big->accounting().publishedCells, 1u);
+  EXPECT_EQ(Little->accounting().publishedCells, 1u);
+}
+
+TEST(SmallTableTableResourceTest, UniformOnlyPlanAllocatesNoEndianPayload) {
+  for (bool Little : {true, false}) {
+    auto Plan = endianResourcePlan(Little);
+    for (unsigned I = 0; I < Plan.fields.size(); ++I) {
+      auto &Field = Plan.fields[I];
+      Field.strategy = EJitSmallTableStrategy::Uniform;
+      Field.uniformValue = Plan.rows[0].bits[I];
+      Field.retainedAxes.clear();
+      Field.tableRows = Field.tableBytes = 0;
+      Field.columnName.clear();
+      Plan.rows[1].bits[I] = Plan.rows[0].bits[I];
+    }
+    std::string Error;
+    ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+    auto Resource = EJitSmallTableTableResource::create(Plan, 41, 0, Error);
+    ASSERT_NE(Resource, nullptr) << Error;
+    EXPECT_EQ(Resource->base(), nullptr);
+    EXPECT_TRUE(Resource->columns().empty());
+    EXPECT_EQ(Resource->capacityBytes(), 0u);
+    EXPECT_EQ(Resource->accounting().payloadBytes, 0u);
+    EXPECT_EQ(Resource->accounting().publishedBytes, 0u);
+    EXPECT_EQ(Resource->accounting().publishedCells, 0u);
+    EXPECT_EQ(Resource->publish(0, 0, Plan.rows[0].bits[0]),
+              EJitSmallTableTableResource::PublishResult::NotATable);
+  }
+}
+
+TEST(SmallTableTableResourceTest, PlanRejectsUnsupportedIntegerByteShapes) {
+  for (bool Little : {true, false}) {
+    const auto Good = endianResourcePlan(Little);
+    for (const auto &BadShape :
+         {std::pair<unsigned, unsigned>{0, 1}, {65, 8}, {9, 1}, {16, 3}}) {
+      auto Bad = Good;
+      Bad.fields[0].bitWidth = BadShape.first;
+      Bad.fields[0].accessSize = BadShape.second;
+      std::string Why;
+      EXPECT_FALSE(Bad.isConsistent(&Why));
+      EXPECT_FALSE(Why.empty());
+    }
+  }
+}
+
+// Copy literal target bytes, deliberately setting integer storage padding to
+// prove width masking. No host-native integers enter the source fixture.
+void fillEndianSource(uint8_t *Source, const EJitSmallTablePlan &Plan) {
+  for (unsigned Row = 0; Row < 2; ++Row)
+    for (unsigned Field = 0; Field < std::size(EndianScalars); ++Field) {
+      const auto &Scalar = EndianScalars[Field];
+      auto *Address = Source + Row * Plan.sourceStrides[0] +
+                      Plan.fields[Field].sourceOffset;
+      const uint8_t *Bytes = Plan.littleEndian ? Scalar.little[Row] : Scalar.big[Row];
+      std::memcpy(Address, Bytes, Scalar.bytes);
+      if (Scalar.bitWidth % 8 != 0) {
+        const unsigned HighByte = Plan.littleEndian ? Scalar.bytes - 1 : 0;
+        Address[HighByte] |= static_cast<uint8_t>(0xff << (Scalar.bitWidth % 8));
+      }
+    }
+}
+
+TEST(SmallTableEndianReadTest, AdmissionReadsLiteralBytesInContractOrder) {
+  for (bool Little : {true, false}) {
+    auto Plan = endianResourcePlan(Little);
+    // These bit patterns are compared unchanged, not converted through a host
+    // float/double value; the scalar-kind path must retain their exact bits.
+    Plan.fields[2].kind = EJitSmallTableKind::Float;
+    Plan.fields[3].kind = EJitSmallTableKind::Double;
+    std::string Error;
+    ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+    const auto Contract = buildAdmissionContract(Plan);
+    EXPECT_EQ(Contract.littleEndian, Little);
+    std::vector<uint8_t> Source(2 * Plan.elementBytes);
+    fillEndianSource(Source.data(), Plan);
+    for (unsigned Row = 0; Row < 2; ++Row) {
+      SCOPED_TRACE(std::string(Little ? "LE" : "BE") +
+                   " admission row=" + std::to_string(Row));
+      auto Member = readAdmissionMember(
+          Contract, {Source.data(), Source.size()}, {Row}, Error);
+      ASSERT_TRUE(Member.has_value()) << Error;
+      EXPECT_EQ(ArrayRef<uint64_t>(Member->bits),
+                ArrayRef<uint64_t>(Plan.rows[Row].bits));
+      EXPECT_EQ(validateAdmission(Contract, *Member, &Error),
+                EJitSmallTableAdmission::Compatible) << Error;
+    }
+  }
+}
+
+TEST(SmallTableEndianReadTest, PlannerReadsLiteralBytesInModuleOrder) {
+  for (bool Little : {true, false}) {
+    LLVMContext Context;
+    std::string Text = "target datalayout = \"";
+    Text += Little ? "e" : "E";
+    Text += "-p:64:64-i64:64-n32:64-S128\"\n";
+    Text += "target triple = \"";
+    Text += Little ? "aarch64-none-elf" : "aarch64_be-none-elf";
+    Text += "\"\n%Row = type { ";
+    for (unsigned I = 0; I < std::size(EndianScalars); ++I)
+      Text += (I ? ", " : "") + std::string("[8 x i8]");
+    Text += " }\n@g_ordered = external global [2 x %Row]\n";
+    Text += "define i32 @ordered(i32 %index) !ejit.metadata !0 {\n";
+    Text += "%row = getelementptr inbounds [2 x %Row], ptr @g_ordered, "
+            "i64 0, i32 %index\n";
+    for (unsigned I = 0; I < std::size(EndianScalars); ++I) {
+      const std::string Index = std::to_string(I);
+      Text += "%p" + Index + " = getelementptr inbounds %Row, ptr %row, "
+              "i32 0, i32 " + Index + "\n";
+      const std::string Type = I == 2 ? "float" : I == 3 ? "double" :
+          "i" + std::to_string(EndianScalars[I].bitWidth);
+      Text += "%v" + Index + " = load " + Type + ", ptr %p" + Index +
+              ", align 1, !ejit.may_const !1\n";
+    }
+    Text += "ret i32 0\n}\n!0 = !{!2}\n!1 = !{}\n"
+            "!2 = !{!\"ejit_entry\"}\n";
+    SMDiagnostic Diagnostic;
+    auto Module = parseAssemblyString(Text, Diagnostic, Context);
+    ASSERT_NE(Module, nullptr) << Text;
+    auto Expected = endianResourcePlan(Little);
+    Expected.elementBytes = 8 * std::size(EndianScalars);
+    Expected.sourceStrides[0] = Expected.elementBytes;
+    for (unsigned I = 0; I < Expected.fields.size(); ++I)
+      Expected.fields[I].sourceOffset = 8 * I;
+    std::vector<uint8_t> Source(2 * Expected.elementBytes);
+    fillEndianSource(Source.data(), Expected);
+    const SmallVector<EJitSmallTableDim, 1> Dims = {
+        {EJitSmallTableDim::Kind::Argument, 0, 0, 2}};
+    const SmallVector<EJitSmallTableRowKey, 2> Rows = {{{0}}, {{1}}};
+    EJitSmallTableRequest Request;
+    Request.module = Module.get();
+    Request.entryName = "ordered";
+    Request.sourceVarName = "g_ordered";
+    Request.dims = Dims;
+    Request.source = {Source.data(), Source.size()};
+    Request.authorizedRows = Rows;
+    Request.readiness = testReadiness();
+    std::string Error;
+    auto Actual = EJitSmallTablePlanner::plan(Request, Error);
+    ASSERT_TRUE(Actual.has_value()) << Error;
+    ASSERT_EQ(Actual->fields.size(), std::size(EndianScalars));
+    EXPECT_EQ(Actual->littleEndian, Little);
+    EXPECT_EQ(Actual->elementBytes, Expected.elementBytes);
+    EXPECT_EQ(Actual->fields[2].kind, EJitSmallTableKind::Float);
+    EXPECT_EQ(Actual->fields[3].kind, EJitSmallTableKind::Double);
+    for (unsigned Row = 0; Row < 2; ++Row)
+      EXPECT_EQ(ArrayRef<uint64_t>(Actual->rows[Row].bits),
+                ArrayRef<uint64_t>(Expected.rows[Row].bits))
+          << (Little ? "LE" : "BE") << " planner row=" << Row;
+    const auto Contract = buildAdmissionContract(*Actual);
+    for (unsigned Row = 0; Row < 2; ++Row) {
+      auto Member = readAdmissionMember(
+          Contract, {Source.data(), Source.size()}, {Row}, Error);
+      ASSERT_TRUE(Member.has_value()) << Error;
+      EXPECT_EQ(ArrayRef<uint64_t>(Member->bits),
+                ArrayRef<uint64_t>(Expected.rows[Row].bits));
+      EXPECT_EQ(validateAdmission(Contract, *Member, &Error),
+                EJitSmallTableAdmission::Compatible) << Error;
+    }
+  }
+}
+
+std::string printEndianTestModule(const Module &M) {
+  std::string Text;
+  raw_string_ostream Stream(Text);
+  M.print(Stream, nullptr);
+  return Text;
+}
+
+TEST_F(SmallTableTest, MaterializationRefusesMismatchedPlanByteOrderWithoutEdits) {
+  for (bool ModuleLittle : {true, false}) {
+    SMDiagnostic Diagnostic;
+    auto M = parseAssemblyString(widthModuleText(), Diagnostic, Ctx);
+    ASSERT_NE(M, nullptr);
+    auto Set = makeWidthPlanSet(*M);
+    ASSERT_NE(Set->find("w_entry"), nullptr);
+    auto Plan = *Set->find("w_entry");
+    std::string Layout = M->getDataLayoutStr();
+    ASSERT_FALSE(Layout.empty());
+    Layout[0] = ModuleLittle ? 'e' : 'E';
+    M->setDataLayout(Layout);
+    Plan.littleEndian = !ModuleLittle;
+    std::string Error;
+    ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+    const std::string Before = printEndianTestModule(*M);
+    EXPECT_FALSE(EJitSmallTablePass::materialize(*M, Plan, &Error));
+    EXPECT_EQ(Error,
+              "small-table plan byte order does not match module data layout");
+    EXPECT_EQ(printEndianTestModule(*M), Before)
+        << "refusal precedes any global insertion or load replacement";
+  }
+}
+
+TEST_F(SmallTableTest, DirectPassRefusesMismatchedByteOrderWithExistingColumns) {
+  for (bool ModuleLittle : {true, false}) {
+    SMDiagnostic Diagnostic;
+    auto M = parseAssemblyString(widthModuleText(), Diagnostic, Ctx);
+    ASSERT_NE(M, nullptr);
+    auto Set = makeWidthPlanSet(*M);
+    ASSERT_NE(Set->find("w_entry"), nullptr);
+    auto Plan = *Set->find("w_entry");
+    // The first may_const i1 field is uniform; the other three remain tables.
+    // A caller that bypasses materialize must neither fold this constant nor
+    // reuse existing columns against a differently ordered plan.
+    auto &Uniform = Plan.fields[0];
+    Uniform.strategy = EJitSmallTableStrategy::Uniform;
+    Uniform.uniformValue = Plan.rows[0].bits[0];
+    Uniform.retainedAxes.clear();
+    Uniform.columnName.clear();
+    Uniform.tableRows = Uniform.tableBytes = 0;
+    std::string Layout = M->getDataLayoutStr();
+    ASSERT_FALSE(Layout.empty());
+    Layout[0] = ModuleLittle ? 'e' : 'E';
+    M->setDataLayout(Layout);
+    Plan.littleEndian = ModuleLittle;
+    std::string Error;
+    ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+    ASSERT_TRUE(EJitSmallTablePass::materialize(*M, Plan, &Error)) << Error;
+    for (unsigned I = 1; I < Plan.fields.size(); ++I)
+      ASSERT_NE(M->getNamedGlobal(Plan.fields[I].columnName), nullptr);
+    Plan.littleEndian = !ModuleLittle;
+    const std::string Before = printEndianTestModule(*M);
+    EJitSmallTablePass Pass(Plan);
+    FunctionAnalysisManager Analyses;
+    const auto Preserved = Pass.run(*M->getFunction("w_entry"), Analyses);
+    EXPECT_TRUE(Preserved.areAllPreserved());
+    EXPECT_EQ(Pass.getStats().uniformFolded, 0u);
+    EXPECT_EQ(Pass.getStats().tableReplaced, 0u);
+    EXPECT_EQ(printEndianTestModule(*M), Before);
+    EXPECT_EQ(countTableLoads(*M->getFunction("w_entry"),
+                             EJitSmallTablePlan::TableGlobalPrefix), 0u);
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // B0/B1/B2: the online runtime over the real planner, pass, ORC engine and real
 // executions.
 //
@@ -3770,6 +4167,505 @@ protected:
                               reinterpret_cast<void *>(&RuntimeHook));
   }
 };
+
+// A real nonuniform i64 trailer keeps pre-fix last i33 typed reads inside the
+// actual allocation: deterministic incorrect execution, not an out-of-bounds
+// read whose undefined behavior could make the regression spuriously pass.
+const uint64_t PackedOddValues[3][3] = {
+    {0x1a2b3, 0x1a2b3c4d5ULL, 0x8877665544332211ULL},
+    {0x10002, 0x102030405ULL, 0x1021324354657687ULL},
+    {0x1c4d5, 0x1e6f70819ULL, 0xf0e1d2c3b4a59687ULL}};
+const uint32_t PackedOddLive[3] = {8, 17, 29};
+const uint8_t PackedOddLittle[3][3][8] = {
+    {{0xb3, 0xa2, 0x01}, {0xd5, 0xc4, 0xb3, 0xa2, 0x01},
+     {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}},
+    {{0x02, 0x00, 0x01}, {0x05, 0x04, 0x03, 0x02, 0x01},
+     {0x87, 0x76, 0x65, 0x54, 0x43, 0x32, 0x21, 0x10}},
+    {{0xd5, 0xc4, 0x01}, {0x19, 0x08, 0xf7, 0xe6, 0x01},
+     {0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0}}};
+const uint8_t PackedOddBig[3][3][8] = {
+    {{0x01, 0xa2, 0xb3}, {0x01, 0xa2, 0xb3, 0xc4, 0xd5},
+     {0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11}},
+    {{0x01, 0x00, 0x02}, {0x01, 0x02, 0x03, 0x04, 0x05},
+     {0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87}},
+    {{0x01, 0xc4, 0xd5}, {0x01, 0xe6, 0xf7, 0x08, 0x19},
+     {0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87}}};
+
+std::string packedOddModuleText(StringRef Header, ArrayRef<unsigned> Widths,
+                                bool HasLive) {
+  std::string Text = Header.str() + "\n%PackedRow = type { ";
+  for (unsigned I = 0; I < Widths.size() + unsigned(HasLive); ++I)
+    Text += (I ? ", " : "") + std::string("[8 x i8]");
+  Text += " }\n@g_packed_odd = external global [3 x %PackedRow]\n";
+  Text += "define i64 @packed_odd_entry(i32 %index) !ejit.metadata !0 {\n";
+  Text += "%row = getelementptr inbounds [3 x %PackedRow], ptr @g_packed_odd, "
+          "i64 0, i32 %index\n";
+  for (unsigned I = 0; I < Widths.size(); ++I) {
+    const std::string Id = std::to_string(I);
+    Text += "%p" + Id + " = getelementptr inbounds %PackedRow, ptr %row, "
+            "i32 0, i32 " + Id + "\n";
+    Text += "%v" + Id + " = load i" + std::to_string(Widths[I]) +
+            ", ptr %p" + Id + ", align 1, !ejit.may_const !1\n";
+    if (Widths[I] < 64)
+      Text += "%w" + Id + " = zext i" + std::to_string(Widths[I]) +
+              " %v" + Id + " to i64\n";
+    const std::string Value = (Widths[I] == 64 ? "%v" : "%w") + Id;
+    if (I == 0)
+      Text += "%mix0 = xor i64 " + Value + ", 0\n";
+    else
+      Text += "%mix" + Id + " = xor i64 %mix" + std::to_string(I - 1) +
+              ", " + Value + "\n";
+  }
+  const std::string Mix = "%mix" + std::to_string(Widths.size() - 1);
+  if (HasLive) {
+    Text += "%livep = getelementptr inbounds %PackedRow, ptr %row, i32 0, i32 " +
+            std::to_string(Widths.size()) + "\n";
+    Text += "%live = load i32, ptr %livep, align 1\n"
+            "%live64 = zext i32 %live to i64\n"
+            "%low = and i32 %live, 1\n%even = icmp eq i32 %low, 0\n"
+            "br i1 %even, label %positive, label %negative\n"
+            "positive:\n%plus = add i64 " + Mix + ", %live64\nret i64 %plus\n"
+            "negative:\n%minus = sub i64 " + Mix +
+            ", %live64\nret i64 %minus\n";
+  } else {
+    Text += "ret i64 " + Mix + "\n";
+  }
+  Text += "}\n!0 = !{!2}\n!1 = !{}\n!2 = !{!\"ejit_entry\"}\n";
+  return Text;
+}
+
+void fillPackedOddSource(uint8_t (&Source)[3][32], bool Little) {
+  std::memset(Source, 0x5a, sizeof(Source));
+  const unsigned Sizes[] = {3, 5, 8};
+  for (unsigned Row = 0; Row < 3; ++Row) {
+    for (unsigned Field = 0; Field < 3; ++Field) {
+      const uint8_t *Bytes = Little ? PackedOddLittle[Row][Field]
+                                    : PackedOddBig[Row][Field];
+      std::memcpy(Source[Row] + 8 * Field, Bytes, Sizes[Field]);
+      if (Field < 2)
+        Source[Row][8 * Field + (Little ? Sizes[Field] - 1 : 0)] |= 0xfe;
+    }
+    std::memset(Source[Row] + 24, 0, 4);
+    Source[Row][Little ? 24 : 27] = static_cast<uint8_t>(PackedOddLive[Row]);
+  }
+}
+
+uint64_t packedOddAot(unsigned Row) {
+  const uint64_t Mix = PackedOddValues[Row][0] ^ PackedOddValues[Row][1] ^
+                       PackedOddValues[Row][2];
+  return PackedOddLive[Row] & 1 ? Mix - PackedOddLive[Row]
+                               : Mix + PackedOddLive[Row];
+}
+
+TEST_F(SmallTableTest, CompilerEmittedOddWidthsExecuteSecondAndLastRows) {
+  SMDiagnostic Diagnostic;
+  auto M = parseAssemblyString(
+      packedOddModuleText(moduleTargetHeader(), {17, 33, 64}, true),
+      Diagnostic, Ctx);
+  ASSERT_NE(M, nullptr);
+  alignas(8) uint8_t Source[3][32];
+  fillPackedOddSource(Source, M->getDataLayout().isLittleEndian());
+  const SmallVector<EJitSmallTableDim, 1> Dims = {
+      {EJitSmallTableDim::Kind::Argument, 0, 0, 3}};
+  const SmallVector<EJitSmallTableRowKey, 3> Rows = {{{0}}, {{1}}, {{2}}};
+  EJitSmallTableRequest Request;
+  Request.module = M.get();
+  Request.entryName = "packed_odd_entry";
+  Request.sourceVarName = "g_packed_odd";
+  Request.dims = Dims;
+  Request.source = {&Source[0][0], sizeof(Source)};
+  Request.authorizedRows = Rows;
+  Request.readiness = testReadiness();
+  std::string Error;
+  auto Plan = EJitSmallTablePlanner::plan(Request, Error);
+  ASSERT_TRUE(Plan.has_value()) << Error;
+  EXPECT_EQ(Plan->storage, EJitSmallTableStorage::CompilerEmitted);
+  ASSERT_EQ(Plan->fields.size(), 3u);
+  for (unsigned Field = 0; Field < 3; ++Field) {
+    EXPECT_EQ(Plan->fields[Field].strategy, EJitSmallTableStrategy::Table);
+    for (unsigned Row = 0; Row < 3; ++Row)
+      EXPECT_EQ(Plan->rows[Row].bits[Field], PackedOddValues[Row][Field]);
+  }
+  auto Set = std::make_shared<EJitSmallTablePlanSet>();
+  Set->add(std::make_shared<const EJitSmallTablePlan>(*Plan));
+  auto &Registry = makeRegistry();
+  Registry.registerArray("row", "g_packed_odd", &Source[0][0], sizeof(Source));
+  auto Engine = compileWithEngine(*M, Set, Registry, 0x571733,
+                                  "packed_odd_entry");
+  ASSERT_NE(Engine, nullptr);
+  auto Fn = lookupSealed<uint64_t (*)(uint32_t)>(
+      *Engine, 0x571733, "packed_odd_entry");
+  ASSERT_NE(Fn, nullptr);
+  for (unsigned Row = 0; Row < 3; ++Row)
+    EXPECT_EQ(Fn(Row), packedOddAot(Row)) << "compiler-emitted row=" << Row;
+}
+
+TEST_F(SmallTableRuntimeTest, RuntimeOwnedOddWidthsRunCommonT1AndCompleteT2) {
+  struct RegistryScope {
+    RegistryScope() {
+      EJitFuncRegistry::instance().reset();
+      EJitLifecycleRegistry::instance().reset();
+    }
+    ~RegistryScope() {
+      EJitFuncRegistry::instance().reset();
+      EJitLifecycleRegistry::instance().reset();
+    }
+  } Registries;
+  SMDiagnostic Diagnostic;
+  auto M = parseAssemblyString(
+      packedOddModuleText(moduleTargetHeader(), {17, 33, 64}, true),
+      Diagnostic, Ctx);
+  ASSERT_NE(M, nullptr);
+  alignas(8) uint8_t Source[3][32];
+  fillPackedOddSource(Source, M->getDataLayout().isLittleEndian());
+  auto &Registry = makeRegistry();
+  Registry.registerArray("row", "g_packed_odd", &Source[0][0], sizeof(Source));
+  auto Provider = std::make_shared<EJitSmallTableHostFactSource>(
+      "g_packed_odd", Source, sizeof(Source), 0xe1733);
+  for (unsigned Row = 0; Row < 3; ++Row)
+    Provider->addReadyMember({Row}, Row + 1);
+  EJitSmallTableRuntime::Options Options;
+  Options.sampling.aggregateLimit = 8;
+  auto Runtime = makeRuntime(Provider, Options);
+  ASSERT_NE(Runtime, nullptr);
+  EJitSmallTableHost::Options HostOptions;
+  HostOptions.runtime = Options;
+  auto HostOrError = EJitSmallTableHost::create(*Runtime, Provider, HostOptions);
+  ASSERT_TRUE(static_cast<bool>(HostOrError)) << toString(HostOrError.takeError());
+  auto Host = std::move(*HostOrError);
+  const uint32_t DimType =
+      EJitLifecycleRegistry::instance().resolveAssign("row");
+  ASSERT_NE(DimType, kEJitInvalidDimType);
+  const SmallVector<EJitSmallTableDim, 1> Dims = {
+      {EJitSmallTableDim::Kind::Argument, 0, 0, 3}};
+  std::string Error;
+  const std::vector<std::string> Periods = {"row"};
+  EJitSmallTableHost::EntryRequest Request;
+  Request.module = M.get();
+  Request.entryName = "packed_odd_entry";
+  Request.funcIndex =
+      EJitFuncRegistry::instance().resolveAssign("packed_odd_entry");
+  Request.sourceVarName = "g_packed_odd";
+  Request.dims = Dims;
+  Request.dimPeriodNames = Periods;
+  Request.codeGeneration = 0x1733;
+  auto Prepared = Host->planEntry(Request, Error);
+  ASSERT_TRUE(static_cast<bool>(Prepared)) << Error;
+  ASSERT_EQ(Runtime->plan()->fields.size(), 3u);
+  ASSERT_EQ(Runtime->resource()->columns().size(), 3u);
+  EXPECT_EQ(Runtime->plan()->storage, EJitSmallTableStorage::RuntimeOwned);
+  EXPECT_EQ(Runtime->plan()->fields[0].accessSize, 3u);
+  EXPECT_EQ(Runtime->plan()->fields[1].accessSize, 5u);
+  EXPECT_EQ(Runtime->resource()->capacityBytes(), 56u);
+  for (unsigned Field = 0; Field < 3; ++Field) {
+    EXPECT_EQ(Runtime->plan()->fields[Field].strategy,
+              EJitSmallTableStrategy::Table);
+    for (unsigned Row = 0; Row < 3; ++Row)
+      EXPECT_EQ(Runtime->plan()->rows[Row].bits[Field],
+                PackedOddValues[Row][Field]);
+  }
+  auto T1OrError = Host->compileT1(Error);
+  ASSERT_TRUE(static_cast<bool>(T1OrError)) << Error;
+  auto T1 = reinterpret_cast<uint64_t (*)(uint32_t)>(*T1OrError);
+  ASSERT_NE(T1, nullptr);
+  const auto *I33 = Runtime->resource()->columnForField(1);
+  const auto *Trailer = Runtime->resource()->columnForField(2);
+  ASSERT_NE(I33, nullptr);
+  ASSERT_NE(Trailer, nullptr);
+  EXPECT_EQ(I33->offset, 16u);
+  EXPECT_EQ(Trailer->offset, 32u);
+  EXPECT_LE(I33->offset + 2 * 8 + 8, Runtime->resource()->capacityBytes());
+  for (unsigned Field = 0; Field < 3; ++Field) {
+    auto Bound = Runtime->engine().lookup(
+        0x1733, Runtime->plan()->fields[Field].columnName);
+    ASSERT_TRUE(static_cast<bool>(Bound)) << toString(Bound.takeError());
+    EXPECT_EQ(*Bound, Runtime->resource()->columnAddress(Field));
+  }
+  for (unsigned Sample = 0; Sample < 8; ++Sample) {
+    const unsigned Row = Sample % 3;
+    uint64_t Ticket = 0;
+    void *Entered = Host->enterInstrumented({DimType}, {Row}, &Ticket, &Error);
+    ASSERT_NE(Entered, nullptr) << Error;
+    ASSERT_NE(Ticket, 0u);
+    EXPECT_EQ(Entered, *T1OrError);
+    EXPECT_EQ(Host->activeExecutions(), 1u);
+    EXPECT_EQ(Runtime->physicalReaders(Runtime->resourceGeneration()), 1u);
+    EXPECT_EQ(reinterpret_cast<uint64_t (*)(uint32_t)>(Entered)(Row),
+              packedOddAot(Row))
+        << "common T1 sample=" << Sample << " row=" << Row;
+    Host->leave(Ticket);
+    EXPECT_EQ(Host->activeExecutions(), 0u);
+    EXPECT_EQ(Runtime->physicalReaders(Runtime->resourceGeneration()), 0u);
+  }
+  EXPECT_EQ(Runtime->currentSessionSamples(), 8u);
+  EXPECT_EQ(Runtime->inFlight(), 0u);
+  EXPECT_TRUE(Runtime->samplingExhausted());
+  uint64_t OverQuota = 99;
+  EXPECT_EQ(Host->enterInstrumented({DimType}, {0}, &OverQuota, &Error), nullptr);
+  EXPECT_EQ(OverQuota, 0u);
+  auto Frozen = Runtime->freeze(Error);
+  ASSERT_TRUE(static_cast<bool>(Frozen)) << Error;
+  const auto *Bundle = *Frozen;
+  ASSERT_NE(Bundle, nullptr);
+  EXPECT_EQ(Bundle->sampleCount, 8u);
+  EXPECT_EQ(Bundle->participatingMembers, 3u);
+  EXPECT_EQ(Provider->outstandingBorrows(), 0u);
+  ASSERT_EQ(Bundle->counters.size(), 1u);
+  const auto &Captured = Bundle->counters.front();
+  ASSERT_NE(Captured.profcAddr, 0u);
+  ASSERT_NE(Captured.profdAddr, 0u);
+  ASSERT_NE(Captured.pgoName, nullptr);
+  EXPECT_STREQ(Captured.pgoName, "packed_odd_entry");
+  auto Reader = InstrProfReader::create(
+      MemoryBuffer::getMemBufferCopy(Bundle->profileData));
+  ASSERT_TRUE(static_cast<bool>(Reader)) << toString(Reader.takeError());
+  unsigned Records = 0;
+  for (const NamedInstrProfRecord &Record : **Reader) {
+    ++Records;
+    EXPECT_EQ(Record.Name, StringRef(Captured.pgoName));
+    const auto *Data =
+        reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(
+            Captured.profdAddr);
+    EXPECT_EQ(Record.Hash, Data->FuncHash);
+    EXPECT_EQ(IndexedInstrProf::ComputeHash(Record.Name), Data->NameRef);
+    ASSERT_EQ(Record.Counts.size(), Data->NumCounters);
+    ASSERT_FALSE(Record.Counts.empty());
+    const auto *Raw = reinterpret_cast<const uint64_t *>(Captured.profcAddr);
+    uint64_t Total = 0;
+    for (unsigned Counter = 0; Counter < Record.Counts.size(); ++Counter) {
+      EXPECT_EQ(Record.Counts[Counter], Raw[Counter]);
+      EXPECT_LE(Raw[Counter], 8u) << "no call executes outside the real quota";
+      Total += Raw[Counter];
+    }
+    EXPECT_GE(Total, 8u) << "the profile contains real execution, not tickets";
+  }
+  EXPECT_EQ(Records, 1u);
+  EXPECT_FALSE((*Reader)->hasError());
+  auto PublishError = Host->publishGeneration(Error);
+  ASSERT_FALSE(static_cast<bool>(PublishError))
+      << Error << ": " << toString(std::move(PublishError));
+  ASSERT_EQ(Host->publishedSlots(), 3u);
+  ASSERT_NE(Host->activeEntry(), nullptr);
+  for (unsigned Row = 0; Row < 3; ++Row) {
+    uint64_t Ticket = 0;
+    void *Entered = Host->enter({DimType}, {Row}, &Ticket, &Error);
+    ASSERT_NE(Entered, nullptr) << Error;
+    ASSERT_NE(Ticket, 0u);
+    EXPECT_EQ(Entered, Host->activeEntry());
+    EXPECT_EQ(Host->activeExecutions(), 1u);
+    EXPECT_EQ(Runtime->physicalReaders(Runtime->resourceGeneration()), 1u);
+    EXPECT_EQ(Provider->outstandingBorrows(), 1u);
+    EXPECT_EQ(reinterpret_cast<uint64_t (*)(uint32_t)>(Entered)(Row),
+              packedOddAot(Row)) << "common T2 row=" << Row;
+    Host->leave(Ticket);
+    EXPECT_EQ(Host->activeExecutions(), 0u);
+    EXPECT_EQ(Runtime->physicalReaders(Runtime->resourceGeneration()), 0u);
+    EXPECT_EQ(Provider->outstandingBorrows(), 0u);
+  }
+  EXPECT_EQ(Runtime->inFlight(), 0u);
+  EXPECT_EQ(Bundle->sampleCount, 8u);
+}
+
+TEST_F(SmallTableTest, RuntimeOwnedOddWidthsUsePackedGepInBothTargetOrders) {
+  const unsigned Widths[] = {17, 33, 41, 49};
+  const unsigned AccessBytes[] = {3, 5, 6, 7};
+  for (bool Little : {true, false}) {
+    const std::string Header = std::string("target datalayout = \"") +
+        (Little ? "e" : "E") + "-p:64:64-i64:64-n32:64-S128\"\n";
+    for (bool RuntimeOwned : {false, true}) {
+      SMDiagnostic Diagnostic;
+      auto M = parseAssemblyString(
+          packedOddModuleText(Header, Widths, false), Diagnostic, Ctx);
+      ASSERT_NE(M, nullptr);
+      EJitSmallTablePlan Plan;
+      Plan.entryName = "packed_odd_entry";
+      Plan.sourceVarName = "g_packed_odd";
+      Plan.elementBytes = 32;
+      Plan.sourceStrides.push_back(32);
+      Plan.dims.push_back({EJitSmallTableDim::Kind::Argument, 0, 0, 3});
+      Plan.littleEndian = Little;
+      Plan.storage = RuntimeOwned ? EJitSmallTableStorage::RuntimeOwned
+                                  : EJitSmallTableStorage::CompilerEmitted;
+      Plan.runtimeRowAdmission = RuntimeOwned;
+      Plan.readiness = testReadiness();
+      for (unsigned I = 0; I < 4; ++I) {
+        EJitSmallTableField Field;
+        Field.sourceOffset = I * 8;
+        Field.accessSize = AccessBytes[I];
+        Field.bitWidth = Widths[I];
+        Field.retainedAxes = {0};
+        Field.tableRows = 3;
+        Field.tableBytes = 3 * AccessBytes[I];
+        Field.columnName = "__ejit_stab_packed_g" + std::to_string(I);
+        Plan.fields.push_back(std::move(Field));
+      }
+      for (unsigned Row = 0; Row < 3; ++Row)
+        Plan.rows.push_back({true, {0x10000u + Row, 0x100000000ULL + Row,
+                                    0x10000000000ULL + Row,
+                                    0x1000000000000ULL + Row}});
+      std::string Error;
+      ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+      ASSERT_TRUE(EJitSmallTablePass::materialize(*M, Plan, &Error)) << Error;
+      const auto Contract = buildAdmissionContract(Plan);
+      for (unsigned I = 0; I < 4; ++I) {
+        const auto *Global = M->getNamedGlobal(Plan.fields[I].columnName);
+        ASSERT_NE(Global, nullptr);
+        const auto *Array = dyn_cast<ArrayType>(Global->getValueType());
+        ASSERT_NE(Array, nullptr);
+        EXPECT_EQ(Contract.fields[I].resource.alignment, 1u);
+        EXPECT_EQ(Array->getElementType()->getIntegerBitWidth(),
+                  RuntimeOwned ? 8u : Widths[I]);
+        EXPECT_EQ(Array->getNumElements(),
+                  RuntimeOwned ? Plan.fields[I].tableBytes : 3u);
+        EXPECT_EQ(Global->hasInitializer(), !RuntimeOwned);
+      }
+      EJitSmallTablePass Pass(Plan);
+      FunctionAnalysisManager Analyses;
+      Pass.run(*M->getFunction("packed_odd_entry"), Analyses);
+      EXPECT_EQ(Pass.getStats().tableReplaced, 4u);
+      unsigned Loads = 0;
+      for (const Instruction &Inst :
+           instructions(*M->getFunction("packed_odd_entry"))) {
+        const auto *Load = dyn_cast<LoadInst>(&Inst);
+        if (!Load || !Load->getMetadata("ejit.smalltable.load"))
+          continue;
+        ASSERT_LT(Loads, 4u);
+        const auto *Gep = dyn_cast<GetElementPtrInst>(Load->getPointerOperand());
+        ASSERT_NE(Gep, nullptr);
+        if (RuntimeOwned) {
+          EXPECT_TRUE(Gep->getSourceElementType()->isIntegerTy(8));
+          EXPECT_EQ(Gep->getNumIndices(), 1u);
+          EXPECT_EQ(Load->getAlign().value(), 1u);
+          const auto *Mul = dyn_cast<BinaryOperator>(Gep->getOperand(1));
+          ASSERT_NE(Mul, nullptr);
+          EXPECT_EQ(Mul->getOpcode(), Instruction::Mul);
+          const auto *Scale = dyn_cast<ConstantInt>(Mul->getOperand(1));
+          ASSERT_NE(Scale, nullptr);
+          EXPECT_EQ(Scale->getZExtValue(), AccessBytes[Loads]);
+        } else {
+          const auto *Typed = dyn_cast<ArrayType>(Gep->getSourceElementType());
+          ASSERT_NE(Typed, nullptr);
+          EXPECT_EQ(Typed->getElementType()->getIntegerBitWidth(), Widths[Loads]);
+          EXPECT_EQ(Gep->getNumIndices(), 2u);
+          EXPECT_EQ(Load->getAlign(),
+                    M->getDataLayout().getABITypeAlign(Load->getType()));
+        }
+        ++Loads;
+      }
+      EXPECT_EQ(Loads, 4u);
+    }
+  }
+}
+
+EJitSmallTablePlan packedOddGuardPlan(bool Little) {
+  EJitSmallTablePlan Plan;
+  Plan.entryName = "packed_odd_entry";
+  Plan.sourceVarName = "g_packed_odd";
+  Plan.elementBytes = 32;
+  Plan.dims.push_back({EJitSmallTableDim::Kind::Argument, 0, 0, 3});
+  Plan.sourceStrides.push_back(32);
+  Plan.littleEndian = Little;
+  Plan.storage = EJitSmallTableStorage::RuntimeOwned;
+  Plan.runtimeRowAdmission = true;
+  Plan.readiness = testReadiness();
+  const unsigned Widths[] = {17, 33, 41, 49};
+  for (unsigned I = 0; I < 4; ++I) {
+    EJitSmallTableField Field;
+    Field.sourceOffset = I * 8;
+    Field.bitWidth = Widths[I];
+    Field.accessSize = (Widths[I] + 7) / 8;
+    Field.retainedAxes = {0};
+    Field.tableRows = 3;
+    Field.tableBytes = 3 * Field.accessSize;
+    Field.columnName = "__ejit_stab_guard_" + std::to_string(I);
+    Plan.fields.push_back(std::move(Field));
+  }
+  for (unsigned Row = 0; Row < 3; ++Row)
+    Plan.rows.push_back({true, {0x10000, 0x100000000ULL + Row,
+                                0x10000000000ULL + Row,
+                                0x1000000000000ULL + Row}});
+  // Refusal must occur before even this otherwise-safe uniform replacement.
+  auto &Uniform = Plan.fields[0];
+  Uniform.strategy = EJitSmallTableStrategy::Uniform;
+  Uniform.uniformValue = 0x10000;
+  Uniform.retainedAxes.clear();
+  Uniform.tableRows = Uniform.tableBytes = 0;
+  Uniform.columnName.clear();
+  return Plan;
+}
+
+TEST_F(SmallTableTest, DirectPassRefusesForeignRuntimeColumnsWithoutAnyIrEdits) {
+  enum Fault { StaleTyped, ShortBytes, Defined, ConstantDefined, ConstantDeclared };
+  const unsigned Widths[] = {17, 33, 41, 49};
+  for (bool Little : {true, false}) {
+    for (Fault Bad : {StaleTyped, ShortBytes, Defined, ConstantDefined,
+                      ConstantDeclared}) {
+      SCOPED_TRACE(std::string(Little ? "LE" : "BE") +
+                   " column fault=" + std::to_string(Bad));
+      const std::string Header = std::string("target datalayout = \"") +
+          (Little ? "e" : "E") + "-p:64:64-i64:64-n32:64-S128\"\n";
+      SMDiagnostic Diagnostic;
+      auto M = parseAssemblyString(packedOddModuleText(Header, Widths, false),
+                                    Diagnostic, Ctx);
+      ASSERT_NE(M, nullptr);
+      auto Plan = packedOddGuardPlan(Little);
+      std::string Error;
+      ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+      for (unsigned I = 1; I < Plan.fields.size(); ++I) {
+        const auto &Field = Plan.fields[I];
+        ArrayType *ColumnType =
+            ArrayType::get(Type::getInt8Ty(Ctx), Field.tableBytes);
+        if (I == 1 && Bad == StaleTyped)
+          ColumnType = ArrayType::get(Type::getIntNTy(Ctx, Field.bitWidth),
+                                       Field.tableRows);
+        if (I == 1 && Bad == ShortBytes)
+          ColumnType = ArrayType::get(Type::getInt8Ty(Ctx), Field.tableBytes - 1);
+        Constant *Initializer = nullptr;
+        if (I == 1 && (Bad == Defined || Bad == ConstantDefined))
+          Initializer = ConstantAggregateZero::get(ColumnType);
+        new GlobalVariable(*M, ColumnType,
+                           I == 1 && (Bad == ConstantDefined ||
+                                      Bad == ConstantDeclared),
+                           GlobalValue::ExternalLinkage, Initializer,
+                           Field.columnName);
+      }
+      const std::string Before = printEndianTestModule(*M);
+      EJitSmallTablePass Pass(Plan);
+      FunctionAnalysisManager Analyses;
+      const auto Preserved = Pass.run(*M->getFunction("packed_odd_entry"),
+                                      Analyses);
+      EXPECT_TRUE(Preserved.areAllPreserved());
+      EXPECT_EQ(Pass.getStats().uniformFolded, 0u);
+      EXPECT_EQ(Pass.getStats().tableReplaced, 0u);
+      EXPECT_EQ(printEndianTestModule(*M), Before)
+          << "foreign runtime storage cannot trigger any partial replacement";
+    }
+  }
+}
+
+TEST_F(SmallTableTest, MaterializeRefusesStaleTypedRuntimeColumnWithoutIrEdits) {
+  const unsigned Widths[] = {17, 33, 41, 49};
+  for (bool Little : {true, false}) {
+    const std::string Header = std::string("target datalayout = \"") +
+        (Little ? "e" : "E") + "-p:64:64-i64:64-n32:64-S128\"\n";
+    SMDiagnostic Diagnostic;
+    auto M = parseAssemblyString(packedOddModuleText(Header, Widths, false),
+                                  Diagnostic, Ctx);
+    ASSERT_NE(M, nullptr);
+    auto Plan = packedOddGuardPlan(Little);
+    std::string Error;
+    ASSERT_TRUE(Plan.isConsistent(&Error)) << Error;
+    const auto &Field = Plan.fields[1];
+    auto *StaleType = ArrayType::get(Type::getIntNTy(Ctx, Field.bitWidth),
+                                     Field.tableRows);
+    new GlobalVariable(*M, StaleType, false, GlobalValue::ExternalLinkage,
+                       nullptr, Field.columnName);
+    const std::string Before = printEndianTestModule(*M);
+    EXPECT_FALSE(EJitSmallTablePass::materialize(*M, Plan, &Error));
+    EXPECT_NE(Error.find("different type"), std::string::npos) << Error;
+    EXPECT_EQ(printEndianTestModule(*M), Before);
+  }
+}
 
 /// B0 fail-closed: with no provider, with a provider that cannot grant the
 /// protected read borrow, with a moved configuration generation, or with no
@@ -4020,11 +4916,12 @@ TEST_F(SmallTableRuntimeTest, RuntimeCommonBudgetFreezesBundleAndRunsCommonT2) {
   RT->leaveAdmitted(InFlightTicket);
   EXPECT_EQ(RT->inFlight(), 0u);
 
-  // An execution above the aggregate budget still runs (the specialized code is
-  // correct) but is NOT counted as a sample and is not in flight either.
+  // Quota exhaustion rejects a new T1 so its real counters cannot exceed the
+  // configured window. The caller continues on AOT until T2 is published.
   EJitSmallTableSampleTicket Over;
-  EXPECT_TRUE(RT->enterAdmitted({0, 0}, &Over, &Error));
+  EXPECT_FALSE(RT->enterAdmitted({0, 0}, &Over, &Error));
   EXPECT_FALSE(Over.valid);
+  EXPECT_FALSE(Over.counted);
   EXPECT_EQ(RT->currentSessionSamples(), 5u);
   EXPECT_EQ(RT->inFlight(), 0u);
 
@@ -4275,6 +5172,95 @@ TEST_F(SmallTableRuntimeTest, RuntimeConflictPreparesOneGenerationAndMigratesMem
       << "retirement never frees the live generation";
 }
 
+/// B1/B2 PHYSICAL LIFETIME (2026-09-16 P1 repair): the exact counterexample the
+/// coordinator derived from this source. A cancelled execution of generation G
+/// is no longer the session's, but it is still a REAL call inside G's column
+/// storage. Cancel -> beginNextGeneration -> retireGenerationsUpTo(G) must NOT
+/// free that storage: the retirement is deferred to the execution's own leave,
+/// which then performs the safe reclamation.
+TEST_F(SmallTableRuntimeTest, CancelledExecutionKeepsItsGenerationUntilTheRealLeave) {
+  auto M = parseAutoEntry();
+  ASSERT_TRUE(M);
+  SmallVector<EJitSmallTableDim, 2> Dims = autoDims(kAutoCells, kAutoTrps);
+  std::shared_ptr<EJitSmallTableHostProvider> Provider = hostProvider(0xE060);
+  EJitSmallTableRuntime::Options Opts;
+  Opts.sampling.aggregateLimit = 8;
+  auto RT = makeRuntime(Provider, Opts);
+  ASSERT_NE(RT, nullptr);
+  addProfileRuntimeHook(*RT);
+  std::string Error;
+  ASSERT_TRUE(static_cast<bool>(RT->prepare(*M, "a_entry", "g_auto", Dims, Error)))
+      << Error;
+  ASSERT_TRUE(static_cast<bool>(RT->compileCommonT1(1, Error))) << Error;
+  const uint64_t G1 = RT->resourceGeneration();
+
+  // Step 1: a real admitted execution of G1 is entered and PAUSED.
+  EJitSmallTableSampleTicket Ticket;
+  ASSERT_TRUE(RT->enterAdmitted({0, 0}, &Ticket, &Error)) << Error;
+  ASSERT_TRUE(Ticket.valid);
+  ASSERT_NE(RT->resource(), nullptr);
+  ASSERT_FALSE(RT->resource()->columns().empty());
+  const unsigned TableField = RT->resource()->columns().front().fieldIndex;
+  const uintptr_t G1Column0 =
+      reinterpret_cast<uintptr_t>(RT->resource()->columnAddress(TableField));
+  ASSERT_NE(G1Column0, 0u);
+  EXPECT_EQ(RT->physicalReaders(G1), 1u);
+
+  // Step 2: cancel (logical) and replace the generation (which retains G1).
+  RT->cancel("timeout while the call is running");
+  EXPECT_EQ(RT->inFlight(), 1u) << "the real call is still in flight";
+  EXPECT_EQ(RT->physicalReaders(G1), 1u);
+  SmallVector<EJitSmallTableRowKey, 2> Extra;
+  Extra.push_back({{1, 1}});
+  auto NextOrErr = RT->beginNextGeneration(Extra, Error);
+  ASSERT_TRUE(static_cast<bool>(NextOrErr)) << Error
+      << "a cancelled session does not block the new generation";
+  const uint64_t G2 = RT->resourceGeneration();
+  ASSERT_GT(G2, G1);
+  EXPECT_EQ(RT->retainedGenerationCount(), 1u);
+
+  // Step 3: retire G1. The storage a running call reads is NOT freed - the
+  // retirement is deferred and the bytes stay accounted.
+  EXPECT_TRUE(RT->retireGenerationsUpTo(G1));
+  EXPECT_EQ(RT->stats().retiredGenerations, 0u)
+      << "nothing may be freed while a real execution is inside the generation";
+  EXPECT_EQ(RT->retainedGenerationCount(), 1u);
+  EXPECT_GT(RT->retainedBytes(), 0u);
+  EXPECT_EQ(RT->pendingRetireGenerationCount(), 1u);
+  EXPECT_GT(RT->pendingRetireBytes(), 0u);
+  EXPECT_GE(RT->stats().deferredRetirements, 1u);
+  EXPECT_EQ(RT->physicalReaders(G1), 1u);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(RT->resource()->columnAddress(TableField)) != 0,
+            true)
+      << "the CURRENT generation is unaffected";
+
+  // Step 4: the real return. The old completion is stale for sampling and it is
+  // the event that releases G1's storage - never a premature free.
+  RT->leaveAdmitted(Ticket);
+  EXPECT_EQ(RT->inFlight(), 0u);
+  EXPECT_EQ(RT->physicalReaders(G1), 0u);
+  EXPECT_EQ(RT->pendingRetireGenerationCount(), 0u);
+  EXPECT_EQ(RT->stats().retiredGenerations, 1u);
+  EXPECT_GE(RT->stats().reclaimedAfterReaders, 1u)
+      << "the safe reclamation is recorded, not silent";
+  EXPECT_EQ(RT->retainedGenerationCount(), 0u);
+  EXPECT_EQ(RT->retainedBytes(), 0u);
+  EXPECT_GE(RT->stats().staleCallbacks, 1u)
+      << "the late completion is counted against its OWN session";
+  EXPECT_EQ(RT->resourceGeneration(), G2)
+      << "the retired generation can never become the current one again";
+
+  // The replacement generation is fully usable: it compiles, samples and runs.
+  auto T1bOrErr = RT->compileCommonT1(2, Error);
+  ASSERT_TRUE(static_cast<bool>(T1bOrErr)) << Error;
+  auto Fn2 = reinterpret_cast<int32_t (*)(uint32_t, uint32_t, int32_t)>(*T1bOrErr);
+  ASSERT_NE(Fn2, nullptr);
+  EXPECT_EQ(RT->currentSessionSamples(), 0u)
+      << "a stale completion never settles into the replacement session";
+  for (int32_t X = -1; X <= 2; ++X)
+    EXPECT_EQ(Fn2(0, 0, X), aotAuto(g_auto[0][0], X));
+}
+
 /// B2 cancel/timeout: the session stops granting tickets, its borrows are gone
 /// and a ticket it granted becomes a stale callback.
 TEST_F(SmallTableRuntimeTest, RuntimeCancelRejectsStaleCallbacksAndStopsDispatch) {
@@ -4303,15 +5289,30 @@ TEST_F(SmallTableRuntimeTest, RuntimeCancelRejectsStaleCallbacksAndStopsDispatch
   RT->cancel("sampling window timed out");
   EXPECT_FALSE(RT->sessionOpen());
   EXPECT_EQ(RT->cancellationReason(), "sampling window timed out");
+  // PHYSICAL LIFETIME (2026-09-16 P1 repair): the cancelled session gave up its
+  // sample ACCOUNTING (`sessionInFlight_`), but the execution it granted is a
+  // real call that has not returned. The runtime keeps its in-flight count and
+  // the window's protected read until that call completes, because the
+  // instrumented code already entered and still reads the table/source.
+  EXPECT_EQ(RT->sessionInFlight(), 0u)
+      << "the cancelled session no longer owns its samples";
+  EXPECT_EQ(RT->inFlight(), 1u)
+      << "the granted execution is still physically in flight";
+  EXPECT_TRUE(RT->samplingProtected())
+      << "the window's protected read guards the running call";
+  EXPECT_EQ(Provider->outstandingBorrows(), 1u)
+      << "cancel does not release a borrow a running execution still needs";
+
+  // The ticket belongs to the cancelled session: its completion is stale, never
+  // merged into whatever session comes next. It is also what releases the
+  // physical lease, so the borrow and the in-flight count end at the real
+  // return - not at the cancel.
+  RT->leaveAdmitted(Ticket);
+  EXPECT_EQ(RT->stats().staleCallbacks, 1u);
   EXPECT_EQ(RT->inFlight(), 0u);
   EXPECT_FALSE(RT->samplingProtected());
   EXPECT_EQ(Provider->outstandingBorrows(), 0u)
-      << "cancel releases every borrow the runtime held";
-
-  // The ticket belongs to the cancelled session: its completion is stale, never
-  // merged into whatever session comes next.
-  RT->leaveAdmitted(Ticket);
-  EXPECT_EQ(RT->stats().staleCallbacks, 1u);
+      << "the cancelled window's borrow is released at its last real return";
 
   // No new dispatch and no freeze on a cancelled session.
   EXPECT_FALSE(RT->enterAdmitted({0, 0}, &Ticket, &Error));
@@ -4513,11 +5514,12 @@ TEST_F(SmallTableRuntimeTest,
   EXPECT_EQ(RT->currentSessionSamples(), 64u);
   EXPECT_EQ(RT->inFlight(), 0u);
 
-  // Above the budget the specialized code still runs (it is correct); the
-  // execution is simply not counted as a sample.
+  // Above the budget new calls take AOT; they must not execute uncounted T1
+  // instrumentation and silently grow the supposedly bounded profile.
   EJitSmallTableSampleTicket Over;
-  EXPECT_TRUE(RT->enterAdmitted({0, 0}, &Over, &Error));
+  EXPECT_FALSE(RT->enterAdmitted({0, 0}, &Over, &Error));
   EXPECT_FALSE(Over.valid);
+  EXPECT_FALSE(Over.counted);
   EXPECT_EQ(RT->currentSessionSamples(), 64u);
 
   // Freeze ONE immutable bundle and run the common T2 against the same

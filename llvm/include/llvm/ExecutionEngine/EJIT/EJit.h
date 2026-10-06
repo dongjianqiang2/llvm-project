@@ -14,6 +14,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#endif
 #include <memory>
 #include <string>
 
@@ -141,6 +144,9 @@ public:
   /// shared build). May be null if the compile driver was not constructed.
   EJitSharedTaskPool *sharedTaskPool();
   const EJitSharedTaskPool *sharedTaskPool() const;
+  EJitSharedTaskPool::OwnerControlResult runControlOnOwnerAndWait(
+      std::function<void()> Work, uint32_t WaitRounds = 1u << 20);
+  bool abortFunctionPgoOnOwner(uint32_t FuncIndex);
 #endif
 
   /// Access the module loader (for funcIndex → funcName resolution in
@@ -197,6 +203,7 @@ public:
   }
 
 private:
+  friend struct EJitWrapperRuntimeTestAccess;
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;
   std::unique_ptr<EJitModuleLoader> moduleLoader_;

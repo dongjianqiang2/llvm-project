@@ -43,6 +43,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
+#include <chrono>
 #include <thread>
 #endif
 
@@ -1234,11 +1235,15 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
   // Stand-ins for the AOT globals: two [D] cell tables, and (for the sentinel
   // slot) the MissFn the table is defined pre-filled with. The runtime only
   // stores and compares these addresses; nothing ever calls through them.
-  constexpr uint32_t D = 16;
+  constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
+  constexpr uint32_t Instance = D > 3 ? 3 : D - 1;
   static uintptr_t sentinelCells[D];
   static uintptr_t guardedCells[D];
   static uintptr_t missFnStandIn = 0;
-  sentinelCells[3] = reinterpret_cast<uintptr_t>(&missFnStandIn);
+  for (uint32_t I = 0; I < D; ++I) {
+    sentinelCells[I] = reinterpret_cast<uintptr_t>(&missFnStandIn);
+    guardedCells[I] = 0;
+  }
 
   // C ABI registration: funcindex first (name -> registry funcIndex), then
   // the slot with its dimensionality and sentinel.
@@ -1252,28 +1257,119 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                             &missFnStandIn);
   ejit_register_icache_slot("guarded_c_fn", &guardedCells[0], 1, nullptr);
 
+  // These are mock code pointers for the registration/drain protocol only;
+  // they are never executed and do not provide PGO instrumentation evidence.
+  // Keep the compiler context alive until EJit's destructor joins its worker.
+  struct CompilerInputs {
+    uint32_t sentinelIndex;
+    uint32_t guardedIndex;
+  } Inputs{sentinelIdx, guardedIdx};
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
 
-  // Model a resolve that filled each slot's identity (this also arms the
-  // table, so the toggle's drain actually walks it).
-  EJitDimPair id[1] = {{0, 3}};
-  sp->icacheFill(sentinelIdx, reinterpret_cast<void *>(0x2000), id, 1,
-                 sp->icacheBeginResolve());
-  sp->icacheFill(guardedIdx, reinterpret_cast<void *>(0x3000), id, 1,
-                 sp->icacheBeginResolve());
-  ASSERT_EQ(sentinelCells[3], 0x2000u);
-  ASSERT_EQ(guardedCells[3], 0x3000u);
+  // With branch audit enabled the real runtime enables online PGO. An arbitrary
+  // pointer is intentionally NOT eligible for inline-cache fill: Tier-1 must
+  // continue through taskpool sampling, and only a published Tier-2 may bypass
+  // it. Publish both mock identities through the actual worker/cache protocol,
+  // preserving that safety gate instead of disabling PGO for this fixture.
+  sp->setCompiler(
+      [](void *Ctx, const EJitCompileRequest &Req, void **Out) {
+        const auto &Inputs = *static_cast<const CompilerInputs *>(Ctx);
+        const uint32_t Index = stripReqTier(Req.funcIndex);
+        if (Index != Inputs.sentinelIndex && Index != Inputs.guardedIndex)
+          return false;
+        const bool Final = decodeReqTier(Req.funcIndex) == kEJitTierPgoUse;
+        *Out = reinterpret_cast<void *>(
+            Final ? (Index == Inputs.sentinelIndex ? 0x2000 : 0x3000)
+                  : (Index == Inputs.sentinelIndex ? 0x4000 : 0x5000));
+        return true;
+      },
+      &Inputs);
+  // Mock addresses have no ORC code range or pending allocation batch. Their
+  // cache identity/tier publication, not allocator behavior, is under test.
+  sp->setCodeRangeProvider(nullptr, nullptr);
+  sp->setCodeBatchCallbacks(nullptr, nullptr, nullptr);
+  sp->setPgoEnabled(true, 1);
+  ASSERT_TRUE(ejit.activate("cell", Instance));
+  const EJitDimPair id[1] = {{lifeSlot, Instance}};
+  auto WaitFor = [&](auto Ready) {
+    const auto Deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < Deadline) {
+      EJitSharedDiagnostics D{};
+      sp->getDiagnostics(D);
+      if (Ready(D))
+        return true;
+      std::this_thread::yield();
+    }
+    return false;
+  };
+  auto FillPublished = [&](uint32_t Index, uintptr_t Tier1, uintptr_t Final,
+                           uintptr_t Empty, uintptr_t *Cells,
+                           uint64_t Completed) {
+    // A compilation request is not a progress query: repeated compileOrGet
+    // while a publication is changing can submit another sampling session.
+    // Request once, observe completion without dispatch, take exactly one T1
+    // hit to arm T2, then observe that completion before the final lookup.
+    auto Request = sp->compileOrGet(Index, id, 1, nullptr);
+    EXPECT_EQ(Request.status, EJitCompileOrGetStatus::EnqueuedPending);
+    if (Request.status != EJitCompileOrGetStatus::EnqueuedPending)
+      return false;
+    if (!WaitFor([&](const EJitSharedDiagnostics &D) {
+          return D.tier1Compiles == Completed && D.pendingCount == 0 &&
+                 D.queueDepth == 0 && D.pgoActiveFunctionCount == 1;
+        }))
+      return false;
+    auto Sample = sp->tryCacheHit(Index, id, 1);
+    EXPECT_EQ(Sample.status, EJitCompileOrGetStatus::CacheHit);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(Sample.fnPtr), Tier1);
+    if (Sample.status != EJitCompileOrGetStatus::CacheHit)
+      return false;
+    sp->icacheFill(Index, Sample.fnPtr, id, 1, sp->icacheBeginResolve());
+    if (Sample.hasReadToken)
+      sp->releaseRead(Sample.bucketIndex);
+    EXPECT_EQ(Cells[Instance], Empty)
+        << "online PGO must keep Tier-1 out of the inline cache";
+    if (!WaitFor([&](const EJitSharedDiagnostics &D) {
+          return D.tier2Compiles == Completed && D.pendingCount == 0 &&
+                 D.queueDepth == 0 && D.pgoActiveFunctionCount == 0;
+        }))
+      return false;
+    auto Published = sp->tryCacheHit(Index, id, 1);
+    EXPECT_EQ(Published.status, EJitCompileOrGetStatus::CacheHit);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(Published.fnPtr), Final);
+    if (Published.status != EJitCompileOrGetStatus::CacheHit)
+      return false;
+    sp->icacheFill(Index, Published.fnPtr, id, 1, sp->icacheBeginResolve());
+    if (Published.hasReadToken)
+      sp->releaseRead(Published.bucketIndex);
+    return Cells[Instance] == Final;
+  };
+  ASSERT_TRUE(FillPublished(sentinelIdx, 0x4000, 0x2000,
+                            reinterpret_cast<uintptr_t>(&missFnStandIn),
+                            sentinelCells, 1))
+      << "sentinel identity did not complete one mock T1/T2 session";
+  ASSERT_TRUE(FillPublished(guardedIdx, 0x5000, 0x3000, 0, guardedCells, 2))
+      << "guarded identity did not complete one mock T1/T2 session";
+  ASSERT_EQ(sentinelCells[Instance], 0x2000u);
+  ASSERT_EQ(guardedCells[Instance], 0x3000u);
+  EXPECT_TRUE(sp->isPgoEnabled());
+  EJitSharedDiagnostics Diagnostics{};
+  sp->getDiagnostics(Diagnostics);
+  EXPECT_EQ(Diagnostics.tier1Compiles, 2u);
+  EXPECT_EQ(Diagnostics.tier2Compiles, 2u);
 
-  // The public activate path drains: sentinel slot -> &MissFn, guarded slot
-  // -> 0. This is the C-ABI end of the contract the SharedTaskPool tests pin
-  // at the internal-API level.
-  EXPECT_TRUE(ejit.activate("cell", 3));
-  EXPECT_EQ(sentinelCells[3], reinterpret_cast<uintptr_t>(&missFnStandIn))
+  // A real public activate flip drains: sentinel slot -> &MissFn, guarded
+  // slot -> 0. Activate another previously disabled row: repeating activation
+  // of the sampled row would not flip a version or drain. This preserves the
+  // public-activate end of the contract pinned by the internal-API tests.
+  const uint32_t OtherInstance = Instance == 0 ? 1 : 0;
+  EXPECT_TRUE(ejit.activate("cell", OtherInstance));
+  EXPECT_EQ(sentinelCells[Instance], reinterpret_cast<uintptr_t>(&missFnStandIn))
       << "a sentinel slot registered through the C ABI must drain to &MissFn";
-  EXPECT_EQ(guardedCells[3], 0u)
+  EXPECT_EQ(guardedCells[Instance], 0u)
       << "a guarded (null-missFn) slot must keep the historical 0";
 }
 #endif // EJIT_SRE_SHARED_TASKPOOL
@@ -3662,8 +3758,23 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   auto AuditSites = sp.collectMayConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u)
       << "audit must recognize metadata-marked may_const loads";
-  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
-  EXPECT_TRUE(AuditSites.front().hasFieldOffset);
+  const auto &Site = AuditSites.front();
+  EXPECT_EQ(Site.functionName, F->getName().str());
+  EXPECT_EQ(Site.globalName, GVar->getName().str());
+  ASSERT_TRUE(Site.hasFieldOffset);
+  // The audit coordinate is relative to ONE array element, not the global
+  // array base. Independently derive the real GEP's total byte offset, then
+  // erase complete elements as the frontend's field metadata contract requires.
+  const DataLayout &DL = M->getDataLayout();
+  const auto *GEPOp = dyn_cast<GEPOperator>(GEP);
+  ASSERT_NE(GEPOp, nullptr);
+  APInt TotalOffset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+  ASSERT_TRUE(GEPOp->accumulateConstantOffset(DL, TotalOffset));
+  const uint64_t ElementBytes =
+      DL.getTypeAllocSize(ArrTy->getElementType()).getFixedValue();
+  ASSERT_GT(ElementBytes, 0u);
+  EXPECT_EQ(TotalOffset.getZExtValue(), 2u * ElementBytes);
+  EXPECT_EQ(Site.fieldOffset, TotalOffset.getZExtValue() % ElementBytes);
 #endif
   auto PA = sp.run(*F, H.FAM);
 

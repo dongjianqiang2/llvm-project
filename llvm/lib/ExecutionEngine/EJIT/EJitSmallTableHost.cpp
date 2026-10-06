@@ -28,6 +28,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
+#include "EJitWrapperRuntimeTestAccess.h"
+#include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
@@ -40,6 +44,9 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#ifndef EJIT_FREESTANDING
+#include <mutex>
+#endif
 
 namespace llvm {
 namespace ejit {
@@ -63,7 +70,26 @@ void EJitSmallTableHostFactSource::invalidateGeneration() {
 // Construction
 //===----------------------------------------------------------------------===//
 
-EJitSmallTableHost::~EJitSmallTableHost() = default;
+EJitSmallTableHost::~EJitSmallTableHost() {
+  // A host is destroyed only when no real execution is inside it (the owner
+  // teardown parks it otherwise), but a caller that deletes it directly must
+  // still not leave a generation reader or a protected borrow behind: release
+  // every remaining lease so a retained generation can be reclaimed.
+  for (ExecutionRecord &Rec : executions_) {
+    if (Rec.isSample && runtime_)
+      runtime_->leaveAdmitted(Rec.ticket);
+    if (Rec.borrow) {
+      Rec.borrow->release();
+      Rec.borrow.reset();
+    }
+    if (!Rec.isSample && Rec.resourceGeneration != 0 && runtime_) {
+      runtime_->releaseReader(Rec.resourceGeneration);
+      Rec.resourceGeneration = 0;
+    }
+  }
+  executions_.clear();
+  activeExecutions_ = 0;
+}
 
 Expected<std::unique_ptr<EJitSmallTableHost>> EJitSmallTableHost::create(
     const Config &Cfg, PeriodArrayRegistry &Registry, EJitRuntimeState &State,
@@ -109,14 +135,211 @@ namespace {
 /// feature is explicitly enabled; null means OFF and every dispatch entry takes
 /// its original AOT/compile path untouched.
 std::atomic<EJitSmallTableHost *> gSmallTableHost{nullptr};
+EJIT_SHARED_SECTION std::atomic<uint64_t> gSmallTablePolicyEpoch{1};
+EJitWrapperRuntimeTestAccess::HostInstallationObserver
+    gHostInstallationObserver = nullptr;
+void *gHostInstallationObserverContext = nullptr;
+
+/// The completion ABI carries only a token, so it must identify its owner
+/// across host replacement. Never wrap into a token an older owner may hold.
+std::atomic<uint64_t> gNextSmallTableExecutionToken{1};
+
+uint64_t allocateExecutionToken() {
+  uint64_t Next = gNextSmallTableExecutionToken.load(std::memory_order_relaxed);
+  while (Next != std::numeric_limits<uint64_t>::max()) {
+    if (gNextSmallTableExecutionToken.compare_exchange_weak(
+            Next, Next + 1, std::memory_order_relaxed))
+      return Next;
+  }
+  return 0;
+}
+
+/// Owners that were uninstalled (disable / host replacement / instance
+/// teardown) while a real execution was still inside their table. A late
+/// `ejit_stab_leave` must still reach the host whose token it carries, so the
+/// object - and with it the protected borrow and the resource generation the
+/// running call reads - is retained until that execution returns.
+#ifndef EJIT_FREESTANDING
+std::mutex &retiredOwnerMutex() {
+  static std::mutex M;
+  return M;
+}
+#endif
+std::vector<std::unique_ptr<EJitSmallTableHost>> &retiredOwners() {
+  static std::vector<std::unique_ptr<EJitSmallTableHost>> Owners;
+  return Owners;
+}
 } // namespace
 
 EJitSmallTableHost *EJitSmallTableHost::installGlobal(EJitSmallTableHost *Host) {
-  return gSmallTableHost.exchange(Host, std::memory_order_acq_rel);
+  if (Host && global() == Host && Host->wrapperAdmissionReady())
+    return Host; // an already-effective same-owner install is a true no-op
+  if (Host)
+    Host->acquireOwnerControlPin();
+  struct InstallationPin {
+    EJitSmallTableHost *Host;
+    ~InstallationPin() {
+      if (Host)
+        Host->releaseOwnerControlPin();
+    }
+  } Pin{Host};
+  // Close this Host before its pointer becomes visible, even when replacing
+  // another bound Host for the same function whose shared bit is already owned.
+  if (Host)
+    Host->setWrapperAdmissionReady(false);
+  EJitSmallTableHost *Old =
+      gSmallTableHost.exchange(Host, std::memory_order_acq_rel);
+  notePolicyChange();
+  if (Old && Old != Host &&
+      (!Host || !Host->isBoundTo(Old->funcIndex())))
+    releaseSmallTableOwnership(Old);
+  if (Host && gHostInstallationObserver)
+    gHostInstallationObserver(gHostInstallationObserverContext, Host);
+  // A Host can have been prepared before installation. Installing that bound
+  // policy must still join the ordinary-PGO handoff; merely moving the wrapper
+  // hook would otherwise leave the earlier session occupying admission.
+  if (Host && Host->isBoundTo(Host->funcIndex()) &&
+      Host->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
+      !inSmallTableOwnerRequest(Host)) {
+    if (Error E = runSmallTableOwnerRequest(
+            Host->funcIndex(), Host, []() -> Error { return Error::success(); })) {
+      const std::string Why = toString(std::move(E));
+      Host->cancel(Why);
+      EJIT_DIAG("small-table bound installation remains AOT: %s", Why.c_str());
+    }
+  }
+  return Old;
+}
+
+void EJitWrapperRuntimeTestAccess::setHostInstallationObserver(
+    HostInstallationObserver Observer, void *Context) {
+  gHostInstallationObserver = Observer;
+  gHostInstallationObserverContext = Context;
+}
+
+uint64_t EJitSmallTableHost::policyEpoch() {
+  return gSmallTablePolicyEpoch.load(std::memory_order_acquire);
+}
+
+void EJitSmallTableHost::notePolicyChange() {
+  uint64_t Epoch = gSmallTablePolicyEpoch.load(std::memory_order_acquire);
+  while (Epoch != std::numeric_limits<uint64_t>::max() &&
+         !gSmallTablePolicyEpoch.compare_exchange_weak(
+             Epoch, Epoch + 1, std::memory_order_acq_rel)) {}
 }
 
 EJitSmallTableHost *EJitSmallTableHost::global() {
   return gSmallTableHost.load(std::memory_order_acquire);
+}
+
+bool EJitSmallTableHost::beginOwnerTeardown() {
+  setWrapperAdmissionReady(false);
+  // Logical teardown FIRST: no new call can be admitted, every slot stops being
+  // published and every entered execution is settled for sampling. The physical
+  // leases stay until their own completions.
+  if (global() == this)
+    installGlobal(nullptr);
+  retractPublishedSlots();
+  cancel("small-table normal path disabled");
+  if (executions_.empty() && ownerControlPins_.loadAcquire() == 0)
+    return true; // destroy now: nothing is inside this table
+  return false;  // retain: a real execution still holds this generation
+}
+
+void EJitSmallTableHost::adoptRetired(std::unique_ptr<EJitSmallTableHost> Host) {
+  if (!Host)
+    return;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  retiredOwners().push_back(std::move(Host));
+}
+
+bool EJitSmallTableHost::leaveRetainedExecution(uint64_t Ticket) {
+  if (Ticket == 0)
+    return false;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  std::vector<std::unique_ptr<EJitSmallTableHost>> &Owners = retiredOwners();
+  for (size_t I = 0; I < Owners.size(); ++I) {
+    EJitSmallTableHost *H = Owners[I].get();
+    if (!H || !H->ownsExecution(Ticket))
+      continue;
+    H->leave(Ticket);
+    // The completion emptied the last physical lease: the retained owner is
+    // released here, still under the registry lock, so an entry can never be
+    // looked up after its destruction. A host whose own `leave` reached this
+    // point has already erased its registry entry, in which case the lookup
+    // above would not have found it.
+    if (H->physicalExecutions() == 0 && H->ownerControlPins_.loadAcquire() == 0)
+      Owners.erase(Owners.begin() + static_cast<ptrdiff_t>(I));
+    return true;
+  }
+  return false;
+}
+
+void EJitSmallTableHost::releaseOwnerControlPin() {
+  if (ownerControlPins_.fetchSub(1) != 1 || physicalExecutions() != 0)
+    return;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  auto &Owners = retiredOwners();
+  for (size_t I = 0; I < Owners.size(); ++I)
+    if (Owners[I].get() == this) {
+      Owners.erase(Owners.begin() + static_cast<ptrdiff_t>(I));
+      return; // may have destroyed this: do not access any field afterward
+    }
+}
+
+uint64_t EJitSmallTableHost::retainedOwnerCount() {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  return retiredOwners().size();
+}
+
+uint64_t EJitSmallTableHost::retainedOwnerOutstandingExecutions() {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  uint64_t N = 0;
+  for (const std::unique_ptr<EJitSmallTableHost> &H : retiredOwners())
+    if (H)
+      N += H->physicalExecutions();
+  return N;
+}
+
+bool EJitSmallTableHost::releaseRetainedOwner(EJitSmallTableHost *Host) {
+  if (!Host)
+    return false;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  std::vector<std::unique_ptr<EJitSmallTableHost>> &Owners = retiredOwners();
+  for (size_t I = 0; I < Owners.size(); ++I) {
+    if (Owners[I].get() != Host)
+      continue;
+    Owners[I].release(); // ownership returns to the caller; the object lives on
+    Owners.erase(Owners.begin() + static_cast<ptrdiff_t>(I));
+    return true;
+  }
+  return false;
+}
+
+void EJitSmallTableHost::abandonRetainedOwners() {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  retiredOwners().clear();
+}
+
+bool EJitSmallTableHost::ownsExecution(uint64_t Ticket) const {
+  for (const ExecutionRecord &Rec : executions_)
+    if (Rec.token == Ticket)
+      return true;
+  return false;
 }
 
 //===----------------------------------------------------------------------===//
@@ -213,6 +436,27 @@ bool EJitSmallTableHost::coordinateOf(ArrayRef<uint32_t> DimTypes,
 
 Expected<const EJitSmallTablePlan *>
 EJitSmallTableHost::planEntry(const EntryRequest &Request, std::string &Why) {
+  if (global() == this &&
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
+      (Request.funcIndex >= EJitFuncRegistry::instance().count() ||
+       EJitFuncRegistry::instance().lookup(Request.entryName) != Request.funcIndex)) {
+    Why = "small-table request function index does not identify its registered entry";
+    return make_error<StringError>(Why, inconvertibleErrorCode());
+  }
+  if (global() == this &&
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
+      !inSmallTableOwnerRequest(this)) {
+    const EJitSmallTablePlan *Plan = nullptr;
+    if (Error E = runSmallTableOwnerRequest(Request.funcIndex, this, [&]() -> Error {
+          auto P = planEntry(Request, Why);
+          if (!P)
+            return P.takeError();
+          Plan = *P;
+          return Error::success();
+        }))
+      return std::move(E);
+    return Plan;
+  }
   if (bound_) {
     Why = "small-table host: entry '" + entryName_ +
           "' is already bound; one host drives one entry";
@@ -273,6 +517,7 @@ EJitSmallTableHost::planEntry(const EntryRequest &Request, std::string &Why) {
   ensureProfileRuntimeHook();
 
   bound_ = true;
+  notePolicyChange();
   planReady_ = true;
   factRevision_ = facts_->configurationRevision();
 
@@ -326,6 +571,20 @@ void EJitSmallTableHost::ensureProfileRuntimeHook() {
 }
 
 Expected<void *> EJitSmallTableHost::compileT1(std::string &Why) {
+  if (global() == this &&
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
+      !inSmallTableOwnerRequest(this)) {
+    void *Entry = nullptr;
+    if (Error E = runSmallTableOwnerRequest(funcIndex_, this, [&]() -> Error {
+          auto P = compileT1(Why);
+          if (!P)
+            return P.takeError();
+          Entry = *P;
+          return Error::success();
+        }, /*InitialHandoff=*/false))
+      return std::move(E);
+    return Entry;
+  }
   if (!runtime_->plan()) {
     Why = "small-table host: compileT1 before a successful plan";
     return make_error<StringError>(Why, inconvertibleErrorCode());
@@ -363,6 +622,12 @@ Expected<void *> EJitSmallTableHost::compileT1(std::string &Why) {
 
 Error EJitSmallTableHost::requestEntry(const EntryRequest &Request,
                                        void *executableAot, std::string &Why) {
+  if (global() == this &&
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
+      !inSmallTableOwnerRequest(this))
+    return runSmallTableOwnerRequest(Request.funcIndex, this, [&]() {
+      return requestEntry(Request, executableAot, Why);
+    });
   aotEntry_ = executableAot;
   auto PlanOrErr = planEntry(Request, Why);
   if (!PlanOrErr)
@@ -410,6 +675,12 @@ void EJitSmallTableHost::rebuildSlots() {
 }
 
 Error EJitSmallTableHost::publishGeneration(std::string &Why) {
+  if (global() == this &&
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
+      !inSmallTableOwnerRequest(this))
+    return runSmallTableOwnerRequest(funcIndex_, this, [&]() {
+      return publishGeneration(Why);
+    }, /*InitialHandoff=*/false);
   if (!planReady_ || !t1Ready_) {
     Why = "small-table host: publishGeneration before a successful T1";
     return make_error<StringError>(Why, inconvertibleErrorCode());
@@ -557,7 +828,49 @@ bool EJitSmallTableHost::wouldDispatchCall(ArrayRef<uint32_t> DimTypes,
       *Why = Local;
     return false;
   }
-  return wouldDispatch(Coordinate, Why);
+  if (wouldDispatch(Coordinate, Why))
+    return true;
+  // Pre-publication: the ONE common sampling session is filled by ACTUAL
+  // admitted calls, so a call the host would admit to the instrumented tier must
+  // be allowed through the runtime's resolve gate rather than being sent to the
+  // AOT body. The authoritative admission decision is still `enter`'s; this only
+  // stops the cheap pre-filter from blocking every real call while the window
+  // fills. A coordinate that is not samplable keeps the published refusal.
+  return samplingAdmissible(Coordinate, Why);
+}
+
+bool EJitSmallTableHost::samplingAdmissible(ArrayRef<uint64_t> Coordinate,
+                                            std::string *Why) const {
+  auto Refuse = [&](const char *Msg) {
+    if (Why)
+      *Why = Msg;
+    return false;
+  };
+  if (!bound_ || !planReady_)
+    return Refuse("no small-table entry is bound to this function index");
+  if (!t1Ready_ || !runtime_->sessionOpen())
+    return Refuse("no open sampling session for this entry");
+  if (runtime_->samplingExhausted())
+    return Refuse("aggregate sampling budget reached; use AOT until T2 publishes");
+  const EJitSmallTableLogicalSlot *Slot = findSlot(Coordinate);
+  if (!Slot)
+    return Refuse("the coordinate has no slot: the member was never admitted");
+  if (Slot->admission != EJitSmallTableAdmission::Compatible &&
+      Slot->admission != EJitSmallTableAdmission::Extendable)
+    return Refuse("the member admission does not allow the specialized code");
+  if (!Slot->tableReady)
+    return Refuse("tableReady is false for this coordinate");
+  const bool Deactivated =
+      std::any_of(deactivated_.begin(), deactivated_.end(),
+                  [&](const std::vector<uint64_t> &C) {
+                    return C.size() == Coordinate.size() &&
+                           std::equal(C.begin(), C.end(), Coordinate.begin());
+                  });
+  if (Deactivated)
+    return Refuse("the coordinate was deactivated: its slot stays drained");
+  if (Why)
+    Why->clear();
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -587,6 +900,7 @@ EJitSmallTableHost::dispatch(ArrayRef<uint32_t> DimTypes,
   }
 
   uint64_t Ticket = 0;
+  const uint64_t Before = runtime_->currentSessionSamples();
   void *Entry = enter(DimTypes, InstanceIds, &Ticket, &Why);
   if (!Entry) {
     ++aotDispatchCount_;
@@ -595,16 +909,72 @@ EJitSmallTableHost::dispatch(ArrayRef<uint32_t> DimTypes,
 
   using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
   EntryFn Fn = reinterpret_cast<EntryFn>(Entry);
-  const uint64_t Before = runtime_->currentSessionSamples();
+  const bool Counted = runtime_->currentSessionSamples() > Before;
   const int64_t Value =
       Fn(static_cast<uint64_t>(Coordinate[0]),
          dims_.size() > 1 ? static_cast<uint64_t>(Coordinate[1]) : 0ull, Arg);
   EJitSmallTableDispatchResult R;
   R.status = EJitSmallTableDispatch::Dispatched;
-  R.counted = runtime_->currentSessionSamples() > Before;
+  R.counted = Counted;
   R.value = Value;
   leave(Ticket);
   return R;
+}
+
+bool EJitSmallTableHost::pinForExecutionPreparation(
+    ArrayRef<uint32_t> DimTypes, ArrayRef<uint32_t> Instances, uint64_t &Pin,
+    std::string &Why) {
+  Pin = 0;
+  SmallVector<uint64_t, 4> Coordinate;
+  if (!coordinateOf(DimTypes, Instances, Coordinate, &Why))
+    return false;
+  if (!codeReady_) {
+    if (!samplingAdmissible(Coordinate, &Why))
+      return false;
+  } else if (gateFor(Coordinate, nullptr, Why) !=
+             EJitSmallTableDispatch::Dispatched) {
+    return false;
+  }
+  if (!facts_ || !facts_->epochCurrent(runtime_->contract().domainEpoch)) {
+    Why = "configuration is not current at execution preparation";
+    return false;
+  }
+  // Pin physical ownership BEFORE a virtual borrow callback. That callback can
+  // disable/replace this Host; a preparation pin must keep its owner and table
+  // alive even on the failure return. The caller's guard leaves Pin in all cases.
+  ExecutionRecord Rec;
+  Rec.token = allocateExecutionToken();
+  if (!Rec.token) {
+    Why = "small-table preparation token space exhausted";
+    return false;
+  }
+  Rec.resourceGeneration = runtime_->resourceGeneration();
+  Rec.codeGeneration = codeGeneration_;
+  Rec.logicalSession = logicalSessionId_;
+  runtime_->acquireReader(Rec.resourceGeneration);
+  Pin = Rec.token;
+  executions_.push_back(std::move(Rec));
+  ++activeExecutions_;
+  auto Facts = facts_;
+  const uint64_t DomainEpoch = runtime_->contract().domainEpoch;
+  auto Borrow = Facts->borrow(runtime_->contract().sourceVarName, Why);
+  if (!Borrow)
+    return false;
+  if (Borrow->stale() || !Facts->epochCurrent(DomainEpoch)) {
+    Borrow->release();
+    Why = "configuration changed at execution preparation";
+    return false;
+  }
+  // Re-entrant callbacks can reallocate executions_; never keep a vector
+  // element reference across borrow(). Match the globally unique real token.
+  for (ExecutionRecord &Record : executions_)
+    if (Record.token == Pin) {
+      Record.borrow = std::move(Borrow);
+      return true;
+    }
+  Borrow->release();
+  Why = "preparation owner was completed during borrow";
+  return false;
 }
 
 void *EJitSmallTableHost::enter(ArrayRef<uint32_t> DimTypes,
@@ -624,6 +994,23 @@ void *EJitSmallTableHost::enter(ArrayRef<uint32_t> DimTypes,
   std::string Local;
   if (!coordinateOf(DimTypes, InstanceIds, Coordinate, &Local))
     return Refuse(Local);
+
+  // PR231: ONE common T1 per entry/code generation is filled by the entry's OWN
+  // admitted business calls, not by a host-side loop. While the sampling session
+  // is open and no final generation is published, an admitted member's ordinary
+  // call is a real sample and runs the instrumented tier; `leave` closes exactly
+  // that execution. The published (T2) gate below is unchanged and still
+  // requires codeReady + a published slot, so nothing here exposes final code
+  // before publication.
+  if (!codeReady_ && samplingAdmissible(Coordinate, nullptr)) {
+    void *SampleEntry =
+        enterInstrumented(DimTypes, InstanceIds, OutTicket, nullptr);
+    if (SampleEntry) {
+      if (Why)
+        Why->clear();
+      return SampleEntry;
+    }
+  }
 
   std::string GateWhy;
   const EJitSmallTableDispatch Gate =
@@ -687,14 +1074,27 @@ bool EJitSmallTableHost::enterPublished(ArrayRef<uint64_t> Coordinate,
       Borrow->stale()) {
     Borrow->invalidate("configuration generation moved at dispatch");
     Borrow->release();
-    facts_->onBorrowReleased(Borrow.get());
     Why = "configuration generation moved at dispatch";
     return false;
   }
   ExecutionRecord Rec;
-  Rec.token = nextExecutionToken_++;
+  Rec.token = allocateExecutionToken();
+  if (Rec.token == 0) {
+    Borrow->release();
+    Why = "small-table execution token space exhausted";
+    return false;
+  }
   Rec.isSample = false;
   Rec.borrow = std::move(Borrow);
+  Rec.resourceGeneration = runtime_->resourceGeneration();
+  Rec.codeGeneration = codeGeneration_;
+  Rec.logicalSession = logicalSessionId_;
+  // The physical lease: the runtime counts a reader for this generation, so a
+  // retirement that arrives while this call is running cannot free the column
+  // storage its compiled address reads. Released only by this execution's own
+  // `leave` (never by a cancel).
+  if (Rec.resourceGeneration != 0)
+    runtime_->acquireReader(Rec.resourceGeneration);
   executions_.push_back(std::move(Rec));
   ++activeExecutions_;
   if (OutToken)
@@ -703,73 +1103,147 @@ bool EJitSmallTableHost::enterPublished(ArrayRef<uint64_t> Coordinate,
   return true;
 }
 
+uint64_t EJitSmallTableHost::beginLogicalSession() {
+  ++logicalSessionId_;
+  return logicalSessionId_;
+}
+
+void EJitSmallTableHost::releasePhysicalLease(ExecutionRecord &Rec) {
+  if (Rec.borrow) {
+    // Release the execution's protected read: the configuration was protected
+    // for exactly as long as the specialized code ran. A cancellation does NOT
+    // release this - the call is still running and its compiled code may still
+    // read the source region.
+    Rec.borrow->release();
+    Rec.borrow.reset();
+  }
+  if (Rec.resourceGeneration != 0) {
+    // Drop the generation reader. This is what makes a deferred retirement
+    // reclaimable once the last real execution of that generation returns.
+    // Sampling tickets own their reader in the runtime and release it through
+    // leaveAdmitted. Published calls own their reader directly in this host.
+    if (!Rec.isSample)
+      runtime_->releaseReader(Rec.resourceGeneration);
+    Rec.resourceGeneration = 0;
+  }
+}
+
 void EJitSmallTableHost::leavePublished(uint64_t Token) {
   if (Token == 0)
     return;
-  // An execution a cancel/config-change already closed is a stale callback: it
-  // is counted, and it never closes a newer generation's execution.
-  if (std::find(cancelledTokens_.begin(), cancelledTokens_.end(), Token) !=
-      cancelledTokens_.end()) {
-    ++staleLeaveCount_;
-    return;
-  }
   // Find this execution's record. Executions may complete out of order (a
   // nested call, a preempted core), so the token, not the stack position, is
-  // the identity.
+  // the identity. A record a cancel/config change already closed logically is
+  // STILL here: the real call is running, and its physical lease must be
+  // released by this completion, never by the cancellation.
   for (size_t I = executions_.size(); I > 0; --I) {
     ExecutionRecord &Rec = executions_[I - 1];
     if (Rec.token != Token)
       continue;
+    // A completion that arrives after a cancel/configuration change is a stale
+    // callback for SAMPLING: it is counted and never merged into the generation
+    // that follows. Its own physical lease is released either way.
+    const bool Stale = Rec.logicallyClosed ||
+                       Rec.logicalSession != logicalSessionId_ ||
+                       (Rec.isSample &&
+                        (runtime_->sessionId() != Rec.runtimeSession ||
+                         !runtime_->sessionOpen()));
+    if (Stale)
+      ++staleLeaveCount_;
     if (activeExecutions_ > 0)
       --activeExecutions_;
     if (Rec.isSample) {
-      // A sampling session's ticket: closing it is the runtime's sample
-      // completion. A ticket whose session has since changed is a stale
-      // callback, which the runtime counts and never merges.
-      if (runtime_->sessionId() != samplingSessionAtEnter_)
-        ++staleLeaveCount_;
+      // The runtime's session identity is its own serial: a ticket whose session
+      // has since changed is a stale callback, which the runtime counts and
+      // never merges. It still decrements the runtime's physical in-flight count
+      // for exactly this execution.
       runtime_->leaveAdmitted(Rec.ticket);
     }
-    if (Rec.borrow) {
-      // Release the execution's protected read: the configuration was protected
-      // for exactly as long as the specialized code ran.
-      Rec.borrow->release();
-      facts_->onBorrowReleased(Rec.borrow.get());
-    }
+    releasePhysicalLease(Rec);
     executions_.erase(executions_.begin() + static_cast<ptrdiff_t>(I - 1));
+    reclaimDeferredRetirements();
     return;
   }
 }
-
 void EJitSmallTableHost::closeOutstandingExecutions() {
+  // LOGICAL settlement only. The generated code that already entered is not
+  // stopped by a cancel: it still holds the compiled address and still reads the
+  // table's raw column storage. Releasing the protected borrow or erasing the
+  // record here would let the resource be retired (and its storage freed) while
+  // that call is still running, which is precisely the physical-lifetime
+  // violation this protocol exists to prevent. So each in-flight execution is
+  // marked closed for admission/publication/sampling purposes and KEEPS its
+  // lease: the protected borrow, the resource-generation reader and the record
+  // all survive until the real `leave` releases them.
   for (ExecutionRecord &Rec : executions_) {
-    if (Rec.borrow) {
-      // The specialized code is not going to complete under this generation:
-      // releasing the protected read is what keeps the configuration free, and
-      // recording the token makes the eventual completion a stale callback.
-      Rec.borrow->release();
-      facts_->onBorrowReleased(Rec.borrow.get());
-    }
-    if (Rec.isSample) {
-      // Tell the runtime this sample completion arrives after its session was
-      // cancelled: the execution is counted as a stale callback and never
-      // merged into the next generation.
-      EJitSmallTableSampleTicket Stale = Rec.ticket;
-      Stale.sessionId = runtime_->sessionId() + 1;
-      Stale.valid = true;
-      runtime_->leaveAdmitted(Stale);
-    }
-    cancelledTokens_.push_back(Rec.token);
+    if (Rec.logicallyClosed)
+      continue;
+    Rec.logicallyClosed = true;
+    // A sampling execution whose session was cancelled must still deliver its
+    // OWN completion to the runtime at its real return: that is what decrements
+    // the runtime's physical in-flight count for exactly this execution. Nothing
+    // is delivered here, because the execution has not returned.
   }
-  executions_.clear();
-  activeExecutions_ = 0;
+}
+
+void EJitSmallTableHost::reclaimDeferredRetirements() {
+  retiredExecutions_ = 0;
+  retiredExecutionGeneration_ = 0;
+  for (const ExecutionRecord &Rec : executions_) {
+    if (Rec.resourceGeneration == 0 ||
+        Rec.resourceGeneration > retirementWatermark_)
+      continue;
+    ++retiredExecutions_;
+    if (retiredExecutionGeneration_ == 0 ||
+        Rec.resourceGeneration < retiredExecutionGeneration_)
+      retiredExecutionGeneration_ = Rec.resourceGeneration;
+  }
+  if (retiredExecutions_ != 0)
+    return;
+  if (retirementWatermark_ != 0) {
+    runtime_->reclaimRetiredGenerations();
+    retirementWatermark_ = 0;
+  }
+}
+
+uint64_t EJitSmallTableHost::reclaimRetiredNow() {
+  // Explicit reclaim point. It never frees a generation a real execution is
+  // still inside: the runtime only reclaims what its physical reader counts say
+  // is unread.
+  return runtime_->reclaimRetiredGenerations();
+}
+
+uint64_t EJitSmallTableHost::logicallyClosedExecutions() const {
+  uint64_t N = 0;
+  for (const ExecutionRecord &Rec : executions_)
+    if (Rec.logicallyClosed)
+      ++N;
+  return N;
+}
+
+uint64_t EJitSmallTableHost::oldestExecutionGeneration() const {
+  uint64_t Oldest = 0;
+  for (const ExecutionRecord &Rec : executions_)
+    if (Rec.resourceGeneration != 0 &&
+        (Oldest == 0 || Rec.resourceGeneration < Oldest))
+      Oldest = Rec.resourceGeneration;
+  return Oldest;
+}
+
+std::vector<uint64_t> EJitSmallTableHost::executionGenerations() const {
+  std::vector<uint64_t> Out;
+  for (const ExecutionRecord &Rec : executions_)
+    if (Rec.resourceGeneration != 0 &&
+        std::find(Out.begin(), Out.end(), Rec.resourceGeneration) == Out.end())
+      Out.push_back(Rec.resourceGeneration);
+  llvm::sort(Out);
+  return Out;
 }
 
 void EJitSmallTableHost::leave(uint64_t Ticket) {
   if (!runtime_)
     return;
-  // Ticket 0 means the runtime admitted the execution but had already reached
-  // the aggregate budget: it is not in flight and nothing is closed.
+  // Ticket0 is a refusal/no-policy path: no specialized execution was entered.
   if (Ticket == 0)
     return;
   leavePublished(Ticket);
@@ -816,16 +1290,32 @@ void *EJitSmallTableHost::enterInstrumented(ArrayRef<uint32_t> DimTypes,
       *Why = Local;
     return nullptr;
   }
-  // Register the sample so `leave` closes exactly this execution: the runtime's
-  // in-flight count and aggregate budget are its bookkeeping, while the host
-  // owns the token the wrapper hands back.
-  samplingSessionAtEnter_ = runtime_->sessionId();
+  // Every admitted T1 dispatch has a physical ticket through its real return.
+  // The runtime owns its sampling borrow and generation reader; the
+  // host token routes its actual completion back to that runtime after teardown.
+  if (!Ticket.valid) {
+    if (Why)
+      *Why = "runtime admitted T1 without a physical execution ticket";
+    return nullptr;
+  }
+  const uint64_t Token = allocateExecutionToken();
+  if (Token == 0) {
+    runtime_->leaveAdmitted(Ticket);
+    if (Why)
+      *Why = "small-table execution token space exhausted";
+    return nullptr;
+  }
   ++activeExecutions_;
   ExecutionRecord Rec;
-  Rec.token = nextExecutionToken_++;
+  Rec.token = Token;
   Rec.isSample = true;
   Rec.ticket = Ticket;
-  if (OutTicket && Ticket.valid)
+  Rec.resourceGeneration = runtime_->resourceGeneration();
+  Rec.codeGeneration = codeGeneration_;
+  Rec.logicalSession = logicalSessionId_;
+  Rec.runtimeSession = runtime_->sessionId();
+  // enterAdmitted already acquired this sampling ticket's physical reader.
+  if (OutTicket)
     *OutTicket = Rec.token;
   executions_.push_back(std::move(Rec));
   if (Why)
@@ -842,8 +1332,8 @@ uint64_t EJitSmallTableHost::driveSampling(uint64_t MaxExecutions, int64_t Arg) 
   uint64_t Done = 0;
   // Real executions through the ordinary enter/leave path, spread over the
   // members the contract admits. Only executions the runtime actually counts
-  // consume the aggregate budget; once it is reached the remaining calls would
-  // still run correct specialized code but stop being samples, so stop.
+  // consume the aggregate budget; once it is reached new calls use AOT until
+  // the completed window is frozen and T2 published, so stop.
   size_t SlotCursor = 0;
   while (Done < MaxExecutions && runtime_->currentSessionSamples() < Budget &&
          !runtime_->samplingExhausted()) {
@@ -888,9 +1378,11 @@ uint64_t EJitSmallTableHost::driveSampling(uint64_t MaxExecutions, int64_t Arg) 
 //===----------------------------------------------------------------------===//
 
 void EJitSmallTableHost::noteConfigurationChange(StringRef Reason) {
+  notePolicyChange();
   const std::string R = Reason.empty() ? std::string("configuration changed")
                                        : Reason.str();
   retractPublishedSlots();
+  beginLogicalSession();
   closeOutstandingExecutions();
   drainSlots(R);
   runtime_->noteGenerationChange(R);
@@ -900,9 +1392,11 @@ void EJitSmallTableHost::noteConfigurationChange(StringRef Reason) {
 }
 
 void EJitSmallTableHost::cancel(StringRef Reason) {
+  notePolicyChange();
   const std::string R =
       Reason.empty() ? std::string("cancelled") : Reason.str();
   retractPublishedSlots();
+  beginLogicalSession();
   closeOutstandingExecutions();
   drainSlots(R);
   runtime_->cancel(R);
@@ -953,10 +1447,6 @@ Error EJitSmallTableHost::beginNextGeneration(
 
 bool EJitSmallTableHost::retireGenerationsUpTo(uint64_t Generation,
                                                std::string &Why) {
-  if (runtime_->inFlight() != 0) {
-    Why = "an admitted execution is still in flight";
-    return false;
-  }
   // Freeing the storage a published entry may still be executing against would
   // be a use-after-free, so refuse while any slot reads that generation. The
   // caller drains the slots first (noteConfigurationChange/cancel), which is
@@ -967,10 +1457,22 @@ bool EJitSmallTableHost::retireGenerationsUpTo(uint64_t Generation,
           std::to_string(publishedResourceGeneration_);
     return false;
   }
+  // A real execution still inside a generation of this range does NOT make the
+  // retirement fail: it makes it DEFERRED. The runtime keeps the storage and its
+  // bytes accounted until that execution's own `leave` drops the last reader;
+  // `reclaimDeferredRetirements` then releases it. Logical cancellation is not
+  // physical completion, so a cancel followed by a rebuild does not license the
+  // free (spec §7 retained old generation, NO_RECLAIM without a proven safe
+  // reclamation).
   if (!runtime_->retireGenerationsUpTo(Generation)) {
     Why = "the runtime refused to retire generation " +
-          std::to_string(Generation);
+          std::to_string(Generation) + " (above the current generation)";
     return false;
+  }
+  retirementWatermark_ = std::max(retirementWatermark_, Generation);
+  reclaimDeferredRetirements();
+  if (retiredExecutions_ != 0) {
+    ++deferredRetirements_;
   }
   Why.clear();
   return true;

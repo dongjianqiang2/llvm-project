@@ -144,6 +144,9 @@ constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
 // only under -ejit-small-table-hooks (default off), so the baseline AOT wrapper
 // is byte-for-byte unchanged when the feature is off.
 constexpr const char *FN_STAB_ENTER = "ejit_stab_enter";
+constexpr const char *FN_STAB_WRAPPER_ENTER = "ejit_stab_wrapper_enter";
+constexpr const char *FN_STAB_NO_POLICY_CURRENT =
+    "ejit_stab_wrapper_no_policy_current";
 constexpr const char *FN_STAB_LEAVE = "ejit_stab_leave";
 constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
 constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =

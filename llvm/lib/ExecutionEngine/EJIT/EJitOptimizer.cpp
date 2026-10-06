@@ -22,6 +22,8 @@
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
 // cleanupFPM_ and the LowerExpect prefix are hand-added below.
 #include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/IPO/Inliner.h"
@@ -139,6 +141,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
                     static_cast<int>(ctx.optLevel), ctx.dimensions.size(),
                     static_cast<int>(ctx.tier), M.getName().str().c_str());
   lastCounterNames_.clear();
+  lastCounterProfileNames_.clear();
+  counterProfileNamesByRef_.clear();
   lastVpFunctions_.clear();
   scalarSiteCountsByFunc_.clear();
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -233,6 +237,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     runLightOptPipeline(M);
     ModulePassManager GenMPM;
     GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
+    GenMPM.run(M, MAM_);
+    // Gen retains the canonical name as the instrprof intrinsic's NamePtr
+    // initializer. Lowering legalizes the counter symbol and erases that name
+    // variable, so capture between the two passes, including any Gen renaming.
+    captureCounterProfileNames(M);
     // Tier-1 machine code is SHARED and executed concurrently by multiple cores
     // (shared taskpool). A plain __profc_* load/add/store would lose counts and
     // let Tier-2 profile synthesis read a torn value. Lower with atomic counter
@@ -241,8 +250,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     // / Tier-2 (PGOUse) machine code carries no profiling instrumentation.
     InstrProfOptions InstrProfOpts;
     InstrProfOpts.Atomic = true;
-    GenMPM.addPass(InstrProfilingLoweringPass(InstrProfOpts));
-    GenMPM.run(M, MAM_);
+    ModulePassManager LoweringMPM;
+    LoweringMPM.addPass(InstrProfilingLoweringPass(InstrProfOpts));
+    LoweringMPM.run(M, MAM_);
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
     // Scalar/loop-bound value sites (EJIT_VALUE_PROFILE.md §7.1): discover +
     // instrument AFTER the Gen/Lowering passes (so the CFG carries the same
@@ -639,8 +649,41 @@ void EJitOptimizer::runLightOptPipeline(Module &M) {
       FPM.run(F, FAM_);
 }
 
+void EJitOptimizer::captureCounterProfileNames(Module &M) {
+  counterProfileNamesByRef_.clear();
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    const std::string CanonicalName = getIRPGOFuncName(F);
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        auto *Counter = dyn_cast<InstrProfCntrInstBase>(&I);
+        if (!Counter)
+          continue;
+        GlobalVariable *NameVar = Counter->getName();
+        if (!NameVar || !NameVar->hasInitializer())
+          continue;
+        auto *NameData = dyn_cast<ConstantDataArray>(NameVar->getInitializer());
+        if (!NameData || !NameData->isString())
+          continue;
+        StringRef InstrumentedName = NameData->isCString()
+                                         ? NameData->getAsCString()
+                                         : NameData->getAsString();
+        const uint64_t NameRef = IndexedInstrProf::ComputeHash(InstrumentedName);
+        auto Result = counterProfileNamesByRef_.try_emplace(
+            NameRef, InstrumentedName.str());
+        // Preserve only an exact, unique canonical mapping. In particular,
+        // never reconstruct '<source>;internal' from a legalized symbol.
+        if (CanonicalName != InstrumentedName ||
+            Result.first->second != InstrumentedName)
+          Result.first->second.clear();
+      }
+  }
+}
+
 void EJitOptimizer::captureCounterGlobals(Module &M) {
   lastCounterNames_.clear();
+  lastCounterProfileNames_.clear();
   // PR231 B2: a symbol can only be resolved by name if it is emitted GLOBAL.
   // The instrumentation passes create the counters, the profile version flag and
   // the runtime-hook user function with hidden visibility (and sometimes local
@@ -666,9 +709,26 @@ void EJitOptimizer::captureCounterGlobals(Module &M) {
     // Default InternalLinkage is invisible to ORC J->lookup (P0-3): force
     // External so the compile driver can resolve counter addresses by name.
     MakeResolvable(&GV);
-    if (IsProfc)
-      // PGOFuncName = name with the "__profc_" prefix stripped.
-      lastCounterNames_.emplace_back(Name.drop_front(strlen("__profc_")).str());
+    if (IsProfc && !GV.isDeclaration()) {
+      StringRef SymbolSuffix = Name.drop_front(strlen("__profc_"));
+      lastCounterNames_.emplace_back(SymbolSuffix.str());
+      // InstrProfiling gives each counter/data pair the same actual suffix,
+      // including its optional CFG hash postfix. NameRef is the canonical
+      // name hash, not the hash of this assembler-safe suffix.
+      GlobalVariable *Data =
+          M.getNamedGlobal((Twine("__profd_") + SymbolSuffix).str());
+      auto *Init = Data && Data->hasInitializer()
+                       ? dyn_cast<ConstantStruct>(Data->getInitializer())
+                       : nullptr;
+      auto *NameRef = Init && Init->getNumOperands() != 0
+                          ? dyn_cast<ConstantInt>(Init->getOperand(0))
+                          : nullptr;
+      if (!NameRef || NameRef->getBitWidth() != 64)
+        continue;
+      auto It = counterProfileNamesByRef_.find(NameRef->getZExtValue());
+      if (It != counterProfileNamesByRef_.end() && !It->second.empty())
+        lastCounterProfileNames_[SymbolSuffix] = It->second;
+    }
   }
   // The profile version flag and the runtime-hook user function are created by
   // the same instrumentation pipeline and are resolvable for the same reason.

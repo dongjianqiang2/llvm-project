@@ -82,11 +82,25 @@ public:
   }
 
   /// PGO counter global names captured during the last Instrumented (Tier-1)
-  /// compile (PGOFuncName suffix of each __profc_<name>). Empty for
+  /// compile (the actual symbol suffix of each __profc_<name>). Empty for
   /// Baseline/PGOUse. The compile driver looks up __profc_/__profd_ by these
-  /// names to capture counter addresses for Tier-2 profile synthesis.
+  /// names to capture counter addresses for Tier-2 profile synthesis. A symbol
+  /// suffix is not necessarily the canonical PGO function name: LLVM legalizes
+  /// characters in internal-function counter symbols.
   ArrayRef<std::string> getLastCounterNames() const {
     return lastCounterNames_;
+  }
+
+  /// Canonical IR-PGO name belonging to an emitted counter symbol suffix from
+  /// the last Instrumented compile. Captured from the real instrumentation's
+  /// name string and matched to the lowered __profd_ NameRef, never guessed by
+  /// reversing symbol legalization. Empty for a missing or ambiguous mapping;
+  /// consumers must fail closed and verify the actual data NameRef. The result
+  /// remains valid only until the next runPipeline.
+  StringRef getCounterProfileName(StringRef SymbolSuffix) const {
+    auto It = lastCounterProfileNames_.find(SymbolSuffix);
+    return It == lastCounterProfileNames_.end() ? StringRef()
+                                              : StringRef(It->second);
   }
 
   /// Names of the small-table column globals materialized by the last compile
@@ -172,10 +186,15 @@ private:
   /// and Tier-2 keeps the CFG (and thus the PGO hash) aligned.
   void runLightOptPipeline(Module &M);
 
+  /// Capture the canonical names from real PGO Gen intrinsics before lowering
+  /// erases their name variables. A colliding NameRef has no usable mapping.
+  void captureCounterProfileNames(Module &M);
+
   /// After PGOInstrumentationGen + InstrProfilingLoweringPass, force the
   /// __profc_*/__profd_* counter globals to ExternalLinkage (default
   /// InternalLinkage is invisible to ORC J->lookup, P0-3) and record each
-  /// PGOFuncName (suffix of __profc_<name>) in lastCounterNames_.
+  /// actual symbol suffix in lastCounterNames_, separately from its canonical
+  /// profile name matched through the actual __profd_ initializer's NameRef.
   void captureCounterGlobals(Module &M);
 
   /// Run the EJIT optimization pipeline: a single fused sequence that exploits
@@ -233,9 +252,13 @@ private:
   // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
   FunctionPassManager pgoUseFPM_;
 
-  // PGO: PGOFuncNames captured by the last Tier-1 compile (see
+  // PGO: actual counter symbol suffixes captured by the last Tier-1 compile (see
   // captureCounterGlobals). Cleared at the start of each runPipeline.
   SmallVector<std::string, 4> lastCounterNames_;
+  StringMap<std::string> lastCounterProfileNames_;
+  // Canonical Gen-stage names, keyed by the NameRef emitted into __profd_. An
+  // empty value denotes a hash collision or inconsistent instrumentation.
+  DenseMap<uint64_t, std::string> counterProfileNamesByRef_;
   // Value profile (EJIT_VALUE_PROFILE.md §5.1): function table captured by the
   // last Tier-1 compile. Cleared at the start of each runPipeline. The scalar
   // instrumentation pass records per-function site counts into

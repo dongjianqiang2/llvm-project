@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -104,6 +105,7 @@ public:
 
   /// Owner-only orderly shutdown of the shared worker (soft-stop + join).
   void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
+  bool abortFunctionPgoOnOwner(uint32_t FuncIndex);
 #endif
 
   EJitRuntimeState &getRuntimeState() { return runtimeState_; }
@@ -138,6 +140,7 @@ public:
   void registerSymbol(const std::string &name, void *addr);
 
 private:
+  friend struct EJitWrapperRuntimeTestAccess;
   const Config &config_;
   EJitRuntimeState &runtimeState_;
   EJitModuleLoader &loader_;
@@ -192,6 +195,9 @@ private:
     uintptr_t profdAddr = 0;
   };
   std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+  /// Only functions handed to a common Host preserve previous physical JDs
+  /// on future ordinary compilations; logical cache/profile identities stay.
+  std::unordered_set<uint32_t> handedOffFunctions_;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct Tier1MayConstState {
     uintptr_t counterBase = 0;
@@ -220,6 +226,7 @@ private:
   /// merge), touched only by the single owner worker: the collector is armed
   /// at the first Tier-1 capture and disarmed once the last round merged.
   uint32_t vpRoundsActive_ = 0;
+  std::unordered_map<uint64_t, uint32_t> vpLiveRounds_;
 #endif
 };
 

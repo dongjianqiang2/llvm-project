@@ -53,6 +53,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableRuntime.h"
 #include "llvm/Support/Error.h"
@@ -71,6 +72,17 @@ namespace ejit {
 class EJitOrcEngine;
 class EJitRuntimeState;
 class PeriodArrayRegistry;
+class EJitSmallTableHost;
+/// Internal owner identity of the live C-runtime instance, 0 when absent.
+uint64_t currentEJitRuntimeOwnerIdentity();
+/// C++ normal-path owner-worker controls; component-only hosted runtimes have
+/// no live C-runtime owner and keep their explicit synchronous component API.
+bool onSmallTableOwnerWorker();
+bool inSmallTableOwnerRequest(EJitSmallTableHost *Host);
+Error runSmallTableOwnerRequest(uint32_t FuncIndex, EJitSmallTableHost *Host,
+                               std::function<Error()> Job,
+                               bool InitialHandoff = true);
+void releaseSmallTableOwnership(EJitSmallTableHost *Host);
 
 //===----------------------------------------------------------------------===//
 // The product fact-source seam
@@ -240,10 +252,13 @@ class EJitSmallTableHost {
 public:
   struct Options {
     EJitSmallTableRuntime::Options runtime;
-    /// When true, `dispatch` refuses before `publishGeneration` succeeded: the
-    /// slot is published only when BOTH tableReady and codeReady hold, which is
-    /// the §6.5 rule. Tests may lower it to exercise the T1 window explicitly
-    /// through `enter`, but a product configuration must leave it true.
+    /// When true, the FINAL (published) tier refuses until `publishGeneration`
+    /// succeeded: a slot exposes its T2 entry only when BOTH tableReady and
+    /// codeReady hold, which is the §6.5 rule, and a product configuration must
+    /// leave it true. It deliberately does NOT gate the sampling tier: while the
+    /// ONE common T1 window is open, an admitted member's ordinary call is a
+    /// real sample of that window (spec §10) and runs the instrumented entry;
+    /// publication remains the only way final code becomes reachable.
     bool requireCodeReadyForDispatch = true;
     /// Aggregate budget for a sampling-only driver (the initial T1 window).
     /// The runtime owns the real (configurable) budget; this only bounds the
@@ -301,6 +316,63 @@ public:
   static EJitSmallTableHost *installGlobal(EJitSmallTableHost *Host);
   /// The process-global host, or null when the feature is OFF.
   static EJitSmallTableHost *global();
+  /// Monotonic dispatch decision epoch. Owner-serialized policy changes and
+  /// runtime replacement invalidate an early no-policy snapshot.
+  static uint64_t policyEpoch();
+  static void notePolicyChange();
+  bool belongsToRuntimeOwner(uint64_t Identity) const {
+    return Identity != 0 && wrapperRuntimeOwnerIdentity_ == Identity;
+  }
+  /// Normal-path wrapper admission is published only after this Host's real
+  /// owner-worker handoff completes. Installing an already-bound replacement
+  /// may not borrow the previous Host's function-owned bit as its own grant.
+  /// This internal C++ gate does not change explicit component enter/dispatch.
+  bool wrapperAdmissionReady() const {
+    return wrapperAdmissionReady_.loadAcquire() != 0;
+  }
+
+  /// Uninstall + logically cancel this host for a DISABLE or a host
+  /// replacement, without destroying it while a real execution is still inside
+  /// its table. A late `leave` must still release that execution's physical
+  /// lease (and its generation), so an execution that is still running keeps the
+  /// object alive via the retired-owner registry until it returns.
+  ///
+  /// Returns true when the host was destroyed immediately (no real execution was
+  /// still running, so the caller's `unique_ptr` is now null and nothing is
+  /// left); false when it was retained and the caller must MOVE its ownership
+  /// into the registry with `adoptRetired(std::move(Owned))`.
+  bool beginOwnerTeardown();
+
+  /// Hand a host parked by `beginOwnerTeardown` to the process-global retired
+  /// owner registry (which destroys it as soon as its last execution leaves).
+  static void adoptRetired(std::unique_ptr<EJitSmallTableHost> Host);
+
+  /// Deliver a completion to a host that is no longer installed globally but is
+  /// still retained for its outstanding executions. Returns true when some
+  /// retired host recognized the ticket.
+  static bool leaveRetainedExecution(uint64_t Ticket);
+  void acquireOwnerControlPin() { ownerControlPins_.fetchAdd(1); }
+  void releaseOwnerControlPin();
+
+  /// Retained owners still parked waiting for their last execution to return.
+  /// Zero after every late `leave` was delivered.
+  static uint64_t retainedOwnerCount();
+
+  /// The count of real executions that a retained owner is still holding open.
+  /// Callers use it to observe that a disable/replacement parked the host
+  /// instead of destroying a table a running call still reads.
+  static uint64_t retainedOwnerOutstandingExecutions();
+
+  /// Remove \p Host from the retained-owner registry without destroying it (a
+  /// test/owner teardown that takes its own object back). Returns true when the
+  /// host was parked there.
+  static bool releaseRetainedOwner(EJitSmallTableHost *Host);
+
+  /// Destroy every retained owner regardless of its outstanding executions.
+  /// ONLY for a harness that has already established that no execution can
+  /// return (a failed test, a process-level teardown); the production path
+  /// releases a retained owner through its late `leave`.
+  static void abandonRetainedOwners();
 
   /// Retract every published logical slot through the real invalidation path the
   /// owner installed (see `setInvalidationHook`), so a call site that already
@@ -388,12 +460,27 @@ public:
 
   /// The two hooks the AOT wrapper emits around the specialized dispatch
   /// (`ejit_stab_enter` / `ejit_stab_leave`). `enter` returns the callable entry
-  /// when THIS execution may run specialized code - admission, table readiness,
-  /// code readiness, eligibility and the published slot must all hold - and null
-  /// otherwise, in which case the wrapper takes its AOT body. It records the
-  /// execution as in flight and holds the session's protected read across it.
+  /// when THIS execution may run specialized code and null otherwise, in which
+  /// case the wrapper takes its AOT body. Two tiers answer:
+  ///   * the FINAL tier, once `publishGeneration` succeeded: admission, table
+  ///     readiness, code readiness and the published slot must all hold, and the
+  ///     returned entry is the T2 compiled from the frozen bundle;
+  ///   * the SAMPLING tier, while the ONE common T1 window is open: admission,
+  ///     table readiness and a not-deactivated slot suffice, and the returned
+  ///     entry is the instrumented T1. This is what fills the aggregate budget
+  ///     from the entry's own admitted business calls (spec §10), and it never
+  ///     exposes final code.
+  /// Either way the execution is recorded as in flight and holds the protected
+  /// read across the real call; `leave` releases exactly that execution.
   void *enter(ArrayRef<uint32_t> dimTypes, ArrayRef<uint32_t> instanceIds,
               uint64_t *outTicket, std::string *Why);
+  /// Non-sampling physical pin for common-object permission preparation.
+  /// Checks admission/quota and obtains a protected read BEFORE platform calls.
+  /// Must be closed through the same retained-owner leave routing; consumes no
+  /// sample and is not authority to execute the code.
+  bool pinForExecutionPreparation(ArrayRef<uint32_t> DimTypes,
+                                  ArrayRef<uint32_t> Instances,
+                                  uint64_t &Pin, std::string &Why);
   /// Complete an execution started by `enter`. A ticket from a session that has
   /// since been frozen/cancelled is a stale callback: it is rejected and
   /// counted, never merged into another generation.
@@ -424,9 +511,48 @@ public:
   Error beginNextGeneration(ArrayRef<EJitSmallTableRowKey> ExtraMembers,
                             std::string &Why);
   /// Release the resources of every generation `<= Generation`. Refuses while a
-  /// slot published from such a generation is still reachable, or while an
-  /// execution is in flight.
+  /// slot published from such a generation is still reachable.
+  ///
+  /// A generation a REAL execution is still inside is not freed: its retirement
+  /// is deferred until that execution's own `leave` (logical cancellation is not
+  /// physical completion). `hasRetiredExecutions()`/`retiredExecutionGeneration()`
+  /// report the deferral and `reclaimRetiredNow()` performs the reclaim once the
+  /// last reader of the retired generation has returned.
   bool retireGenerationsUpTo(uint64_t Generation, std::string &Why);
+  /// Process every retirement that was deferred because a real execution was
+  /// still inside the generation, and return how many generations were really
+  /// released. Idempotent; `leave` already calls it for every completed
+  /// execution, so this is for a caller that wants the reclaim at a point of its
+  /// own choosing (and for observing it).
+  uint64_t reclaimRetiredNow();
+
+  //--- physical execution lifetime (generation-scoped) ----------------------
+
+  /// Real executions that were entered through this host and have not returned,
+  /// whether or not a logical cancellation already closed them. This is the
+  /// PHYSICAL reader count: a generation may not be freed while it is non-zero.
+  uint64_t physicalExecutions() const { return activeExecutions_; }
+  /// Executions a cancel/configuration change/generation replacement already
+  /// closed logically while their real call is still running. They are stale for
+  /// sampling AND still protected physically.
+  uint64_t logicallyClosedExecutions() const;
+  /// True while any real execution still holds a lease on a resource generation
+  /// that was asked to retire.
+  bool hasRetiredExecutions() const { return retiredExecutions_ != 0; }
+  /// The oldest resource generation a live execution still holds a lease on
+  /// (0 when none). A new session must never adopt this generation.
+  uint64_t oldestExecutionGeneration() const;
+  /// The generation whose retirement is waiting for a reader (0 when none).
+  uint64_t retiredExecutionGeneration() const { return retiredExecutionGeneration_; }
+  /// Deferrals this host performed because a real execution still held the
+  /// generation it was asked to retire.
+  uint64_t deferredRetirementCount() const { return deferredRetirements_; }
+  /// Logical session serial: bumped by every cancel/configuration change. A
+  /// completion that arrives with an older serial is stale for sampling and
+  /// still releases its own physical lease.
+  uint64_t sessionRevision() const { return logicalSessionId_; }
+  /// Resource generations this host's live executions are inside, ascending.
+  std::vector<uint64_t> executionGenerations() const;
 
   //--- product lifecycle boundary ------------------------------------------
 
@@ -487,6 +613,11 @@ public:
   /// Published executions that are currently running (entered, not left). A
   /// generation may not be retired while this is non-zero.
   uint64_t activeExecutions() const { return activeExecutions_; }
+  uint64_t ownerWorkerOperations() const { return ownerWorkerOperations_; }
+  void noteOwnerWorkerOperation() { ++ownerWorkerOperations_; }
+  /// Whether this host still owns the ticket, so the runtime leave hook can
+  /// route a replaced host's completion to its retained owner.
+  bool ownsExecutionTicket(uint64_t Ticket) const { return ownsExecution(Ticket); }
   bool samplingProtected() const { return runtime_->samplingProtected(); }
   const EJitSmallTableProfileBundle *bundle() const { return runtime_->bundle(); }
   /// The plan this entry is bound to, or null.
@@ -550,6 +681,17 @@ public:
 
 private:
   EJitSmallTableHost() = default;
+  friend Error runSmallTableOwnerRequest(uint32_t, EJitSmallTableHost *,
+                                         std::function<Error()>, bool);
+  void setWrapperAdmissionReady(bool Ready) {
+    wrapperAdmissionReady_.storeRelease(Ready ? 1 : 0);
+  }
+  EJitAtomicU32 wrapperAdmissionReady_{0};
+
+  /// Whether \p Ticket names an execution THIS host entered and has not yet
+  /// closed. Used by the retired-owner registry to deliver a late completion to
+  /// the right object.
+  bool ownsExecution(uint64_t Ticket) const;
 
   /// Rebuild the slot table from the runtime's admissions for the current
   /// resource generation. Called after every successful publication.
@@ -568,6 +710,16 @@ private:
   EJitSmallTableDispatch
   gateFor(ArrayRef<uint64_t> Coordinate, const EJitSmallTableLogicalSlot **SlotOut,
           std::string &Why) const;
+  /// Whether \p Coordinate may be admitted to the COMMON SAMPLING TIER: the
+  /// member is admitted and table-ready, it was not deactivated, and the
+  /// session's instrumented entry exists with the session still open. This is
+  /// the pre-publication half of "may this call be admitted": the runtime's
+  /// resolve gate (`wouldDispatchCall`) uses it so a real call reaches
+  /// `ejit_stab_enter` instead of being forced onto the AOT body while the ONE
+  /// common T1 window is still filling. It NEVER exposes a final (T2) entry:
+  /// `wouldDispatch`/`gateFor` keep requiring publication for that.
+  bool samplingAdmissible(ArrayRef<uint64_t> Coordinate,
+                          std::string *Why) const;
   /// Enter one PUBLISHED execution: the admitted, published coordinate's code is
   /// already compiled, so this neither needs nor consumes the sampling session
   /// (which is frozen by then) and never affects the immutable bundle. What it
@@ -579,10 +731,48 @@ private:
                       std::string &Why);
   void leavePublished(uint64_t Token);
   /// Close every execution still entered (cancel / configuration change /
-  /// generation replacement): their protected reads are released and their
-  /// tokens become stale, so a completion that arrives later is counted and
-  /// never applied to the generation that follows.
+  /// generation replacement) LOGICALLY: their completions become stale for
+  /// sampling and for the generation that follows, and their tokens are
+  /// recorded so a later completion is recognized. The physical lease (protected
+  /// read borrow + resource-generation reader) is deliberately NOT released
+  /// here: the generated code that already entered is still running, so the
+  /// table and the borrow stay valid until its own `leave` arrives.
   void closeOutstandingExecutions();
+  /// Advance the host's logical session serial and return the new value.
+  uint64_t beginLogicalSession();
+
+  /// One entered execution: the token that must be closed, the resource lease it
+  /// holds for as long as the real call runs, and the protected read that must
+  /// be released at its real return. `logicallyClosed` means a cancel/config
+  /// change/generation replacement already settled it for sampling; the record
+  /// itself stays until the physical completion.
+  struct ExecutionRecord {
+    uint64_t token = 0;
+    bool isSample = false;
+    EJitSmallTableSampleTicket ticket;
+    std::unique_ptr<EJitSmallTableReadBorrow> borrow;
+    /// Resource generation whose column storage this execution reads. Retained
+    /// until the record is erased.
+    uint64_t resourceGeneration = 0;
+    /// Code generation the entry was entered through (the identity a late
+    /// completion must report, and which must never settle into a newer
+    /// session's quota).
+    uint64_t codeGeneration = 0;
+    /// Host logical session serial at entry.
+    uint64_t logicalSession = 0;
+    /// The runtime session serial at entry (sampling tickets only).
+    uint64_t runtimeSession = 0;
+    /// A cancel/config change/generation replacement already closed this
+    /// execution: its completion is stale for sampling, and it still releases
+    /// its own physical lease at its real return.
+    bool logicallyClosed = false;
+  };
+
+  /// Release \p Rec's physical lease (borrow + generation reader) exactly once.
+  void releasePhysicalLease(ExecutionRecord &Rec);
+  /// Perform any retirement that was deferred while a real execution was inside
+  /// a generation; called after every physical release.
+  void reclaimDeferredRetirements();
   /// Build one dispatch result without calling anything.
   EJitSmallTableDispatchResult refuse(EJitSmallTableDispatch Status,
                                       std::string Why);
@@ -604,6 +794,7 @@ private:
 
   bool planReady_ = false;
   bool t1Ready_ = false;
+  uint64_t wrapperRuntimeOwnerIdentity_ = currentEJitRuntimeOwnerIdentity();
   bool codeReady_ = false;
   void *t1Entry_ = nullptr;
   void *t2Entry_ = nullptr;
@@ -626,28 +817,26 @@ private:
   uint64_t unprovableCoordinateCount_ = 0;
   uint64_t staleLeaveCount_ = 0;
   uint64_t drainedSlotCount_ = 0;
-  /// Published executions currently entered but not left, and the token serial
-  /// handed to each. Kept by the host because a published execution is not a
-  /// sampling session sample.
+  /// Published and sampling executions currently entered but not left. This is
+  /// the host's PHYSICAL reader count: it is only decremented by the execution's
+  /// own `leave`, never by a cancel.
   uint64_t activeExecutions_ = 0;
-  uint64_t nextExecutionToken_ = 1;
-  /// One entered execution: the ticket that must be closed and the protected
-  /// read that must be released, in entry order.
-  struct ExecutionRecord {
-    uint64_t token = 0;
-    bool isSample = false;
-    EJitSmallTableSampleTicket ticket;
-    std::unique_ptr<EJitSmallTableReadBorrow> borrow;
-  };
+  uint64_t ownerWorkerOperations_ = 0;
+  EJitAtomicU32 ownerControlPins_{0};
   std::vector<ExecutionRecord> executions_;
-  /// Tokens of executions that a cancel/config-change closed while they were
-  /// still entered. A later completion with one of these tokens is a stale
-  /// callback: it is counted and never applied to a newer generation.
-  std::vector<uint64_t> cancelledTokens_;
-  /// Serial of the sampling session the sampling tickets belong to, captured
-  /// when they are handed out so a completion after a session change is
-  /// recognized as stale.
-  uint64_t samplingSessionAtEnter_ = 0;
+  /// The logical session serial, advanced by cancel/configuration change. A
+  /// completion carrying an older serial is stale; it still releases its own
+  /// lease.
+  uint64_t logicalSessionId_ = 1;
+  /// Generation whose retirement is waiting for a physical reader, the count of
+  /// live executions still inside retired generations, and the number of
+  /// deferrals observed. These are the observable half of the physical lease.
+  uint64_t retiredExecutionGeneration_ = 0;
+  /// Highest generation requested for retirement. Diagnostic oldest-generation
+  /// reporting must not become the cutoff for later physical completions.
+  uint64_t retirementWatermark_ = 0;
+  uint64_t retiredExecutions_ = 0;
+  uint64_t deferredRetirements_ = 0;
   /// The owner's real invalidation path (inline-cache cell drain). Empty when
   /// no owner installed one; `retractionAvailable()` reports which.
   std::function<void()> invalidationHook_;

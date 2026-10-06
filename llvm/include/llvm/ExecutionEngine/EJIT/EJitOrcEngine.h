@@ -145,8 +145,16 @@ public:
   /// Load a bitcode module into a per-specialization JITDylib identified
   /// by cacheKey. Each specialization gets its own JITDylib so symbols
   /// from the same TU bitcode can be defined multiple times without conflict.
+  /// PreservePreviousPhysical is an owner-only, opt-in lifetime boundary for
+  /// function-scoped PGO handoff recovery. It creates a fresh physical JD and
+  /// keeps every prior JD alive in the ORC session until engine teardown;
+  /// lookup(cacheKey, ...) then addresses only the latest successful load.
+  /// This does not reclaim a prior object at logical cancel or a call's leave,
+  /// and cacheKey/profile/audit identity stays logical. The default retains
+  /// the existing same-key replacement behavior.
   Error loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
-                          const std::string &origFnName);
+                          const std::string &origFnName,
+                          bool PreservePreviousPhysical = false);
 
   /// Look up a compiled function symbol in the specialization JITDylib
   /// identified by cacheKey.
@@ -181,11 +189,19 @@ public:
   /// for the runtime-owned form: one skip per table column.
   uint64_t getTransformClaimSkips() const;
 
-  /// PGO: PGOFuncNames captured by the last Tier-1 compile (the suffix of each
-  /// __profc_<name> that captureCounterGlobals forced external). The compile
-  /// driver looks up __profc_/__profd_ by these names after a Tier-1 compile to
-  /// capture counter addresses for Tier-2 profile synthesis (§5.2).
+  /// PGO: actual symbol suffixes captured by the last Tier-1 compile (the suffix
+  /// of each __profc_<name> that captureCounterGlobals forced external). The
+  /// compile driver looks up __profc_/__profd_ by these names after a Tier-1
+  /// compile to capture counter addresses for Tier-2 profile synthesis (§5.2).
+  /// These may
+  /// differ from canonical PGO names because of LLVM symbol legalization.
   ArrayRef<std::string> getLastCounterNames() const;
+
+  /// Canonical profile name for a real counter symbol suffix captured by the
+  /// last Tier-1 compile. Empty when absent or ambiguous; the consumer must
+  /// reject it and verify the real __profd_ NameRef. Valid until the next
+  /// optimizer pipeline; copy it before another compilation.
+  StringRef getCounterProfileName(StringRef SymbolSuffix) const;
 
   /// Value profile: function table captured by the last Tier-1 compile (see
   /// EJitOptimizer::getLastVpFunctions). Empty unless the Tier-1 compile ran
@@ -226,6 +242,12 @@ public:
 #endif
 
 private:
+  friend struct EJitSmallTableCounterCaptureTestAccess;
+  /// Remove only an existing profile counter's ORC lookup definition. Private
+  /// test access uses this after materialization to obtain a real missing-symbol
+  /// error; this does not unload the code/resource or manufacture profile data.
+  Error removeCounterSymbolForTesting(uint64_t CacheKey, StringRef Name);
+
   struct Impl;
   std::unique_ptr<Impl> P;
 };

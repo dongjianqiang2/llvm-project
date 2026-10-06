@@ -18,14 +18,38 @@ add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp
   EJitFieldOffsetTest.cpp
   EJitSmallTableTest.cpp
+  EJitSmallTableHostTest.cpp
+  EJitWrapperGenHooksTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
+  EJitProfileLoweringTest.cpp
   EJitVpMergeTest.cpp
   EJitVpScalarSpecTest.cpp
   EJitVpPipelineTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
+
+# The real wrapper/taskpool tests include the same shared-runtime headers as
+# LLVMEJIT. These settings are target-scoped on the library, so forward their
+# cache values rather than relying on header defaults in the test TUs.
+if(EJIT_SRE_SHARED_TASKPOOL)
+  target_compile_definitions(EJITTests PRIVATE
+    EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+    EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
+endif()
+if(EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  target_compile_definitions(EJITTests PRIVATE EJIT_SRE_TASKPOOL_NO_RECLAIM)
+endif()
+if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+  target_compile_definitions(EJITTests PRIVATE EJIT_SRE_SHARED_CODE_POINTERS)
+endif()
+if(EJIT_CODE_POOL_4K_SEAL)
+  target_compile_definitions(EJITTests PRIVATE EJIT_CODE_POOL_4K_SEAL)
+endif()
+if(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  target_compile_definitions(EJITTests PRIVATE EJIT_CODE_POOL_BATCHED_PUBLISH)
+endif()
 
 # The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
 # matching the LLVMEJIT build; without these definitions they compile to empty

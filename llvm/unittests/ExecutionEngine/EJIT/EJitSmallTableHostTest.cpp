@@ -26,26 +26,62 @@
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h" // the wrapper C ABI hooks
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/ProfileData/InstrProfReader.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
+#include <algorithm>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+namespace llvm {
+namespace ejit {
+/// This access is deliberately private to the capture regressions. Neither
+/// production callers nor the test fixture can replace an ORC lookup result.
+struct EJitSmallTableCounterCaptureTestAccess {
+  using BeforeCapture =
+      std::function<void(EJitOrcEngine &, uint64_t, ArrayRef<std::string>)>;
+
+  static void install(EJitSmallTableRuntime &Runtime, BeforeCapture Hook) {
+    Runtime.beforeCounterCaptureForTesting_ = std::move(Hook);
+  }
+  static bool installed(const EJitSmallTableRuntime &Runtime) {
+    return static_cast<bool>(Runtime.beforeCounterCaptureForTesting_);
+  }
+  static size_t capturedNames(const EJitSmallTableRuntime &Runtime) {
+    return Runtime.counterNames_.size();
+  }
+  static size_t capturedAddresses(const EJitSmallTableRuntime &Runtime) {
+    return Runtime.counterAddrs_.size();
+  }
+  static Error remove(EJitOrcEngine &Engine, uint64_t Generation,
+                      StringRef Symbol) {
+    return Engine.removeCounterSymbolForTesting(Generation, Symbol);
+  }
+};
+} // namespace ejit
+} // namespace llvm
 
 namespace {
 
@@ -84,6 +120,18 @@ int32_t g_matrix_out[kCeilingCells];
 /// row of the declared index space (never an out-of-bounds read).
 HostElement g_focus[kCells][kTrps + 1];
 int32_t g_focus_out[kCells];
+uint64_t g_profilePositiveCalls = 0;
+uint64_t g_profileNegativeCalls = 0;
+
+LLVM_ATTRIBUTE_NOINLINE int32_t hostProfilePositive(int32_t Value) {
+  ++g_profilePositiveCalls;
+  return Value + 17;
+}
+
+LLVM_ATTRIBUTE_NOINLINE int32_t hostProfileNegative(int32_t Value) {
+  ++g_profileNegativeCalls;
+  return Value - 23;
+}
 
 constexpr const char *kCellPeriod = "tenant_cell";
 constexpr const char *kTrpPeriod = "tenant_trp";
@@ -154,10 +202,14 @@ std::string hostTargetHeader() {
 /// The entry text: two dimension arguments (cell, trp), one dynamic argument
 /// (x), four authorized may_const loads in one element.
 std::string hostModuleText(StringRef Entry, StringRef Global, StringRef Out,
-                           unsigned Cells, unsigned Trps) {
+                           unsigned Cells, unsigned Trps,
+                           bool BranchProfile = false) {
   const std::string CA = Twine(Cells).str();
   const std::string TA = Twine(Trps).str();
   std::string Text = hostTargetHeader();
+  if (BranchProfile)
+    Text += "declare i32 @host_profile_positive(i32)\n"
+            "declare i32 @host_profile_negative(i32)\n";
   Text += "\n    %A = type { i32, i32, i32, i32 }\n";
   Text += "    @" + Global.str() + " = external global [" + CA + " x [" + TA +
           " x %A]]\n";
@@ -188,8 +240,30 @@ std::string hostModuleText(StringRef Entry, StringRef Global, StringRef Out,
   Text += "      %sum = add i32 %s3, %xm\n";
   Text += "      %isone = icmp eq i32 %mode, 1\n";
   Text += "      %res = select i1 %isone, i32 %sum, i32 -1\n";
-  Text += "      ret i32 %res\n";
-  Text += "    }\n\n    !0 = !{!2}\n    !1 = !{}\n";
+  if (BranchProfile)
+    Text += "      %negative = icmp slt i32 %x, 0\n"
+            "      br i1 %negative, label %neg, label %pos\n"
+            "    neg:\n"
+            "      %n = call i32 @profile_negative_inner(i32 %res)\n"
+            "      ret i32 %n\n"
+            "    pos:\n"
+            "      %p = call i32 @profile_positive_inner(i32 %res)\n"
+            "      ret i32 %p\n";
+  else
+    Text += "      ret i32 %res\n";
+  Text += "    }\n\n";
+  if (BranchProfile)
+    Text += "define internal i32 @profile_positive_inner(i32 %v) noinline {\n"
+            "entry:\n"
+            "  %r = call i32 @host_profile_positive(i32 %v)\n"
+            "  ret i32 %r\n"
+            "}\n"
+            "define internal i32 @profile_negative_inner(i32 %v) noinline {\n"
+            "entry:\n"
+            "  %r = call i32 @host_profile_negative(i32 %v)\n"
+            "  ret i32 %r\n"
+            "}\n";
+  Text += "    !0 = !{!2}\n    !1 = !{}\n";
   Text += "    !2 = !{!\"ejit_entry\"}\n";
   return Text;
 }
@@ -227,6 +301,8 @@ protected:
     prevGlobal_ = EJitSmallTableHost::installGlobal(nullptr);
     fillMatrixConfig();
     fillFocusConfig();
+    g_profilePositiveCalls = 0;
+    g_profileNegativeCalls = 0;
     // The entry's own external globals must be resolvable by the engine, which
     // reads them from this instance's registry (the AOT registration callbacks
     // fill it in the product). Registered once here: the engine resolves them
@@ -261,9 +337,11 @@ protected:
 
   std::unique_ptr<Module> parseHost(StringRef Entry, StringRef Global,
                                     StringRef Out, unsigned Cells,
-                                    unsigned Trps) {
+                                    unsigned Trps,
+                                    bool BranchProfile = false) {
     SMDiagnostic Err;
-    auto M = parseAssemblyString(hostModuleText(Entry, Global, Out, Cells, Trps),
+    auto M = parseAssemblyString(hostModuleText(Entry, Global, Out, Cells, Trps,
+                                              BranchProfile),
                                  Err, Ctx);
     if (!M)
       Err.print("SmallTableHostTest", errs());
@@ -312,15 +390,24 @@ protected:
   /// confirmed-ready window inside that schema.
   bool requestFocusEntry(unsigned Cells = kCells, unsigned Trps = kTrps,
                          unsigned ReadyCells = kCells,
-                         unsigned ReadyTrps = kTrps) {
-    auto M = parseHost("f_entry", "g_focus", "g_focus_out", Cells, kTrps + 1);
+                         unsigned ReadyTrps = kTrps,
+                         EJitSmallTableHost::Options Opts = {},
+                         bool BranchProfile = false) {
+    auto M = parseHost("f_entry", "g_focus", "g_focus_out", Cells, kTrps + 1,
+                       BranchProfile);
     if (!M)
       return false;
     Modules.push_back(std::move(M));
     Facts = makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus), 0xF00D,
                       Cells, Trps, ReadyCells, ReadyTrps);
-    if (!makeHost(Facts))
+    if (!makeHost(Facts, Opts))
       return false;
+    if (BranchProfile) {
+      Host->registerExtraSymbol("host_profile_positive",
+                                reinterpret_cast<void *>(&hostProfilePositive));
+      Host->registerExtraSymbol("host_profile_negative",
+                                reinterpret_cast<void *>(&hostProfileNegative));
+    }
     installRetractionHook();
     if (!Host->retractionAvailable()) {
       ADD_FAILURE() << "the owner invalidation hook was not installed";
@@ -397,8 +484,9 @@ protected:
       return false;
     }
     if (TicketOut && *TicketOut == 0) {
-      // Not counted (budget reached): no execution was opened.
-      return true;
+      // A successful T1 admission always provides a completion ticket.
+      ADD_FAILURE() << "callable T1 was admitted without physical protection";
+      return false;
     }
     using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
     reinterpret_cast<EntryFn>(Entry)(Cell, Trp, Arg);
@@ -433,6 +521,331 @@ protected:
     const uint32_t I[2] = {Cell, Trp};
     return Host->dispatch(D, I, X);
   }
+
+  /// The REAL wrapper ABI (`ejit_stab_enter`), the same entry the generated
+  /// dispatch calls: it resolves through the process-global host, gates on
+  /// admission/publication and hands back a ticket. Used by the paused-execution
+  /// tests so the lease under test is created by the production hook, not by a
+  /// test-only call.
+  void *wrapperEnter(uint32_t Cell, uint32_t Trp, uint64_t *Ticket) {
+    ejit_dim_pair_t Pairs[2];
+    Pairs[0].dimType = cellSlot();
+    Pairs[0].instanceId = Cell;
+    Pairs[1].dimType = trpSlot();
+    Pairs[1].instanceId = Trp;
+    const char *Why = nullptr;
+    return ejit_stab_enter(Host->funcIndex(), Pairs, 2, Ticket, &Why);
+  }
+
+  /// Run one specialized call to COMPLETION: enter through the wrapper hook, call
+  /// the returned entry with the real AOT signature, leave. Returns the value.
+  int64_t runWrapperCall(uint32_t Cell, uint32_t Trp, int64_t X) {
+    uint64_t Ticket = 0;
+    void *Entry = wrapperEnter(Cell, Trp, &Ticket);
+    if (!Entry)
+      return std::numeric_limits<int64_t>::min();
+    using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
+    const int64_t Value =
+        reinterpret_cast<EntryFn>(Entry)(Cell, Trp, X);
+    ejit_stab_leave(Ticket);
+    return Value;
+  }
+
+  /// Publish the NEXT resource generation through the ordinary path (prepare ->
+  /// T1 -> real sampling window -> freeze -> T2 -> slots) for the given extra
+  /// members. `False` with a GoogleTest failure on any refused step.
+  bool driveNextGeneration(ArrayRef<EJitSmallTableRowKey> Extra) {
+    std::string Why;
+    if (Error E = Host->beginNextGeneration(Extra, Why)) {
+      ADD_FAILURE() << "beginNextGeneration failed: " << toString(std::move(E))
+                    << " (" << Why << ")";
+      return false;
+    }
+    if (auto E = Host->compileT1(Why); !E) {
+      ADD_FAILURE() << "compileT1 failed: " << toString(E.takeError())
+                    << " (" << Why << ")";
+      return false;
+    }
+    if (Host->driveSampling(4096, 3) == 0) {
+      ADD_FAILURE() << "the sampling driver performed no real execution";
+      return false;
+    }
+    if (Error E = Host->publishGeneration(Why)) {
+      ADD_FAILURE() << "publishGeneration failed: " << toString(std::move(E))
+                    << " (" << Why << ")";
+      return false;
+    }
+    return true;
+  }
+
+  /// Fault injection is AFTER a genuine multi-function T1 materializes and
+  /// BEFORE capture opens the sampling session. Erasing either real symbol of
+  /// any sorted inventory pair must force capture to fail closed, regardless
+  /// of how many preceding pairs had already been captured.
+  /// Recovery recompiles the same source, then consumes a fresh full profile.
+  void checkMissingCounterFailsClosedAndRecovers(StringRef Prefix,
+                                                unsigned MissingIndex) {
+    ASSERT_LT(MissingIndex, 3u);
+    using Access = EJitSmallTableCounterCaptureTestAccess;
+    auto M = parseHost("f_entry", "g_focus", "g_focus_out", kCells, kTrps + 1,
+                       /*BranchProfile=*/true);
+    ASSERT_NE(M, nullptr);
+    Modules.push_back(std::move(M));
+    auto InFacts = makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus), 0xF00D,
+                             kCells, kTrps);
+    EJitSmallTableHost::Options Opts;
+    Opts.runtime.sampling.freezeWaitMillis = 25;
+    ASSERT_TRUE(makeHost(InFacts, Opts));
+    Host->registerExtraSymbol("host_profile_positive",
+                              reinterpret_cast<void *>(&hostProfilePositive));
+    Host->registerExtraSymbol("host_profile_negative",
+                              reinterpret_cast<void *>(&hostProfileNegative));
+    installRetractionHook();
+    ASSERT_TRUE(Host->retractionAvailable());
+    ASSERT_NE(registerLifecycle(kCellPeriod), kEJitInvalidDimType);
+    ASSERT_NE(registerLifecycle(kTrpPeriod), kEJitInvalidDimType);
+
+    EJitSmallTableHost::EntryRequest Req;
+    Req.module = Modules.front().get();
+    Req.entryName = "f_entry";
+    Req.funcIndex = EJitFuncRegistry::instance().resolveAssign("f_entry");
+    Req.sourceVarName = "g_focus";
+    Dims = focusDims();
+    Req.dims = Dims;
+    Periods = {kCellPeriod, kTrpPeriod};
+    Req.dimPeriodNames = Periods;
+    Req.codeGeneration = 1;
+
+    auto &Runtime = Host->runtime();
+    const uint64_t SessionBefore = Runtime.sessionId();
+    unsigned HookCalls = 0;
+    bool Removed = false;
+    std::vector<std::string> OriginalNames;
+    std::vector<std::string> OriginalProfileNames;
+    std::string MissingSymbol;
+    Access::install(Runtime, [&](EJitOrcEngine &Engine, uint64_t Generation,
+                                 ArrayRef<std::string> Names) {
+      ++HookCalls;
+      ASSERT_NE(Engine.getActiveContext(), nullptr);
+      EXPECT_EQ(Engine.getActiveContext()->tier, CompileTier::Instrumented);
+      ASSERT_EQ(Names.size(), 3u)
+          << "this exact inventory is the root and both real helpers";
+      OriginalNames.assign(Names.begin(), Names.end());
+      ASSERT_EQ(std::set<std::string>(Names.begin(), Names.end()).size(),
+                Names.size());
+      // Prove these are genuine emitted pairs, not invented names or addresses.
+      // No saved pointer is dereferenced after removing its lookup definition.
+      for (const std::string &Name : Names) {
+        StringRef ProfileName = Engine.getCounterProfileName(Name);
+        ASSERT_FALSE(ProfileName.empty());
+        OriginalProfileNames.push_back(ProfileName.str());
+        for (StringRef PairPrefix : {"__profc_", "__profd_"}) {
+          auto Address = Engine.lookup(Generation, PairPrefix.str() + Name);
+          ASSERT_TRUE(static_cast<bool>(Address))
+              << Name << ": " << toString(Address.takeError());
+          ASSERT_NE(*Address, nullptr);
+          if (PairPrefix == "__profd_") {
+            const auto *Data =
+                reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(
+                    *Address);
+            EXPECT_EQ(IndexedInstrProf::ComputeHash(ProfileName), Data->NameRef)
+                << "canonical PGO name must identify the genuine emitted pair";
+          }
+        }
+      }
+      std::vector<std::string> SymbolNames(Names.begin(), Names.end());
+      std::sort(SymbolNames.begin(), SymbolNames.end());
+      MissingSymbol = Prefix.str() + SymbolNames[MissingIndex];
+      Error RemoveError = Access::remove(Engine, Generation, MissingSymbol);
+      ASSERT_FALSE(static_cast<bool>(RemoveError))
+          << toString(std::move(RemoveError));
+      Removed = true;
+      auto Missing = Engine.lookup(Generation, MissingSymbol);
+      ASSERT_FALSE(static_cast<bool>(Missing));
+      const std::string OrcError = toString(Missing.takeError());
+      EXPECT_NE(OrcError.find("Symbols not found"), std::string::npos)
+          << OrcError;
+      EXPECT_NE(OrcError.find(MissingSymbol), std::string::npos) << OrcError;
+    });
+
+    std::string Why;
+    Error RequestError = Host->requestEntry(
+        Req, reinterpret_cast<void *>(&aotFocusEntry), Why);
+    ASSERT_TRUE(static_cast<bool>(RequestError))
+        << "a missing real counter may not open a partial-profile session";
+    const std::string Failure = toString(std::move(RequestError));
+    ASSERT_EQ(HookCalls, 1u);
+    ASSERT_TRUE(Removed);
+    ASSERT_EQ(OriginalNames.size(), 3u);
+    EXPECT_NE(Failure.find("incomplete common T1 profile counter capture"),
+              std::string::npos) << Failure;
+    EXPECT_NE(Failure.find(MissingSymbol), std::string::npos) << Failure;
+    EXPECT_NE(Failure.find("Symbols not found"), std::string::npos) << Failure;
+    EXPECT_EQ(Why, Failure);
+    EXPECT_EQ(Runtime.cancellationReason(), Failure);
+    EXPECT_EQ(Runtime.engine().getActiveContext(), nullptr);
+    EXPECT_FALSE(Access::installed(Runtime)) << "injection must be one-shot";
+    EXPECT_EQ(Access::capturedNames(Runtime), 0u);
+    EXPECT_EQ(Access::capturedAddresses(Runtime), 0u);
+    const auto EmittedNames = Runtime.engine().getLastCounterNames();
+    EXPECT_EQ(std::vector<std::string>(EmittedNames.begin(), EmittedNames.end()),
+              OriginalNames) << "capture failure must not shrink the expected set";
+    EXPECT_EQ(Runtime.sessionId(), SessionBefore);
+    EXPECT_FALSE(Runtime.sessionOpen());
+    EXPECT_EQ(Runtime.currentSessionSamples(), 0u);
+    EXPECT_EQ(Runtime.inFlight(), 0u);
+    EXPECT_EQ(Runtime.physicalReaders(Runtime.resourceGeneration()), 0u);
+    EXPECT_FALSE(Runtime.samplingProtected());
+    EXPECT_GT(Facts->borrowCount(), 0u) << "planning and publication really borrowed";
+    EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+    EXPECT_EQ(Runtime.bundle(), nullptr);
+    EXPECT_EQ(Host->instrumentedEntry(), nullptr);
+    EXPECT_EQ(Host->activeEntry(), nullptr);
+    EXPECT_EQ(Host->publishedSlots(), 0u);
+    EXPECT_FALSE(Host->codeReady());
+
+    const auto Refused = call(0, 0, 4);
+    EXPECT_EQ(Refused.status, EJitSmallTableDispatch::Aot) << Refused.why;
+    EXPECT_FALSE(Refused.counted);
+    EXPECT_EQ(Host->aotEntry(), reinterpret_cast<void *>(&aotFocusEntry));
+    uint64_t Ticket = 99;
+    EXPECT_EQ(wrapperEnter(0, 0, &Ticket), nullptr);
+    EXPECT_EQ(Ticket, 0u);
+    EXPECT_EQ(Host->physicalExecutions(), 0u);
+    EXPECT_EQ(g_profilePositiveCalls, 0u);
+    EXPECT_EQ(g_profileNegativeCalls, 0u);
+    auto Frozen = Runtime.freeze(Why, /*Force=*/true);
+    ASSERT_FALSE(static_cast<bool>(Frozen));
+    EXPECT_NE(toString(Frozen.takeError()).find(MissingSymbol),
+              std::string::npos);
+    auto T2WithoutProfile = Runtime.compileCommonT2(Why);
+    ASSERT_FALSE(static_cast<bool>(T2WithoutProfile));
+    EXPECT_NE(toString(T2WithoutProfile.takeError()).find("without a frozen bundle"),
+              std::string::npos);
+    EXPECT_EQ(Runtime.engine().getActiveContext(), nullptr);
+
+    // A fresh real materialization re-emits the removed definition. It is not
+    // restored with an absolute/dummy symbol or by reducing the captured set.
+    auto Recovered = Host->compileT1(Why);
+    ASSERT_TRUE(static_cast<bool>(Recovered))
+        << Why << ": " << toString(Recovered.takeError());
+    ASSERT_NE(*Recovered, nullptr);
+    EXPECT_EQ(HookCalls, 1u);
+    EXPECT_EQ(Runtime.engine().getActiveContext(), nullptr);
+    ASSERT_TRUE(Runtime.sessionOpen());
+    EXPECT_EQ(Runtime.sessionId(), SessionBefore + 1);
+    EXPECT_EQ(Runtime.currentSessionSamples(), 0u);
+    EXPECT_EQ(Access::capturedNames(Runtime), OriginalNames.size());
+    EXPECT_EQ(Access::capturedAddresses(Runtime), OriginalNames.size());
+    auto Restored = Runtime.engine().lookup(Req.codeGeneration, MissingSymbol);
+    ASSERT_TRUE(static_cast<bool>(Restored)) << toString(Restored.takeError());
+    ASSERT_NE(*Restored, nullptr);
+    const uint64_t Budget = Runtime.sampleBudget();
+    ASSERT_EQ(Budget, 64u);
+    for (uint64_t I = 0; I < Budget; ++I) {
+      const unsigned Cell = I % kCells;
+      const unsigned Trp = (I / kCells) % kTrps;
+      const int32_t X = I % 2 ? -3 : 4;
+      const auto Result = call(Cell, Trp, X);
+      ASSERT_EQ(Result.status, EJitSmallTableDispatch::Dispatched) << Result.why;
+      EXPECT_TRUE(Result.counted);
+      EXPECT_EQ(Result.value,
+                aotEntry(Cell, Trp, X) + (X < 0 ? -23 : 17));
+    }
+    EXPECT_EQ(Runtime.currentSessionSamples(), Budget);
+    EXPECT_EQ(g_profilePositiveCalls, Budget / 2);
+    EXPECT_EQ(g_profileNegativeCalls, Budget / 2);
+    auto Complete = Runtime.freeze(Why);
+    ASSERT_TRUE(static_cast<bool>(Complete))
+        << Why << ": " << toString(Complete.takeError());
+    const auto *Bundle = *Complete;
+    ASSERT_NE(Bundle, nullptr);
+    EXPECT_EQ(Bundle->sampleCount, Budget);
+    EXPECT_EQ(Bundle->sessionId, SessionBefore + 1);
+    EXPECT_EQ(Bundle->counters.size(), OriginalNames.size());
+    auto Reader = InstrProfReader::create(
+        MemoryBuffer::getMemBufferCopy(Bundle->profileData));
+    ASSERT_TRUE(static_cast<bool>(Reader)) << toString(Reader.takeError());
+    const std::set<std::string> ExpectedNames(OriginalProfileNames.begin(),
+                                             OriginalProfileNames.end());
+    ASSERT_EQ(ExpectedNames.size(), OriginalNames.size());
+    std::set<std::string> CapturedNames;
+    for (const auto &Counter : Bundle->counters) {
+      ASSERT_NE(Counter.pgoName, nullptr);
+      ASSERT_TRUE(CapturedNames.insert(Counter.pgoName).second);
+    }
+    EXPECT_EQ(CapturedNames, ExpectedNames);
+    std::set<std::string> ProfileNames;
+    bool SawRoot = false;
+    for (const auto &Record : **Reader) {
+      ASSERT_TRUE(ProfileNames.insert(Record.Name.str()).second);
+      const PgoCounterRef *Counter = nullptr;
+      for (const auto &Candidate : Bundle->counters)
+        if (Record.Name == Candidate.pgoName)
+          Counter = &Candidate;
+      ASSERT_NE(Counter, nullptr);
+      ASSERT_NE(Counter->profdAddr, 0u);
+      ASSERT_NE(Counter->profcAddr, 0u);
+      const auto *Data =
+          reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(
+              Counter->profdAddr);
+      EXPECT_EQ(IndexedInstrProf::ComputeHash(Record.Name), Data->NameRef)
+          << "profile lookup must use the canonical PGO function name, not "
+             "the legalized counter-symbol suffix: " << Record.Name.str();
+      ASSERT_EQ(Record.Hash, Data->FuncHash);
+      ASSERT_EQ(Record.Counts.size(), Data->NumCounters);
+      const auto *Counts = reinterpret_cast<const uint64_t *>(Counter->profcAddr);
+      for (size_t I = 0; I < Record.Counts.size(); ++I)
+        EXPECT_EQ(Record.Counts[I], Counts[I]) << Record.Name.str() << ": " << I;
+      if (Record.Name == "f_entry") {
+        SawRoot = true;
+        ASSERT_GT(Record.Counts.size(), 1u);
+      }
+    }
+    EXPECT_TRUE(SawRoot);
+    EXPECT_FALSE((*Reader)->hasError());
+    EXPECT_EQ(ProfileNames, ExpectedNames);
+
+    // IR PGO numbers the non-MST edges, not a universal entry-counter slot.
+    // In this two-path CFG slot zero is a branch edge (32), while PGOUse
+    // reconstructs the real function entry count (64) from the full profile.
+    // Replay the same plan/prefix and the ACTUAL bundle; do not infer the
+    // entry count from an arbitrary counter or from the logical sample count.
+    auto ProfileReplay = CloneModule(*Req.module);
+    auto Plans = std::make_shared<EJitSmallTablePlanSet>();
+    ASSERT_NE(Host->plan(), nullptr);
+    Plans->add(std::make_shared<const EJitSmallTablePlan>(*Host->plan()));
+    EJitOptimizer ProfileOptimizer(State.getRegistry());
+    ProfileOptimizer.setSmallTablePlans(Plans);
+    SpecializationContext ProfileContext;
+    ProfileContext.fnName = Req.entryName;
+    ProfileContext.cacheKey = Req.codeGeneration;
+    ProfileContext.optLevel = Opts.runtime.optLevel;
+    ProfileContext.tier = CompileTier::PGOUse;
+    ProfileContext.profileData = Bundle->profileData;
+    ProfileOptimizer.runPipeline(*ProfileReplay, ProfileContext);
+    for (StringRef FunctionName : {"f_entry", "profile_positive_inner",
+                                   "profile_negative_inner"}) {
+      Function *F = ProfileReplay->getFunction(FunctionName);
+      ASSERT_NE(F, nullptr) << FunctionName.str();
+      auto EntryCount = F->getEntryCount();
+      ASSERT_TRUE(EntryCount.has_value()) << FunctionName.str();
+      EXPECT_EQ(EntryCount->getCount(),
+                FunctionName == "f_entry" ? Budget : Budget / 2)
+          << FunctionName.str();
+    }
+    EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+    ASSERT_FALSE(static_cast<bool>(Host->publishGeneration(Why))) << Why;
+    EXPECT_EQ(Host->activeTier(), "final");
+    for (int32_t X : {-2, 3}) {
+      const auto Result = call(0, 0, X);
+      ASSERT_EQ(Result.status, EJitSmallTableDispatch::Dispatched) << Result.why;
+      EXPECT_EQ(Result.value, aotEntry(0, 0, X) + (X < 0 ? -23 : 17));
+    }
+    EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+    EXPECT_EQ(Runtime.physicalInFlight(), 0u);
+    EXPECT_EQ(Host->physicalExecutions(), 0u);
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -454,24 +867,71 @@ TEST_F(SmallTableHostTest, UnboundFunctionIndexNeverEntersTheFeature) {
   EXPECT_EQ(ejit_small_table_published_slots(), 0u);
 }
 
-TEST_F(SmallTableHostTest, BoundEntryStaysAotUntilCodeIsReady) {
-  ASSERT_TRUE(requestFocusEntry());
-  // The plan exists and the members are admitted, but no code generation is
-  // published yet: every dispatch must take the AOT path (fail closed), and the
-  // AOT path is exactly what the real baseline computes.
+TEST_F(SmallTableHostTest, BoundEntrySamplesTheCommonT1UntilCodeIsReady) {
+  // The plan exists and some members are admitted, but no FINAL code generation
+  // is published yet. Two rules hold at once:
+  //   * no FINAL entry is exposed: `wouldDispatch` stays false and the tier is
+  //     the instrumented one, so publication is what gates the T2 entry;
+  //   * an admitted member's ordinary call is a REAL sample of the ONE common T1
+  //     window (spec §10) -- that is what fills the aggregate budget from
+  //     business traffic -- while a coordinate outside the admitted set still
+  //     takes the AOT path and consumes nothing.
+  ASSERT_TRUE(requestFocusEntry(kCells, kTrps, /*ReadyCells=*/kCells - 1, kTrps));
   EXPECT_EQ(Host->publishedSlots(), 0u);
   EXPECT_EQ(Host->activeTier(), "instrumented");
   EXPECT_FALSE(Host->codeReady());
-  for (unsigned C = 0; C < kCells; ++C)
-    for (unsigned T = 0; T < kTrps; ++T) {
-      std::string Why;
-      EXPECT_FALSE(Host->wouldDispatch({C, T}, &Why)) << Why;
-      const auto R = call(C, T, 2);
-      EXPECT_EQ(R.status, EJitSmallTableDispatch::Aot) << R.why;
-      EXPECT_FALSE(R.counted);
-    }
-  EXPECT_EQ(Host->runtime().currentSessionSamples(), 0u)
-      << "a refused call never consumes the aggregate budget";
+
+  const uint64_t Budget = Host->runtime().sampleBudget();
+  ASSERT_LT(kTrps, Budget);
+  for (unsigned T = 0; T < kTrps; ++T) {
+    std::string Why;
+    EXPECT_FALSE(Host->wouldDispatch({0, T}, &Why))
+        << "no FINAL entry may be exposed before publication";
+    const auto R = call(0, T, 2);
+    EXPECT_EQ(R.status, EJitSmallTableDispatch::Dispatched) << R.why;
+    EXPECT_TRUE(R.counted)
+        << "an admitted pre-publication call is a real sample of the common T1";
+    EXPECT_EQ(R.value, aotEntry(0, T, 2));
+  }
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), kTrps)
+      << "exactly the admitted members' real calls are counted";
+  EXPECT_EQ(Host->physicalExecutions(), 0u)
+      << "each sampling execution completed before the next one";
+
+  // The unconfirmed member of the SAME declared schema still fails closed.
+  const auto Refused = call(kCells - 1, 0, 2);
+  EXPECT_EQ(Refused.status, EJitSmallTableDispatch::Aot) << Refused.why;
+  EXPECT_FALSE(Refused.counted);
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), kTrps)
+      << "an AOT call never consumes the aggregate budget";
+}
+
+TEST_F(SmallTableHostTest, MissingRealProfcFailsClosedAndRecoversCompleteProfile) {
+  checkMissingCounterFailsClosedAndRecovers("__profc_", /*MissingIndex=*/2);
+}
+
+TEST_F(SmallTableHostTest, MissingRealProfdFailsClosedAndRecoversCompleteProfile) {
+  checkMissingCounterFailsClosedAndRecovers("__profd_", /*MissingIndex=*/2);
+}
+
+TEST_F(SmallTableHostTest,
+       MissingFirstRealProfcFailsClosedAndRecoversCompleteProfile) {
+  checkMissingCounterFailsClosedAndRecovers("__profc_", /*MissingIndex=*/0);
+}
+
+TEST_F(SmallTableHostTest,
+       MissingFirstRealProfdFailsClosedAndRecoversCompleteProfile) {
+  checkMissingCounterFailsClosedAndRecovers("__profd_", /*MissingIndex=*/0);
+}
+
+TEST_F(SmallTableHostTest,
+       MissingSecondRealProfcFailsClosedAndRecoversCompleteProfile) {
+  checkMissingCounterFailsClosedAndRecovers("__profc_", /*MissingIndex=*/1);
+}
+
+TEST_F(SmallTableHostTest,
+       MissingSecondRealProfdFailsClosedAndRecoversCompleteProfile) {
+  checkMissingCounterFailsClosedAndRecovers("__profd_", /*MissingIndex=*/1);
 }
 
 //===----------------------------------------------------------------------===//
@@ -783,8 +1243,8 @@ TEST_F(SmallTableHostTest, AggregateBudgetIsSharedAcrossMembersAndHoldsInFlight)
   EXPECT_FALSE(Host->samplingProtected())
       << "freeze ends the sampling window and releases the protected read";
 
-  // An execution above the aggregate budget still runs the correct code but is
-  // not counted.
+  // Once T2 is published, final-code executions run normally and consume no
+  // further T1 quota. Quota-exhausted pre-publication calls instead use AOT.
   const auto R = call(2, 2, 4);
   ASSERT_EQ(R.status, EJitSmallTableDispatch::Dispatched) << R.why;
   EXPECT_FALSE(R.counted);
@@ -996,6 +1456,795 @@ TEST_F(SmallTableHostTest, RetireRefusesWhileAPublishedSlotStillReadsTheResource
 }
 
 //===----------------------------------------------------------------------===//
+// 5b. PHYSICAL execution lifetime: the table survives a logical cancel, a
+//     rebuild and a retirement until the real call returns (P1 repair).
+//===----------------------------------------------------------------------===//
+
+TEST_F(SmallTableHostTest, PublishedExecutionKeepsItsGenerationThroughCancelRebuildAndRetire) {
+  // The coordinator's source-derived counterexample, as a real paused execution:
+  // Publish generation 1, enter through the wrapper ABI and PAUSE before leave;
+  // cancel; rebuild to generation 2; ask to retire generation 1. The old table
+  // must stay alive - the live call still reads its raw column addresses - and
+  // the reclaim must happen only when that call really returns.
+  ASSERT_TRUE(requestFocusEntry());
+  ASSERT_TRUE(driveAndPublish());
+
+  const uint64_t OldGen = Host->runtime().resourceGeneration();
+  const uint64_t OldCodeGen = Host->publishedCodeGeneration();
+  ASSERT_NE(OldGen, 0u);
+
+  // A published slot the engine resolved, and the wrapper ABI entry that hands
+  // out the ticket exactly as the generated dispatch does.
+  const auto Live = call(1, 1, 5);
+  ASSERT_EQ(Live.status, EJitSmallTableDispatch::Dispatched) << Live.why;
+  EXPECT_EQ(Live.value, aotEntry(1, 1, 5));
+
+  uint64_t Ticket = 0;
+  void *Entry = wrapperEnter(1, 1, &Ticket);
+  ASSERT_NE(Entry, nullptr);
+  ASSERT_NE(Ticket, 0u);
+  EXPECT_EQ(Entry, Host->activeEntry())
+      << "the wrapper hook must hand back the published generation's entry";
+  using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
+  const int64_t PausedValue = reinterpret_cast<EntryFn>(Entry)(1, 1, 5);
+  EXPECT_EQ(PausedValue, aotEntry(1, 1, 5))
+      << "the paused execution really entered the specialized code";
+
+  const uint64_t BorrowsWhileRunning = Facts->outstandingBorrows();
+  EXPECT_GE(BorrowsWhileRunning, 1u)
+      << "a published execution runs under its own protected read";
+  EXPECT_EQ(Host->physicalExecutions(), 1u);
+  EXPECT_EQ(Host->runtime().physicalReaders(OldGen), 1u);
+
+  // The real return of the EARLIER dispatch already released its lease; the
+  // paused one is the only reader left.
+  Host->cancel("timeout while a published call is running");
+  EXPECT_EQ(Host->publishedSlots(), 0u);
+  EXPECT_EQ(Host->physicalExecutions(), 1u)
+      << "cancel is logical: the running call keeps its generation";
+  EXPECT_EQ(Host->logicallyClosedExecutions(), 1u);
+  EXPECT_EQ(Host->runtime().physicalReaders(OldGen), 1u);
+  EXPECT_EQ(Host->oldestExecutionGeneration(), OldGen);
+
+  // A new generation may be prepared and compiled while the old call runs: the
+  // rebuild is not blocked by a physical reader, and it must not disturb it.
+  SmallVector<EJitSmallTableRowKey, 4> Extra;
+  for (unsigned T = 0; T < kTrps; ++T)
+    Extra.push_back({{2, T}});
+  Facts->addReadyMember({2, 0}, 0xC000);
+  Facts->addReadyMember({2, 1}, 0xC001);
+  Facts->addReadyMember({2, 2}, 0xC002);
+
+  std::string Why;
+  Error Rebuild = Host->beginNextGeneration(Extra, Why);
+  if (Rebuild) {
+    ADD_FAILURE() << "beginNextGeneration refused while only a PUBLISHED call "
+                     "of the old generation is running: "
+                  << toString(std::move(Rebuild)) << " (" << Why << ")";
+    consumeError(std::move(Rebuild));
+    return;
+  }
+  const uint64_t NewGen = Host->runtime().resourceGeneration();
+  ASSERT_GT(NewGen, OldGen) << "a new resource generation is adopted";
+  EXPECT_EQ(Host->runtime().physicalReaders(OldGen), 1u)
+      << "adopting a new generation must not release the old reader";
+  EXPECT_GT(Host->runtime().retainedBytes(), 0u)
+      << "the old generation is retained while its reader runs";
+  EXPECT_GT(Facts->outstandingBorrows(), 0u)
+      << "the paused call's protected read is still held after the rebuild";
+
+  // Ask to retire the OLD generation while the call is still inside it. The
+  // retirement is accepted but DEFERRED: nothing may be freed yet.
+  const uint64_t RetainedBefore = Host->runtime().retainedGenerationCount();
+  ASSERT_TRUE(Host->retireGenerationsUpTo(OldGen, Why)) << Why;
+  EXPECT_TRUE(Host->hasRetiredExecutions())
+      << "the retirement waits for the physical reader";
+  EXPECT_EQ(Host->retiredExecutionGeneration(), OldGen);
+  EXPECT_EQ(Host->runtime().physicalReaders(OldGen), 1u)
+      << "the generation is still physically read";
+  EXPECT_GT(Host->runtime().pendingRetireGenerationCount(), 0u)
+      << "the retirement is recorded as pending, not performed";
+  EXPECT_EQ(Host->runtime().retainedGenerationCount(), RetainedBefore)
+      << "no retained generation may be dropped under a running call";
+  EXPECT_EQ(Host->runtime().stats().retiredGenerations, 0u)
+      << "nothing was freed while the call was still reading the table";
+  EXPECT_GE(Host->runtime().stats().deferredRetirements, 1u);
+
+  // The real return releases exactly this execution's lease and completes the
+  // deferred reclaim.
+  const uint64_t BytesBeforeLeave = Host->runtime().pendingRetireBytes();
+  EXPECT_GT(BytesBeforeLeave, 0u);
+  ejit_stab_leave(Ticket);
+  EXPECT_EQ(Host->physicalExecutions(), 0u);
+  EXPECT_EQ(Host->runtime().physicalReaders(OldGen), 0u);
+  EXPECT_FALSE(Host->hasRetiredExecutions());
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 0u)
+      << "the deferred retirement was reclaimed at the real return";
+  EXPECT_GE(Host->runtime().stats().reclaimedAfterReaders, 1u)
+      << "the safe reclamation is recorded, not silent";
+  EXPECT_LT(Host->runtime().retainedGenerationCount(), RetainedBefore)
+      << "the old generation's storage is released now that no one reads it";
+  EXPECT_EQ(Host->oldestExecutionGeneration(), 0u)
+      << "the late leave must not settle into the replacement session";
+
+  // The replacement session is untouched by the late completion, and it works.
+  EXPECT_EQ(Host->runtime().resourceGeneration(), NewGen);
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+  EXPECT_TRUE(Host->driveSampling(4096, 7) > 0);
+  ASSERT_FALSE(static_cast<bool>(Host->publishGeneration(Why))) << Why;
+  EXPECT_EQ(Host->publishedResourceGeneration(), NewGen);
+  EXPECT_NE(Host->publishedCodeGeneration(), OldCodeGen)
+      << "the replacement is a distinct code generation";
+  const auto NewCall = call(2, 0, 5);
+  ASSERT_EQ(NewCall.status, EJitSmallTableDispatch::Dispatched) << NewCall.why;
+  EXPECT_EQ(NewCall.value, aotEntry(2, 0, 5))
+      << "the replacement session's values come from its own resource";
+  EXPECT_EQ(Host->staleLeaveCount(), 1u)
+      << "exactly the late completion is counted stale, not the new session";
+}
+
+TEST_F(SmallTableHostTest, SamplingExecutionKeepsItsResourceAndBorrowThroughCancelRebuild) {
+  // The T1 half of the same rule: a real sampling execution is paused inside the
+  // instrumented entry, the session is cancelled and a new generation is
+  // prepared. The runtime's in-flight count and the window's protected read are
+  // physical and must survive until the execution returns.
+  EJitSmallTableHost::Options Opts;
+  Opts.runtime.sampling.aggregateLimit = 4;
+  Opts.runtime.sampling.freezeWaitMillis = 100;
+  auto M = parseHost("f_entry", "g_focus", "g_focus_out", kCells, kTrps + 1);
+  ASSERT_TRUE(M);
+  Facts = makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus), 0xF00D, kCells,
+                    kTrps);
+  ASSERT_TRUE(makeHost(Facts, Opts));
+  installRetractionHook();
+  registerLifecycle(kCellPeriod);
+  registerLifecycle(kTrpPeriod);
+  EJitSmallTableHost::EntryRequest Req;
+  Req.module = M.get();
+  Req.entryName = "f_entry";
+  Req.funcIndex = EJitFuncRegistry::instance().resolveAssign("f_entry");
+  Req.sourceVarName = "g_focus";
+  LocalDims = focusDims();
+  Req.dims = LocalDims;
+  std::vector<std::string> P = {kCellPeriod, kTrpPeriod};
+  Req.dimPeriodNames = P;
+  std::string Why;
+  ASSERT_TRUE(static_cast<bool>(Host->planEntry(Req, Why))) << Why;
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+
+  const uint64_t Gen = Host->runtime().resourceGeneration();
+  ASSERT_NE(Gen, 0u);
+  const uint32_t D[2] = {cellSlot(), trpSlot()};
+  const uint32_t I[2] = {0, 0};
+  uint64_t Ticket = 0;
+  void *Entry = Host->enterInstrumented(D, I, &Ticket, &Why);
+  ASSERT_NE(Entry, nullptr) << Why;
+  ASSERT_NE(Ticket, 0u);
+  // The real instrumented execution is entered but NOT left: it is paused inside
+  // the sampling window, exactly where a cancel would previously have zeroed the
+  // runtime's in-flight count and released the window's read.
+  using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
+  EXPECT_EQ(reinterpret_cast<EntryFn>(Entry)(0, 0, 4), aotEntry(0, 0, 4));
+  EXPECT_EQ(Host->runtime().inFlight(), 1u);
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 1u);
+  EXPECT_TRUE(Host->runtime().samplingProtected());
+  EXPECT_EQ(Host->runtime().physicalReaders(Gen), 1u);
+
+  Host->cancel("timeout with a sampling execution paused");
+  EXPECT_EQ(Host->runtime().inFlight(), 1u)
+      << "the runtime's in-flight count is physical and survives cancel";
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 0u)
+      << "the cancelled session gave up its sample accounting";
+  EXPECT_TRUE(Host->runtime().samplingProtected())
+      << "the window's protected read guards the paused execution";
+  EXPECT_EQ(Host->runtime().physicalReaders(Gen), 1u);
+  EXPECT_EQ(Host->physicalExecutions(), 1u);
+  EXPECT_GE(Facts->outstandingBorrows(), 1u);
+
+  // A new generation may still be prepared: the cancelled session's sample is
+  // not a barrier, but its RESOURCE stays retained while it runs.
+  SmallVector<EJitSmallTableRowKey, 4> Extra;
+  for (unsigned T = 0; T < kTrps; ++T)
+    Extra.push_back({{2, T}});
+  Facts->addReadyMember({2, 0}, 0xD000);
+  Facts->addReadyMember({2, 1}, 0xD001);
+  Facts->addReadyMember({2, 2}, 0xD002);
+  Error Rebuild = Host->beginNextGeneration(Extra, Why);
+  ASSERT_FALSE(static_cast<bool>(Rebuild)) << toString(std::move(Rebuild)) << " "
+                                           << Why;
+  EXPECT_GT(Host->runtime().resourceGeneration(), Gen);
+  EXPECT_EQ(Host->runtime().physicalReaders(Gen), 1u)
+      << "the old generation is still physically read after the rebuild";
+
+  // The generation-1 storage must not be reclaimable yet.
+  ASSERT_TRUE(Host->retireGenerationsUpTo(Gen, Why)) << Why;
+  EXPECT_GT(Host->runtime().pendingRetireGenerationCount(), 0u);
+  EXPECT_EQ(Host->runtime().stats().retiredGenerations, 0u);
+
+  // The paused execution returns: the stale sample is counted, the physical
+  // lease and the window's protected read are released, and the deferred
+  // generation can be reclaimed.
+  Host->leave(Ticket);
+  EXPECT_EQ(Host->runtime().inFlight(), 0u);
+  EXPECT_FALSE(Host->runtime().samplingProtected())
+      << "the cancelled window's borrow is released once its last reader left";
+  EXPECT_EQ(Host->runtime().physicalReaders(Gen), 0u);
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 0u);
+  EXPECT_GE(Host->runtime().stats().staleCallbacks, 1u)
+      << "the late sample is a stale callback, never a completion of the new "
+         "session";
+  EXPECT_EQ(Host->staleLeaveCount(), 1u);
+  EXPECT_GT(Host->runtime().stats().reclaimedAfterReaders, 0u);
+
+  // The replacement session's own aggregate budget is untouched by the stale
+  // sample: it starts from zero and reaches its own full quota.
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), 0u)
+      << "a stale completion must not settle into the replacement session";
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+  EXPECT_TRUE(Host->driveSampling(4096, 11) > 0);
+  EXPECT_EQ(Host->runtime().currentSessionSamples(),
+            Host->runtime().sampleBudget());
+  ASSERT_FALSE(static_cast<bool>(Host->publishGeneration(Why))) << Why;
+  const auto Ok = call(0, 0, 11);
+  ASSERT_EQ(Ok.status, EJitSmallTableDispatch::Dispatched) << Ok.why;
+  EXPECT_EQ(Ok.value, aotEntry(0, 0, 11));
+}
+
+TEST_F(SmallTableHostTest, NormalReturnControlLeavesNoLeaseOrDeferredRetirement) {
+  // The control for both paused tests: the SAME transitions with every call
+  // completed normally must leave no reader, no deferral and no pending bytes,
+  // and the resources must be reclaimable immediately.
+  ASSERT_TRUE(requestFocusEntry());
+  ASSERT_TRUE(driveAndPublish());
+  const uint64_t OldGen = Host->runtime().resourceGeneration();
+  for (int32_t X = -2; X <= 2; ++X) {
+    EXPECT_EQ(runWrapperCall(1, 1, X), aotEntry(1, 1, X));
+  }
+  EXPECT_EQ(Host->physicalExecutions(), 0u);
+  EXPECT_EQ(Host->runtime().physicalReaders(OldGen), 0u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u)
+      << "every normal return releases its own protected read";
+  EXPECT_EQ(Host->runtime().inFlight(), 0u);
+
+  SmallVector<EJitSmallTableRowKey, 4> Extra;
+  for (unsigned T = 0; T < kTrps; ++T)
+    Extra.push_back({{2, T}});
+  Facts->addReadyMember({2, 0}, 0xE000);
+  Facts->addReadyMember({2, 1}, 0xE001);
+  Facts->addReadyMember({2, 2}, 0xE002);
+  std::string Why;
+  Host->cancel("normal-return control drains the published generation");
+  ASSERT_FALSE(static_cast<bool>(Host->beginNextGeneration(Extra, Why))) << Why;
+  ASSERT_TRUE(Host->retireGenerationsUpTo(OldGen, Why)) << Why;
+  EXPECT_FALSE(Host->hasRetiredExecutions())
+      << "no reader is left, so nothing is deferred";
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 0u);
+  EXPECT_EQ(Host->runtime().pendingRetireBytes(), 0u);
+  EXPECT_EQ(Host->runtime().stats().deferredRetirements, 0u);
+  EXPECT_GT(Host->runtime().stats().retiredGenerations, 0u)
+      << "the unread generation is really released";
+}
+
+TEST_F(SmallTableHostTest, LastQuotaT1SurvivesWhileLaterCallsStayAot) {
+  EJitSmallTableHost::Options Opts;
+  Opts.runtime.sampling.aggregateLimit = 1;
+  Opts.runtime.sampling.waitForInFlightOnFreeze = false;
+  ASSERT_TRUE(requestFocusEntry(kCells, kTrps, kCells, kTrps, Opts));
+  const uint64_t OldGen = Host->runtime().resourceGeneration();
+  uint64_t Ticket = 0;
+  void *Entry = wrapperEnter(1, 1, &Ticket);
+  ASSERT_NE(Entry, nullptr);
+  ASSERT_NE(Ticket, 0u) << "the last admitted T1 still needs its real leave";
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), 1u);
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 1u);
+  EXPECT_EQ(Host->physicalExecutions(), 1u);
+  EXPECT_EQ(Host->runtime().physicalReaders(OldGen), 1u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 1u);
+
+  std::vector<std::pair<const uint64_t *, std::vector<uint64_t>>> RawSnapshots;
+  for (const std::string &Name : Host->runtime().engine().getLastCounterNames()) {
+    auto Counters = Host->runtime().engine().lookup(1, "__profc_" + Name);
+    auto Data = Host->runtime().engine().lookup(1, "__profd_" + Name);
+    ASSERT_TRUE(static_cast<bool>(Counters)) << toString(Counters.takeError());
+    ASSERT_TRUE(static_cast<bool>(Data)) << toString(Data.takeError());
+    const auto *Header =
+        reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(*Data);
+    const auto *Values = reinterpret_cast<const uint64_t *>(*Counters);
+    ASSERT_GT(Header->NumCounters, 0u);
+    RawSnapshots.push_back(
+        {Values, std::vector<uint64_t>(Values, Values + Header->NumCounters)});
+  }
+  ASSERT_FALSE(RawSnapshots.empty());
+  uint64_t LaterTicket = 123;
+  EXPECT_EQ(wrapperEnter(0, 0, &LaterTicket), nullptr);
+  EXPECT_EQ(LaterTicket, 0u);
+  const auto Later = call(0, 0, 3);
+  EXPECT_EQ(Later.status, EJitSmallTableDispatch::Aot);
+  EXPECT_EQ(aotFocusEntry(0, 0, 3), aotEntry(0, 0, 3))
+      << "the caller's AOT fallback still performs the business computation";
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), 1u);
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 1u);
+  for (const auto &Snapshot : RawSnapshots)
+    for (size_t I = 0; I < Snapshot.second.size(); ++I)
+      EXPECT_EQ(Snapshot.first[I], Snapshot.second[I])
+          << "quota-exhausted AOT must not alter any real T1 edge counter";
+
+  std::string Why;
+  auto Early = Host->runtime().freeze(Why);
+  EXPECT_FALSE(static_cast<bool>(Early)) << "freeze must drain the last real T1";
+  if (!Early)
+    consumeError(Early.takeError());
+  Host->cancel("last-quota T1 is still executing");
+  ASSERT_FALSE(static_cast<bool>(Host->beginNextGeneration({}, Why))) << Why;
+  ASSERT_TRUE(Host->retireGenerationsUpTo(OldGen, Why)) << Why;
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 1u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 1u);
+  using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
+  EXPECT_EQ(reinterpret_cast<EntryFn>(Entry)(1, 1, 5), aotEntry(1, 1, 5))
+      << "the old physical call's code and table survive replacement";
+  ejit_stab_leave(Ticket);
+  EXPECT_EQ(Host->physicalExecutions(), 0u);
+  EXPECT_EQ(Host->runtime().inFlight(), 0u);
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 0u);
+  EXPECT_EQ(Host->runtime().retainedGenerationCount(), 0u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+}
+
+TEST_F(SmallTableHostTest, OldSampleLeaveCannotCompleteAReplacementSample) {
+  EJitSmallTableHost::Options Opts;
+  Opts.runtime.sampling.aggregateLimit = 1;
+  Opts.runtime.sampling.waitForInFlightOnFreeze = false;
+  ASSERT_TRUE(requestFocusEntry(kCells, kTrps, kCells, kTrps, Opts));
+  const uint64_t OldGen = Host->runtime().resourceGeneration();
+  uint64_t OldTicket = 0;
+  void *OldEntry = wrapperEnter(0, 0, &OldTicket);
+  ASSERT_NE(OldEntry, nullptr);
+  ASSERT_NE(OldTicket, 0u);
+  Host->cancel("replace a paused sampled call");
+  std::string Why;
+  ASSERT_FALSE(static_cast<bool>(Host->beginNextGeneration({}, Why))) << Why;
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+  ASSERT_TRUE(Host->retireGenerationsUpTo(OldGen, Why)) << Why;
+  uint64_t NewTicket = 0;
+  void *NewEntry = wrapperEnter(1, 1, &NewTicket);
+  ASSERT_NE(NewEntry, nullptr);
+  ASSERT_NE(NewTicket, 0u);
+  EXPECT_EQ(Host->runtime().inFlight(), 2u);
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 1u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 2u)
+      << "each overlapping sampling session owns its own protected read";
+
+  using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
+  EXPECT_EQ(reinterpret_cast<EntryFn>(OldEntry)(0, 0, 2), aotEntry(0, 0, 2));
+  ejit_stab_leave(OldTicket);
+  EXPECT_EQ(Host->runtime().inFlight(), 1u);
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 1u)
+      << "the old return must not decrement the new session's freeze barrier";
+  EXPECT_EQ(Facts->outstandingBorrows(), 1u);
+  ejit_stab_leave(OldTicket); // duplicate: no execution may be closed twice
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 1u);
+  auto Early = Host->runtime().freeze(Why);
+  EXPECT_FALSE(static_cast<bool>(Early));
+  if (!Early)
+    consumeError(Early.takeError());
+  EXPECT_EQ(reinterpret_cast<EntryFn>(NewEntry)(1, 1, 4), aotEntry(1, 1, 4));
+  ejit_stab_leave(NewTicket);
+  ASSERT_FALSE(static_cast<bool>(Host->publishGeneration(Why))) << Why;
+  ASSERT_NE(Host->bundle(), nullptr);
+  EXPECT_EQ(Host->bundle()->sampleCount, 1u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+}
+
+TEST_F(SmallTableHostTest, ReplacementSamplingMustObtainItsOwnBorrow) {
+  ASSERT_TRUE(requestFocusEntry());
+  uint64_t OldTicket = 0;
+  ASSERT_NE(wrapperEnter(0, 0, &OldTicket), nullptr);
+  ASSERT_NE(OldTicket, 0u);
+  Host->cancel("retain old sampling borrow");
+  std::string Why;
+  ASSERT_FALSE(static_cast<bool>(Host->beginNextGeneration({}, Why))) << Why;
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+  Facts->refuseBorrow("replacement transaction is not ready");
+  uint64_t NewTicket = 0;
+  EXPECT_EQ(wrapperEnter(1, 1, &NewTicket), nullptr)
+      << "the retained old borrow cannot authorize a new session";
+  EXPECT_EQ(NewTicket, 0u);
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), 0u);
+  EXPECT_EQ(Host->runtime().inFlight(), 1u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 1u);
+  Facts->allowBorrow();
+  ASSERT_NE(wrapperEnter(1, 1, &NewTicket), nullptr);
+  EXPECT_EQ(Facts->outstandingBorrows(), 2u);
+  ejit_stab_leave(OldTicket);
+  EXPECT_EQ(Facts->outstandingBorrows(), 1u);
+  ejit_stab_leave(NewTicket);
+  Host->cancel("close replacement window");
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+}
+
+TEST_F(SmallTableHostTest, RetiringTwoLiveGenerationsDrainsBothReaderSets) {
+  ASSERT_TRUE(requestFocusEntry());
+  const uint64_t G1 = Host->runtime().resourceGeneration();
+  uint64_t T1 = 0;
+  ASSERT_NE(wrapperEnter(0, 0, &T1), nullptr);
+  Host->cancel("prepare second generation while first call runs");
+  std::string Why;
+  ASSERT_FALSE(static_cast<bool>(Host->beginNextGeneration({}, Why))) << Why;
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+  const uint64_t G2 = Host->runtime().resourceGeneration();
+  uint64_t T2 = 0;
+  ASSERT_NE(wrapperEnter(1, 1, &T2), nullptr);
+  Host->cancel("prepare third generation while both old calls run");
+  ASSERT_FALSE(static_cast<bool>(Host->beginNextGeneration({}, Why))) << Why;
+  ASSERT_TRUE(Host->retireGenerationsUpTo(G2, Why)) << Why;
+  EXPECT_EQ(Host->physicalExecutions(), 2u);
+  EXPECT_EQ(Host->retiredExecutionGeneration(), G1);
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 2u);
+  ejit_stab_leave(T1);
+  EXPECT_EQ(Host->physicalExecutions(), 1u);
+  EXPECT_TRUE(Host->hasRetiredExecutions());
+  EXPECT_EQ(Host->retiredExecutionGeneration(), G2);
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 1u);
+  ejit_stab_leave(T2);
+  EXPECT_FALSE(Host->hasRetiredExecutions());
+  EXPECT_EQ(Host->runtime().pendingRetireGenerationCount(), 0u);
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+}
+
+TEST_F(SmallTableHostTest, LastLeaveDoesNotImplicitlyRetireAnOldGeneration) {
+  ASSERT_TRUE(requestFocusEntry());
+  const uint64_t OldGen = Host->runtime().resourceGeneration();
+  uint64_t Ticket = 0;
+  ASSERT_NE(wrapperEnter(0, 0, &Ticket), nullptr);
+  Host->cancel("prepare replacement without retiring the old generation");
+  std::string Why;
+  ASSERT_FALSE(static_cast<bool>(Host->beginNextGeneration({}, Why))) << Why;
+  EXPECT_EQ(Host->runtime().retainedGenerationCount(), 1u);
+  ejit_stab_leave(Ticket);
+  EXPECT_EQ(Host->runtime().retainedGenerationCount(), 1u)
+      << "retention remains until the explicit retirement protocol permits it";
+  EXPECT_EQ(Host->runtime().stats().retiredGenerations, 0u);
+  ASSERT_TRUE(Host->retireGenerationsUpTo(OldGen, Why)) << Why;
+  EXPECT_EQ(Host->runtime().retainedGenerationCount(), 0u);
+}
+
+TEST_F(SmallTableHostTest, ReplacementHostCannotStealARetainedOwnersTicket) {
+  ASSERT_TRUE(requestFocusEntry());
+  ASSERT_TRUE(driveAndPublish());
+  uint64_t OldTicket = 0;
+  void *OldEntry = wrapperEnter(0, 0, &OldTicket);
+  ASSERT_NE(OldEntry, nullptr);
+  ASSERT_NE(OldTicket, 0u);
+  std::shared_ptr<EJitSmallTableHostFactSource> OldFacts = Facts;
+  ASSERT_FALSE(Host->beginOwnerTeardown());
+  EJitSmallTableHost::adoptRetired(std::move(Host));
+  Modules.clear();
+  ASSERT_TRUE(requestFocusEntry());
+  uint64_t NewTicket = 0;
+  ASSERT_NE(wrapperEnter(1, 1, &NewTicket), nullptr);
+  ASSERT_NE(NewTicket, 0u);
+  EXPECT_NE(NewTicket, OldTicket)
+      << "tokens identify physical executions across every host owner";
+  using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
+  EXPECT_EQ(reinterpret_cast<EntryFn>(OldEntry)(0, 0, 3), aotEntry(0, 0, 3));
+  ejit_stab_leave(OldTicket);
+  EXPECT_EQ(EJitSmallTableHost::retainedOwnerCount(), 0u);
+  EXPECT_EQ(OldFacts->outstandingBorrows(), 0u);
+  EXPECT_EQ(Host->physicalExecutions(), 1u)
+      << "old-owner completion cannot close the replacement host's execution";
+  EXPECT_EQ(Host->runtime().sessionInFlight(), 1u);
+  ejit_stab_leave(NewTicket);
+  Host->cancel("finish replacement test window");
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// 5c. ONE common T1 window filled by REAL executions, and the common T2 that
+//     consumes the whole frozen bundle.
+//===----------------------------------------------------------------------===//
+
+TEST_F(SmallTableHostTest, RealExecutionsFillOneCommonT1WindowOfSixtyFour) {
+  // The aggregate budget is the contract: ONE common window of 64 REAL admitted
+  // executions shared by every admitted ready member (not 64 per member, and
+  // not a representative-only sample). The window here is filled by ordinary
+  // admitted calls through enter/leave - not by the sampling driver - so what
+  // fills it is real execution completion, and the freeze happens only after
+  // every one of them returned.
+  EJitSmallTableHost::Options Opts;
+  Opts.runtime.sampling.aggregateLimit = 64;
+  Opts.runtime.sampling.freezeWaitMillis = 100;
+  auto M = parseHost("f_entry", "g_focus", "g_focus_out", kCells, kTrps + 1);
+  ASSERT_TRUE(M);
+  Facts = makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus), 0xF00D, kCells,
+                    kTrps);
+  ASSERT_TRUE(makeHost(Facts, Opts));
+  installRetractionHook();
+  registerLifecycle(kCellPeriod);
+  registerLifecycle(kTrpPeriod);
+  EJitSmallTableHost::EntryRequest Req;
+  Req.module = M.get();
+  Req.entryName = "f_entry";
+  Req.funcIndex = EJitFuncRegistry::instance().resolveAssign("f_entry");
+  Req.sourceVarName = "g_focus";
+  LocalDims = focusDims();
+  Req.dims = LocalDims;
+  std::vector<std::string> P = {kCellPeriod, kTrpPeriod};
+  Req.dimPeriodNames = P;
+  Req.codeGeneration = 1;
+  std::string Why;
+  ASSERT_TRUE(static_cast<bool>(Host->planEntry(Req, Why))) << Why;
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+  ASSERT_EQ(Host->runtime().sampleBudget(), 64u)
+      << "the default aggregate budget is 64 for ONE entry/code generation";
+
+  // Ordinary traffic: round-robin over every admitted member until the shared
+  // budget is reached, each execution entered and left for real.
+  const uint32_t D[2] = {cellSlot(), trpSlot()};
+  uint64_t Calls = 0;
+  unsigned Member = 0;
+  while (!Host->runtime().samplingExhausted()) {
+    const unsigned Cell = Member % kCells;
+    const unsigned Trp = (Member / kCells) % kTrps;
+    ++Member;
+    const uint32_t I[2] = {Cell, Trp};
+    uint64_t Ticket = 0;
+    void *Entry = Host->enterInstrumented(D, I, &Ticket, &Why);
+    ASSERT_NE(Entry, nullptr) << Why;
+    using EntryFn = int64_t (*)(uint64_t, uint64_t, int64_t);
+    const int64_t Got = reinterpret_cast<EntryFn>(Entry)(Cell, Trp, 1);
+    EXPECT_EQ(Got, aotEntry(Cell, Trp, 1))
+        << "cell=" << Cell << " trp=" << Trp;
+    ASSERT_NE(Ticket, 0u)
+        << "a counted execution without a ticket cannot be completed";
+    Host->leave(Ticket);
+    ++Calls;
+    ASSERT_LT(Calls, 512u) << "the aggregate budget never filled";
+  }
+  EXPECT_EQ(Calls, 64u) << "exactly the aggregate budget of real executions";
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), 64u)
+      << "the samples are real admitted executions, not lookups";
+  EXPECT_EQ(Host->runtime().inFlight(), 0u)
+      << "every real execution returned before any freeze";
+  EXPECT_TRUE(Host->runtime().samplingProtected())
+      << "the open window keeps its protected read until freeze or cancel";
+  EXPECT_TRUE(Host->runtime().samplingExhausted())
+      << "the shared budget is what the 64 real executions reached";
+
+  // Freeze only after the real executions completed: the immutable bundle is
+  // whole and carries the same table/generation identity the code bound.
+  const EJitSmallTableProfileBundle *BundleWhileOpen = Host->bundle();
+  EXPECT_EQ(BundleWhileOpen, nullptr) << "nothing is frozen before the freeze";
+  EXPECT_EQ(Host->runtime().sampleCount() >= 64u, true);
+  ASSERT_FALSE(static_cast<bool>(Host->publishGeneration(Why))) << Why;
+  const EJitSmallTableProfileBundle *Bundle = Host->bundle();
+  ASSERT_NE(Bundle, nullptr);
+  EXPECT_EQ(Bundle->sampleCount, 64u);
+  EXPECT_EQ(Bundle->resourceGeneration, Host->runtime().resourceGeneration())
+      << "the bundle names the resource generation T1 was compiled against";
+  EXPECT_EQ(Bundle->resourceAddress,
+            reinterpret_cast<uintptr_t>(Host->runtime().resource()->base()))
+      << "symbol-name equality is not identity: the address must be the same";
+  EXPECT_GT(Bundle->participatingMembers, 1u)
+      << "the common window is shared by more than one member";
+  EXPECT_FALSE(Bundle->readinessProvider.empty());
+  EXPECT_FALSE(Bundle->profileData.empty())
+      << "the bundle must carry a real synthesized profile, not a placeholder";
+  EXPECT_FALSE(Bundle->counters.empty());
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), 64u)
+      << "the aggregate session count is the frozen sample count";
+  EXPECT_EQ(Host->activeTier(), "final");
+}
+
+TEST_F(SmallTableHostTest, FreezeWaitsForTheLastInFlightExecution) {
+  // Admission is not completion: with the freeze wait enabled, a freeze that
+  // arrives while an admitted execution is still running must wait for its real
+  // return rather than read a half-complete window.
+  EJitSmallTableHost::Options Opts;
+  Opts.runtime.sampling.aggregateLimit = 4;
+  Opts.runtime.sampling.waitForInFlightOnFreeze = true;
+  Opts.runtime.sampling.freezeWaitMillis = 3000;
+  auto M = parseHost("f_entry", "g_focus", "g_focus_out", kCells, kTrps + 1);
+  ASSERT_TRUE(M);
+  Facts = makeFacts("g_focus", &g_focus[0][0], sizeof(g_focus), 0xF00D, kCells,
+                    kTrps);
+  ASSERT_TRUE(makeHost(Facts, Opts));
+  installRetractionHook();
+  registerLifecycle(kCellPeriod);
+  registerLifecycle(kTrpPeriod);
+  EJitSmallTableHost::EntryRequest Req;
+  Req.module = M.get();
+  Req.entryName = "f_entry";
+  Req.funcIndex = EJitFuncRegistry::instance().resolveAssign("f_entry");
+  Req.sourceVarName = "g_focus";
+  LocalDims = focusDims();
+  Req.dims = LocalDims;
+  std::vector<std::string> P = {kCellPeriod, kTrpPeriod};
+  Req.dimPeriodNames = P;
+  Req.codeGeneration = 1;
+  std::string Why;
+  ASSERT_TRUE(static_cast<bool>(Host->planEntry(Req, Why))) << Why;
+  ASSERT_TRUE(static_cast<bool>(Host->compileT1(Why))) << Why;
+
+  // Three completed samples and one execution held open: the window is at its
+  // budget while the fourth real execution has not returned.
+  const uint32_t D[2] = {cellSlot(), trpSlot()};
+  for (unsigned I = 0; I < 3; ++I) {
+    const uint32_t Inst[2] = {I, 0};
+    uint64_t Ticket = 0;
+    void *Entry = Host->enterInstrumented(D, Inst, &Ticket, &Why);
+    ASSERT_NE(Entry, nullptr) << Why;
+    Host->leave(Ticket);
+  }
+  const uint32_t Inst[2] = {0, 1};
+  uint64_t Ticket = 0;
+  void *Entry = Host->enterInstrumented(D, Inst, &Ticket, &Why);
+  ASSERT_NE(Entry, nullptr) << Why;
+  ASSERT_NE(Ticket, 0u);
+  ASSERT_EQ(Host->runtime().currentSessionSamples(), 4u);
+  ASSERT_EQ(Host->runtime().sessionInFlight(), 1u);
+
+  // The freeze is refused (not silently truncated) while that execution runs.
+  std::string FreezeWhy;
+  auto Frozen = Host->runtime().freeze(FreezeWhy);
+  EXPECT_FALSE(static_cast<bool>(Frozen)) << "a granted dispatch is not a sample";
+  if (!Frozen)
+    consumeError(Frozen.takeError());
+  EXPECT_FALSE(FreezeWhy.empty());
+  EXPECT_EQ(Host->runtime().inFlight(), 1u)
+      << "the refused freeze must not have dropped the execution";
+
+  // The real return completes the window; the freeze then succeeds on the SAME
+  // session and the bundle reports all four real executions.
+  Host->leave(Ticket);
+  EXPECT_EQ(Host->runtime().inFlight(), 0u);
+  std::string Why2;
+  ASSERT_FALSE(static_cast<bool>(Host->publishGeneration(Why2))) << Why2;
+  ASSERT_NE(Host->bundle(), nullptr);
+  EXPECT_EQ(Host->bundle()->sampleCount, 4u);
+  EXPECT_EQ(Host->runtime().inFlight(), 0u);
+}
+
+TEST_F(SmallTableHostTest, FrozenBundleIsConsumedWholeByTheCommonT2) {
+  // The common T2 is compiled FROM the frozen bundle and must bind the SAME
+  // table resource as T1 (resource address AND generation, checked by the engine
+  // lookup, not by symbol name). The published slots then run the T2 entry.
+  ASSERT_TRUE(requestFocusEntry(kCells, kTrps, kCells, kTrps, {},
+                                /*BranchProfile=*/true));
+  const uint64_t Budget = Host->runtime().sampleBudget();
+  for (uint64_t I = 0; I < Budget; ++I) {
+    const unsigned Cell = I % kCells;
+    const unsigned Trp = (I / kCells) % kTrps;
+    const int32_t X = I % 2 ? -3 : 4;
+    EXPECT_EQ(runWrapperCall(Cell, Trp, X),
+              aotEntry(Cell, Trp, X) + (X < 0 ? -23 : 17));
+  }
+  EXPECT_EQ(Host->runtime().currentSessionSamples(), Budget);
+  EXPECT_GT(g_profilePositiveCalls, 0u);
+  EXPECT_GT(g_profileNegativeCalls, 0u);
+  std::string Why;
+  auto Frozen = Host->runtime().freeze(Why);
+  ASSERT_TRUE(static_cast<bool>(Frozen)) << Why;
+  const EJitSmallTableProfileBundle *Bundle = Host->bundle();
+  ASSERT_NE(Bundle, nullptr);
+  ASSERT_EQ(Bundle->resourceGeneration, Host->runtime().resourceGeneration());
+  ASSERT_EQ(Bundle->resourceAddress,
+            reinterpret_cast<uintptr_t>(Host->runtime().resource()->base()));
+  ASSERT_GT(Bundle->counters.size(), 0u);
+
+  // Every counter the bundle carries resolves in the SAME engine to a real
+  // address: that is the profile data T2 consumes.
+  for (const PgoCounterRef &C : Bundle->counters) {
+    ASSERT_NE(C.pgoName, nullptr);
+    std::string SymbolSuffix;
+    for (const std::string &Suffix :
+         Host->runtime().engine().getLastCounterNames())
+      if (Host->runtime().engine().getCounterProfileName(Suffix) == C.pgoName) {
+        ASSERT_TRUE(SymbolSuffix.empty()) << "duplicate canonical name mapping";
+        SymbolSuffix = Suffix;
+      }
+    ASSERT_FALSE(SymbolSuffix.empty()) << C.pgoName;
+    const std::string CounterName = "__profc_" + SymbolSuffix;
+    auto Addr = Host->runtime().engine().lookup(Bundle->codeGeneration,
+                                              CounterName);
+    ASSERT_TRUE(static_cast<bool>(Addr))
+        << CounterName << ": " << toString(Addr.takeError());
+    EXPECT_NE(C.profcAddr, 0u) << CounterName;
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(*Addr), C.profcAddr) << CounterName;
+  }
+
+  const std::string CompleteProfile = Bundle->profileData;
+  ASSERT_FALSE(CompleteProfile.empty());
+  auto ReaderOrErr = InstrProfReader::create(
+      MemoryBuffer::getMemBufferCopy(CompleteProfile));
+  ASSERT_TRUE(static_cast<bool>(ReaderOrErr))
+      << toString(ReaderOrErr.takeError());
+  std::set<std::string> CapturedNames;
+  for (const PgoCounterRef &Counter : Bundle->counters) {
+    ASSERT_NE(Counter.pgoName, nullptr);
+    ASSERT_TRUE(CapturedNames.insert(Counter.pgoName).second)
+        << "duplicate captured profile function";
+  }
+  std::set<std::string> ExpectedNames;
+  for (const std::string &Name : Host->runtime().engine().getLastCounterNames()) {
+    StringRef ProfileName = Host->runtime().engine().getCounterProfileName(Name);
+    ASSERT_FALSE(ProfileName.empty());
+    ASSERT_TRUE(ExpectedNames.insert(ProfileName.str()).second);
+  }
+  EXPECT_EQ(CapturedNames, ExpectedNames)
+      << "capture may not silently omit an emitted function's counters";
+  EXPECT_GE(CapturedNames.size(), 3u)
+      << "the root and both noinline helpers must be present in the bundle";
+  std::set<std::string> ProfileNames;
+  bool SawMultipleCounters = false;
+  for (const NamedInstrProfRecord &Record : **ReaderOrErr) {
+    ASSERT_TRUE(ProfileNames.insert(Record.Name.str()).second)
+        << "duplicate decoded profile function";
+    const PgoCounterRef *Captured = nullptr;
+    for (const PgoCounterRef &Counter : Bundle->counters)
+      if (Record.Name == Counter.pgoName)
+        Captured = &Counter;
+    ASSERT_NE(Captured, nullptr) << Record.Name.str();
+    ASSERT_NE(Captured->profdAddr, 0u);
+    const auto *Data =
+        reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(
+            Captured->profdAddr);
+    EXPECT_EQ(IndexedInstrProf::ComputeHash(Record.Name), Data->NameRef)
+        << "canonical PGO name hash must match the real __profd NameRef: "
+        << Record.Name.str();
+    ASSERT_EQ(Record.Hash, Data->FuncHash) << Record.Name.str();
+    ASSERT_EQ(Record.Counts.size(), Data->NumCounters) << Record.Name.str();
+    ASSERT_FALSE(Record.Counts.empty());
+    if (Record.Name == "f_entry") {
+      EXPECT_GT(Data->NumCounters, 1u)
+          << "the dynamic two-path fixture must cover tail edge counters";
+      SawMultipleCounters = Data->NumCounters > 1;
+    }
+    const auto *RawCounts =
+        reinterpret_cast<const uint64_t *>(Captured->profcAddr);
+    for (size_t I = 0; I < Record.Counts.size(); ++I)
+      EXPECT_EQ(Record.Counts[I], RawCounts[I])
+          << Record.Name.str() << " counter " << I;
+  }
+  EXPECT_FALSE((*ReaderOrErr)->hasError());
+  EXPECT_EQ(ProfileNames, CapturedNames)
+      << "the frozen profile contains every captured function's full counters";
+  EXPECT_TRUE(SawMultipleCounters);
+  ASSERT_FALSE(static_cast<bool>(Host->publishGeneration(Why))) << Why;
+  EXPECT_EQ(Host->bundle(), Bundle) << "T2 consumes the same frozen bundle";
+  EXPECT_EQ(Host->bundle()->profileData, CompleteProfile);
+
+  // The published tier is the T2 compiled from this bundle, and it is a
+  // different code generation from the instrumented T1.
+  EXPECT_EQ(Host->activeTier(), "final");
+  ASSERT_NE(Host->instrumentedEntry(), nullptr);
+  ASSERT_NE(Host->activeEntry(), nullptr);
+  EXPECT_NE(Host->activeEntry(), Host->instrumentedEntry())
+      << "T2 is its own compiled entry, not the instrumented one";
+
+  // Published calls run that T2 under the same provider contract. Mutating an
+  // authorized configuration field here without moving the provider revision
+  // would violate that contract and must be tested as admission refusal, not
+  // as an unchanged published dispatch (see changed-member tests).
+  const EJitSmallTablePlan *Plan = Host->plan();
+  ASSERT_NE(Plan, nullptr);
+  ASSERT_GE(Plan->fields.size(), 2u);
+  ASSERT_EQ(Plan->fields[1].strategy, EJitSmallTableStrategy::Table)
+      << "this fixture's per-cell field must be a table for this check";
+  const uint64_t PositiveBeforeT2 = g_profilePositiveCalls;
+  const uint64_t NegativeBeforeT2 = g_profileNegativeCalls;
+  for (unsigned C = 0; C < kCells; ++C)
+    for (unsigned T = 0; T < kTrps; ++T)
+      for (int32_t X : {-2, 3}) {
+        const auto R = call(C, T, X);
+        ASSERT_EQ(R.status, EJitSmallTableDispatch::Dispatched) << R.why;
+        EXPECT_EQ(R.value, aotEntry(C, T, X) + (X < 0 ? -23 : 17))
+            << "the common T2 consumes the full profile and executes both paths";
+      }
+  EXPECT_EQ(g_profilePositiveCalls - PositiveBeforeT2, kCells * kTrps);
+  EXPECT_EQ(g_profileNegativeCalls - NegativeBeforeT2, kCells * kTrps);
+}
+
+//===----------------------------------------------------------------------===//
 // 6. Failure paths: queue/compile failure, cancel, stale callbacks, retraction
 //===----------------------------------------------------------------------===//
 
@@ -1086,20 +2335,43 @@ TEST_F(SmallTableHostTest, CancelRejectsStaleCallbacksAndLaterDispatch) {
 
   Host->cancel("timeout");
   EXPECT_EQ(Host->publishedSlots(), 0u);
-  EXPECT_EQ(Host->activeExecutions(), 0u)
-      << "cancelling drains the logical slots and closes the executions";
-  EXPECT_EQ(Facts->outstandingBorrows(), 0u)
-      << "cancelling must release the cancelled execution's protected read";
+  // PHYSICAL LIFETIME (coordinator P1 repair, 2026-09-16). The cancel settles
+  // the execution LOGICALLY - no new call is admitted, the slot is drained, the
+  // session stops counting - but the granted execution is a real call that has
+  // not returned. Its protected read and its resource generation stay held until
+  // its own `leave`, because the generated code already entered and still reads
+  // the table through the column addresses it bound.
+  EXPECT_EQ(Host->activeExecutions(), 1u)
+      << "logical cancellation is not physical completion";
+  EXPECT_EQ(Host->physicalExecutions(), 1u);
+  EXPECT_EQ(Host->logicallyClosedExecutions(), 1u)
+      << "the in-flight execution is settled for sampling, not released";
+  EXPECT_EQ(Facts->outstandingBorrows(), 1u)
+      << "the protected read must survive until the real call returns";
+  EXPECT_EQ(Host->runtime().inFlight(), 1u)
+      << "the runtime's in-flight count is physical and survives cancel";
+  EXPECT_TRUE(Host->runtime().samplingProtected())
+      << "the sampling window's borrow guards the running execution";
+  EXPECT_EQ(Host->runtime().physicalReaders(Host->runtime().resourceGeneration()),
+            1u);
   EXPECT_FALSE(Host->codeReady());
 
-  // Completing the granted execution now is a stale completion: it is counted,
-  // never merged into a later generation.
+  // Completing the granted execution now is a stale completion for the session:
+  // it is counted, never merged into a later generation, and it releases its OWN
+  // physical lease.
   const uint64_t Before = Host->staleLeaveCount();
   Host->leave(Ticket);
   EXPECT_EQ(Host->staleLeaveCount(), Before + 1)
       << "a ticket from a cancelled session must be recognized as stale";
   EXPECT_GT(Host->runtime().stats().staleCallbacks, 0u)
       << "the runtime must record the stale sample callback too";
+  EXPECT_EQ(Host->activeExecutions(), 0u)
+      << "the real return releases the physical execution";
+  EXPECT_EQ(Facts->outstandingBorrows(), 0u)
+      << "the real return releases the protected read";
+  EXPECT_EQ(Host->runtime().inFlight(), 0u);
+  EXPECT_FALSE(Host->runtime().samplingProtected())
+      << "the cancelled window's borrow is released once its last reader left";
 
   const auto R = call(0, 0, 1);
   EXPECT_EQ(R.status, EJitSmallTableDispatch::Aot) << R.why;

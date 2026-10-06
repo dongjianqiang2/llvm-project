@@ -302,7 +302,7 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 //===----------------------------------------------------------------------===//
 // PR231 small-table normal path: the wrapper enter/leave hooks.
 //
-// The AOT wrapper emits these around a resolved specialized dispatch so that an
+// The AOT wrapper emits the new early wrapper entry below, before resolving, so an
 // admitted execution is accounted, and the sampling session's protected read
 // stays held, for the ACTUAL call rather than only for the pointer lookup:
 //
@@ -311,11 +311,10 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 //   else if (why)       { ...original AOT body... }   // policy applies, refused
 //   else                { ...unchanged dispatch... }  // no policy for this entry
 //
-// `ejit_stab_enter` returns NULL unless tableReady, codeReady, the member's
-// admission and the published logical slot all hold for the row this call
-// belongs to, so the caller can never reach a specialization that was not
-// admitted. `ticket` is 0 when the execution ran but was not counted (the
-// aggregate budget is reached): `ejit_stab_leave(0)` is a no-op.
+// During sampling an admitted/table-ready member executes the common T1 under
+// a real nonzero ticket. Once its aggregate quota is spent, it takes AOT until
+// common T2 is published: no uncounted T1 instrumentation is executed. Published
+// T2 also holds a real physical ticket, but does not add a sampling count.
 //
 // The THREE answers above are the ABI the wrapper's three dispatch paths depend
 // on. Only a function index a host is actually bound to is under small-table
@@ -347,7 +346,7 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 
 /// Wrapper enter hook. Returns the callable specialized entry when this
 /// execution may run specialized code, else NULL. \p outTicket receives the
-/// execution's ticket for `ejit_stab_leave` (0 when not counted). \p outWhy
+/// execution's nonzero physical ticket for `ejit_stab_leave`. \p outWhy
 /// receives NULL when no small-table policy owns \p funcIndex (the caller keeps
 /// its unchanged dispatch), or a fixed diagnostic literal when the policy
 /// applies and refused (the caller takes the AOT body). The literal is never
@@ -356,9 +355,28 @@ void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
                       uint32_t numDims, uint64_t *outTicket,
                       const char **outWhy);
 
+/// Early wrapper-only tri-state decision, BEFORE ordinary resolution (including
+/// inline-cache probes). Same three answers as enter; a non-null entry always
+/// has a nonzero execution ticket. Owned refusals never start ordinary PGO.
+/// Validates descriptors and the live runtime/lifecycle, then prepares the
+/// actual common code and writable counters on the calling core. The old enter
+/// ABI remains available to existing callers.
+void *ejit_stab_wrapper_enter(uint32_t funcIndex,
+                              const ejit_dim_pair_t *dims, uint32_t numDims,
+                              const ejit_bound_ptr_t *boundPointers,
+                              uint32_t boundCount, uint64_t *outTicket,
+                              const char **outWhy, uint64_t *outPolicyEpoch);
+
+/// Revalidate an early no-policy answer before ordinary lookup/dispatch. A
+/// changed policy/runtime takes AOT, never redirects a generic PGO call into
+/// the common object after starting its ordinary session.
+bool ejit_stab_wrapper_no_policy_current(uint64_t policyEpoch);
+
 /// Wrapper leave hook. Idempotent for ticket 0; a ticket whose session is no
-/// longer current is a stale callback: it is rejected and counted, never merged
-/// into another generation.
+/// longer current is a stale sampling callback: it is counted but never merged
+/// into another generation. Its own physical lease is still released at this
+/// real leave; logical cancel never substitutes for return. Duplicate leaves
+/// cannot release a new generation's lease.
 void ejit_stab_leave(uint64_t ticket);
 
 /// Coordinate form: ask for the specialized entry of \p coordinate (one index

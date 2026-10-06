@@ -39,6 +39,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -59,6 +61,7 @@ class EJitOrcEngine;
 class EJitSmallTableReadBorrow;
 class EJitSmallTableReadinessProvider;
 class EJitSmallTableTableResource;
+class EJitSmallTableHost;
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct SpecializationContext;
@@ -308,7 +311,9 @@ public:
   Accounting accounting() const;
 
 private:
-  EJitSmallTableTableResource() = default;
+  explicit EJitSmallTableTableResource(bool LittleEndian)
+      : littleEndian_(LittleEndian) {}
+  const bool littleEndian_;
 
   uint8_t *base_ = nullptr;
   uint64_t capacityBytes_ = 0;
@@ -341,7 +346,10 @@ struct EJitSmallTableSamplingPolicy {
 struct EJitSmallTableSampleTicket {
   uint64_t sessionId = 0;
   uint64_t serial = 0;
+  /// Every admitted T1 has a valid physical ticket through its actual leave.
+  /// Quota-exhausted calls take AOT and receive no sampling ticket.
   bool valid = false;
+  bool counted = false;
 };
 
 /// The immutable frozen profile bundle of one common session (spec §10):
@@ -399,6 +407,14 @@ public:
     uint64_t generationsPrepared = 0;
     uint64_t migratedRows = 0;
     uint64_t retiredGenerations = 0;
+    /// Retirements that had to wait for a physical reader of the generation to
+    /// leave (spec §7 retained-old-generation rule). A deferred retirement is
+    /// NOT a freed resource: the bytes stay accounted until the last reader
+    /// returns, which is when the reclamation happens.
+    uint64_t deferredRetirements = 0;
+    /// Generations whose storage was really released after their last physical
+    /// reader left (the safe-reclamation half of `deferredRetirements`).
+    uint64_t reclaimedAfterReaders = 0;
   };
 
   ~EJitSmallTableRuntime();
@@ -451,7 +467,32 @@ public:
   /// Release the storage of generations `<= Generation` for code that can no
   /// longer dispatch to them. A generation above the current one is refused
   /// (returns false) rather than freeing live storage.
+  ///
+  /// PHYSICAL READER PROTECTION. A generation whose columns a real execution is
+  /// still reading is NOT freed here: the retirement is recorded as deferred and
+  /// the storage is reclaimed by `reclaimRetiredGenerations` when the last
+  /// reader of that generation leaves. Logical cancellation is not proof of
+  /// physical completion, so an execution that was cancelled mid-flight still
+  /// holds its generation until its own leave arrives. Returns false only for a
+  /// generation above the current one.
   bool retireGenerationsUpTo(uint64_t Generation);
+
+  /// Free every generation whose retirement was deferred and whose last physical
+  /// reader has since left. Idempotent and safe to call from any bookkeeping
+  /// point (a leave, a cancel, a teardown). Returns the number of generations
+  /// released.
+  uint64_t reclaimRetiredGenerations();
+
+  /// Generations <= some retired generation whose storage is still held only
+  /// because a physical reader is inside them. Empty when nothing is deferred.
+  uint64_t pendingRetireGenerationCount() const { return retired_.size(); }
+  /// Bytes held for retired generations that a reader is still inside.
+  uint64_t pendingRetireBytes() const;
+  /// Physical readers currently inside \p Generation (real executions that took
+  /// a lease and have not left). 0 means the generation may be reclaimed.
+  uint64_t physicalReaders(uint64_t Generation) const;
+  /// Every generation with at least one physical reader (ascending).
+  std::vector<uint64_t> physicallyReadGenerations() const;
 
   /// Compile the common instrumented T1 through the real engine, verify that the
   /// compiled code bound this resource (not a same-named foreign table), publish
@@ -467,10 +508,11 @@ public:
 
   /// Record one REAL execution of the admitted specialized entry for \p Indices.
   /// Returns false when the call must take the AOT path instead: the member was
-  /// never admitted, is not ready, the session is exhausted/stale, or the code
+  /// never admitted, is not ready, the quota is exhausted, the session is
+  /// closed/stale, or the code
   /// has no admitted rows. A call that is not admitted never consumes budget.
   ///
-  /// The first counted execution of a session takes the session's protected read
+  /// The first physical execution of a session takes the session's protected read
   /// borrow and holds it until the session freezes or is cancelled, so the
   /// instrumented entry is always called while the configuration generation is
   /// read-protected (spec §6.1.1/§10). If no borrow can be taken the call is
@@ -484,19 +526,35 @@ public:
 
   uint64_t sampleCount() const { return stats_.acceptedSamples; }
   /// Real admitted samples of the CURRENT entry/code generation. The aggregate
-  /// budget is per generation, so a compatible late member and a new generation
-  /// do not restart it, and a new generation gets its own quota.
+  /// budget is per generation: a compatible late member does not restart it,
+  /// while a replacement generation gets its own quota.
   uint64_t currentSessionSamples() const { return sessionSamples_; }
   uint64_t sampleBudget() const { return options_.sampling.aggregateLimit; }
   bool samplingExhausted() const {
     return sessionSamples_ >= options_.sampling.aggregateLimit;
   }
+  /// Real executions that were entered through the sampling session and have not
+  /// returned (the freezing barrier). A cancel does not zero this: the calls are
+  /// still running.
   uint64_t inFlight() const { return inFlight_; }
+  /// The CURRENT (open) session's granted-and-not-completed executions. This is
+  /// what blocks replacing the generation being sampled (`beginNextGeneration`)
+  /// and what a freeze has to drain. Executions a cancel already gave up on are
+  /// not part of it: they read the retained old resource and may keep running
+  /// while a new generation is prepared.
+  uint64_t sessionInFlight() const { return sessionInFlight_; }
+  /// Physical readers of the table storage, across every session and tier. A
+  /// generation with a non-zero `physicalReaders` count may not be freed.
+  uint64_t physicalInFlight() const { return inFlight_; }
   bool sessionOpen() const { return sessionOpen_; }
   uint64_t sessionId() const { return sessionId_; }
   /// True while the session holds the protected read borrow that guards the
-  /// source region for the whole sampling window.
-  bool samplingProtected() const { return sessionBorrow_ != nullptr; }
+  /// source region for the whole sampling window. A cancelled session keeps the
+  /// borrow until its last real execution returns (physical protection), so
+  /// `samplingProtected()` can stay true after `cancel` while `inFlight() != 0`.
+  bool samplingProtected() const {
+    return sessionBorrow_ != nullptr || !retiredSessionBorrows_.empty();
+  }
 
   /// Freeze ONE immutable profile bundle for the common session. Requires the
   /// aggregate budget to be reached (or \p Force) and, when the policy asks for
@@ -541,6 +599,13 @@ public:
   }
 
 private:
+  /// The runtime owns sampling readers through exact execution tickets; the
+  /// host owns published T2 readers through its execution records. These
+  /// primitives stay private so arbitrary callers cannot drop another call's
+  /// protection without delivering that execution's actual completion.
+  friend class EJitSmallTableHost;
+  friend struct EJitSmallTableCounterCaptureTestAccess;
+
   EJitSmallTableRuntime() = default;
 
   /// Publish \p Indices' rows if the contract admits them; returns the
@@ -555,6 +620,19 @@ private:
   Expected<const EJitSmallTablePlan *>
   buildGeneration(Module &M, ArrayRef<EJitSmallTableRowKey> Rows,
                   uint64_t Generation, std::string &Error);
+
+  /// Take one physical read lease on \p Generation for a real execution whose
+  /// code reads that generation's column storage.
+  void acquireReader(uint64_t Generation);
+  /// Drop one physical read lease and reclaim anything it was holding back.
+  void releaseReader(uint64_t Generation);
+  /// Erase every retained resource `<= Generation` immediately (no reader).
+  void freeRetainedUpTo(uint64_t Generation);
+  /// Free \p Generation's retained resource when its last reader left.
+  void freeIfUnread(uint64_t Generation);
+  /// Release the sampling window's protected read borrow once no real execution
+  /// is still inside the window (cancel/failure path).
+  void releaseSessionBorrowIfDrained();
 
   Config config_;
   PeriodArrayRegistry *registry_ = nullptr;
@@ -582,6 +660,15 @@ private:
   /// bytes they account for (spec §8 retention budget).
   std::vector<std::unique_ptr<EJitSmallTableTableResource>> retained_;
   uint64_t retainedBytes_ = 0;
+  /// Generations `<= some retired generation` that could not be freed because a
+  /// real execution was still reading them, with the number of such readers.
+  /// The resource stays in `retained_` (and its bytes stay accounted) until the
+  /// last reader leaves; `reclaimRetiredGenerations` then releases it.
+  std::map<uint64_t, uint64_t> retired_;
+  /// Physical readers per generation, across both T1 and T2. This remains
+  /// independent of the current sampling-session barrier after cancellation.
+  /// Absent key means zero readers.
+  std::map<uint64_t, uint64_t> readers_;
   /// True between preparing generation N+1 and compiling it.
   bool pendingGeneration_ = false;
   uint64_t codeGeneration_ = 0;
@@ -594,6 +681,10 @@ private:
   /// the resolved __profc_/__profd_ addresses.
   std::vector<std::string> counterNames_;
   std::vector<std::pair<uintptr_t, uintptr_t>> counterAddrs_;
+  /// Private, one-shot fault-injection seam for the actual ORC capture tests.
+  /// Empty in production; it cannot replace counters or the lookup result.
+  std::function<void(EJitOrcEngine &, uint64_t, ArrayRef<std::string>)>
+      beforeCounterCaptureForTesting_;
 
   /// Members already admitted for dispatch, keyed by their coordinate.
   std::vector<std::pair<std::vector<uint64_t>, EJitSmallTableAdmission>>
@@ -603,12 +694,32 @@ private:
 
   uint64_t sessionId_ = 0;
   uint64_t nextTicketSerial_ = 1;
+  struct SamplingExecution {
+    uint64_t sessionId = 0;
+    uint64_t resourceGeneration = 0;
+  };
+  /// Exact physical executions. A duplicate/stale completion must not close
+  /// another execution or decrement a replacement session's barrier.
+  std::map<uint64_t, SamplingExecution> samplingExecutions_;
+  /// PHYSICAL in-flight count: every real execution entered through the sampling
+  /// session that has not returned. `cancel` never zeroes it; only the
+  /// executions' own `leaveAdmitted` decrements it.
   uint64_t inFlight_ = 0;
+  /// The CURRENT open session's share of `inFlight_`: executions whose completing
+  /// callback still belongs to it. A cancel lowers it to zero (the session that
+  /// granted them is over) while `inFlight_` keeps counting them physically, so a
+  /// cancelled session's late executions neither block a rebuild nor block a
+  /// freeze of the NEXT session.
+  uint64_t sessionInFlight_ = 0;
   /// Protected read borrow held for the whole sampling window (taken by the
   /// first counted execution, released by freeze/cancel). `samplingProtected()`
   /// reports it; a null value means the session is not reading the source under
   /// a provider guarantee, which is why a sample then refuses.
   std::unique_ptr<EJitSmallTableReadBorrow> sessionBorrow_;
+  /// Cancelled sessions may still execute while a replacement session opens.
+  /// Each old session keeps its OWN protected read until its last real leave.
+  std::map<uint64_t, std::unique_ptr<EJitSmallTableReadBorrow>>
+      retiredSessionBorrows_;
   /// Admitted samples of the current generation only (the aggregate budget is
   /// per entry/code generation; `stats_.acceptedSamples` stays cumulative).
   uint64_t sessionSamples_ = 0;

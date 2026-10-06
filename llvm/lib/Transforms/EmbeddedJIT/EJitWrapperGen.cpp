@@ -33,6 +33,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <limits>
 #include <map>
 #include <string>
@@ -629,8 +630,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   auto *StabI64Ty = Type::getInt64Ty(Ctx);
   if (EnableEJitSmallTableHooks) {
     M.getOrInsertFunction(
-        FN_STAB_ENTER,
-        FunctionType::get(PtrTy, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
+        FN_STAB_WRAPPER_ENTER,
+        FunctionType::get(PtrTy,
+                          {I32Ty, PtrTy, I32Ty, PtrTy, I32Ty, PtrTy, PtrTy,
+                           PtrTy},
+                          false));
+    M.getOrInsertFunction(FN_STAB_NO_POLICY_CURRENT,
+                          FunctionType::get(Type::getInt1Ty(Ctx),
+                                            {StabI64Ty}, false));
     M.getOrInsertFunction(
         FN_STAB_LEAVE,
         FunctionType::get(Type::getVoidTy(Ctx), {StabI64Ty}, false));
@@ -961,6 +968,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Value *Ticket = nullptr; // i64 written by ejit_stab_enter, read by leave
       Value *Why = nullptr;    // ptr: null => no small-table policy applies
       Value *Entry = nullptr;  // ptr: the callable this dispatch will use
+      Value *Bounds = nullptr;
+      Value *Epoch = nullptr;
     };
     auto createStabSlots = [&](IRBuilder<> &B) -> StabSlots {
       StabSlots S;
@@ -971,6 +980,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       S.Ticket = B.CreateAlloca(I64Ty, nullptr, "ejit_stab_ticket");
       S.Why = B.CreateAlloca(PtrTy, nullptr, "ejit_stab_why");
       S.Entry = B.CreateAlloca(PtrTy, nullptr, "ejit_stab_entry_slot");
+      S.Epoch = B.CreateAlloca(I64Ty, nullptr, "ejit_stab_policy_epoch");
+      if (!BoundPtrs.empty())
+        S.Bounds = B.CreateAlloca(
+            ArrayType::get(StructType::get(PtrTy, I32Ty, I32Ty),
+                           BoundPtrs.size()), nullptr, "ejit_stab_bounds");
       return S;
     };
 
@@ -1032,11 +1046,30 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       }
       Value *DimsPtr = NumDims > 0 ? B.CreatePointerCast(S.Dims, PtrTy)
                                    : ConstantPointerNull::get(PtrTy);
+      Value *BoundsPtr = ConstantPointerNull::get(PtrTy);
+      if (!BoundPtrs.empty()) {
+        auto *DescTy = StructType::get(PtrTy, I32Ty, I32Ty);
+        auto *ArrayTy = ArrayType::get(DescTy, BoundPtrs.size());
+        for (unsigned I = 0; I < BoundPtrs.size(); ++I) {
+          Value *Indices[] = {B.getInt32(0), B.getInt32(I)};
+          Value *Desc = B.CreateInBoundsGEP(ArrayTy, S.Bounds, Indices);
+          const auto &Info = BoundPtrs[I];
+          B.CreateStore(B.CreatePointerCast(Fn.getArg(Info.ArgIndex), PtrTy),
+                        B.CreateStructGEP(DescTy, Desc, 0));
+          B.CreateStore(B.getInt32(Info.PointeeSize),
+                        B.CreateStructGEP(DescTy, Desc, 1));
+          B.CreateStore(B.getInt32(Info.ArgIndex),
+                        B.CreateStructGEP(DescTy, Desc, 2));
+        }
+        BoundsPtr = B.CreatePointerCast(S.Bounds, PtrTy);
+      }
       Value *Entered = B.CreateCall(
-          M.getFunction(FN_STAB_ENTER),
+          M.getFunction(FN_STAB_WRAPPER_ENTER),
           {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, NumDims),
+           BoundsPtr, B.getInt32(BoundPtrs.size()),
            B.CreatePointerCast(S.Ticket, PtrTy),
-           B.CreatePointerCast(S.Why, PtrTy)},
+           B.CreatePointerCast(S.Why, PtrTy),
+           B.CreatePointerCast(S.Epoch, PtrTy)},
           "ejit_stab_entry");
       auto *DecideBB = BasicBlock::Create(Ctx, "jit_stab_decide", &Fn);
       B.CreateCondBr(B.CreateIsNotNull(Entered), AdmittedBB, DecideBB);
@@ -1101,6 +1134,36 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       B.CreateCondBr(IdxValid, CallBB, FallbackBB);
 
       B.SetInsertPoint(CallBB);
+      // The common object owns this execution BEFORE any ordinary lookup.
+      // No generic read token or per-cell PGO session exists on this edge.
+      if (EnableEJitSmallTableHooks) {
+        auto *PlainBB = BasicBlock::Create(Ctx, "jit_plain_resolve", &Fn);
+        auto *CommonBB = BasicBlock::Create(Ctx, "jit_common_call", &Fn);
+        SmallVector<Value *, 4> Types, Instances;
+        for (unsigned I = 0; I < DimCount; ++I) {
+          Types.push_back(emitDimTypeVal(B, I));
+          Instances.push_back(emitInstanceVal(B, Fn, I));
+        }
+        Value *Entry = emitStabEnter(B, Fn, Stab, FallbackBB, CommonBB,
+                                    PlainBB, FuncIdx, DimCount, Types, Instances);
+        IRBuilder<> Common(CommonBB);
+        SmallVector<Value *, 8> CommonArgs;
+        for (unsigned I = 0; I < F->arg_size(); ++I)
+          CommonArgs.push_back(Fn.getArg(I));
+        Value *Ret = Common.CreateCall(F->getFunctionType(), Entry, CommonArgs);
+        emitStabLeave(Common, Stab);
+        if (F->getReturnType()->isVoidTy())
+          Common.CreateRetVoid();
+        else
+          Common.CreateRet(Ret);
+        B.SetInsertPoint(PlainBB);
+        auto *ResolveBB = BasicBlock::Create(Ctx, "jit_plain_current", &Fn);
+        Value *Current = B.CreateCall(
+            M.getFunction(FN_STAB_NO_POLICY_CURRENT),
+            {B.CreateLoad(I64Ty, Stab.Epoch)});
+        B.CreateCondBr(Current, ResolveBB, FallbackBB);
+        B.SetInsertPoint(ResolveBB);
+      }
       Value *TBeforeLookup = nullptr, *TAfterLookup = nullptr;
       if (EJitWrapperTiming)
         TBeforeLookup = B.CreateCall(TraceNow, {}, "ejit_t_before_lookup");
@@ -1192,6 +1255,19 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                      DispatchBB, FallbackBB);
 
       B.SetInsertPoint(DispatchBB);
+      if (EnableEJitSmallTableHooks) {
+        auto *CurrentBB = BasicBlock::Create(Ctx, "jit_plain_dispatch", &Fn);
+        auto *ChangedBB = BasicBlock::Create(Ctx, "jit_policy_changed", &Fn);
+        Value *Current = B.CreateCall(
+            M.getFunction(FN_STAB_NO_POLICY_CURRENT),
+            {B.CreateLoad(I64Ty, Stab.Epoch)});
+        B.CreateCondBr(Current, CurrentBB, ChangedBB);
+        IRBuilder<> Changed(ChangedBB);
+        Changed.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ),
+                           {Changed.CreateLoad(I32Ty, OutBucketAlloca)});
+        Changed.CreateBr(FallbackBB);
+        B.SetInsertPoint(CurrentBB);
+      }
       SmallVector<Value *, 8> Args;
       for (unsigned I = 0; I < F->arg_size(); ++I)
         Args.push_back(Fn.getArg(I));
@@ -1199,56 +1275,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       if (EJitFunctionBodyTiming)
         BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
 
-      // PR231: the resolved specialization runs only inside an execution the
-      // runtime admitted. The gate sits AFTER a successful compile_or_get and
-      // immediately BEFORE the actual call, so the host's protected read covers
-      // the call itself (not just the lookup), and every exit below settles it:
-      //   admitted -> jit_stab_call, callable = the published slot's entry, the
-      //               taskpool read is released after the call (releaseAndTrace)
-      //   refused  -> jit_stab_refuse: RELEASE the taskpool read token this
-      //               successful compile_or_get handed us, then FallbackBB (the
-      //               AOT body). A refusal is only reachable after a success, so
-      //               jumping straight to the AOT body would leak one read token
-      //               per refused call and no drain/freeze could ever complete.
-      //   no policy-> jit_stab_call, callable = the taskpool's own pointer
-      // With the flag off nothing here is emitted and this is the previous
-      // dispatch byte for byte.
+      // No-policy dispatch uses only its ordinary bucket lease. The common
+      // ticketed edge has already returned above; there is no late redirection.
       Value *Callee = OutFn;
-      BasicBlock *CallSiteBB = DispatchBB;
-      if (EnableEJitSmallTableHooks) {
-        // The taskpool's own resolved pointer is the default callable: it is
-        // what a call with no small-table policy (and the AOT-equivalent case)
-        // must keep using. An admitted execution overwrites the slot with the
-        // published logical slot's entry.
-        B.CreateStore(OutFn, Stab.Entry);
-        SmallVector<Value *, 4> DimTypes, DimInstances;
-        for (unsigned I = 0; I < DimCount; ++I) {
-          DimTypes.push_back(emitDimTypeVal(B, I));
-          DimInstances.push_back(emitInstanceVal(B, Fn, I));
-        }
-        CallSiteBB = BasicBlock::Create(Ctx, "jit_stab_call", &Fn);
-        auto *AdmittedBB = BasicBlock::Create(Ctx, "jit_stab_go", &Fn);
-        auto *RefuseBB = BasicBlock::Create(Ctx, "jit_stab_refuse", &Fn);
-        Value *Entered =
-            emitStabEnter(B, Fn, Stab, RefuseBB, AdmittedBB, CallSiteBB,
-                          FuncIdx, DimCount, DimTypes, DimInstances);
-        IRBuilder<> AdmittedBuilder(AdmittedBB);
-        AdmittedBuilder.CreateStore(Entered, Stab.Entry);
-        AdmittedBuilder.CreateBr(CallSiteBB);
-        // Settle the read token on the refusal edge. This is the same release
-        // the specialized path performs (through releaseAndTrace) and the same
-        // one a cache-hit miss performs; the JIT timing record is deliberately
-        // NOT emitted here, because the JIT body does not run. The AOT body
-        // keeps its own instrumentation, so the chosen path stays honestly
-        // accounted as AOT.
-        IRBuilder<> RefuseBuilder(RefuseBB);
-        RefuseBuilder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ),
-                                 {RefuseBuilder.CreateLoad(I32Ty,
-                                                           OutBucketAlloca)});
-        RefuseBuilder.CreateBr(FallbackBB);
-        B.SetInsertPoint(CallSiteBB);
-        Callee = B.CreateLoad(PtrTy, Stab.Entry, "ejit_callee");
-      }
       auto releaseAndTrace = [&]() {
         Value *BodyEnd = nullptr;
         if (EJitFunctionBodyTiming)
@@ -1305,6 +1334,20 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     };
 
     if (EmitIcacheProbe) {
+      // A refused owned call must not re-enter the resolver via MissFn: a
+      // policy change there must not turn an already refused call into a miss.
+      // Keep an ABI-identical, untouched AOT body only in the opt-in hook form.
+      Function *RefusedAot = nullptr;
+      if (EnableEJitSmallTableHooks) {
+        ValueToValueMapTy Map;
+        RefusedAot = CloneFunction(F, Map);
+        RefusedAot->setName(F->getName() + "_smalltable_aot");
+        RefusedAot->setLinkage(GlobalValue::InternalLinkage);
+        SmallVector<std::pair<unsigned, MDNode *>, 4> Metadata;
+        RefusedAot->getAllMetadata(Metadata);
+        for (const auto &MD : Metadata)
+          RefusedAot->setMetadata(MD.first, nullptr);
+      }
       //=== LEVER B: frame-less wrapper (F) + noinline MissFn (slow path) =====
       // The hit path (F) is just the probe + two tail calls (br spec on hit, br
       // MissFn on miss) -- no allocas, no calls, no frame. MissFn holds the
@@ -1392,6 +1435,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // single-block form cannot survive the flag (see Sentinelize below).
       StabSlots Stab = createStabSlots(B);
       Value *WrapperBegin = nullptr;
+      BasicBlock *StabAotBB = nullptr;
       if (EJitFunctionBodyTiming)
         WrapperBegin = B.CreateCall(TraceNow, {}, "ejit_wrapper_begin");
       Value *TBeforeIcache = nullptr, *FuncIdxForTiming = nullptr;
@@ -1431,6 +1475,37 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       if (!Sentinelize) {
         JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
         JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
+      }
+      if (EnableEJitSmallTableHooks) {
+        auto *ProbeBB = BasicBlock::Create(Ctx, "jit_plain_probe", F);
+        auto *CommonBB = BasicBlock::Create(Ctx, "jit_common_hit_call", F);
+        auto *RefuseBB = BasicBlock::Create(Ctx, "jit_common_aot", F);
+        StabAotBB = RefuseBB;
+        SmallVector<Value *, 4> Types, Instances;
+        for (unsigned I = 0; I < DimCount; ++I) {
+          Types.push_back(emitDimTypeVal(B, I));
+          Instances.push_back(emitInstanceVal(B, *F, I));
+        }
+        Value *Entry = emitStabEnter(B, *F, Stab, RefuseBB, CommonBB,
+                                    ProbeBB, FuncIdxForStab, DimCount,
+                                    Types, Instances);
+        SmallVector<Value *, 8> Args;
+        for (auto &Arg : F->args())
+          Args.push_back(&Arg);
+        IRBuilder<> Common(CommonBB);
+        Value *Ret = Common.CreateCall(F->getFunctionType(), Entry, Args);
+        emitStabLeave(Common, Stab);
+        if (F->getReturnType()->isVoidTy())
+          Common.CreateRetVoid();
+        else
+          Common.CreateRet(Ret);
+        IRBuilder<> Refuse(RefuseBB);
+        Value *AotRet = Refuse.CreateCall(RefusedAot, Args);
+        if (F->getReturnType()->isVoidTy())
+          Refuse.CreateRetVoid();
+        else
+          Refuse.CreateRet(AotRet);
+        B.SetInsertPoint(ProbeBB);
       }
       Value *SlotPtr = IcacheSlot;
       if (NumDims > 0) {
@@ -1504,31 +1579,16 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         if (EJitFunctionBodyTiming)
           BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
 
-        // PR231: the cached cell is re-validated before it is called. The cell
-        // was filled through the gated dispatch, but a drain, a retired
-        // generation or a configuration change can have made it stale; the gate
-        // refuses those, and a refusal takes the AOT path through the miss
-        // function (whose own dispatch is gated too). One callee slot, one call
-        // site, one leave: no path out of here finishes with an open lease.
+        // Only no-policy reaches the ordinary cache. Do not redirect a cached
+        // ordinary T1 into common code after its PGO session has started.
         Value *HitCallee = ICSlotLoad;
-        BasicBlock *HitCallBB = JitIcacheDispatch;
         if (EnableEJitSmallTableHooks) {
-          B.CreateStore(ICSlotLoad, Stab.Entry);
-          SmallVector<Value *, 4> DimTypes, DimInstances;
-          for (unsigned I = 0; I < DimCount; ++I) {
-            DimTypes.push_back(emitDimTypeVal(B, I));
-            DimInstances.push_back(emitInstanceVal(B, *F, I));
-          }
-          HitCallBB = BasicBlock::Create(Ctx, "jit_stab_hit_call", F);
-          auto *HitAdmittedBB = BasicBlock::Create(Ctx, "jit_stab_hit_go", F);
-          Value *Entered =
-              emitStabEnter(B, *F, Stab, JitMiss, HitAdmittedBB, HitCallBB,
-                            FuncIdxForStab, DimCount, DimTypes, DimInstances);
-          IRBuilder<> HitAdmittedBuilder(HitAdmittedBB);
-          HitAdmittedBuilder.CreateStore(Entered, Stab.Entry);
-          HitAdmittedBuilder.CreateBr(HitCallBB);
-          B.SetInsertPoint(HitCallBB);
-          HitCallee = B.CreateLoad(PtrTy, Stab.Entry, "ejit_hit_callee");
+          auto *CurrentBB = BasicBlock::Create(Ctx, "jit_plain_hit_call", F);
+          Value *Current = B.CreateCall(
+              M.getFunction(FN_STAB_NO_POLICY_CURRENT),
+              {B.CreateLoad(I64Ty, Stab.Epoch)});
+          B.CreateCondBr(Current, CurrentBB, StabAotBB);
+          B.SetInsertPoint(CurrentBB);
         }
         auto emitHitTiming = [&]() {
           Value *BodyEnd = nullptr;

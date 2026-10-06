@@ -15,10 +15,12 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h" // PR231 dispatch gate
+#include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitDimPair layout
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
+#include "EJitWrapperRuntimeTestAccess.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
@@ -30,6 +32,7 @@
 #endif
 #ifndef EJIT_FREESTANDING
 #include <chrono>
+#include <thread>
 #endif
 // ejit_print_version() falls back to std::printf when not routing through the
 // SRE platform sink. Mirrors the EJIT_DIAG <cstdio> include (non-SRE path).
@@ -37,6 +40,7 @@
 #include <cstdio>
 #endif
 #include <cstddef>
+#include <memory>
 #include <type_traits>
 
 using namespace llvm;
@@ -146,6 +150,279 @@ static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
 #endif // EJIT_SRE_SHARED_TASKPOOL
 
 static EJit *gEJIT = nullptr;
+static uint64_t gRuntimeOwnerIdentity = 0;
+static EJitAtomicU32 gRuntimeOperationPins{0};
+static EJit *gDeferredRuntimeShutdown = nullptr;
+
+namespace {
+#ifndef EJIT_FREESTANDING
+thread_local EJitSmallTableHost *gInsideSmallTableOwnerRequest = nullptr;
+#else
+// One real owner worker only; task identity is checked before consulting this.
+static EJitSmallTableHost *gInsideSmallTableOwnerRequest = nullptr;
+#endif
+struct RuntimeOperationPin {
+  explicit RuntimeOperationPin(EJit *Runtime) : runtime(Runtime) {
+    if (runtime)
+      gRuntimeOperationPins.fetchAdd(1);
+  }
+  ~RuntimeOperationPin() {
+    if (runtime && gRuntimeOperationPins.fetchSub(1) == 1 &&
+        gDeferredRuntimeShutdown) {
+      EJit *Retired = gDeferredRuntimeShutdown;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+      if (auto *Pool = Retired->sharedTaskPool())
+        if (Pool->isCurrentOwnerWorker())
+          return; // never join/delete this worker from inside its own job
+#endif
+      gDeferredRuntimeShutdown = nullptr;
+      delete Retired;
+    }
+  }
+  EJit *runtime;
+};
+} // namespace
+
+uint64_t llvm::ejit::currentEJitRuntimeOwnerIdentity() {
+  return gEJIT ? gRuntimeOwnerIdentity : 0;
+}
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+namespace {
+// Separate additive shared control object: do not silently change the published
+// taskpool blob ABI. The product linker must place this in the same coherent
+// inter-core domain as that blob. Pending is an owned refusal, never no-policy.
+constexpr uint32_t kFunctionClosed = 1u << 31;
+constexpr uint32_t kFunctionPending = 1u << 30;
+constexpr uint32_t kFunctionReaders = kFunctionPending - 1;
+// The generation is part of the SAME atomic as the resolver count. A late
+// resolver from an earlier owner can never decrement a newly reset row.
+EJIT_SHARED_SECTION static EJitAtomicU64
+    gSmallTableFunctionControl[kEJitMaxFuncIndex];
+EJIT_SHARED_SECTION static EJitAtomicU32 gSmallTableControlGeneration;
+
+bool ordinaryFunctionAllowed(void *Ctx, uint32_t Func) {
+  auto *State = static_cast<EJitSharedTaskPoolState *>(Ctx);
+  if (!State || Func >= kEJitMaxFuncIndex)
+    return false;
+  const uint32_t Generation = State->generation.loadAcquire();
+  const uint64_t Tagged = gSmallTableFunctionControl[Func].loadAcquire();
+  return gSmallTableControlGeneration.loadAcquire() == Generation &&
+         (Tagged >> 32) == Generation && !(Tagged & kFunctionClosed);
+}
+
+bool storeFunctionControl(uint32_t Func, uint32_t Generation, uint32_t Word) {
+  uint64_t Tagged = gSmallTableFunctionControl[Func].loadAcquire();
+  while ((Tagged >> 32) == Generation) {
+    if (gSmallTableFunctionControl[Func].compareExchange(
+            Tagged, (uint64_t{Generation} << 32) | Word))
+      return true;
+  }
+  return false;
+}
+
+struct OrdinaryResolvePin {
+  RuntimeOperationPin RuntimePin;
+  uint32_t Func;
+  uint32_t Generation = 0;
+  bool admitted = false;
+  explicit OrdinaryResolvePin(uint32_t F) : RuntimePin(gEJIT), Func(F) {
+    auto *Pool = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
+    auto *State = Pool ? Pool->state() : nullptr;
+    if (!ordinaryFunctionAllowed(State, Func))
+      return;
+    Generation = State->generation.loadAcquire();
+    uint64_t Word = gSmallTableFunctionControl[Func].loadAcquire();
+    for (unsigned Try = 0; Try != 256; ++Try) {
+      if ((Word >> 32) != Generation ||
+          gSmallTableControlGeneration.loadAcquire() != Generation ||
+          (Word & kFunctionClosed) || (Word & kFunctionReaders) == kFunctionReaders)
+        return;
+      if (gSmallTableFunctionControl[Func].compareExchange(Word, Word + 1)) {
+        admitted = true;
+        return;
+      }
+    }
+  }
+  ~OrdinaryResolvePin() {
+    if (!admitted)
+      return;
+    uint64_t Tagged = gSmallTableFunctionControl[Func].loadAcquire();
+    while ((Tagged >> 32) == Generation && (Tagged & kFunctionReaders))
+      if (gSmallTableFunctionControl[Func].compareExchange(Tagged, Tagged - 1))
+        return;
+  }
+};
+} // namespace
+#endif
+
+bool llvm::ejit::onSmallTableOwnerWorker() {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  auto *Pool = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
+  return Pool && Pool->isCurrentOwnerWorker();
+#else
+  return false;
+#endif
+}
+
+bool llvm::ejit::inSmallTableOwnerRequest(EJitSmallTableHost *Host) {
+  return onSmallTableOwnerWorker() && gInsideSmallTableOwnerRequest == Host;
+}
+
+Error llvm::ejit::runSmallTableOwnerRequest(
+    uint32_t Func, EJitSmallTableHost *Host, std::function<Error()> Job,
+    bool InitialHandoff) {
+  auto Fail = [](const char *Why) -> Error {
+    return make_error<StringError>(Why, inconvertibleErrorCode());
+  };
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJit *Runtime = gEJIT;
+  RuntimeOperationPin RuntimePin(Runtime);
+  auto *Pool = Runtime ? Runtime->sharedTaskPool() : nullptr;
+  auto *State = Pool ? Pool->state() : nullptr;
+  if (!State || Func >= kEJitMaxFuncIndex ||
+      Func >= EJitFuncRegistry::instance().count() || !Host ||
+      EJitSmallTableHost::global() != Host ||
+      !Host->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) ||
+      State->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+      gSmallTableControlGeneration.loadAcquire() != State->generation.loadAcquire())
+    return Fail("small-table worker request has no live owner");
+  const uint32_t Generation = State->generation.loadAcquire();
+  if (State->mode.loadAcquire() == static_cast<uint32_t>(EJitCompileMode::Off))
+    return Fail("small-table Off mode forbids new common compilation");
+  Host->acquireOwnerControlPin();
+  struct HostControlPin {
+    EJitSmallTableHost *Host;
+    ~HostControlPin() { Host->releaseOwnerControlPin(); }
+  } HostPin{Host};
+  uint64_t Previous = gSmallTableFunctionControl[Func].loadAcquire();
+  for (;;) {
+    if ((Previous >> 32) != Generation)
+      return Fail("small-table control generation changed before handoff");
+    if (Previous & kFunctionPending)
+      return Fail("small-table worker request is already pending");
+    if (gSmallTableFunctionControl[Func].compareExchange(
+            Previous, Previous | kFunctionClosed | kFunctionPending))
+      break;
+  }
+  EJitSmallTableHost::notePolicyChange();
+  // Drain resolver windows, NOT calls / bucket readers. A running old T1 may
+  // itself request handoff and must not deadlock waiting for its own return.
+  unsigned Wait = 0;
+  while (gSmallTableFunctionControl[Func].loadAcquire() & kFunctionReaders) {
+    if (State->generation.loadAcquire() != Generation ||
+        gSmallTableControlGeneration.loadAcquire() != Generation)
+      return Fail("small-table owner changed during resolver handoff");
+    if (++Wait == (1u << 20)) {
+      if (gSmallTableControlGeneration.loadAcquire() == Generation &&
+          State->generation.loadAcquire() == Generation) {
+        uint64_t Tagged = gSmallTableFunctionControl[Func].loadAcquire();
+        const uint64_t Clear = (Previous & kFunctionClosed)
+                                   ? kFunctionPending
+                                   : (kFunctionClosed | kFunctionPending);
+        while ((Tagged >> 32) == Generation &&
+               !gSmallTableFunctionControl[Func].compareExchange(
+                   Tagged, Tagged & ~Clear)) {}
+      }
+      return Fail("small-table resolver handoff deadline exceeded");
+    }
+#ifndef EJIT_FREESTANDING
+    std::this_thread::yield();
+#endif
+  }
+  struct Result { std::string ErrorText; bool Ran = false; };
+  auto ResultState = std::make_shared<Result>();
+  auto Control = Runtime->runControlOnOwnerAndWait([=]() {
+    ResultState->Ran = true;
+    if (gEJIT != Runtime || EJitSmallTableHost::global() != Host ||
+        State->generation.loadAcquire() != Generation ||
+        !Pool->isCurrentOwnerWorker()) {
+      ResultState->ErrorText = "small-table worker owner changed before handoff";
+      return;
+    }
+    if (InitialHandoff && !Runtime->abortFunctionPgoOnOwner(Func)) {
+      ResultState->ErrorText = "small-table worker could not abort ordinary PGO";
+      return;
+    }
+    struct ControlScope {
+      EJitSmallTableHost *Previous;
+      ControlScope(EJitSmallTableHost *H)
+          : Previous(gInsideSmallTableOwnerRequest) {
+        gInsideSmallTableOwnerRequest = H;
+      }
+      ~ControlScope() { gInsideSmallTableOwnerRequest = Previous; }
+    } Scope(Host);
+    if (Error E = Job())
+      ResultState->ErrorText = toString(std::move(E));
+  });
+  const bool OwnerCurrent = gEJIT == Runtime &&
+      EJitSmallTableHost::global() == Host &&
+      State->generation.loadAcquire() == Generation;
+  const bool Success = OwnerCurrent && Control.status ==
+                           EJitSharedTaskPool::OwnerControlStatus::Completed &&
+                       ResultState->Ran && ResultState->ErrorText.empty();
+  // A bound policy remains owned on failure: local and peer wrappers must both
+  // refuse to AOT, rather than starting a fresh ordinary PGO session behind it.
+  // An unbound failed request has no policy and may restore ordinary dispatch.
+  EJitSmallTableHost *CurrentHost = EJitSmallTableHost::global();
+  const bool ReplacementOwned = gEJIT == Runtime && CurrentHost &&
+      CurrentHost->isBoundTo(Func) &&
+      CurrentHost->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity());
+  // The per-Host publication gate is distinct from the shared function bit:
+  // a prepared replacement can inherit Closed from the old owner but must not
+  // admit execution before its OWN successful joined worker handoff.
+  if (Success && InitialHandoff)
+    Host->setWrapperAdmissionReady(true);
+  if (gSmallTableControlGeneration.loadAcquire() == Generation &&
+      State->generation.loadAcquire() == Generation)
+    storeFunctionControl(Func, Generation,
+                         ReplacementOwned ? kFunctionClosed : 0);
+  EJitSmallTableHost::notePolicyChange();
+  if (!Success) {
+    if (!ResultState->ErrorText.empty())
+      return make_error<StringError>(ResultState->ErrorText,
+                                    inconvertibleErrorCode());
+    return Fail("small-table owner-worker request was rejected or cancelled before start");
+  }
+  if (Control.deadlineExceeded)
+    EJIT_DIAG("small-table owner request func=%u completed after wait deadline", Func);
+  Host->noteOwnerWorkerOperation();
+  return Error::success();
+#else
+  return Fail("small-table owner-worker service is unavailable");
+#endif
+}
+
+void llvm::ejit::releaseSmallTableOwnership(EJitSmallTableHost *Host) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!Host || !Host->isBoundTo(Host->funcIndex()) ||
+      !Host->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()))
+    return;
+  const uint32_t Func = Host->funcIndex();
+  if (Func < kEJitMaxFuncIndex &&
+      !(gSmallTableFunctionControl[Func].loadAcquire() & kFunctionPending))
+    storeFunctionControl(Func, gSmallTableControlGeneration.loadAcquire(), 0);
+#endif
+}
+
+// Test TU declares this identical internal C++ seam; no public C ABI/config
+// hook and no fake runtime/counter object is involved.
+namespace llvm { namespace ejit {
+EJitSharedTaskPool *EJitWrapperRuntimeTestAccess::pool() {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  return gEJIT ? gEJIT->sharedTaskPool() : nullptr;
+#else
+  return nullptr;
+#endif
+}
+bool EJitWrapperRuntimeTestAccess::counters(
+    uint64_t Key, SmallVectorImpl<EJitWrapperCounterView> &Out) {
+  Out.clear();
+  return gEJIT && gEJIT->compileDriver_ &&
+         driverCounters(*gEJIT->compileDriver_, Key, Out);
+}
+} }
 
 #ifdef EJIT_DIAG_ENABLE
 EJitAtomicU64 gIcacheNullFillSkips;
@@ -361,6 +638,17 @@ static_assert(std::is_standard_layout<ejit_config_t>::value,
 // Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
 // the online-PGO auto-trigger on regardless of the (unversioned) config.
 static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
+  if (gDeferredRuntimeShutdown) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+    auto *Pool = gDeferredRuntimeShutdown->sharedTaskPool();
+    if (gRuntimeOperationPins.loadAcquire() != 0 ||
+        (Pool && Pool->isCurrentOwnerWorker()))
+      return EJIT_ERR_NOT_ACTIVE;
+#endif
+    EJit *Retired = gDeferredRuntimeShutdown;
+    gDeferredRuntimeShutdown = nullptr;
+    delete Retired;
+  }
   if (gEJIT) {
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
@@ -379,7 +667,11 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
   if (forcePgo)
     cfg.enablePgo = true;
 
+  if (gRuntimeOwnerIdentity == UINT64_MAX)
+    return EJIT_ERR_MEMORY; // owner identities never wrap into an old Host
   gEJIT = new (std::nothrow) EJit(cfg);
+  ++gRuntimeOwnerIdentity;
+  EJitSmallTableHost::notePolicyChange();
   if (!gEJIT) {
     EJIT_DIAG("failed: out of memory");
     return EJIT_ERR_MEMORY;
@@ -400,6 +692,17 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
   }
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (auto *Pool = gEJIT->sharedTaskPool()) {
+    auto *State = Pool->state();
+    if (State && State->ownerCoreId.loadAcquire() == EJitCoreId::current() &&
+        gSmallTableControlGeneration.loadAcquire() != State->generation.loadAcquire()) {
+      gSmallTableControlGeneration.storeRelease(0);
+      for (auto &Control : gSmallTableFunctionControl)
+        Control.storeRelease(uint64_t{State->generation.loadAcquire()} << 32);
+      gSmallTableControlGeneration.storeRelease(State->generation.loadAcquire());
+    }
+    Pool->setFunctionOwnershipGateFn(ordinaryFunctionAllowed, State);
+  }
   bindDumpSharedStateFromRuntime();
 #endif
   EJIT_DIAG("initialized: mode=%d opt=%d cache=%zu entries=%u pgo=%d "
@@ -421,12 +724,17 @@ ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
 }
 
 void ejit_shutdown(void) {
+  EJitSmallTableHost::notePolicyChange();
   EJIT_DIAG("shutting down");
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   setDumpSharedState(nullptr);
 #endif
-  delete gEJIT;
+  EJit *Runtime = gEJIT;
   gEJIT = nullptr;
+  if (Runtime && gRuntimeOperationPins.loadAcquire() != 0)
+    gDeferredRuntimeShutdown = Runtime;
+  else
+    delete Runtime;
   EJIT_DIAG("shutdown complete");
 }
 
@@ -953,16 +1261,9 @@ inline bool smallTableAllowsDispatch(uint32_t funcIndex,
     return true;
   if (!Host->isBoundTo(funcIndex))
     return true;
-  SmallVector<uint32_t, 4> Types;
-  SmallVector<uint32_t, 4> Instances;
-  Types.reserve(numDims);
-  Instances.reserve(numDims);
-  for (uint32_t I = 0; I < numDims; ++I) {
-    Types.push_back(dims[I].dimType);
-    Instances.push_back(dims[I].instanceId);
-  }
-  std::string Why;
-  return Host->wouldDispatchCall(Types, Instances, &Why);
+  // An owned execution is admitted ONLY by the ticketed wrapper entry. Public
+  // resolution must not launch a second PGO session for code it won't execute.
+  return false;
 }
 
 static ejit_status_t taskpoolCompileOrGetImpl(
@@ -981,6 +1282,11 @@ static ejit_status_t taskpoolCompileOrGetImpl(
   // the status code.
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  OrdinaryResolvePin ResolvePin(funcIndex);
+  if (!ResolvePin.admitted)
+    return EJIT_ERR_NOT_ACTIVE;
+#endif
   auto *tp = activeTaskPool();
   if (!tp) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: no taskpool", funcIndex);
@@ -1184,6 +1490,9 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     *outBucket = 0;
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+  OrdinaryResolvePin ResolvePin(funcIndex);
+  if (!ResolvePin.admitted)
+    return EJIT_ERR_NOT_ACTIVE;
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
@@ -1227,6 +1536,9 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = 0;
   if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  OrdinaryResolvePin ResolvePin(funcIndex);
+  if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
   auto *tp = activeTaskPool();
   if (!tp)
@@ -1282,6 +1594,9 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = 0;
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+  OrdinaryResolvePin ResolvePin(funcIndex);
+  if (!ResolvePin.admitted)
+    return EJIT_ERR_NOT_ACTIVE;
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
@@ -1335,6 +1650,9 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = 0;
   if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  OrdinaryResolvePin ResolvePin(funcIndex);
+  if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
   auto *tp = activeTaskPool();
   if (!tp)
@@ -1392,6 +1710,9 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = 0;
   if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  OrdinaryResolvePin ResolvePin(funcIndex);
+  if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
   auto *tp = activeTaskPool();
   if (!tp)
@@ -1581,11 +1902,170 @@ void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
   return Entry;
 }
 
-void ejit_stab_leave(uint64_t ticket) {
+bool ejit_stab_wrapper_no_policy_current(uint64_t Epoch) {
+  return Epoch != 0 && Epoch != UINT64_MAX &&
+         Epoch == EJitSmallTableHost::policyEpoch();
+}
+
+void *ejit_stab_wrapper_enter(
+    uint32_t FuncIndex, const ejit_dim_pair_t *Dims, uint32_t NumDims,
+    const ejit_bound_ptr_t *Bounds, uint32_t BoundCount, uint64_t *OutTicket,
+    const char **OutWhy, uint64_t *OutEpoch) {
+  if (OutTicket)
+    *OutTicket = 0;
+  if (OutWhy)
+    *OutWhy = nullptr;
+  const uint64_t Epoch = EJitSmallTableHost::policyEpoch();
+  if (OutEpoch)
+    *OutEpoch = Epoch;
   EJitSmallTableHost *Host = EJitSmallTableHost::global();
-  if (!Host || ticket == 0)
+  auto Refuse = [&](const char *Why) -> void * {
+    if (OutWhy)
+      *OutWhy = Why;
+    return nullptr;
+  };
+  if (Epoch == UINT64_MAX)
+    return Refuse("small-table policy epoch space is exhausted");
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  auto *LivePool = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
+  if (LivePool && FuncIndex < kEJitMaxFuncIndex &&
+      !ordinaryFunctionAllowed(LivePool->state(), FuncIndex)) {
+    if (gSmallTableFunctionControl[FuncIndex].loadAcquire() & kFunctionPending)
+      return Refuse("small-table worker handoff is pending");
+    if (!Host || !Host->isBoundTo(FuncIndex))
+      return Refuse("small-table owned function has no local owner bridge");
+  }
+#endif
+  if (!Host || !Host->isBoundTo(FuncIndex))
+    return nullptr;
+  if (!Host->wrapperAdmissionReady())
+    return Refuse("small-table Host installation has not completed worker handoff");
+  if (!OutTicket || !OutWhy || !OutEpoch || NumDims > 4 ||
+      (NumDims && !Dims) ||
+      !validateBoundPtrDescriptors(
+          reinterpret_cast<const EJitBoundPtrDescriptor *>(Bounds), BoundCount))
+    return Refuse("invalid small-table wrapper descriptors");
+  EJit *Runtime = gEJIT;
+  RuntimeOperationPin RuntimePin(Runtime);
+  if (!Runtime ||
+      !Host->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) ||
+      FuncIndex >= EJitFuncRegistry::instance().count() ||
+      EJitFuncRegistry::instance().lookup(Host->entryName()) != FuncIndex)
+    return Refuse("small-table runtime or function identity is not live");
+  // Covers every virtual fact callback, including epochCurrent before the
+  // preparation resource exists. Teardown parks this owner until we return.
+  Host->acquireOwnerControlPin();
+  struct WrapperOwnerPin {
+    EJitSmallTableHost *Host;
+    ~WrapperOwnerPin() { Host->releaseOwnerControlPin(); }
+  } OwnerPin{Host};
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *Pool = Runtime->sharedTaskPool();
+  EJitSharedTaskPoolState *State = Pool ? Pool->state() : nullptr;
+  if (!State || State->initState.loadAcquire() !=
+                    static_cast<uint32_t>(EJitSharedInitState::Ready))
+    return Refuse("small-table taskpool is not Ready");
+  const uint32_t Generation = State->generation.loadAcquire();
+  const uint32_t Owner = State->ownerCoreId.loadAcquire();
+#ifdef EJIT_FREESTANDING
+  // A private C++ Host/table is NOT made cross-core by publishing its address.
+  // A product owner/borrow/shared-table bridge must replace this restriction.
+  if (EJitCoreId::current() != Owner)
+    return Refuse("small-table cross-core owner bridge is not installed");
+#endif
+  uint32_t Versions[4] = {};
+  for (uint32_t I = 0; I < NumDims; ++I) {
+    if (Dims[I].dimType >= kEJitMaxDimTypes ||
+        Dims[I].instanceId >= kEJitMaxInstances ||
+        !Pool->isInstanceActive(Dims[I].dimType, Dims[I].instanceId))
+      return Refuse("small-table lifecycle instance is disabled or invalid");
+    for (uint32_t J = 0; J < I; ++J)
+      if (Dims[J].dimType == Dims[I].dimType)
+        return Refuse("duplicate small-table lifecycle dimension");
+    Versions[I] =
+        State->version[Dims[I].dimType][Dims[I].instanceId].loadAcquire();
+  }
+  SmallVector<uint32_t, 4> Types, Instances;
+  for (uint32_t I = 0; I < NumDims; ++I) {
+    Types.push_back(Dims[I].dimType);
+    Instances.push_back(Dims[I].instanceId);
+  }
+  uint64_t PreparationPin = 0;
+  struct PinGuard {
+    uint64_t &Pin;
+    ~PinGuard() { ejit_stab_leave(Pin); }
+  } Guard{PreparationPin};
+  std::string PinWhy;
+  if (!Host->pinForExecutionPreparation(Types, Instances, PreparationPin,
+                                        PinWhy))
+    return Refuse("small-table execution preparation admission refused");
+  void *ExpectedEntry = Host->activeEntry();
+  if (!ExpectedEntry)
+    return Refuse("small-table common code is not ready");
+#ifdef EJIT_SRE_CODE_POOL
+  EJitCompiledCodeInfo Info;
+  if (!Host->runtime().engine().isCodeReady(ExpectedEntry) ||
+      !Host->runtime().engine().findCodeRange(ExpectedEntry, Info) ||
+      !Pool->prepareExternalExecution(ExpectedEntry, Info))
+    return Refuse("small-table common-object execution preparation refused");
+#endif
+  if (gEJIT != Runtime || EJitSmallTableHost::global() != Host ||
+      !Host->wrapperAdmissionReady() ||
+      EJitSmallTableHost::policyEpoch() != Epoch ||
+      State->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+      State->generation.loadAcquire() != Generation ||
+      State->ownerCoreId.loadAcquire() != Owner ||
+      Host->activeEntry() != ExpectedEntry)
+    return Refuse("small-table owner or generation changed during preparation");
+  for (uint32_t I = 0; I < NumDims; ++I)
+    if (!Pool->isInstanceActive(Dims[I].dimType, Dims[I].instanceId) ||
+        State->version[Dims[I].dimType][Dims[I].instanceId].loadAcquire() !=
+            Versions[I])
+      return Refuse("small-table lifecycle changed during preparation");
+  // Admission itself calls product facts. Revalidate AFTER those callbacks as
+  // well; never return another generation's unprepared entry, or a ticket whose
+  // owner was replaced after the earlier permission check.
+  uint64_t Serial = 0;
+  std::string EnterWhy;
+  void *Entry = Host->enter(Types, Instances, &Serial, &EnterWhy);
+  bool StillCurrent = Entry == ExpectedEntry && Serial != 0 &&
+      gEJIT == Runtime && EJitSmallTableHost::global() == Host &&
+      Host->wrapperAdmissionReady() &&
+      EJitSmallTableHost::policyEpoch() == Epoch &&
+      State->initState.loadAcquire() ==
+          static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+      State->generation.loadAcquire() == Generation &&
+      State->ownerCoreId.loadAcquire() == Owner;
+  for (uint32_t I = 0; I < NumDims && StillCurrent; ++I)
+    StillCurrent = Pool->isInstanceActive(Dims[I].dimType, Dims[I].instanceId) &&
+        State->version[Dims[I].dimType][Dims[I].instanceId].loadAcquire() == Versions[I];
+  if (!StillCurrent) {
+    ejit_stab_leave(Serial);
+    return Refuse("small-table admission refused or owner changed at admission");
+  }
+  *OutTicket = Serial;
+  return Entry;
+#else
+  return Refuse("small-table wrapper taskpool bridge is unavailable");
+#endif
+}
+
+void ejit_stab_leave(uint64_t ticket) {
+  if (ticket == 0)
     return;
-  Host->leave(ticket);
+  EJitSmallTableHost *Host = EJitSmallTableHost::global();
+  if (Host && Host->ownsExecutionTicket(ticket)) {
+    Host->leave(ticket);
+    return;
+  }
+  // Either the feature was disabled (or the host replaced) while this execution
+  // was still running, or the token belongs to an owner that a replacement
+  // displaced. The owner that handed out the ticket is retained for exactly this
+  // completion, so the physical lease and the table generation it reads are
+  // released now instead of leaking or being freed under a running call. A
+  // globally installed host that does not own the token is untouched.
+  EJitSmallTableHost::leaveRetainedExecution(ticket);
 }
 
 void ejit_stab_dispatch(uint32_t funcIndex, const uint32_t *coordinate,
