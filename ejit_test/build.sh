@@ -163,11 +163,14 @@ else
   _set_min_libs "${ARCH}"
   OTHER_LIBS=$(echo "${MIN_LIBS}" | sed '/^$/d' | tr '\n' ' ')
 fi
-# EJitLibcallStubs references the stack-protector ABI symbol __stack_chk_guard
-# by address; host glibc on x86_64 (TLS canary) no longer exports it as data.
-# Define it at 0 for the static link - the test binaries themselves compile
-# without stack protector, so nothing ever loads the value.
-LINK_LIBS="-lz -lpthread -ldl -Wl,--defsym,__stack_chk_guard=0"
+# EJitLibcallStubs references __stack_chk_guard by address; x86_64 glibc keeps
+# the canary in TLS and does not export it, so define it at 0 there. Not on
+# AArch64: ld.so exports it and libc reads it, so a 0 definition preempting it
+# faults every binary before main.
+LINK_LIBS="-lz -lpthread -ldl"
+if [[ "${ARCH}" == "x86" ]]; then
+  LINK_LIBS="${LINK_LIBS} -Wl,--defsym,__stack_chk_guard=0"
+fi
 STRIP_FLAG="-Wl,--strip-all"
 if ${NO_STRIP}; then STRIP_FLAG=""; fi
 
@@ -212,6 +215,14 @@ ALL_TESTS=(
   ejit_sentinel_smoke_test
 )
 
+# Switch-case test: without EJIT_SWITCH_CASE, clang ignores ejit_runtime_dim.
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && \
+   grep -q "^EJIT_SWITCH_CASE:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+  ALL_TESTS+=(ejit_switch_case_test ejit_switch_case_pgo_test)
+  echo "Switch-case:    EJIT_SWITCH_CASE=ON (ejit_switch_case_test," \
+       "ejit_switch_case_pgo_test enabled)"
+fi
+
 # Per-test compile flags (e.g. for disabling global constructors)
 declare -A COMPILE_FLAGS
 COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false"
@@ -222,6 +233,9 @@ COMPILE_FLAGS[ejit_fixed_dim_test]=""
 # Sentinel-wrapper smoke: icache ON so the wrapper takes the branchless
 # (NumDims <= 2, cell table defined pre-filled with &MissFn) form.
 COMPILE_FLAGS[ejit_sentinel_smoke_test]="-mllvm -ejit-inline-cache"
+# The switch-case design assumes the inline cache is on (EJIT_SWITCH_CASE.md §1.3).
+COMPILE_FLAGS[ejit_switch_case_test]="-mllvm -ejit-inline-cache"
+COMPILE_FLAGS[ejit_switch_case_pgo_test]="-mllvm -ejit-inline-cache"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.

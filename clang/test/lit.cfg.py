@@ -195,6 +195,10 @@ if have_host_jit_feature_support('jit'):
     if have_host_out_of_process_jit_feature_support():
         config.available_features.add("host-supports-out-of-process-jit")
 
+# EmbeddedJIT: Sema keeps ejit_runtime_dim only when built with EJIT_SWITCH_CASE.
+if config.ejit_switch_case:
+    config.available_features.add("ejit-switch-case")
+
 if config.clang_staticanalyzer:
     config.available_features.add("staticanalyzer")
     tools.append("clang-check")

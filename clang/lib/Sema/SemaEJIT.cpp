@@ -25,6 +25,7 @@
 using llvm::ejit::MAX_BOUND_PTR_PARAMS;
 using llvm::ejit::MAX_PERIOD_ARR_IND_PARAMS;
 using llvm::ejit::MAX_PERIOD_ARR_SIZE;
+using llvm::ejit::MAX_RUNTIME_DIM_ARMS;
 
 using namespace clang;
 
@@ -251,6 +252,45 @@ void handleEjitFreeDimAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   PVD->addAttr(::new (S.Context) EjitFreeDimAttr(S.Context, AL));
 }
 
+/// handleEjitRuntimeDimAttr - Process the ejit_runtime_dim attribute: an
+/// integer parameter of at most 32 bits (the JIT's projection descriptor holds
+/// 32), with an optional arm limit in [1, MAX_RUNTIME_DIM_ARMS]. Dropped with a
+/// warning without EJIT_SWITCH_CASE. The other checks run post-merge in
+/// checkEjitRuntimeDim.
+void handleEjitRuntimeDimAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  auto *PVD = dyn_cast<ParmVarDecl>(D);
+  if (!PVD) {
+    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
+        << AL << AL.isRegularKeywordAttribute() << "function parameters";
+    return;
+  }
+
+  QualType PT = PVD->getType();
+  if (!PT->isIntegerType() || S.Context.getTypeSize(PT) > 32) {
+    S.Diag(AL.getLoc(), diag::err_ejit_runtime_dim_invalid_type) << PVD;
+    return;
+  }
+
+  uint32_t MaxArms = 0;
+  if (AL.getNumArgs() == 1) {
+    if (!S.checkUInt32Argument(AL, AL.getArgAsExpr(0), MaxArms))
+      return;
+    if (MaxArms < 1 || MaxArms > MAX_RUNTIME_DIM_ARMS) {
+      S.Diag(AL.getArgAsExpr(0)->getExprLoc(),
+             diag::err_ejit_runtime_dim_max_arms)
+          << MAX_RUNTIME_DIM_ARMS;
+      return;
+    }
+  }
+
+#ifndef EJIT_SWITCH_CASE
+  S.Diag(AL.getLoc(), diag::warn_ejit_runtime_dim_ignored);
+  return;
+#else
+  PVD->addAttr(::new (S.Context) EjitRuntimeDimAttr(S.Context, AL, MaxArms));
+#endif
+}
+
 void handleEjitBoundPtrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *PVD = dyn_cast<ParmVarDecl>(D);
   if (!PVD) {
@@ -407,6 +447,38 @@ void checkEjitFreeDim(Sema &S, const FunctionDecl *FD) {
       }))
     S.Diag(FirstFree->getLocation(), diag::warn_ejit_free_dim_no_dimension)
         << FD << FirstFreeParm;
+}
+
+/// checkEjitRuntimeDim - Post-merge validation, like checkEjitFreeDim: no
+/// ejit_period_arr_ind or ejit_free_dim on the same parameter (ejit_bound_ptr
+/// is excluded by type), at most one per function, and only on an ejit_entry.
+void checkEjitRuntimeDim(Sema &S, const FunctionDecl *FD) {
+  if (!FD)
+    return;
+
+  const EjitRuntimeDimAttr *First = nullptr;
+  const ParmVarDecl *FirstParm = nullptr;
+  for (const ParmVarDecl *P : FD->parameters()) {
+    const auto *RD = P->getAttr<EjitRuntimeDimAttr>();
+    if (!RD)
+      continue;
+    if (P->hasAttr<EjitPeriodArrIndAttr>())
+      S.Diag(RD->getLocation(), diag::err_ejit_runtime_dim_kind_conflict)
+          << P << "ejit_period_arr_ind";
+    if (P->hasAttr<EjitFreeDimAttr>())
+      S.Diag(RD->getLocation(), diag::err_ejit_runtime_dim_kind_conflict)
+          << P << "ejit_free_dim";
+    if (!First) {
+      First = RD;
+      FirstParm = P;
+    } else {
+      S.Diag(RD->getLocation(), diag::err_ejit_runtime_dim_too_many) << FD;
+    }
+  }
+
+  if (First && !FD->hasAttr<EjitEntryAttr>())
+    S.Diag(First->getLocation(), diag::err_ejit_runtime_dim_not_entry)
+        << FirstParm << FD;
 }
 
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {

@@ -162,6 +162,11 @@ if(EJIT_SRE_PGO_BRANCH_AUDIT)
   list(APPEND EJIT_SOURCES EJitBranchProfile.cpp)
 endif()
 
+# Switch-case mode (option declared in llvm/CMakeLists.txt).
+if(EJIT_SWITCH_CASE)
+  list(APPEND EJIT_SOURCES EJitSwitchCase.cpp)
+endif()
+
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
 if(NOT EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES
@@ -202,6 +207,18 @@ if(EJIT_SRE_TASKPOOL_NO_RECLAIM)
     EJIT_SRE_TASKPOOL_NO_RECLAIM)
   message(STATUS
     "EmbeddedJIT: NO_RECLAIM shared-cache hot path enabled (JIT code must never be physically reclaimed)")
+endif()
+
+# Switch-case mode, scoped to LLVMEJIT.
+if(EJIT_SWITCH_CASE)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_SWITCH_CASE
+    EJIT_SWITCH_CASE_MAX_ARMS=${EJIT_SWITCH_CASE_MAX_ARMS}
+    EJIT_SWITCH_CASE_MAX_REGION=${EJIT_SWITCH_CASE_MAX_REGION}
+    EJIT_SWITCH_CASE_MAX_CLONED=${EJIT_SWITCH_CASE_MAX_CLONED})
+  message(STATUS
+    "EmbeddedJIT: switch-case mode enabled (arms=${EJIT_SWITCH_CASE_MAX_ARMS}, "
+    "region=${EJIT_SWITCH_CASE_MAX_REGION}, cloned=${EJIT_SWITCH_CASE_MAX_CLONED})")
 endif()
 
 # Propagate the target triple setting to the C++ code
