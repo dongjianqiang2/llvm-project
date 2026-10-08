@@ -112,6 +112,7 @@ set(EJIT_SOURCES
   EJitSmallTable.cpp
   EJitSmallTableRuntime.cpp
   EJitSmallTableHost.cpp
+  EJitSmallTableSreBridge.cpp
   EJitOptimizer.cpp
   EJitPassBuilder.cpp
   EJitProfileMerge.cpp

@@ -138,6 +138,11 @@ public:
   /// may not exist yet: a peer elected owner after a re-election builds its
   /// engine long after registration is over and must still see every symbol.
   void registerSymbol(const std::string &name, void *addr);
+  /// Owner-side replay into another real engine of THIS runtime (common table
+  /// generation). Registration is frozen before worker controls consume it.
+  const std::vector<std::pair<std::string, void *>> &getRegisteredSymbols() const {
+    return userSymbols_;
+  }
 
 private:
   friend struct EJitWrapperRuntimeTestAccess;

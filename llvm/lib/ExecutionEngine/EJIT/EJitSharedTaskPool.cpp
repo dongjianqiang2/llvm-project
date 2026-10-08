@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "EJitSmallTableSreBridgeInternal.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
@@ -4547,6 +4548,7 @@ void EJitSharedTaskPool::runWorkerLoop() {
   CurrentOwnerWorker = this;
 #endif
   workerLoopActive_.store(true, std::memory_order_release);
+  smallTableSreWorkerEnter(*this);
   EJIT_DIAG_VERBOSE("shared worker loop enter");
   // Loop until a terminal state. The worker is a PRODUCTION-lifetime task: it
   // never exits just because the owner is slightly slow to publish Ready (no
@@ -4557,15 +4559,22 @@ void EJitSharedTaskPool::runWorkerLoop() {
   // hook runs OUTSIDE any bucket lock / queue slot / dedup critical state
   // (pollOne returns before we idle).
   for (;;) {
+    // Physical PREP/COMMIT/LEAVE and snapshots are control traffic, not
+    // compiler jobs. Service one, then still give the normal queue one poll:
+    // bounded fairness without applying compile throttle to every business RPC.
+    const bool BridgeServiced = serviceSmallTableSreBridge(*this);
     EJitWorkerStep s = workerPollOnce();
     if (s == EJitWorkerStep::Exit)
       break;
+    if (s == EJitWorkerStep::Idle && BridgeServiced)
+      continue;
     if (s == EJitWorkerStep::WaitForReady || s == EJitWorkerStep::Idle) {
       workerIdle(1); // single yield while waiting / empty queue
     } else
       workerThrottle();
   }
   EJIT_DIAG_VERBOSE("shared worker loop leave");
+  smallTableSreWorkerExit(*this);
   workerLoopActive_.store(false, std::memory_order_release);
   cancelQueuedOwnerControl();
 #ifndef EJIT_FREESTANDING

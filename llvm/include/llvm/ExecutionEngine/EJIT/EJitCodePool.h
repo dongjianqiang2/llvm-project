@@ -150,6 +150,13 @@ public:
     /// allocation.
     uintptr_t fixedBase = 0;
     size_t fixedSize = 0;
+    /// Optional allocator over this EXACT fixed region, shared by independent
+    /// managers. It returns one poolSize-byte, poolAlign-aligned, exclusive
+    /// window inside the region, or null on exhaustion. Claimed windows are
+    /// never recycled, even after a split/link failure or manager destruction.
+    /// Empty keeps the historical manager-local fixed bump cursor. This is
+    /// NOT a dynamic fallback: returned addresses are checked before use.
+    RawAllocFn sharedFixedAlloc;
     /// When true, the fixed region starts read-only (code segment, RX) and each
     /// slab is enable_rw'd before writing. Ignored unless fixedSize > 0.
     /// Default false (data-region placement, RW).

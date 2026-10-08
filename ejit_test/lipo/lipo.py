@@ -35,7 +35,7 @@ The stub is intentionally NOT merged into ejit.o here so host builds keep
 using the platform libc.
 """
 
-import subprocess as sp, os, sys, re, argparse, struct, glob, shutil
+import subprocess as sp, os, sys, re, argparse, struct, glob, shutil, tempfile
 
 
 # ── per-architecture configuration ──────────────────────────────────────────
@@ -69,6 +69,71 @@ COMMON_LIBS = [
     "libLLVMOrcTargetProcess.a", "libLLVMRuntimeDyld.a", "libLLVMBitWriter.a",
     "libLLVMGlobalISel.a",
 ]
+
+# These hooks are referenced by AOT wrappers and the small-table SRE demo only
+# after the runtime archive has already been partially linked. Preserve them
+# when present, without manufacturing undefined symbols in configurations that
+# do not provide the feature.
+SMALL_TABLE_API_ROOTS = (
+    "ejit_stab_enter",
+    "ejit_stab_wrapper_enter",
+    "ejit_stab_wrapper_no_policy_current",
+    "ejit_stab_leave",
+    "ejit_stab_dispatch",
+    "ejit_small_table_host_installed",
+    "ejit_small_table_published_slots",
+)
+
+# SRE-facing C adapters used to bind core-local state and bridge the runtime
+# hooks above. These are also optional at the generic lipo stage because older
+# runtime archives may not contain the SRE bridge yet.
+SMALL_TABLE_SRE_ROOTS = (
+    "ejit_small_table_sre_prepare",
+    "ejit_small_table_sre_request",
+    "ejit_small_table_sre_get_snapshot",
+    "ejit_small_table_sre_finish",
+    "ejit_small_table_sre_cancel",
+    "ejit_small_table_sre_print",
+)
+
+# Demo/board entry points are application adapters, not runtime ABI. They are
+# rooted only when an adapter object is actually present in the input archive.
+SMALL_TABLE_DEMO_ROOTS = (
+    "test_ejit_period",
+    "test_ejit_smalltable_print",
+)
+
+# These public roots are also used by the post-merge verifier. Keep the root
+# inventory centralized so the two partial-link stages cannot silently drift.
+EJIT_API_ROOTS = (
+    "ejit_init", "ejit_init_pgo", "ejit_shutdown", "ejit_activate",
+    "ejit_deactivate", "ejit_activate_all", "ejit_deactivate_all",
+    "ejit_is_active", "ejit_get_stats", "ejit_register_symbol",
+    "ejit_register_bitcode", "ejit_register_period_array",
+    "ejit_register_static_var", "ejit_clear_cache", "ejit_compile_or_get",
+    "ejit_invalidate", "ejit_set_compile_mode", "ejit_get_compile_mode",
+    "ejit_get_last_error", "ejit_set_log_level", "ejit_get_log_level",
+    "ejit_print_registry", "ejit_print_func_meta", "ejit_get_code_pool_stats",
+    "ejit_get_code_pool_stats_v2", "ejit_print_code_pool_stats",
+    "ejit_print_active", "ejit_print_version",
+)
+
+OPTIONAL_API_ROOTS = (
+    "ejit_register_lifecycle", "ejit_register_funcindex",
+    "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
+    "ejit_taskpool_compile_or_get_bound_v", "ejit_taskpool_release_read",
+    "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",
+    "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",
+    "ejit_taskpool_compile_or_get_4d", "ejit_taskpool_set_instance_enabled",
+    "ejit_taskpool_pending_count", "ejit_publish_pending_code",
+    "ejit_taskpool_get_stats", "ejit_taskpool_print_stats",
+    "ejit_taskpool_get_worker_core", "ejit_taskpool_print_compiled",
+    "ejit_taskpool_trace_now", "ejit_taskpool_trace_wrapper", "ejit_dump_func",
+    "ejit_print_dumped", "ejit_print_dumped_module", "ejit_dump_all",
+    "ejit_print_mayconst_ranking", "ejit_register_icache_slot",
+    *SMALL_TABLE_API_ROOTS, *SMALL_TABLE_SRE_ROOTS,
+    *SMALL_TABLE_DEMO_ROOTS,
+)
 
 
 def all_libs(arch):
@@ -123,6 +188,156 @@ def _find_objcopy(build_dir):
         return "llvm-objcopy", True
     # No llvm-objcopy anywhere; fall back to GNU objcopy.
     return "objcopy", False
+
+
+def _find_readelf(build_dir):
+    """Return an ELF inspection tool; verification fails if none is available."""
+    llvm_readelf = os.path.join(build_dir, "bin", "llvm-readelf")
+    if os.path.exists(llvm_readelf):
+        return llvm_readelf
+    return shutil.which("llvm-readelf") or shutil.which("readelf")
+
+
+def _parse_nm_defined(output):
+    """Return symbol -> [(type, value)] from nm -g --defined-only output."""
+    symbols = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or len(fields[-2]) != 1:
+            continue
+        symbol_type, name = fields[-2], fields[-1]
+        if symbol_type in ("U", "u", "?"):
+            continue
+        value = fields[-3] if len(fields) >= 3 else ""
+        symbols.setdefault(name, []).append((symbol_type, value))
+    return symbols
+
+
+def _nm_defined(path):
+    result = sp.run(["nm", "-g", "--defined-only", path],
+                    capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"nm could not inspect defined symbols in {path}: "
+            f"{result.stderr[-300:]}")
+    return _parse_nm_defined(result.stdout)
+
+
+def _readelf_sections(path, build_dir):
+    return set(_readelf_section_names(path, build_dir))
+
+
+def _readelf_section_names(path, build_dir):
+    tool = _find_readelf(build_dir)
+    if not tool:
+        raise RuntimeError("no llvm-readelf/readelf available for lipo verification")
+    result = sp.run([tool, "-W", "-S", path], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"readelf could not inspect sections in {path}: "
+            f"{result.stderr[-300:]}")
+    sections = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*\[\s*\d+\]\s+(\S+)", line)
+        if match:
+            sections.append(match.group(1))
+    if not sections:
+        raise RuntimeError(f"readelf found no ELF sections in {path}")
+    return sections
+
+
+def _readelf_is_relocatable(path, build_dir):
+    tool = _find_readelf(build_dir)
+    if not tool:
+        raise RuntimeError("no llvm-readelf/readelf available for lipo verification")
+    result = sp.run([tool, "-W", "-h", path], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"readelf could not inspect ELF header in {path}: "
+            f"{result.stderr[-300:]}")
+    types = re.findall(r"^\s*Type:\s*(.*?)\s*$", result.stdout, re.MULTILINE)
+    if not types or any(not re.match(r"REL(?:\s|$)", item) for item in types):
+        raise RuntimeError(
+            f"lipo output is not entirely relocatable ELF: {path}; types={types}")
+
+
+def _check_root_definitions(path, build_dir, expected, reject_duplicates=True):
+    symbols = _nm_defined(path)
+    missing = sorted(set(expected) - set(symbols))
+    if missing:
+        raise RuntimeError(
+            f"lipo output lost required defined symbols: {', '.join(missing)}")
+    if reject_duplicates:
+        duplicate = sorted(name for name in set(expected)
+                           if len(symbols.get(name, ())) > 1)
+        if duplicate:
+            raise RuntimeError(
+                f"lipo output has duplicate root definitions: "
+                f"{', '.join(duplicate)}")
+    return symbols
+
+
+def _check_root_duplicates(symbols, roots, path):
+    duplicates = sorted(name for name in set(roots)
+                        if len(symbols.get(name, ())) > 1)
+    if duplicates:
+        raise RuntimeError(
+            f"input has duplicate lipo root definitions in {path}: "
+            f"{', '.join(duplicates)}")
+
+
+def _check_required_sections(path, build_dir, source_sections,
+                             final_merge=False):
+    section_names = _readelf_section_names(path, build_dir)
+    sections = set(section_names)
+    missing = {".symtab", ".strtab"} - sections
+    if missing:
+        raise RuntimeError(
+            f"lipo output is missing ELF symbol/string tables {sorted(missing)}")
+    if any(name == ".init_array" or name.startswith(".init_array.")
+           for name in source_sections):
+        if ".init_array" not in sections and not any(
+                name.startswith(".init_array.") for name in sections):
+            raise RuntimeError("lipo output discarded input .init_array registrations")
+    for name in (".ejit_bitcode", ".ejit_period"):
+        present_in_source = any(
+            section == name or section.startswith(name + ".")
+            for section in source_sections)
+        if present_in_source and name not in sections:
+            if not final_merge:
+                raise RuntimeError(f"lipo GC discarded registration section {name}")
+    mc_shared_in_source = any(
+        section == ".mc_shared" or section.startswith(".mc_shared.")
+        for section in source_sections)
+    if mc_shared_in_source:
+        if ".mc_shared" not in sections:
+            raise RuntimeError("lipo output discarded the explicit .mc_shared section")
+        if final_merge:
+            if section_names.count(".mc_shared") != 1 or any(
+                    section.startswith(".mc_shared.") for section in section_names):
+                raise RuntimeError(
+                    "final lipo object did not consolidate .mc_shared inputs "
+                    "into one explicit .mc_shared output section")
+    if final_merge:
+        for section, prefix in ((".ejit_bitcode", "ejit_bitcode"),
+                                (".ejit_period", "ejit_period")):
+            if not any(source == section or source.startswith(section + ".")
+                       for source in source_sections):
+                continue
+            symbols = _nm_defined(path)
+            start = symbols.get(f"__start_{prefix}", ())
+            stop = symbols.get(f"__stop_{prefix}", ())
+            if len(start) != 1 or len(stop) != 1:
+                raise RuntimeError(
+                    f"final lipo object lost unique {prefix} registration bounds")
+            try:
+                if int(stop[0][1], 16) <= int(start[0][1], 16):
+                    raise RuntimeError(
+                        f"final lipo object has empty {prefix} registration range")
+            except ValueError as error:
+                raise RuntimeError(
+                    f"cannot parse {prefix} registration bounds") from error
+    return sections
 
 
 def _try_strip_arm_mapping_symbols(merged_o, work_dir, build_dir):
@@ -339,6 +554,38 @@ def doit_gc_merge(args):
 
     LD = args.ld or ld(args.build_dir)
     CXX = cxx(args.build_dir)
+    require_small_table = getattr(args, "require_small_table", False)
+    require_small_table_sre = getattr(args, "require_small_table_sre", False)
+    require_demo = getattr(args, "require_demo", False)
+    gc_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "gc-merge.ld")
+
+    try:
+        input_sections = _readelf_sections(input_a, args.build_dir)
+        input_symbols = _nm_defined(input_a)
+    except RuntimeError as error:
+        print(f"ERROR: input archive verification failed: {error}")
+        sys.exit(1)
+
+    if require_small_table:
+        missing = sorted(set(SMALL_TABLE_API_ROOTS) - set(input_symbols))
+        if missing:
+            print("ERROR: --require-small-table input is missing runtime hooks: "
+                  + ", ".join(missing))
+            sys.exit(1)
+    if require_small_table_sre:
+        required = set(SMALL_TABLE_API_ROOTS) | set(SMALL_TABLE_SRE_ROOTS)
+        missing = sorted(required - set(input_symbols))
+        if missing:
+            print("ERROR: --require-small-table-sre input is missing runtime hooks: "
+                  + ", ".join(missing))
+            sys.exit(1)
+    if require_demo:
+        missing = sorted(set(SMALL_TABLE_DEMO_ROOTS) - set(input_symbols))
+        if missing:
+            print("ERROR: --require-demo input is missing demo adapters: "
+                  + ", ".join(missing))
+            sys.exit(1)
 
     # ── 1. Extract .o from input .a ───────────────────────────────────────
     print("[1/3] Extracting .o from input .a ...", flush=True)
@@ -355,59 +602,17 @@ def doit_gc_merge(args):
     # object is linked, so generated wrapper references are not visible yet.
     # Optional roots are retained only when the input runtime defines them, so
     # taskpool-OFF archives do not acquire unresolved taskpool symbols.
-    ejit_api = [
-        "ejit_init", "ejit_init_pgo", "ejit_shutdown", "ejit_activate", "ejit_deactivate",
-        "ejit_activate_all", "ejit_deactivate_all", "ejit_is_active",
-        "ejit_get_stats",
-        "ejit_register_symbol", "ejit_register_bitcode",
-        "ejit_register_period_array", "ejit_register_static_var",
-        "ejit_clear_cache", "ejit_compile_or_get", "ejit_invalidate",
-        "ejit_set_compile_mode", "ejit_get_compile_mode", "ejit_get_last_error",
-        # General diagnostics (always available — defined outside the
-        # EJIT_SRE_TASKPOOL ifdef in EJitRuntime.cpp).
-        "ejit_set_log_level", "ejit_get_log_level",
-        "ejit_print_registry", "ejit_print_func_meta",
-        "ejit_get_code_pool_stats", "ejit_get_code_pool_stats_v2",
-        "ejit_print_code_pool_stats",
-        "ejit_print_active",
-        # Build identity (LLVM version + git commit). Called from user app
-        # code, never from AOT, so it needs a GC root to survive --gc-sections.
-        "ejit_print_version",
-    ]
-    optional_api = [
-        "ejit_register_lifecycle", "ejit_register_funcindex",
-        "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
-        "ejit_taskpool_compile_or_get_bound_v",
-        "ejit_taskpool_release_read",
-        "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",
-        "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",
-        "ejit_taskpool_compile_or_get_4d",
-        "ejit_taskpool_set_instance_enabled", "ejit_taskpool_pending_count",
-        "ejit_publish_pending_code",
-        "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
-        "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",
-        "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
-        "ejit_print_dumped_module", "ejit_dump_all",
-        "ejit_print_mayconst_ranking",
-        # Inline-cache: ejit_register_icache_slot is called from
-        # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
-        # runtime, so gc-merge's --gc-sections would discard it without this GC
-        # root. The production wrapper reads @__ejit_icache_fn_<name> directly
-        # (no ejit_icache_try call). ejitIcacheRegisterSlot/gIcacheFnSlots are
-        # reachable from this root + ejit_init's .ejit_period walk, no explicit
-        # root needed.
-        "ejit_register_icache_slot",
-    ]
+    ejit_api = list(EJIT_API_ROOTS)
+    optional_api = list(OPTIONAL_API_ROOTS)
 
-    defined = set()
-    nm_result = sp.run(["nm", "-g", "--defined-only", input_a],
-                       capture_output=True, text=True)
-    if nm_result.returncode == 0:
-        for line in nm_result.stdout.splitlines():
-            fields = line.split()
-            if fields:
-                defined.add(fields[-1])
+    defined = set(input_symbols)
     retained_optional = [s for s in optional_api if s in defined]
+    rooted_definitions = (set(ejit_api) | set(retained_optional)) & defined
+    try:
+        _check_root_duplicates(input_symbols, rooted_definitions, input_a)
+    except RuntimeError as error:
+        print(f"ERROR: {error}")
+        sys.exit(1)
     ejit_api.extend(retained_optional)
     if retained_optional:
         print("       optional GC roots: " + ", ".join(retained_optional))
@@ -417,9 +622,12 @@ def doit_gc_merge(args):
         u_flags.extend(["-u", s])
 
     merged_o = os.path.join(work, "_merged.o")
+    if not os.path.isfile(gc_script):
+        print(f"ERROR: GC retention linker script missing: {gc_script}")
+        sys.exit(1)
     r = sp.run(
         [LD, "-r", "-o", merged_o, "--gc-sections", "--entry=ejit_init",
-         "--allow-multiple-definition"]
+         "--allow-multiple-definition", "-T", gc_script]
         + u_flags
         + o_files,
         capture_output=True, text=True,
@@ -445,9 +653,32 @@ def doit_gc_merge(args):
     if os.path.exists(nogroup_o):
         merged_o = nogroup_o
 
+    try:
+        _readelf_is_relocatable(merged_o, args.build_dir)
+        _check_required_sections(merged_o, args.build_dir, input_sections)
+        _check_root_definitions(merged_o, args.build_dir, rooted_definitions)
+    except RuntimeError as error:
+        print(f"ERROR: post-GC ELF verification failed: {error}")
+        sys.exit(1)
+
     # ── 3. Build new .a ───────────────────────────────────────────────────
     print(f"[3/3] Building {output} ...", flush=True)
-    sp.run(["ar", "crs", output, merged_o], capture_output=True)
+    staged_output = os.path.join(work, "_gc_output.a")
+    archive_result = sp.run(["ar", "crs", staged_output, merged_o],
+                            capture_output=True, text=True)
+    if archive_result.returncode != 0:
+        print("ERROR: could not package verified GC object")
+        print(archive_result.stderr[-500:])
+        sys.exit(1)
+    try:
+        _readelf_is_relocatable(staged_output, args.build_dir)
+        _check_required_sections(staged_output, args.build_dir, input_sections)
+        _check_root_definitions(staged_output, args.build_dir,
+                                rooted_definitions)
+    except RuntimeError as error:
+        print(f"ERROR: post-archive ELF verification failed: {error}")
+        sys.exit(1)
+    os.replace(staged_output, output)
     sz_mb = os.path.getsize(output) / (1024 * 1024)
     print(f"       {sz_mb:.0f} MB")
     print(f"       output: {output}")
@@ -461,24 +692,88 @@ def doit_merge(args):
     input_a = os.path.abspath(args.input)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     merge_ld = os.path.join(script_dir, "merge.ld")
+    require_small_table = getattr(args, "require_small_table", False)
+    require_small_table_sre = getattr(args, "require_small_table_sre", False)
+    require_demo = getattr(args, "require_demo", False)
 
     if not os.path.exists(merge_ld):
         print(f"ERROR: merge.ld not found at {merge_ld}")
         sys.exit(1)
 
-    output = args.output or os.path.join(script_dir, "ejit.o")
+    output = os.path.abspath(args.output or os.path.join(script_dir, "ejit.o"))
     LD = args.ld or ld(build_dir)
 
-    print(f"[merge] ld -r -T merge.ld -> {output} ...", flush=True)
-    r = sp.run([
-        LD, "-r", "-o", output, "-T", merge_ld,
-        "--whole-archive", input_a,
-    ], capture_output=True, text=True)
-
-    if r.returncode != 0:
-        print("ERROR: ld -r failed")
-        print(r.stderr[:500])
+    try:
+        input_sections = _readelf_sections(input_a, build_dir)
+        input_symbols = _nm_defined(input_a)
+        _check_required_sections(input_a, build_dir, input_sections)
+    except RuntimeError as error:
+        print(f"ERROR: input archive verification failed: {error}")
         sys.exit(1)
+
+    if require_small_table:
+        missing = sorted(set(SMALL_TABLE_API_ROOTS) - set(input_symbols))
+        if missing:
+            print("ERROR: --require-small-table input is missing runtime hooks: "
+                  + ", ".join(missing))
+            sys.exit(1)
+    if require_small_table_sre:
+        required = set(SMALL_TABLE_API_ROOTS) | set(SMALL_TABLE_SRE_ROOTS)
+        missing = sorted(required - set(input_symbols))
+        if missing:
+            print("ERROR: --require-small-table-sre input is missing runtime hooks: "
+                  + ", ".join(missing))
+            sys.exit(1)
+    if require_demo:
+        missing = sorted(set(SMALL_TABLE_DEMO_ROOTS) - set(input_symbols))
+        if missing:
+            print("ERROR: --require-demo input is missing demo adapters: "
+                  + ", ".join(missing))
+            sys.exit(1)
+
+    known_roots = set(EJIT_API_ROOTS) | set(OPTIONAL_API_ROOTS)
+    rooted_definitions = known_roots & set(input_symbols)
+    try:
+        _check_root_duplicates(input_symbols, rooted_definitions, input_a)
+    except RuntimeError as error:
+        print(f"ERROR: {error}")
+        sys.exit(1)
+
+    output_dir = os.path.dirname(output)
+    if not os.path.isdir(output_dir):
+        print(f"ERROR: output directory does not exist: {output_dir}")
+        sys.exit(1)
+    fd, staged_output = tempfile.mkstemp(prefix=".lipo_merge_", suffix=".o",
+                                         dir=output_dir)
+    os.close(fd)
+    os.unlink(staged_output)
+
+    print(f"[merge] ld -r -T merge.ld -> {output} ...", flush=True)
+    try:
+        r = sp.run([
+            LD, "-r", "-o", staged_output, "-T", merge_ld,
+            "--whole-archive", input_a,
+        ], capture_output=True, text=True)
+
+        if r.returncode != 0:
+            print("ERROR: ld -r failed")
+            print(r.stderr[:500])
+            sys.exit(1)
+
+        try:
+            _readelf_is_relocatable(staged_output, build_dir)
+            _check_required_sections(staged_output, build_dir, input_sections,
+                                     final_merge=True)
+            _check_root_definitions(staged_output, build_dir,
+                                    rooted_definitions)
+        except RuntimeError as error:
+            print(f"ERROR: post-merge ELF verification failed: {error}")
+            sys.exit(1)
+
+        os.replace(staged_output, output)
+    finally:
+        if os.path.exists(staged_output):
+            os.unlink(staged_output)
 
     sz_mb = os.path.getsize(output) / (1024 * 1024)
     print(f"       {sz_mb:.0f} MB")
@@ -505,12 +800,24 @@ def main():
     g.add_argument("--build-dir", required=True, help="LLVM build directory")
     g.add_argument("--ld", help="Override linker (default: build-dir/bin/ld.lld)")
     g.add_argument("--output", help="Output .a path")
+    g.add_argument("--require-small-table", action="store_true",
+                   help="Fail unless all seven small-table runtime hooks exist")
+    g.add_argument("--require-small-table-sre", action="store_true",
+                   help="Fail unless all small-table runtime and SRE bridge hooks exist")
+    g.add_argument("--require-demo", action="store_true",
+                   help="Fail unless both small-table demo adapters exist")
 
     m = sub.add_parser("merge", help="ld -r merge into single ejit.o")
     m.add_argument("--input", required=True, help="Input .a from gc-merge step")
     m.add_argument("--build-dir", required=True, help="LLVM build directory")
     m.add_argument("--ld", help="Override linker (default: build-dir/bin/ld.lld)")
     m.add_argument("--output", help="Output .o path (default: ejit.o alongside lipo.py)")
+    m.add_argument("--require-small-table", action="store_true",
+                   help="Fail unless all seven small-table runtime hooks exist")
+    m.add_argument("--require-small-table-sre", action="store_true",
+                   help="Fail unless all small-table runtime and SRE bridge hooks exist")
+    m.add_argument("--require-demo", action="store_true",
+                   help="Fail unless both small-table demo adapters exist")
 
     args = p.parse_args()
 

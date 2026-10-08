@@ -18,6 +18,24 @@ DUMP_APIS = (
     "ejit_print_dumped",
     "ejit_print_dumped_module",
 )
+SMALL_TABLE_HOOKS = (
+    "ejit_stab_enter",
+    "ejit_stab_wrapper_enter",
+    "ejit_stab_wrapper_no_policy_current",
+    "ejit_stab_leave",
+    "ejit_stab_dispatch",
+    "ejit_small_table_host_installed",
+    "ejit_small_table_published_slots",
+)
+SMALL_TABLE_SRE_HOOKS = (
+    "ejit_small_table_sre_prepare",
+    "ejit_small_table_sre_request",
+    "ejit_small_table_sre_get_snapshot",
+    "ejit_small_table_sre_finish",
+    "ejit_small_table_sre_cancel",
+    "ejit_small_table_sre_print",
+)
+SMALL_TABLE_DEMO = ("test_ejit_period", "test_ejit_smalltable_print")
 
 
 def find_tool(*names):
@@ -48,19 +66,33 @@ def load_lipo():
     return module
 
 
-def build_archive(root, clang, ar, symbols, name):
+def build_archive(root, clang, ar, symbols, name, registration_fixture=False):
     source = root / f"{name}.c"
     obj = root / f"{name}.o"
     archive = root / f"{name}.a"
     definitions = ["void ejit_init(void) {}"]
     definitions.extend(f"void {symbol}(void) {{}}" for symbol in symbols)
     definitions.append("void deliberately_unrooted(void) {}")
+    if registration_fixture:
+        definitions.extend(
+            [
+                '__attribute__((used,section(".ejit_bitcode"))) '
+                'const unsigned char bitcode_registration[] = {0x45, 0x4a};',
+                '__attribute__((used,section(".ejit_period"))) '
+                'const unsigned char period_registration[] = {0x50, 0x52};',
+                '__attribute__((used,section(".mc_shared"))) '
+                'unsigned int shared_core_state = 7;',
+                'static void registered_constructor(void) { shared_core_state++; }',
+                '__attribute__((used,section(".init_array.00101"))) '
+                'void (*const constructor_registration)(void) = registered_constructor;',
+            ]
+        )
     source.write_text("\n".join(definitions) + "\n", encoding="ascii")
     run(
         [
             clang,
-            "--target=x86_64-unknown-linux-gnu",
             "-c",
+            "-ffreestanding",
             "-ffunction-sections",
             source,
             "-o",
@@ -71,7 +103,9 @@ def build_archive(root, clang, ar, symbols, name):
     return archive
 
 
-def gc_merge(lipo, root, archive, ar, nm, ld, name):
+def gc_merge(lipo, root, archive, ar, nm, ld, name, *,
+             require_small_table=False, require_small_table_sre=False,
+             require_demo=False):
     output = root / f"{name}_gc.a"
     build_dir = root / "empty-build"
     build_dir.mkdir(exist_ok=True)
@@ -88,17 +122,64 @@ def gc_merge(lipo, root, archive, ar, nm, ld, name):
     lipo.sp.run = routed_run
     try:
         with contextlib.redirect_stdout(io.StringIO()) as output_log:
-            lipo.doit_gc_merge(
-                SimpleNamespace(
-                    input=str(archive),
-                    output=str(output),
-                    build_dir=str(build_dir),
-                    ld=str(ld),
-                )
-            )
+            lipo.doit_gc_merge(SimpleNamespace(
+                input=str(archive), output=str(output),
+                build_dir=str(build_dir), ld=str(ld),
+                require_small_table=require_small_table,
+                require_small_table_sre=require_small_table_sre,
+                require_demo=require_demo,
+            ))
+    except BaseException as error:
+        error.captured_stdout = output_log.getvalue()
+        raise
     finally:
         lipo.sp.run = original_run
     return output, output_log.getvalue()
+
+
+def merge(lipo, root, archive, nm, ld, name, *,
+          require_small_table_sre=False, require_demo=False):
+    output = root / f"{name}.o"
+    build_dir = root / "empty-build"
+    original_run = lipo.sp.run
+
+    def routed_run(command, *args, **kwargs):
+        command = list(command)
+        if command[0] == "nm":
+            command[0] = str(nm)
+        return original_run(command, *args, **kwargs)
+
+    lipo.sp.run = routed_run
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as output_log:
+            lipo.doit_merge(SimpleNamespace(
+                input=str(archive), output=str(output),
+                build_dir=str(build_dir), ld=str(ld),
+                require_small_table=False,
+                require_small_table_sre=require_small_table_sre,
+                require_demo=require_demo,
+            ))
+    finally:
+        lipo.sp.run = original_run
+    return output, output_log.getvalue()
+
+
+def build_duplicate_root_archive(root, clang, ar, name):
+    objects = []
+    for index in range(2):
+        source = root / f"{name}_{index}.c"
+        obj = root / f"{name}_{index}.o"
+        source.write_text(
+            "void ejit_init(void) {}\n"
+            "void ejit_stab_enter(void) {}\n",
+            encoding="ascii",
+        )
+        run([clang, "-c", "-ffreestanding", "-ffunction-sections",
+             source, "-o", obj])
+        objects.append(obj)
+    archive = root / f"{name}.a"
+    run([ar, "rcs", archive, *objects])
+    return archive
 
 
 def defined_symbols(nm, archive):
@@ -132,13 +213,91 @@ def main():
         if "deliberately_unrooted" in complete_symbols:
             raise AssertionError("gc-merge retained an unrooted control symbol")
 
+        smalltable = build_archive(
+            root, clang, ar,
+            (*SMALL_TABLE_HOOKS, *SMALL_TABLE_SRE_HOOKS, *SMALL_TABLE_DEMO),
+            "smalltable", registration_fixture=True,
+        )
+        smalltable_gc, smalltable_log = gc_merge(
+            lipo, root, smalltable, ar, nm, ld, "smalltable",
+            require_small_table_sre=True, require_demo=True,
+        )
+        smalltable_symbols = defined_symbols(nm, smalltable_gc)
+        expected_roots = set(SMALL_TABLE_HOOKS + SMALL_TABLE_SRE_HOOKS + SMALL_TABLE_DEMO)
+        if expected_roots - smalltable_symbols:
+            raise AssertionError(
+                "small-table runtime/demo roots were discarded: "
+                f"{sorted(expected_roots - smalltable_symbols)}; "
+                f"log={smalltable_log!r}"
+            )
+
+        smalltable_sections = lipo._readelf_sections(smalltable_gc, str(root / "empty-build"))
+        for section in (".ejit_bitcode", ".ejit_period", ".mc_shared", ".init_array"):
+            if section not in smalltable_sections and not any(
+                    name.startswith(section + ".") for name in smalltable_sections):
+                raise AssertionError(f"gc-merge discarded retained section {section}")
+
+        smalltable_merged, merge_log = merge(
+            lipo, root, smalltable_gc, nm, ld, "smalltable-merged",
+            require_small_table_sre=True, require_demo=True,
+        )
+        merged_symbols = defined_symbols(nm, smalltable_merged)
+        if expected_roots - merged_symbols:
+            raise AssertionError(
+                "final merge discarded small-table roots: "
+                f"{sorted(expected_roots - merged_symbols)}; log={merge_log!r}"
+            )
+        merged_sections = lipo._readelf_sections(
+            smalltable_merged, str(root / "empty-build"))
+        if not {".symtab", ".strtab", ".rodata", ".mc_shared", ".init_array"} <= merged_sections:
+            raise AssertionError(
+                f"final merge lost symbol/registration/shared sections: "
+                f"{sorted(merged_sections)}"
+            )
+        for prefix in ("ejit_bitcode", "ejit_period"):
+            if f"__start_{prefix}" not in merged_symbols or f"__stop_{prefix}" not in merged_symbols:
+                raise AssertionError(f"final merge lost {prefix} registry bounds")
+
         minimal = build_archive(root, clang, ar, (), "minimal")
         minimal_gc, _ = gc_merge(lipo, root, minimal, ar, nm, ld, "minimal")
         minimal_symbols = defined_symbols(nm, minimal_gc)
         if "ejit_init" not in minimal_symbols:
             raise AssertionError("mandatory ejit_init root was discarded")
-        if set(DUMP_APIS) & minimal_symbols:
+        if (set(DUMP_APIS) | set(SMALL_TABLE_HOOKS) |
+                set(SMALL_TABLE_SRE_HOOKS) | set(SMALL_TABLE_DEMO)) & minimal_symbols:
             raise AssertionError("gc-merge fabricated missing optional symbols")
+
+        try:
+            gc_merge(lipo, root, minimal, ar, nm, ld, "strict-smalltable",
+                     require_small_table_sre=True)
+        except SystemExit as error:
+            if error.code != 1:
+                raise
+        else:
+            raise AssertionError("--require-small-table-sre accepted missing hooks")
+
+        try:
+            gc_merge(lipo, root, minimal, ar, nm, ld, "strict-demo",
+                     require_demo=True)
+        except SystemExit as error:
+            if error.code != 1:
+                raise
+        else:
+            raise AssertionError("--require-demo accepted missing adapters")
+
+        duplicate = build_duplicate_root_archive(root, clang, ar, "duplicate")
+        try:
+            _, duplicate_log = gc_merge(lipo, root, duplicate, ar, nm, ld, "duplicate")
+        except SystemExit as error:
+            if error.code != 1:
+                raise
+            if ("duplicate lipo root definitions" not in error.captured_stdout or
+                    "ejit_stab_enter" not in error.captured_stdout):
+                raise AssertionError(
+                    f"duplicate-root error was not diagnosed: "
+                    f"{error.captured_stdout!r}")
+        else:
+            raise AssertionError("gc-merge accepted duplicate strong root definitions")
 
     print("lipo GC-root regression: PASS")
 

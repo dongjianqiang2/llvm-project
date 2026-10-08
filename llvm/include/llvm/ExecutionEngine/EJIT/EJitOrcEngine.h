@@ -221,6 +221,11 @@ public:
   /// environments where dynamic symbol lookup is unavailable.
   void addUserSymbol(const std::string &name, void *addr);
 
+  /// Actual non-synthetic function entry metadata produced by the most recent
+  /// PGOUse transform. Raw instrumentation counter slot zero is not generally
+  /// an entry count (edge instrumentation may store separate branch counts).
+  bool getFunctionProfileEntryCount(StringRef Name, uint64_t &Count) const;
+
 #ifdef EJIT_SRE_CODE_POOL
   /// Snapshot of the SRE code-pool statistics (pool / sealed counts, used /
   /// wasted bytes, enable_ex invocations) for diagnostics and tests. Returns a

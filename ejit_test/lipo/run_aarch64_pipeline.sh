@@ -1,7 +1,7 @@
 #!/bin/bash
 # EJIT aarch64 ejit.o pipeline — native build with clang, no bare-metal trimming.
 # Run from the llvm-project root, after building:
-#   ninja -C build_release_aarch64 clang LLVMEJIT lld
+#   tools/build-limited.sh ninja -C build_release_aarch64 clang LLVMEJIT lld
 #
 # Uses the build directory's own clang/clang++ and ld.lld (native aarch64).
 #
@@ -50,7 +50,42 @@ BUILD_DIR="${POSITIONAL[0]:-build_release_aarch64}"
 OUTPUT="${POSITIONAL[1]:-ejit_test/lipo/ejit.o}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORK_DIR="$SCRIPT_DIR/.lipo_work_aarch64"
+
+# Prefer an explicitly supplied workspace serializer; otherwise walk parent
+# directories so nested worktrees find the coordinator workspace's wrapper.
+BUILD_LIMITER="${EJIT_BUILD_LIMITER:-}"
+if [[ -n "$BUILD_LIMITER" ]]; then
+  if [[ ! -x "$BUILD_LIMITER" ]]; then
+    echo "ERROR: EJIT_BUILD_LIMITER is not executable: $BUILD_LIMITER" >&2
+    exit 2
+  fi
+else
+  SEARCH_DIR="$REPO_ROOT"
+  while [[ "$SEARCH_DIR" != "/" ]]; do
+    if [[ -x "$SEARCH_DIR/tools/build-limited.sh" ]]; then
+      BUILD_LIMITER="$SEARCH_DIR/tools/build-limited.sh"
+      break
+    fi
+    SEARCH_DIR="$(dirname "$SEARCH_DIR")"
+  done
+fi
+
+run_ninja() {
+  if [[ -n "$BUILD_LIMITER" ]]; then
+    "$BUILD_LIMITER" ninja "$@"
+  else
+    ninja -j8 "$@"
+  fi
+}
+
+STRICT_SMALL_TABLE_ARGS=()
+case "${EJIT_REQUIRE_SMALL_TABLE_SRE:-0}" in
+  1|ON|on|true|TRUE) STRICT_SMALL_TABLE_ARGS=(--require-small-table-sre) ;;
+  0|OFF|off|false|FALSE|"") ;;
+  *) echo "ERROR: EJIT_REQUIRE_SMALL_TABLE_SRE must be 0/1 or OFF/ON" >&2; exit 2 ;;
+esac
 
 INC="$BUILD_DIR/lib/Target/AArch64/AArch64GenSubtargetInfo.inc"
 
@@ -62,7 +97,7 @@ rm -rf "$WORK_DIR"
 regen_inc() {
   echo "── Regenerating AArch64GenSubtargetInfo.inc (llvm-tblgen -gen-subtarget) ──"
   rm -f "$INC"
-  ninja -C "$BUILD_DIR" AArch64CommonTableGen
+  run_ninja -C "$BUILD_DIR" AArch64CommonTableGen
 }
 
 # ── Step 0: manage per-CPU scheduling model tables ───────────────────────────
@@ -88,14 +123,14 @@ if [[ $DO_STRIP -eq 1 ]]; then
   fi
   python3 "$SCRIPT_DIR/ejit_strip_sched_models.py" "$BUILD_DIR" "$KEEP_MODEL"
   echo "── Rebuilding LLVMAArch64CodeGen + LLVMAArch64Desc ──"
-  ninja -C "$BUILD_DIR" LLVMAArch64CodeGen LLVMAArch64Desc
+  run_ninja -C "$BUILD_DIR" LLVMAArch64CodeGen LLVMAArch64Desc
 else
   # No-strip: if the .inc is currently patched, regenerate from source.
   if grep -q "EJIT: stripped" "$INC" 2>/dev/null; then
     echo "── Step 0: .inc is patched — regenerating from TableGen sources ──"
     regen_inc
     echo "── Rebuilding LLVMAArch64CodeGen + LLVMAArch64Desc ──"
-    ninja -C "$BUILD_DIR" LLVMAArch64CodeGen LLVMAArch64Desc
+    run_ninja -C "$BUILD_DIR" LLVMAArch64CodeGen LLVMAArch64Desc
   else
     echo "── Step 0: no-strip, .inc is already original ──"
   fi
@@ -113,7 +148,8 @@ python3 "$SCRIPT_DIR/lipo.py" extract \
 # using EJIT API entry points as gc roots.
 python3 "$SCRIPT_DIR/lipo.py" gc-merge \
   --input="$SCRIPT_DIR/libejit_lipo_aarch64.a" \
-  --build-dir="$BUILD_DIR"
+  --build-dir="$BUILD_DIR" \
+  "${STRICT_SMALL_TABLE_ARGS[@]}"
 
 # ── Step 3: merge ─────────────────────────────────────────────────────────────
 # ld -r -T merge.ld: merges per-function sections into single .text/.rodata/.data
@@ -121,6 +157,7 @@ python3 "$SCRIPT_DIR/lipo.py" gc-merge \
 python3 "$SCRIPT_DIR/lipo.py" merge \
   --input="$SCRIPT_DIR/libejit_lipo_aarch64_gc.a" \
   --build-dir="$BUILD_DIR" \
+  "${STRICT_SMALL_TABLE_ARGS[@]}" \
   --output="$OUTPUT"
 
 echo ""

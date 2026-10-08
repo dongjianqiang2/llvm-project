@@ -9,6 +9,8 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITRUNTIME_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITRUNTIME_H
 
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTableSreBridge.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

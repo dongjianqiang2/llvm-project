@@ -417,6 +417,12 @@ Error EJit::enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
   if (!HostOrErr)
     return HostOrErr.takeError();
   smallTableHost_ = std::move(*HostOrErr);
+  // Common code still calls this image's real external hooks/libfunctions.
+  // Replay the same durable registered definitions as the ordinary engine;
+  // do not invent placeholders or implicitly resolve the host process.
+  if (compileDriver_)
+    for (const auto &Symbol : compileDriver_->getRegisteredSymbols())
+      smallTableHost_->registerExtraSymbol(Symbol.first, Symbol.second);
 
   // The real retraction path: retiring the shared dispatch cache drains the
   // registered inline-cache cells and bumps the L0 dispatch epoch, so a call

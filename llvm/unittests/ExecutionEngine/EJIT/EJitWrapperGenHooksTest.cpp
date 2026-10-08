@@ -89,6 +89,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__linux__)
+#include <atomic>
+#include <cstdio>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -3418,5 +3424,569 @@ TEST_F(GeneratedWrapperTaskpoolTest,
       << "an unadmitted coordinate must not reach a taskpool compile";
   EXPECT_EQ(Host->physicalExecutions(), 0u);
 }
+
+#if defined(__linux__)
+// Actual kernel tasks + actual native mappings, over the new POD control path.
+// This is not an SRE SDK, not inter-core MMU/cache-coherence acceptance, and not
+// a core-ID stand-in for worker identity. Every C command reaches the existing
+// real Async worker, and every business call executes the pass's real wrapper.
+std::atomic<bool> gBridgeDenyCallerMapping{false};
+std::atomic<uint64_t> gBridgeCallerTask{0};
+uint64_t bridgeLinuxTask(void *) { return static_cast<uint64_t>(syscall(SYS_gettid)); }
+void bridgeLinuxDelay(void *, uint32_t) { std::this_thread::yield(); }
+int bridgeLinuxMapping(void *, uintptr_t Address, uint64_t Bytes, uint32_t Access) {
+  if (!Address || !Bytes || Bytes > UINTPTR_MAX - Address ||
+      (gBridgeDenyCallerMapping.load() && bridgeLinuxTask(nullptr) == gBridgeCallerTask.load()))
+    return -1;
+  FILE *Maps = std::fopen("/proc/self/maps", "r");
+  if (!Maps) return -1;
+  uintptr_t Cursor = Address;
+  const uintptr_t End = Address + Bytes;
+  char Line[512], Permissions[5] = {};
+  while (Cursor < End && std::fgets(Line, sizeof(Line), Maps)) {
+    unsigned long long Lo = 0, Hi = 0;
+    if (std::sscanf(Line, "%llx-%llx %4s", &Lo, &Hi, Permissions) != 3 ||
+        Lo > Cursor || Hi <= Cursor) continue;
+    if ((Access & EJIT_STAB_SRE_DATA_READ) && Permissions[0] != 'r') break;
+    if ((Access & EJIT_STAB_SRE_DATA_WRITE) && Permissions[1] != 'w') break;
+    Cursor = std::min<uintptr_t>(End, Hi);
+  }
+  std::fclose(Maps);
+  return Cursor == End ? 0 : -1;
+}
+
+class GeneratedWrapperSreBridgeTest : public GeneratedWrapperTest {
+protected:
+  ejit_small_table_sre_source_state_t SourceState{};
+  ejit_small_table_sre_request_t Request{};
+  ejit_small_table_sre_snapshot_t Before{}, After{};
+  WrapElement CompilerRows[6][2]{};
+  int32_t CompilerOutput[6][2]{};
+  std::unique_ptr<orc::LLJIT> CompilerImage;
+  int32_t (*CompilerEntry)(int32_t, int32_t, int32_t) = nullptr;
+  void SetUp() override {
+    ejit_shutdown();
+    gBridgeDenyCallerMapping = false;
+    gBridgeCallerTask = bridgeLinuxTask(nullptr);
+    ejit_small_table_sre_bindings_t Bindings{};
+    Bindings.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
+    Bindings.structSize = sizeof(Bindings);
+    Bindings.waitRounds = 65536;
+    Bindings.current_task_id = bridgeLinuxTask;
+    Bindings.delay_ticks = bridgeLinuxDelay;
+    Bindings.prepare_shared_data = bridgeLinuxMapping;
+    ASSERT_EQ(ejit_small_table_sre_prepare(&Bindings), EJIT_STAB_SRE_OK);
+    GeneratedWrapperTest::SetUp();
+  }
+  void TearDown() override {
+    gBridgeDenyCallerMapping = false;
+    GeneratedWrapperTest::TearDown();
+  }
+  bool buildWrapper(bool Icache = false, bool Reentrant = false,
+                    const std::string *Override = nullptr) {
+    std::string Body = Override ? *Override : Reentrant
+        ? reentrantEntryBodyText("g_wrap", "g_wrap_out", kWrapCells)
+        : entryBodyText("g_wrap", "g_wrap_out", kWrapCells);
+    auto W = GeneratedWrapper::create(FuncIdx, CellSlot, true, Icache, &Body,
+                                      /*SeedCacheHit=*/false);
+    if (!W) { ADD_FAILURE() << toString(W.takeError()); return false; }
+    Wrapper = std::move(*W);
+    if (!Reentrant && !Icache && !Override) return true;
+    ejit_shutdown();
+    // Same registered body as the AOT image. Payload survives the joined worker.
+    LLVMContext Ctx;
+    auto M = parseModule(Ctx, Body, "SRE bridge actual body");
+    if (!M) return false;
+    SmallVector<char, 0> Buffer;
+    raw_svector_ostream OS(Buffer);
+    WriteBitcodeToFile(*M, OS);
+    RegisteredBitcode.assign(Buffer.begin(), Buffer.end());
+    ejit_register_period_array(kWrapPeriod, "g_wrap", &g_wrap[0].mode, sizeof(g_wrap));
+    ejit_register_static_var("g_wrap", &g_wrap[0].mode);
+    ejit_register_static_var("g_wrap_out", &g_wrap_out[0]);
+    ejit_register_bitcode("f_entry", RegisteredBitcode.data(), RegisteredBitcode.size());
+    if (Reentrant) ejit_register_symbol("wrap_observe", reinterpret_cast<void *>(&wrapObserve));
+    if (Icache) ejit_register_icache_slot("f_entry", Wrapper->icacheSlot(), 1, nullptr);
+    ejit_config_t Cfg{};
+    Cfg.compileMode = EJIT_COMPILE_ASYNC; Cfg.optLevel = EJIT_OPT_L2;
+    if (ejit_init_pgo(&Cfg) != EJIT_OK) return false;
+    for (unsigned C = 0; C < kWrapReadyCells; ++C)
+      if (ejit_activate(kWrapPeriod, C) != EJIT_OK) return false;
+    return true;
+  }
+  bool buildActualCompilerRegistry2d() {
+    ejit_shutdown();
+    for (unsigned C = 0; C < 6; ++C)
+      for (unsigned T = 0; T < 2; ++T)
+        CompilerRows[C][T] = {1, static_cast<int32_t>(10 + 2 * C + T)};
+    std::string Body = entryBodyText("g_wrap", "g_wrap_out", kWrapCells);
+    auto Replace = [&](StringRef From, StringRef To) {
+      size_t Pos = 0;
+      while ((Pos = Body.find(From.str(), Pos)) != std::string::npos) {
+        Body.replace(Pos, From.size(), To.str()); Pos += To.size();
+      }
+    };
+    Replace("@g_wrap = external global [4 x %A]",
+            "@g_wrap = external global [6 x [2 x %A]], !ejit.metadata !6");
+    Replace("[4 x i32]", "[12 x i32]");
+    Replace("@f_entry(i32 %cell, i32 %x)",
+            "@f_entry(i32 %cell, i32 %trp, i32 %x)");
+    Replace("getelementptr inbounds [4 x %A], ptr @g_wrap, i64 0, i32 %cell",
+            "getelementptr inbounds [6 x [2 x %A]], ptr @g_wrap, i64 0, i32 %cell, i32 %trp");
+    Replace("      %op = getelementptr inbounds [12 x i32], ptr @g_wrap_out, i64 0, i32 %cell",
+            "      %c2 = mul i32 %cell, 2\n      %linear = add i32 %c2, %trp\n"
+            "      %op = getelementptr inbounds [12 x i32], ptr @g_wrap_out, i64 0, i32 %linear");
+    Replace("!0 = !{!1, !2}", "!0 = !{!1, !2, !5}");
+    Body += "    !5 = !{!\"ejit_period_arr_ind\", !\"bridge_trp\", i32 1}\n"
+            "    !6 = !{!7}\n"
+            "    !7 = !{!\"ejit_period_arr\", !\"tenant_cell\", i32 6}\n";
+    // This is exactly the compiler's relevant shape: nested source arrays,
+    // one OUTER period-array count, two parameter lifecycle dimensions and
+    // genuine per-load may_const markers (no invented nested-global fallback).
+    auto Context = std::make_unique<LLVMContext>();
+    auto M = parseModule(*Context, Body, "actual compiler outer-element registry");
+    if (!M || verifyModule(*M, &errs())) return false;
+    SmallVector<char, 0> Buffer;
+    raw_svector_ostream OS(Buffer);
+    WriteBitcodeToFile(*M, OS);
+    RegisteredBitcode.assign(Buffer.begin(), Buffer.end());
+    const bool SavedCtors = EnableEJitGlobalCtors;
+    const bool Hooks = EnableEJitSmallTableHooks, Icache = EJitInlineCache;
+    auto RestoreOptions = make_scope_exit([&] {
+      EnableEJitGlobalCtors = SavedCtors;
+      EnableEJitSmallTableHooks = Hooks; EJitInlineCache = Icache;
+    });
+    EnableEJitGlobalCtors = false; EnableEJitSmallTableHooks = true; EJitInlineCache = false;
+    Analyses A;
+    ModulePassManager PM;
+    PM.addPass(EJitRegisterPeriodPass());
+    PM.run(*M, A.MAM);
+    auto *Table = M->getGlobalVariable(".ejit.registry.period", true);
+    if (!Table || !Table->hasInitializer()) return false;
+    auto *Record = dyn_cast<ConstantStruct>(Table->getInitializer()->getAggregateElement(0u));
+    if (!Record || cast<ConstantInt>(Record->getOperand(4))->getZExtValue() != 6)
+      return false;
+    if (M->getDataLayout().getTypeAllocSize(M->getNamedGlobal("g_wrap")->getValueType()) !=
+        sizeof(CompilerRows)) return false;
+    auto *F = M->getFunction("f_entry");
+    IRBuilder<> Mark(&*F->getEntryBlock().getFirstInsertionPt());
+    Mark.CreateCall(M->getOrInsertFunction("wrap_aot_observe", FunctionType::get(Mark.getVoidTy(), false)));
+    runWrapperGen(*M, A);
+    EnableEJitGlobalCtors = SavedCtors; EnableEJitSmallTableHooks = Hooks; EJitInlineCache = Icache;
+    auto *Auto = M->getFunction(FN_AUTO_REGISTER);
+    if (!Auto || verifyModule(*M, &errs())) return false;
+    Auto->setLinkage(GlobalValue::ExternalLinkage);
+    auto J = orc::LLJITBuilder().create();
+    if (!J) { ADD_FAILURE() << toString(J.takeError()); return false; }
+    CompilerImage = std::move(*J);
+    orc::SymbolMap Symbols;
+    auto Add = [&](StringRef Name, const void *Address) {
+      Symbols[CompilerImage->getExecutionSession().intern(Name)] = orc::ExecutorSymbolDef(
+          orc::ExecutorAddr::fromPtr(Address), JITSymbolFlags::Exported | JITSymbolFlags::Callable);
+    };
+    Add("g_wrap", CompilerRows); Add("g_wrap_out", CompilerOutput);
+    Add("wrap_aot_observe", reinterpret_cast<const void *>(&wrapAotObserve));
+    Add("ejit_register_period_array", reinterpret_cast<const void *>(&ejit_register_period_array));
+    Add("ejit_register_static_var", reinterpret_cast<const void *>(&ejit_register_static_var));
+    Add("ejit_register_funcindex", reinterpret_cast<const void *>(&ejit_register_funcindex));
+    Add("ejit_register_lifecycle", reinterpret_cast<const void *>(&ejit_register_lifecycle));
+    Add("ejit_stab_wrapper_enter", reinterpret_cast<const void *>(&ejit_stab_wrapper_enter));
+    Add("ejit_stab_wrapper_no_policy_current", reinterpret_cast<const void *>(&ejit_stab_wrapper_no_policy_current));
+    Add("ejit_stab_leave", reinterpret_cast<const void *>(&ejit_stab_leave));
+    Add("ejit_taskpool_compile_or_get_2d", reinterpret_cast<const void *>(&ejit_taskpool_compile_or_get_2d));
+    Add("ejit_taskpool_release_read", reinterpret_cast<const void *>(&ejit_taskpool_release_read));
+    if (Error E = CompilerImage->getMainJITDylib().define(orc::absoluteSymbols(std::move(Symbols)))) {
+      ADD_FAILURE() << toString(std::move(E)); return false;
+    }
+    if (Error E = CompilerImage->addIRModule(orc::ThreadSafeModule(std::move(M), std::move(Context)))) {
+      ADD_FAILURE() << toString(std::move(E)); return false;
+    }
+    auto AutoAddress = CompilerImage->lookup(FN_AUTO_REGISTER);
+    if (!AutoAddress) { ADD_FAILURE() << toString(AutoAddress.takeError()); return false; }
+    // EXECUTE the real pass-generated registration function. It registers the
+    // same outer count as its static record, and fixes both real wrapper slots.
+    reinterpret_cast<void (*)()>(AutoAddress->getValue())();
+    auto Entry = CompilerImage->lookup("f_entry");
+    if (!Entry) { ADD_FAILURE() << toString(Entry.takeError()); return false; }
+    CompilerEntry = reinterpret_cast<int32_t (*)(int32_t, int32_t, int32_t)>(Entry->getValue());
+    ejit_register_static_var("g_wrap", CompilerRows);
+    ejit_register_static_var("g_wrap_out", CompilerOutput);
+    ejit_register_bitcode("f_entry", RegisteredBitcode.data(), RegisteredBitcode.size());
+    ejit_config_t Cfg{};
+    Cfg.compileMode = EJIT_COMPILE_ASYNC; Cfg.optLevel = EJIT_OPT_L2;
+    if (ejit_init_pgo(&Cfg) != EJIT_OK) return false;
+    for (unsigned C = 0; C < 6; ++C) if (ejit_activate(kWrapPeriod, C) != EJIT_OK) return false;
+    for (unsigned T = 0; T < 2; ++T) if (ejit_activate("bridge_trp", T) != EJIT_OK) return false;
+    return true;
+  }
+  void request(uint64_t Limit = 64) {
+    SourceState = {0xF00D, 1, 0, 0};
+    Request = {};
+    Request.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
+    Request.structSize = sizeof(Request);
+    std::strcpy(Request.entryName, "f_entry");
+    std::strcpy(Request.sourceVarName, "g_wrap");
+    Request.sourceAddress = reinterpret_cast<uintptr_t>(&g_wrap[0]);
+    Request.sourceBytes = sizeof(g_wrap);
+    Request.sourceState = reinterpret_cast<uintptr_t>(&SourceState);
+    Request.aotEntry = reinterpret_cast<uintptr_t>(&wrapAotEntry);
+    Request.sourceEpoch = SourceState.epoch;
+    Request.configurationRevision = SourceState.revision;
+    Request.codeGeneration = 1; Request.sampleLimit = Limit;
+    Request.numDims = 1; Request.numMembers = kWrapReadyCells;
+    Request.domainCoverage = 1;
+    Request.dims[0].argumentIndex = 0;
+    Request.dims[0].extent = kWrapCells;
+    std::strcpy(Request.dims[0].periodName, kWrapPeriod);
+    for (unsigned I = 0; I < kWrapReadyCells; ++I) {
+      Request.members[I].coordinate[0] = I;
+      Request.members[I].configurationGeneration = 1;
+      Request.members[I].fieldsInitialized = 1;
+    }
+    ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  }
+  void cold(uint64_t Limit, bool Icache = false) {
+    ASSERT_TRUE(buildWrapper(Icache)); request(Limit);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(UINT32_MAX, &Before), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(Before.funcIndex, FuncIdx);
+    ASSERT_NE(Before.workerTaskIdentity, bridgeLinuxTask(nullptr));
+    ASSERT_NE(Before.workerTaskIdentity, 0u);
+    ASSERT_EQ(Before.tier, 1u);
+    ASSERT_GT(Before.expectedCounterPairs, 0u);
+    ASSERT_EQ(Before.counterPairs, Before.expectedCounterPairs);
+    ASSERT_EQ(Before.genericAsyncEnqueues, 0u);
+    for (uint64_t I = 0; I < Limit; ++I)
+      ASSERT_EQ(Wrapper->call(I % kWrapReadyCells, 4),
+                wrapAotResult(g_wrap[I % kWrapReadyCells], 4));
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(Before.sampleCount, Limit);
+    EXPECT_EQ(Before.rootEntryCount, 0u);
+    EXPECT_EQ(Before.rootEntryCountValid, 0u);
+    ASSERT_EQ(Before.counterWordCount, 1u);
+    EXPECT_EQ(Before.counts[0], Limit);
+    EXPECT_EQ(Before.physicalExecutions, 0u);
+    EXPECT_EQ(g_aotCalls, 0u);
+    EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+    EXPECT_EQ(g_aotCalls, 1u);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(After.countersDigest, Before.countersDigest);
+    EXPECT_EQ(After.rootEntryCountValid, 0u);
+    EXPECT_EQ(After.rootEntryCount, 0u);
+    EXPECT_EQ(After.sampleCount, Limit);
+    ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(After.tier, 2u);
+    EXPECT_EQ(After.fullProfileValid, 1u);
+    EXPECT_EQ(After.rootEntryCountValid, 1u);
+    EXPECT_EQ(After.rootEntryCount, Limit);
+    EXPECT_GT(After.profileBytes, 0u);
+    EXPECT_EQ(After.counterPairs, After.expectedCounterPairs);
+    EXPECT_EQ(After.countersDigest, Before.countersDigest);
+    EXPECT_EQ(After.borrowReaders, 0u);
+    for (unsigned I = 0; I < kWrapReadyCells; ++I)
+      EXPECT_EQ(Wrapper->call(I, 5), wrapAotResult(g_wrap[I], 5));
+    EXPECT_EQ(g_aotCalls, 1u);
+    EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+    EXPECT_EQ(After.genericAsyncCompiles, 0u);
+    EXPECT_EQ(After.genericPending, 0u);
+  }
+};
+TEST_F(GeneratedWrapperSreBridgeTest, ColdRealWrapperFull64ProfileAndCommonT2) { cold(64); }
+TEST_F(GeneratedWrapperSreBridgeTest, ColdRealWrapperConfigurable8ProfileAndCommonT2) { cold(8); }
+TEST_F(GeneratedWrapperSreBridgeTest, ColdActualZeroIcacheFull64ProfileAndCommonT2) { cold(64, true); }
+TEST_F(GeneratedWrapperSreBridgeTest, ActualCompilerOuterCountSixByTwoCold64CompleteProfileAndT2) {
+  ASSERT_TRUE(buildActualCompilerRegistry2d());
+  SourceState = {0xF00D, 1, 0, 0};
+  Request = {};
+  Request.abiVersion = EJIT_STAB_SRE_ABI_VERSION; Request.structSize = sizeof(Request);
+  std::strcpy(Request.entryName, "f_entry"); std::strcpy(Request.sourceVarName, "g_wrap");
+  Request.sourceAddress = reinterpret_cast<uintptr_t>(CompilerRows);
+  Request.sourceBytes = sizeof(CompilerRows);
+  Request.sourceState = reinterpret_cast<uintptr_t>(&SourceState);
+  Request.aotEntry = reinterpret_cast<uintptr_t>(CompilerEntry);
+  Request.sourceEpoch = SourceState.epoch; Request.configurationRevision = SourceState.revision;
+  Request.codeGeneration = 1; Request.sampleLimit = 64;
+  Request.numDims = 2; Request.numMembers = 12; Request.domainCoverage = 1;
+  Request.dims[0].argumentIndex = 0; Request.dims[0].extent = 6;
+  Request.dims[1].argumentIndex = 1; Request.dims[1].extent = 2;
+  std::strcpy(Request.dims[0].periodName, kWrapPeriod);
+  std::strcpy(Request.dims[1].periodName, "bridge_trp");
+  for (unsigned I = 0; I < 12; ++I) {
+    Request.members[I].coordinate[0] = I / 2; Request.members[I].coordinate[1] = I % 2;
+    Request.members[I].configurationGeneration = 1; Request.members[I].fieldsInitialized = 1;
+  }
+  // Bad byte requests cannot reinterpret a compiler row count as accessible
+  // bytes, cannot over-read, and cannot install a partial common policy.
+  --Request.sourceBytes;
+  EXPECT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_INVALID);
+  Request.sourceBytes += 2;
+  EXPECT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_INVALID);
+  --Request.sourceBytes;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(Before.admittedMembers, 12u);
+  for (unsigned I = 0; I < 64; ++I) {
+    const unsigned C = (I % 12) / 2, T = I % 2;
+    EXPECT_EQ(CompilerEntry(C, T, 4), wrapAotResult(CompilerRows[C][T], 4));
+    EXPECT_EQ(CompilerOutput[C][T], 4);
+  }
+  EXPECT_EQ(g_aotCalls, 0u);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(Before.sampleCount, 64u);
+  EXPECT_EQ(Before.physicalExecutions, 0u);
+  EXPECT_EQ(Before.rootEntryCountValid, 0u);
+  ASSERT_EQ(Before.counterWordCount, 1u); EXPECT_EQ(Before.counts[0], 64u);
+  EXPECT_EQ(CompilerEntry(5, 1, 4), wrapAotResult(CompilerRows[5][1], 4));
+  EXPECT_EQ(g_aotCalls, 1u);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.tier, 2u); EXPECT_EQ(After.fullProfileValid, 1u);
+  EXPECT_EQ(After.rootEntryCountValid, 1u); EXPECT_EQ(After.rootEntryCount, 64u);
+  EXPECT_EQ(After.publishedSlots, 12u); EXPECT_EQ(After.borrowReaders, 0u);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  EXPECT_EQ(After.genericAsyncEnqueues, 0u); EXPECT_EQ(After.genericPending, 0u);
+  for (unsigned C = 0; C < 6; ++C)
+    for (unsigned T = 0; T < 2; ++T) {
+      EXPECT_EQ(CompilerEntry(C, T, 5), wrapAotResult(CompilerRows[C][T], 5));
+      EXPECT_EQ(CompilerOutput[C][T], 5);
+    }
+  EXPECT_EQ(g_aotCalls, 1u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest, BranchCountersAreNotEntryCountAndCompleteProfileFeedsT2) {
+  std::string Body = entryBodyText("g_wrap", "g_wrap_out", kWrapCells);
+  const std::string Needle = "      %xm = mul i32 %x, 3\n";
+  ASSERT_NE(Body.find(Needle), std::string::npos);
+  Body.replace(Body.find(Needle), Needle.size(),
+      "      %positive = icmp sge i32 %x, 0\n"
+      "      br i1 %positive, label %pos, label %neg\n"
+      "    pos:\n"
+      "      %pv = call i32 @bridge_positive(i32 %x)\n"
+      "      br label %join\n"
+      "    neg:\n"
+      "      %nv = call i32 @bridge_negative(i32 %x)\n"
+      "      br label %join\n"
+      "    join:\n"
+      "      %xm = phi i32 [ %pv, %pos ], [ %nv, %neg ]\n");
+  Body += "\n    define internal i32 @bridge_positive(i32 %x) noinline {\n"
+          "      %v = mul i32 %x, 3\n      ret i32 %v\n    }\n"
+          "    define internal i32 @bridge_negative(i32 %x) noinline {\n"
+          "      %v = mul i32 %x, 5\n      ret i32 %v\n    }\n";
+  ASSERT_TRUE(buildWrapper(false, false, &Body)); request(64);
+  for (unsigned I = 0; I < 64; ++I) {
+    const int X = I % 2 ? -4 : 4;
+    EXPECT_EQ(Wrapper->call(I % kWrapReadyCells, X),
+              wrapAotResult(g_wrap[I % kWrapReadyCells], X) + (X < 0 ? 2 * X : 0));
+  }
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+  ASSERT_EQ(Before.sampleCount, 64u);
+  EXPECT_EQ(Before.rootEntryCountValid, 0u);
+  EXPECT_EQ(Before.rootEntryCount, 0u);
+  const ejit_small_table_sre_counter_t *Root = nullptr;
+  for (uint32_t I = 0; I < Before.counterPairs; ++I)
+    if (StringRef(Before.counters[I].name) == "f_entry") Root = &Before.counters[I];
+  ASSERT_NE(Root, nullptr);
+  ASSERT_EQ(Root->wordCount, 2u);
+  EXPECT_EQ(Before.counts[Root->firstWord], 32u);
+  EXPECT_EQ(Before.counts[Root->firstWord + 1], 32u);
+  ASSERT_GE(Before.counterPairs, 3u);
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  EXPECT_EQ(g_aotCalls, 1u);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.tier, 2u);
+  EXPECT_EQ(After.fullProfileValid, 1u);
+  EXPECT_EQ(After.rootEntryCountValid, 1u);
+  EXPECT_EQ(After.rootEntryCount, 64u);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  for (unsigned I = 0; I < kWrapReadyCells; ++I)
+    EXPECT_EQ(Wrapper->call(I, -5), wrapAotResult(g_wrap[I], -5) - 10);
+  EXPECT_EQ(g_aotCalls, 1u);
+  EXPECT_EQ(After.genericPending, 0u);
+  EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest, RefusedSourceBorrowClosesAllocatedPreparationPin) {
+  ASSERT_TRUE(buildWrapper()); request(8);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+  SourceState.writerBlocked = 1;
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  SourceState.writerBlocked = 0;
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.sampleCount, 0u);
+  EXPECT_EQ(After.physicalExecutions, 0u);
+  EXPECT_EQ(After.borrowReaders, 0u);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+  EXPECT_EQ(g_aotCalls, 1u);
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.sampleCount, 1u);
+  EXPECT_EQ(After.physicalExecutions, 0u);
+  EXPECT_EQ(g_aotCalls, 1u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest, RealCallerPermissionRefusalClosesPreparationWithoutSample) {
+  ASSERT_TRUE(buildWrapper()); request();
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+  gBridgeDenyCallerMapping = true;
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  gBridgeDenyCallerMapping = false;
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.sampleCount, 0u);
+  EXPECT_EQ(After.physicalExecutions, 0u);
+  EXPECT_EQ(After.borrowReaders, 0u);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+  EXPECT_EQ(g_aotCalls, 1u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest, CancelDuringRealCallRetainsBorrowUntilActualWrapperLeave) {
+  ASSERT_TRUE(buildWrapper(false, true)); request(8);
+  unsigned Observations = 0;
+  g_observe = [&] {
+    ++Observations;
+    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(Before.physicalExecutions, 1u);
+    EXPECT_GT(Before.borrowReaders, 0u);
+    EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(ejit_small_table_sre_cancel(FuncIdx), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(After.physicalExecutions, 1u);
+    EXPECT_GT(After.borrowReaders, 0u);
+  };
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  g_observe = nullptr;
+  EXPECT_EQ(Observations, 1u);
+  EXPECT_EQ(SourceState.readers, 0u);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.physicalExecutions, 0u);
+  EXPECT_EQ(After.borrowReaders, 0u);
+  EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+  // Config writing only AFTER the actual leave; no mutation under old borrow.
+  SourceState.writerBlocked = 1;
+  g_wrap[0].bycell += 20;
+  SourceState.epoch = 0xF00E; SourceState.revision = 2;
+  SourceState.writerBlocked = 0;
+  Request.sourceEpoch = SourceState.epoch;
+  Request.configurationRevision = SourceState.revision;
+  Request.codeGeneration = 2;
+  for (unsigned I = 0; I < kWrapReadyCells; ++I)
+    Request.members[I].configurationGeneration = 2;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+}
+TEST_F(GeneratedWrapperSreBridgeTest, ShutdownDuringRealCallPreservesLateLeaveAndReinitDropsOldControl) {
+  ASSERT_TRUE(buildWrapper(false, true)); request(8);
+  unsigned Observations = 0;
+  g_observe = [&] {
+    ++Observations;
+    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(Before.physicalExecutions, 1u);
+    EXPECT_GT(SourceState.readers, 0u);
+    ejit_shutdown();
+    EXPECT_GT(SourceState.readers, 0u) << "shutdown is not an actual leave";
+    ejit_config_t Cfg{};
+    Cfg.compileMode = EJIT_COMPILE_ASYNC; Cfg.optLevel = EJIT_OPT_L2;
+    EXPECT_NE(ejit_init_pgo(&Cfg), EJIT_OK) << "old live code forbids runtime replacement";
+    EXPECT_GT(SourceState.readers, 0u);
+  };
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  g_observe = nullptr;
+  EXPECT_EQ(Observations, 1u);
+  EXPECT_EQ(SourceState.readers, 0u) << "exact late leave reached the still-pinned original worker";
+  // Join/deallocate the retired facade from the caller, not its own worker.
+  ejit_shutdown();
+  // Runtime registration storage is consumed by init, not a persistent image
+  // cache. Reinitialize from the SAME real body and symbols, as the product's
+  // per-core registration/bootstrap does; do not weaken exact dense identity.
+  ejit_register_period_array(kWrapPeriod, "g_wrap", &g_wrap[0].mode, sizeof(g_wrap));
+  ejit_register_static_var("g_wrap", &g_wrap[0].mode);
+  ejit_register_static_var("g_wrap_out", &g_wrap_out[0]);
+  ejit_register_bitcode("f_entry", RegisteredBitcode.data(), RegisteredBitcode.size());
+  ejit_register_symbol("wrap_observe", reinterpret_cast<void *>(&wrapObserve));
+  ejit_config_t Cfg{};
+  Cfg.compileMode = EJIT_COMPILE_ASYNC; Cfg.optLevel = EJIT_OPT_L2;
+  ASSERT_EQ(ejit_init_pgo(&Cfg), EJIT_OK);
+  for (unsigned I = 0; I < kWrapReadyCells; ++I)
+    ASSERT_EQ(ejit_activate(kWrapPeriod, I), EJIT_OK);
+  EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_INVALID);
+  EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_INVALID);
+  EXPECT_EQ(ejit_small_table_sre_cancel(FuncIdx), EJIT_STAB_SRE_INVALID);
+  Request.codeGeneration = 2;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.sampleCount, 1u);
+  EXPECT_EQ(After.physicalExecutions, 0u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest, RepeatedOldTicketCannotCloseReplacementRealExecution) {
+  ASSERT_TRUE(buildWrapper(false, true)); request(8);
+  const ejit_dim_pair_t Dim{CellSlot, 0};
+  uint64_t Old = 0, Epoch = 0;
+  const char *Why = nullptr;
+  void *Entry = ejit_stab_wrapper_enter(FuncIdx, &Dim, 1, nullptr, 0, &Old, &Why, &Epoch);
+  ASSERT_NE(Entry, nullptr); ASSERT_NE(Old, 0u); ASSERT_EQ(Why, nullptr);
+  auto Fn = reinterpret_cast<int32_t (*)(int32_t, int32_t)>(Entry);
+  EXPECT_EQ(Fn(0, 4), wrapAotResult(g_wrap[0], 4));
+  ASSERT_EQ(ejit_small_table_sre_cancel(FuncIdx), EJIT_STAB_SRE_OK);
+  EXPECT_GT(SourceState.readers, 0u);
+  ejit_stab_leave(Old);
+  EXPECT_EQ(SourceState.readers, 0u);
+  Request.codeGeneration = 2;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  unsigned Observations = 0;
+  g_observe = [&] {
+    ++Observations;
+    ejit_stab_leave(Old);
+    ejit_stab_leave(Old);
+    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(After.physicalExecutions, 1u);
+    EXPECT_GT(After.borrowReaders, 0u);
+    EXPECT_EQ(After.codeGeneration, 2u);
+  };
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  g_observe = nullptr;
+  EXPECT_EQ(Observations, 1u);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.physicalExecutions, 0u);
+  EXPECT_EQ(After.sampleCount, 1u);
+}
+TEST_F(GeneratedWrapperSreBridgeTest, BoundedConcurrentPreparationAndControlsAcrossShutdown) {
+  ASSERT_TRUE(buildWrapper()); request(256);
+  std::atomic<unsigned> Calls{0}, Controls{0};
+  std::atomic<bool> Start{false};
+  std::thread Caller([&] {
+    while (!Start.load()) std::this_thread::yield();
+    for (unsigned I = 0; I < 96; ++I) {
+      const unsigned Cell = I % kWrapReadyCells;
+      EXPECT_EQ(Wrapper->call(Cell, 4), wrapAotResult(g_wrap[Cell], 4));
+      ++Calls;
+    }
+  });
+  std::thread Controller([&] {
+    while (!Start.load()) std::this_thread::yield();
+    ejit_small_table_sre_snapshot_t S{};
+    for (unsigned I = 0; I < 96; ++I) {
+      const int R = ejit_small_table_sre_get_snapshot(FuncIdx, &S);
+      EXPECT_TRUE(R == EJIT_STAB_SRE_OK || R == EJIT_STAB_SRE_BUSY ||
+                  R == EJIT_STAB_SRE_BLOCKED || R == EJIT_STAB_SRE_INVALID);
+      ++Controls;
+    }
+  });
+  Start = true;
+  const auto Deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while ((!Calls.load() || !Controls.load()) &&
+         std::chrono::steady_clock::now() < Deadline) std::this_thread::yield();
+  EXPECT_GT(Calls.load(), 0u);
+  EXPECT_GT(Controls.load(), 0u);
+  ejit_shutdown();
+  Caller.join(); Controller.join();
+  EXPECT_EQ(Calls.load(), 96u);
+  EXPECT_EQ(Controls.load(), 96u);
+  ejit_shutdown(); // finish retired-owner destruction on the non-worker
+  EXPECT_EQ(SourceState.readers, 0u);
+}
+#endif // __linux__
 
 } // namespace

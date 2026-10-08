@@ -31,6 +31,24 @@
 namespace llvm {
 namespace ejit {
 
+/// Atomic access to an ABI-owned plain integer cell (e.g. an additive C/POD
+/// command or configuration-commit descriptor). The reference is private/local;
+/// it never changes the storage layout or constructs/rezeros shared cells.
+template <typename T> class EJitAtomicRef {
+public:
+  explicit EJitAtomicRef(T &Value) : value_(&Value) {}
+  T loadAcquire() const { return __atomic_load_n(value_, __ATOMIC_ACQUIRE); }
+  void storeRelease(T Value) { __atomic_store_n(value_, Value, __ATOMIC_RELEASE); }
+  bool compareExchange(T &Expected, T Desired) {
+    return __atomic_compare_exchange_n(value_, &Expected, Desired, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+  }
+  T fetchAdd(T Delta) { return __atomic_fetch_add(value_, Delta, __ATOMIC_ACQ_REL); }
+  T fetchSub(T Delta) { return __atomic_fetch_sub(value_, Delta, __ATOMIC_ACQ_REL); }
+private:
+  T *value_;
+};
+
 //===----------------------------------------------------------------------===//
 // EJitAtomic<T>
 //

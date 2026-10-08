@@ -30,6 +30,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#if defined(EJIT_FREESTANDING) && defined(EJIT_FIXED_CODE_POOL)
+#include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
+#endif
 #include "llvm/IR/Module.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/Error.h"
@@ -345,13 +348,14 @@ EJitSmallTableRuntime::create(
     const Config &Cfg, PeriodArrayRegistry &Registry, EJitRuntimeState &State,
     std::shared_ptr<EJitSmallTableReadinessProvider> Provider, Options Opts) {
 #if defined(EJIT_FREESTANDING) && defined(EJIT_FIXED_CODE_POOL)
-  // Each Engine currently creates its own manager starting at the SAME linker
-  // reservation. A second common Engine could overwrite ordinary code still
-  // executing. Do not claim board readiness until a shared allocation domain
-  // or explicitly disjoint reservations are supplied by the product binding.
-  return make_error<StringError>(
-      "small-table fixed code pool requires a non-overlapping allocation domain",
-      inconvertibleErrorCode());
+  // Historical per-engine private cursors start at the SAME linker reservation
+  // and could overwrite ordinary code still executing. Only the explicit,
+  // validated, monotonic shared domain enables a second common Engine. This
+  // proves allocation separation, not product cross-core board readiness.
+  if (!sreSharedFixedCodePoolDomainActive())
+    return make_error<StringError>(
+        "small-table fixed code pool requires a non-overlapping allocation domain",
+        inconvertibleErrorCode());
 #endif
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, Registry, State);
   if (!EngineOrErr)

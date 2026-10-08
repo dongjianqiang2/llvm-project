@@ -183,6 +183,9 @@ struct EJitOrcEngine::Impl {
   /// User-registered symbols (functions + globals) for bare-metal.
   /// Populated via ejit_register_symbol() / addUserSymbol().
   std::map<std::string, void *> userSymbols;
+  /// Owner-local snapshot of genuine PGOUse metadata, never inferred from a
+  /// raw counter index. Cleared for every transform to reject stale metadata.
+  std::map<std::string, uint64_t> profileEntryCounts;
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
@@ -909,6 +912,14 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 
           engine->P->optimizer->runPipeline(M, *ctx);
 
+          engine->P->profileEntryCounts.clear();
+          if (ctx->tier == CompileTier::PGOUse)
+            for (const Function &F : M)
+              if (!F.isDeclaration())
+                if (auto Count = F.getEntryCount(/*AllowSynthetic=*/false))
+                  engine->P->profileEntryCounts.emplace(F.getName().str(),
+                                                       Count->getCount());
+
           // The optimizer's analysis managers are persistent across
           // compilations, but this module is released once linking finishes.
           // Drop the cached analyses now, while the IR is still alive: a cached
@@ -1491,6 +1502,16 @@ bool EJitOrcEngine::printMayConstRanking() const {
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
   P->userSymbols[name] = addr;
+}
+
+bool EJitOrcEngine::getFunctionProfileEntryCount(StringRef Name,
+                                                uint64_t &Count) const {
+  Count = 0;
+  auto I = P->profileEntryCounts.find(Name.str());
+  if (I == P->profileEntryCounts.end())
+    return false;
+  Count = I->second;
+  return true;
 }
 
 #ifdef EJIT_SRE_CODE_POOL

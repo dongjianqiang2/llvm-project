@@ -29,6 +29,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "EJitWrapperRuntimeTestAccess.h"
+#include "EJitSmallTableSreBridgeInternal.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
@@ -146,7 +147,9 @@ std::atomic<uint64_t> gNextSmallTableExecutionToken{1};
 
 uint64_t allocateExecutionToken() {
   uint64_t Next = gNextSmallTableExecutionToken.load(std::memory_order_relaxed);
-  while (Next != std::numeric_limits<uint64_t>::max()) {
+  // The high bit names additive cross-core bridge tokens. Both namespaces
+  // exhaust without wrap, so a stale/duplicate token cannot name another call.
+  while (Next < (uint64_t{1} << 63)) {
     if (gNextSmallTableExecutionToken.compare_exchange_weak(
             Next, Next + 1, std::memory_order_relaxed))
       return Next;
@@ -222,6 +225,7 @@ uint64_t EJitSmallTableHost::policyEpoch() {
 }
 
 void EJitSmallTableHost::notePolicyChange() {
+  smallTableSrePolicyChanged();
   uint64_t Epoch = gSmallTablePolicyEpoch.load(std::memory_order_acquire);
   while (Epoch != std::numeric_limits<uint64_t>::max() &&
          !gSmallTablePolicyEpoch.compare_exchange_weak(
