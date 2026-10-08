@@ -28,6 +28,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
+#include "EJitOwnerWorkerContext.h"
+#include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "EJitWrapperRuntimeTestAccess.h"
 #include "EJitSmallTableSreBridgeInternal.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
@@ -175,6 +177,16 @@ std::vector<std::unique_ptr<EJitSmallTableHost>> &retiredOwners() {
 } // namespace
 
 EJitSmallTableHost *EJitSmallTableHost::installGlobal(EJitSmallTableHost *Host) {
+  return installGlobalImpl(Host, nullptr);
+}
+
+EJitSmallTableHost *EJitSmallTableHost::installGlobal(
+    const detail::OwnerWorkerContext &Worker, EJitSmallTableHost *Host) {
+  return installGlobalImpl(Host, &Worker);
+}
+
+EJitSmallTableHost *EJitSmallTableHost::installGlobalImpl(
+    EJitSmallTableHost *Host, const detail::OwnerWorkerContext *Worker) {
   if (Host && global() == Host && Host->wrapperAdmissionReady())
     return Host; // an already-effective same-owner install is a true no-op
   if (Host)
@@ -203,11 +215,20 @@ EJitSmallTableHost *EJitSmallTableHost::installGlobal(EJitSmallTableHost *Host) 
   // hook would otherwise leave the earlier session occupying admission.
   if (Host && Host->isBoundTo(Host->funcIndex()) &&
       Host->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
-      !inSmallTableOwnerRequest(Host)) {
-    if (Error E = runSmallTableOwnerRequest(
-            Host->funcIndex(), Host, []() -> Error { return Error::success(); })) {
+      (Worker || !inSmallTableOwnerRequest(Host))) {
+    SmallTableOwnerWorkerJob Job =
+        [](const detail::OwnerWorkerContext &) { return Error::success(); };
+    Error Handoff = Worker
+                        ? runSmallTableOwnerRequest(*Worker, Host->funcIndex(),
+                                                    Host, Job)
+                        : runSmallTableOwnerRequest(Host->funcIndex(), Host,
+                                                    Job);
+    if (Error E = std::move(Handoff)) {
       const std::string Why = toString(std::move(E));
-      Host->cancel(Why);
+      if (Worker)
+        Host->cancel(*Worker, Why);
+      else
+        Host->cancel(Why);
       EJIT_DIAG("small-table bound installation remains AOT: %s", Why.c_str());
     }
   }
@@ -237,14 +258,47 @@ EJitSmallTableHost *EJitSmallTableHost::global() {
 }
 
 bool EJitSmallTableHost::beginOwnerTeardown() {
+  return beginOwnerTeardownImpl(nullptr);
+}
+
+bool EJitSmallTableHost::beginOwnerTeardown(
+    const detail::OwnerWorkerContext &Worker) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJit *Runtime = acquireSmallTableSreRuntime(Worker);
+  if (!Runtime)
+    return false;
+  struct RuntimePin {
+    EJit *Runtime;
+    const detail::OwnerWorkerContext &Worker;
+    ~RuntimePin() { releaseSmallTableSreRuntime(Runtime, Worker); }
+  } Pin{Runtime, Worker};
+  EJitSharedTaskPool *Pool = Runtime->sharedTaskPool();
+  if (!Pool || !Worker.activeFor(*Pool) || Runtime->smallTableHost() != this)
+    return false;
+#else
+  (void)Worker;
+  return false;
+#endif
+  return beginOwnerTeardownImpl(&Worker);
+}
+
+bool EJitSmallTableHost::beginOwnerTeardownImpl(
+    const detail::OwnerWorkerContext *Worker) {
   setWrapperAdmissionReady(false);
   // Logical teardown FIRST: no new call can be admitted, every slot stops being
   // published and every entered execution is settled for sampling. The physical
   // leases stay until their own completions.
-  if (global() == this)
-    installGlobal(nullptr);
+  if (global() == this) {
+    if (Worker)
+      installGlobal(*Worker, nullptr);
+    else
+      installGlobal(nullptr);
+  }
   retractPublishedSlots();
-  cancel("small-table normal path disabled");
+  if (Worker)
+    cancel(*Worker, "small-table normal path disabled");
+  else
+    cancel("small-table normal path disabled");
   if (executions_.empty() && ownerControlPins_.loadAcquire() == 0)
     return true; // destroy now: nothing is inside this table
   return false;  // retain: a real execution still holds this generation
@@ -277,6 +331,27 @@ bool EJitSmallTableHost::leaveRetainedExecution(uint64_t Ticket) {
     // point has already erased its registry entry, in which case the lookup
     // above would not have found it.
     if (H->physicalExecutions() == 0 && H->ownerControlPins_.loadAcquire() == 0)
+      Owners.erase(Owners.begin() + static_cast<ptrdiff_t>(I));
+    return true;
+  }
+  return false;
+}
+
+bool EJitSmallTableHost::leaveRetainedExecution(
+    EJitSmallTableHost *ExpectedHost, uint64_t Ticket) {
+  if (!ExpectedHost || Ticket == 0)
+    return false;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Guard(retiredOwnerMutex());
+#endif
+  std::vector<std::unique_ptr<EJitSmallTableHost>> &Owners = retiredOwners();
+  for (size_t I = 0; I < Owners.size(); ++I) {
+    EJitSmallTableHost *Host = Owners[I].get();
+    if (Host != ExpectedHost || !Host->ownsExecution(Ticket))
+      continue;
+    Host->leave(Ticket);
+    if (Host->physicalExecutions() == 0 &&
+        Host->ownerControlPins_.loadAcquire() == 0)
       Owners.erase(Owners.begin() + static_cast<ptrdiff_t>(I));
     return true;
   }
@@ -441,25 +516,51 @@ bool EJitSmallTableHost::coordinateOf(ArrayRef<uint32_t> DimTypes,
 Expected<const EJitSmallTablePlan *>
 EJitSmallTableHost::planEntry(const EntryRequest &Request, std::string &Why) {
   if (global() == this &&
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity())) {
+    const EJitSmallTablePlan *Plan = nullptr;
+    SmallTableOwnerWorkerJob Job = [this, &Request, &Why, &Plan](
+        const detail::OwnerWorkerContext &) -> Error {
+      auto P = planEntryImpl(Request, Why);
+      if (!P)
+        return P.takeError();
+      Plan = *P;
+      return Error::success();
+    };
+    if (Error E = runSmallTableOwnerRequest(Request.funcIndex, this,
+                                            std::move(Job)))
+      return std::move(E);
+    return Plan;
+  }
+  return planEntryImpl(Request, Why);
+}
+
+Expected<const EJitSmallTablePlan *> EJitSmallTableHost::planEntry(
+    const detail::OwnerWorkerContext &Worker, const EntryRequest &Request,
+    std::string &Why) {
+  const EJitSmallTablePlan *Plan = nullptr;
+  SmallTableOwnerWorkerJob Job = [this, &Request, &Why, &Plan](
+      const detail::OwnerWorkerContext &) -> Error {
+    auto P = planEntryImpl(Request, Why);
+    if (!P)
+      return P.takeError();
+    Plan = *P;
+    return Error::success();
+  };
+  if (Error E = runSmallTableOwnerRequest(Worker, Request.funcIndex, this,
+                                          std::move(Job)))
+    return std::move(E);
+  return Plan;
+}
+
+Expected<const EJitSmallTablePlan *>
+EJitSmallTableHost::planEntryImpl(const EntryRequest &Request,
+                                 std::string &Why) {
+  if (global() == this &&
       belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
       (Request.funcIndex >= EJitFuncRegistry::instance().count() ||
        EJitFuncRegistry::instance().lookup(Request.entryName) != Request.funcIndex)) {
     Why = "small-table request function index does not identify its registered entry";
     return make_error<StringError>(Why, inconvertibleErrorCode());
-  }
-  if (global() == this &&
-      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
-      !inSmallTableOwnerRequest(this)) {
-    const EJitSmallTablePlan *Plan = nullptr;
-    if (Error E = runSmallTableOwnerRequest(Request.funcIndex, this, [&]() -> Error {
-          auto P = planEntry(Request, Why);
-          if (!P)
-            return P.takeError();
-          Plan = *P;
-          return Error::success();
-        }))
-      return std::move(E);
-    return Plan;
   }
   if (bound_) {
     Why = "small-table host: entry '" + entryName_ +
@@ -576,19 +677,42 @@ void EJitSmallTableHost::ensureProfileRuntimeHook() {
 
 Expected<void *> EJitSmallTableHost::compileT1(std::string &Why) {
   if (global() == this &&
-      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
-      !inSmallTableOwnerRequest(this)) {
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity())) {
     void *Entry = nullptr;
-    if (Error E = runSmallTableOwnerRequest(funcIndex_, this, [&]() -> Error {
-          auto P = compileT1(Why);
-          if (!P)
-            return P.takeError();
-          Entry = *P;
-          return Error::success();
-        }, /*InitialHandoff=*/false))
+    SmallTableOwnerWorkerJob Job = [this, &Why, &Entry](
+        const detail::OwnerWorkerContext &) -> Error {
+      auto P = compileT1Impl(Why);
+      if (!P)
+        return P.takeError();
+      Entry = *P;
+      return Error::success();
+    };
+    if (Error E = runSmallTableOwnerRequest(
+            funcIndex_, this, std::move(Job), /*InitialHandoff=*/false))
       return std::move(E);
     return Entry;
   }
+  return compileT1Impl(Why);
+}
+
+Expected<void *> EJitSmallTableHost::compileT1(
+    const detail::OwnerWorkerContext &Worker, std::string &Why) {
+  void *Entry = nullptr;
+  SmallTableOwnerWorkerJob Job = [this, &Why, &Entry](
+      const detail::OwnerWorkerContext &) -> Error {
+    auto P = compileT1Impl(Why);
+    if (!P)
+      return P.takeError();
+    Entry = *P;
+    return Error::success();
+  };
+  if (Error E = runSmallTableOwnerRequest(
+          Worker, funcIndex_, this, std::move(Job), /*InitialHandoff=*/false))
+    return std::move(E);
+  return Entry;
+}
+
+Expected<void *> EJitSmallTableHost::compileT1Impl(std::string &Why) {
   if (!runtime_->plan()) {
     Why = "small-table host: compileT1 before a successful plan";
     return make_error<StringError>(Why, inconvertibleErrorCode());
@@ -627,16 +751,35 @@ Expected<void *> EJitSmallTableHost::compileT1(std::string &Why) {
 Error EJitSmallTableHost::requestEntry(const EntryRequest &Request,
                                        void *executableAot, std::string &Why) {
   if (global() == this &&
-      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
-      !inSmallTableOwnerRequest(this))
-    return runSmallTableOwnerRequest(Request.funcIndex, this, [&]() {
-      return requestEntry(Request, executableAot, Why);
-    });
+      belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity())) {
+    SmallTableOwnerWorkerJob Job = [this, &Request, executableAot, &Why](
+        const detail::OwnerWorkerContext &) -> Error {
+      return requestEntryImpl(Request, executableAot, Why);
+    };
+    return runSmallTableOwnerRequest(Request.funcIndex, this, std::move(Job));
+  }
+  return requestEntryImpl(Request, executableAot, Why);
+}
+
+Error EJitSmallTableHost::requestEntry(
+    const detail::OwnerWorkerContext &Worker, const EntryRequest &Request,
+    void *executableAot, std::string &Why) {
+  SmallTableOwnerWorkerJob Job = [this, &Request, executableAot, &Why](
+      const detail::OwnerWorkerContext &) -> Error {
+    return requestEntryImpl(Request, executableAot, Why);
+  };
+  return runSmallTableOwnerRequest(Worker, Request.funcIndex, this,
+                                  std::move(Job));
+}
+
+Error EJitSmallTableHost::requestEntryImpl(const EntryRequest &Request,
+                                           void *executableAot,
+                                           std::string &Why) {
   aotEntry_ = executableAot;
-  auto PlanOrErr = planEntry(Request, Why);
+  auto PlanOrErr = planEntryImpl(Request, Why);
   if (!PlanOrErr)
     return PlanOrErr.takeError();
-  auto T1OrErr = compileT1(Why);
+  auto T1OrErr = compileT1Impl(Why);
   if (!T1OrErr)
     return T1OrErr.takeError();
   return Error::success();
@@ -681,10 +824,28 @@ void EJitSmallTableHost::rebuildSlots() {
 Error EJitSmallTableHost::publishGeneration(std::string &Why) {
   if (global() == this &&
       belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) &&
-      !inSmallTableOwnerRequest(this))
-    return runSmallTableOwnerRequest(funcIndex_, this, [&]() {
-      return publishGeneration(Why);
-    }, /*InitialHandoff=*/false);
+      !inSmallTableOwnerRequest(this)) {
+    SmallTableOwnerWorkerJob Job = [this, &Why](
+        const detail::OwnerWorkerContext &) {
+      return publishGenerationImpl(Why);
+    };
+    return runSmallTableOwnerRequest(funcIndex_, this, std::move(Job),
+                                     /*InitialHandoff=*/false);
+  }
+  return publishGenerationImpl(Why);
+}
+
+Error EJitSmallTableHost::publishGeneration(
+    const detail::OwnerWorkerContext &Worker, std::string &Why) {
+  SmallTableOwnerWorkerJob Job = [this, &Why](
+      const detail::OwnerWorkerContext &) {
+    return publishGenerationImpl(Why);
+  };
+  return runSmallTableOwnerRequest(Worker, funcIndex_, this, std::move(Job),
+                                   /*InitialHandoff=*/false);
+}
+
+Error EJitSmallTableHost::publishGenerationImpl(std::string &Why) {
   if (!planReady_ || !t1Ready_) {
     Why = "small-table host: publishGeneration before a successful T1";
     return make_error<StringError>(Why, inconvertibleErrorCode());
@@ -1396,6 +1557,31 @@ void EJitSmallTableHost::noteConfigurationChange(StringRef Reason) {
 }
 
 void EJitSmallTableHost::cancel(StringRef Reason) {
+  cancelImpl(Reason);
+}
+
+void EJitSmallTableHost::cancel(
+    const detail::OwnerWorkerContext &Worker, StringRef Reason) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJit *Runtime = acquireSmallTableSreRuntime(Worker);
+  if (!Runtime)
+    return;
+  struct RuntimePin {
+    EJit *Runtime;
+    const detail::OwnerWorkerContext &Worker;
+    ~RuntimePin() { releaseSmallTableSreRuntime(Runtime, Worker); }
+  } Pin{Runtime, Worker};
+  EJitSharedTaskPool *Pool = Runtime->sharedTaskPool();
+  if (!Pool || !Worker.activeFor(*Pool) || Runtime->smallTableHost() != this)
+    return;
+#else
+  (void)Worker;
+  return;
+#endif
+  cancelImpl(Reason);
+}
+
+void EJitSmallTableHost::cancelImpl(StringRef Reason) {
   notePolicyChange();
   const std::string R =
       Reason.empty() ? std::string("cancelled") : Reason.str();

@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "EJitOwnerWorkerContext.h"
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
 #endif
@@ -395,6 +396,30 @@ EJit::~EJit() {
 
 Error EJit::enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
                              EJitSmallTableHost::Options Opts) {
+  return enableSmallTableImpl(nullptr, std::move(Facts), std::move(Opts));
+}
+
+Error EJit::enableSmallTable(const detail::OwnerWorkerContext &Worker,
+                             std::shared_ptr<EJitSmallTableFactSource> Facts,
+                             EJitSmallTableHost::Options Opts) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *Pool = sharedTaskPool();
+  if (!Pool || !Worker.validFor(*Pool))
+    return make_error<StringError>("small-table enable has a stale worker context",
+                                   inconvertibleErrorCode());
+#else
+  (void)Worker;
+  return make_error<StringError>(
+      "small-table worker context requires the shared taskpool",
+      inconvertibleErrorCode());
+#endif
+  return enableSmallTableImpl(&Worker, std::move(Facts), std::move(Opts));
+}
+
+Error EJit::enableSmallTableImpl(
+    const detail::OwnerWorkerContext *Worker,
+    std::shared_ptr<EJitSmallTableFactSource> Facts,
+    EJitSmallTableHost::Options Opts) {
   if (smallTableHost_) {
     if (smallTableHost_->facts() == Facts)
       return Error::success();
@@ -434,7 +459,10 @@ Error EJit::enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
       sp->retireDispatchCache();
 #endif
   });
-  EJitSmallTableHost::installGlobal(smallTableHost_.get());
+  if (Worker)
+    EJitSmallTableHost::installGlobal(*Worker, smallTableHost_.get());
+  else
+    EJitSmallTableHost::installGlobal(smallTableHost_.get());
   EJIT_DIAG("small-table normal path enabled: provider=%s",
             smallTableHost_->runtime().providerLabel().str().c_str());
   return Error::success();
@@ -446,6 +474,25 @@ EJit::runControlOnOwnerAndWait(std::function<void()> Work, uint32_t WaitRounds) 
   return compileDriver_
              ? compileDriver_->sharedTaskPool()->runControlOnOwnerAndWait(
                    std::move(Work), WaitRounds)
+             : EJitSharedTaskPool::OwnerControlResult{};
+}
+
+EJitSharedTaskPool::OwnerControlResult EJit::runControlOnOwnerAndWait(
+    std::function<void(const detail::OwnerWorkerContext &)> Work,
+    uint32_t WaitRounds) {
+  return compileDriver_
+             ? compileDriver_->sharedTaskPool()->runControlOnOwnerAndWait(
+                   std::move(Work), WaitRounds)
+             : EJitSharedTaskPool::OwnerControlResult{};
+}
+
+EJitSharedTaskPool::OwnerControlResult EJit::runControlOnOwnerAndWait(
+    const detail::OwnerWorkerContext &Worker,
+    std::function<void(const detail::OwnerWorkerContext &)> Work,
+    uint32_t WaitRounds) {
+  return compileDriver_
+             ? compileDriver_->sharedTaskPool()->runControlOnOwnerAndWait(
+                   Worker, std::move(Work), WaitRounds)
              : EJitSharedTaskPool::OwnerControlResult{};
 }
 
@@ -462,9 +509,40 @@ bool EJit::abortFunctionPgoOnOwner(uint32_t FuncIndex) {
          compileDriver_->abortFunctionPgoOnOwner(FuncIndex);
 #endif
 }
+
+bool EJit::abortFunctionPgoOnOwner(
+    const detail::OwnerWorkerContext &Worker, uint32_t FuncIndex) {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  (void)Worker;
+  EJIT_DIAG("small-table handoff refused func=%u: VP generation bridge missing",
+            FuncIndex);
+  return false;
+#else
+  return compileDriver_ &&
+         compileDriver_->sharedTaskPool()->abortFunctionPgoOnOwner(Worker,
+                                                                    FuncIndex) &&
+         compileDriver_->abortFunctionPgoOnOwner(Worker, FuncIndex);
+#endif
+}
 #endif
 
 void EJit::disableSmallTable() {
+  disableSmallTableImpl(nullptr);
+}
+
+void EJit::disableSmallTable(const detail::OwnerWorkerContext &Worker) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *Pool = sharedTaskPool();
+  if (!Pool || !Worker.activeFor(*Pool))
+    return;
+#else
+  (void)Worker;
+  return;
+#endif
+  disableSmallTableImpl(&Worker);
+}
+
+void EJit::disableSmallTableImpl(const detail::OwnerWorkerContext *Worker) {
   if (!smallTableHost_)
     return;
   // The host performs the logical teardown itself (uninstall the global gate,
@@ -474,7 +552,10 @@ void EJit::disableSmallTable() {
   // addresses that call is reading, so ownership moves to the process-global
   // retired-owner registry and the object lives until its last execution
   // returns. `ejit_stab_leave` delivers that completion to the retained owner.
-  if (!smallTableHost_->beginOwnerTeardown()) {
+  const bool Destroyed =
+      Worker ? smallTableHost_->beginOwnerTeardown(*Worker)
+             : smallTableHost_->beginOwnerTeardown();
+  if (!Destroyed) {
     EJitSmallTableHost::adoptRetired(std::move(smallTableHost_));
     return;
   }

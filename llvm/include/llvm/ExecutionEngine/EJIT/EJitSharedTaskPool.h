@@ -49,6 +49,11 @@ namespace llvm {
 namespace ejit {
 
 class EJitModuleLoader;
+class EJit;
+class EJitCompileDriver;
+namespace detail {
+class OwnerWorkerContext;
+}
 
 //===----------------------------------------------------------------------===//
 // Read-only diagnostics snapshot (spec §11 observability). Every field is a
@@ -61,7 +66,8 @@ struct EJitSharedDiagnostics {
   uint32_t lastInitError; ///< error code recorded on Failed
   uint32_t initAttempts;  ///< total election attempts
   uint32_t codeSharingEnabled;
-  uint64_t workerTaskId;
+  uint64_t workerTaskId; ///< Legacy worker-start marker; not necessarily an SDK
+                         ///< task ID.
   uint64_t registrationFingerprint;
   uint32_t queueDepth;      ///< approximate in-ring requests
   uint32_t pendingCount;    ///< in-flight dedup slots
@@ -496,12 +502,14 @@ public:
   /// completion and report deadlineExceeded; never abandon its live captures.
   OwnerControlResult runControlOnOwnerAndWait(
       std::function<void()> Work, uint32_t WaitRounds = 1u << 20);
+  /// Kept for source compatibility; no implicit/global identity is trusted.
   bool isCurrentOwnerWorker() const;
   using WorkerIdentityFn = bool (*)(void *);
-  /// Freestanding needs actual task identity; a core id is not sufficient.
+  /// Legacy compatibility hook. Identity callbacks are no longer used for
+  /// authorization; the worker capability is passed explicitly instead.
   void setWorkerIdentityCallback(WorkerIdentityFn Fn, void *Ctx) {
-    workerIdentityFn_ = Fn;
-    workerIdentityCtx_ = Ctx;
+    (void)Fn;
+    (void)Ctx;
   }
   using FunctionOwnershipGateFn = bool (*)(void *, uint32_t);
   /// true permits ordinary dispatch/compile; false denotes pending/owned.
@@ -901,9 +909,10 @@ public:
       return false;
     if (state_->ownerCoreId.loadAcquire() == kEJitInvalidCoreId)
       return false;
-    // Published only after a successful worker start, cleared by
-    // ownerShutdown: the one field separating "a worker is running" from "the
-    // blob merely looks Ready".
+    // The owner publishes the worker-start callback's nonzero marker only
+    // after that callback succeeds. Some platforms provide no numeric task ID
+    // and use a readiness sentinel instead. This is shared readiness evidence
+    // for peers, not caller identity; Bridge SDK task identity is separate.
     if (state_->workerTaskId.loadAcquire() == 0)
       return false;
     // Re-validate: an ownerShutdown concurrent with the reads above moves the
@@ -1172,9 +1181,8 @@ public:
   /// for the owner to complete the diagnostic and returns its success status.
   bool requestMayConstRanking();
 
-  /// The worker loop body: poll until the shared state leaves Ready. Public so
-  /// an injected task entry can forward to it; normally reached via
-  /// WorkerEntry.
+  /// Compatibility symbol only. It refuses to enter the worker loop because
+  /// no explicit worker-entry context can be inferred from the caller.
   void runWorkerLoop();
 
   /// One step of the worker state machine. Public so a deterministic test can
@@ -1197,8 +1205,28 @@ public:
   uint64_t workerIdleYields() const { return workerIdleYields_.loadRelaxed(); }
 
 private:
+  friend struct EJitSharedTaskPoolTestAccess;
+  friend class detail::OwnerWorkerContext;
+  friend class EJit;
+  friend class EJitCompileDriver;
+  OwnerControlResult runControlOnOwnerAndWait(
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  OwnerControlResult runControlOnOwnerAndWait(
+      const detail::OwnerWorkerContext &Worker,
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  bool isCurrentOwnerWorker(const detail::OwnerWorkerContext &Worker) const;
+  bool isWorkerContextActive(const detail::OwnerWorkerContext &Worker) const;
+  bool abortFunctionPgoOnOwner(const detail::OwnerWorkerContext &Worker,
+                               uint32_t FuncIndex);
   static void workerEntryThunk(void *ctx);
-  bool serviceOwnerControl();
+  void runWorkerLoop(const detail::OwnerWorkerContext &Worker);
+  bool serviceOwnerControl(const detail::OwnerWorkerContext &Worker);
+  EJitWorkerStep workerPollOnceInternal(
+      const detail::OwnerWorkerContext *Worker);
+  bool matchesWorkerContext(const detail::OwnerWorkerContext &Worker) const;
+  uint64_t nextWorkerContextEpoch();
   void cancelQueuedOwnerControl();
   bool ordinaryFunctionAllowed(uint32_t FuncIndex) const {
     return !functionOwnershipGateFn_ ||
@@ -1479,15 +1507,15 @@ private:
   struct OwnerControlJob {
     enum : uint32_t { Queued, Started, Done, Cancelled };
     std::atomic<uint32_t> state{Queued};
-    std::function<void()> work;
-    explicit OwnerControlJob(std::function<void()> Work)
+    std::function<void(const detail::OwnerWorkerContext &)> work;
+    explicit OwnerControlJob(
+        std::function<void(const detail::OwnerWorkerContext &)> Work)
         : work(std::move(Work)) {}
   };
   EJitAtomicU32 ownerControlLock_{0};
   std::shared_ptr<OwnerControlJob> ownerControl_;
   std::atomic<bool> workerLoopActive_{false};
-  WorkerIdentityFn workerIdentityFn_ = nullptr;
-  void *workerIdentityCtx_ = nullptr;
+  std::atomic<uint64_t> activeWorkerContextEpoch_{0};
   FunctionOwnershipGateFn functionOwnershipGateFn_ = nullptr;
   void *functionOwnershipGateCtx_ = nullptr;
   std::vector<EJitCompileRequest> deferredControlRequests_;

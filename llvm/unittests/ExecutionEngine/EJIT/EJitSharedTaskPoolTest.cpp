@@ -17,6 +17,9 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
+#include "EJitSharedTaskPoolTestAccess.h"
+#include "../../../lib/ExecutionEngine/EJIT/EJitOwnerWorkerContext.h"
+#include "../../../lib/ExecutionEngine/EJIT/EJitSmallTableSreBridgeInternal.h"
 #include "gtest/gtest.h"
 #include <algorithm>
 #include <atomic>
@@ -31,6 +34,29 @@
 #include <vector>
 
 using namespace llvm::ejit;
+
+#if defined(EJIT_SRE_TASKPOOL_TESTING)
+// This standalone target compiles the pool directly and links only Support.
+// It deliberately has no runtime facade, Host, ORC engine or C bridge policy.
+// Keep those external seams absent rather than manufacturing a runtime/pin or
+// pretending that the mock compiler below exercised real PGO/code execution.
+namespace llvm::ejit {
+EJit *acquireSmallTableSreRuntime(EJitSharedTaskPool *) { return nullptr; }
+void releaseSmallTableSreRuntime(
+    EJit *Runtime, const llvm::ejit::detail::OwnerWorkerContext &) {
+  if (Runtime)
+    ADD_FAILURE() << "standalone scheduler tests cannot own a facade pin";
+}
+void smallTableSreWorkerEnter(
+    EJitSharedTaskPool &, const llvm::ejit::detail::OwnerWorkerContext &) {}
+bool serviceSmallTableSreBridge(
+    EJitSharedTaskPool &, const llvm::ejit::detail::OwnerWorkerContext &) {
+  return false;
+}
+void smallTableSreWorkerExit(
+    EJitSharedTaskPool &, const llvm::ejit::detail::OwnerWorkerContext &) {}
+} // namespace llvm::ejit
+#endif
 
 #if defined(_WIN32)
 // COFF retains the diagnostic dump routine from the directly compiled
@@ -1386,7 +1412,7 @@ TEST_F(SharedTaskPoolTest, BatchPgoFourTier2CompilesRetainWorkerThrottle) {
   Batch.recordTimeline = true;
   BatchTimelineIdleCtx Idle{&Batch, state_.get()};
   Owner.setWorkerIdleHook(&mockBatchTimelineIdle, &Idle);
-  Owner.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(Owner);
 
   // C=compile, D=worker throttle, F=enable_ex/cache publication. There must be
   // a scheduling gap between every Tier-2 compile and after publication.
@@ -1469,7 +1495,7 @@ TEST_F(SharedTaskPoolTest, BatchPgoTwentyFunctionsRunInFiveThrottledWaves) {
     ASSERT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
               EJitCompileOrGetStatus::EnqueuedPending);
 
-  Owner.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(Owner);
 
   std::string Expected;
   for (unsigned Wave = 0; Wave != 5; ++Wave) {
@@ -2145,7 +2171,7 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntrySurvivesInitializingAndConsumes) {
   // Simulate the SRE task being scheduled BEFORE the owner published Ready.
   state_->initState.storeRelease(
       static_cast<uint32_t>(EJitSharedInitState::Initializing));
-  pool.runWorkerLoop(); // REAL entry; the idle script drives the transitions.
+  EJitSharedTaskPoolTestAccess::runRealWorker(pool); // Same actual trampoline.
 
   EXPECT_GE(script.initializingYields,
             3); // yielded (not exited) on Initializing
@@ -2178,7 +2204,7 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntryConsumesThenStops) {
   for (uint32_t f = 1; f <= 3; ++f)
     ASSERT_EQ(pool.compileOrGet(f, nullptr, 0, codeFor(f)).status,
               EJitCompileOrGetStatus::EnqueuedPending);
-  pool.runWorkerLoop(); // REAL entry: consumes 3 then sees Stopping → exits.
+  EJitSharedTaskPoolTestAccess::runRealWorker(pool); // Same actual trampoline.
   EXPECT_GE(pool.workerConsumeLoops(), 3u);
   EJitSharedDiagnostics d;
   pool.getDiagnostics(d);
@@ -2199,7 +2225,7 @@ TEST_F(SharedTaskPoolTest, RealWorkerThrottlesBetweenConsumedRequests) {
               EJitCompileOrGetStatus::EnqueuedPending);
 
   uint64_t before = pool.workerIdleYields();
-  pool.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(pool);
   EXPECT_GE(pool.workerConsumeLoops(), 3u);
   EXPECT_GT(pool.workerIdleYields(), before);
 }
@@ -7409,20 +7435,34 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
 // This fixture starts the actual production worker loop on a real host thread.
 // Its idle pause is worker-only; a requester yielding while waiting cannot
 // accidentally service its own job or enter that pause.
+static_assert(!std::is_default_constructible<llvm::ejit::detail::OwnerWorkerContext>::value,
+              "ordinary callers cannot manufacture a worker capability");
+static_assert(!std::is_copy_constructible<llvm::ejit::detail::OwnerWorkerContext>::value &&
+                  !std::is_move_constructible<llvm::ejit::detail::OwnerWorkerContext>::value,
+              "production capabilities cannot be copied or moved to callers");
 struct ControlWorker {
   EJitSharedTaskPool *pool = nullptr;
   std::thread thread;
+  std::thread::id workerThreadId;
+  uint32_t core = 0;
+  std::atomic<bool> threadReady{false};
   std::atomic<bool> pause{false};
   std::atomic<bool> paused{false};
   std::atomic<bool> pauseExpired{false};
   static bool start(void *Context, EJitSharedTaskPool::WorkerEntryFn Entry,
                     void *EntryContext, uint64_t *TaskId) {
     auto &Self = *static_cast<ControlWorker *>(Context);
-    Self.thread = std::thread([Entry, EntryContext] {
-      EJitCoreId::setCurrentForTest(0);
+    Self.threadReady.store(false, std::memory_order_relaxed);
+    Self.thread = std::thread([&Self, Entry, EntryContext] {
+      // Publish the real std::thread handle before the idle hook reads it.
+      while (!Self.threadReady.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      EJitCoreId::setCurrentForTest(Self.core);
       Entry(EntryContext);
     });
-    *TaskId = 1;
+    Self.workerThreadId = Self.thread.get_id();
+    Self.threadReady.store(true, std::memory_order_release);
+    *TaskId = 0; // SDK task identity is genuinely unknown, not a made-up PID.
     return true;
   }
   static void stop(void *Context) {
@@ -7433,7 +7473,7 @@ struct ControlWorker {
   }
   static void idle(void *Context, uint32_t) {
     auto &Self = *static_cast<ControlWorker *>(Context);
-    if (Self.pool->isCurrentOwnerWorker() && Self.pause.load()) {
+    if (std::this_thread::get_id() == Self.workerThreadId && Self.pause.load()) {
       const auto Deadline = std::chrono::steady_clock::now() +
                             std::chrono::seconds(5);
       Self.paused.store(true, std::memory_order_release);
@@ -7471,17 +7511,207 @@ TEST_F(SharedTaskPoolTest, OwnerControlRunsOnRealWorkerIncludingNestedJob) {
   const auto Requester = std::this_thread::get_id();
   std::thread::id Executed, Nested;
   EJitSharedTaskPool::OwnerControlResult NestedResult;
-  auto Result = Owner.runControlOnOwnerAndWait([&] {
-    Executed = std::this_thread::get_id();
-    NestedResult = Owner.runControlOnOwnerAndWait(
-        [&] { Nested = std::this_thread::get_id(); }, 0);
-  });
+  auto Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        EXPECT_TRUE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Owner, Context));
+        EXPECT_FALSE(Owner.isCurrentOwnerWorker());
+        Executed = std::this_thread::get_id();
+        NestedResult = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+            Owner, Context,
+            [&](const llvm::ejit::detail::OwnerWorkerContext &NestedContext) {
+              EXPECT_EQ(&NestedContext, &Context);
+              EXPECT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+                  Owner, NestedContext));
+              Nested = std::this_thread::get_id();
+            },
+            0);
+      });
   EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
   EXPECT_NE(Executed, Requester);
   EXPECT_EQ(Executed, Worker.thread.get_id());
   EXPECT_EQ(Nested, Executed);
   EXPECT_EQ(NestedResult.status,
             EJitSharedTaskPool::OwnerControlStatus::Completed);
+  Owner.ownerShutdown();
+}
+
+TEST_F(SharedTaskPoolTest, SameCoreShellWithoutContextStillQueuesToRealWorker) {
+  ControlWorker Worker;
+  Worker.core = 6;
+  Worker.pause.store(true);
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  EJitCoreId::setCurrentForTest(6);
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_TRUE(waitForControl([&] { return Worker.paused.load(); }));
+  EXPECT_FALSE(Owner.isCurrentOwnerWorker())
+      << "a shell sharing the worker core has no worker-entry capability";
+  EXPECT_EQ(state_->workerTaskId.loadAcquire(), 0u);
+  std::atomic<uint32_t> Calls{0};
+  auto Cancelled = Owner.runControlOnOwnerAndWait([&] { ++Calls; }, 4);
+  EXPECT_EQ(Cancelled.status,
+            EJitSharedTaskPool::OwnerControlStatus::CancelledBeforeStart);
+  EXPECT_TRUE(Cancelled.deadlineExceeded);
+  EXPECT_EQ(Calls.load(), 0u) << "same-core caller must not execute inline";
+  Worker.pause.store(false, std::memory_order_release);
+  std::thread::id Executed;
+  uint32_t ExecutedCore = kEJitInvalidCoreId;
+  EJitSharedTaskPool::OwnerControlResult Completed;
+  // The paused worker must first remove the cancelled queued job. Retry only
+  // the busy/rejected enqueue; the callback is still required to run once.
+  EXPECT_TRUE(waitForControl([&] {
+    Completed = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          EXPECT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              Owner, Context));
+          Executed = std::this_thread::get_id();
+          ExecutedCore = EJitCoreId::current();
+          ++Calls;
+        });
+    return Completed.status != EJitSharedTaskPool::OwnerControlStatus::Rejected;
+  }));
+  EXPECT_EQ(Completed.status,
+            EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(Executed, Worker.thread.get_id());
+  EXPECT_NE(Executed, std::this_thread::get_id());
+  EXPECT_EQ(ExecutedCore, 6u);
+  EXPECT_EQ(Calls.load(), 1u);
+  Owner.ownerShutdown();
+  EXPECT_FALSE(Worker.pauseExpired.load());
+}
+
+TEST_F(SharedTaskPoolTest, WorkerContextCannotAuthorizeAnotherPool) {
+  ControlWorker Worker, OtherWorker;
+  EJitSharedTaskPool Owner, Other;
+  auto OtherState = std::make_unique<EJitSharedTaskPoolState>();
+  Other.bind(OtherState.get());
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  OtherWorker.pool = &Other;
+  OtherWorker.core = 1;
+  Other.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &OtherWorker);
+  Other.setWorkerIdleHook(ControlWorker::idle, &OtherWorker);
+  EJitCoreId::setCurrentForTest(1);
+  auto OtherInit = Other.init();
+  EXPECT_EQ(OtherInit, EJitSharedTaskPool::InitResult::BecameOwner);
+  EJitCoreId::setCurrentForTest(0);
+  if (OtherInit != EJitSharedTaskPool::InitResult::BecameOwner) {
+    Owner.ownerShutdown();
+    return;
+  }
+  EXPECT_EQ(EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+                Other,
+                [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+                  EXPECT_TRUE(
+                      EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+                          Other, Context));
+                })
+                .status,
+            EJitSharedTaskPool::OwnerControlStatus::Completed);
+  unsigned ForeignCalls = 0;
+  EJitSharedTaskPool::OwnerControlResult Foreign;
+  auto Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        EXPECT_TRUE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Owner, Context));
+        EXPECT_FALSE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Other, Context));
+        Foreign = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+            Other, Context,
+            [&](const llvm::ejit::detail::OwnerWorkerContext &) { ++ForeignCalls; }, 0);
+        EXPECT_FALSE(EJitSharedTaskPoolTestAccess::abortFunctionPgoOnOwner(
+            Other, Context, 5));
+      });
+  EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(Foreign.status, EJitSharedTaskPool::OwnerControlStatus::Rejected);
+  EXPECT_EQ(ForeignCalls, 0u);
+  Other.ownerShutdown();
+  Owner.ownerShutdown();
+}
+
+TEST_F(SharedTaskPoolTest,
+       WorkerContextInvalidatesDuringShutdownAndRestartUsesNewGeneration) {
+  ControlWorker Worker;
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  const uint32_t FirstGeneration = state_->generation.loadAcquire();
+  std::atomic<bool> Started{false}, ObservedStopping{false}, Expired{false};
+  unsigned NestedCalls = 0;
+  std::unique_ptr<llvm::ejit::detail::OwnerWorkerContext> StaleContext;
+  EJitSharedTaskPool::OwnerControlResult Outer, Nested;
+  std::thread Requester([&] {
+    Outer = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          EXPECT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              Owner, Context));
+          StaleContext =
+              EJitSharedTaskPoolTestAccess::cloneForStaleValidation(Context);
+          Started.store(true, std::memory_order_release);
+          if (!waitForControl([&] {
+                return state_->initState.loadAcquire() ==
+                       static_cast<uint32_t>(EJitSharedInitState::Stopping);
+              })) {
+            Expired.store(true);
+            return;
+          }
+          // The context is still a live stack object here, not a saved pointer
+          // dereferenced after the old worker has exited.
+          ObservedStopping.store(true, std::memory_order_release);
+          EXPECT_FALSE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              Owner, Context));
+          EXPECT_FALSE(StaleContext->validFor(Owner));
+          Nested = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+              Owner, Context,
+              [&](const llvm::ejit::detail::OwnerWorkerContext &) { ++NestedCalls; }, 0);
+        });
+  });
+  EXPECT_TRUE(waitForControl([&] { return Started.load(); }));
+  Owner.ownerShutdown(); // joins the actual callback and its worker-entry stack
+  Requester.join();
+  EXPECT_FALSE(Expired.load());
+  EXPECT_TRUE(ObservedStopping.load());
+  EXPECT_EQ(Outer.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(Nested.status, EJitSharedTaskPool::OwnerControlStatus::Rejected);
+  EXPECT_EQ(NestedCalls, 0u);
+  EXPECT_GT(state_->generation.loadAcquire(), FirstGeneration);
+  ASSERT_NE(StaleContext, nullptr);
+  EXPECT_FALSE(StaleContext->validFor(Owner));
+  EXPECT_FALSE(StaleContext->activeFor(Owner));
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  const uint32_t RestartGeneration = state_->generation.loadAcquire();
+  EXPECT_GT(RestartGeneration, FirstGeneration);
+  unsigned RestartCalls = 0;
+  unsigned StaleCalls = 0;
+  EJitSharedTaskPool::OwnerControlResult StaleResult;
+  auto Restart = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        EXPECT_TRUE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Owner, Context));
+        EXPECT_EQ(state_->generation.loadAcquire(), RestartGeneration);
+        EXPECT_FALSE(StaleContext->validFor(Owner));
+        EXPECT_FALSE(StaleContext->activeFor(Owner));
+        StaleResult = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+            Owner, *StaleContext,
+            [&](const llvm::ejit::detail::OwnerWorkerContext &) { ++StaleCalls; }, 0);
+        ++RestartCalls;
+      });
+  EXPECT_EQ(Restart.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(RestartCalls, 1u);
+  EXPECT_EQ(StaleResult.status,
+            EJitSharedTaskPool::OwnerControlStatus::Rejected);
+  EXPECT_EQ(StaleCalls, 0u);
+  EXPECT_EQ(state_->workerTaskId.loadAcquire(), 0u);
   Owner.ownerShutdown();
 }
 
@@ -7599,10 +7829,12 @@ TEST_F(SharedTaskPoolTest,
   uint32_t ForeignStillPending = 0;
   EJitSharedTaskPool::OwnerControlResult Result;
   std::thread Requester([&] {
-    Result = Owner.runControlOnOwnerAndWait([&] {
-      Aborted = Owner.abortFunctionPgoOnOwner(5);
-      ForeignStillPending = state_->inFlight[6].loadAcquire();
-    });
+    Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          Aborted = EJitSharedTaskPoolTestAccess::abortFunctionPgoOnOwner(
+              Owner, Context, 5);
+          ForeignStillPending = state_->inFlight[6].loadAcquire();
+        });
   });
   EXPECT_TRUE(waitForControl([&] { return Queued.load(); }));
   Worker.pause.store(false);
@@ -7724,8 +7956,11 @@ TEST_F(SharedTaskPoolTest,
   // it relinquish that writer and service control without the old real leave.
   Blocked.store(5, std::memory_order_release);
   bool Aborted = false;
-  auto Result = Owner.runControlOnOwnerAndWait(
-      [&] { Aborted = Owner.abortFunctionPgoOnOwner(5); });
+  auto Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        Aborted = EJitSharedTaskPoolTestAccess::abortFunctionPgoOnOwner(
+            Owner, Context, 5);
+      });
   EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
   EXPECT_TRUE(Aborted);
   EXPECT_EQ(state_->buckets[BucketIndex].writeFlag.loadAcquire(), 0u);

@@ -106,6 +106,8 @@ public:
   /// Owner-only orderly shutdown of the shared worker (soft-stop + join).
   void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
   bool abortFunctionPgoOnOwner(uint32_t FuncIndex);
+  bool abortFunctionPgoOnOwner(const detail::OwnerWorkerContext &Worker,
+                               uint32_t FuncIndex);
 #endif
 
   EJitRuntimeState &getRuntimeState() { return runtimeState_; }

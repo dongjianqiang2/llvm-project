@@ -3,6 +3,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableSreBridge.h"
 #include "EJitSmallTableSreBridgeInternal.h"
+#include "EJitOwnerWorkerContext.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
@@ -98,9 +99,12 @@ void copyText(char *To, size_t Capacity, StringRef Text) {
   To[N] = 0;
 }
 void delay() { LocalBindings.delay_ticks(LocalBindings.context, 1); }
-bool isActualBridgeWorker(void *Pool) {
-  return LocalWorkerPool == Pool && LocalWorkerTask && load32(&LocalPrepared) &&
-         LocalBindings.current_task_id(LocalBindings.context) == LocalWorkerTask;
+bool isActualBridgeWorker(EJitSharedTaskPool &Pool,
+                          const llvm::ejit::detail::OwnerWorkerContext &Worker) {
+  // Only the private worker-entry context authorizes owner operations. An
+  // optional SDK task ID is diagnostic data, not a shell/worker fast path.
+  return LocalWorkerPool == &Pool && load32(&LocalPrepared) &&
+         Worker.validFor(Pool);
 }
 bool dataReady(uintptr_t Address, uint64_t Bytes, uint32_t Access) {
   return Address && Bytes && Bytes <= UINTPTR_MAX - Address &&
@@ -190,6 +194,7 @@ private:
 struct Lease {
   uint64_t ticket = 0;
   uint64_t hostTicket = 0;
+  uint64_t pendingHostTicket = 0;
   uint64_t epoch = 0;
   uint64_t ownerIdentity = 0;
   uint32_t generation = 0;
@@ -222,7 +227,7 @@ Lease *lease(uint64_t Ticket) {
       return &L;
   return nullptr;
 }
-void closeLease(Lease &L) {
+bool closeLease(Lease &L, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
   OwnerControl &O = owner();
   if (!O.retirementObserved && O.runtime == L.runtime &&
       smallTableSreLocalRuntime() != L.runtime) {
@@ -233,16 +238,27 @@ void closeLease(Lease &L) {
     // cancel itself cannot release an in-flight borrow/table/code generation.
     O.retirementObserved = true;
     if (auto *Host = O.runtime->smallTableHost())
-      Host->cancel("SRE facade logically shut down; exact physical leave follows");
+      Host->cancel(Worker,
+                   "SRE facade logically shut down; exact physical leave follows");
+  }
+  // Route through the authenticated owner-local retained registry. A refused
+  // close is NOT an actual completion: retain the exact shared token, Host
+  // ticket and facade pin rather than reclaiming a still-live generation.
+  if (L.pendingHostTicket) {
+    if (!smallTableSreLeaveHostTicket(Worker, L.host, L.pendingHostTicket))
+      return false;
+    L.pendingHostTicket = 0;
+  }
+  if (L.hostTicket) {
+    if (!smallTableSreLeaveHostTicket(Worker, L.host, L.hostTicket)) return false;
+    L.hostTicket = 0;
   }
   store64(&Shared.leaseTokens[static_cast<size_t>(&L - owner().leases)], 0);
-  // Route through the owner-local retained registry; cancellation did not leave.
-  if (L.hostTicket)
-    ejit_stab_leave(L.hostTicket);
   EJit *Runtime = L.runtime;
   L = Lease();
   if (Runtime)
-    releaseSmallTableSreRuntime(Runtime);
+    releaseSmallTableSreRuntime(Runtime, Worker);
+  return true;
 }
 #ifdef EJIT_SRE_CODE_POOL
 uint64_t freshTicket() {
@@ -343,7 +359,7 @@ bool validateProfile(const EJitSmallTableProfileBundle &Bundle,
   return true;
 }
 
-int setupRequest(Command &C) {
+int setupRequest(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
   const auto &R = C.request;
   if (R.abiVersion != EJIT_STAB_SRE_ABI_VERSION || R.structSize != sizeof(R) ||
       !boundedString(R.entryName, sizeof(R.entryName)) ||
@@ -357,8 +373,9 @@ int setupRequest(Command &C) {
       !dataReady(R.sourceAddress, R.sourceBytes, EJIT_STAB_SRE_DATA_READ))
     return fail(C, EJIT_STAB_SRE_INVALID, "invalid SRE request or shared-source mapping");
   EJit *Runtime = smallTableSreLocalRuntime();
-  if (!Runtime || Runtime->sharedTaskPool() != LocalWorkerPool ||
-      !LocalWorkerPool->isCurrentOwnerWorker())
+  if (!Runtime || !LocalWorkerPool ||
+      Runtime->sharedTaskPool() != LocalWorkerPool ||
+      !isActualBridgeWorker(*LocalWorkerPool, Worker))
     return fail(C, EJIT_STAB_SRE_BLOCKED, "SRE request is not on the real live owner worker");
   const uint32_t Func = EJitFuncRegistry::instance().lookup(R.entryName);
   if (Func >= EJitFuncRegistry::instance().count() ||
@@ -413,7 +430,7 @@ int setupRequest(Command &C) {
   OwnerControl &O = owner();
   // Logical teardown parks old executions in the EXISTING retained-owner
   // registry. Their opaque bridge leases still name their exact physical call.
-  Runtime->disableSmallTable();
+  Runtime->disableSmallTable(Worker);
   O.runtime = Runtime;
   O.facts = std::move(Facts);
   O.fullProfileValid = false;
@@ -428,7 +445,7 @@ int setupRequest(Command &C) {
   EJitSmallTableHost::Options Opts;
   Opts.runtime.sampling.aggregateLimit = R.sampleLimit;
   Opts.runtime.sampling.freezeWaitMillis = 1;
-  if (Error E = Runtime->enableSmallTable(O.facts, Opts)) {
+  if (Error E = Runtime->enableSmallTable(Worker, O.facts, Opts)) {
     return fail(C, EJIT_STAB_SRE_BLOCKED, toString(std::move(E)));
   }
   auto *Host = Runtime->smallTableHost();
@@ -441,9 +458,10 @@ int setupRequest(Command &C) {
   Req.dimPeriodNames = Periods;
   Req.codeGeneration = R.codeGeneration;
   std::string Why;
-  if (Error E = Host->requestEntry(Req, reinterpret_cast<void *>(R.aotEntry), Why)) {
+  if (Error E = Host->requestEntry(Worker, Req,
+                                  reinterpret_cast<void *>(R.aotEntry), Why)) {
     const std::string Detail = toString(std::move(E));
-    Runtime->disableSmallTable();
+    Runtime->disableSmallTable(Worker);
     return fail(C, EJIT_STAB_SRE_FAILED, Detail);
   }
   auto &Engine = Host->runtime().engine();
@@ -459,7 +477,7 @@ int setupRequest(Command &C) {
     if (Canonical.empty() || !Counts || !Data) {
       if (!Counts) consumeError(Counts.takeError());
       if (!Data) consumeError(Data.takeError());
-      Host->cancel("SRE exact counter inventory could not be resolved");
+      Host->cancel(Worker, "SRE exact counter inventory could not be resolved");
       return fail(C, EJIT_STAB_SRE_FAILED, "missing real common counter/data pair or canonical name");
     }
     const auto *Header = reinterpret_cast<const RawInstrProf::ProfileData<uintptr_t> *>(*Data);
@@ -473,7 +491,7 @@ int setupRequest(Command &C) {
     O.counterRefs[I].pgoName = O.counterNames[I].c_str();
   C.function = Func;
   C.result = EJIT_STAB_SRE_OK;
-  EJIT_DIAG("small-table SRE common T1 requested func=%u members=%u budget=%llu actual_worker_task=%llu",
+  EJIT_DIAG("small-table SRE common T1 requested func=%u members=%u budget=%llu owner_context=worker sdk_worker_task=%llu",
             Func, R.numMembers, (unsigned long long)R.sampleLimit,
             (unsigned long long)LocalWorkerTask);
   return C.result;
@@ -527,7 +545,7 @@ int snapshot(Command &C) {
   return C.result;
 }
 
-int finish(Command &C) {
+int finish(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
   OwnerControl &O = owner();
   auto *Host = O.runtime ? O.runtime->smallTableHost() : nullptr;
   if (!Host || !functionMatches(C.function))
@@ -547,18 +565,19 @@ int finish(Command &C) {
   auto Bundle = Host->runtime().freeze(Why);
   if (!Bundle) return fail(C, EJIT_STAB_SRE_FAILED, toString(Bundle.takeError()));
   if (!validateProfile(**Bundle, C.snapshot, Why)) {
-    Host->cancel(Why);
+    Host->cancel(Worker, Why);
     return fail(C, EJIT_STAB_SRE_FAILED, Why);
   }
   O.frozen = C.snapshot;
   O.frozen.profileBytes = (*Bundle)->profileData.size();
-  if (Error E = Host->publishGeneration(Why))
+  if (Error E = Host->publishGeneration(Worker, Why))
     return fail(C, EJIT_STAB_SRE_FAILED, toString(std::move(E)));
   uint64_t ActualEntryCount = 0;
   if (!Host->runtime().engine().getFunctionProfileEntryCount(
           Host->entryName(), ActualEntryCount) ||
       ActualEntryCount != (*Bundle)->sampleCount) {
-    Host->cancel("actual PGOUse entry metadata is missing or differs from complete T1 samples");
+    Host->cancel(Worker,
+                 "actual PGOUse entry metadata is missing or differs from complete T1 samples");
     return fail(C, EJIT_STAB_SRE_FAILED,
                 "actual PGOUse entry metadata is missing or differs from complete T1 samples");
   }
@@ -572,11 +591,13 @@ int finish(Command &C) {
   return snapshot(C);
 }
 
-int prepareExecution(Command &C) {
+int prepareExecution(Command &C,
+                     const llvm::ejit::detail::OwnerWorkerContext &Worker) {
 #ifndef EJIT_SRE_CODE_POOL
   // The bridge needs the actual pool-owned finalized range for caller
   // permissions. Shared taskpool alone does not provide these engine APIs;
   // do not acquire a lease or pretend non-pool code has been prepared.
+  (void)Worker;
   return fail(C, EJIT_STAB_SRE_BLOCKED,
               "common SRE execution requires EJIT_SRE_CODE_POOL");
 #else
@@ -594,62 +615,69 @@ int prepareExecution(Command &C) {
   if (!L) return fail(C, EJIT_STAB_SRE_BUSY, "bounded common execution lease capacity exhausted");
   const char *Why = nullptr;
   uint32_t Versions[4] = {}, Generation = 0;
-  if (!smallTableSreValidateOwnerCall(C.function, C.dims, C.numDims,
+  if (!smallTableSreValidateOwnerCall(Worker, C.function, C.dims, C.numDims,
                                      C.bounds, C.boundCount, Versions, Generation, Why))
     return fail(C, EJIT_STAB_SRE_BLOCKED, Why);
   SmallVector<uint32_t, 4> Types, Instances;
   for (uint32_t I = 0; I < C.numDims; ++I) {
     Types.push_back(C.dims[I].dimType); Instances.push_back(C.dims[I].instanceId);
   }
+  // Pin the facade BEFORE a product borrow callback can make a real Host
+  // preparation ticket. Even a refused exact close must retain its original
+  // worker and physical generation rather than leave an untracked Host pin.
+  const uint64_t Token = freshTicket();
+  if (!Token || !retainSmallTableSreRuntime(Runtime))
+    return fail(C, EJIT_STAB_SRE_BLOCKED, "common physical runtime pin was refused");
+  L->ticket = Token;
+  L->runtime = Runtime; L->host = Host;
+  L->generation = Generation; L->function = C.function;
+  L->ownerIdentity = currentEJitRuntimeOwnerIdentity();
+  L->ownerCore = Runtime->sharedTaskPool()->state()->ownerCoreId.loadAcquire();
+  store64(&Shared.leaseTokens[static_cast<size_t>(L - O.leases)], Token);
+  C.ticket = Token;
+  const auto RefusePreparation = [&](StringRef Why) {
+    if (!closeLease(*L, Worker))
+      return fail(C, EJIT_STAB_SRE_BLOCKED,
+                  "exact common preparation close refused; physical pin retained");
+    C.ticket = 0;
+    return fail(C, EJIT_STAB_SRE_BLOCKED, Why);
+  };
   uint64_t Pin = 0;
   std::string PinWhy;
-  if (!Host->pinForExecutionPreparation(Types, Instances, Pin, PinWhy)) {
+  const bool Pinned = Host->pinForExecutionPreparation(Types, Instances, Pin, PinWhy);
+  L->hostTicket = Pin;
+  if (!Pinned || !Pin) {
     // A product fact callback may reject AFTER the physical ticket was made.
     // Every failure closes that exact preparation, even when Pin != 0.
-    ejit_stab_leave(Pin);
-    return fail(C, EJIT_STAB_SRE_BLOCKED, PinWhy);
+    return RefusePreparation(PinWhy);
   }
-  auto ReleasePin = [&]() { ejit_stab_leave(Pin); };
   void *Entry = Host->activeEntry();
   EJitCompiledCodeInfo Info;
   if (!Entry || !Host->runtime().engine().isCodeReady(Entry) ||
       !Host->runtime().engine().findCodeRange(Entry, Info)) {
-    ReleasePin();
-    return fail(C, EJIT_STAB_SRE_BLOCKED, "common finalized code range is unavailable");
+    return RefusePreparation("common finalized code range is unavailable");
   }
   auto *Resource = Host->runtime().resource();
   if (!Resource || Resource->columns().size() > 32) {
-    ReleasePin(); return fail(C, EJIT_STAB_SRE_BLOCKED, "common table range inventory is unavailable or unbounded");
+    return RefusePreparation("common table range inventory is unavailable or unbounded");
   }
   C.tableCount = 0;
   for (const auto &Column : Resource->columns()) {
     const uintptr_t Address = reinterpret_cast<uintptr_t>(Resource->columnAddress(Column.fieldIndex));
     if (!Address || !Column.payloadBytes) {
-      ReleasePin(); return fail(C, EJIT_STAB_SRE_BLOCKED, "common table column has no actual published storage");
+      return RefusePreparation("common table column has no actual published storage");
     }
     C.tables[C.tableCount++] = {Address, Column.payloadBytes};
   }
-  const uint64_t Token = freshTicket();
-  if (!Token || !retainSmallTableSreRuntime(Runtime)) {
-    ReleasePin(); return fail(C, EJIT_STAB_SRE_BLOCKED, "common physical runtime pin was refused");
-  }
-  L->ticket = Token; L->hostTicket = Pin;
   L->epoch = smallTableSreWrapperEpoch(EJitSmallTableHost::policyEpoch());
-  L->ownerIdentity = currentEJitRuntimeOwnerIdentity();
-  L->ownerCore = Runtime->sharedTaskPool()->state()->ownerCoreId.loadAcquire();
-  if (!L->ownerIdentity) {
-    *L = Lease();
-    ReleasePin();
-    releaseSmallTableSreRuntime(Runtime);
-    return fail(C, EJIT_STAB_SRE_BLOCKED, "common owner retired during physical preparation");
-  }
-  L->generation = Generation; L->function = C.function;
-  L->runtime = Runtime; L->host = Host; L->entry = Entry;
+  if (!L->ownerIdentity ||
+      L->ownerIdentity != currentEJitRuntimeOwnerIdentity())
+    return RefusePreparation("common owner retired during physical preparation");
+  L->entry = Entry;
   L->numDims = C.numDims;
   for (uint32_t I = 0; I < C.numDims; ++I) {
     L->dims[I] = C.dims[I]; L->versions[I] = Versions[I];
   }
-  store64(&Shared.leaseTokens[static_cast<size_t>(L - O.leases)], Token);
   C.ticket = Token; C.epoch = L->epoch;
   C.ownerIdentity = L->ownerIdentity; C.ownerGeneration = Generation;
   C.entry = reinterpret_cast<uintptr_t>(Entry); C.code = Info;
@@ -660,12 +688,16 @@ int prepareExecution(Command &C) {
 #endif
 }
 
-int commitExecution(Command &C) {
+int commitExecution(Command &C,
+                    const llvm::ejit::detail::OwnerWorkerContext &Worker) {
   Lease *L = lease(C.ticket);
   if (!L || L->executing)
     return fail(C, EJIT_STAB_SRE_BLOCKED, "stale or duplicate common preparation token");
   const auto Refuse = [&](const char *Why) {
-    closeLease(*L); return fail(C, EJIT_STAB_SRE_BLOCKED, Why);
+    if (!closeLease(*L, Worker))
+      return fail(C, EJIT_STAB_SRE_BLOCKED,
+                  "exact common admission close refused; physical pin retained");
+    return fail(C, EJIT_STAB_SRE_BLOCKED, Why);
   };
   auto *Pool = L->runtime->sharedTaskPool();
   auto *State = Pool ? Pool->state() : nullptr;
@@ -689,6 +721,7 @@ int commitExecution(Command &C) {
   uint64_t Execution = 0;
   std::string Why;
   void *Entry = L->host->enter(Types, Instances, &Execution, &Why);
+  L->pendingHostTicket = Execution;
   if (!Entry || !Execution || Entry != L->entry ||
       L->epoch != smallTableSreWrapperEpoch(EJitSmallTableHost::policyEpoch()) ||
       EJitSmallTableHost::global() != L->host ||
@@ -697,50 +730,62 @@ int commitExecution(Command &C) {
       State->generation.loadAcquire() != L->generation ||
       State->ownerCoreId.loadAcquire() != L->ownerCore ||
       State->initState.loadAcquire() != static_cast<uint32_t>(EJitSharedInitState::Ready)) {
-    ejit_stab_leave(Execution);
     return Refuse("common admission refused or owner changed in product fact callback");
   }
   for (uint32_t I = 0; I < L->numDims; ++I)
     if (!Pool->isInstanceActive(L->dims[I].dimType, L->dims[I].instanceId) ||
         State->version[L->dims[I].dimType][L->dims[I].instanceId].loadAcquire() != L->versions[I]) {
-      ejit_stab_leave(Execution);
       return Refuse("common lifecycle changed in product admission callback");
     }
-  ejit_stab_leave(L->hostTicket); // preparation pin, NOT a sample completion
+  if (!smallTableSreLeaveHostTicket(Worker, L->host, L->hostTicket))
+    return Refuse("exact common preparation pin close refused before admission");
   L->hostTicket = Execution; L->executing = true;
+  L->pendingHostTicket = 0;
   C.entry = reinterpret_cast<uintptr_t>(Entry);
   C.ownerIdentity = L->ownerIdentity; C.ownerGeneration = L->generation;
   return C.result = EJIT_STAB_SRE_OK;
 }
 
-void process(Command &C) {
+void process(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
   C.result = EJIT_STAB_SRE_BLOCKED;
+  if (!LocalWorkerPool || !load32(&LocalPrepared) ||
+      !(C.operation == LeaveExecution ? Worker.activeFor(*LocalWorkerPool)
+                                     : Worker.validFor(*LocalWorkerPool))) {
+    fail(C, EJIT_STAB_SRE_BLOCKED,
+         "SRE bridge command requires the exact live worker-entry context");
+    return;
+  }
   if (C.operation == LeaveExecution) {
     // A true late leave remains serviceable after logical shutdown/cancel.
     // It can only close the exact old token, never a replacement lease.
-    if (Lease *L = lease(C.ticket)) closeLease(*L);
+    if (Lease *L = lease(C.ticket))
+      if (!closeLease(*L, Worker)) {
+        fail(C, EJIT_STAB_SRE_BLOCKED,
+             "exact common physical leave refused; original lease retained");
+        return;
+      }
     C.result = EJIT_STAB_SRE_OK;
     return;
   }
   EJit *Runtime = smallTableSreLocalRuntime();
   if (!Runtime || Runtime->sharedTaskPool() != LocalWorkerPool ||
-      !LocalWorkerPool->isCurrentOwnerWorker() ||
       !LocalWorkerPool->state() ||
       LocalWorkerPool->state()->initState.loadAcquire() != static_cast<uint32_t>(EJitSharedInitState::Ready)) {
     fail(C, EJIT_STAB_SRE_BLOCKED, "SRE bridge has no live Ready owner worker"); return;
   }
   switch (C.operation) {
-  case Request: setupRequest(C); break;
+  case Request: setupRequest(C, Worker); break;
   case Snapshot: snapshot(C); break;
-  case Finish: finish(C); break;
-  case PrepareExecution: prepareExecution(C); break;
-  case CommitExecution: commitExecution(C); break;
+  case Finish: finish(C, Worker); break;
+  case PrepareExecution: prepareExecution(C, Worker); break;
+  case CommitExecution: commitExecution(C, Worker); break;
   case Cancel: {
     auto *Host = owner().runtime ? owner().runtime->smallTableHost() : nullptr;
     if (!Host || !functionMatches(C.function)) {
       fail(C, EJIT_STAB_SRE_INVALID, "cancel has no matching common Host"); break;
     }
-    Host->cancel("SRE explicit cancel; real executions retain their leases");
+    Host->cancel(Worker,
+                 "SRE explicit cancel; real executions retain their leases");
     smallTableSrePolicyChanged();
     C.result = EJIT_STAB_SRE_OK;
     break;
@@ -748,7 +793,7 @@ void process(Command &C) {
   case Print: {
     if (snapshot(C) != EJIT_STAB_SRE_OK && C.result != EJIT_STAB_SRE_BUSY) break;
     const auto &S = C.snapshot;
-    EJIT_DIAG("SRE_STAB func=%u worker=%llu tier=%u samples=%llu/%llu physical=%llu borrows=%llu counters=%u/%u words=%u root=%llu full_profile=%u generic_enqueues=%llu generic_compiles=%llu pending=%llu",
+    EJIT_DIAG("SRE_STAB func=%u owner_context=worker sdk_worker_task=%llu tier=%u samples=%llu/%llu physical=%llu borrows=%llu counters=%u/%u words=%u root=%llu full_profile=%u generic_enqueues=%llu generic_compiles=%llu pending=%llu",
               S.funcIndex, (unsigned long long)S.workerTaskIdentity, S.tier,
               (unsigned long long)S.sampleCount, (unsigned long long)S.sampleLimit,
               (unsigned long long)S.physicalExecutions, (unsigned long long)S.borrowReaders,
@@ -773,18 +818,13 @@ int transact(Command &C, bool RealLeave = false) {
     return EJIT_STAB_SRE_BLOCKED;
   const uint32_t Limit = LocalBindings.waitRounds ? LocalBindings.waitRounds : 8192u;
   uint32_t ReadyWait = 0;
-  while (!RealLeave &&
-         (!load64(&Shared.workerTask) || !load64(&Shared.ownerIdentity))) {
+  while (!RealLeave && !load64(&Shared.ownerIdentity)) {
     if (++ReadyWait >= Limit) return EJIT_STAB_SRE_BLOCKED;
     delay();
   }
-  if (LocalWorkerPool && isActualBridgeWorker(LocalWorkerPool)) {
-    EJit *Pinned = acquireSmallTableSreRuntime(LocalWorkerPool);
-    if (!Pinned) return EJIT_STAB_SRE_BLOCKED;
-    process(C);
-    releaseSmallTableSreRuntime(Pinned);
-    return C.result;
-  }
+  // Every public caller goes through the POD queue, including callers on the
+  // worker's core or reporting the same SDK task ID. Only service(), which
+  // receives the private worker-entry context, may touch owner-private state.
   Command *Slot = nullptr;
   uint32_t Wait = 0;
   while (!Slot) {
@@ -869,66 +909,82 @@ bool smallTableSreOwnsFunction(uint32_t Func) {
   (void)Func; return false;
 #endif
 }
-void smallTableSreWorkerEnter(EJitSharedTaskPool &Pool) {
+void smallTableSreWorkerEnter(EJitSharedTaskPool &Pool,
+                             const llvm::ejit::detail::OwnerWorkerContext &Worker) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (!load32(&LocalPrepared)) return;
+  if (!load32(&LocalPrepared) || !Worker.validFor(Pool)) return;
   LocalWorkerPool = &Pool;
-  LocalWorkerTask = LocalBindings.current_task_id(LocalBindings.context);
-  if (!LocalWorkerTask) {
-    EJIT_DIAG("small-table SRE bridge BLOCKED: actual worker task identity unavailable");
-    return;
-  }
-  // This hook is called ONLY from the actual worker loop, not pollOnce/core-ID
-  // simulation. Subsequent controls compare the real SDK task token exactly.
-  Pool.setWorkerIdentityCallback(isActualBridgeWorker, &Pool);
+  // Capture a real SDK result only at the authenticated worker entry. Missing
+  // SDK diagnostics remain zero; a context token must never masquerade as PID.
+  LocalWorkerTask = LocalBindings.current_task_id
+                        ? LocalBindings.current_task_id(LocalBindings.context)
+                        : 0;
+  EJIT_DIAG("small-table SRE worker entered owner_context=worker sdk_worker_task=%llu",
+            (unsigned long long)LocalWorkerTask);
 #else
-  (void)Pool;
+  (void)Pool; (void)Worker;
 #endif
 }
-bool serviceSmallTableSreBridge(EJitSharedTaskPool &Pool) {
+bool serviceSmallTableSreBridge(EJitSharedTaskPool &Pool,
+                                const llvm::ejit::detail::OwnerWorkerContext &Worker) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (load32(&Shared.enabled) != 1 || !isActualBridgeWorker(&Pool)) return false;
+  if (load32(&Shared.enabled) != 1 || LocalWorkerPool != &Pool ||
+      !load32(&LocalPrepared) || !Worker.activeFor(Pool))
+    return false;
   bool QueuedWork = false;
   for (const auto &C : Shared.commands)
     if (load32(&C.state) == Queued) { QueuedWork = true; break; }
   if (!QueuedWork && load64(&Shared.ownerIdentity) != 0 && Pool.state() &&
       load32(&Shared.ownerGeneration) == Pool.state()->generation.loadAcquire())
     return false; // no idle-loop runtime pin, no accidental deferred shutdown
-  EJit *Runtime = acquireSmallTableSreRuntime(&Pool);
-  if (!Runtime) return false;
-  struct RuntimePin {
-    EJit *Runtime;
-    ~RuntimePin() { releaseSmallTableSreRuntime(Runtime); }
-  } Pin{Runtime};
-  if (!Pool.state()) return false;
-  auto *State = Pool.state();
-  if (State->initState.loadAcquire() != static_cast<uint32_t>(EJitSharedInitState::Ready)) return false;
-  const uint64_t LiveOwner = currentEJitRuntimeOwnerIdentity();
-  if (LiveOwner && smallTableSreLocalRuntime() == Runtime) {
-    store32(&Shared.ownerCore, State->ownerCoreId.loadAcquire());
-    store32(&Shared.ownerGeneration, State->generation.loadAcquire());
-    store64(&Shared.workerTask, LocalWorkerTask);
-    // Logical shutdown may clear the live publication after the test above.
-    // Never erase the prior routing identity of still-pinned real executions.
-    store64(&Shared.ownerIdentity, LiveOwner);
+  Command *Completed = nullptr;
+  {
+    EJit *Runtime = acquireSmallTableSreRuntime(Worker);
+    if (!Runtime) return false;
+    struct RuntimePin {
+      EJit *Runtime;
+      const llvm::ejit::detail::OwnerWorkerContext &Worker;
+      ~RuntimePin() { releaseSmallTableSreRuntime(Runtime, Worker); }
+    } Pin{Runtime, Worker};
+    if (!Pool.state()) return false;
+    auto *State = Pool.state();
+    const bool Ready = State->initState.loadAcquire() ==
+                       static_cast<uint32_t>(EJitSharedInitState::Ready);
+    const uint64_t LiveOwner = currentEJitRuntimeOwnerIdentity();
+    if (Ready && LiveOwner && smallTableSreLocalRuntime() == Runtime) {
+      store32(&Shared.ownerCore, State->ownerCoreId.loadAcquire());
+      store32(&Shared.ownerGeneration, State->generation.loadAcquire());
+      store64(&Shared.workerTask, LocalWorkerTask);
+      // Logical shutdown may clear the live publication after the test above.
+      // Never erase the prior routing identity of still-pinned real executions.
+      store64(&Shared.ownerIdentity, LiveOwner);
+    }
+    for (auto &C : Shared.commands) {
+      uint32_t Expected = Queued;
+      if (!cas32(&C.state, Expected, Started)) continue;
+      // Owner-local temporary lifetime protection; no private pointer rides the
+      // command. A physical preparation/execution adds its own persistent pin.
+      process(C, Worker);
+      Completed = &C;
+      break;
+    }
   }
-  for (auto &C : Shared.commands) {
-    uint32_t Expected = Queued;
-    if (!cas32(&C.state, Expected, Started)) continue;
-    // Owner-local temporary lifetime protection; no private pointer rides the
-    // command. A physical preparation/execution adds its own persistent pin.
-    process(C);
-    store32(&C.state, Done);
+  if (Completed) {
+    // The public waiter may immediately retire/reinitialize the facade. Done
+    // therefore includes releasing this command's worker-local Runtime pin.
+    store32(&Completed->state, Done);
     return true;
   }
 #else
-  (void)Pool;
+  (void)Pool; (void)Worker;
 #endif
   return false;
 }
-void smallTableSreWorkerExit(EJitSharedTaskPool &Pool) {
+void smallTableSreWorkerExit(EJitSharedTaskPool &Pool,
+                            const llvm::ejit::detail::OwnerWorkerContext &Worker) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (LocalWorkerPool != &Pool) return;
+  if (LocalWorkerPool != &Pool || !load32(&LocalPrepared) ||
+      !Worker.activeFor(Pool)) return;
   for (Lease &L : owner().leases)
     if (L.ticket) {
       EJIT_DIAG("SRE worker exited with live physical ticket=%llu; NOT reclaimed",
@@ -951,7 +1007,7 @@ void smallTableSreWorkerExit(EJitSharedTaskPool &Pool) {
   O.codeGeneration = 0;
   LocalWorkerPool = nullptr; LocalWorkerTask = 0;
 #else
-  (void)Pool;
+  (void)Pool; (void)Worker;
 #endif
 }
 
@@ -974,7 +1030,13 @@ bool smallTableSreWrapperEnter(uint32_t Func, const ejit_dim_pair_t *Dims,
   C.operation = PrepareExecution; C.function = Func; C.numDims = NumDims; C.boundCount = BoundCount;
   for (uint32_t I = 0; I < NumDims; ++I) C.dims[I] = Dims[I];
   for (uint32_t I = 0; I < BoundCount; ++I) C.bounds[I] = Bounds[I];
-  if (transact(C) != EJIT_STAB_SRE_OK) return true;
+  if (transact(C) != EJIT_STAB_SRE_OK) {
+    if (C.ticket) {
+      C.operation = LeaveExecution;
+      completeRealLeave(C);
+    }
+    return true;
+  }
   const uint64_t Token = C.ticket;
   EJit *Caller = acquireSmallTableSreRuntime(nullptr);
   struct CallerRuntimePin {
@@ -1048,11 +1110,11 @@ extern "C" {
 int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *Bindings) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!Bindings || Bindings->abiVersion != EJIT_STAB_SRE_ABI_VERSION ||
-      Bindings->structSize != sizeof(*Bindings) || !Bindings->current_task_id ||
+      Bindings->structSize != sizeof(*Bindings) ||
       !Bindings->delay_ticks || !Bindings->prepare_shared_data ||
       Bindings->waitRounds > 65536 ||
-      (Bindings->flags & ~EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN) ||
-      !Bindings->current_task_id(Bindings->context)) return EJIT_STAB_SRE_BLOCKED;
+      (Bindings->flags & ~EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN))
+    return EJIT_STAB_SRE_BLOCKED;
   if (load32(&LocalPrepared)) {
     return LocalBindings.current_task_id == Bindings->current_task_id &&
                    LocalBindings.delay_ticks == Bindings->delay_ticks &&
@@ -1062,8 +1124,8 @@ int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *Bindings
                    LocalBindings.waitRounds == Bindings->waitRounds
                ? EJIT_STAB_SRE_OK : EJIT_STAB_SRE_BUSY;
   }
-  // Bindings must precede worker startup; installing them later could capture
-  // a shell task as an already-existing worker and is explicitly forbidden.
+  // Bindings must precede worker startup. Task-ID diagnostics are captured
+  // only by the authenticated worker entry, never by this public setup call.
   if (smallTableSreLocalRuntime()) return EJIT_STAB_SRE_BLOCKED;
   LocalBindings = *Bindings;
   store32(&LocalPrepared, 1);

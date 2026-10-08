@@ -27,10 +27,20 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
   和两个 shell 入口必须在最终合并对象中有唯一真实定义；严格 demo roots
   同时保留 `g_pr231_probe_dispatch` 共享 OBJECT 和 `pr231_probe_inflight`
   真实 AOT FUNC，缺任一即报错，不依赖碰巧被别的引用留下。
-- 复制 `ejit_smalltable_sre_platform.h.example` 到 SDK 工程，绑定真实 task-self
-  和共享数据权限接口，定义 `EJIT_PR231_PLATFORM_HEADER` 指向它。
-  模板故意无法直接编译；没有提供绑定时，用例打印 `BLOCKED`，不继续初始化。
-  不可用 core ID 冒充 task ID，也不能将权限检查写成固定返回零。
+- **不需要 SDK task-self 接口或 `EJIT_PR231_CURRENT_TASK_ID` 宏**。shell C
+  入口只向现有 worker 命令队列提交；worker 内部操作沿真实入口调用链传递
+  不可公开构造的执行上下文，校验 pool、启动代际和重启 epoch，避免自排队。
+  旧 bindings ABI 不变；可选 `current_task_id` 仅供真实 SDK 身份诊断，未提供时
+  `workerTaskIdentity=0`（未知），不把内部上下文或核号冒充任务 ID。
+- 共享数据映射是**独立未完成的平台接入**。现有 code pool 能准备真实共同
+  代码和 T1 计数器权限，但 RuntimeOwned 小表仍使用普通 `new[]`；配置放入
+  `.mc_shared` 不能证明 owner 堆中的表也共享。本轮不新增共享区、不改变 allocator
+  或扩大权限范围。需产品证明 commands/source/state、共同表及计数器的同物理
+  coherent backing，并在实际调用核准备权限。可用
+  `ejit_smalltable_sre_platform.h.example` 绑定真实映射接口，定义
+  `EJIT_PR231_PLATFORM_HEADER` 指向它；无需任何 task-id 绑定。
+  缺少该能力时明确打印 `BLOCKED: shared-data mapping binding missing`，
+  不继续初始化；不能将权限检查写成固定返回零。
 - `.mc_shared` 必须在两核映射到同一 VA、同一真正 coherent 存储；共享命令、
   配置、source-state、output、callback槽及调测flags都在此节。用例在两核setup
   分别检查callback槽READ及调测flagsR/W权限，不用成功空实现替代。真实AOT
@@ -77,7 +87,7 @@ ejit_taskpool_print_compiled
 
 ```text
 [STAB231] worker=6 ready; run test_ejit_period on core16
-[EJIT] ... common T1 requested ... members=12 budget=64 actual_worker_task=...
+[EJIT] ... common T1 requested ... members=12 budget=64 owner_context=worker sdk_worker_task=0
 [EJIT] ... FULL profile consumed ... samples=64 pairs=... words=... root_count=64 T2=published
 [STAB231] HELD_CANCEL physical=1 borrow=1 retained=...
 [STAB231] PASS cold: members=12 samples=64 pairs=... words=... profile=... commonT2=1; ... OK
@@ -85,6 +95,8 @@ ejit_taskpool_print_compiled
 ```
 
 检查项：所有成员值和普通 live load/store 正确；普通 PGO enqueue/pending 为零；
+本用例没有 SDK task-id 绑定，`sdk_worker_task=0` 是未知诊断，不是身份鉴权失败；
+正确 worker 执行由内部上下文和实际 owner-worker 操作记录验证。
 真实共同计数器完整记录、T2 的真实 PGO entry metadata 恰好64/8；
 不能把分支 counter[0] 当 entry 次数。quota+1 在 T2 发布前回 AOT，不改共同计数器；
 全部预期 counter/data pair 被完整冻结并消费，12个逻辑 slot 进入共同 T2；

@@ -22,6 +22,7 @@
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
 #include "EJitWrapperRuntimeTestAccess.h"
+#include "EJitOwnerWorkerContext.h"
 #include "EJitSmallTableSreBridgeInternal.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
@@ -47,6 +48,69 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+namespace llvm {
+namespace ejit {
+namespace detail {
+
+/// The only bridge into the private worker-control methods. The class is
+/// forward-declared (but never defined) in installed headers, so its friendship
+/// does not create an ADL-visible callback that can hand out a worker context.
+class SmallTableOwnerRequestAccess final {
+public:
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  static EJitSharedTaskPool::OwnerControlResult runControl(
+      EJit &Runtime, SmallTableOwnerWorkerJob Work) {
+    std::function<void(const OwnerWorkerContext &)> Adapted =
+        [Work = std::move(Work)](const OwnerWorkerContext &Worker) mutable {
+          if (Error E = Work(Worker)) {
+            // The owner-request wrapper records business errors in its joined
+            // result and returns success. This defensive consume is required
+            // because the pool's queued callback has a void return type.
+            EJIT_DIAG("small-table owner job unexpectedly returned Error");
+            consumeError(std::move(E));
+          }
+        };
+    return Runtime.runControlOnOwnerAndWait(std::move(Adapted));
+  }
+
+  static EJitSharedTaskPool::OwnerControlResult runControl(
+      EJit &Runtime, const OwnerWorkerContext &Worker,
+      SmallTableOwnerWorkerJob Work) {
+    std::function<void(const OwnerWorkerContext &)> Adapted =
+        [Work = std::move(Work)](const OwnerWorkerContext &Context) mutable {
+          if (Error E = Work(Context)) {
+            // The owner-request wrapper records business errors in its joined
+            // result and returns success. This defensive consume is required
+            // because the pool's direct callback has a void return type.
+            EJIT_DIAG("small-table owner job unexpectedly returned Error");
+            consumeError(std::move(E));
+          }
+        };
+    return Runtime.runControlOnOwnerAndWait(Worker, std::move(Adapted));
+  }
+
+  static bool abortFunctionPgo(EJit &Runtime,
+                               const OwnerWorkerContext &Worker,
+                               uint32_t FuncIndex) {
+    return Runtime.abortFunctionPgoOnOwner(Worker, FuncIndex);
+  }
+#endif
+
+  static void publishReady(EJitSmallTableHost *Host) {
+    if (Host && EJitSmallTableHost::global() == Host)
+      Host->setWrapperAdmissionReady(true);
+  }
+
+  static bool leaveRetainedExecution(EJitSmallTableHost *Host,
+                                     uint64_t Ticket) {
+    return EJitSmallTableHost::leaveRetainedExecution(Host, Ticket);
+  }
+};
+
+} // namespace detail
+} // namespace ejit
+} // namespace llvm
 
 //===----------------------------------------------------------------------===//
 // Compile-time contract checks: each assert locks two independently defined
@@ -194,22 +258,24 @@ void finishRuntimeDestruction(EJit *Runtime) {
   gRuntimeTransition = RuntimeTransition::Idle;
 }
 
-#ifndef EJIT_FREESTANDING
-thread_local EJitSmallTableHost *gInsideSmallTableOwnerRequest = nullptr;
-#else
-// One real owner worker only; task identity is checked before consulting this.
-static EJitSmallTableHost *gInsideSmallTableOwnerRequest = nullptr;
-#endif
 struct RuntimeOperationPin {
   explicit RuntimeOperationPin(EJit *Expected = nullptr)
       : runtime(Expected ? (retainSmallTableSreRuntime(Expected) ? Expected
                                                                : nullptr)
                          : acquireSmallTableSreRuntime()) {}
+  explicit RuntimeOperationPin(
+      const llvm::ejit::detail::OwnerWorkerContext &Worker)
+      : runtime(acquireSmallTableSreRuntime(Worker)), worker(&Worker) {}
   ~RuntimeOperationPin() {
-    if (runtime)
-      releaseSmallTableSreRuntime(runtime);
+    if (runtime) {
+      if (worker)
+        releaseSmallTableSreRuntime(runtime, *worker);
+      else
+        releaseSmallTableSreRuntime(runtime);
+    }
   }
   EJit *runtime;
+  const llvm::ejit::detail::OwnerWorkerContext *worker = nullptr;
 };
 } // namespace
 
@@ -240,6 +306,34 @@ EJit *llvm::ejit::acquireSmallTableSreRuntime(EJitSharedTaskPool *ExpectedPool) 
   gRuntimeOperationPins.fetchAdd(1);
   return Runtime;
 }
+EJit *llvm::ejit::acquireSmallTableSreRuntime(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) {
+  RuntimeLifecycleGuard Guard;
+  if (gRuntimeTransition == RuntimeTransition::Deleting)
+    return nullptr;
+  EJit *Runtime = nullptr;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // Prefer the facade whose pool owns this still-active entry. This can be the
+  // deferred old facade after public shutdown detached gEJIT; never pin a new
+  // facade merely because it is globally current.
+  if (gDeferredRuntimeShutdown) {
+    EJitSharedTaskPool *Pool = gDeferredRuntimeShutdown->sharedTaskPool();
+    if (Pool && Worker.activeFor(*Pool))
+      Runtime = gDeferredRuntimeShutdown;
+  }
+  if (!Runtime && gEJIT) {
+    EJitSharedTaskPool *Pool = gEJIT->sharedTaskPool();
+    if (Pool && Worker.activeFor(*Pool))
+      Runtime = gEJIT;
+  }
+#else
+  (void)Worker;
+#endif
+  if (!Runtime || gRuntimeOperationPins.loadAcquire() == UINT32_MAX)
+    return nullptr;
+  gRuntimeOperationPins.fetchAdd(1);
+  return Runtime;
+}
 bool llvm::ejit::retainSmallTableSreRuntime(EJit *Runtime) {
   RuntimeLifecycleGuard Guard;
   if (!Runtime || gRuntimeTransition == RuntimeTransition::Deleting ||
@@ -251,7 +345,8 @@ bool llvm::ejit::retainSmallTableSreRuntime(EJit *Runtime) {
   gRuntimeOperationPins.fetchAdd(1);
   return true;
 }
-void llvm::ejit::releaseSmallTableSreRuntime(EJit *Runtime) {
+static void releaseSmallTableSreRuntimeImpl(
+    EJit *Runtime, const llvm::ejit::detail::OwnerWorkerContext *Worker) {
   if (!Runtime)
     return;
   {
@@ -260,12 +355,13 @@ void llvm::ejit::releaseSmallTableSreRuntime(EJit *Runtime) {
         gRuntimeOperationPins.loadAcquire() == 0)
       return;
   }
-  // Our pin is still held while invoking task-identity callbacks. Such a
-  // callback is outside the gate and cannot invalidate this owned Runtime.
+  // Keep our pin until the explicit worker context has been checked. The
+  // context check is lock-free and does not infer caller identity from an SDK
+  // task ID, core ID or ambient marker.
   bool OnWorker = false;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (auto *Pool = Runtime->sharedTaskPool())
-    OnWorker = Pool->isCurrentOwnerWorker();
+    OnWorker = Worker && Worker->activeFor(*Pool);
 #endif
   EJit *Destroy = nullptr;
   {
@@ -284,12 +380,22 @@ void llvm::ejit::releaseSmallTableSreRuntime(EJit *Runtime) {
     finishRuntimeDestruction(Destroy);
 }
 
+void llvm::ejit::releaseSmallTableSreRuntime(EJit *Runtime) {
+  releaseSmallTableSreRuntimeImpl(Runtime, nullptr);
+}
+
+void llvm::ejit::releaseSmallTableSreRuntime(
+    EJit *Runtime, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
+  releaseSmallTableSreRuntimeImpl(Runtime, &Worker);
+}
+
 bool llvm::ejit::smallTableSreValidateOwnerCall(
-    uint32_t Func, const ejit_dim_pair_t *Dims, uint32_t NumDims,
+    const llvm::ejit::detail::OwnerWorkerContext &Worker, uint32_t Func,
+    const ejit_dim_pair_t *Dims, uint32_t NumDims,
     const ejit_bound_ptr_t *Bounds, uint32_t BoundCount, uint32_t *Versions,
     uint32_t &Generation, const char *&Why) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  RuntimeOperationPin RuntimePin;
+  RuntimeOperationPin RuntimePin(Worker);
   EJit *Runtime = RuntimePin.runtime;
   auto *Host = EJitSmallTableHost::global();
   auto *Pool = Runtime ? Runtime->sharedTaskPool() : nullptr;
@@ -299,7 +405,7 @@ bool llvm::ejit::smallTableSreValidateOwnerCall(
       !Host->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) ||
       Func >= EJitFuncRegistry::instance().count() ||
       EJitFuncRegistry::instance().lookup(Host->entryName()) != Func ||
-      !State || !Pool->isCurrentOwnerWorker() ||
+      !State || !Worker.validFor(*Pool) ||
       State->initState.loadAcquire() != static_cast<uint32_t>(EJitSharedInitState::Ready)) {
     Why = "SRE common owner/function identity or worker handoff is not live";
     return false;
@@ -322,7 +428,7 @@ bool llvm::ejit::smallTableSreValidateOwnerCall(
   }
   return true;
 #else
-  (void)Func; (void)Dims; (void)NumDims; (void)Bounds; (void)BoundCount;
+  (void)Worker; (void)Func; (void)Dims; (void)NumDims; (void)Bounds; (void)BoundCount;
   (void)Versions; (void)Generation;
   Why = "SRE common shared taskpool is unavailable"; return false;
 #endif
@@ -399,31 +505,33 @@ struct OrdinaryResolvePin {
 #endif
 
 bool llvm::ejit::onSmallTableOwnerWorker() {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  RuntimeOperationPin Pin;
-  auto *Pool = Pin.runtime ? Pin.runtime->sharedTaskPool() : nullptr;
-  return Pool && Pool->isCurrentOwnerWorker();
-#else
+  // There is deliberately no implicit caller identity. Worker-only code gets
+  // an explicit OwnerWorkerContext through its internal call chain.
   return false;
-#endif
 }
 
 bool llvm::ejit::inSmallTableOwnerRequest(EJitSmallTableHost *Host) {
-  return onSmallTableOwnerWorker() && gInsideSmallTableOwnerRequest == Host;
+  (void)Host;
+  return false;
 }
 
-Error llvm::ejit::runSmallTableOwnerRequest(
-    uint32_t Func, EJitSmallTableHost *Host, std::function<Error()> Job,
-    bool InitialHandoff) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+namespace {
+using OwnerControlRunner = std::function<
+    EJitSharedTaskPool::OwnerControlResult(SmallTableOwnerWorkerJob)>;
+using OwnerAbort = std::function<bool(
+    const llvm::ejit::detail::OwnerWorkerContext &, uint32_t)>;
+
+Error runSmallTableOwnerRequestImpl(
+    uint32_t Func, EJitSmallTableHost *Host, SmallTableOwnerWorkerJob Job,
+    bool InitialHandoff, EJit *Runtime, EJitSharedTaskPool *Pool,
+    OwnerControlRunner RunControl, OwnerAbort AbortOrdinaryPgo,
+    std::function<void()> PublishReady) {
   auto Fail = [](const char *Why) -> Error {
     return make_error<StringError>(Why, inconvertibleErrorCode());
   };
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  RuntimeOperationPin RuntimePin;
-  EJit *Runtime = RuntimePin.runtime;
-  auto *Pool = Runtime ? Runtime->sharedTaskPool() : nullptr;
   auto *State = Pool ? Pool->state() : nullptr;
-  if (!State || Func >= kEJitMaxFuncIndex ||
+  if (!State || !Job || Func >= kEJitMaxFuncIndex ||
       Func >= EJitFuncRegistry::instance().count() || !Host ||
       EJitSmallTableHost::global() != Host ||
       !Host->belongsToRuntimeOwner(currentEJitRuntimeOwnerIdentity()) ||
@@ -476,29 +584,24 @@ Error llvm::ejit::runSmallTableOwnerRequest(
   }
   struct Result { std::string ErrorText; bool Ran = false; };
   auto ResultState = std::make_shared<Result>();
-  auto Control = Runtime->runControlOnOwnerAndWait([=]() {
+  SmallTableOwnerWorkerJob OwnerJob = [=](
+      const llvm::ejit::detail::OwnerWorkerContext &Worker) {
     ResultState->Ran = true;
     if (gEJIT != Runtime || EJitSmallTableHost::global() != Host ||
         State->generation.loadAcquire() != Generation ||
-        !Pool->isCurrentOwnerWorker()) {
+        !Worker.validFor(*Pool)) {
       ResultState->ErrorText = "small-table worker owner changed before handoff";
-      return;
+      return Error::success();
     }
-    if (InitialHandoff && !Runtime->abortFunctionPgoOnOwner(Func)) {
+    if (InitialHandoff && !AbortOrdinaryPgo(Worker, Func)) {
       ResultState->ErrorText = "small-table worker could not abort ordinary PGO";
-      return;
+      return Error::success();
     }
-    struct ControlScope {
-      EJitSmallTableHost *Previous;
-      ControlScope(EJitSmallTableHost *H)
-          : Previous(gInsideSmallTableOwnerRequest) {
-        gInsideSmallTableOwnerRequest = H;
-      }
-      ~ControlScope() { gInsideSmallTableOwnerRequest = Previous; }
-    } Scope(Host);
-    if (Error E = Job())
+    if (Error E = Job(Worker))
       ResultState->ErrorText = toString(std::move(E));
-  });
+    return Error::success();
+  };
+  auto Control = RunControl(std::move(OwnerJob));
   const bool OwnerCurrent = gEJIT == Runtime &&
       EJitSmallTableHost::global() == Host &&
       State->generation.loadAcquire() == Generation;
@@ -515,8 +618,6 @@ Error llvm::ejit::runSmallTableOwnerRequest(
   // The per-Host publication gate is distinct from the shared function bit:
   // a prepared replacement can inherit Closed from the old owner but must not
   // admit execution before its OWN successful joined worker handoff.
-  if (Success && InitialHandoff)
-    Host->setWrapperAdmissionReady(true);
   if (gSmallTableControlGeneration.loadAcquire() == Generation &&
       State->generation.loadAcquire() == Generation)
     storeFunctionControl(Func, Generation,
@@ -528,12 +629,122 @@ Error llvm::ejit::runSmallTableOwnerRequest(
                                     inconvertibleErrorCode());
     return Fail("small-table owner-worker request was rejected or cancelled before start");
   }
+  // Run this named-friend callback while HostControlPin is still held. A
+  // concurrent replacement may retire the Host as soon as the helper returns.
+  if (InitialHandoff && PublishReady)
+    PublishReady();
   if (Control.deadlineExceeded)
     EJIT_DIAG("small-table owner request func=%u completed after wait deadline", Func);
   Host->noteOwnerWorkerOperation();
   return Error::success();
+}
+} // namespace
+#endif
+
+Error llvm::ejit::runSmallTableOwnerRequest(
+    uint32_t Func, EJitSmallTableHost *Host,
+    SmallTableOwnerWorkerJob Job, bool InitialHandoff) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  RuntimeOperationPin RuntimePin;
+  EJit *Runtime = RuntimePin.runtime;
+  auto *Pool = Runtime ? Runtime->sharedTaskPool() : nullptr;
+  if (!Runtime || !Pool)
+    return make_error<StringError>("small-table worker request has no runtime",
+                                   inconvertibleErrorCode());
+  OwnerControlRunner RunControl = [Runtime](SmallTableOwnerWorkerJob Work) {
+    return llvm::ejit::detail::SmallTableOwnerRequestAccess::runControl(
+        *Runtime, std::move(Work));
+  };
+  OwnerAbort Abort = [Runtime](
+                         const llvm::ejit::detail::OwnerWorkerContext &Worker,
+                         uint32_t FuncIndex) {
+    return llvm::ejit::detail::SmallTableOwnerRequestAccess::abortFunctionPgo(
+        *Runtime, Worker, FuncIndex);
+  };
+  std::function<void()> PublishReady = [Host]() {
+    llvm::ejit::detail::SmallTableOwnerRequestAccess::publishReady(Host);
+  };
+  return runSmallTableOwnerRequestImpl(
+      Func, Host, std::move(Job), InitialHandoff, Runtime, Pool,
+      std::move(RunControl), std::move(Abort), std::move(PublishReady));
 #else
-  return Fail("small-table owner-worker service is unavailable");
+  (void)Func; (void)Host; (void)Job; (void)InitialHandoff;
+  return make_error<StringError>("small-table owner-worker service is unavailable",
+                                 inconvertibleErrorCode());
+#endif
+}
+
+Error llvm::ejit::runSmallTableOwnerRequest(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker, uint32_t Func,
+    EJitSmallTableHost *Host, SmallTableOwnerWorkerJob Job,
+    bool InitialHandoff) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  RuntimeOperationPin RuntimePin(Worker);
+  EJit *Runtime = RuntimePin.runtime;
+  auto *Pool = Runtime ? Runtime->sharedTaskPool() : nullptr;
+  if (!Runtime || !Pool || !Worker.validFor(*Pool))
+    return make_error<StringError>("small-table worker context is stale",
+                                   inconvertibleErrorCode());
+  OwnerControlRunner RunControl = [Runtime, &Worker](
+      SmallTableOwnerWorkerJob Work) {
+    return llvm::ejit::detail::SmallTableOwnerRequestAccess::runControl(
+        *Runtime, Worker, std::move(Work));
+  };
+  OwnerAbort Abort = [Runtime](
+                         const llvm::ejit::detail::OwnerWorkerContext &Context,
+                         uint32_t FuncIndex) {
+    return llvm::ejit::detail::SmallTableOwnerRequestAccess::abortFunctionPgo(
+        *Runtime, Context, FuncIndex);
+  };
+  std::function<void()> PublishReady = [Host]() {
+    llvm::ejit::detail::SmallTableOwnerRequestAccess::publishReady(Host);
+  };
+  return runSmallTableOwnerRequestImpl(
+      Func, Host, std::move(Job), InitialHandoff, Runtime, Pool,
+      std::move(RunControl), std::move(Abort), std::move(PublishReady));
+#else
+  (void)Worker; (void)Func; (void)Host; (void)Job; (void)InitialHandoff;
+  return make_error<StringError>("small-table owner-worker service is unavailable",
+                                 inconvertibleErrorCode());
+#endif
+}
+
+Error llvm::ejit::runSmallTableOwnerRequest(
+    uint32_t Func, EJitSmallTableHost *Host, std::function<Error()> Job,
+    bool InitialHandoff) {
+  if (!Job)
+    return make_error<StringError>("small-table worker request has no job",
+                                   inconvertibleErrorCode());
+  SmallTableOwnerWorkerJob WorkerJob =
+      [Job = std::move(Job)](
+          const llvm::ejit::detail::OwnerWorkerContext &) mutable {
+        return Job();
+      };
+  return runSmallTableOwnerRequest(Func, Host, std::move(WorkerJob),
+                                   InitialHandoff);
+}
+
+bool llvm::ejit::smallTableSreLeaveHostTicket(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker,
+    EJitSmallTableHost *ExpectedHost, uint64_t Ticket) {
+  if (!Ticket)
+    return true;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  RuntimeOperationPin RuntimePin(Worker);
+  EJit *Runtime = RuntimePin.runtime;
+  auto *Pool = Runtime ? Runtime->sharedTaskPool() : nullptr;
+  if (!Runtime || !Pool || !ExpectedHost || !Worker.activeFor(*Pool))
+    return false;
+  if (EJitSmallTableHost *Host = EJitSmallTableHost::global())
+    if (Host == ExpectedHost && Host->ownsExecutionTicket(Ticket)) {
+      Host->leave(Ticket);
+      return true;
+    }
+  return llvm::ejit::detail::SmallTableOwnerRequestAccess::leaveRetainedExecution(
+      ExpectedHost, Ticket);
+#else
+  (void)Worker; (void)ExpectedHost;
+  return false;
 #endif
 }
 

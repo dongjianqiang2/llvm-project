@@ -73,6 +73,10 @@ class EJitOrcEngine;
 class EJitRuntimeState;
 class PeriodArrayRegistry;
 class EJitSmallTableHost;
+namespace detail {
+class OwnerWorkerContext;
+class SmallTableOwnerRequestAccess;
+}
 /// Internal owner identity of the live C-runtime instance, 0 when absent.
 uint64_t currentEJitRuntimeOwnerIdentity();
 /// C++ normal-path owner-worker controls; component-only hosted runtimes have
@@ -314,6 +318,8 @@ public:
   /// consult. Returns the previously installed host (usually null). Owned by
   /// the caller; the global registration holds no ownership.
   static EJitSmallTableHost *installGlobal(EJitSmallTableHost *Host);
+  static EJitSmallTableHost *installGlobal(
+      const detail::OwnerWorkerContext &Worker, EJitSmallTableHost *Host);
   /// The process-global host, or null when the feature is OFF.
   static EJitSmallTableHost *global();
   /// Monotonic dispatch decision epoch. Owner-serialized policy changes and
@@ -342,6 +348,7 @@ public:
   /// left); false when it was retained and the caller must MOVE its ownership
   /// into the registry with `adoptRetired(std::move(Owned))`.
   bool beginOwnerTeardown();
+  bool beginOwnerTeardown(const detail::OwnerWorkerContext &Worker);
 
   /// Hand a host parked by `beginOwnerTeardown` to the process-global retired
   /// owner registry (which destroys it as soon as its last execution leaves).
@@ -432,12 +439,20 @@ public:
   /// the AOT side of every decision, never called by the host itself.
   Error requestEntry(const EntryRequest &Request, void *executableAot,
                      std::string &Why);
+  Error requestEntry(const detail::OwnerWorkerContext &Worker,
+                     const EntryRequest &Request, void *executableAot,
+                     std::string &Why);
 
   /// The request path in two observable steps, for callers that drive their own
   /// scheduler: plan + resource from the confirmed facts, then the common T1.
   Expected<const EJitSmallTablePlan *> planEntry(const EntryRequest &Request,
                                                  std::string &Why);
+  Expected<const EJitSmallTablePlan *>
+  planEntry(const detail::OwnerWorkerContext &Worker,
+            const EntryRequest &Request, std::string &Why);
   Expected<void *> compileT1(std::string &Why);
+  Expected<void *> compileT1(const detail::OwnerWorkerContext &Worker,
+                             std::string &Why);
 
   /// The application's publish step: freeze the ONE common session, compile the
   /// common T2 from the immutable bundle and publish one logical slot per
@@ -445,6 +460,8 @@ public:
   /// the session is not ready, the bundle is stale, T2 does not bind the SAME
   /// resource/generation, or the configuration revision moved.
   Error publishGeneration(std::string &Why);
+  Error publishGeneration(const detail::OwnerWorkerContext &Worker,
+                          std::string &Why);
 
   //--- application dispatch -------------------------------------------------
 
@@ -503,6 +520,7 @@ public:
   void noteConfigurationChange(StringRef Reason);
   /// Cancel the current session and drain every slot (timeout/queue failure).
   void cancel(StringRef Reason);
+  void cancel(const detail::OwnerWorkerContext &Worker, StringRef Reason);
   /// Asynchronously prepare the coalesced next generation over the union of the
   /// members this host already admitted plus \p ExtraMembers: new resource
   /// generation, migrated rows, a fresh common session. Publishing it stays
@@ -681,8 +699,19 @@ public:
 
 private:
   EJitSmallTableHost() = default;
-  friend Error runSmallTableOwnerRequest(uint32_t, EJitSmallTableHost *,
-                                         std::function<Error()>, bool);
+  Expected<const EJitSmallTablePlan *>
+  planEntryImpl(const EntryRequest &Request, std::string &Why);
+  Expected<void *> compileT1Impl(std::string &Why);
+  Error requestEntryImpl(const EntryRequest &Request, void *executableAot,
+                         std::string &Why);
+  Error publishGenerationImpl(std::string &Why);
+  void cancelImpl(StringRef Reason);
+  bool beginOwnerTeardownImpl(const detail::OwnerWorkerContext *Worker);
+  static bool leaveRetainedExecution(EJitSmallTableHost *ExpectedHost,
+                                     uint64_t Ticket);
+  static EJitSmallTableHost *installGlobalImpl(
+      EJitSmallTableHost *Host, const detail::OwnerWorkerContext *Worker);
+  friend class detail::SmallTableOwnerRequestAccess;
   void setWrapperAdmissionReady(bool Ready) {
     wrapperAdmissionReady_.storeRelease(Ready ? 1 : 0);
   }

@@ -64,14 +64,16 @@ ejit_entry int64_t pr231_smalltable_entry(
   return result;
 }
 
-/* The SDK integration header must implement the two documented bindings.
- * Missing SDK bindings are a visible BLOCKED, never a simulated task ID or a
- * successful no-op data permission check. There are no weak undefined hooks.
+/* Runtime owns worker dispatch; this demo does not require a task-self API.
+ * Shared data is a SEPARATE product requirement: the table allocator is still
+ * ordinary new[], not automatically made shared by the .mc_shared source.
+ * Missing mapping bindings are a visible BLOCKED, never a successful no-op
+ * permission check. There are no weak undefined hooks.
  */
 #ifdef EJIT_PR231_PLATFORM_HEADER
 #include EJIT_PR231_PLATFORM_HEADER
 #endif
-#if defined(EJIT_PR231_CURRENT_TASK_ID) && defined(EJIT_PR231_PREPARE_SHARED_DATA)
+#if defined(EJIT_PR231_PREPARE_SHARED_DATA)
 #define PR231_HAVE_PLATFORM 1
 #else
 #define PR231_HAVE_PLATFORM 0
@@ -121,14 +123,6 @@ static int64_t pr231_expected(uint32_t cell, uint32_t trp, int64_t x) {
   return result;
 }
 
-static uint64_t pr231_task(void *unused) {
-  (void)unused;
-#if PR231_HAVE_PLATFORM
-  return EJIT_PR231_CURRENT_TASK_ID();
-#else
-  return 0;
-#endif
-}
 static void pr231_delay(void *unused, uint32_t ticks) {
   (void)unused;
   (void)SRE_TaskDelay(ticks);
@@ -200,13 +194,15 @@ __attribute__((noinline)) void pr231_probe_inflight(void) {
 
 static int pr231_setup(void) {
   if (!PR231_HAVE_PLATFORM) {
-    SRE_printf("[STAB231] BLOCKED: SDK task-id/shared-data bindings missing\n");
+    SRE_printf("[STAB231] BLOCKED: shared-data mapping binding missing "
+               "(commands/source/state/owner-heap tables); "
+               "no SDK task-id API required\n");
     return -20;
   }
   if (pr231_initialized)
     return 0;
 #if EJIT_PR231_CALL_INIT_ARRAY
-  /* A later task/permission/runtime failure must not cause constructors to run
+  /* A later permission/runtime failure must not cause constructors to run
    * twice when setup is retried. This is per-core, not runtime readiness. */
   if (!pr231_init_array_done) {
     SRE_printf("[STAB231][core=%u] init-array begin (once)\n", g_ucLocalCoreID);
@@ -215,10 +211,6 @@ static int pr231_setup(void) {
     SRE_printf("[STAB231][core=%u] init-array done\n", g_ucLocalCoreID);
   }
 #endif
-  if (pr231_task(0) == 0u) {
-    SRE_printf("[STAB231] BLOCKED: no actual task identity\n");
-    return -20;
-  }
   /* Both real caller/worker cores must read the actual shared callback slot.
    * The observer itself runs in AOT against this core's private controller.
    * Its shared flags also need real R/W mapping; section names are not proof.
@@ -241,7 +233,7 @@ static int pr231_setup(void) {
   bindings.flags = g_ucLocalCoreID == PR231_WORKER
                        ? EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN : 0u;
   bindings.waitRounds = EJIT_PR231_WAIT_ROUNDS;
-  bindings.current_task_id = pr231_task;
+  bindings.current_task_id = 0; /* Unknown SDK task ID; never a fabricated ID. */
   bindings.delay_ticks = pr231_delay;
   bindings.prepare_shared_data = pr231_data;
   int rc = ejit_small_table_sre_prepare(&bindings);
@@ -397,7 +389,8 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
                s.admittedMembers == PR231_CELLS * PR231_TRPS &&
                s.expectedCounterPairs != 0u &&
                s.counterPairs == s.expectedCounterPairs &&
-               s.workerTaskIdentity != 0u && s.genericPending == 0u &&
+               s.workerTaskIdentity == 0u && s.ownerIdentity != 0u &&
+               s.ownerWorkerOperations != 0u && s.genericPending == 0u &&
                s.genericAsyncEnqueues == 0u, "cold common T1 / actual counters");
   for (uint32_t n = 0; n < quota; ++n)
     PR231_CHECK(pr231_call(n) == 0, "real generated wrapper value/store");

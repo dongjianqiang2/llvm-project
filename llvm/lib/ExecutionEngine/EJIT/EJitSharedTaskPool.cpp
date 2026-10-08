@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "EJitOwnerWorkerContext.h"
 #include "EJitSmallTableSreBridgeInternal.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
@@ -66,9 +67,11 @@ using namespace llvm::ejit;
 #endif
 
 namespace {
-#ifndef EJIT_FREESTANDING
-thread_local EJitSharedTaskPool *CurrentOwnerWorker = nullptr;
-#endif
+// Monotonic freshness discriminator only: it is never consulted to infer the
+// current caller. This prevents an old context from matching a new Pool object
+// after address reuse, even when the shared generation restarts at the same
+// value.
+std::atomic<uint64_t> NextWorkerContextEpoch{0};
 
 // Compiler reordering barrier used as a portable idle relax (no platform
 // symbol, no arch-specific instruction in this layer).
@@ -4333,31 +4336,79 @@ bool EJitSharedTaskPool::serviceMayConstRankingRequest() {
 }
 
 bool EJitSharedTaskPool::isCurrentOwnerWorker() const {
-  if (workerIdentityFn_)
-    return workerIdentityFn_(workerIdentityCtx_);
-#ifndef EJIT_FREESTANDING
-  return CurrentOwnerWorker == this;
-#else
+  // There is intentionally no implicit task/core/TLS identity. Callers that
+  // are reached from the worker pass its non-transferable context explicitly.
   return false;
-#endif
+}
+
+bool EJitSharedTaskPool::matchesWorkerContext(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) const {
+  return Worker.pool_ == this && Worker.poolEpoch_ != 0 &&
+         Worker.poolEpoch_ ==
+             activeWorkerContextEpoch_.load(std::memory_order_acquire) &&
+         state_ && Worker.stateGeneration_ != 0 &&
+         Worker.stateGeneration_ == state_->generation.loadAcquire();
+}
+
+bool EJitSharedTaskPool::isCurrentOwnerWorker(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) const {
+  if (!isWorkerContextActive(Worker) || !state_)
+    return false;
+  const uint32_t State = state_->initState.loadAcquire();
+  return State == static_cast<uint32_t>(EJitSharedInitState::Initializing) ||
+         State == static_cast<uint32_t>(EJitSharedInitState::Ready);
+}
+
+bool EJitSharedTaskPool::isWorkerContextActive(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) const {
+  return workerLoopActive_.load(std::memory_order_acquire) &&
+         matchesWorkerContext(Worker);
+}
+
+uint64_t EJitSharedTaskPool::nextWorkerContextEpoch() {
+  uint64_t Epoch = NextWorkerContextEpoch.load(std::memory_order_relaxed);
+  for (;;) {
+    if (Epoch == UINT64_MAX)
+      return 0;
+    if (NextWorkerContextEpoch.compare_exchange_weak(
+            Epoch, Epoch + 1, std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+      return Epoch + 1;
+  }
 }
 
 EJitSharedTaskPool::OwnerControlResult
 EJitSharedTaskPool::runControlOnOwnerAndWait(std::function<void()> Work,
                                            uint32_t WaitRounds) {
+  if (!Work)
+    return {};
+  return runControlOnOwnerAndWait(
+      [Work = std::move(Work)](
+          const llvm::ejit::detail::OwnerWorkerContext &) { Work(); },
+      WaitRounds);
+}
+
+EJitSharedTaskPool::OwnerControlResult
+EJitSharedTaskPool::runControlOnOwnerAndWait(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker,
+    std::function<void(const llvm::ejit::detail::OwnerWorkerContext &)> Work,
+    uint32_t WaitRounds) {
+  (void)WaitRounds;
+  if (!Work || !state_ || !isOwner_ || !workerStart_ ||
+      state_->initState.loadAcquire() != kReady ||
+      !isCurrentOwnerWorker(Worker))
+    return {};
+  Work(Worker);
+  return {OwnerControlStatus::Completed, false};
+}
+
+EJitSharedTaskPool::OwnerControlResult
+EJitSharedTaskPool::runControlOnOwnerAndWait(
+    std::function<void(const llvm::ejit::detail::OwnerWorkerContext &)> Work,
+    uint32_t WaitRounds) {
   if (!Work || !state_ || !isOwner_ || !workerStart_ ||
       state_->initState.loadAcquire() != kReady)
     return {};
-#ifdef EJIT_FREESTANDING
-  if (!workerIdentityFn_) {
-    EJIT_DIAG("owner control refused: real platform task identity not bound");
-    return {};
-  }
-#endif
-  if (isCurrentOwnerWorker()) {
-    Work();
-    return {OwnerControlStatus::Completed, false};
-  }
   uint32_t Wait = 0;
   while (!workerLoopActive_.load(std::memory_order_acquire)) {
     if (Wait++ >= WaitRounds || state_->initState.loadAcquire() != kReady)
@@ -4404,8 +4455,9 @@ EJitSharedTaskPool::runControlOnOwnerAndWait(std::function<void()> Work,
   }
 }
 
-bool EJitSharedTaskPool::serviceOwnerControl() {
-  if (!isOwner_ || !isCurrentOwnerWorker())
+bool EJitSharedTaskPool::serviceOwnerControl(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) {
+  if (!isOwner_ || !isCurrentOwnerWorker(Worker))
     return false;
   uint32_t Expected = 0;
   while (!ownerControlLock_.compareExchange(Expected, 1))
@@ -4416,7 +4468,20 @@ bool EJitSharedTaskPool::serviceOwnerControl() {
     return false;
   uint32_t Queued = OwnerControlJob::Queued;
   if (Job->state.compare_exchange_strong(Queued, OwnerControlJob::Started)) {
-    Job->work();
+    {
+      EJit *PinnedRuntime = acquireSmallTableSreRuntime(this);
+      struct RuntimePin {
+        EJit *Runtime;
+        const llvm::ejit::detail::OwnerWorkerContext &Worker;
+        ~RuntimePin() {
+          if (Runtime)
+            releaseSmallTableSreRuntime(Runtime, Worker);
+        }
+      } Pin{PinnedRuntime, Worker};
+      Job->work(Worker);
+    }
+    // Completion means both the callback and its worker-side Runtime pin have
+    // been released. The external waiter can now safely retire the facade.
     Job->state.store(OwnerControlJob::Done, std::memory_order_release);
   }
   return true;
@@ -4435,7 +4500,14 @@ void EJitSharedTaskPool::cancelQueuedOwnerControl() {
 }
 
 bool EJitSharedTaskPool::abortFunctionPgoOnOwner(uint32_t FuncIndex) {
-  if (!state_ || !isOwner_ || !isCurrentOwnerWorker() ||
+  (void)FuncIndex;
+  return false;
+}
+
+bool EJitSharedTaskPool::abortFunctionPgoOnOwner(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker,
+    uint32_t FuncIndex) {
+  if (!state_ || !isOwner_ || !isCurrentOwnerWorker(Worker) ||
       FuncIndex >= kEJitSharedMaxFuncIndex || !functionOwnershipGateFn_ ||
       ordinaryFunctionAllowed(FuncIndex))
     return false;
@@ -4507,13 +4579,18 @@ unsigned EJitSharedTaskPool::pollBudget(unsigned maxItems) {
 }
 
 EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
+  return workerPollOnceInternal(nullptr);
+}
+
+EJitWorkerStep EJitSharedTaskPool::workerPollOnceInternal(
+    const llvm::ejit::detail::OwnerWorkerContext *Worker) {
   if (!state_)
     return EJitWorkerStep::Exit;
   uint32_t st = state_->initState.loadAcquire();
   switch (static_cast<EJitSharedInitState>(st)) {
   case EJitSharedInitState::Ready:
     workerConsumeLoops_.fetchAdd(1);
-    if (serviceOwnerControl())
+    if (Worker && serviceOwnerControl(*Worker))
       return EJitWorkerStep::Consumed;
     // Explicit publication must not starve behind a continuously replenished
     // compile queue or diagnostics. serviceCodeBatchRequest() snapshots and
@@ -4542,13 +4619,15 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
   }
 }
 
-void EJitSharedTaskPool::runWorkerLoop() {
-#ifndef EJIT_FREESTANDING
-  EJitSharedTaskPool *PreviousWorker = CurrentOwnerWorker;
-  CurrentOwnerWorker = this;
-#endif
-  workerLoopActive_.store(true, std::memory_order_release);
-  smallTableSreWorkerEnter(*this);
+void EJitSharedTaskPool::runWorkerLoop(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) {
+  if (!matchesWorkerContext(Worker))
+    return;
+  bool ExpectedInactive = false;
+  if (!workerLoopActive_.compare_exchange_strong(
+          ExpectedInactive, true, std::memory_order_acq_rel))
+    return;
+  smallTableSreWorkerEnter(*this, Worker);
   EJIT_DIAG_VERBOSE("shared worker loop enter");
   // Loop until a terminal state. The worker is a PRODUCTION-lifetime task: it
   // never exits just because the owner is slightly slow to publish Ready (no
@@ -4562,8 +4641,8 @@ void EJitSharedTaskPool::runWorkerLoop() {
     // Physical PREP/COMMIT/LEAVE and snapshots are control traffic, not
     // compiler jobs. Service one, then still give the normal queue one poll:
     // bounded fairness without applying compile throttle to every business RPC.
-    const bool BridgeServiced = serviceSmallTableSreBridge(*this);
-    EJitWorkerStep s = workerPollOnce();
+    const bool BridgeServiced = serviceSmallTableSreBridge(*this, Worker);
+    EJitWorkerStep s = workerPollOnceInternal(&Worker);
     if (s == EJitWorkerStep::Exit)
       break;
     if (s == EJitWorkerStep::Idle && BridgeServiced)
@@ -4574,12 +4653,9 @@ void EJitSharedTaskPool::runWorkerLoop() {
       workerThrottle();
   }
   EJIT_DIAG_VERBOSE("shared worker loop leave");
-  smallTableSreWorkerExit(*this);
+  smallTableSreWorkerExit(*this, Worker);
   workerLoopActive_.store(false, std::memory_order_release);
   cancelQueuedOwnerControl();
-#ifndef EJIT_FREESTANDING
-  CurrentOwnerWorker = PreviousWorker;
-#endif
 }
 
 void EJitSharedTaskPool::workerIdle(uint32_t ticks) {
@@ -4602,7 +4678,37 @@ void EJitSharedTaskPool::workerThrottle() {
 }
 
 void EJitSharedTaskPool::workerEntryThunk(void *ctx) {
-  static_cast<EJitSharedTaskPool *>(ctx)->runWorkerLoop();
+  auto *Pool = static_cast<EJitSharedTaskPool *>(ctx);
+  if (!Pool || !Pool->state_)
+    return;
+  const uint64_t Epoch = Pool->nextWorkerContextEpoch();
+  const uint32_t Generation = Pool->state_->generation.loadAcquire();
+  if (!Epoch || !Generation)
+    return;
+  uint64_t NoActiveWorker = 0;
+  if (!Pool->activeWorkerContextEpoch_.compare_exchange_strong(
+          NoActiveWorker, Epoch, std::memory_order_acq_rel))
+    return;
+  const llvm::ejit::detail::OwnerWorkerContext Worker(Pool, Epoch,
+                                                       Generation);
+  Pool->runWorkerLoop(Worker);
+  uint64_t ActiveEpoch = Epoch;
+  Pool->activeWorkerContextEpoch_.compare_exchange_strong(
+      ActiveEpoch, 0, std::memory_order_acq_rel);
+}
+
+void EJitSharedTaskPool::runWorkerLoop() {
+  EJIT_DIAG("shared worker loop refused: explicit worker context required");
+}
+
+bool llvm::ejit::detail::OwnerWorkerContext::validFor(
+    const EJitSharedTaskPool &Pool) const {
+  return Pool.isCurrentOwnerWorker(*this);
+}
+
+bool llvm::ejit::detail::OwnerWorkerContext::activeFor(
+    const EJitSharedTaskPool &Pool) const {
+  return Pool.isWorkerContextActive(*this);
 }
 
 //===----------------------------------------------------------------------===//

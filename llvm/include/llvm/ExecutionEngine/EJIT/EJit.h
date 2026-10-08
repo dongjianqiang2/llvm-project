@@ -35,6 +35,10 @@ class EJitCompileDriver;
 class EJitLogger;
 class EJitTaskPool;
 class EJitSharedTaskPool;
+namespace detail {
+class OwnerWorkerContext;
+class SmallTableOwnerRequestAccess;
+}
 
 /// Main user-facing class for EmbeddedJIT. Owns all runtime components.
 class EJit {
@@ -193,9 +197,13 @@ public:
   //===--------------------------------------------------------------------===//
   Error enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
                          EJitSmallTableHost::Options Opts = {});
+  Error enableSmallTable(const detail::OwnerWorkerContext &Worker,
+                         std::shared_ptr<EJitSmallTableFactSource> Facts,
+                         EJitSmallTableHost::Options Opts = {});
   /// Tear the small-table normal path down: retract every published slot,
   /// cancel the session and uninstall the process-wide gate.
   void disableSmallTable();
+  void disableSmallTable(const detail::OwnerWorkerContext &Worker);
   /// The instance's small-table integration object, or null when disabled.
   EJitSmallTableHost *smallTableHost() { return smallTableHost_.get(); }
   const EJitSmallTableHost *smallTableHost() const {
@@ -204,6 +212,22 @@ public:
 
 private:
   friend struct EJitWrapperRuntimeTestAccess;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  friend class detail::SmallTableOwnerRequestAccess;
+  EJitSharedTaskPool::OwnerControlResult runControlOnOwnerAndWait(
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  EJitSharedTaskPool::OwnerControlResult runControlOnOwnerAndWait(
+      const detail::OwnerWorkerContext &Worker,
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  bool abortFunctionPgoOnOwner(const detail::OwnerWorkerContext &Worker,
+                               uint32_t FuncIndex);
+#endif
+  Error enableSmallTableImpl(const detail::OwnerWorkerContext *Worker,
+                             std::shared_ptr<EJitSmallTableFactSource> Facts,
+                             EJitSmallTableHost::Options Opts);
+  void disableSmallTableImpl(const detail::OwnerWorkerContext *Worker);
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;
   std::unique_ptr<EJitModuleLoader> moduleLoader_;

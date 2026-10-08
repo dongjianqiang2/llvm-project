@@ -15,6 +15,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "EJitSharedTaskPoolTestAccess.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -325,7 +326,7 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
 #endif
 
   const auto Start = std::chrono::steady_clock::now();
-  Pool.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(Pool);
   const auto Elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - Start)
                            .count();

@@ -1,4 +1,4 @@
-/* Copy to an SDK-owned header and replace the two #error directives with
+/* Copy to an SDK-owned header and replace the mapping #error directive with
  * bindings to the actual product APIs. No SDK signature is guessed here.
  * Compile the demo with:
  *   -DEJIT_PR231_PLATFORM_HEADER='"your_pr231_sre_bindings.h"'
@@ -7,11 +7,8 @@
 #ifndef YOUR_PR231_SRE_BINDINGS_H
 #define YOUR_PR231_SRE_BINDINGS_H
 
-/* Return THIS task's true nonzero identity, including when invoked from the
- * EJIT worker. Do not return core ID or taskpool's diagnostic workerTaskId.
- * A stable token must not be reused while any old execution can still leave.
- */
-#error "Bind EJIT_PR231_CURRENT_TASK_ID() to the actual SDK task-self API"
+/* No task-self API is required. Worker dispatch is internal to the runtime;
+ * the optional old current_task_id C ABI field is diagnostic only. */
 
 /* Return zero only after proving/installing same-VA coherent READ and/or WRITE
  * mapping on this actual calling core. Handle shared commands, source/state,

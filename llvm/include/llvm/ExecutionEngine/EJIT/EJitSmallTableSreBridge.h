@@ -25,8 +25,11 @@ extern "C" {
 #define EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN 1u
 
 /// LOCAL bindings: callbacks/context are never copied into shared commands.
-/// current_task_id must return the real platform task token (nonzero), NOT a
-/// core ID, simulated TLS ID, or taskpool diagnostic workerTaskId.
+/// current_task_id is optional, retained for ABI compatibility and diagnostics.
+/// If provided it must return a real platform task token, NOT a core ID or an
+/// internal execution-context token. NULL reports workerTaskIdentity=0 (unknown).
+/// Dispatch authorization uses an explicit internal worker execution context;
+/// this callback does not let public shell calls bypass the command queue.
 /// prepare_shared_data proves/installs same-VA coherent readable (or writable)
 /// mapping on THIS calling core. A no-op or merely same VA is not this proof.
 typedef struct {
@@ -111,7 +114,7 @@ typedef struct {
   int32_t status;
   uint32_t funcIndex;
   uint64_t ownerIdentity;
-  uint64_t workerTaskIdentity;
+  uint64_t workerTaskIdentity; // Real optional SDK task token; 0=not supplied.
   uint64_t policyEpoch;
   uint64_t codeGeneration;
   uint64_t resourceGeneration;

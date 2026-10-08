@@ -54,6 +54,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
+#include "EJitSharedTaskPoolTestAccess.h"
+#include "../../../lib/ExecutionEngine/EJIT/EJitOwnerWorkerContext.h"
 #include "../../../lib/ExecutionEngine/EJIT/EJitWrapperRuntimeTestAccess.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/AsmParser/Parser.h"
@@ -3630,7 +3632,9 @@ protected:
     Bindings.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
     Bindings.structSize = sizeof(Bindings);
     Bindings.waitRounds = 65536;
-    Bindings.current_task_id = bridgeLinuxTask;
+    // Explicit worker context supplies authority. No SDK query is fabricated
+    // from a core id, TLS, callback flag or diagnostic TaskCreate placeholder.
+    Bindings.current_task_id = nullptr;
     Bindings.delay_ticks = bridgeLinuxDelay;
     Bindings.prepare_shared_data = bridgeLinuxMapping;
     ASSERT_EQ(ejit_small_table_sre_prepare(&Bindings), EJIT_STAB_SRE_OK);
@@ -3846,10 +3850,37 @@ protected:
     }
     ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
   }
-  void singleTuCold(uint64_t Limit) {
+  void singleTuCold(uint64_t Limit, bool WorkerSixCallerSixteen = false) {
+    auto RestoreCore = make_scope_exit([] { EJitCoreId::resetForTest(); });
+    if (WorkerSixCallerSixteen)
+      EJitCoreId::setCurrentForTest(6);
     ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
+    if (WorkerSixCallerSixteen) {
+      auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+      ASSERT_NE(Pool, nullptr);
+      const auto Caller = std::this_thread::get_id();
+      std::thread::id WorkerTask;
+      auto Prepared = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+          *Pool, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+            ASSERT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+                *Pool, Context));
+            WorkerTask = std::this_thread::get_id();
+            // Simulate the product's 6/16 roles, not SDK task identity. The
+            // capability still came from the real native worker-entry stack.
+            EJitCoreId::setCurrentForTest(6);
+          });
+      ASSERT_EQ(Prepared.status,
+                EJitSharedTaskPool::OwnerControlStatus::Completed);
+      ASSERT_NE(WorkerTask, Caller);
+      ASSERT_EQ(Pool->state()->ownerCoreId.loadAcquire(), 6u);
+      EJitCoreId::setCurrentForTest(16);
+    }
     requestCompiler2d(Limit);
-    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+              EJIT_STAB_SRE_OK);
+    EXPECT_EQ(Before.workerTaskIdentity, 0u);
+    EXPECT_NE(Before.ownerIdentity, 0u);
+    EXPECT_GT(Before.ownerWorkerOperations, 0u);
     ASSERT_EQ(Before.admittedMembers, 12u);
     ASSERT_EQ(Before.genericAsyncEnqueues, 0u);
     EXPECT_EQ(ObservationCount(), 0);
@@ -3859,7 +3890,8 @@ protected:
       EXPECT_EQ(CompilerOutput[C][T], 4);
       EXPECT_EQ(ObservationCount(), static_cast<int32_t>(I + 1));
     }
-    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before),
+              EJIT_STAB_SRE_OK);
     EXPECT_EQ(Before.sampleCount, Limit);
     EXPECT_EQ(Before.physicalExecutions, 0u);
     ASSERT_EQ(Before.counterPairs, 1u)
@@ -3870,10 +3902,12 @@ protected:
     EXPECT_EQ(CompilerEntry(5, 1, 4), wrapAotResult(CompilerRows[5][1], 4));
     EXPECT_EQ(g_aotCalls, 1u);
     EXPECT_EQ(ObservationCount(), static_cast<int32_t>(Limit + 1));
-    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+              EJIT_STAB_SRE_OK);
     EXPECT_EQ(After.countersDigest, Before.countersDigest);
     ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
-    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+              EJIT_STAB_SRE_OK);
     EXPECT_EQ(After.tier, 2u);
     EXPECT_EQ(After.fullProfileValid, 1u);
     EXPECT_GT(After.profileBytes, 0u);
@@ -3886,6 +3920,8 @@ protected:
     EXPECT_EQ(After.genericAsyncEnqueues, 0u);
     EXPECT_EQ(After.genericAsyncCompiles, 0u);
     EXPECT_EQ(After.genericPending, 0u);
+    EXPECT_EQ(After.workerTaskIdentity, 0u);
+    EXPECT_GT(After.ownerWorkerOperations, Before.ownerWorkerOperations);
     for (unsigned C = 0; C < 6; ++C)
       for (unsigned T = 0; T < 2; ++T) {
         EXPECT_EQ(CompilerEntry(C, T, 5), wrapAotResult(CompilerRows[C][T], 5));
@@ -3897,7 +3933,8 @@ protected:
     // original AOT initializer. Changing to another real same-image callback
     // modifies the SAME private observer object, without JIT/controller clones.
     auto Alternate = CompilerImage->lookup("pr231_probe_alternate");
-    ASSERT_TRUE(static_cast<bool>(Alternate)) << toString(Alternate.takeError());
+    ASSERT_TRUE(static_cast<bool>(Alternate))
+        << toString(Alternate.takeError());
     *ProbeDispatch = reinterpret_cast<void (*)()>(Alternate->getValue());
     EXPECT_EQ(CompilerEntry(0, 0, 6), wrapAotResult(CompilerRows[0][0], 6));
     EXPECT_EQ(ObservationCount(), static_cast<int32_t>(Limit + 23));
@@ -3916,8 +3953,10 @@ protected:
     Request.aotEntry = reinterpret_cast<uintptr_t>(&wrapAotEntry);
     Request.sourceEpoch = SourceState.epoch;
     Request.configurationRevision = SourceState.revision;
-    Request.codeGeneration = 1; Request.sampleLimit = Limit;
-    Request.numDims = 1; Request.numMembers = kWrapReadyCells;
+    Request.codeGeneration = 1;
+    Request.sampleLimit = Limit;
+    Request.numDims = 1;
+    Request.numMembers = kWrapReadyCells;
     Request.domainCoverage = 1;
     Request.dims[0].argumentIndex = 0;
     Request.dims[0].extent = kWrapCells;
@@ -3933,8 +3972,10 @@ protected:
     ASSERT_TRUE(buildWrapper(Icache)); request(Limit);
     ASSERT_EQ(ejit_small_table_sre_get_snapshot(UINT32_MAX, &Before), EJIT_STAB_SRE_OK);
     ASSERT_EQ(Before.funcIndex, FuncIdx);
-    ASSERT_NE(Before.workerTaskIdentity, bridgeLinuxTask(nullptr));
-    ASSERT_NE(Before.workerTaskIdentity, 0u);
+    ASSERT_EQ(Before.workerTaskIdentity, 0u)
+        << "SDK task id is unknown in the explicit-context path";
+    ASSERT_NE(Before.ownerIdentity, 0u);
+    ASSERT_GT(Before.ownerWorkerOperations, 0u);
     ASSERT_EQ(Before.tier, 1u);
     ASSERT_GT(Before.expectedCounterPairs, 0u);
     ASSERT_EQ(Before.counterPairs, Before.expectedCounterPairs);
@@ -3985,6 +4026,36 @@ TEST_F(GeneratedWrapperSreBridgeTest,
 TEST_F(GeneratedWrapperSreBridgeTest,
        SingleTuActualPass1Configurable8CompleteProfileAndCommonT2) {
   singleTuCold(8);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       SingleTuActualPass1WorkerSixCallerSixteenWithoutTaskIdCold64ToT2) {
+  singleTuCold(64, /*WorkerSixCallerSixteen=*/true);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       MissingSharedDataPermissionHookRemainsFailClosedWithoutTaskId) {
+  ejit_small_table_sre_bindings_t Missing{};
+  Missing.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
+  Missing.structSize = sizeof(Missing);
+  Missing.waitRounds = 65536;
+  Missing.delay_ticks = bridgeLinuxDelay;
+  Missing.current_task_id = nullptr;
+  EXPECT_EQ(ejit_small_table_sre_prepare(&Missing), EJIT_STAB_SRE_BLOCKED)
+      << "an unknown diagnostic task id never replaces real data preparation";
+  // Failed preparation must not clobber the existing immutable, real mapping
+  // binding. The normal cold path must still execute actual counters/profile.
+  cold(8);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       PublicPrepareCannotReplaceExistingUnknownTaskIdBinding) {
+  ejit_small_table_sre_bindings_t Changed{};
+  Changed.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
+  Changed.structSize = sizeof(Changed);
+  Changed.waitRounds = 65536;
+  Changed.delay_ticks = bridgeLinuxDelay;
+  Changed.prepare_shared_data = bridgeLinuxMapping;
+  Changed.current_task_id = bridgeLinuxTask;
+  EXPECT_EQ(ejit_small_table_sre_prepare(&Changed), EJIT_STAB_SRE_BUSY);
+  cold(8);
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
        SingleTuActualPass1LastCallCancelRetainsBorrowUntilRealLeave) {
@@ -4232,6 +4303,70 @@ TEST_F(GeneratedWrapperSreBridgeTest, CancelDuringRealCallRetainsBorrowUntilActu
     Request.members[I].configurationGeneration = 2;
   ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
   EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       ShutdownInsideRealFacadeOwnerJobJoinsReturnBeforeCallerReclaims) {
+  ASSERT_TRUE(buildWrapper());
+  request(8);
+  auto *ActualHost = EJitSmallTableHost::global();
+  auto *ActualPool = EJitWrapperRuntimeTestAccess::pool();
+  ASSERT_NE(ActualHost, nullptr);
+  ASSERT_NE(ActualPool, nullptr);
+  const auto Caller = std::this_thread::get_id();
+  std::thread::id Executed;
+  bool ShutdownReturned = false;
+  Error Result = runSmallTableOwnerRequest(
+      FuncIdx, ActualHost,
+      [&](const llvm::ejit::detail::OwnerWorkerContext &Context) -> Error {
+        EXPECT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+            *ActualPool, Context));
+        Executed = std::this_thread::get_id();
+        EXPECT_NE(Executed, Caller);
+        // This is the actual facade/owner handoff, not a raw pool test callback
+        // that would bypass the runtime's owner-job lifetime pin.
+        ejit_shutdown();
+        ShutdownReturned = true;
+        ejit_config_t Cfg{};
+        Cfg.compileMode = EJIT_COMPILE_ASYNC;
+        Cfg.optLevel = EJIT_OPT_L2;
+        EXPECT_NE(ejit_init_pgo(&Cfg), EJIT_OK)
+            << "the still-running owner job forbids facade replacement";
+        return Error::success();
+      },
+      /*InitialHandoff=*/false);
+  EXPECT_TRUE(static_cast<bool>(Result))
+      << "shutdown invalidated the joined handoff's original runtime owner";
+  if (Result)
+    consumeError(std::move(Result));
+  EXPECT_TRUE(ShutdownReturned) << "worker-side shutdown must not self-join";
+  EXPECT_NE(Executed, Caller);
+  EXPECT_EQ(SourceState.readers, 0u);
+  // The old job has now really returned. Reclamation/join occurs from the
+  // caller, then a fresh facade consumes the original payload and registration.
+  ejit_shutdown();
+  ejit_register_period_array(kWrapPeriod, "g_wrap", &g_wrap[0].mode,
+                             sizeof(g_wrap));
+  ejit_register_static_var("g_wrap", &g_wrap[0].mode);
+  ejit_register_static_var("g_wrap_out", &g_wrap_out[0]);
+  ejit_register_bitcode("f_entry", RegisteredBitcode.data(),
+                        RegisteredBitcode.size());
+  ejit_config_t Cfg{};
+  Cfg.compileMode = EJIT_COMPILE_ASYNC;
+  Cfg.optLevel = EJIT_OPT_L2;
+  ASSERT_EQ(ejit_init_pgo(&Cfg), EJIT_OK);
+  for (unsigned I = 0; I < kWrapReadyCells; ++I)
+    ASSERT_EQ(ejit_activate(kWrapPeriod, I), EJIT_OK);
+  EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+            EJIT_STAB_SRE_INVALID);
+  Request.codeGeneration = 2;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(Wrapper->call(0, 4), wrapAotResult(g_wrap[0], 4));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After),
+            EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.sampleCount, 1u);
+  EXPECT_EQ(After.workerTaskIdentity, 0u);
+  EXPECT_NE(After.ownerIdentity, 0u);
+  EXPECT_GT(After.ownerWorkerOperations, 0u);
 }
 TEST_F(GeneratedWrapperSreBridgeTest, ShutdownDuringRealCallPreservesLateLeaveAndReinitDropsOldControl) {
   ASSERT_TRUE(buildWrapper(false, true)); request(8);

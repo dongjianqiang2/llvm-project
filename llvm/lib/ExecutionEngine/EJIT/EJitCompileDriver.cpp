@@ -988,12 +988,18 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 bool EJitCompileDriver::abortFunctionPgoOnOwner(uint32_t FuncIndex) {
+  (void)FuncIndex;
+  return false;
+}
+
+bool EJitCompileDriver::abortFunctionPgoOnOwner(
+    const detail::OwnerWorkerContext &Worker, uint32_t FuncIndex) {
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   EJIT_DIAG("ordinary profile abort refused func=%u: live VP generation bridge "
             "is not installed", FuncIndex);
   return false;
 #endif
-  if (!sharedPool_.isCurrentOwnerWorker())
+  if (!sharedPool_.isCurrentOwnerWorker(Worker))
     return false;
   handedOffFunctions_.insert(FuncIndex);
   auto Belongs = [&](uint64_t Key) {
