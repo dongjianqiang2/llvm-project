@@ -1,7 +1,7 @@
 # PR231 双核小表调测用例
 
-此目录的 `ejit_smalltable_sre_test.c`（controller）和
-`ejit_smalltable_sre_business.c`（business）使用真实 `ejit_entry`、生成 wrapper、
+此目录只需编译 `ejit_smalltable_sre_test.c` 一个 C 文件，业务、启动与调测都在其中。
+使用真实 `ejit_entry`、生成 wrapper、
 Async worker、共同 T1 的真实计数器、完整 profile 和共同 T2；不是手写 JIT
 入口或 Linux 二进制改名。服务器没有 BiSheng/SRE SDK，**本包不代表已完成
 SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这两项。
@@ -10,10 +10,11 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
 
 - 使用本分支的 patched EJIT clang 和本次完整 runtime；不能用旧 EJIT archive。
   用例不能定义 `EJIT_DISABLE`，不能忽略未知 EJIT attribute 的警告。
-  **两个 C 文件分别编译后链接**，共同使用 `ejit_smalltable_sre_fixture.h`。
-  不要提前 LTO 合成一个 TU；observer 必须保持实际外部 controller 调用，
-  不能把 controller 的 core-private 状态和调测逻辑克隆进 JIT 采样图。
-- **业务 TU 的 wrapper 生成必须加 `-mllvm -ejit-small-table-hooks`**（该选项
+  **只将此 C 文件加入工程**，不要再编译旧版 `business.c`，避免业务符号重复。
+  真实 observer 通过共享的可变 volatile 函数指针槽调用；PASS1将槽外部化并
+  注册实际地址，不追踪其初始化器，测试控制状态不会成为JIT采样图副本。
+  不要把该槽改成const、移除volatile，或改回同TU直接调用observer。
+- **此文件的 wrapper 生成必须加 `-mllvm -ejit-small-table-hooks`**（该选项
   默认OFF）。若在LTO/backend阶段才生成wrapper，该阶段也传此选项；保留
   原EJIT bitcode/AOT pipeline，不另关它们。C setup不能给旧wrapper补hook。
   对实际post-pass IR检查 `pr231_smalltable_entry` 中有
@@ -23,13 +24,17 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
   原产品默认不自动开启小表；本用例通过新 C setup 明确申请。
 - 用例仅替换一个现有 period demo。不要同时链接另一个定义
   `test_ejit_period` 的对象。小表 runtime 七个 hook、新桥接六个 C API
-  和两个 shell 入口必须在最终合并对象中有唯一真实定义。
+  和两个 shell 入口必须在最终合并对象中有唯一真实定义；严格 demo roots
+  同时保留 `g_pr231_probe_dispatch` 共享 OBJECT 和 `pr231_probe_inflight`
+  真实 AOT FUNC，缺任一即报错，不依赖碰巧被别的引用留下。
 - 复制 `ejit_smalltable_sre_platform.h.example` 到 SDK 工程，绑定真实 task-self
   和共享数据权限接口，定义 `EJIT_PR231_PLATFORM_HEADER` 指向它。
   模板故意无法直接编译；没有提供绑定时，用例打印 `BLOCKED`，不继续初始化。
   不可用 core ID 冒充 task ID，也不能将权限检查写成固定返回零。
 - `.mc_shared` 必须在两核映射到同一 VA、同一真正 coherent 存储；共享命令、
-  配置、source-state、output 都在此节。共同表/计数器堆对象也须可共享，并通过
+  配置、source-state、output、callback槽及调测flags都在此节。用例在两核setup
+  分别检查callback槽READ及调测flagsR/W权限，不用成功空实现替代。真实AOT
+  callback代码也须在调用核可执行。共同表/计数器堆对象须可共享，并通过
   调用核的真实权限接口。仅有 section 名或 fingerprint 一致不证明这个前提。
 - 每核私有 runtime/构造器状态必须保持私有；两核各消费同一套注册。
   默认每核首次命令调用一次 `call_init_array_functions()`。若产品启动已经

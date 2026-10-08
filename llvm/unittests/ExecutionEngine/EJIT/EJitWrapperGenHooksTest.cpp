@@ -49,6 +49,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
@@ -56,6 +57,7 @@
 #include "../../../lib/ExecutionEngine/EJIT/EJitWrapperRuntimeTestAccess.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
@@ -312,6 +314,62 @@ std::string reentrantEntryBodyText(StringRef Src, StringRef Out,
   return T;
 }
 
+/// A single C translation unit may define both business and test control code.
+/// Its volatile, mutable callback slot is the closure boundary: the initializer
+/// is owned by the AOT image, not followed or cloned into registered bitcode.
+std::string singleTuCallbackBodyText(StringRef Src, StringRef Out,
+                                     unsigned Cells) {
+  std::string T = reentrantEntryBodyText(Src, Out, Cells);
+  const std::string Direct = "      %obs = call i32 @wrap_observe(i32 %cell)\n";
+  const size_t Pos = T.find(Direct);
+  if (Pos == std::string::npos)
+    return {};
+  T.replace(Pos, Direct.size(),
+            "      %probe = load volatile ptr, ptr @g_pr231_probe_dispatch, align 8\n"
+            "      call void %probe()\n"
+            "      %obs = add i32 0, 0\n");
+  T += R"(
+    @g_pr231_probe_dispatch = global ptr @pr231_probe_inflight, section ".ejit_pr231_shared", align 8
+    @g_pr231_observer_calls = internal global i32 0
+    @g_pr231_controller_state = internal global i32 77
+    define internal void @pr231_probe_inflight() noinline {
+      %before = load i32, ptr @g_pr231_observer_calls, align 4
+      %next = add i32 %before, 1
+      store i32 %next, ptr @g_pr231_observer_calls, align 4
+      %unused = call i32 @wrap_observe(i32 0)
+      ret void
+    }
+    define i32 @pr231_observation_count() {
+      %count = load i32, ptr @g_pr231_observer_calls, align 4
+      ret i32 %count
+    }
+    define void @pr231_probe_alternate() noinline {
+      %before = load i32, ptr @g_pr231_observer_calls, align 4
+      %next = add i32 %before, 10
+      store i32 %next, ptr @g_pr231_observer_calls, align 4
+      ret void
+    }
+    define i32 @test_ejit_period() {
+      %state = load i32, ptr @g_pr231_controller_state, align 4
+      ret i32 %state
+    }
+  )";
+  return T;
+}
+
+Expected<std::unique_ptr<Module>> extractedRegistrationPayload(Module &M,
+                                                               LLVMContext &C) {
+  auto *Embedded = M.getGlobalVariable(GV_EJIT_BITCODE, true);
+  auto *Bytes = Embedded && Embedded->hasInitializer()
+                    ? dyn_cast<ConstantDataSequential>(Embedded->getInitializer())
+                    : nullptr;
+  if (!Bytes)
+    return make_error<StringError>("missing actual PASS1 payload",
+                                   inconvertibleErrorCode());
+  return parseBitcodeFile(MemoryBufferRef(Bytes->getRawDataValues(),
+                                         "actual PASS1 single-TU payload"), C);
+}
+
 /// The re-entrant observation hook. When armed it runs the test's mutations
 /// while the specialized call is on the stack; it returns 0 so the entry's own
 /// result is unchanged.
@@ -361,6 +419,104 @@ protected:
     return Out;
   }
 };
+
+void checkSingleTuCallbackExtraction(StringRef TargetHeader) {
+  LLVMContext Ctx;
+  std::string Text = singleTuCallbackBodyText("g_src", "g_out", kWrapCells);
+  const std::string NativeHeader = hostTargetHeader();
+  ASSERT_EQ(Text.compare(0, NativeHeader.size(), NativeHeader), 0);
+  Text.replace(0, NativeHeader.size(), TargetHeader.str());
+  auto M = parseModule(Ctx, Text, "single-TU actual bitcode extraction");
+  ASSERT_TRUE(M);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  const bool SavedCtors = EnableEJitGlobalCtors;
+  auto Restore = make_scope_exit([&] { EnableEJitGlobalCtors = SavedCtors; });
+  EnableEJitGlobalCtors = false;
+  Analyses A;
+  ModulePassManager PM;
+  PM.addPass(EJitRegisterBitcodePass());
+  PM.run(*M, A.MAM);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+
+  LLVMContext PayloadCtx;
+  auto Payload = extractedRegistrationPayload(*M, PayloadCtx);
+  ASSERT_TRUE(static_cast<bool>(Payload)) << toString(Payload.takeError());
+  ASSERT_FALSE(verifyModule(**Payload, &errs()));
+  SCOPED_TRACE("input DL=" + M->getDataLayoutStr() +
+               " payload DL=" + (*Payload)->getDataLayoutStr());
+  EXPECT_EQ((*Payload)->getTargetTriple(), M->getTargetTriple());
+  EXPECT_EQ((*Payload)->getDataLayoutStr(), M->getDataLayoutStr());
+  EXPECT_EQ((*Payload)->getDataLayout(), M->getDataLayout());
+  auto *Slot = (*Payload)->getNamedGlobal("g_pr231_probe_dispatch");
+  ASSERT_NE(Slot, nullptr);
+  EXPECT_TRUE(Slot->isDeclaration());
+  EXPECT_FALSE(Slot->isConstant());
+  EXPECT_FALSE(Slot->hasLocalLinkage());
+  EXPECT_EQ((*Payload)->getNamedGlobal("g_pr231_observer_calls"), nullptr);
+  EXPECT_EQ((*Payload)->getNamedGlobal("g_pr231_controller_state"), nullptr);
+  EXPECT_EQ((*Payload)->getFunction("pr231_probe_inflight"), nullptr);
+  EXPECT_EQ((*Payload)->getFunction("pr231_observation_count"), nullptr);
+  EXPECT_EQ((*Payload)->getFunction("pr231_probe_alternate"), nullptr);
+  EXPECT_EQ((*Payload)->getFunction("test_ejit_period"), nullptr);
+  unsigned VolatileLoads = 0, IndirectCalls = 0;
+  for (Function &F : **Payload)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        if (auto *Load = dyn_cast<LoadInst>(&I))
+          if (Load->getPointerOperand()->stripPointerCasts() == Slot) {
+            EXPECT_TRUE(Load->isVolatile());
+            ++VolatileLoads;
+          }
+        if (auto *Call = dyn_cast<CallBase>(&I))
+          if (!Call->getCalledFunction()) {
+            auto *Loaded = dyn_cast<LoadInst>(Call->getCalledOperand());
+            ASSERT_NE(Loaded, nullptr);
+            EXPECT_EQ(Loaded->getPointerOperand()->stripPointerCasts(), Slot);
+            ++IndirectCalls;
+          }
+      }
+  EXPECT_EQ(VolatileLoads, 1u);
+  EXPECT_EQ(IndirectCalls, 1u);
+
+  // The actual emitted registry contains the callback SLOT address, not its
+  // initializer's current function address. Product registration resolves that
+  // same mutable object after lipo/GC; no manual test registration supplies it.
+  auto *Registry = M->getGlobalVariable(".ejit.registry.bitcode", true);
+  ASSERT_NE(Registry, nullptr);
+  auto *Records = dyn_cast<ConstantArray>(Registry->getInitializer());
+  ASSERT_NE(Records, nullptr);
+  unsigned SlotRecords = 0;
+  for (Value *V : Records->operands()) {
+    auto *Record = dyn_cast<ConstantStruct>(V);
+    ASSERT_NE(Record, nullptr);
+    if (Record->getOperand(3)->stripPointerCasts() ==
+        M->getNamedGlobal("g_pr231_probe_dispatch")) {
+      EXPECT_EQ(cast<ConstantInt>(Record->getOperand(0))->getZExtValue(),
+                EJIT_REG_SYMBOL);
+      ++SlotRecords;
+    }
+  }
+  EXPECT_EQ(SlotRecords, 1u);
+  auto *OriginalSlot = M->getNamedGlobal("g_pr231_probe_dispatch");
+  ASSERT_TRUE(OriginalSlot->hasInitializer());
+  EXPECT_EQ(OriginalSlot->getInitializer()->stripPointerCasts(),
+            M->getFunction("pr231_probe_inflight"));
+}
+
+TEST_F(WrapperGenIRTest, SingleTuMutableVolatileCallbackIsolatesControllerNative) {
+  checkSingleTuCallbackExtraction(hostTargetHeader());
+}
+
+TEST_F(WrapperGenIRTest, SingleTuMutableVolatileCallbackIsolatesControllerBigEndian) {
+  // LLVM 21's real BE AArch64 ELF ABI, including ptr32/ptr64 address spaces
+  // and 32-bit function-pointer alignment (AArch64TargetMachine.cpp). A legacy
+  // truncated layout would be auto-upgraded by the bitcode reader and is not
+  // the actual frontend/backend ABI this regression must preserve exactly.
+  checkSingleTuCallbackExtraction(
+      "target datalayout = \"E-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-"
+      "i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\"\n"
+      "target triple = \"aarch64_be-none-elf\"\n");
+}
 
 // --- Path 1: the compile_or_get-success dispatch (-ejit-inline-cache OFF) ---
 
@@ -3464,6 +3620,8 @@ protected:
   int32_t CompilerOutput[6][2]{};
   std::unique_ptr<orc::LLJIT> CompilerImage;
   int32_t (*CompilerEntry)(int32_t, int32_t, int32_t) = nullptr;
+  int32_t (*ObservationCount)() = nullptr;
+  void (*volatile *ProbeDispatch)() = nullptr;
   void SetUp() override {
     ejit_shutdown();
     gBridgeDenyCallerMapping = false;
@@ -3514,12 +3672,14 @@ protected:
       if (ejit_activate(kWrapPeriod, C) != EJIT_OK) return false;
     return true;
   }
-  bool buildActualCompilerRegistry2d() {
+  bool buildActualCompilerRegistry2d(bool SingleTuCallback = false) {
     ejit_shutdown();
     for (unsigned C = 0; C < 6; ++C)
       for (unsigned T = 0; T < 2; ++T)
         CompilerRows[C][T] = {1, static_cast<int32_t>(10 + 2 * C + T)};
-    std::string Body = entryBodyText("g_wrap", "g_wrap_out", kWrapCells);
+    std::string Body = SingleTuCallback
+        ? singleTuCallbackBodyText("g_wrap", "g_wrap_out", kWrapCells)
+        : entryBodyText("g_wrap", "g_wrap_out", kWrapCells);
     auto Replace = [&](StringRef From, StringRef To) {
       size_t Pos = 0;
       while ((Pos = Body.find(From.str(), Pos)) != std::string::npos) {
@@ -3558,6 +3718,26 @@ protected:
     });
     EnableEJitGlobalCtors = false; EnableEJitSmallTableHooks = true; EJitInlineCache = false;
     Analyses A;
+    if (SingleTuCallback) {
+      // Run true PASS1 over the WHOLE single-TU image. Runtime input is the
+      // exact embedded closure, not the unextracted test/controller module.
+      ModulePassManager Extract;
+      Extract.addPass(EJitRegisterBitcodePass());
+      Extract.run(*M, A.MAM);
+      LLVMContext PayloadContext;
+      auto Payload = extractedRegistrationPayload(*M, PayloadContext);
+      if (!Payload) { ADD_FAILURE() << toString(Payload.takeError()); return false; }
+      if ((*Payload)->getFunction("pr231_probe_inflight") ||
+          (*Payload)->getNamedGlobal("g_pr231_observer_calls") ||
+          (*Payload)->getNamedGlobal("g_pr231_controller_state") ||
+          (*Payload)->getFunction("test_ejit_period")) return false;
+      auto *Slot = (*Payload)->getNamedGlobal("g_pr231_probe_dispatch");
+      if (!Slot || !Slot->isDeclaration() || Slot->isConstant()) return false;
+      auto *Embedded = cast<ConstantDataSequential>(
+          M->getGlobalVariable(GV_EJIT_BITCODE, true)->getInitializer());
+      StringRef Bytes = Embedded->getRawDataValues();
+      RegisteredBitcode.assign(Bytes.bytes_begin(), Bytes.bytes_end());
+    }
     ModulePassManager PM;
     PM.addPass(EJitRegisterPeriodPass());
     PM.run(*M, A.MAM);
@@ -3586,6 +3766,11 @@ protected:
     };
     Add("g_wrap", CompilerRows); Add("g_wrap_out", CompilerOutput);
     Add("wrap_aot_observe", reinterpret_cast<const void *>(&wrapAotObserve));
+    if (SingleTuCallback) {
+      Add("wrap_observe", reinterpret_cast<const void *>(&wrapObserve));
+      Add("ejit_register_bitcode", reinterpret_cast<const void *>(&ejit_register_bitcode));
+      Add("ejit_register_symbol", reinterpret_cast<const void *>(&ejit_register_symbol));
+    }
     Add("ejit_register_period_array", reinterpret_cast<const void *>(&ejit_register_period_array));
     Add("ejit_register_static_var", reinterpret_cast<const void *>(&ejit_register_static_var));
     Add("ejit_register_funcindex", reinterpret_cast<const void *>(&ejit_register_funcindex));
@@ -3609,15 +3794,114 @@ protected:
     auto Entry = CompilerImage->lookup("f_entry");
     if (!Entry) { ADD_FAILURE() << toString(Entry.takeError()); return false; }
     CompilerEntry = reinterpret_cast<int32_t (*)(int32_t, int32_t, int32_t)>(Entry->getValue());
+    if (SingleTuCallback) {
+      auto Count = CompilerImage->lookup("pr231_observation_count");
+      if (!Count) { ADD_FAILURE() << toString(Count.takeError()); return false; }
+      ObservationCount = reinterpret_cast<int32_t (*)()>(Count->getValue());
+      auto Slot = CompilerImage->lookup("g_pr231_probe_dispatch");
+      if (!Slot) { ADD_FAILURE() << toString(Slot.takeError()); return false; }
+      ProbeDispatch = reinterpret_cast<void (*volatile *)()>(Slot->getValue());
+      if (!ProbeDispatch || !*ProbeDispatch || ObservationCount() != 0) return false;
+    }
     ejit_register_static_var("g_wrap", CompilerRows);
     ejit_register_static_var("g_wrap_out", CompilerOutput);
-    ejit_register_bitcode("f_entry", RegisteredBitcode.data(), RegisteredBitcode.size());
+    if (!SingleTuCallback)
+      ejit_register_bitcode("f_entry", RegisteredBitcode.data(), RegisteredBitcode.size());
     ejit_config_t Cfg{};
     Cfg.compileMode = EJIT_COMPILE_ASYNC; Cfg.optLevel = EJIT_OPT_L2;
     if (ejit_init_pgo(&Cfg) != EJIT_OK) return false;
     for (unsigned C = 0; C < 6; ++C) if (ejit_activate(kWrapPeriod, C) != EJIT_OK) return false;
     for (unsigned T = 0; T < 2; ++T) if (ejit_activate("bridge_trp", T) != EJIT_OK) return false;
     return true;
+  }
+  void requestCompiler2d(uint64_t Limit) {
+    SourceState = {0xF00D, 1, 0, 0};
+    Request = {};
+    Request.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
+    Request.structSize = sizeof(Request);
+    std::strcpy(Request.entryName, "f_entry");
+    std::strcpy(Request.sourceVarName, "g_wrap");
+    Request.sourceAddress = reinterpret_cast<uintptr_t>(CompilerRows);
+    Request.sourceBytes = sizeof(CompilerRows);
+    Request.sourceState = reinterpret_cast<uintptr_t>(&SourceState);
+    Request.aotEntry = reinterpret_cast<uintptr_t>(CompilerEntry);
+    Request.sourceEpoch = SourceState.epoch;
+    Request.configurationRevision = SourceState.revision;
+    Request.codeGeneration = 1;
+    Request.sampleLimit = Limit;
+    Request.numDims = 2;
+    Request.numMembers = 12;
+    Request.domainCoverage = 1;
+    Request.dims[0].argumentIndex = 0;
+    Request.dims[0].extent = 6;
+    Request.dims[1].argumentIndex = 1;
+    Request.dims[1].extent = 2;
+    std::strcpy(Request.dims[0].periodName, kWrapPeriod);
+    std::strcpy(Request.dims[1].periodName, "bridge_trp");
+    for (unsigned I = 0; I < 12; ++I) {
+      Request.members[I].coordinate[0] = I / 2;
+      Request.members[I].coordinate[1] = I % 2;
+      Request.members[I].configurationGeneration = 1;
+      Request.members[I].fieldsInitialized = 1;
+    }
+    ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  }
+  void singleTuCold(uint64_t Limit) {
+    ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
+    requestCompiler2d(Limit);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(Before.admittedMembers, 12u);
+    ASSERT_EQ(Before.genericAsyncEnqueues, 0u);
+    EXPECT_EQ(ObservationCount(), 0);
+    for (uint64_t I = 0; I < Limit; ++I) {
+      const unsigned C = (I % 12) / 2, T = I % 2;
+      EXPECT_EQ(CompilerEntry(C, T, 4), wrapAotResult(CompilerRows[C][T], 4));
+      EXPECT_EQ(CompilerOutput[C][T], 4);
+      EXPECT_EQ(ObservationCount(), static_cast<int32_t>(I + 1));
+    }
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(Before.sampleCount, Limit);
+    EXPECT_EQ(Before.physicalExecutions, 0u);
+    ASSERT_EQ(Before.counterPairs, 1u)
+        << "the AOT controller/observer must not get private JIT PGO counters";
+    ASSERT_EQ(Before.counterWordCount, 1u);
+    EXPECT_EQ(Before.counts[0], Limit);
+    EXPECT_EQ(g_aotCalls, 0u);
+    EXPECT_EQ(CompilerEntry(5, 1, 4), wrapAotResult(CompilerRows[5][1], 4));
+    EXPECT_EQ(g_aotCalls, 1u);
+    EXPECT_EQ(ObservationCount(), static_cast<int32_t>(Limit + 1));
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(After.countersDigest, Before.countersDigest);
+    ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(After.tier, 2u);
+    EXPECT_EQ(After.fullProfileValid, 1u);
+    EXPECT_GT(After.profileBytes, 0u);
+    EXPECT_EQ(After.rootEntryCountValid, 1u);
+    EXPECT_EQ(After.rootEntryCount, Limit);
+    EXPECT_EQ(After.counterPairs, After.expectedCounterPairs);
+    EXPECT_EQ(After.countersDigest, Before.countersDigest);
+    EXPECT_EQ(After.publishedSlots, 12u);
+    EXPECT_EQ(After.borrowReaders, 0u);
+    EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+    EXPECT_EQ(After.genericAsyncCompiles, 0u);
+    EXPECT_EQ(After.genericPending, 0u);
+    for (unsigned C = 0; C < 6; ++C)
+      for (unsigned T = 0; T < 2; ++T) {
+        EXPECT_EQ(CompilerEntry(C, T, 5), wrapAotResult(CompilerRows[C][T], 5));
+        EXPECT_EQ(CompilerOutput[C][T], 5);
+      }
+    EXPECT_EQ(g_aotCalls, 1u);
+    EXPECT_EQ(ObservationCount(), static_cast<int32_t>(Limit + 13));
+    // The emitted T2 must reload the real mutable slot, not devirtualize its
+    // original AOT initializer. Changing to another real same-image callback
+    // modifies the SAME private observer object, without JIT/controller clones.
+    auto Alternate = CompilerImage->lookup("pr231_probe_alternate");
+    ASSERT_TRUE(static_cast<bool>(Alternate)) << toString(Alternate.takeError());
+    *ProbeDispatch = reinterpret_cast<void (*)()>(Alternate->getValue());
+    EXPECT_EQ(CompilerEntry(0, 0, 6), wrapAotResult(CompilerRows[0][0], 6));
+    EXPECT_EQ(ObservationCount(), static_cast<int32_t>(Limit + 23));
+    EXPECT_EQ(g_aotCalls, 1u);
   }
   void request(uint64_t Limit = 64) {
     SourceState = {0xF00D, 1, 0, 0};
@@ -3694,6 +3978,79 @@ protected:
 TEST_F(GeneratedWrapperSreBridgeTest, ColdRealWrapperFull64ProfileAndCommonT2) { cold(64); }
 TEST_F(GeneratedWrapperSreBridgeTest, ColdRealWrapperConfigurable8ProfileAndCommonT2) { cold(8); }
 TEST_F(GeneratedWrapperSreBridgeTest, ColdActualZeroIcacheFull64ProfileAndCommonT2) { cold(64, true); }
+TEST_F(GeneratedWrapperSreBridgeTest,
+       SingleTuActualPass1Cold64CompleteProfileAndCommonT2) {
+  singleTuCold(64);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       SingleTuActualPass1Configurable8CompleteProfileAndCommonT2) {
+  singleTuCold(8);
+}
+TEST_F(GeneratedWrapperSreBridgeTest,
+       SingleTuActualPass1LastCallCancelRetainsBorrowUntilRealLeave) {
+  ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
+  requestCompiler2d(8);
+  for (unsigned I = 0; I < 7; ++I) {
+    const unsigned C = (I % 12) / 2, T = I % 2;
+    EXPECT_EQ(CompilerEntry(C, T, 4), wrapAotResult(CompilerRows[C][T], 4));
+  }
+  ASSERT_EQ(ObservationCount(), 7);
+  unsigned Held = 0;
+  g_observe = [&] {
+    ++Held;
+    EXPECT_EQ(ObservationCount(), 8);
+    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(Before.sampleCount, 8u);
+    EXPECT_EQ(Before.physicalExecutions, 1u);
+    EXPECT_GT(Before.borrowReaders, 0u);
+    EXPECT_GT(SourceState.readers, 0u);
+    EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(ejit_small_table_sre_cancel(FuncIdx), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_BUSY);
+    EXPECT_EQ(After.physicalExecutions, 1u);
+    EXPECT_GT(After.borrowReaders, 0u);
+    EXPECT_GT(SourceState.readers, 0u)
+        << "cancel is not the final real return, even for the last sample";
+  };
+  EXPECT_EQ(CompilerEntry(3, 1, 4), wrapAotResult(CompilerRows[3][1], 4));
+  g_observe = nullptr;
+  EXPECT_EQ(Held, 1u);
+  EXPECT_EQ(g_aotCalls, 0u);
+  EXPECT_EQ(SourceState.readers, 0u);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.physicalExecutions, 0u);
+  EXPECT_EQ(After.borrowReaders, 0u);
+  EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+
+  SourceState.writerBlocked = 1;
+  CompilerRows[3][1].bycell += 20;
+  SourceState.epoch = 0xF00E;
+  SourceState.revision = 2;
+  SourceState.writerBlocked = 0;
+  Request.sourceEpoch = SourceState.epoch;
+  Request.configurationRevision = SourceState.revision;
+  Request.codeGeneration = 2;
+  for (unsigned I = 0; I < 12; ++I)
+    Request.members[I].configurationGeneration = 2;
+  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+  for (unsigned I = 0; I < 8; ++I)
+    EXPECT_EQ(CompilerEntry(3, 1, 5), wrapAotResult(CompilerRows[3][1], 5));
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(Before.sampleCount, 8u);
+  ASSERT_EQ(Before.counterWordCount, 1u);
+  EXPECT_EQ(Before.counts[0], 8u);
+  ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(After.codeGeneration, 2u);
+  EXPECT_EQ(After.tier, 2u);
+  EXPECT_EQ(After.fullProfileValid, 1u);
+  EXPECT_EQ(After.rootEntryCountValid, 1u);
+  EXPECT_EQ(After.rootEntryCount, 8u);
+  EXPECT_EQ(After.countersDigest, Before.countersDigest);
+  EXPECT_EQ(CompilerEntry(3, 1, 6), wrapAotResult(CompilerRows[3][1], 6));
+  EXPECT_EQ(ObservationCount(), 17);
+  EXPECT_EQ(g_aotCalls, 0u);
+}
 TEST_F(GeneratedWrapperSreBridgeTest, ActualCompilerOuterCountSixByTwoCold64CompleteProfileAndT2) {
   ASSERT_TRUE(buildActualCompilerRegistry2d());
   SourceState = {0xF00D, 1, 0, 0};

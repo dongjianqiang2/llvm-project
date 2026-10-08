@@ -1,13 +1,68 @@
 /* PR231 SRE board fixture. Link this instead of other test_ejit_period demos.
  *
- * Link with ejit_smalltable_sre_business.c compiled separately by patched EJIT
- * clang. Do not LTO the controller into entry bitcode. No handwritten JIT.
+ * Compile this ONE C file with patched EJIT clang, like other period demos.
+ * A volatile callback slot keeps the real AOT observer outside the JIT closure;
+ * no second business TU, handwritten bitcode, or handwritten JIT is required.
  * Configuration and output must be mapped coherent/shared at the same VA on
  * both cores by the product linker. A .mc_shared name alone is not proof.
  */
-#include "ejit_smalltable_sre_fixture.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableSreBridge.h"
 #include <string.h>
+
+#ifndef EJIT_PR231_SHARED
+#define EJIT_PR231_SHARED __attribute__((section(".mc_shared"), aligned(64)))
+#endif
+#define PR231_CELLS 6u
+#define PR231_TRPS 2u
+#define PR231_WORKER 6u
+#define PR231_PRODUCER 16u
+typedef struct {
+  ejit_may_const uint32_t mode;
+  ejit_may_const uint32_t cellGain;
+  ejit_may_const uint32_t trpBias;
+  ejit_may_const uint32_t jointBias;
+  uint32_t liveBias;
+} PR231Config;
+
+ejit_period_arr(pr231_cell) PR231Config
+    g_pr231_config[PR231_CELLS][PR231_TRPS] EJIT_PR231_SHARED;
+int64_t g_pr231_output[PR231_CELLS][PR231_TRPS] EJIT_PR231_SHARED;
+
+void pr231_probe_inflight(void);
+/* PASS1 externalizes mutable globals without following their initializer.
+ * Volatile prevents folding this into a same-TU direct call, even with LTO.
+ * The pointer remains a genuine AOT address; it is never a fabricated hook.
+ */
+void (*volatile g_pr231_probe_dispatch)(void) EJIT_PR231_SHARED =
+    pr231_probe_inflight;
+
+__attribute__((noinline)) int64_t
+pr231_positive(int64_t x, uint32_t gain, uint32_t bias) {
+  return x * (int64_t)gain + (int64_t)bias;
+}
+__attribute__((noinline)) int64_t
+pr231_negative(int64_t x, uint32_t gain, uint32_t bias) {
+  return x * (int64_t)gain - (int64_t)bias;
+}
+
+ejit_entry int64_t pr231_smalltable_entry(
+    ejit_period_arr_ind(pr231_cell) uint8_t cell,
+    ejit_period_arr_ind(pr231_trp) uint8_t trp, int64_t x) {
+  g_pr231_probe_dispatch();
+  const PR231Config *cfg = &g_pr231_config[cell][trp];
+  const uint32_t bias = cfg->trpBias + cfg->jointBias;
+  int64_t result = x >= 0 ? pr231_positive(x, cfg->cellGain, bias)
+                          : pr231_negative(x, cfg->cellGain, bias);
+  /* Uniform, cell-only, TRP-only and joint fields, plus a genuine live load
+   * and store. Dynamic sign branches keep the profile nontrivial. */
+  if (cfg->mode == 1u)
+    result += (int64_t)cfg->liveBias;
+  else
+    result -= (int64_t)cfg->liveBias;
+  g_pr231_output[cell][trp] = result;
+  return result;
+}
 
 /* The SDK integration header must implement the two documented bindings.
  * Missing SDK bindings are a visible BLOCKED, never a simulated task ID or a
@@ -42,6 +97,9 @@ static int32_t g_pr231_probe_result EJIT_PR231_SHARED;
 /* These are deliberately core-private: constructors, bindings and the request
  * builder are not shared C++/callback state across cores. */
 static uint32_t pr231_initialized;
+#if EJIT_PR231_CALL_INIT_ARRAY
+static uint32_t pr231_init_array_done;
+#endif
 static uint32_t pr231_func = UINT32_MAX;
 static ejit_small_table_sre_request_t pr231_request;
 /* Keep the bounded inventories off the product shell's small task stack.
@@ -148,12 +206,32 @@ static int pr231_setup(void) {
   if (pr231_initialized)
     return 0;
 #if EJIT_PR231_CALL_INIT_ARRAY
-  SRE_printf("[STAB231][core=%u] init-array begin (once)\n", g_ucLocalCoreID);
-  call_init_array_functions();
-  SRE_printf("[STAB231][core=%u] init-array done\n", g_ucLocalCoreID);
+  /* A later task/permission/runtime failure must not cause constructors to run
+   * twice when setup is retried. This is per-core, not runtime readiness. */
+  if (!pr231_init_array_done) {
+    SRE_printf("[STAB231][core=%u] init-array begin (once)\n", g_ucLocalCoreID);
+    call_init_array_functions();
+    pr231_init_array_done = 1u;
+    SRE_printf("[STAB231][core=%u] init-array done\n", g_ucLocalCoreID);
+  }
 #endif
   if (pr231_task(0) == 0u) {
     SRE_printf("[STAB231] BLOCKED: no actual task identity\n");
+    return -20;
+  }
+  /* Both real caller/worker cores must read the actual shared callback slot.
+   * The observer itself runs in AOT against this core's private controller.
+   * Its shared flags also need real R/W mapping; section names are not proof.
+   */
+  if (pr231_data(0, (uintptr_t)&g_pr231_probe_dispatch,
+                  sizeof(g_pr231_probe_dispatch), EJIT_STAB_SRE_DATA_READ) != 0 ||
+      pr231_data(0, (uintptr_t)&g_pr231_stage, sizeof(g_pr231_stage),
+                  EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) != 0 ||
+      pr231_data(0, (uintptr_t)&g_pr231_probe_arm, sizeof(g_pr231_probe_arm),
+                  EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) != 0 ||
+      pr231_data(0, (uintptr_t)&g_pr231_probe_result, sizeof(g_pr231_probe_result),
+                  EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) != 0) {
+    SRE_printf("[STAB231] BLOCKED: callback/controller shared permissions\n");
     return -20;
   }
   ejit_small_table_sre_bindings_t bindings;
@@ -171,9 +249,11 @@ static int pr231_setup(void) {
     SRE_printf("[STAB231] prepare BLOCKED rc=%d (fresh boot required)\n", rc);
     return -20;
   }
-  /* The hook is defined in this object and registered identically on BOTH
-   * cores, before init. No forged profile-runtime or task-self symbols. */
-  ejit_register_symbol("pr231_probe_inflight", (void *)&pr231_probe_inflight);
+  /* Register the actual mutable slot identically on BOTH cores, before init.
+   * PASS1 also auto-registers it. Its initializer relocation keeps the real
+   * observer alive through GC/lipo; no controller bodies enter the JIT closure.
+   */
+  ejit_register_symbol("g_pr231_probe_dispatch", (void *)&g_pr231_probe_dispatch);
   ejit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
   cfg.compileMode = EJIT_COMPILE_ASYNC;

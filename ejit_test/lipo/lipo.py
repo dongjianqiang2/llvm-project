@@ -101,6 +101,11 @@ SMALL_TABLE_SRE_ROOTS = (
 SMALL_TABLE_DEMO_ROOTS = (
     "test_ejit_period",
     "test_ejit_smalltable_print",
+    # The board adapter dispatches through this mutable shared slot. Keep its
+    # AOT observer alive as well, but only when the strict demo option is used
+    # or the symbols are present in the generic optional-root pass.
+    "g_pr231_probe_dispatch",
+    "pr231_probe_inflight",
 )
 
 # These public roots are also used by the post-merge verifier. Keep the root

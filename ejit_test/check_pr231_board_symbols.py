@@ -10,6 +10,22 @@ import subprocess
 import sys
 
 
+SHARED_OBJECTS = (
+    "g_pr231_config",
+    "g_pr231_output",
+    "g_pr231_source",
+    "g_pr231_stage",
+    "g_pr231_probe_arm",
+    "g_pr231_probe_result",
+    "g_pr231_probe_dispatch",
+)
+GLOBAL_SHARED_OBJECTS = (
+    "g_pr231_config",
+    "g_pr231_output",
+    "g_pr231_probe_dispatch",
+)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("object", type=pathlib.Path)
@@ -34,9 +50,13 @@ def main():
     if args.require_be and int.from_bytes(data[18:20], order) != 183:
         raise RuntimeError("BE object is not AArch64")
     symbols = lipo._nm_defined(str(obj))
-    roots = (*lipo.SMALL_TABLE_API_ROOTS, *lipo.SMALL_TABLE_SRE_ROOTS,
-             *lipo.SMALL_TABLE_DEMO_ROOTS, "pr231_smalltable_entry",
-             "g_pr231_config", "pr231_probe_inflight")
+    roots = tuple(dict.fromkeys((
+        *lipo.SMALL_TABLE_API_ROOTS,
+        *lipo.SMALL_TABLE_SRE_ROOTS,
+        *lipo.SMALL_TABLE_DEMO_ROOTS,
+        "pr231_smalltable_entry",
+        "g_pr231_config",
+    )))
     for name in roots:
         if len(symbols.get(name, ())) != 1:
             raise RuntimeError(f"missing/nonunique actual definition: {name}")
@@ -85,7 +105,7 @@ def main():
                 attributes.setdefault(string(strings, name), []).append(
                     (info >> 4, info & 15, index))
     for name in roots:
-        expected_type = 1 if name == "g_pr231_config" else 2
+        expected_type = 1 if name in GLOBAL_SHARED_OBJECTS else 2
         if attributes.get(name) is None or len(attributes[name]) != 1 or \
                 attributes[name][0][:2] != (1, expected_type):
             raise RuntimeError("not a unique strong typed definition: " + name)
@@ -100,11 +120,14 @@ def main():
     shared = records[shared_index]
     if shared[2] & 3 != 3:  # SHF_WRITE | SHF_ALLOC; mapping coherence is SDK-owned.
         raise RuntimeError("shared section is not writable/allocated")
-    for name in ("g_pr231_config", "g_pr231_output", "g_pr231_source",
-                 "g_pr231_stage", "g_pr231_probe_arm", "g_pr231_probe_result"):
+    for name in SHARED_OBJECTS:
         defs = attributes.get(name, ())
         if len(defs) != 1 or defs[0][1] != 1 or defs[0][2] != shared_index:
             raise RuntimeError("fixture data not uniquely in .mc_shared: " + name)
+    for name in GLOBAL_SHARED_OBJECTS:
+        defs = attributes.get(name, ())
+        if len(defs) != 1 or defs[0][0] != 1:
+            raise RuntimeError("shared API object is not a unique strong global: " + name)
     sections = set(lipo._readelf_section_names(str(obj), str(obj.parent)))
     if not {".symtab", ".strtab", ".init_array", ".mc_shared"} <= sections:
         raise RuntimeError("missing symtab/strtab/init-array/shared section")
@@ -116,7 +139,10 @@ def main():
     table = subprocess.check_output(["readelf", "-sW", str(obj)], text=True)
     if not re.search(r"Symbol table '\.symtab'", table):
         raise RuntimeError("readelf cannot read the actual symbol table")
-    print(f"[PR231_SYMBOLS] PASS 18 real entry/hook/source definitions; ELF64 "
+    distinct_required = len(set(roots) | set(SHARED_OBJECTS))
+    print(f"[PR231_SYMBOLS] PASS {len(roots)} strong roots + "
+          f"{len(SHARED_OBJECTS)} unique shared objects; "
+          f"{distinct_required} distinct required symbols; ELF64 "
           f"{order}-endian {args.kind}; symbol tables + nonempty registries/init + shared placement")
     print(f"[PR231_SYMBOLS] sha256={hashlib.sha256(data).hexdigest()} file={obj}")
     print("[PR231_SYMBOLS] NOT SDK final-link / DLIB load / board acceptance")

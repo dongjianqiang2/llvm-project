@@ -35,7 +35,12 @@ SMALL_TABLE_SRE_HOOKS = (
     "ejit_small_table_sre_cancel",
     "ejit_small_table_sre_print",
 )
-SMALL_TABLE_DEMO = ("test_ejit_period", "test_ejit_smalltable_print")
+SMALL_TABLE_DEMO = (
+    "test_ejit_period",
+    "test_ejit_smalltable_print",
+    "g_pr231_probe_dispatch",
+    "pr231_probe_inflight",
+)
 
 
 def find_tool(*names):
@@ -71,7 +76,19 @@ def build_archive(root, clang, ar, symbols, name, registration_fixture=False):
     obj = root / f"{name}.o"
     archive = root / f"{name}.a"
     definitions = ["void ejit_init(void) {}"]
-    definitions.extend(f"void {symbol}(void) {{}}" for symbol in symbols)
+    if "g_pr231_probe_dispatch" in symbols:
+        # A real object-typed mutable shared callback slot, not a function
+        # placeholder. The target checker separately validates its placement.
+        definitions.append("void pr231_probe_inflight(void);")
+    for symbol in symbols:
+        if symbol == "g_pr231_probe_dispatch":
+            definitions.append(
+                '__attribute__((used,section(".mc_shared"))) '
+                'void (* volatile g_pr231_probe_dispatch)(void) = '
+                'pr231_probe_inflight;'
+            )
+        else:
+            definitions.append(f"void {symbol}(void) {{}}")
     definitions.append("void deliberately_unrooted(void) {}")
     if registration_fixture:
         definitions.extend(
@@ -213,6 +230,37 @@ def main():
         if "deliberately_unrooted" in complete_symbols:
             raise AssertionError("gc-merge retained an unrooted control symbol")
 
+        runtime_only = build_archive(
+            root, clang, ar, (*SMALL_TABLE_HOOKS, *SMALL_TABLE_SRE_HOOKS),
+            "runtime-only", registration_fixture=True,
+        )
+        runtime_only_gc, runtime_only_log = gc_merge(
+            lipo, root, runtime_only, ar, nm, ld, "runtime-only",
+            require_small_table_sre=True,
+        )
+        runtime_only_symbols = defined_symbols(nm, runtime_only_gc)
+        runtime_roots = set(SMALL_TABLE_HOOKS + SMALL_TABLE_SRE_HOOKS)
+        if runtime_roots - runtime_only_symbols:
+            raise AssertionError(
+                "runtime-only --require-small-table-sre discarded a required "
+                f"hook: {sorted(runtime_roots - runtime_only_symbols)}; "
+                f"log={runtime_only_log!r}"
+            )
+        if set(SMALL_TABLE_DEMO) & runtime_only_symbols:
+            raise AssertionError("runtime-only gc-merge fabricated demo roots")
+        runtime_only_merged, _ = merge(
+            lipo, root, runtime_only_gc, nm, ld, "runtime-only-merged",
+            require_small_table_sre=True,
+        )
+        runtime_merged_symbols = defined_symbols(nm, runtime_only_merged)
+        if runtime_roots - runtime_merged_symbols:
+            raise AssertionError(
+                "runtime-only --require-small-table-sre merge discarded a "
+                f"required hook: {sorted(runtime_roots - runtime_merged_symbols)}"
+            )
+        if set(SMALL_TABLE_DEMO) & runtime_merged_symbols:
+            raise AssertionError("runtime-only merge fabricated demo roots")
+
         smalltable = build_archive(
             root, clang, ar,
             (*SMALL_TABLE_HOOKS, *SMALL_TABLE_SRE_HOOKS, *SMALL_TABLE_DEMO),
@@ -284,6 +332,25 @@ def main():
                 raise
         else:
             raise AssertionError("--require-demo accepted missing adapters")
+
+        no_callback = build_archive(
+            root, clang, ar,
+            tuple(symbol for symbol in SMALL_TABLE_DEMO
+                  if symbol != "g_pr231_probe_dispatch"),
+            "strict-demo-missing-callback",
+        )
+        try:
+            gc_merge(lipo, root, no_callback, ar, nm, ld,
+                     "strict-demo-missing-callback", require_demo=True)
+        except SystemExit as error:
+            if error.code != 1:
+                raise
+            if "g_pr231_probe_dispatch" not in error.captured_stdout:
+                raise AssertionError(
+                    "--require-demo did not name the missing callback object: "
+                    f"{error.captured_stdout!r}")
+        else:
+            raise AssertionError("--require-demo accepted a missing callback object")
 
         duplicate = build_duplicate_root_archive(root, clang, ar, "duplicate")
         try:
