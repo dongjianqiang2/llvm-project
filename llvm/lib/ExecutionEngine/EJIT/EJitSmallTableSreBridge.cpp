@@ -244,6 +244,7 @@ void closeLease(Lease &L) {
   if (Runtime)
     releaseSmallTableSreRuntime(Runtime);
 }
+#ifdef EJIT_SRE_CODE_POOL
 uint64_t freshTicket() {
   uint64_t N = load64(&Shared.nextTicket);
   for (;;) {
@@ -254,6 +255,7 @@ uint64_t freshTicket() {
       return Next | BridgeEpochBit;
   }
 }
+#endif
 bool functionMatches(uint32_t F) {
   return F == UINT32_MAX || F == load32(&Shared.function);
 }
@@ -571,6 +573,13 @@ int finish(Command &C) {
 }
 
 int prepareExecution(Command &C) {
+#ifndef EJIT_SRE_CODE_POOL
+  // The bridge needs the actual pool-owned finalized range for caller
+  // permissions. Shared taskpool alone does not provide these engine APIs;
+  // do not acquire a lease or pretend non-pool code has been prepared.
+  return fail(C, EJIT_STAB_SRE_BLOCKED,
+              "common SRE execution requires EJIT_SRE_CODE_POOL");
+#else
   OwnerControl &O = owner();
   EJit *Runtime = smallTableSreLocalRuntime();
   auto *Host = Runtime ? Runtime->smallTableHost() : nullptr;
@@ -648,6 +657,7 @@ int prepareExecution(Command &C) {
   C.sourceBytes = O.facts->request().sourceBytes;
   C.sourceState = O.facts->request().sourceState;
   return C.result = EJIT_STAB_SRE_OK;
+#endif
 }
 
 int commitExecution(Command &C) {

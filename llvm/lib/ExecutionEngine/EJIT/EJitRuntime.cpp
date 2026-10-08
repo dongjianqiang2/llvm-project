@@ -1153,6 +1153,7 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
               funcName);
     return;
   }
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   switch (ejitIcacheRegisterSlot(idx, slot, numDims, missFn)) {
   case EJitIcacheRegResult::Ok:
     EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
@@ -1175,6 +1176,20 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
               funcName, numDims, EJIT_ICACHE_MAX_DIMS);
     break;
   }
+#else
+  // The optional direct inline-cache registry belongs to the shared pool.
+  // Keep ordinary per-instance resolution available, without publishing a
+  // pointer into a cell whose invalidation/lifetime it cannot manage.
+  if (numDims > EJIT_ICACHE_MAX_DIMS) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_INVALID_PARAM, "icache slot numDims above the cap", funcName);
+    return;
+  }
+  EJIT_DIAG_VERBOSE("register_icache_slot name=%s idx=%u: shared fast path "
+                    "unavailable, keeping ordinary taskpool resolution",
+                    funcName, idx);
+  (void)missFn;
+#endif
 }
 
 ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
@@ -1580,8 +1595,8 @@ static ejit_status_t taskpoolCompileOrGetImpl(
   // so a hit still hands back outBucket for ejit_taskpool_release_read and a
   // disabled instance never returns stale code. A true miss falls through to
   // compileOrGet unchanged (enqueue/dedup/compile).
-  void *l0Fn = nullptr;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+  void *l0Fn = nullptr;
   // L0 remains valid for bound calls: it contains only the identity -> code
   // pointer mapping, while bound descriptors are needed only on a miss or a
   // PGO Tier-2 arm. PGO enable/disable retires L0 via dispatchEpoch, so a
@@ -1637,8 +1652,10 @@ static ejit_status_t taskpoolCompileOrGetImpl(
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
                     funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dimsCast, numDims, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, dimsCast, numDims);
+#endif
   return taskpoolStatus(r.status);
 }
 
@@ -1722,9 +1739,11 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     *outBucket = 0;
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   OrdinaryResolvePin ResolvePin(funcIndex);
   if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
@@ -1732,6 +1751,7 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     return EJIT_ERR_NOT_ACTIVE;
   const uint64_t icTok = ejitIcacheBeginResolve();
 
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, nullptr, 0, &l0Fn)) {
     if (outFn)
@@ -1740,6 +1760,7 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
       *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
+#endif
   auto fast = tp->tryCacheHit0D(funcIndex);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -1755,8 +1776,10 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, nullptr, 0, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, nullptr, 0);
+#endif
   return taskpoolStatus(r.status);
 }
 
@@ -1769,9 +1792,11 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = 0;
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   OrdinaryResolvePin ResolvePin(funcIndex);
   if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
@@ -1786,6 +1811,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     return EJIT_ERR_NOT_ACTIVE;
   // Per-core L0: steady-state hit with no rwlock, scan, or read token.
   // kEJitNoBucket tells the caller no token was taken.
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 1, &l0Fn)) {
     if (outFn)
@@ -1794,6 +1820,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
+#endif
   auto fast = tp->tryCacheHit1D(funcIndex, dim0, inst0);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -1801,8 +1828,10 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 1, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
     if (fast.fnPtr)
       tp->l0Fill(funcIndex, fast.fnPtr, dims, 1);
+#endif
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 1, /*fallback=*/nullptr);
@@ -1811,8 +1840,10 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 1, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, dims, 1);
+#endif
   return taskpoolStatus(r.status);
 }
 
@@ -1826,9 +1857,11 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = 0;
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   OrdinaryResolvePin ResolvePin(funcIndex);
   if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
@@ -1842,6 +1875,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
                                 reinterpret_cast<const ejit_dim_pair_t *>(dims),
                                 2))
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
     if (outFn)
@@ -1850,6 +1884,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
+#endif
   auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
   if (fast.fastPathTerminal) {
     if (outFn)
@@ -1857,8 +1892,10 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 2, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
     if (fast.fnPtr)
       tp->l0Fill(funcIndex, fast.fnPtr, dims, 2);
+#endif
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
@@ -1867,8 +1904,10 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 2, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, dims, 2);
+#endif
   return taskpoolStatus(r.status);
 }
 
@@ -1883,9 +1922,11 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = 0;
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   OrdinaryResolvePin ResolvePin(funcIndex);
   if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
@@ -1900,6 +1941,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
                                 reinterpret_cast<const ejit_dim_pair_t *>(dims),
                                 3))
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 3, &l0Fn)) {
     if (outFn)
@@ -1908,6 +1950,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
+#endif
   auto fast =
       tp->tryCacheHit3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2);
   if (fast.fastPathTerminal) {
@@ -1916,8 +1959,10 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 3, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
     if (fast.fnPtr)
       tp->l0Fill(funcIndex, fast.fnPtr, dims, 3);
+#endif
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 3, /*fallback=*/nullptr);
@@ -1926,8 +1971,10 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 3, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, dims, 3);
+#endif
   return taskpoolStatus(r.status);
 }
 
@@ -1943,9 +1990,11 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
     *outBucket = 0;
   if (!gEJIT)
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   OrdinaryResolvePin ResolvePin(funcIndex);
   if (!ResolvePin.admitted)
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
@@ -1962,6 +2011,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
                                 reinterpret_cast<const ejit_dim_pair_t *>(dims),
                                 4))
     return EJIT_ERR_NOT_ACTIVE;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 4, &l0Fn)) {
     if (outFn)
@@ -1970,6 +2020,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
       *outBucket = kEJitNoBucket;
     return EJIT_OK;
   }
+#endif
   auto fast = tp->tryCacheHit4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
                                 inst2, dim3, inst3);
   if (fast.fastPathTerminal) {
@@ -1978,8 +2029,10 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
     if (outBucket)
       *outBucket = fast.bucketIndex;
     ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr, dims, 4, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
     if (fast.fnPtr)
       tp->l0Fill(funcIndex, fast.fnPtr, dims, 4);
+#endif
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 4, /*fallback=*/nullptr);
@@ -1988,8 +2041,10 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
   if (outBucket)
     *outBucket = r.bucketIndex;
   ejitIcacheFillOnSuccess(funcIndex, r.fnPtr, dims, 4, icTok);
+#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (r.fnPtr)
     tp->l0Fill(funcIndex, r.fnPtr, dims, 4);
+#endif
   return taskpoolStatus(r.status);
 }
 
