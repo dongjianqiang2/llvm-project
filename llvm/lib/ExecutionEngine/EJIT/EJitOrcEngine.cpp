@@ -30,6 +30,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -175,13 +176,31 @@ struct EJitOrcEngine::Impl {
   /// independently compiled and symbols from different specializations
   /// never conflict.
   std::map<uint64_t, orc::JITDylib *> specDylibs;
+  /// Owner-only physical naming identity for retained loads. The ORC session,
+  /// not specDylibs' latest-pointer index, owns every created JD. Never wrap
+  /// this serial: a previous physical object may still be executing.
+  uint64_t freshPhysicalSerial = 0;
   /// User-registered symbols (functions + globals) for bare-metal.
   /// Populated via ejit_register_symbol() / addUserSymbol().
   std::map<std::string, void *> userSymbols;
+  /// Owner-local snapshot of genuine PGOUse metadata, never inferred from a
+  /// raw counter index. Cleared for every transform to reject stale metadata.
+  std::map<std::string, uint64_t> profileEntryCounts;
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
   std::unique_ptr<EJitOptimizer> optimizer;
+  /// PR231 small-table plans. Held here so a setter call before or after
+  /// Create() reaches the persistent optimizer, and so the plan set outlives
+  /// every compilation that consults it.
+  std::shared_ptr<const EJitSmallTablePlanSet> smallTablePlans;
+  /// PR231 A0: transform-created symbols of the last materialization that the
+  /// module's own MaterializationResponsibility already defined, and which were
+  /// therefore NOT claimed a second time. Non-zero means a prepared module was
+  /// handed to the engine (its own claim owns the table column), which is the
+  /// supported client order; the value is exposed for the regression test that
+  /// pins the ownership rule.
+  uint64_t transformClaimSkips = 0;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
   /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
   /// emitted assembly matches the real JIT output). Null if creation failed.
@@ -730,7 +749,18 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // With Large, the 3 extra movz/movk instructions per global access eaten
   // the specialization savings (fewer BBs / folded branches). Small makes
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
-  JTMBOrErr->setCodeModel(CodeModel::Small);
+  //
+  // COFF host exception: on x86-64 COFF the same Small model lowers every
+  // external global to a 32-bit absolute reference
+  // (IMAGE_REL_AMD64_ADDR32), which JITLink's COFF backend does not implement
+  // (it supports ADDR32NB/REL32*/ADDR64 but not ADDR32) and which the >4 GiB
+  // JIT slab could not satisfy anyway; the Large model uses 64-bit absolute
+  // references there. Same class of host-toolchain constraint as
+  // wantDSOLocal() - the AArch64 product target keeps the Small model.
+  if (JTMBOrErr->getTargetTriple().isOSBinFormatCOFF())
+    JTMBOrErr->setCodeModel(CodeModel::Large);
+  else
+    JTMBOrErr->setCodeModel(CodeModel::Small);
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
@@ -820,6 +850,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
   engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  // Apply any small-table plan set installed before the optimizer existed. The
+  // default is empty, so the feature stays OFF unless a caller installs plans.
+  engine->P->optimizer->setSmallTablePlans(engine->P->smallTablePlans);
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -857,6 +890,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           if (!ctx)
             return;
 
+          // PR231 A0 regression counter: how many transform-created symbols this
+          // materialization found already owned by the module's own claim (see
+          // the claim-only-what-is-not-already-defined rule below).
+          engine->P->transformClaimSkips = 0;
+
           // Clear stale analysis results from previous compilations
           // (each compilation uses a fresh Module with new IR unit pointers).
           engine->P->optimizer->clearAnalyses();
@@ -873,6 +911,21 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           }
 
           engine->P->optimizer->runPipeline(M, *ctx);
+
+          engine->P->profileEntryCounts.clear();
+          if (ctx->tier == CompileTier::PGOUse)
+            for (const Function &F : M)
+              if (!F.isDeclaration())
+                if (auto Count = F.getEntryCount(/*AllowSynthetic=*/false))
+                  engine->P->profileEntryCounts.emplace(F.getName().str(),
+                                                       Count->getCount());
+
+          // The optimizer's analysis managers are persistent across
+          // compilations, but this module is released once linking finishes.
+          // Drop the cached analyses now, while the IR is still alive: a cached
+          // analysis (e.g. MemorySSA) destroyed at engine teardown would walk
+          // freed IR. The next compilation starts from cleared managers anyway.
+          engine->P->optimizer->clearAnalyses();
 
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
@@ -970,26 +1023,93 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
         // MR's claim - computed at addIRModule from the original module -
         // does NOT include them. defineMaterializing adds them so ORC
         // lookup resolves (compileCold's Tier-1 counter capture, §5.2).
-        {
+        TSM.withModuleDo([&](Module &M) {
           orc::SymbolFlagsMap symFlags;
+          auto ClaimDefinition = [&](StringRef Name) {
+            // Instrumentation lowering is target-dependent: Linux does not
+            // emit the runtime-hook user, and other transforms may leave only
+            // declarations. A materialization claim promises an emitted
+            // definition, not merely a name the pipeline once considered.
+            auto Interned = engine->P->J->mangleAndIntern(Name);
+            if (R.getSymbols().count(Interned) ||
+                engine->P->userSymbols.count(Name.str())) {
+              ++engine->P->transformClaimSkips;
+              return;
+            }
+            const GlobalValue *GV = M.getNamedValue(Name);
+            if (!GV || GV->isDeclarationForLinker() || GV->hasLocalLinkage())
+              return;
+            // Keep runtime lookup visibility for the counters and table
+            // definitions. The IR may mark them hidden for object linking,
+            // but the owner still resolves them through LLJIT's lookup API.
+            symFlags[Interned] = JITSymbolFlags::fromGlobalValue(*GV);
+            symFlags[Interned] |= JITSymbolFlags::Exported;
+          };
+          // PR231 B2: the instrumented (Tier-1) pipeline also creates the
+          // profile version flag as a COMDAT definition, after addIRModule, so
+          // the MR's claim cannot contain it. Without claiming it an Instrumented
+          // module cannot materialize at all on COFF (the symbol is listed as
+          // unmaterializable), which is exactly what stops the common T1
+          // compile. The flag carries no counter state: the counters are the
+          // __profc_/__profd_ globals below.
+          if (!engine->P->optimizer->getLastCounterNames().empty()) {
+            const char *VersionName = "__llvm_profile_raw_version";
+            const char *HookUserName = "__llvm_profile_runtime_user";
+            ClaimDefinition(VersionName);
+            // The lowering also synthesizes the runtime-hook user function on
+            // targets that need one (COFF among them). It is created inside the
+            // transform too, so it must be claimed the same way.
+            ClaimDefinition(HookUserName);
+          }
           for (const std::string &name :
                engine->P->optimizer->getLastCounterNames()) {
-            symFlags[engine->P->J->mangleAndIntern("__profc_" + name)] =
-                JITSymbolFlags::Exported;
-            symFlags[engine->P->J->mangleAndIntern("__profd_" + name)] =
-                JITSymbolFlags::Exported;
+            // Same duplicate-claim rule as the small-table columns below: a
+            // counter the module already defines - or that a caller registered
+            // through addUserSymbol, which defines an absolute symbol in this
+            // spec JITDylib - belongs to that existing owner, so it is not
+            // claimed a second time here (that would be a duplicate
+            // defineMaterializing definition).
+            const std::string ProfcName = "__profc_" + name;
+            const std::string ProfdName = "__profd_" + name;
+            ClaimDefinition(ProfcName);
+            ClaimDefinition(ProfdName);
+          }
+          // PR231: the small-table pass also creates globals inside runPipeline
+          // (after addIRModule), so the MR's claim does not include them.
+          // Claiming them as exported lets the runtime resolve a table's stable
+          // address and publish later rows into it (§6.5); without this ORC
+          // rejects the transform's new definitions as unexpected.
+          //
+          // Claim only the columns this module did NOT already define. A client
+          // may hand the engine a module that a previous round already prepared
+          // (materialize() + the pass, or a second compile of the same prepared
+          // module); that module's own claim, computed by addIRModule, already
+          // contains the symbol, and claiming it again is a duplicate definition
+          // (`In defineMaterializing operation, duplicate definition of symbol
+          // '__ejit_stab_...'`). Ownership of an existing definition therefore
+          // stays with the IRMaterializationUnit that declared it; the runtime
+          // still resolves the same stable address through that claim.
+          for (const std::string &name :
+               engine->P->optimizer->getLastSmallTableColumnNames()) {
+            // Ownership: a column the module itself defines is already claimed
+            // by its IRMaterializationUnit, and a column the runtime registered
+            // through addUserSymbol is already defined as an absolute symbol in
+            // this JITDylib (the runtime-owned resource form). In both cases
+            // re-claiming it is a duplicate `defineMaterializing` definition, so
+            // the existing owner keeps it.
+            ClaimDefinition(name);
           }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-          if (!engine->P->optimizer->getLastMayConstLoadSites().empty())
-            symFlags[engine->P->J->mangleAndIntern("__ejit_mayconst_hits")] =
-                JITSymbolFlags::Exported;
+          if (!engine->P->optimizer->getLastMayConstLoadSites().empty()) {
+            ClaimDefinition("__ejit_mayconst_hits");
+          }
 #endif
           if (!symFlags.empty())
             if (auto Err = R.defineMaterializing(std::move(symFlags)))
               EJIT_DIAG("transform: defineMaterializing PGO counters "
                         "failed: %s",
                         toString(std::move(Err)).c_str());
-        }
+        });
         return std::move(TSM);
       });
 
@@ -998,7 +1118,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 }
 
 Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
-                                       const std::string &origFnName) {
+                                     const std::string &origFnName,
+                                     bool PreservePreviousPhysical) {
   EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
                     origFnName.c_str(), bitcodeData.size());
   auto Ctx = std::make_unique<LLVMContext>();
@@ -1083,7 +1204,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
 
   // Each specialization gets its own JITDylib so that symbols from
   // different specializations (same TU bitcode loaded multiple times)
-  // never conflict. Remove any stale JD from a previous compilation
+  // never conflict. By default remove any stale JD from a previous compilation
   // of the same cacheKey (e.g., after ejit_clear_cache).
   // PGO: a Tier-2 recompile for the same cacheKey removes the Tier-1
   // JITDylib BEFORE the new compile.  This is safe under code-pool v1
@@ -1091,8 +1212,19 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   // fnPtrs in the cache remain valid.  A future retain-until-publish
   // path (deferring removeJITDylib until after cachePublish succeeds)
   // would be needed for reclaimable memory managers (§5 JD lifecycle).
+  // Function-scoped handoff recovery cannot infer physical return from a
+  // logical profile abort. Its opt-in retained path leaves the old JD owned by
+  // the session and installs a new latest-pointer index only after load
+  // succeeds. Both T1 and T2 may use this path; no old code/counter address is
+  // removed here. Retention ends only at engine teardown, not at publish/leave.
+  if (PreservePreviousPhysical &&
+      P->freshPhysicalSerial == std::numeric_limits<uint64_t>::max())
+    return make_error<StringError>(
+        "fresh physical JITDylib identity space exhausted",
+        inconvertibleErrorCode());
+
   auto it = P->specDylibs.find(cacheKey);
-  if (it != P->specDylibs.end()) {
+  if (!PreservePreviousPhysical && it != P->specDylibs.end()) {
     if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
       EJIT_DIAG("loadBitcode key=0x%016lx: remove stale JD FAILED: %s",
                 cacheKey, toString(std::move(Err)).c_str());
@@ -1104,8 +1236,17 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
           ? "t1"
           : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse ? "t2"
                                                                       : "base";
-  auto JDOrErr = P->J->createJITDylib("spec_" + std::string(TierTag) + "_" +
-                                      std::to_string(cacheKey));
+  std::string JDName = "spec_" + std::string(TierTag) + "_" +
+                       std::to_string(cacheKey);
+  if (PreservePreviousPhysical) {
+    const uint64_t Serial = ++P->freshPhysicalSerial;
+    JDName += "_physical_" + std::to_string(Serial);
+    EJIT_DIAG_VERBOSE("loadBitcode fresh key=0x%016lx physical=%llu "
+                      "previous_retained=%u",
+                      cacheKey, static_cast<unsigned long long>(Serial),
+                      static_cast<unsigned>(it != P->specDylibs.end()));
+  }
+  auto JDOrErr = P->J->createJITDylib(JDName);
   if (!JDOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
     return JDOrErr.takeError();
@@ -1170,6 +1311,34 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   for (const std::string &n : unresolvedNames)
     EJIT_DIAG_DEBUG("  %s", n.c_str());
 
+  // PR231 B2: a symbol registered through addUserSymbol must be resolvable by
+  // THIS compile even when the reference to it is synthesized by the transform
+  // rather than present in the module as loaded. The scans above can only see
+  // declarations that already exist at addIRModule time, but the instrumented
+  // pipeline creates the profile-runtime hook declaration
+  // (`__llvm_profile_runtime`, referenced by the `__llvm_profile_runtime_user`
+  // function it also creates) while it runs, so on targets that need that hook
+  // (COFF - ELF/Linux returns early in InstrProfilingLowering) the spec
+  // JITDylib had no definition and the whole Tier-1 module failed to
+  // materialize with "Symbols not found: [ __llvm_profile_runtime ]".
+  //
+  // Ownership: a name the module itself DEFINES keeps its own
+  // IRMaterializationUnit claim - defining an absolute symbol for it here
+  // would be a duplicate definition - so only names the module leaves
+  // undefined (or does not mention at all) take the registered address.
+  for (const auto &KV : P->userSymbols) {
+    if (KV.first.empty() || !KV.second)
+      continue;
+    auto Interned = P->J->mangleAndIntern(KV.first);
+    if (globalSymbols.count(Interned))
+      continue;
+    const GlobalValue *ModuleOwned = (*ModuleOrErr)->getNamedValue(KV.first);
+    if (ModuleOwned && !ModuleOwned->isDeclaration())
+      continue;
+    globalSymbols[Interned] = orc::ExecutorSymbolDef(
+        orc::ExecutorAddr::fromPtr(KV.second), JITSymbolFlags::Exported);
+  }
+
   // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
   // and the stack-protector guard/fail) that the AOT symbol collector cannot
   // register because they are never present as IR declarations — the JIT
@@ -1196,14 +1365,35 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   if (auto Err = P->J->addIRModule(
           *JDOrErr,
           orc::ThreadSafeModule(std::move(*ModuleOrErr), std::move(Ctx)))) {
-    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error", cacheKey);
-    return Err;
+    // Carry the ORC error text into the diagnostic: which JD symbol the module
+    // could not claim is the only useful clue when this fails at load time.
+    std::string Reason = toString(std::move(Err));
+    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: add IR module error: %s", cacheKey,
+              Reason.c_str());
+    return make_error<StringError>(std::move(Reason), inconvertibleErrorCode());
   }
 
   P->specDylibs[cacheKey] = &*JDOrErr;
   EJIT_DIAG_VERBOSE("loadBitcode OK key=0x%016lx func=%s", cacheKey,
                     origFnName.c_str());
   return Error::success();
+}
+
+Error EJitOrcEngine::removeCounterSymbolForTesting(uint64_t CacheKey,
+                                                   StringRef Name) {
+  if (!Name.starts_with("__profc_") && !Name.starts_with("__profd_"))
+    return make_error<StringError>("counter-capture test may remove only a "
+                                   "real profile counter symbol",
+                                   inconvertibleErrorCode());
+  auto It = P->specDylibs.find(CacheKey);
+  if (It == P->specDylibs.end())
+    return make_error<StringError>("counter-capture test has no specialization "
+                                   "JITDylib",
+                                   inconvertibleErrorCode());
+  // JITDylib::remove erases the symbol definition, not the owning resource
+  // tracker or allocations. Capture's following lookup therefore fails in ORC
+  // itself, while all other real counter definitions and the common T1 remain.
+  return It->second->remove({P->J->mangleAndIntern(Name)});
 }
 
 Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
@@ -1263,10 +1453,33 @@ const SpecializationContext *EJitOrcEngine::getActiveContext() const {
   return P->activeCtx;
 }
 
+void EJitOrcEngine::setSmallTablePlans(
+    std::shared_ptr<const EJitSmallTablePlanSet> Plans) {
+  P->smallTablePlans = std::move(Plans);
+  if (P->optimizer)
+    P->optimizer->setSmallTablePlans(P->smallTablePlans);
+}
+
 ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
   if (P->optimizer)
     return P->optimizer->getLastCounterNames();
   return {};
+}
+
+StringRef EJitOrcEngine::getCounterProfileName(StringRef SymbolSuffix) const {
+  if (P->optimizer)
+    return P->optimizer->getCounterProfileName(SymbolSuffix);
+  return {};
+}
+
+ArrayRef<std::string> EJitOrcEngine::getLastSmallTableColumnNames() const {
+  if (P->optimizer)
+    return P->optimizer->getLastSmallTableColumnNames();
+  return {};
+}
+
+uint64_t EJitOrcEngine::getTransformClaimSkips() const {
+  return P->transformClaimSkips;
 }
 
 ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {
@@ -1289,6 +1502,16 @@ bool EJitOrcEngine::printMayConstRanking() const {
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
   P->userSymbols[name] = addr;
+}
+
+bool EJitOrcEngine::getFunctionProfileEntryCount(StringRef Name,
+                                                uint64_t &Count) const {
+  Count = 0;
+  auto I = P->profileEntryCounts.find(Name.str());
+  if (I == P->profileEntryCounts.end())
+    return false;
+  Count = I->second;
+  return true;
 }
 
 #ifdef EJIT_SRE_CODE_POOL

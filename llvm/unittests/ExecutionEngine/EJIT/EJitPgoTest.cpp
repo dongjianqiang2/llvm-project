@@ -7,12 +7,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/AsmParser/Parser.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "EJitSharedTaskPoolTestAccess.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -25,10 +28,14 @@
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -137,6 +144,7 @@ static bool realOrcStressCompile(void *Opaque, const EJitCompileRequest &Req,
   return *OutFn != nullptr;
 }
 
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
 static bool realOrcStressCodeReady(void *Opaque, const void *Fn) {
   auto *Ctx = static_cast<RealCompileStressCtx *>(Opaque);
   return Ctx->engine->isCodeReady(Fn);
@@ -151,10 +159,13 @@ static bool realOrcStressFlush(void *Opaque) {
   Ctx->published.store(true, std::memory_order_release);
   return true;
 }
+#endif
 
 struct RealHostDelayCtx {
   EJitSharedTaskPoolState *state = nullptr;
   RealCompileStressCtx *compile = nullptr;
+  std::atomic<int> *publishResult = nullptr;
+  std::thread::id workerThread;
   std::atomic<unsigned> throttleCalls{0};
   std::atomic<unsigned> waitCalls{0};
   std::atomic<uint64_t> totalThrottleMilliseconds{0};
@@ -171,7 +182,21 @@ static void realHostPlatformDelay(void *Opaque, uint32_t Ticks) {
                                              std::memory_order_relaxed);
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(Milliseconds));
-  if (Ticks != 1u && Ctx->compile->published.load(std::memory_order_acquire))
+  // Only the worker may stop its loop. The publisher also uses this delay
+  // hook while waiting; it must first observe and acknowledge Succeeded.
+  if (std::this_thread::get_id() != Ctx->workerThread)
+    return;
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+  const bool Finished =
+      Ctx->compile->published.load(std::memory_order_acquire) &&
+      Ctx->publishResult->load(std::memory_order_acquire) != -1;
+#else
+  // Immediate publication has no explicit batch request or flush callback.
+  // The final per-compile scheduling gap still runs before stopping.
+  const bool Finished = Ctx->compile->completed.load(std::memory_order_acquire) ==
+                        RealCompileStressFunctions;
+#endif
+  if (Finished)
     Ctx->state->initState.storeRelease(
         static_cast<uint32_t>(EJitSharedInitState::Stopping));
 }
@@ -225,10 +250,17 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   EJitSharedTaskPool Pool;
   Pool.bind(Shared.get());
   Pool.setCompiler(&realOrcStressCompile, &Compile);
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
+  // Match CompileDriver: these callbacks opt baseline requests into deferred
+  // batch compilation and must not be installed in an immediate-publish build.
   Pool.setCodeBatchCallbacks(&realOrcStressCodeReady, &realOrcStressFlush,
                              &Compile);
+#endif
   Pool.setMode(EJitCompileMode::Async);
   RealHostDelayCtx Delay{Shared.get(), &Compile};
+  std::atomic<int> PublishResult{-1};
+  Delay.publishResult = &PublishResult;
+  Delay.workerThread = std::this_thread::get_id();
   Pool.setWorkerIdleHook(&realHostPlatformDelay, &Delay);
   ASSERT_EQ(Pool.init(), EJitSharedTaskPool::InitResult::BecameOwner);
 
@@ -239,8 +271,11 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
               EJitCompileOrGetStatus::EnqueuedPending);
 
   std::atomic<bool> StopHeartbeat{false};
+  std::atomic<bool> WorkerTimedOut{false};
   std::atomic<unsigned> Heartbeats{0};
   std::atomic<unsigned> MaxHeartbeatGapUs{0};
+  const auto WorkerDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
   std::thread Heartbeat([&] {
     auto Previous = std::chrono::steady_clock::now();
     while (!StopHeartbeat.load(std::memory_order_acquire)) {
@@ -252,26 +287,54 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
       updateAtomicMax(MaxHeartbeatGapUs, static_cast<unsigned>(Gap));
       Heartbeats.fetch_add(1, std::memory_order_relaxed);
       Previous = Now;
+      if (Now >= WorkerDeadline) {
+        WorkerTimedOut.store(true, std::memory_order_release);
+        Shared->initState.storeRelease(
+            static_cast<uint32_t>(EJitSharedInitState::Stopping));
+        break;
+      }
     }
   });
 
-  std::atomic<int> PublishResult{-1};
+  bool RequestObserved = true;
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
   std::thread Publisher([&] {
     PublishResult.store(Pool.requestCodeBatchFlushAndWait() ? 1 : 0,
                         std::memory_order_release);
   });
+  const auto RequestDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (Shared->codeBatchRequestState.loadAcquire() !=
-         static_cast<uint32_t>(EJitCodeBatchRequestState::Requested))
-    std::this_thread::yield();
+         static_cast<uint32_t>(EJitCodeBatchRequestState::Requested)) {
+    if (std::chrono::steady_clock::now() >= RequestDeadline ||
+        PublishResult.load(std::memory_order_acquire) != -1) {
+      RequestObserved = false;
+      Shared->initState.storeRelease(
+          static_cast<uint32_t>(EJitSharedInitState::Stopping));
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+#else
+  // OFF is a real supported mode, not a skipped batch test. The API reports
+  // that manual batching is unavailable; all 20 requests compile and publish
+  // individually through the same real ORC engine and throttled worker.
+  PublishResult.store(Pool.requestCodeBatchFlushAndWait() ? 1 : 0,
+                      std::memory_order_release);
+  EXPECT_EQ(Shared->codeBatchRequestState.loadAcquire(),
+            static_cast<uint32_t>(EJitCodeBatchRequestState::Idle));
+#endif
 
   const auto Start = std::chrono::steady_clock::now();
-  Pool.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(Pool);
   const auto Elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - Start)
                            .count();
   StopHeartbeat.store(true, std::memory_order_release);
   Heartbeat.join();
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
   Publisher.join();
+#endif
 
   std::printf("[REAL-STRESS] worker done compiles=%u throttles=%u "
               "waits=%u elapsed_ms=%lld heartbeats=%u max_gap_us=%u\n",
@@ -282,10 +345,27 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
 
   EXPECT_EQ(Compile.completed.load(), RealCompileStressFunctions);
   EXPECT_EQ(Compile.maxActive.load(), 1u);
+  EXPECT_TRUE(RequestObserved) << "batch publisher did not request work in 5s";
+  EXPECT_FALSE(WorkerTimedOut.load(std::memory_order_acquire))
+      << "real ORC worker did not complete in 60s";
+  EJitSharedDiagnostics Diagnostics{};
+  Pool.getDiagnostics(Diagnostics);
+  EXPECT_EQ(Diagnostics.asyncCompiles, RealCompileStressFunctions);
+  EXPECT_EQ(Diagnostics.compileFailed, 0u);
+  EXPECT_EQ(Diagnostics.publishFailed, 0u);
+#ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
   EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 1);
   EXPECT_TRUE(Compile.published.load(std::memory_order_acquire));
   // 20 queue-consume gaps + 20 real ORC compile gaps + one post-publish gap.
   EXPECT_EQ(Delay.throttleCalls.load(), 41u);
+  RecordProperty("publish_mode", "batched");
+#else
+  EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 0);
+  EXPECT_FALSE(Compile.published.load(std::memory_order_acquire));
+  // Immediate mode consumes, compiles and publishes each request in one step.
+  EXPECT_EQ(Delay.throttleCalls.load(), RealCompileStressFunctions);
+  RecordProperty("publish_mode", "immediate");
+#endif
   EXPECT_GE(static_cast<uint64_t>(Elapsed),
             Delay.totalThrottleMilliseconds.load());
   EXPECT_GT(Heartbeats.load(), RealCompileStressFunctions);
@@ -294,6 +374,7 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   using StressFn = uint32_t (*)(uint32_t);
   for (uint32_t Func = 0; Func != RealCompileStressFunctions; ++Func) {
     ASSERT_NE(Compile.compiled[Func], nullptr);
+    ASSERT_TRUE(Compile.engine->isCodeReady(Compile.compiled[Func]));
     auto *Fn = reinterpret_cast<StressFn>(Compile.compiled[Func]);
     EXPECT_EQ(Fn(7u), applyStressArithmetic(7u, Func));
   }
@@ -1042,6 +1123,37 @@ std::unique_ptr<Module> makeSimpleFooModule(LLVMContext &Ctx) {
   B.CreateRet(B.CreateAdd(F->getArg(0), ConstantInt::get(I32, 1)));
   return M;
 }
+
+// Two real instrumented functions, with no external dependencies. Keeping the
+// helper noinline makes the retained-profile checks cover the complete emitted
+// counter inventory, not just the entry's first counter.
+std::unique_ptr<Module> makeFreshPhysicalLifetimeModule(LLVMContext &Ctx) {
+  auto M = std::make_unique<Module>("fresh_physical_lifetime", Ctx);
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *FT = FunctionType::get(I32, {I32}, false);
+  // This is a TU-private callee, not an externally exported lookup root. The
+  // optimizer internalizes non-entry callees; pre-claiming an external helper
+  // would leave ORC's original MU demanding a definition it no longer emits.
+  auto *Helper = Function::Create(FT, Function::InternalLinkage,
+                                 "fresh_lifetime_helper", M.get());
+  Helper->addFnAttr(Attribute::NoInline);
+  {
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Helper));
+    B.CreateRet(B.CreateAdd(B.CreateMul(Helper->getArg(0), B.getInt32(3)),
+                           B.getInt32(2)));
+  }
+  auto *Entry = Function::Create(FT, Function::ExternalLinkage,
+                                "fresh_lifetime_entry", M.get());
+  markEJitEntry(*Entry);
+  {
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Entry));
+    Value *First = B.CreateCall(Helper, {Entry->getArg(0)});
+    Value *Second =
+        B.CreateCall(Helper, {B.CreateAdd(Entry->getArg(0), B.getInt32(1))});
+    B.CreateRet(B.CreateAdd(First, Second));
+  }
+  return M;
+}
 } // namespace
 
 // PGO full-runtime wiring: EJitOrcEngine loadBitcode (Instrumented) -> Gen
@@ -1247,6 +1359,239 @@ TEST(EJitPgo, Tier1ToTier2FullCycle) {
     if (EC)
       EXPECT_GT(EC->getCount(), 0u);
   }
+}
+
+// A function that handed its ordinary PGO session to a small-table policy may
+// later resume ordinary compilation. A logical abort is not a physical return:
+// Fresh retains old code AND every old counter/data object until engine
+// teardown. This exercises that engine boundary directly, without fake counter
+// writes, fake lowering, a manufactured leave, or dereferencing a removed JD.
+TEST(EJitPgo, FreshPhysicalLoadsRetainRealCodeAndCompleteCounterInventory) {
+  constexpr uint64_t LogicalKey = (uint64_t{7} << 32) | 3;
+  constexpr uint32_t SampleCalls = 16;
+  const std::string EntryName = "fresh_lifetime_entry";
+  std::string Bitcode;
+  {
+    LLVMContext Ctx;
+    auto M = makeFreshPhysicalLifetimeModule(Ctx);
+    raw_string_ostream OS(Bitcode);
+    WriteBitcodeToFile(*M, OS);
+  }
+  ASSERT_FALSE(Bitcode.empty());
+
+  // Inspect the IR produced by the ACTUAL engine's PGOUse transform, rather
+  // than accepting a successful machine-code lookup as proof of profile use.
+  SmallString<128> DumpDir;
+  ASSERT_FALSE(static_cast<bool>(
+      sys::fs::createUniqueDirectory("ejit-fresh-physical", DumpDir)));
+  auto RemoveDumpDir = make_scope_exit(
+      [&] { (void)sys::fs::remove_directories(DumpDir); });
+  EJitRuntimeState State;
+  Config Cfg;
+  Cfg.enablePgo = true;
+  Cfg.dumpJITDir = DumpDir.str().str();
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+
+  auto LoadFresh = [&](CompileTier Tier, StringRef Profile,
+                       void *&Fn) -> void {
+    SpecializationContext Ctx;
+    Ctx.fnName = EntryName;
+    Ctx.cacheKey = LogicalKey;
+    Ctx.tier = Tier;
+    Ctx.profileData = Profile.str();
+    Engine->setActiveContext(&Ctx);
+    auto ResetContext =
+        make_scope_exit([&] { Engine->setActiveContext(nullptr); });
+    ASSERT_FALSE(errorToBool(Engine->loadBitcodeModule(
+        Bitcode, LogicalKey, EntryName, /*PreservePreviousPhysical=*/true)));
+    auto FnOrErr = Engine->lookup(LogicalKey, EntryName);
+    ASSERT_TRUE(static_cast<bool>(FnOrErr));
+    Fn = *FnOrErr;
+    ASSERT_NE(Fn, nullptr);
+#ifdef EJIT_SRE_CODE_POOL
+    ASSERT_FALSE(errorToBool(Engine->flushPendingCode()));
+    ASSERT_TRUE(Engine->isCodeReady(Fn));
+#endif
+    EXPECT_EQ(Engine->getActiveContext()->cacheKey, LogicalKey);
+  };
+
+  struct CounterObject {
+    std::string symbolSuffix;
+    std::string profileName;
+    uintptr_t profc = 0;
+    uintptr_t profd = 0;
+    uint64_t hash = 0;
+    uint32_t count = 0;
+  };
+  auto CaptureAll = [&](std::vector<CounterObject> &Objects) -> void {
+    EXPECT_TRUE(Engine->getCounterProfileName("not_an_emitted_counter").empty());
+    std::vector<std::string> Names(Engine->getLastCounterNames().begin(),
+                                   Engine->getLastCounterNames().end());
+    std::sort(Names.begin(), Names.end());
+    ASSERT_EQ(Names.size(), 2u);
+    for (const std::string &Name : Names) {
+      auto Profc = Engine->lookup(LogicalKey, "__profc_" + Name);
+      auto Profd = Engine->lookup(LogicalKey, "__profd_" + Name);
+      ASSERT_TRUE(static_cast<bool>(Profc)) << Name;
+      ASSERT_TRUE(static_cast<bool>(Profd)) << Name;
+      CounterObject C;
+      C.symbolSuffix = Name;
+      C.profileName = Engine->getCounterProfileName(Name).str();
+      ASSERT_FALSE(C.profileName.empty()) << Name;
+      C.profc = reinterpret_cast<uintptr_t>(*Profc);
+      C.profd = reinterpret_cast<uintptr_t>(*Profd);
+      ASSERT_NE(C.profc, 0u);
+      ASSERT_NE(C.profd, 0u);
+      uint64_t NameRef = 0;
+      std::memcpy(&NameRef, reinterpret_cast<const void *>(C.profd),
+                  sizeof(NameRef));
+      ASSERT_EQ(NameRef, IndexedInstrProf::ComputeHash(C.profileName));
+      std::memcpy(&C.hash, reinterpret_cast<const void *>(C.profd + 8),
+                  sizeof(C.hash));
+      std::memcpy(&C.count, reinterpret_cast<const void *>(C.profd + 48),
+                  sizeof(C.count));
+      ASSERT_NE(C.hash, 0u);
+      ASSERT_GT(C.count, 0u);
+      ASSERT_LE(C.count, 32u);
+      Objects.push_back(std::move(C));
+    }
+  };
+  auto ReadAll = [](const std::vector<CounterObject> &Objects) {
+    std::vector<std::vector<uint64_t>> Counts;
+    for (const CounterObject &C : Objects) {
+      auto *Counters = reinterpret_cast<const uint64_t *>(C.profc);
+      std::vector<uint64_t> Values;
+      for (uint32_t I = 0; I < C.count; ++I)
+        Values.push_back(__atomic_load_n(&Counters[I], __ATOMIC_ACQUIRE));
+      Counts.push_back(std::move(Values));
+    }
+    return Counts;
+  };
+  using EntryFn = int32_t (*)(int32_t);
+  void *OldT1 = nullptr;
+  LoadFresh(CompileTier::Instrumented, {}, OldT1);
+  ASSERT_FALSE(HasFatalFailure());
+  std::vector<CounterObject> OldObjects;
+  CaptureAll(OldObjects);
+  ASSERT_FALSE(HasFatalFailure());
+  for (uint32_t I = 0; I < SampleCalls; ++I)
+    EXPECT_EQ(reinterpret_cast<EntryFn>(OldT1)(I), 6 * int32_t(I) + 7);
+  const auto ProfileCounts = ReadAll(OldObjects);
+  std::vector<PgoCounterRef> Refs;
+  bool SawEntry = false, SawHelper = false;
+  for (size_t I = 0; I < OldObjects.size(); ++I) {
+    const CounterObject &C = OldObjects[I];
+    ASSERT_EQ(C.count, 1u);
+    if (C.profileName == EntryName) {
+      SawEntry = true;
+      EXPECT_EQ(ProfileCounts[I][0], SampleCalls);
+    } else if (StringRef(C.profileName).ends_with("fresh_lifetime_helper")) {
+      SawHelper = true;
+      EXPECT_NE(C.profileName, C.symbolSuffix)
+          << "the internal canonical name must not be its legalized symbol";
+      EXPECT_EQ(ProfileCounts[I][0], 2 * SampleCalls);
+    }
+    Refs.push_back({C.profileName.c_str(), C.profc, C.profd});
+  }
+  ASSERT_TRUE(SawEntry && SawHelper);
+  std::string Profile = synthesizeProfileBuffer(Refs);
+  ASSERT_FALSE(Profile.empty());
+  auto ReaderOrErr = IndexedInstrProfReader::create(MemoryBuffer::getMemBuffer(
+      Profile, "fresh-real.prof", /*RequiresNullTerminator=*/false));
+  ASSERT_TRUE(static_cast<bool>(ReaderOrErr));
+  for (size_t I = 0; I < OldObjects.size(); ++I) {
+    auto Record = (*ReaderOrErr)->getInstrProfRecord(OldObjects[I].profileName,
+                                                    OldObjects[I].hash);
+    ASSERT_TRUE(static_cast<bool>(Record));
+    EXPECT_EQ(Record->Name, OldObjects[I].profileName);
+    EXPECT_EQ(Record->Counts, ProfileCounts[I]);
+  }
+
+  void *OldT2 = nullptr;
+  LoadFresh(CompileTier::PGOUse, Profile, OldT2);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_NE(OldT2, OldT1);
+  EXPECT_EQ(reinterpret_cast<EntryFn>(OldT2)(11), 73);
+  EXPECT_EQ(ReadAll(OldObjects), ProfileCounts);
+  SmallString<160> OptimizedPath(DumpDir);
+  sys::path::append(OptimizedPath,
+                    EntryName + "_" + std::to_string(LogicalKey) + "_opt.ll");
+  LLVMContext DumpCtx;
+  SMDiagnostic Diagnostic;
+  auto Optimized = parseAssemblyFile(OptimizedPath, Diagnostic, DumpCtx);
+  ASSERT_NE(Optimized, nullptr) << Diagnostic.getMessage().str();
+  auto *FinalEntry = Optimized->getFunction(EntryName);
+  ASSERT_NE(FinalEntry, nullptr);
+  auto EntryCount = FinalEntry->getEntryCount();
+  ASSERT_TRUE(EntryCount.has_value())
+      << "the actual fresh T2 transform did not consume the real profile";
+  EXPECT_EQ(EntryCount->getCount(), SampleCalls);
+  auto *FinalHelper = Optimized->getFunction("fresh_lifetime_helper");
+  ASSERT_NE(FinalHelper, nullptr);
+  auto HelperCount = FinalHelper->getEntryCount();
+  ASSERT_TRUE(HelperCount.has_value())
+      << "the actual fresh T2 helper did not consume its canonical profile";
+  EXPECT_EQ(HelperCount->getCount(), 2 * SampleCalls);
+
+  void *NewT1 = nullptr;
+  LoadFresh(CompileTier::Instrumented, {}, NewT1);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_NE(NewT1, OldT1);
+  ASSERT_NE(NewT1, OldT2);
+  std::vector<CounterObject> NewObjects;
+  CaptureAll(NewObjects);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_EQ(NewObjects.size(), OldObjects.size());
+  for (size_t I = 0; I < OldObjects.size(); ++I) {
+    EXPECT_EQ(NewObjects[I].symbolSuffix, OldObjects[I].symbolSuffix);
+    EXPECT_EQ(NewObjects[I].profileName, OldObjects[I].profileName);
+    EXPECT_EQ(NewObjects[I].hash, OldObjects[I].hash);
+    EXPECT_EQ(NewObjects[I].count, OldObjects[I].count);
+    EXPECT_NE(NewObjects[I].profc, OldObjects[I].profc);
+    EXPECT_NE(NewObjects[I].profd, OldObjects[I].profd);
+    uint64_t OldHash = 0;
+    uint32_t OldCount = 0;
+    std::memcpy(&OldHash, reinterpret_cast<const void *>(OldObjects[I].profd + 8),
+                sizeof(OldHash));
+    std::memcpy(&OldCount,
+                reinterpret_cast<const void *>(OldObjects[I].profd + 48),
+                sizeof(OldCount));
+    EXPECT_EQ(OldHash, OldObjects[I].hash);
+    EXPECT_EQ(OldCount, OldObjects[I].count);
+  }
+  const auto NewBefore = ReadAll(NewObjects);
+  for (const auto &Counters : NewBefore)
+    EXPECT_EQ(Counters, std::vector<uint64_t>(Counters.size(), 0));
+  EXPECT_EQ(reinterpret_cast<EntryFn>(OldT1)(13), 85);
+  const auto OldAfter = ReadAll(OldObjects);
+  for (size_t I = 0; I < OldObjects.size(); ++I)
+    EXPECT_EQ(OldAfter[I][0] - ProfileCounts[I][0],
+              OldObjects[I].profileName == EntryName ? 1u : 2u);
+  EXPECT_EQ(ReadAll(NewObjects), NewBefore)
+      << "the retained old T1 must not write the new physical counter object";
+  EXPECT_EQ(reinterpret_cast<EntryFn>(NewT1)(17), 109);
+  EXPECT_EQ(ReadAll(OldObjects), OldAfter);
+  const auto NewAfter = ReadAll(NewObjects);
+  for (size_t I = 0; I < NewObjects.size(); ++I)
+    EXPECT_EQ(NewAfter[I][0],
+              NewObjects[I].profileName == EntryName ? 1u : 2u);
+  EXPECT_EQ(reinterpret_cast<EntryFn>(OldT2)(19), 121);
+  EXPECT_EQ(ReadAll(OldObjects), OldAfter);
+  EXPECT_EQ(ReadAll(NewObjects), NewAfter);
+  auto Latest = Engine->lookup(LogicalKey, EntryName);
+  ASSERT_TRUE(static_cast<bool>(Latest));
+  EXPECT_EQ(*Latest, NewT1);
+  std::printf("[FRESH-JD] logical_key=0x%016llx physical_objects=3 "
+              "counter_sets=%zu profile_calls=%u "
+              "old_t1=%p old_t2=%p new_t1=%p retained_until=engine_teardown\n",
+              static_cast<unsigned long long>(LogicalKey), OldObjects.size(),
+              SampleCalls, OldT1, OldT2, NewT1);
+  RecordProperty("fresh_physical_objects", 3);
+  RecordProperty("fresh_counter_sets", OldObjects.size());
+  RecordProperty("fresh_real_profile_calls", SampleCalls);
+  RecordProperty("fresh_retention_boundary", "engine_teardown_not_leave");
 }
 
 // PGO (§5): shared Tier-1 machine code runs on multiple cores concurrently, so

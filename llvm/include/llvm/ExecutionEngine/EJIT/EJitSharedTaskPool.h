@@ -41,12 +41,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <vector>
 
 namespace llvm {
 namespace ejit {
 
 class EJitModuleLoader;
+class EJit;
+class EJitCompileDriver;
+namespace detail {
+class OwnerWorkerContext;
+}
 
 //===----------------------------------------------------------------------===//
 // Read-only diagnostics snapshot (spec §11 observability). Every field is a
@@ -59,7 +66,8 @@ struct EJitSharedDiagnostics {
   uint32_t lastInitError; ///< error code recorded on Failed
   uint32_t initAttempts;  ///< total election attempts
   uint32_t codeSharingEnabled;
-  uint64_t workerTaskId;
+  uint64_t workerTaskId; ///< Legacy worker-start marker; not necessarily an SDK
+                         ///< task ID.
   uint64_t registrationFingerprint;
   uint32_t queueDepth;      ///< approximate in-ring requests
   uint32_t pendingCount;    ///< in-flight dedup slots
@@ -480,6 +488,39 @@ public:
   }
   EJitSharedTaskPoolState *state() const { return state_; }
 
+  /// Prepare the actual common object, not a generic cache slot's range.
+  /// The caller holds a real small-table execution ticket for its lifetime.
+  bool prepareExternalExecution(void *Entry, const EJitCompiledCodeInfo &Info);
+  enum class OwnerControlStatus : uint8_t {
+    Completed, CancelledBeforeStart, Rejected
+  };
+  struct OwnerControlResult {
+    OwnerControlStatus status = OwnerControlStatus::Rejected;
+    bool deadlineExceeded = false;
+  };
+  /// Queued work expires by CAS cancellation. Once Started, join its actual
+  /// completion and report deadlineExceeded; never abandon its live captures.
+  OwnerControlResult runControlOnOwnerAndWait(
+      std::function<void()> Work, uint32_t WaitRounds = 1u << 20);
+  /// Kept for source compatibility; no implicit/global identity is trusted.
+  bool isCurrentOwnerWorker() const;
+  using WorkerIdentityFn = bool (*)(void *);
+  /// Legacy compatibility hook. Identity callbacks are no longer used for
+  /// authorization; the worker capability is passed explicitly instead.
+  void setWorkerIdentityCallback(WorkerIdentityFn Fn, void *Ctx) {
+    (void)Fn;
+    (void)Ctx;
+  }
+  using FunctionOwnershipGateFn = bool (*)(void *, uint32_t);
+  /// true permits ordinary dispatch/compile; false denotes pending/owned.
+  void setFunctionOwnershipGateFn(FunctionOwnershipGateFn Fn, void *Ctx) {
+    functionOwnershipGateFn_ = Fn;
+    functionOwnershipGateCtx_ = Ctx;
+  }
+  /// Requires the external function gate and resolver barrier closed. Retires
+  /// logical slots only; never waits old call readers or frees their code/JDs.
+  bool abortFunctionPgoOnOwner(uint32_t FuncIndex);
+
   /// Callback type for forEachCompiled: receives the Ready cache slot itself
   /// (funcIndex/dims/numDims/fnPtr plus publish metadata such as versions,
   /// codeSize, poolId, generation) and the caller-provided context.
@@ -759,6 +800,26 @@ public:
     pgoAdmissionTestHook_ = fn;
     pgoAdmissionTestHookCtx_ = ctx;
   }
+  /// Test-only interleaving seams. The caller must bound any wait and must not
+  /// modify a hook while that facade is being used by another thread. Neither
+  /// seam exists in the product build; the publication hook intentionally runs
+  /// under its genuine bucket writer lock.
+  void setCacheMissTestHook(TestHookFn fn, void *ctx) {
+    cacheMissTestHook_ = fn;
+    cacheMissTestHookCtx_ = ctx;
+  }
+  void setCachePublishTestHook(TestHookFn fn, void *ctx) {
+    cachePublishTestHook_ = fn;
+    cachePublishTestHookCtx_ = ctx;
+  }
+  void setTier2EnqueueTestHook(TestHookFn Fn, void *Ctx) {
+    tier2EnqueueTestHook_ = Fn;
+    tier2EnqueueTestHookCtx_ = Ctx;
+  }
+  void setOwnerControlQueuedTestHook(TestHookFn Fn, void *Ctx) {
+    ownerControlQueuedTestHook_ = Fn;
+    ownerControlQueuedTestHookCtx_ = Ctx;
+  }
 #endif
 
   /// True when the shared PGO auto-trigger is armed.
@@ -848,9 +909,10 @@ public:
       return false;
     if (state_->ownerCoreId.loadAcquire() == kEJitInvalidCoreId)
       return false;
-    // Published only after a successful worker start, cleared by
-    // ownerShutdown: the one field separating "a worker is running" from "the
-    // blob merely looks Ready".
+    // The owner publishes the worker-start callback's nonzero marker only
+    // after that callback succeeds. Some platforms provide no numeric task ID
+    // and use a readiness sentinel instead. This is shared readiness evidence
+    // for peers, not caller identity; Bridge SDK task identity is separate.
     if (state_->workerTaskId.loadAcquire() == 0)
       return false;
     // Re-validate: an ownerShutdown concurrent with the reads above moves the
@@ -1119,9 +1181,8 @@ public:
   /// for the owner to complete the diagnostic and returns its success status.
   bool requestMayConstRanking();
 
-  /// The worker loop body: poll until the shared state leaves Ready. Public so
-  /// an injected task entry can forward to it; normally reached via
-  /// WorkerEntry.
+  /// Compatibility symbol only. It refuses to enter the worker loop because
+  /// no explicit worker-entry context can be inferred from the caller.
   void runWorkerLoop();
 
   /// One step of the worker state machine. Public so a deterministic test can
@@ -1144,7 +1205,33 @@ public:
   uint64_t workerIdleYields() const { return workerIdleYields_.loadRelaxed(); }
 
 private:
+  friend struct EJitSharedTaskPoolTestAccess;
+  friend class detail::OwnerWorkerContext;
+  friend class EJit;
+  friend class EJitCompileDriver;
+  OwnerControlResult runControlOnOwnerAndWait(
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  OwnerControlResult runControlOnOwnerAndWait(
+      const detail::OwnerWorkerContext &Worker,
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  bool isCurrentOwnerWorker(const detail::OwnerWorkerContext &Worker) const;
+  bool isWorkerContextActive(const detail::OwnerWorkerContext &Worker) const;
+  bool abortFunctionPgoOnOwner(const detail::OwnerWorkerContext &Worker,
+                               uint32_t FuncIndex);
   static void workerEntryThunk(void *ctx);
+  void runWorkerLoop(const detail::OwnerWorkerContext &Worker);
+  bool serviceOwnerControl(const detail::OwnerWorkerContext &Worker);
+  EJitWorkerStep workerPollOnceInternal(
+      const detail::OwnerWorkerContext *Worker);
+  bool matchesWorkerContext(const detail::OwnerWorkerContext &Worker) const;
+  uint64_t nextWorkerContextEpoch();
+  void cancelQueuedOwnerControl();
+  bool ordinaryFunctionAllowed(uint32_t FuncIndex) const {
+    return !functionOwnershipGateFn_ ||
+           functionOwnershipGateFn_(functionOwnershipGateCtx_, FuncIndex);
+  }
   /// Yield/delay the CPU (injected hook, or a reordering barrier). \p ticks=1
   /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task
   /// throttle delay. Bumps workerIdleYields_ either way.
@@ -1241,13 +1328,8 @@ private:
   /// by cacheLookup() and all fixed-dimension specializations.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
-  /// Submit Tier-2 from an identity/version-validated slot while its bucket
-  /// read lock is held. This preserves the exact slot snapshot without
-  /// enlarging the 16-byte CompileOrGetResult hot-path return value.
-  void
-  enqueueTier2FromSlot(const EJitSharedCacheSlot &slot,
-                       const EJitBoundPtrDescriptor *boundPointers = nullptr,
-                       uint32_t boundCount = 0);
+  /// Submit Tier-2 for the original caller identity, not a mutable slot which
+  /// may have been reused after a saturated lookup dropped its read token.
   void
   enqueueTier2ForIdentity(uint32_t funcIndex, const EJitDimPair *dims,
                           uint32_t numDims,
@@ -1266,8 +1348,7 @@ private:
   /// cache-hit counter is incremented exactly once and the semantics stay
   /// identical. Does NOT perform the Ready or instance-enabled checks (the
   /// callers do those first).
-  CompileOrGetResult classifyHit(const SharedLookup &Hit,
-                                 bool enqueueTier2 = true);
+  CompileOrGetResult classifyHit(const SharedLookup &Hit);
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info,
                                  bool pgoClearExclusive = false);
@@ -1281,6 +1362,15 @@ private:
   void cacheDropPending(const EJitCompileRequest &req, void *fnPtr);
   bool cacheHasPending(uint32_t funcIndex, const EJitDimPair *dims,
                        uint32_t numDims);
+  /// Admission-only, quota-neutral recheck while the caller owns dedup.
+  /// Contention is not evidence of absence and must not open a new session.
+  enum class CachePresence : uint8_t { Absent, Present, Contended };
+  CachePresence probeCacheForAdmission(uint32_t funcIndex,
+                                      const EJitDimPair *dims,
+                                      uint32_t numDims);
+  /// Quota-neutral exact recheck after claiming dedup: a delayed old sampling
+  /// arm cannot queue another T2 after actual T2 publication retired that claim.
+  bool currentSamplingRequestMayEnqueueTier2(const EJitCompileRequest &Request);
 
   /// Snapshot of one Ready cache slot taken under the bucket read lock, so the
   /// expensive per-core execute-permission preparation (split + enable_ex)
@@ -1397,6 +1487,14 @@ private:
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   TestHookFn pgoAdmissionTestHook_ = nullptr;
   void *pgoAdmissionTestHookCtx_ = nullptr;
+  TestHookFn cacheMissTestHook_ = nullptr;
+  void *cacheMissTestHookCtx_ = nullptr;
+  TestHookFn cachePublishTestHook_ = nullptr;
+  void *cachePublishTestHookCtx_ = nullptr;
+  TestHookFn tier2EnqueueTestHook_ = nullptr;
+  void *tier2EnqueueTestHookCtx_ = nullptr;
+  TestHookFn ownerControlQueuedTestHook_ = nullptr;
+  void *ownerControlQueuedTestHookCtx_ = nullptr;
 #endif
   OwnerElectedFn ownerElected_ = nullptr;
   void *ownerElectedCtx_ = nullptr;
@@ -1406,6 +1504,22 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
+  struct OwnerControlJob {
+    enum : uint32_t { Queued, Started, Done, Cancelled };
+    std::atomic<uint32_t> state{Queued};
+    std::function<void(const detail::OwnerWorkerContext &)> work;
+    explicit OwnerControlJob(
+        std::function<void(const detail::OwnerWorkerContext &)> Work)
+        : work(std::move(Work)) {}
+  };
+  EJitAtomicU32 ownerControlLock_{0};
+  std::shared_ptr<OwnerControlJob> ownerControl_;
+  std::atomic<bool> workerLoopActive_{false};
+  std::atomic<uint64_t> activeWorkerContextEpoch_{0};
+  FunctionOwnershipGateFn functionOwnershipGateFn_ = nullptr;
+  void *functionOwnershipGateCtx_ = nullptr;
+  std::vector<EJitCompileRequest> deferredControlRequests_;
+  std::vector<void *> retainedAbortedCode_;
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   IcacheFillMidpointHook icacheFillMidpointHook_ = nullptr;
   void *icacheFillMidpointCtx_ = nullptr;

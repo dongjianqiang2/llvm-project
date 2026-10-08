@@ -55,7 +55,12 @@ class LipoBoundPtrRootTest(unittest.TestCase):
                 ld="fake-ld")
             with mock.patch.object(LIPO.sp, "run", side_effect=fake_run), \
                  mock.patch.object(LIPO, "_try_strip_arm_mapping_symbols"), \
-                 mock.patch.object(LIPO, "_try_remove_group"):
+                 mock.patch.object(LIPO, "_try_remove_group"), \
+                 mock.patch.object(LIPO, "_readelf_sections",
+                                   return_value={".symtab", ".strtab"}), \
+                 mock.patch.object(LIPO, "_readelf_is_relocatable"), \
+                 mock.patch.object(LIPO, "_check_required_sections"), \
+                 mock.patch.object(LIPO, "_check_root_definitions"):
                 LIPO.doit_gc_merge(args)
 
             self.assertEqual(len(ld_commands), 1)

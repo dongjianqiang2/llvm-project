@@ -14,6 +14,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
@@ -24,6 +25,7 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
 #include "llvm/IR/Module.h"
+#include <memory>
 
 namespace llvm {
 namespace ejit {
@@ -65,12 +67,51 @@ public:
   /// to avoid dangling pointers to IR units from previous modules.
   void clearAnalyses();
 
+  /// Install the small-table plan set the optimizer consults (PR231 §6.5/§6.6).
+  /// Default is an empty set: the small-table pass is then never constructed
+  /// and every compile takes the unmodified baseline pipeline. The optimizer
+  /// keeps the shared_ptr alive for the lifetime of the plan lookup; plans are
+  /// immutable value snapshots. Production wiring of this seam (plan
+  /// construction from a confirmed-ready member set, admission validation and
+  /// row publication) is a later milestone; the host tests drive it directly.
+  void setSmallTablePlans(std::shared_ptr<const EJitSmallTablePlanSet> Plans) {
+    smallTablePlans_ = std::move(Plans);
+  }
+  const EJitSmallTablePlanSet *getSmallTablePlans() const {
+    return smallTablePlans_.get();
+  }
+
   /// PGO counter global names captured during the last Instrumented (Tier-1)
-  /// compile (PGOFuncName suffix of each __profc_<name>). Empty for
+  /// compile (the actual symbol suffix of each __profc_<name>). Empty for
   /// Baseline/PGOUse. The compile driver looks up __profc_/__profd_ by these
-  /// names to capture counter addresses for Tier-2 profile synthesis.
+  /// names to capture counter addresses for Tier-2 profile synthesis. A symbol
+  /// suffix is not necessarily the canonical PGO function name: LLVM legalizes
+  /// characters in internal-function counter symbols.
   ArrayRef<std::string> getLastCounterNames() const {
     return lastCounterNames_;
+  }
+
+  /// Canonical IR-PGO name belonging to an emitted counter symbol suffix from
+  /// the last Instrumented compile. Captured from the real instrumentation's
+  /// name string and matched to the lowered __profd_ NameRef, never guessed by
+  /// reversing symbol legalization. Empty for a missing or ambiguous mapping;
+  /// consumers must fail closed and verify the actual data NameRef. The result
+  /// remains valid only until the next runPipeline.
+  StringRef getCounterProfileName(StringRef SymbolSuffix) const {
+    auto It = lastCounterProfileNames_.find(SymbolSuffix);
+    return It == lastCounterProfileNames_.end() ? StringRef()
+                                              : StringRef(It->second);
+  }
+
+  /// Names of the small-table column globals materialized by the last compile
+  /// (PR231 §6.5). The globals are created inside the IR transform, after
+  /// addIRModule, so the materialization responsibility computed from the
+  /// original module does not include them; the engine claims these names as
+  /// exported exactly like the PGO counters, which is what lets the runtime
+  /// resolve each table's stable address and publish later rows into it.
+  /// Empty when no plan is installed (feature OFF) or for a uniform-only plan.
+  ArrayRef<std::string> getLastSmallTableColumnNames() const {
+    return lastSmallTableColumns_;
   }
 
   /// Value-profile capture of the last Instrumented (Tier-1) compile: every
@@ -116,6 +157,24 @@ private:
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
+  /// The existing may_const replacement without re-entering the small-table
+  /// pass. The context overload runs the small-table pass first; the no-context
+  /// overload (phase 4, after `runSmallTablePass(M, EntryName)`) must not run it
+  /// again, or it would clear the recorded column names with an empty entry.
+  /// \p BlockLegacyFoldEntry, when non-empty, names the entry whose legacy
+  /// compile-time may_const fold must be blocked because a small-table plan was
+  /// lowered for it in this round (PR231 whole-entry readiness contract).
+  void runStructFieldPassImpl(Module &M, const SpecializationContext &ctx,
+                              StringRef BlockLegacyFoldEntry = {});
+
+  /// Run the small-table pass for \p EntryName, if a plan is installed for it.
+  /// Called immediately before the existing struct-field pass in every replace
+  /// round, so all three rounds see the table form and no round can regress it.
+  /// Returns true when a plan was materialized (lowered) for this entry; the
+  /// caller then blocks the legacy compile-time fold for that entry, so the
+  /// compiled code depends only on the plan's recorded contract and on real
+  /// dynamic reads.
+  bool runSmallTablePass(Module &M, StringRef EntryName);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call
@@ -133,10 +192,15 @@ private:
   /// and Tier-2 keeps the CFG (and thus the PGO hash) aligned.
   void runLightOptPipeline(Module &M);
 
+  /// Capture the canonical names from real PGO Gen intrinsics before lowering
+  /// erases their name variables. A colliding NameRef has no usable mapping.
+  void captureCounterProfileNames(Module &M);
+
   /// After PGOInstrumentationGen + InstrProfilingLoweringPass, force the
   /// __profc_*/__profd_* counter globals to ExternalLinkage (default
   /// InternalLinkage is invisible to ORC J->lookup, P0-3) and record each
-  /// PGOFuncName (suffix of __profc_<name>) in lastCounterNames_.
+  /// actual symbol suffix in lastCounterNames_, separately from its canonical
+  /// profile name matched through the actual __profd_ initializer's NameRef.
   void captureCounterGlobals(Module &M);
 
   /// Run the EJIT optimization pipeline: a single fused sequence that exploits
@@ -147,6 +211,8 @@ private:
   /// ABI compatibility and does not affect the pipeline.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
                                CompileTier tier);
+  void runOptimizationPipeline(Module &M, OptimizationLevel level,
+                               CompileTier tier, StringRef EntryName);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,
@@ -160,6 +226,14 @@ private:
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
+
+  /// Small-table plans (PR231). Empty by default: the feature is OFF and no
+  /// pass is constructed, so the baseline pipeline is unchanged.
+  std::shared_ptr<const EJitSmallTablePlanSet> smallTablePlans_;
+
+  /// Column globals created by the last small-table materialization (PR231);
+  /// the engine claims them in the materialization responsibility.
+  SmallVector<std::string, 8> lastSmallTableColumns_;
 
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.
@@ -184,9 +258,13 @@ private:
   // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
   FunctionPassManager pgoUseFPM_;
 
-  // PGO: PGOFuncNames captured by the last Tier-1 compile (see
+  // PGO: actual counter symbol suffixes captured by the last Tier-1 compile (see
   // captureCounterGlobals). Cleared at the start of each runPipeline.
   SmallVector<std::string, 4> lastCounterNames_;
+  StringMap<std::string> lastCounterProfileNames_;
+  // Canonical Gen-stage names, keyed by the NameRef emitted into __profd_. An
+  // empty value denotes a hash collision or inconsistent instrumentation.
+  DenseMap<uint64_t, std::string> counterProfileNamesByRef_;
   // Value profile (EJIT_VALUE_PROFILE.md §5.1): function table captured by the
   // last Tier-1 compile. Cleared at the start of each runPipeline. The scalar
   // instrumentation pass records per-function site counts into

@@ -9,6 +9,8 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITRUNTIME_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITRUNTIME_H
 
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTableSreBridge.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -298,6 +300,100 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);
+
+//===----------------------------------------------------------------------===//
+// PR231 small-table normal path: the wrapper enter/leave hooks.
+//
+// The AOT wrapper emits the new early wrapper entry below, before resolving, so an
+// admitted execution is accounted, and the sampling session's protected read
+// stays held, for the ACTUAL call rather than only for the pointer lookup:
+//
+//   entry = ejit_stab_enter(funcIndex, dims, numDims, &ticket, &why);
+//   if (entry)          { result = entry(args...); ejit_stab_leave(ticket); }
+//   else if (why)       { ...original AOT body... }   // policy applies, refused
+//   else                { ...unchanged dispatch... }  // no policy for this entry
+//
+// During sampling an admitted/table-ready member executes the common T1 under
+// a real nonzero ticket. Once its aggregate quota is spent, it takes AOT until
+// common T2 is published: no uncounted T1 instrumentation is executed. Published
+// T2 also holds a real physical ticket, but does not add a sampling count.
+//
+// The THREE answers above are the ABI the wrapper's three dispatch paths depend
+// on. Only a function index a host is actually bound to is under small-table
+// policy; for every other entry the hook answers "no policy" (NULL entry and
+// `*outWhy == NULL`) and the wrapper must keep its ordinary dispatch, because
+// one host bound to one entry must not disable JIT specialization for the rest
+// of the image. `*outWhy != NULL` always means the policy applies and refused.
+// The reason text is a fixed literal (never allocated) and is diagnostic only.
+//
+// With no small-table host installed (the feature OFF) the hook answers "no
+// policy", so a wrapper built with the hooks always keeps its previous behavior
+// when the product has not activated a small table.
+//
+// `ejit_stab_dispatch` is the same policy applied to a call by MEMBER
+// COORDINATE: the caller gets the specialized entry only after the gate admits
+// the coordinate, and the real call is made by the caller and closed with
+// `ejit_stab_leave`. `ejit_small_table_host_installed` reports whether any of
+// this is active.
+//===----------------------------------------------------------------------===//
+
+/// Outcome of a small-table dispatch request. Mirrors
+/// `EJitSmallTableDispatch`; kept as plain integers so the C ABI does not
+/// depend on the C++ enum's layout.
+#define EJIT_STAB_DISPATCHED 0
+#define EJIT_STAB_NOT_BOUND 1
+#define EJIT_STAB_AOT 2
+#define EJIT_STAB_COORDINATE_UNPROVABLE 3
+#define EJIT_STAB_NO_ENTRY 4
+
+/// Wrapper enter hook. Returns the callable specialized entry when this
+/// execution may run specialized code, else NULL. \p outTicket receives the
+/// execution's nonzero physical ticket for `ejit_stab_leave`. \p outWhy
+/// receives NULL when no small-table policy owns \p funcIndex (the caller keeps
+/// its unchanged dispatch), or a fixed diagnostic literal when the policy
+/// applies and refused (the caller takes the AOT body). The literal is never
+/// allocated and must not be retained, freed or modified.
+void *ejit_stab_enter(uint32_t funcIndex, const ejit_dim_pair_t *dims,
+                      uint32_t numDims, uint64_t *outTicket,
+                      const char **outWhy);
+
+/// Early wrapper-only tri-state decision, BEFORE ordinary resolution (including
+/// inline-cache probes). Same three answers as enter; a non-null entry always
+/// has a nonzero execution ticket. Owned refusals never start ordinary PGO.
+/// Validates descriptors and the live runtime/lifecycle, then prepares the
+/// actual common code and writable counters on the calling core. The old enter
+/// ABI remains available to existing callers.
+void *ejit_stab_wrapper_enter(uint32_t funcIndex,
+                              const ejit_dim_pair_t *dims, uint32_t numDims,
+                              const ejit_bound_ptr_t *boundPointers,
+                              uint32_t boundCount, uint64_t *outTicket,
+                              const char **outWhy, uint64_t *outPolicyEpoch);
+
+/// Revalidate an early no-policy answer before ordinary lookup/dispatch. A
+/// changed policy/runtime takes AOT, never redirects a generic PGO call into
+/// the common object after starting its ordinary session.
+bool ejit_stab_wrapper_no_policy_current(uint64_t policyEpoch);
+
+/// Wrapper leave hook. Idempotent for ticket 0; a ticket whose session is no
+/// longer current is a stale sampling callback: it is counted but never merged
+/// into another generation. Its own physical lease is still released at this
+/// real leave; logical cancel never substitutes for return. Duplicate leaves
+/// cannot release a new generation's lease.
+void ejit_stab_leave(uint64_t ticket);
+
+/// Coordinate form: ask for the specialized entry of \p coordinate (one index
+/// per declared dimension, outermost first). Writes EJIT_STAB_* to \p outStatus,
+/// the entry to \p outEntry and the ticket to \p outTicket. The caller makes
+/// the real call and then calls `ejit_stab_leave`.
+void ejit_stab_dispatch(uint32_t funcIndex, const uint32_t *coordinate,
+                        uint32_t numDims, void **outEntry, uint64_t *outTicket,
+                        int *outStatus);
+
+/// True while a small-table normal-path host is installed process-wide.
+bool ejit_small_table_host_installed(void);
+
+/// Number of logical slots the installed host currently publishes.
+uint64_t ejit_small_table_published_slots(void);
 
 unsigned ejit_taskpool_pending_count(void);
 

@@ -25,16 +25,19 @@ SECTIONS
     *(.rodata .rodata.* .gnu.linkonce.r.*)
     . = ALIGN(8);
     __start_ejit_bitcode = .;
-    KEEP(*(.ejit_bitcode))
+    KEEP(*(.ejit_bitcode .ejit_bitcode.*))
     __stop_ejit_bitcode = .;
 
     /* --- EmbeddedJIT period registry --- */
     . = ALIGN(8);
     __start_ejit_period = .;
-    KEEP(*(.ejit_period))
+    KEEP(*(.ejit_period .ejit_period.*))
     __stop_ejit_period = .;
   }
   .data           : { *(.data .data.* .gnu.linkonce.d.*) }
+  /* Keep cross-core SRE data in a named section instead of folding it into
+   * .data; board link scripts and diagnostics rely on this boundary. */
+  .mc_shared      : { KEEP(*(.mc_shared .mc_shared.*)) }
   .bss            : { *(.bss .bss.* .gnu.linkonce.b.*) }
 
   /* ── init / fini ──────────────────────────────────────────────────── */
@@ -74,11 +77,20 @@ SECTIONS
 
   /* ── relocations (keep ― needed by partial link) ──────────────────── */
   .rela.text      : { *(.rela.text .rela.text.*) }
-  .rela.rodata    : { *(.rela.rodata .rela.rodata.*) }
+  .rela.rodata    : {
+    *(.rela.rodata .rela.rodata.*)
+    *(.rela.ejit_bitcode .rela.ejit_bitcode.*)
+    *(.rela.ejit_period .rela.ejit_period.*)
+  }
   .rela.data      : { *(.rela.data .rela.data.*) }
+  .rela.mc_shared : { *(.rela.mc_shared .rela.mc_shared.*) }
   .rela.data.rel.ro : { *(.rela.data.rel.ro .rela.data.rel.ro.*) }
   .rela.eh_frame  : { *(.rela.eh_frame .rela.eh_frame.*) }
   .rela.init_array : { *(.rela.init_array .rela.init_array.*) }
   .rela.plt       : { *(.rela.plt) }
 
 }
+
+/* ld emits .symtab/.strtab for this relocatable object; lipo.py verifies that
+ * they remain present after both partial-link stages. They are not discarded
+ * by this script. */

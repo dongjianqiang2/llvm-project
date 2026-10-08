@@ -17,6 +17,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "EJitOwnerWorkerContext.h"
+#include "EJitSmallTableSreBridgeInternal.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
@@ -65,6 +67,11 @@ using namespace llvm::ejit;
 #endif
 
 namespace {
+// Monotonic freshness discriminator only: it is never consulted to infer the
+// current caller. This prevents an old context from matching a new Pool object
+// after address reuse, even when the shared generation restarts at the same
+// value.
+std::atomic<uint64_t> NextWorkerContextEpoch{0};
 
 // Compiler reordering barrier used as a portable idle relax (no platform
 // symbol, no arch-specific instruction in this layer).
@@ -1580,7 +1587,8 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
 void EJitSharedTaskPool::enqueueTier2ForIdentity(
     uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
     const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
-  if (state_->mode.loadAcquire() !=
+  if (!state_ || state_->initState.loadAcquire() != kReady ||
+      !ordinaryFunctionAllowed(funcIndex) || state_->mode.loadAcquire() !=
       static_cast<uint32_t>(EJitCompileMode::Async))
     return;
 
@@ -1596,8 +1604,19 @@ void EJitSharedTaskPool::enqueueTier2ForIdentity(
   for (uint32_t i = 0; i < boundCount; ++i)
     T2.boundPointers[i] = boundPointers[i];
 
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (tier2EnqueueTestHook_)
+    tier2EnqueueTestHook_(tier2EnqueueTestHookCtx_);
+#endif
   if (dedupMark(T2.funcIndex, T2.generation) != EJitDedupResult::Claimed)
     return;
+  // The arm was produced before claiming dedup and may now be stale. The old
+  // worker retires its claim only after real publication; recheck the original
+  // caller identity without counting another sample or acquiring a writer.
+  if (!currentSamplingRequestMayEnqueueTier2(T2)) {
+    dedupClear(T2.funcIndex, T2.generation);
+    return; // current T2 / changed policy / contention: no extra compilation
+  }
   if (queuePush(T2)) {
     EJIT_STAT_INC(state_->counters.asyncEnqueues);
     EJIT_DIAG_VERBOSE("shared taskpool PGO Tier-2 enqueued func=%u gen=%u",
@@ -1608,13 +1627,6 @@ void EJitSharedTaskPool::enqueueTier2ForIdentity(
   dedupClear(T2.funcIndex, T2.generation);
   EJIT_STAT_INC(state_->counters.queueFull);
   EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full", funcIndex);
-}
-
-void EJitSharedTaskPool::enqueueTier2FromSlot(
-    const EJitSharedCacheSlot &Slot,
-    const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
-  enqueueTier2ForIdentity(Slot.funcIndex, Slot.dims, Slot.numDims,
-                          boundPointers, boundCount);
 }
 
 bool EJitSharedTaskPool::admitPgoFunction(uint32_t funcIndex,
@@ -2107,6 +2119,38 @@ bool EJitSharedTaskPool::ensurePoolSplitForCurrentCore(uint32_t self,
   return false;
 }
 
+bool EJitSharedTaskPool::prepareExternalExecution(
+    void *Entry, const EJitCompiledCodeInfo &Info) {
+  if (!state_ || !Entry || Info.fnPtr != Entry ||
+      state_->initState.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+      Info.writableCount > kEJitSharedMaxWritableRanges)
+    return false;
+  const uint32_t Generation = state_->generation.loadAcquire();
+  const uint32_t Owner = state_->ownerCoreId.loadAcquire();
+  const uint32_t Self = EJitCoreId::current();
+  if (Self != Owner && !codeSharingEnabled_)
+    return false;
+  PeerCodeRange R;
+  R.fn = Entry;
+  R.codeStart = Info.codeStart;
+  R.codeSize = Info.codeSize;
+  R.poolBase = Info.poolBase;
+  R.poolSize = Info.poolSize;
+  R.writableCount = Info.writableCount;
+  R.requiresPeerEnableRw = Info.requiresPeerEnableRw;
+  for (uint32_t I = 0; I < R.writableCount; ++I) {
+    R.writables[I].addr = Info.writableRanges[I].addr;
+    R.writables[I].size = Info.writableRanges[I].size;
+  }
+  if (!prepareExecForCurrentCore(R, Self))
+    return false;
+  return state_->initState.loadAcquire() ==
+             static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+         state_->generation.loadAcquire() == Generation &&
+         state_->ownerCoreId.loadAcquire() == Owner;
+}
+
 bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
                                                    uint32_t self) {
   EJIT_DIAG_VERBOSE("prepareExec: core=%u fn=%p codeStart=0x%llx codeSize=%llu "
@@ -2291,6 +2335,114 @@ bool EJitSharedTaskPool::cacheHasPending(uint32_t funcIndex,
   return false;
 }
 
+EJitSharedTaskPool::CachePresence
+EJitSharedTaskPool::probeCacheForAdmission(uint32_t funcIndex,
+                                          const EJitDimPair *dims,
+                                          uint32_t numDims) {
+  const uint64_t Key = hashIdentity(funcIndex, dims, numDims);
+  EJitSharedCacheBucket &B =
+      state_->buckets[static_cast<uint32_t>(Key % kEJitSharedCacheBuckets)];
+  for (unsigned Attempt = 0; Attempt != 4; ++Attempt) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    uint32_t Sequence;
+    if (!bucketSeqBegin(B, Sequence)) {
+      cpuRelax();
+      continue;
+    }
+#endif
+    if (!bucketTryRead(B)) {
+      cpuRelax();
+      continue;
+    }
+    const uint32_t Generation = state_->generation.loadAcquire();
+    bool Found = false;
+    for (uint32_t S = 0; S < kEJitSharedCacheSlots; ++S) {
+      EJitSharedCacheSlot &Slot = B.slots[S];
+      const uint32_t State = Slot.state.loadAcquire();
+      if (Slot.identityHash != Key || Slot.generation != Generation ||
+          (State != static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+           State != static_cast<uint32_t>(EJitSharedSlotState::Pending)) ||
+          !slotIdentityMatches(Slot, funcIndex, dims, numDims))
+        continue;
+      Found = true;
+      for (uint32_t I = 0; I < numDims; ++I)
+        if (Slot.versions[I] !=
+            instanceVersion(dims[I].dimType, dims[I].instanceId)) {
+          Found = false;
+          break;
+        }
+      break;
+    }
+    bucketReadRelease(B);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    if (!bucketSeqStable(B, Sequence)) {
+      cpuRelax();
+      continue;
+    }
+#endif
+    return Found ? CachePresence::Present : CachePresence::Absent;
+  }
+  return CachePresence::Contended;
+}
+
+bool EJitSharedTaskPool::currentSamplingRequestMayEnqueueTier2(
+    const EJitCompileRequest &Request) {
+  const uint32_t Func = stripReqTier(Request.funcIndex);
+  const uint64_t Key = hashIdentity(Func, Request.dims, Request.numDims);
+  auto &Bucket =
+      state_->buckets[static_cast<uint32_t>(Key % kEJitSharedCacheBuckets)];
+  for (unsigned Attempt = 0; Attempt != 4; ++Attempt) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    uint32_t Sequence;
+    if (!bucketSeqBegin(Bucket, Sequence)) {
+      cpuRelax();
+      continue;
+    }
+#endif
+    if (!bucketTryRead(Bucket)) {
+      cpuRelax();
+      continue;
+    }
+    bool Eligible = false;
+    uint64_t Samples = 0;
+    for (auto &Slot : Bucket.slots) {
+      if (Slot.identityHash != Key || Slot.generation != Request.generation ||
+          Slot.state.loadAcquire() !=
+              static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+          !slotIdentityMatches(Slot, Func, Request.dims, Request.numDims))
+        continue;
+      Eligible = true;
+      for (unsigned I = 0; I != Request.numDims; ++I)
+        if (Slot.versions[I] != Request.versions[I]) {
+          Eligible = false;
+          break;
+        }
+      // Baseline code published before enabling PGO is intentionally eligible;
+      // a real current PgoUse object is not, even if an old T1 arm survived.
+      Eligible &= Slot.tier.loadRelaxed() < kEJitTierPgoUse;
+      Samples = Slot.hitCount.loadRelaxed();
+      break;
+    }
+    bucketReadRelease(Bucket);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    // Validate both positive and negative observations, not only returned code.
+    if (!bucketSeqStable(Bucket, Sequence)) {
+      cpuRelax();
+      continue;
+    }
+#endif
+    const uint32_t Threshold = state_->tier2Threshold.loadAcquire();
+    return Eligible && Threshold && Samples >= Threshold &&
+           state_->initState.loadAcquire() == kReady &&
+           Request.generation == state_->generation.loadAcquire() &&
+           versionsCurrent(Request) && ordinaryFunctionAllowed(Func) &&
+           state_->pgoEnabled.loadAcquire() != 0 &&
+           state_->mode.loadAcquire() ==
+               static_cast<uint32_t>(EJitCompileMode::Async);
+  }
+  return false; // not proof of eligible T1; later saturated calls retry safely
+}
+
 EJitPublishStatus
 EJitSharedTaskPool::cacheStageBatchRequest(const EJitCompileRequest &req) {
   if (!state_ || req.numDims > 4)
@@ -2424,7 +2576,9 @@ EJitSharedTaskPool::cacheStagePending(const EJitCompileRequest &req,
   state_->dispatchEpoch.fetchAdd(1);
   bucketWriteRelease(B);
 
-  if (releaseFn_ && OldFn && OldFn != fnPtr)
+  if (releaseFn_ && OldFn && OldFn != fnPtr &&
+      std::find(retainedAbortedCode_.begin(), retainedAbortedCode_.end(),
+                OldFn) == retainedAbortedCode_.end())
     releaseFn_(releaseCtx_, OldFn);
   return EJitPublishStatus::Published;
 }
@@ -2482,7 +2636,52 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
   EJitSharedCacheBucket &B = state_->buckets[bucket];
 
-  bucketWrite(B, pgoClearExclusive);
+  // An old real call may synchronously request ownership while this worker is
+  // waiting for that call's bucket reader. The control job closes the function
+  // gate first, so publication must relinquish its writer rather than deadlock
+  // the owner worker. Unowned publication keeps the original reader drain.
+  auto AcquirePublicationWriter = [&]() {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    if (pgoClearExclusive) {
+      while (B.writeFlag.exchange(1) != 0) {
+        if (!ordinaryFunctionAllowed(fidx))
+          return false;
+        cpuRelax();
+      }
+    } else
+#endif
+    {
+      uint32_t Expected = 0;
+      while (!B.writeFlag.compareExchange(Expected, 1)) {
+        if (!ordinaryFunctionAllowed(fidx))
+          return false;
+        Expected = 0;
+        cpuRelax();
+      }
+    }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    B.publishSeq.fetchAdd(1);
+    if (!pgoClearExclusive)
+#endif
+    while (B.readers.loadAcquire() != 0) {
+      if (!ordinaryFunctionAllowed(fidx)) {
+        bucketWriteRelease(B);
+        return false;
+      }
+      cpuRelax();
+    }
+    return true;
+  };
+  if (!AcquirePublicationWriter())
+    return EJitPublishStatus::VersionMismatch;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (cachePublishTestHook_)
+    cachePublishTestHook_(cachePublishTestHookCtx_);
+#endif
+  if (!ordinaryFunctionAllowed(fidx)) {
+    bucketWriteRelease(B);
+    return EJitPublishStatus::VersionMismatch;
+  }
 
   // Commit gate (§5.3/§5.4): re-verify the version snapshot under the lock.
   for (uint32_t i = 0; i < req.numDims; ++i)
@@ -2600,7 +2799,9 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   // different identity when the bucket was full. Readers already drained to 0
   // under the write lock and the slot now points at the new code, so the old
   // pointer is unreachable and safe to free.
-  if (releaseFn_ && oldFn && oldFn != fnPtr)
+  if (releaseFn_ && oldFn && oldFn != fnPtr &&
+      std::find(retainedAbortedCode_.begin(), retainedAbortedCode_.end(),
+                oldFn) == retainedAbortedCode_.end())
     releaseFn_(releaseCtx_, oldFn);
   return EJitPublishStatus::Published;
 }
@@ -2862,6 +3063,7 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // Owner-private batch state must never cross a generation boundary.
       pendingBatchCompiles_.clear();
       pendingPublishes_.clear();
+      deferredControlRequests_.clear();
       autoTier2PublishPending_ = false;
       initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
                         pgoEnabled_.loadRelaxed(),
@@ -2994,6 +3196,7 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
 }
 
 void EJitSharedTaskPool::ownerShutdown() {
+  cancelQueuedOwnerControl();
   // Disarm this core's L0: its entries hold code pointers about to become
   // invalid. Peers stay armed but cannot match after the epoch bump below.
   gEJitL0State = nullptr;
@@ -3021,6 +3224,7 @@ void EJitSharedTaskPool::ownerShutdown() {
       releaseFn_(releaseCtx_, P.fn);
   pendingBatchCompiles_.clear();
   pendingPublishes_.clear();
+  deferredControlRequests_.clear();
   autoTier2PublishPending_ = false;
   // Release what the election built, between the join and Uninitialized: no
   // compile can be in flight, and no peer can be elected yet. Without this the
@@ -3028,6 +3232,10 @@ void EJitSharedTaskPool::ownerShutdown() {
   // system accumulates one per handoff.
   if (ownerReleased_)
     ownerReleased_(ownerReleasedCtx_);
+  // These are retained pointer identities, not an owning allocator. The Engine
+  // teardown above ends that retention epoch; do not mistake a reused address
+  // in a new generation for an old retained physical object.
+  retainedAbortedCode_.clear();
   state_->ownerCoreId.storeRelease(kEJitInvalidCoreId);
   state_->workerTaskId.storeRelease(0);
   state_->generation.storeRelease(state_->generation.loadRelaxed() + 1);
@@ -3041,10 +3249,8 @@ void EJitSharedTaskPool::ownerShutdown() {
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::classifyHit(const SharedLookup &Hit, bool enqueueTier2) {
+EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   CompileOrGetResult R;
-  if (enqueueTier2 && Hit.tier2Arm && Hit.slot)
-    enqueueTier2FromSlot(*Hit.slot);
   if (Hit.hasReadToken && Hit.fnPtr) {
     if (Hit.slot)
       markPostPublishSeen(*Hit.slot);
@@ -3098,6 +3304,11 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
     uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
     const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount) {
   CompileOrGetResult R;
+  if (!ordinaryFunctionAllowed(funcIndex)) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
   // Parameter check already done by the C API layer.
 
   // Ready check (§5.2 step 0): a not-yet-Ready pool is a clean fallback and
@@ -3129,14 +3340,10 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
   SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
 #endif
   if (Hit.tier2Arm && Hit.slot) {
-    if (boundCount)
-      enqueueTier2ForIdentity(funcIndex, dims, numDims, boundPointers,
-                              boundCount);
-    else
-      enqueueTier2FromSlot(*Hit.slot);
+    enqueueTier2ForIdentity(funcIndex, dims, numDims, boundPointers, boundCount);
     Hit.tier2Arm = false;
   }
-  return classifyHit(Hit, /*enqueueTier2=*/false);
+  return classifyHit(Hit);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3150,22 +3357,35 @@ EJitSharedTaskPool::CompileOrGetResult EJitSharedTaskPool::tryCacheHit(
 EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::tryCacheHit0D(uint32_t funcIndex) {
   CompileOrGetResult R;
+  if (!ordinaryFunctionAllowed(funcIndex)) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
   if (!state_ || state_->initState.loadAcquire() != kReady) {
     R.status = EJitCompileOrGetStatus::OffMode;
     R.fastPathTerminal = true;
     return R;
   }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  return classifyHit(cacheLookupSeq0D(funcIndex));
+  SharedLookup Hit = cacheLookupSeq0D(funcIndex);
 #else
-  return classifyHit(cacheLookup0D(funcIndex));
+  SharedLookup Hit = cacheLookup0D(funcIndex);
 #endif
+  if (Hit.tier2Arm && Hit.slot)
+    enqueueTier2ForIdentity(funcIndex, nullptr, 0);
+  return classifyHit(Hit);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t inst0) {
   CompileOrGetResult R;
+  if (!ordinaryFunctionAllowed(funcIndex)) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
   if (!state_ || state_->initState.loadAcquire() != kReady) {
     R.status = EJitCompileOrGetStatus::OffMode;
     R.fastPathTerminal = true;
@@ -3178,10 +3398,15 @@ EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
     return R;
   }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  return classifyHit(cacheLookupSeq1D(funcIndex, dim0, inst0));
+  SharedLookup Hit = cacheLookupSeq1D(funcIndex, dim0, inst0);
 #else
-  return classifyHit(cacheLookup1D(funcIndex, dim0, inst0));
+  SharedLookup Hit = cacheLookup1D(funcIndex, dim0, inst0);
 #endif
+  if (Hit.tier2Arm && Hit.slot) {
+    const EJitDimPair Dims[] = {{dim0, inst0}};
+    enqueueTier2ForIdentity(funcIndex, Dims, 1);
+  }
+  return classifyHit(Hit);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
@@ -3189,6 +3414,11 @@ EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t inst0, uint32_t dim1,
                                   uint32_t inst1) {
   CompileOrGetResult R;
+  if (!ordinaryFunctionAllowed(funcIndex)) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
   if (!state_ || state_->initState.loadAcquire() != kReady) {
     R.status = EJitCompileOrGetStatus::OffMode;
     R.fastPathTerminal = true;
@@ -3201,10 +3431,15 @@ EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
     return R;
   }
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  return classifyHit(cacheLookupSeq2D(funcIndex, dim0, inst0, dim1, inst1));
+  SharedLookup Hit = cacheLookupSeq2D(funcIndex, dim0, inst0, dim1, inst1);
 #else
-  return classifyHit(cacheLookup2D(funcIndex, dim0, inst0, dim1, inst1));
+  SharedLookup Hit = cacheLookup2D(funcIndex, dim0, inst0, dim1, inst1);
 #endif
+  if (Hit.tier2Arm && Hit.slot) {
+    const EJitDimPair Dims[] = {{dim0, inst0}, {dim1, inst1}};
+    enqueueTier2ForIdentity(funcIndex, Dims, 2);
+  }
+  return classifyHit(Hit);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
@@ -3212,6 +3447,11 @@ EJitSharedTaskPool::tryCacheHit3D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t inst0, uint32_t dim1, uint32_t inst1,
                                   uint32_t dim2, uint32_t inst2) {
   CompileOrGetResult R;
+  if (!ordinaryFunctionAllowed(funcIndex)) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
   if (!state_ || state_->initState.loadAcquire() != kReady) {
     R.status = EJitCompileOrGetStatus::OffMode;
     R.fastPathTerminal = true;
@@ -3224,13 +3464,16 @@ EJitSharedTaskPool::tryCacheHit3D(uint32_t funcIndex, uint32_t dim0,
     R.fastPathTerminal = true;
     return R;
   }
-#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   const EJitDimPair d3[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
-  return classifyHit(cacheLookupSeq(funcIndex, d3, 3));
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  SharedLookup Hit = cacheLookupSeq(funcIndex, d3, 3);
 #else
-  return classifyHit(
-      cacheLookup3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2));
+  SharedLookup Hit =
+      cacheLookup3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2);
 #endif
+  if (Hit.tier2Arm && Hit.slot)
+    enqueueTier2ForIdentity(funcIndex, d3, 3);
+  return classifyHit(Hit);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
@@ -3239,6 +3482,11 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
                                   uint32_t dim2, uint32_t inst2, uint32_t dim3,
                                   uint32_t inst3) {
   CompileOrGetResult R;
+  if (!ordinaryFunctionAllowed(funcIndex)) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
   if (!state_ || state_->initState.loadAcquire() != kReady) {
     R.status = EJitCompileOrGetStatus::OffMode;
     R.fastPathTerminal = true;
@@ -3251,14 +3499,17 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
     R.fastPathTerminal = true;
     return R;
   }
-#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   const EJitDimPair d4[4] = {
       {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
-  return classifyHit(cacheLookupSeq(funcIndex, d4, 4));
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  SharedLookup Hit = cacheLookupSeq(funcIndex, d4, 4);
 #else
-  return classifyHit(cacheLookup4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
-                                   inst2, dim3, inst3));
+  SharedLookup Hit = cacheLookup4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
+                                 inst2, dim3, inst3);
 #endif
+  if (Hit.tier2Arm && Hit.slot)
+    enqueueTier2ForIdentity(funcIndex, d4, 4);
+  return classifyHit(Hit);
 }
 
 EJitSharedTaskPool::CompileOrGetResult
@@ -3290,6 +3541,10 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   // True miss: continue the slow path with the caller's fallback.
   R.fnPtr = fallback;
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (cacheMissTestHook_)
+    cacheMissTestHook_(cacheMissTestHookCtx_);
+#endif
   // Batched baseline compilation releases the coarse per-function in-flight
   // claim after installing an exact-identity Pending marker. Coalesce only an
   // identical request here so another cell/TRP version of the same function
@@ -3430,6 +3685,29 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     return R;
   case EJitDedupResult::Claimed:
     break;
+  }
+
+  // The initial lookup may have observed a transient publisher write, or a
+  // genuinely empty slot that became Ready before this producer claimed dedup.
+  // The old worker releases dedup only AFTER publication: owning this new claim
+  // therefore requires a fresh, authoritative absence check before starting
+  // another compiler/PGO session. Do not use tryCacheHit while holding the
+  // claim: it would increment T1 quota and block its own automatic T2 enqueue.
+  if (probeCacheForAdmission(funcIndex, dims, numDims) !=
+      CachePresence::Absent) {
+    dedupClear(funcIndex, gen);
+    R = tryCacheHit(funcIndex, dims, numDims, boundPointers, boundCount);
+    if (R.fastPathTerminal) {
+      if (R.status != EJitCompileOrGetStatus::CacheHit)
+        R.fnPtr = fallback;
+      return R;
+    }
+    // Pending or repeated writer contention: take AOT without treating an
+    // unobservable slot as missing. The next call can retry normal lookup.
+    EJIT_STAT_INC(state_->counters.alreadyPending);
+    R.status = EJitCompileOrGetStatus::AlreadyPending;
+    R.fnPtr = fallback;
+    return R;
   }
 
   bool newlyAdmitted = false;
@@ -3594,6 +3872,11 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
   for (PendingPublish &P : pendingPublishes_) {
     const uint32_t Tier = decodeReqTier(P.req.funcIndex);
     const uint32_t FuncIndex = stripReqTier(P.req.funcIndex);
+    if (!ordinaryFunctionAllowed(FuncIndex)) {
+      retainedAbortedCode_.push_back(P.fn);
+      dedupClear(P.req.funcIndex, P.req.generation);
+      continue;
+    }
     EJitCompiledCodeInfo Info{};
     bool Ready = !codeReadyFn_ || codeReadyFn_(codeBatchCtx_, P.fn);
     bool HasRange =
@@ -3602,6 +3885,14 @@ bool EJitSharedTaskPool::flushPendingPublishes(bool compileBatchRequests) {
         Ready ? cachePublish(P.req, P.fn, HasRange ? &Info : nullptr,
                              Tier == kEJitTierPgoUse)
               : EJitPublishStatus::Failed;
+    if (PS != EJitPublishStatus::Published &&
+        !ordinaryFunctionAllowed(FuncIndex)) {
+      retainedAbortedCode_.push_back(P.fn);
+      dedupClear(P.req.funcIndex, P.req.generation);
+      EJIT_DIAG("shared worker publish cancelled for function handoff func=%u",
+                FuncIndex);
+      continue; // owner abort settles admission; this is not a real leave
+    }
     if (PS == EJitPublishStatus::Published) {
       ++Published;
       EJIT_STAT_INC(state_->counters.asyncCompiles);
@@ -3669,6 +3960,9 @@ bool EJitSharedTaskPool::serviceCodeBatchRequest() {
   uint32_t Queued =
       state_->enqueuePos.loadAcquire() - state_->dequeuePos.loadAcquire();
   Queued = std::min(Queued, kEJitSharedQueueSlots);
+  // A function handoff may have moved foreign requests out of the ring without
+  // executing them. They still predate this flush and must be included.
+  Queued += static_cast<uint32_t>(deferredControlRequests_.size());
   while (Queued-- != 0 && pollOne()) {
     // Explicit publication may drain several queued requests inside one
     // worker step. Preserve the normal per-request scheduling gap.
@@ -3694,7 +3988,8 @@ bool EJitSharedTaskPool::serviceAutoTier2Publish() {
   // pollOne() has just observed the queue empty. Re-check both positions so a
   // Tier-1 request that raced that observation is compiled from the far pool
   // before the near-pool Tier-2 batch is sealed and published.
-  if (state_->enqueuePos.loadAcquire() != state_->dequeuePos.loadAcquire())
+  if (!deferredControlRequests_.empty() ||
+      state_->enqueuePos.loadAcquire() != state_->dequeuePos.loadAcquire())
     return false;
 
   autoTier2PublishPending_ = false;
@@ -3804,6 +4099,10 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   // worker.
   const uint32_t tier = decodeReqTier(req.funcIndex);
   const uint32_t realFuncIndex = stripReqTier(req.funcIndex);
+  if (!ordinaryFunctionAllowed(realFuncIndex)) {
+    dedupClear(req.funcIndex, req.generation);
+    return;
+  }
   const bool pgoClearExclusive = tier == kEJitTierPgoUse;
   auto dropBatchRequestMarker = [&] {
     if (hasBatchRequestMarker)
@@ -3860,6 +4159,11 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     return;
   }
   const EJitCompileRequest PublishReq = requestForPublication(req);
+  if (!ordinaryFunctionAllowed(realFuncIndex)) {
+    retainedAbortedCode_.push_back(fn);
+    dedupClear(req.funcIndex, req.generation);
+    return;
+  }
   // Resolve the real executable range for the freshly compiled pointer (from
   // the owner's code-pool finalize metadata) so it can be published into the
   // cache slot for cross-core 4K sealing. Optional: if no provider is wired or
@@ -3939,6 +4243,14 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
   if (info.codeSize == 0 && codeRangeFn_)
     (void)codeRangeFn_(codeRangeCtx_, fn, &info);
   EJitPublishStatus PS = cachePublish(PublishReq, fn, &info, pgoClearExclusive);
+  if (PS != EJitPublishStatus::Published &&
+      !ordinaryFunctionAllowed(realFuncIndex)) {
+    retainedAbortedCode_.push_back(fn);
+    dedupClear(req.funcIndex, req.generation);
+    EJIT_DIAG("shared worker publish cancelled for function handoff func=%u",
+              realFuncIndex);
+    return; // no release/completed notification before the owner abort
+  }
   switch (PS) {
   case EJitPublishStatus::Published:
     EJIT_STAT_INC(state_->counters.asyncCompiles);
@@ -3996,8 +4308,15 @@ bool EJitSharedTaskPool::pollOne() {
   // also compiles immediately, but runCompile retains its near-pool result
   // owner-private until queue-drain publication replaces the live Tier-1 slot.
   EJitCompileRequest Req{};
-  if (!queuePop(Req))
+  if (!deferredControlRequests_.empty()) {
+    Req = deferredControlRequests_.front();
+    deferredControlRequests_.erase(deferredControlRequests_.begin());
+  } else if (!queuePop(Req))
     return false;
+  if (!ordinaryFunctionAllowed(stripReqTier(Req.funcIndex))) {
+    dedupClear(Req.funcIndex, Req.generation);
+    return true;
+  }
   if (codeReadyFn_ && codeBatchFlushFn_ &&
       decodeReqTier(Req.funcIndex) == kEJitTierBaseline) {
     if (pendingBatchCompiles_.size() >= kEJitSharedQueueSlots) {
@@ -4035,6 +4354,242 @@ bool EJitSharedTaskPool::serviceMayConstRankingRequest() {
   return true;
 }
 
+bool EJitSharedTaskPool::isCurrentOwnerWorker() const {
+  // There is intentionally no implicit task/core/TLS identity. Callers that
+  // are reached from the worker pass its non-transferable context explicitly.
+  return false;
+}
+
+bool EJitSharedTaskPool::matchesWorkerContext(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) const {
+  return Worker.pool_ == this && Worker.poolEpoch_ != 0 &&
+         Worker.poolEpoch_ ==
+             activeWorkerContextEpoch_.load(std::memory_order_acquire) &&
+         state_ && Worker.stateGeneration_ != 0 &&
+         Worker.stateGeneration_ == state_->generation.loadAcquire();
+}
+
+bool EJitSharedTaskPool::isCurrentOwnerWorker(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) const {
+  if (!isWorkerContextActive(Worker) || !state_)
+    return false;
+  const uint32_t State = state_->initState.loadAcquire();
+  return State == static_cast<uint32_t>(EJitSharedInitState::Initializing) ||
+         State == static_cast<uint32_t>(EJitSharedInitState::Ready);
+}
+
+bool EJitSharedTaskPool::isWorkerContextActive(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) const {
+  return workerLoopActive_.load(std::memory_order_acquire) &&
+         matchesWorkerContext(Worker);
+}
+
+uint64_t EJitSharedTaskPool::nextWorkerContextEpoch() {
+  uint64_t Epoch = NextWorkerContextEpoch.load(std::memory_order_relaxed);
+  for (;;) {
+    if (Epoch == UINT64_MAX)
+      return 0;
+    if (NextWorkerContextEpoch.compare_exchange_weak(
+            Epoch, Epoch + 1, std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+      return Epoch + 1;
+  }
+}
+
+EJitSharedTaskPool::OwnerControlResult
+EJitSharedTaskPool::runControlOnOwnerAndWait(std::function<void()> Work,
+                                           uint32_t WaitRounds) {
+  if (!Work)
+    return {};
+  return runControlOnOwnerAndWait(
+      [Work = std::move(Work)](
+          const llvm::ejit::detail::OwnerWorkerContext &) { Work(); },
+      WaitRounds);
+}
+
+EJitSharedTaskPool::OwnerControlResult
+EJitSharedTaskPool::runControlOnOwnerAndWait(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker,
+    std::function<void(const llvm::ejit::detail::OwnerWorkerContext &)> Work,
+    uint32_t WaitRounds) {
+  (void)WaitRounds;
+  if (!Work || !state_ || !isOwner_ || !workerStart_ ||
+      state_->initState.loadAcquire() != kReady ||
+      !isCurrentOwnerWorker(Worker))
+    return {};
+  Work(Worker);
+  return {OwnerControlStatus::Completed, false};
+}
+
+EJitSharedTaskPool::OwnerControlResult
+EJitSharedTaskPool::runControlOnOwnerAndWait(
+    std::function<void(const llvm::ejit::detail::OwnerWorkerContext &)> Work,
+    uint32_t WaitRounds) {
+  if (!Work || !state_ || !isOwner_ || !workerStart_ ||
+      state_->initState.loadAcquire() != kReady)
+    return {};
+  uint32_t Wait = 0;
+  while (!workerLoopActive_.load(std::memory_order_acquire)) {
+    if (Wait++ >= WaitRounds || state_->initState.loadAcquire() != kReady)
+      return {};
+    if (workerIdle_)
+      workerIdle_(workerIdleCtx_, 1);
+    else
+      cpuRelax();
+  }
+  auto Job = std::make_shared<OwnerControlJob>(std::move(Work));
+  uint32_t Expected = 0;
+  while (!ownerControlLock_.compareExchange(Expected, 1))
+    Expected = 0;
+  if (ownerControl_ || state_->initState.loadAcquire() != kReady) {
+    ownerControlLock_.storeRelease(0);
+    return {};
+  }
+  ownerControl_ = Job;
+  ownerControlLock_.storeRelease(0);
+#ifdef EJIT_SRE_TASKPOOL_TESTING
+  if (ownerControlQueuedTestHook_)
+    ownerControlQueuedTestHook_(ownerControlQueuedTestHookCtx_);
+#endif
+  bool Exceeded = false;
+  for (;;) {
+    uint32_t State = Job->state.load(std::memory_order_acquire);
+    if (State == OwnerControlJob::Done)
+      return {OwnerControlStatus::Completed, Exceeded};
+    if (State == OwnerControlJob::Cancelled)
+      return {OwnerControlStatus::CancelledBeforeStart, Exceeded};
+    if (!Exceeded &&
+        (Wait++ >= WaitRounds || state_->initState.loadAcquire() != kReady)) {
+      Exceeded = true;
+      uint32_t Queued = OwnerControlJob::Queued;
+      if (Job->state.compare_exchange_strong(Queued,
+                                             OwnerControlJob::Cancelled))
+        return {OwnerControlStatus::CancelledBeforeStart, true};
+      // Started cannot be cancelled: retain captures and join real completion.
+    }
+    if (workerIdle_)
+      workerIdle_(workerIdleCtx_, 1);
+    else
+      cpuRelax();
+  }
+}
+
+bool EJitSharedTaskPool::serviceOwnerControl(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) {
+  if (!isOwner_ || !isCurrentOwnerWorker(Worker))
+    return false;
+  uint32_t Expected = 0;
+  while (!ownerControlLock_.compareExchange(Expected, 1))
+    Expected = 0;
+  auto Job = std::move(ownerControl_);
+  ownerControlLock_.storeRelease(0);
+  if (!Job)
+    return false;
+  uint32_t Queued = OwnerControlJob::Queued;
+  if (Job->state.compare_exchange_strong(Queued, OwnerControlJob::Started)) {
+    {
+      EJit *PinnedRuntime = acquireSmallTableSreRuntime(this);
+      struct RuntimePin {
+        EJit *Runtime;
+        const llvm::ejit::detail::OwnerWorkerContext &Worker;
+        ~RuntimePin() {
+          if (Runtime)
+            releaseSmallTableSreRuntime(Runtime, Worker);
+        }
+      } Pin{PinnedRuntime, Worker};
+      Job->work(Worker);
+    }
+    // Completion means both the callback and its worker-side Runtime pin have
+    // been released. The external waiter can now safely retire the facade.
+    Job->state.store(OwnerControlJob::Done, std::memory_order_release);
+  }
+  return true;
+}
+
+void EJitSharedTaskPool::cancelQueuedOwnerControl() {
+  uint32_t Expected = 0;
+  while (!ownerControlLock_.compareExchange(Expected, 1))
+    Expected = 0;
+  auto Job = std::move(ownerControl_);
+  ownerControlLock_.storeRelease(0);
+  if (Job) {
+    uint32_t Queued = OwnerControlJob::Queued;
+    Job->state.compare_exchange_strong(Queued, OwnerControlJob::Cancelled);
+  }
+}
+
+bool EJitSharedTaskPool::abortFunctionPgoOnOwner(uint32_t FuncIndex) {
+  (void)FuncIndex;
+  return false;
+}
+
+bool EJitSharedTaskPool::abortFunctionPgoOnOwner(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker,
+    uint32_t FuncIndex) {
+  if (!state_ || !isOwner_ || !isCurrentOwnerWorker(Worker) ||
+      FuncIndex >= kEJitSharedMaxFuncIndex || !functionOwnershipGateFn_ ||
+      ordinaryFunctionAllowed(FuncIndex))
+    return false;
+  // Only this worker consumes the ring. Preserve foreign work privately rather
+  // than executing it during another function's control operation.
+  const uint32_t End = state_->enqueuePos.loadAcquire();
+  uint32_t Wait = 0;
+  while (state_->dequeuePos.loadAcquire() != End) {
+    EJitCompileRequest Request;
+    if (!queuePop(Request)) {
+      if (++Wait == (1u << 20))
+        return false;
+      cpuRelax();
+      continue;
+    }
+    if (stripReqTier(Request.funcIndex) != FuncIndex)
+      deferredControlRequests_.push_back(Request);
+  }
+  auto SameFunction = [&](const auto &Request) {
+    return stripReqTier(Request.funcIndex) == FuncIndex;
+  };
+  deferredControlRequests_.erase(
+      std::remove_if(deferredControlRequests_.begin(),
+                     deferredControlRequests_.end(), SameFunction),
+      deferredControlRequests_.end());
+  pendingBatchCompiles_.erase(
+      std::remove_if(pendingBatchCompiles_.begin(), pendingBatchCompiles_.end(),
+                     [&](const auto &P) { return SameFunction(P.req); }),
+      pendingBatchCompiles_.end());
+  pendingPublishes_.erase(
+      std::remove_if(pendingPublishes_.begin(), pendingPublishes_.end(),
+                     [&](const auto &P) {
+                       if (!SameFunction(P.req))
+                         return false;
+                       retainedAbortedCode_.push_back(P.fn);
+                       return true;
+                     }),
+      pendingPublishes_.end());
+  autoTier2PublishPending_ =
+      std::any_of(pendingPublishes_.begin(), pendingPublishes_.end(),
+                  [](const auto &P) {
+                    return decodeReqTier(P.req.funcIndex) == kEJitTierPgoUse;
+                  });
+  // Root's ownership gate plus completed resolver barrier excludes new readers
+  // for this function. Real calls already holding tokens remain protected:
+  // change ONLY atomic logical state, not fields/pointers or physical ownership.
+  for (auto &Bucket : state_->buckets)
+    for (auto &Slot : Bucket.slots)
+      if (Slot.funcIndex == FuncIndex &&
+          Slot.generation == state_->generation.loadAcquire()) {
+        void *OldFn = reinterpret_cast<void *>(Slot.fnPtr.loadAcquire());
+        if (OldFn &&
+            std::find(retainedAbortedCode_.begin(), retainedAbortedCode_.end(),
+                      OldFn) == retainedAbortedCode_.end())
+          retainedAbortedCode_.push_back(OldFn);
+        Slot.state.storeRelease(static_cast<uint32_t>(EJitSharedSlotState::Empty));
+      }
+  dedupClear(FuncIndex, state_->generation.loadAcquire());
+  finishPgoFunction(FuncIndex, false, "small-table function ownership handoff");
+  retireDispatchCache();
+  return true;
+}
+
 unsigned EJitSharedTaskPool::pollBudget(unsigned maxItems) {
   unsigned n = 0;
   while (n < maxItems && pollOne())
@@ -4043,12 +4598,19 @@ unsigned EJitSharedTaskPool::pollBudget(unsigned maxItems) {
 }
 
 EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
+  return workerPollOnceInternal(nullptr);
+}
+
+EJitWorkerStep EJitSharedTaskPool::workerPollOnceInternal(
+    const llvm::ejit::detail::OwnerWorkerContext *Worker) {
   if (!state_)
     return EJitWorkerStep::Exit;
   uint32_t st = state_->initState.loadAcquire();
   switch (static_cast<EJitSharedInitState>(st)) {
   case EJitSharedInitState::Ready:
     workerConsumeLoops_.fetchAdd(1);
+    if (Worker && serviceOwnerControl(*Worker))
+      return EJitWorkerStep::Consumed;
     // Explicit publication must not starve behind a continuously replenished
     // compile queue or diagnostics. serviceCodeBatchRequest() snapshots and
     // drains the work that predates the request before publishing it.
@@ -4076,7 +4638,15 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
   }
 }
 
-void EJitSharedTaskPool::runWorkerLoop() {
+void EJitSharedTaskPool::runWorkerLoop(
+    const llvm::ejit::detail::OwnerWorkerContext &Worker) {
+  if (!matchesWorkerContext(Worker))
+    return;
+  bool ExpectedInactive = false;
+  if (!workerLoopActive_.compare_exchange_strong(
+          ExpectedInactive, true, std::memory_order_acq_rel))
+    return;
+  smallTableSreWorkerEnter(*this, Worker);
   EJIT_DIAG_VERBOSE("shared worker loop enter");
   // Loop until a terminal state. The worker is a PRODUCTION-lifetime task: it
   // never exits just because the owner is slightly slow to publish Ready (no
@@ -4087,15 +4657,24 @@ void EJitSharedTaskPool::runWorkerLoop() {
   // hook runs OUTSIDE any bucket lock / queue slot / dedup critical state
   // (pollOne returns before we idle).
   for (;;) {
-    EJitWorkerStep s = workerPollOnce();
+    // Physical PREP/COMMIT/LEAVE and snapshots are control traffic, not
+    // compiler jobs. Service one, then still give the normal queue one poll:
+    // bounded fairness without applying compile throttle to every business RPC.
+    const bool BridgeServiced = serviceSmallTableSreBridge(*this, Worker);
+    EJitWorkerStep s = workerPollOnceInternal(&Worker);
     if (s == EJitWorkerStep::Exit)
       break;
+    if (s == EJitWorkerStep::Idle && BridgeServiced)
+      continue;
     if (s == EJitWorkerStep::WaitForReady || s == EJitWorkerStep::Idle) {
       workerIdle(1); // single yield while waiting / empty queue
     } else
       workerThrottle();
   }
   EJIT_DIAG_VERBOSE("shared worker loop leave");
+  smallTableSreWorkerExit(*this, Worker);
+  workerLoopActive_.store(false, std::memory_order_release);
+  cancelQueuedOwnerControl();
 }
 
 void EJitSharedTaskPool::workerIdle(uint32_t ticks) {
@@ -4118,7 +4697,37 @@ void EJitSharedTaskPool::workerThrottle() {
 }
 
 void EJitSharedTaskPool::workerEntryThunk(void *ctx) {
-  static_cast<EJitSharedTaskPool *>(ctx)->runWorkerLoop();
+  auto *Pool = static_cast<EJitSharedTaskPool *>(ctx);
+  if (!Pool || !Pool->state_)
+    return;
+  const uint64_t Epoch = Pool->nextWorkerContextEpoch();
+  const uint32_t Generation = Pool->state_->generation.loadAcquire();
+  if (!Epoch || !Generation)
+    return;
+  uint64_t NoActiveWorker = 0;
+  if (!Pool->activeWorkerContextEpoch_.compare_exchange_strong(
+          NoActiveWorker, Epoch, std::memory_order_acq_rel))
+    return;
+  const llvm::ejit::detail::OwnerWorkerContext Worker(Pool, Epoch,
+                                                       Generation);
+  Pool->runWorkerLoop(Worker);
+  uint64_t ActiveEpoch = Epoch;
+  Pool->activeWorkerContextEpoch_.compare_exchange_strong(
+      ActiveEpoch, 0, std::memory_order_acq_rel);
+}
+
+void EJitSharedTaskPool::runWorkerLoop() {
+  EJIT_DIAG("shared worker loop refused: explicit worker context required");
+}
+
+bool llvm::ejit::detail::OwnerWorkerContext::validFor(
+    const EJitSharedTaskPool &Pool) const {
+  return Pool.isCurrentOwnerWorker(*this);
+}
+
+bool llvm::ejit::detail::OwnerWorkerContext::activeFor(
+    const EJitSharedTaskPool &Pool) const {
+  return Pool.isWorkerContextActive(*this);
 }
 
 //===----------------------------------------------------------------------===//

@@ -13,7 +13,7 @@
 
 ```bash
 # 0. 编译 runtime
-ninja -C build_release_x86 LLVMEJIT
+tools/build-limited.sh ninja -C build_release_x86 LLVMEJIT
 
 # 1-3. 三步裁剪
 python3 ejit_test/lipo/lipo.py extract \
@@ -41,14 +41,32 @@ bash ejit_test/build.sh --run --lipo
 
 ```bash
 # 0. 编译（当前环境为 aarch64，无需交叉编译）
-./build.sh release aarch64
-ninja -C build_release_aarch64 clang LLVMEJIT lld
+# build_release_aarch64 must already be configured for Release/AArch64.
+tools/build-limited.sh ninja -C build_release_aarch64 clang LLVMEJIT lld
 
 # 1-3. 一键脚本（无 --exclude，保留完整 LLVM 功能）
 ./ejit_test/lipo/run_aarch64_pipeline.sh
 ```
 
 产出 `ejit_test/lipo/ejit.o` (~37 MB)。
+
+如需把新 SRE bridge 纳入强制验收，可运行
+`EJIT_REQUIRE_SMALL_TABLE_SRE=1 ./ejit_test/lipo/run_aarch64_pipeline.sh`；
+此时 `gc-merge` 和最终 `merge` 都要求 7 个 small-table runtime hook 与
+6 个 SRE C bridge hook 全部存在。默认模式兼容旧 runtime archive，仍按
+“存在才保留”处理可选入口。如果输入归档本身应包含两个板端适配器，可额外
+传 `--require-demo` 检查 `test_ejit_period` 和 `test_ejit_smalltable_print`；
+适配器若由业务对象单独提供，不应对 runtime 归档启用这个选项。
+
+脚本在工作区内会自动发现 `tools/build-limited.sh` 并通过它串行执行必要的
+Ninja 重建；也可用 `EJIT_BUILD_LIMITER` 指定该包装器。离开该工作区时，脚本
+回退到 `ninja -j8`。
+
+每个部分链接阶段都会检查输出仍是 relocatable ELF、根符号未丢失且无重复，
+并保留 `.symtab`/`.strtab`、`.init_array`、`.ejit_bitcode`、`.ejit_period`
+和独立的 `.mc_shared` section。最终 merge 还会验证 bitcode/period 注册边界。
+轻量回归夹具可由 `python3 ejit_test/lipo/test_lipo_gc_roots.py` 运行；它需要
+clang、ar、nm、ld.lld 和 readelf。
 
 > 如需进一步瘦身（~30 MB），参考下方「bare-metal 裁剪」小节。
 
@@ -99,6 +117,9 @@ python3 ejit_test/lipo/lipo.py merge \
   --output=ejit_test/lipo/ejit.o
 ```
 
+需要严格检查新 SRE bridge 时，在以上两个命令中都加
+`--require-small-table-sre`。
+
 交叉编译时可通过 `--cxx` / `--ld` 覆盖编译器/链接器路径。
 
 ### Bare-metal 裁剪（可选瘦身）
@@ -108,7 +129,7 @@ python3 ejit_test/lipo/lipo.py merge \
 ```bash
 # 配置时启用 EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=ON
 cmake ... -DEJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=ON
-ninja -C build_release_aarch64 LLVMEJIT
+tools/build-limited.sh ninja -C build_release_aarch64 LLVMEJIT
 
 # extract 时传入 --exclude 排除不需要的 pass（完整列表见 git history）
 python3 ejit_test/lipo/lipo.py extract \
@@ -226,4 +247,4 @@ wrapper 使用的 `ejit_taskpool_compile_or_get` /
 - `EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=ON` 不能用于编译 clang/lld（它们需要 Wasm/COFF/DWARF 等后端），只能对 `LLVMEJIT` target 启用
 - `merge.ld` 控制最终 `.o` 的段布局（text/rodata/data 顺序），需要与链接脚本配合
 - lipo 输出是 `ld -r` 部分链接的 `.o`（relocatable），不是最终可执行文件或 `.a`
-- `llvm-objcopy` 可剥离 ARM `$x/$d` 映射符号（省 ~3-5 MB），需先构建：`ninja -C build_release_aarch64 llvm-objcopy`
+- `llvm-objcopy` 可剥离 ARM `$x/$d` 映射符号（省 ~3-5 MB），需先构建：`tools/build-limited.sh ninja -C build_release_aarch64 llvm-objcopy`

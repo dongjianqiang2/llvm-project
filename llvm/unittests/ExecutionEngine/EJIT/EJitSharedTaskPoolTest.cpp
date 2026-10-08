@@ -6,16 +6,20 @@
 //
 //===----------------------------------------------------------------------===//
 //
-//  Deterministic, single-thread tests for the cross-core SHARED taskpool. Many
+//  Tests for the cross-core SHARED taskpool. Many deterministic cases simulate
 //  "cores" are simulated inside one process by switching EJitCoreId between
 //  calls — no real thread is needed to exercise owner election, the shared MPSC
 //  queue, cross-core dedup, generation/version invalidation, and the commit
-//  gate. One optional test uses the host platform task to run a real worker.
+//  gate. Concurrent cases also run actual producer/publisher threads, and one
+//  optional test uses the host platform task to run a real worker.
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
+#include "EJitSharedTaskPoolTestAccess.h"
+#include "../../../lib/ExecutionEngine/EJIT/EJitOwnerWorkerContext.h"
+#include "../../../lib/ExecutionEngine/EJIT/EJitSmallTableSreBridgeInternal.h"
 #include "gtest/gtest.h"
 #include <algorithm>
 #include <atomic>
@@ -30,6 +34,29 @@
 #include <vector>
 
 using namespace llvm::ejit;
+
+#if defined(EJIT_SRE_TASKPOOL_TESTING)
+// This standalone target compiles the pool directly and links only Support.
+// It deliberately has no runtime facade, Host, ORC engine or C bridge policy.
+// Keep those external seams absent rather than manufacturing a runtime/pin or
+// pretending that the mock compiler below exercised real PGO/code execution.
+namespace llvm::ejit {
+EJit *acquireSmallTableSreRuntime(EJitSharedTaskPool *) { return nullptr; }
+void releaseSmallTableSreRuntime(
+    EJit *Runtime, const llvm::ejit::detail::OwnerWorkerContext &) {
+  if (Runtime)
+    ADD_FAILURE() << "standalone scheduler tests cannot own a facade pin";
+}
+void smallTableSreWorkerEnter(
+    EJitSharedTaskPool &, const llvm::ejit::detail::OwnerWorkerContext &) {}
+bool serviceSmallTableSreBridge(
+    EJitSharedTaskPool &, const llvm::ejit::detail::OwnerWorkerContext &) {
+  return false;
+}
+void smallTableSreWorkerExit(
+    EJitSharedTaskPool &, const llvm::ejit::detail::OwnerWorkerContext &) {}
+} // namespace llvm::ejit
+#endif
 
 #if defined(_WIN32)
 // COFF retains the diagnostic dump routine from the directly compiled
@@ -465,6 +492,44 @@ protected:
   void TearDown() override {
     ejitIcacheClearAll();
     EJitCoreId::resetForTest();
+  }
+
+  // These helpers are for quiescent, single-call fixtures. Both compiled
+  // contracts are asserted precisely; the NO_RECLAIM sentinel is never used
+  // as an array index and its release must not mutate even one shared byte.
+  void expectHitReadOwnership(
+      const EJitSharedTaskPool::CompileOrGetResult &Hit) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    EXPECT_FALSE(Hit.hasReadToken);
+    EXPECT_EQ(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    for (const auto &Bucket : state_->buckets)
+      EXPECT_EQ(Bucket.readers.loadAcquire(), 0u);
+#else
+    ASSERT_TRUE(Hit.hasReadToken);
+    ASSERT_LT(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    EXPECT_EQ(state_->buckets[Hit.bucketIndex].readers.loadAcquire(), 1u);
+#endif
+  }
+
+  void releaseHitReadOwnership(
+      EJitSharedTaskPool &Pool,
+      const EJitSharedTaskPool::CompileOrGetResult &Hit) {
+    expectHitReadOwnership(Hit);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    ASSERT_FALSE(Hit.hasReadToken);
+    ASSERT_EQ(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    std::vector<unsigned char> Before(sizeof(*state_));
+    std::memcpy(Before.data(), state_.get(), Before.size());
+    Pool.releaseRead(Hit.bucketIndex); // sentinel is a genuine no-op
+    EXPECT_EQ(std::memcmp(Before.data(), state_.get(), Before.size()), 0);
+    for (const auto &Bucket : state_->buckets)
+      EXPECT_EQ(Bucket.readers.loadAcquire(), 0u);
+#else
+    ASSERT_TRUE(Hit.hasReadToken);
+    ASSERT_LT(Hit.bucketIndex, kEJitSharedCacheBuckets);
+    Pool.releaseRead(Hit.bucketIndex); // actual matching token return
+    EXPECT_EQ(state_->buckets[Hit.bucketIndex].readers.loadAcquire(), 0u);
+#endif
   }
 
   // Register a test-local stand-in for the wrapper's @__ejit_icache_fn_<name>
@@ -1347,7 +1412,7 @@ TEST_F(SharedTaskPoolTest, BatchPgoFourTier2CompilesRetainWorkerThrottle) {
   Batch.recordTimeline = true;
   BatchTimelineIdleCtx Idle{&Batch, state_.get()};
   Owner.setWorkerIdleHook(&mockBatchTimelineIdle, &Idle);
-  Owner.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(Owner);
 
   // C=compile, D=worker throttle, F=enable_ex/cache publication. There must be
   // a scheduling gap between every Tier-2 compile and after publication.
@@ -1430,7 +1495,7 @@ TEST_F(SharedTaskPoolTest, BatchPgoTwentyFunctionsRunInFiveThrottledWaves) {
     ASSERT_EQ(Owner.compileOrGet(Func, nullptr, 0, codeFor(Func)).status,
               EJitCompileOrGetStatus::EnqueuedPending);
 
-  Owner.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(Owner);
 
   std::string Expected;
   for (unsigned Wave = 0; Wave != 5; ++Wave) {
@@ -1668,11 +1733,7 @@ TEST_F(SharedTaskPoolTest, PublishLookupAndReadTokenRelease) {
   auto hit = owner.compileOrGet(11, d0, 1, codeFor(11));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(11));
-  EXPECT_TRUE(hit.hasReadToken);
-  // A held read token keeps readers > 0.
-  EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
-  owner.releaseRead(hit.bucketIndex);
-  EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  releaseHitReadOwnership(owner, hit);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2110,7 +2171,7 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntrySurvivesInitializingAndConsumes) {
   // Simulate the SRE task being scheduled BEFORE the owner published Ready.
   state_->initState.storeRelease(
       static_cast<uint32_t>(EJitSharedInitState::Initializing));
-  pool.runWorkerLoop(); // REAL entry; the idle script drives the transitions.
+  EJitSharedTaskPoolTestAccess::runRealWorker(pool); // Same actual trampoline.
 
   EXPECT_GE(script.initializingYields,
             3); // yielded (not exited) on Initializing
@@ -2143,7 +2204,7 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntryConsumesThenStops) {
   for (uint32_t f = 1; f <= 3; ++f)
     ASSERT_EQ(pool.compileOrGet(f, nullptr, 0, codeFor(f)).status,
               EJitCompileOrGetStatus::EnqueuedPending);
-  pool.runWorkerLoop(); // REAL entry: consumes 3 then sees Stopping → exits.
+  EJitSharedTaskPoolTestAccess::runRealWorker(pool); // Same actual trampoline.
   EXPECT_GE(pool.workerConsumeLoops(), 3u);
   EJitSharedDiagnostics d;
   pool.getDiagnostics(d);
@@ -2164,7 +2225,7 @@ TEST_F(SharedTaskPoolTest, RealWorkerThrottlesBetweenConsumedRequests) {
               EJitCompileOrGetStatus::EnqueuedPending);
 
   uint64_t before = pool.workerIdleYields();
-  pool.runWorkerLoop();
+  EJitSharedTaskPoolTestAccess::runRealWorker(pool);
   EXPECT_GE(pool.workerConsumeLoops(), 3u);
   EXPECT_GT(pool.workerIdleYields(), before);
 }
@@ -2263,8 +2324,8 @@ TEST_F(SharedTaskPoolTest, CodeSharingOffRejectsPeerWithoutReenqueue) {
 }
 #endif
 
-// 七.6 — code sharing ON: a non-owner core gets the SAME fnPtr + read token,
-// and the owner can read its own pointer too.
+// 七.6 — code sharing ON: a non-owner core gets the SAME fnPtr under the
+// compiled token/load-only ownership contract; the owner can read it too.
 TEST_F(SharedTaskPoolTest, CodeSharingOnReturnsSamePointerToPeer) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
@@ -2276,8 +2337,7 @@ TEST_F(SharedTaskPoolTest, CodeSharingOnReturnsSamePointerToPeer) {
   auto ownerHit = owner.compileOrGet(61, nullptr, 0, codeFor(61));
   EXPECT_EQ(ownerHit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(ownerHit.fnPtr, codeFor(61));
-  if (ownerHit.hasReadToken)
-    owner.releaseRead(ownerHit.bucketIndex);
+  releaseHitReadOwnership(owner, ownerHit);
 
   EJitSharedTaskPool peer;
   peer.bind(state_.get());
@@ -2285,8 +2345,7 @@ TEST_F(SharedTaskPoolTest, CodeSharingOnReturnsSamePointerToPeer) {
   auto peerHit = peer.compileOrGet(61, nullptr, 0, codeFor(61));
   ASSERT_EQ(peerHit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(peerHit.fnPtr, codeFor(61)); // same pointer cross-core
-  EXPECT_TRUE(peerHit.hasReadToken);
-  peer.releaseRead(peerHit.bucketIndex);
+  releaseHitReadOwnership(peer, peerHit);
 }
 
 // 七.7 — a request whose generation has been superseded is dropped at the
@@ -2466,8 +2525,7 @@ TEST_F(SharedTaskPoolTest, FourKPeerSplitsOnceSealsSinglePage) {
   auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(1));
-  EXPECT_TRUE(hit.hasReadToken);
-  owner.releaseRead(hit.bucketIndex);
+  releaseHitReadOwnership(owner, hit);
 
   ASSERT_EQ(fourK.splits.size(), 1u);
   EXPECT_EQ(fourK.splits[0].first, range.poolBase);
@@ -3362,8 +3420,8 @@ TEST_F(SharedTaskPoolTest, FourKReinitForcesPeerToReSplit) {
 // semantic (ordering, counters, read tokens) while NEVER enqueuing/deduping.
 //===----------------------------------------------------------------------===//
 
-// 1/ A cache hit is served entirely on the fast path: fnPtr + bucket + a held
-//    read token, fastPathTerminal set, and NO enqueue/dedup side effects.
+// 1/ A cache hit is served entirely on the fast path with the compiled read
+//    ownership contract, fastPathTerminal and NO enqueue/dedup side effects.
 TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
@@ -3377,11 +3435,8 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(1));
-  EXPECT_TRUE(fast.hasReadToken);
   EXPECT_FALSE(fast.readyButNotShareable);
-  // A held read token keeps readers > 0 (same ownership contract as
-  // compileOrGet — the caller must release through releaseRead).
-  EXPECT_GT(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+  expectHitReadOwnership(fast);
 
   EJitSharedDiagnostics after;
   owner.getDiagnostics(after);
@@ -3390,8 +3445,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_EQ(after.queueDepth, 0u);                      // no dedup slot
   EXPECT_EQ(after.pendingCount, 0u);
 
-  owner.releaseRead(fast.bucketIndex);
-  EXPECT_EQ(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+  releaseHitReadOwnership(owner, fast);
 }
 
 // 2/ A true miss is NOT terminal on the fast path (no enqueue), and the slow
@@ -3508,8 +3562,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitEvenWhenModeOff) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(30));
-  EXPECT_TRUE(fast.hasReadToken);
-  owner.releaseRead(fast.bucketIndex);
+  releaseHitReadOwnership(owner, fast);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3518,7 +3571,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitEvenWhenModeOff) {
 // must match the generic tryCacheHit() semantics for the matching numDims.
 //===----------------------------------------------------------------------===//
 
-// 0D/1D/2D/3D/4D cache hit: fnPtr + bucket + read token, no enqueue/dedup.
+// 0D/1D/2D/3D/4D cache hit: fnPtr and compiled read ownership, no enqueue/dedup.
 TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
@@ -3540,9 +3593,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   EXPECT_TRUE(h0.fastPathTerminal);
   EXPECT_EQ(h0.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h0.fnPtr, codeFor(1));
-  EXPECT_TRUE(h0.hasReadToken);
-  EXPECT_GT(state_->buckets[h0.bucketIndex].readers.loadAcquire(), 0u);
-  owner.releaseRead(h0.bucketIndex);
+  releaseHitReadOwnership(owner, h0);
 
   // 1D
   EJitDimPair d1[1] = {dim(0, 1)};
@@ -3550,8 +3601,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   auto h1 = owner.tryCacheHit1D(2, 0, 1);
   ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h1.fnPtr, codeFor(2));
-  EXPECT_TRUE(h1.hasReadToken);
-  owner.releaseRead(h1.bucketIndex);
+  releaseHitReadOwnership(owner, h1);
 
   // 2D
   EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
@@ -3559,7 +3609,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   auto h2 = owner.tryCacheHit2D(3, 0, 1, 1, 2);
   ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h2.fnPtr, codeFor(3));
-  owner.releaseRead(h2.bucketIndex);
+  releaseHitReadOwnership(owner, h2);
 
   // 3D
   EJitDimPair d3[3] = {dim(0, 1), dim(1, 2), dim(2, 3)};
@@ -3567,7 +3617,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   auto h3 = owner.tryCacheHit3D(4, 0, 1, 1, 2, 2, 3);
   ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h3.fnPtr, codeFor(4));
-  owner.releaseRead(h3.bucketIndex);
+  releaseHitReadOwnership(owner, h3);
 
   // 4D
   EJitDimPair d4[4] = {dim(0, 1), dim(1, 2), dim(2, 3), dim(3, 4)};
@@ -3575,7 +3625,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   auto h4 = owner.tryCacheHit4D(5, 0, 1, 1, 2, 2, 3, 3, 4);
   ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h4.fnPtr, codeFor(5));
-  owner.releaseRead(h4.bucketIndex);
+  releaseHitReadOwnership(owner, h4);
 
   // Cache hits do not enqueue/dedup.
   EJitSharedDiagnostics d;
@@ -3668,8 +3718,7 @@ TEST_F(SharedTaskPoolTest, FixedDimServesHitEvenWhenModeOff) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(40));
-  EXPECT_TRUE(fast.hasReadToken);
-  owner.releaseRead(fast.bucketIndex);
+  releaseHitReadOwnership(owner, fast);
 }
 
 // readyButNotShareable: a peer core that may not read the pointer gets a clean
@@ -6533,6 +6582,399 @@ TEST_F(SharedTaskPoolTest, ConcurrentPeersCapTier1AtConfiguredSampleCount) {
   EXPECT_EQ(rec.tier2, 1);
 }
 
+// Unlike ConcurrentPeersCapTier1AtConfiguredSampleCount, the sole consumer is
+// publishing T2 while producer threads continue to resolve the same identity.
+// A transient bucket write must not be mistaken for a new cold identity after
+// the old request's dedup/admission claims have been released. This is a cache
+// protocol regression: mock code addresses are never executed and do not prove
+// actual instrumentation, profile capture, or board permission coherence.
+TEST_F(SharedTaskPoolTest,
+       MissObservedDuringRealTier2PublicationIsRecheckedBeforeNewAdmission) {
+  constexpr uint32_t kFunction = 5;
+  struct Interleave {
+    std::atomic<bool> publishEntered{false};
+    std::atomic<bool> releasePublish{false};
+    std::atomic<bool> missEntered{false};
+    std::atomic<bool> releaseMiss{false};
+    std::atomic<bool> timedOut{false};
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    void pause(std::atomic<bool> &entered, std::atomic<bool> &release) {
+      entered.store(true, std::memory_order_release);
+      while (!release.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          timedOut.store(true, std::memory_order_release);
+          return;
+        }
+        std::this_thread::yield();
+      }
+    }
+  } interleave;
+  PgoRecorder recorder;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompileRecordPgo, &recorder);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(owner.compileOrGet(kFunction, nullptr, 0, codeFor(kFunction)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto sample = owner.compileOrGet(kFunction, nullptr, 0, codeFor(kFunction));
+  ASSERT_EQ(sample.status, EJitCompileOrGetStatus::CacheHit);
+  if (sample.hasReadToken)
+    owner.releaseRead(sample.bucketIndex);
+  ASSERT_EQ(owner.pendingCount(), 1u);
+
+  EJitSharedTaskPool peer;
+  attachPeer(peer, state_.get(), 1);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setCachePublishTestHook(
+      [](void *context) {
+        auto &state = *static_cast<Interleave *>(context);
+        state.pause(state.publishEntered, state.releasePublish);
+      },
+      &interleave);
+  peer.setCacheMissTestHook(
+      [](void *context) {
+        auto &state = *static_cast<Interleave *>(context);
+        state.pause(state.missEntered, state.releaseMiss);
+      },
+      &interleave);
+  auto waitFor = [&](std::atomic<bool> &entered) {
+    while (!entered.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= interleave.deadline)
+        return false;
+      std::this_thread::yield();
+    }
+    return true;
+  };
+
+  bool consumed = false;
+  std::thread publisher([&] {
+    EJitCoreId::setCurrentForTest(0);
+    consumed = owner.pollOne();
+  });
+  const bool sawRealWriter = waitFor(interleave.publishEntered);
+  // This flag is held by cachePublish itself, not manufactured by the test.
+  const uint32_t writerFlag =
+      state_->buckets[bucketOfIdentity(kFunction, nullptr, 0)]
+          .writeFlag.loadAcquire();
+  EJitSharedTaskPool::CompileOrGetResult resolved;
+  std::thread producer([&] {
+    EJitCoreId::setCurrentForTest(1);
+    resolved = peer.compileOrGet(kFunction, nullptr, 0, codeFor(kFunction));
+  });
+  const bool sawContendedMiss = waitFor(interleave.missEntered);
+
+  // The producer's genuine contended miss is now stale: let the real consumer
+  // publish T2 and retire its dedup/admission claims before that producer
+  // continues. Without a post-claim cache recheck it opens a new T1 session.
+  interleave.releasePublish.store(true, std::memory_order_release);
+  publisher.join();
+  owner.setCachePublishTestHook(nullptr, nullptr);
+  EJitSharedDiagnostics published;
+  owner.getDiagnostics(published);
+  interleave.releaseMiss.store(true, std::memory_order_release);
+  producer.join();
+  peer.setCacheMissTestHook(nullptr, nullptr);
+  if (resolved.hasReadToken)
+    peer.releaseRead(resolved.bucketIndex);
+
+  EXPECT_TRUE(sawRealWriter);
+  EXPECT_EQ(writerFlag, 1u);
+  EXPECT_TRUE(sawContendedMiss);
+  EXPECT_FALSE(interleave.timedOut.load(std::memory_order_acquire));
+  EXPECT_TRUE(consumed);
+  EXPECT_EQ(published.tier1Compiles, 1u);
+  EXPECT_EQ(published.tier2Compiles, 1u);
+  EXPECT_EQ(published.pgoCompletedFunctions, 1u);
+  EXPECT_EQ(published.pendingCount, 0u);
+  EXPECT_EQ(published.pgoActiveFunctionCount, 0u);
+  EXPECT_EQ(resolved.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(resolved.fnPtr,
+            codeFor(encodeReqTier(kFunction, kEJitTierPgoUse)));
+  // Drain any erroneous extra request to expose real compiler counts rather
+  // than merely asserting a status label. Mock addresses are never executed.
+  EXPECT_FALSE(owner.pollOne());
+  EXPECT_EQ(recorder.tier1, 1);
+  EXPECT_EQ(recorder.tier2, 1);
+  EJitSharedDiagnostics diagnostics;
+  owner.getDiagnostics(diagnostics);
+  EXPECT_EQ(diagnostics.tier1Compiles, 1u);
+  EXPECT_EQ(diagnostics.tier2Compiles, 1u);
+  EXPECT_EQ(diagnostics.pgoCompletedFunctions, 1u);
+  EXPECT_EQ(diagnostics.pgoActiveFunctionCount, 0u);
+  EXPECT_EQ(diagnostics.pendingCount, 0u);
+  EXPECT_EQ(diagnostics.queueDepth, 0u);
+}
+
+TEST_F(SharedTaskPoolTest,
+       DelayedTier2ArmAfterRealPublicationDoesNotCompileTier2Twice) {
+  constexpr uint32_t kFunction = 5;
+  PgoRecorder Recorder;
+  EJitSharedTaskPool Owner;
+  EJitCoreId::setCurrentForTest(0);
+  Owner.bind(state_.get());
+  Owner.setCompiler(&mockCompileRecordPgo, &Recorder);
+  Owner.setCodeSharingEnabled(true);
+  Owner.setPgoEnabled(true, 1);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(kFunction, nullptr, 0, codeFor(kFunction)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(Owner.pollOne());
+  auto Sample = Owner.tryCacheHit0D(kFunction);
+  ASSERT_EQ(Sample.status, EJitCompileOrGetStatus::CacheHit);
+  if (Sample.hasReadToken)
+    Owner.releaseRead(Sample.bucketIndex);
+  ASSERT_EQ(Owner.pendingCount(), 1u);
+
+  EJitSharedTaskPool Peer;
+  attachPeer(Peer, state_.get(), 1);
+  struct ArmPause {
+    std::atomic<bool> Entered{false};
+    std::atomic<bool> Resume{false};
+    std::atomic<bool> Expired{false};
+    const std::chrono::steady_clock::time_point Deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  } Pause;
+  Peer.setTier2EnqueueTestHook(
+      [](void *Context) {
+        auto &P = *static_cast<ArmPause *>(Context);
+        P.Entered.store(true, std::memory_order_release);
+        while (!P.Resume.load(std::memory_order_acquire)) {
+          if (std::chrono::steady_clock::now() >= P.Deadline) {
+            P.Expired.store(true);
+            return;
+          }
+          std::this_thread::yield();
+        }
+      }, &Pause);
+  EJitSharedTaskPool::CompileOrGetResult Result;
+  std::thread Producer([&] {
+    EJitCoreId::setCurrentForTest(1);
+    // A genuine saturated T1 lookup carries a retry arm, then pauses before
+    // dedup. No cache slot, sampler count or writer word is fabricated.
+    Result = Peer.tryCacheHit0D(kFunction);
+  });
+  while (!Pause.Entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < Pause.Deadline)
+    std::this_thread::yield();
+  EXPECT_TRUE(Pause.Entered.load());
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_TRUE(Owner.pollOne()); // real T2 publication retires the old claim
+  EJitSharedDiagnostics Published;
+  Owner.getDiagnostics(Published);
+  EXPECT_EQ(Published.tier2Compiles, 1u);
+  EXPECT_EQ(Published.pendingCount, 0u);
+  EXPECT_EQ(Published.pgoCompletedFunctions, 1u);
+  Pause.Resume.store(true, std::memory_order_release);
+  Producer.join();
+  Peer.setTier2EnqueueTestHook(nullptr, nullptr);
+  EXPECT_FALSE(Pause.Expired.load());
+  EXPECT_EQ(Result.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_FALSE(Result.hasReadToken);
+  EXPECT_FALSE(Owner.pollOne())
+      << "a stale sampling arm queued a second actual Tier-2 compilation";
+  EXPECT_EQ(Recorder.tier1, 1);
+  EXPECT_EQ(Recorder.tier2, 1);
+  EJitSharedDiagnostics Final;
+  Owner.getDiagnostics(Final);
+  EXPECT_EQ(Final.tier1Compiles, 1u);
+  EXPECT_EQ(Final.tier2Compiles, 1u);
+  EXPECT_EQ(Final.pgoCompletedFunctions, 1u);
+  EXPECT_EQ(Final.pgoActiveFunctionCount, 0u);
+  EXPECT_EQ(Final.pendingCount, 0u);
+  EXPECT_EQ(Final.queueDepth, 0u);
+}
+
+TEST_F(SharedTaskPoolTest,
+       ConcurrentHotResolveDuringTier2PublicationDoesNotRestartPgoSession) {
+  constexpr uint32_t kThreads = 8;
+  constexpr uint32_t kRounds = 64;
+  constexpr uint32_t kCallsPerThread = 512;
+  constexpr uint32_t kFunction = 5;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(15);
+
+  struct ConcurrentPgoRecorder {
+    std::atomic<uint32_t> tier1{0};
+    std::atomic<uint32_t> tier2{0};
+  } recorder;
+  auto compile = [](void *context, const EJitCompileRequest &request,
+                    void **result) -> bool {
+    auto &record = *static_cast<ConcurrentPgoRecorder *>(context);
+    if (decodeReqTier(request.funcIndex) == kEJitTierPgoUse)
+      record.tier2.fetch_add(1, std::memory_order_relaxed);
+    else
+      record.tier1.fetch_add(1, std::memory_order_relaxed);
+    *result = codeFor(request.funcIndex);
+    return true;
+  };
+
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(0);
+  owner.bind(state_.get());
+  owner.setCompiler(compile, &recorder);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, 1);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+
+  std::vector<std::unique_ptr<EJitSharedTaskPool>> facades;
+  for (uint32_t core = 1; core <= kThreads; ++core) {
+    auto peer = std::make_unique<EJitSharedTaskPool>();
+    attachPeer(*peer, state_.get(), core);
+    facades.push_back(std::move(peer));
+  }
+  EJitCoreId::setCurrentForTest(0);
+  const EJitDimPair dimensions[] = {dim(1, 4)};
+  std::atomic<uint32_t> phase{0};
+  std::atomic<uint32_t> ready{0};
+  std::atomic<uint32_t> finished{0};
+  std::atomic<uint32_t> restartedSessions{0};
+  std::atomic<uint32_t> unexpectedResults{0};
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> producers;
+  for (uint32_t thread = 0; thread < kThreads; ++thread) {
+    producers.emplace_back([&, thread] {
+      EJitCoreId::setCurrentForTest(thread + 1);
+      EJitSharedTaskPool &peer = *facades[thread];
+      uint32_t seenPhase = 0;
+      ready.fetch_add(1, std::memory_order_release);
+      while (!stop.load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < deadline) {
+        const uint32_t nextPhase = phase.load(std::memory_order_acquire);
+        if (nextPhase == seenPhase) {
+          std::this_thread::yield();
+          continue;
+        }
+        seenPhase = nextPhase;
+        for (uint32_t call = 0; call < kCallsPerThread; ++call) {
+          auto result = peer.compileOrGet(kFunction, dimensions, 1,
+                                          codeFor(kFunction));
+          if (result.hasReadToken)
+            peer.releaseRead(result.bucketIndex);
+          // T1 was already published exactly once before opening this phase.
+          // A CacheHit may legitimately arm T2, but a fresh EnqueuedPending
+          // here is an erroneous new T1 request, not expected progress.
+          if (result.status == EJitCompileOrGetStatus::EnqueuedPending)
+            restartedSessions.fetch_add(1, std::memory_order_relaxed);
+          else if (result.status == EJitCompileOrGetStatus::CacheHit) {
+            if (result.fnPtr !=
+                    codeFor(encodeReqTier(kFunction, kEJitTierInstrumented)) &&
+                result.fnPtr !=
+                    codeFor(encodeReqTier(kFunction, kEJitTierPgoUse)))
+              unexpectedResults.fetch_add(1, std::memory_order_relaxed);
+          } else if ((result.status ==
+                          EJitCompileOrGetStatus::AlreadyPending ||
+                      result.status ==
+                          EJitCompileOrGetStatus::PgoAdmissionDeferred) &&
+                     result.fnPtr == codeFor(kFunction) &&
+                     !result.hasReadToken) {
+            // Ordinary bounded AOT while compilation/publication is pending.
+          } else if (result.status == EJitCompileOrGetStatus::OffMode &&
+                     result.readyButNotShareable && result.fastPathTerminal &&
+                     result.fnPtr == codeFor(kFunction) &&
+                     !result.hasReadToken) {
+            // A cold peer may snapshot T1 and lose its final revalidation to
+            // genuine T2 publication. The documented pointer gate refuses the
+            // old address; this is not global Off or a failed compile.
+          } else
+            unexpectedResults.fetch_add(1, std::memory_order_relaxed);
+          if (std::chrono::steady_clock::now() >= deadline)
+            break;
+        }
+        finished.fetch_add(1, std::memory_order_release);
+      }
+    });
+  }
+  std::thread publisher([&] {
+    EJitCoreId::setCurrentForTest(0);
+    while (!stop.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      if (!owner.pollOne())
+        std::this_thread::yield();
+    }
+  });
+
+  auto waitFor = [&](auto predicate) {
+    while (!predicate()) {
+      if (std::chrono::steady_clock::now() >= deadline)
+        return false;
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return true;
+  };
+  bool completed = waitFor([&] {
+    return ready.load(std::memory_order_acquire) == kThreads;
+  });
+  uint32_t completedRounds = 0;
+  for (uint32_t round = 0; completed && round < kRounds; ++round) {
+    // Version replacement is only performed after the previous round's real
+    // producers have returned and its consumer has drained every claim.
+    // Eviction, invalidation during a lookup, and extra cells cannot explain
+    // a duplicate compile in the active phase.
+    if (round != 0)
+      owner.setInstanceEnabled(1, 4, false);
+    owner.setInstanceEnabled(1, 4, true);
+    auto cold = owner.compileOrGet(kFunction, dimensions, 1, codeFor(kFunction));
+    completed = cold.status == EJitCompileOrGetStatus::EnqueuedPending;
+    if (!completed)
+      break;
+    completed = waitFor([&] {
+      EJitSharedDiagnostics diagnostics;
+      owner.getDiagnostics(diagnostics);
+      return diagnostics.tier1Compiles >= round + 1 &&
+             diagnostics.pendingCount == 0 && diagnostics.queueDepth == 0;
+    });
+    if (!completed)
+      break;
+    finished.store(0, std::memory_order_release);
+    phase.store(round + 1, std::memory_order_release);
+    completed = waitFor([&] {
+      return finished.load(std::memory_order_acquire) == kThreads;
+    });
+    if (!completed)
+      break;
+    completed = waitFor([&] {
+      EJitSharedDiagnostics diagnostics;
+      owner.getDiagnostics(diagnostics);
+      return diagnostics.pendingCount == 0 && diagnostics.queueDepth == 0 &&
+             diagnostics.pgoActiveFunctionCount == 0;
+    });
+    if (!completed)
+      break;
+    ++completedRounds;
+    if (recorder.tier1.load(std::memory_order_relaxed) != round + 1 ||
+        recorder.tier2.load(std::memory_order_relaxed) != round + 1)
+      break; // Preserve the first offending version without hiding extras.
+  }
+  stop.store(true, std::memory_order_release);
+  for (auto &producer : producers)
+    producer.join();
+  publisher.join();
+
+  EJitSharedDiagnostics diagnostics;
+  owner.getDiagnostics(diagnostics);
+  EXPECT_TRUE(completed) << "bounded producer/publisher progress timed out";
+  EXPECT_EQ(completedRounds, kRounds);
+  EXPECT_EQ(restartedSessions.load(), 0u);
+  EXPECT_EQ(unexpectedResults.load(), 0u);
+  EXPECT_EQ(recorder.tier1.load(), completedRounds);
+  EXPECT_EQ(recorder.tier2.load(), completedRounds);
+  EXPECT_EQ(diagnostics.tier1Compiles, completedRounds);
+  EXPECT_EQ(diagnostics.tier2Compiles, completedRounds);
+  EXPECT_EQ(diagnostics.pgoCompletedFunctions, completedRounds);
+  EXPECT_EQ(diagnostics.pgoActiveFunctionCount, 0u);
+  EXPECT_EQ(diagnostics.pendingCount, 0u);
+  EXPECT_EQ(diagnostics.queueDepth, 0u);
+  EXPECT_EQ(diagnostics.compileFailed, 0u);
+  EXPECT_EQ(diagnostics.publishFailed, 0u);
+}
+
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
 // (3) NO_RECLAIM: two DISTINCT identities each trigger Tier-2; the second
 // request must carry its OWN generation/version snapshot, never inherit the
@@ -6988,6 +7430,559 @@ TEST_F(SharedTaskPoolTest, AsyncServiceUnavailableWithoutAWorker) {
   ASSERT_EQ(state_->initState.loadAcquire(),
             static_cast<uint32_t>(EJitSharedInitState::Ready));
   EXPECT_FALSE(owner.asyncServiceAvailable());
+}
+
+// This fixture starts the actual production worker loop on a real host thread.
+// Its idle pause is worker-only; a requester yielding while waiting cannot
+// accidentally service its own job or enter that pause.
+static_assert(!std::is_default_constructible<llvm::ejit::detail::OwnerWorkerContext>::value,
+              "ordinary callers cannot manufacture a worker capability");
+static_assert(!std::is_copy_constructible<llvm::ejit::detail::OwnerWorkerContext>::value &&
+                  !std::is_move_constructible<llvm::ejit::detail::OwnerWorkerContext>::value,
+              "production capabilities cannot be copied or moved to callers");
+struct ControlWorker {
+  EJitSharedTaskPool *pool = nullptr;
+  std::thread thread;
+  std::thread::id workerThreadId;
+  uint32_t core = 0;
+  std::atomic<bool> threadReady{false};
+  std::atomic<bool> pause{false};
+  std::atomic<bool> paused{false};
+  std::atomic<bool> pauseExpired{false};
+  static bool start(void *Context, EJitSharedTaskPool::WorkerEntryFn Entry,
+                    void *EntryContext, uint64_t *TaskId) {
+    auto &Self = *static_cast<ControlWorker *>(Context);
+    Self.threadReady.store(false, std::memory_order_relaxed);
+    Self.thread = std::thread([&Self, Entry, EntryContext] {
+      // Publish the real std::thread handle before the idle hook reads it.
+      while (!Self.threadReady.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      EJitCoreId::setCurrentForTest(Self.core);
+      Entry(EntryContext);
+    });
+    Self.workerThreadId = Self.thread.get_id();
+    Self.threadReady.store(true, std::memory_order_release);
+    *TaskId = 0; // SDK task identity is genuinely unknown, not a made-up PID.
+    return true;
+  }
+  static void stop(void *Context) {
+    auto &Self = *static_cast<ControlWorker *>(Context);
+    Self.pause.store(false, std::memory_order_release);
+    if (Self.thread.joinable())
+      Self.thread.join();
+  }
+  static void idle(void *Context, uint32_t) {
+    auto &Self = *static_cast<ControlWorker *>(Context);
+    if (std::this_thread::get_id() == Self.workerThreadId && Self.pause.load()) {
+      const auto Deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(5);
+      Self.paused.store(true, std::memory_order_release);
+      while (Self.pause.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= Deadline) {
+          Self.pauseExpired.store(true, std::memory_order_release);
+          break;
+        }
+        std::this_thread::yield();
+      }
+    }
+    std::this_thread::yield();
+  }
+};
+
+template <typename Predicate> bool waitForControl(Predicate Ready) {
+  const auto Deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(5);
+  while (!Ready()) {
+    if (std::chrono::steady_clock::now() >= Deadline)
+      return false;
+    std::this_thread::yield();
+  }
+  return true;
+}
+
+TEST_F(SharedTaskPoolTest, OwnerControlRunsOnRealWorkerIncludingNestedJob) {
+  ControlWorker Worker;
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  const auto Requester = std::this_thread::get_id();
+  std::thread::id Executed, Nested;
+  EJitSharedTaskPool::OwnerControlResult NestedResult;
+  auto Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        EXPECT_TRUE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Owner, Context));
+        EXPECT_FALSE(Owner.isCurrentOwnerWorker());
+        Executed = std::this_thread::get_id();
+        NestedResult = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+            Owner, Context,
+            [&](const llvm::ejit::detail::OwnerWorkerContext &NestedContext) {
+              EXPECT_EQ(&NestedContext, &Context);
+              EXPECT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+                  Owner, NestedContext));
+              Nested = std::this_thread::get_id();
+            },
+            0);
+      });
+  EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_NE(Executed, Requester);
+  EXPECT_EQ(Executed, Worker.thread.get_id());
+  EXPECT_EQ(Nested, Executed);
+  EXPECT_EQ(NestedResult.status,
+            EJitSharedTaskPool::OwnerControlStatus::Completed);
+  Owner.ownerShutdown();
+}
+
+TEST_F(SharedTaskPoolTest, SameCoreShellWithoutContextStillQueuesToRealWorker) {
+  ControlWorker Worker;
+  Worker.core = 6;
+  Worker.pause.store(true);
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  EJitCoreId::setCurrentForTest(6);
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_TRUE(waitForControl([&] { return Worker.paused.load(); }));
+  EXPECT_FALSE(Owner.isCurrentOwnerWorker())
+      << "a shell sharing the worker core has no worker-entry capability";
+  EXPECT_EQ(state_->workerTaskId.loadAcquire(), 0u);
+  std::atomic<uint32_t> Calls{0};
+  auto Cancelled = Owner.runControlOnOwnerAndWait([&] { ++Calls; }, 4);
+  EXPECT_EQ(Cancelled.status,
+            EJitSharedTaskPool::OwnerControlStatus::CancelledBeforeStart);
+  EXPECT_TRUE(Cancelled.deadlineExceeded);
+  EXPECT_EQ(Calls.load(), 0u) << "same-core caller must not execute inline";
+  Worker.pause.store(false, std::memory_order_release);
+  std::thread::id Executed;
+  uint32_t ExecutedCore = kEJitInvalidCoreId;
+  EJitSharedTaskPool::OwnerControlResult Completed;
+  // The paused worker must first remove the cancelled queued job. Retry only
+  // the busy/rejected enqueue; the callback is still required to run once.
+  EXPECT_TRUE(waitForControl([&] {
+    Completed = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          EXPECT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              Owner, Context));
+          Executed = std::this_thread::get_id();
+          ExecutedCore = EJitCoreId::current();
+          ++Calls;
+        });
+    return Completed.status != EJitSharedTaskPool::OwnerControlStatus::Rejected;
+  }));
+  EXPECT_EQ(Completed.status,
+            EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(Executed, Worker.thread.get_id());
+  EXPECT_NE(Executed, std::this_thread::get_id());
+  EXPECT_EQ(ExecutedCore, 6u);
+  EXPECT_EQ(Calls.load(), 1u);
+  Owner.ownerShutdown();
+  EXPECT_FALSE(Worker.pauseExpired.load());
+}
+
+TEST_F(SharedTaskPoolTest, WorkerContextCannotAuthorizeAnotherPool) {
+  ControlWorker Worker, OtherWorker;
+  EJitSharedTaskPool Owner, Other;
+  auto OtherState = std::make_unique<EJitSharedTaskPoolState>();
+  Other.bind(OtherState.get());
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  OtherWorker.pool = &Other;
+  OtherWorker.core = 1;
+  Other.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &OtherWorker);
+  Other.setWorkerIdleHook(ControlWorker::idle, &OtherWorker);
+  EJitCoreId::setCurrentForTest(1);
+  auto OtherInit = Other.init();
+  EXPECT_EQ(OtherInit, EJitSharedTaskPool::InitResult::BecameOwner);
+  EJitCoreId::setCurrentForTest(0);
+  if (OtherInit != EJitSharedTaskPool::InitResult::BecameOwner) {
+    Owner.ownerShutdown();
+    return;
+  }
+  EXPECT_EQ(EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+                Other,
+                [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+                  EXPECT_TRUE(
+                      EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+                          Other, Context));
+                })
+                .status,
+            EJitSharedTaskPool::OwnerControlStatus::Completed);
+  unsigned ForeignCalls = 0;
+  EJitSharedTaskPool::OwnerControlResult Foreign;
+  auto Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        EXPECT_TRUE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Owner, Context));
+        EXPECT_FALSE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Other, Context));
+        Foreign = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+            Other, Context,
+            [&](const llvm::ejit::detail::OwnerWorkerContext &) { ++ForeignCalls; }, 0);
+        EXPECT_FALSE(EJitSharedTaskPoolTestAccess::abortFunctionPgoOnOwner(
+            Other, Context, 5));
+      });
+  EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(Foreign.status, EJitSharedTaskPool::OwnerControlStatus::Rejected);
+  EXPECT_EQ(ForeignCalls, 0u);
+  Other.ownerShutdown();
+  Owner.ownerShutdown();
+}
+
+TEST_F(SharedTaskPoolTest,
+       WorkerContextInvalidatesDuringShutdownAndRestartUsesNewGeneration) {
+  ControlWorker Worker;
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  const uint32_t FirstGeneration = state_->generation.loadAcquire();
+  std::atomic<bool> Started{false}, ObservedStopping{false}, Expired{false};
+  unsigned NestedCalls = 0;
+  std::unique_ptr<llvm::ejit::detail::OwnerWorkerContext> StaleContext;
+  EJitSharedTaskPool::OwnerControlResult Outer, Nested;
+  std::thread Requester([&] {
+    Outer = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          EXPECT_TRUE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              Owner, Context));
+          StaleContext =
+              EJitSharedTaskPoolTestAccess::cloneForStaleValidation(Context);
+          Started.store(true, std::memory_order_release);
+          if (!waitForControl([&] {
+                return state_->initState.loadAcquire() ==
+                       static_cast<uint32_t>(EJitSharedInitState::Stopping);
+              })) {
+            Expired.store(true);
+            return;
+          }
+          // The context is still a live stack object here, not a saved pointer
+          // dereferenced after the old worker has exited.
+          ObservedStopping.store(true, std::memory_order_release);
+          EXPECT_FALSE(EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(
+              Owner, Context));
+          EXPECT_FALSE(StaleContext->validFor(Owner));
+          Nested = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+              Owner, Context,
+              [&](const llvm::ejit::detail::OwnerWorkerContext &) { ++NestedCalls; }, 0);
+        });
+  });
+  EXPECT_TRUE(waitForControl([&] { return Started.load(); }));
+  Owner.ownerShutdown(); // joins the actual callback and its worker-entry stack
+  Requester.join();
+  EXPECT_FALSE(Expired.load());
+  EXPECT_TRUE(ObservedStopping.load());
+  EXPECT_EQ(Outer.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(Nested.status, EJitSharedTaskPool::OwnerControlStatus::Rejected);
+  EXPECT_EQ(NestedCalls, 0u);
+  EXPECT_GT(state_->generation.loadAcquire(), FirstGeneration);
+  ASSERT_NE(StaleContext, nullptr);
+  EXPECT_FALSE(StaleContext->validFor(Owner));
+  EXPECT_FALSE(StaleContext->activeFor(Owner));
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  const uint32_t RestartGeneration = state_->generation.loadAcquire();
+  EXPECT_GT(RestartGeneration, FirstGeneration);
+  unsigned RestartCalls = 0;
+  unsigned StaleCalls = 0;
+  EJitSharedTaskPool::OwnerControlResult StaleResult;
+  auto Restart = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        EXPECT_TRUE(
+            EJitSharedTaskPoolTestAccess::isCurrentOwnerWorker(Owner, Context));
+        EXPECT_EQ(state_->generation.loadAcquire(), RestartGeneration);
+        EXPECT_FALSE(StaleContext->validFor(Owner));
+        EXPECT_FALSE(StaleContext->activeFor(Owner));
+        StaleResult = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+            Owner, *StaleContext,
+            [&](const llvm::ejit::detail::OwnerWorkerContext &) { ++StaleCalls; }, 0);
+        ++RestartCalls;
+      });
+  EXPECT_EQ(Restart.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_EQ(RestartCalls, 1u);
+  EXPECT_EQ(StaleResult.status,
+            EJitSharedTaskPool::OwnerControlStatus::Rejected);
+  EXPECT_EQ(StaleCalls, 0u);
+  EXPECT_EQ(state_->workerTaskId.loadAcquire(), 0u);
+  Owner.ownerShutdown();
+}
+
+TEST_F(SharedTaskPoolTest, QueuedOwnerControlTimeoutNeverRunsItsCallback) {
+  ControlWorker Worker;
+  Worker.pause.store(true);
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_TRUE(waitForControl([&] { return Worker.paused.load(); }));
+  std::atomic<uint32_t> Calls{0};
+  auto Result = Owner.runControlOnOwnerAndWait([&] { ++Calls; }, 4);
+  EXPECT_EQ(Result.status,
+            EJitSharedTaskPool::OwnerControlStatus::CancelledBeforeStart);
+  EXPECT_TRUE(Result.deadlineExceeded);
+  Worker.pause.store(false);
+  Owner.ownerShutdown();
+  EXPECT_EQ(Calls.load(), 0u);
+  EXPECT_FALSE(Worker.pauseExpired.load());
+}
+
+TEST_F(SharedTaskPoolTest, StartedOwnerControlDeadlineStillJoinsRealReturn) {
+  ControlWorker Worker;
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.runControlOnOwnerAndWait([] {}).status,
+            EJitSharedTaskPool::OwnerControlStatus::Completed);
+  std::atomic<bool> Started{false}, Release{false}, Returned{false};
+  std::atomic<bool> Expired{false};
+  Owner.setOwnerControlQueuedTestHook(
+      [](void *Context) {
+        auto &Flag = *static_cast<std::atomic<bool> *>(Context);
+        EXPECT_TRUE(waitForControl([&] { return Flag.load(); }));
+      }, &Started);
+  EJitSharedTaskPool::OwnerControlResult Result;
+  std::thread Requester([&] {
+    Result = Owner.runControlOnOwnerAndWait([&] {
+      Started.store(true, std::memory_order_release);
+      if (!waitForControl([&] { return Release.load(); }))
+        Expired.store(true);
+    }, 0);
+    Returned.store(true, std::memory_order_release);
+  });
+  EXPECT_TRUE(waitForControl([&] { return Started.load(); }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(Returned.load()) << "Started timeout abandoned live callback";
+  Release.store(true);
+  Requester.join();
+  EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_TRUE(Result.deadlineExceeded);
+  EXPECT_FALSE(Expired.load());
+  Owner.ownerShutdown();
+}
+
+TEST_F(SharedTaskPoolTest,
+       OwnerFunctionAbortDropsOnlyTargetWorkWithoutReleasingLiveReaders) {
+  ControlWorker Worker;
+  struct CompileContext {
+    PgoRecorder Recorder;
+    std::atomic<bool> FreshTarget{false};
+  } Compile;
+  ReleaseLog Releases;
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setCompiler(
+      [](void *Context, const EJitCompileRequest &Req, void **Out) {
+        auto &C = *static_cast<CompileContext *>(Context);
+        bool Ok = mockCompileRecordPgo(&C.Recorder, Req, Out);
+        if (Ok && stripReqTier(Req.funcIndex) == 5 && C.FreshTarget.load())
+          *Out = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(*Out) +
+                                         0x100000u);
+        return Ok;
+      }, &Compile);
+  Owner.setReleaser(mockRelease, &Releases);
+  Owner.setPgoEnabled(true, 64, 2);
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(Owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_TRUE(waitForControl([&] {
+    EJitSharedDiagnostics D;
+    Owner.getDiagnostics(D);
+    return D.tier1Compiles == 1 && D.pendingCount == 0;
+  }));
+  auto Borrow = Owner.tryCacheHit0D(5);
+  EXPECT_EQ(Borrow.status, EJitCompileOrGetStatus::CacheHit);
+  Worker.pause.store(true);
+  EXPECT_TRUE(waitForControl([&] { return Worker.paused.load(); }));
+  for (uint32_t I = 1; I != 64; ++I) {
+    auto Hit = Owner.tryCacheHit0D(5);
+    if (Hit.hasReadToken)
+      Owner.releaseRead(Hit.bucketIndex);
+  }
+  EXPECT_EQ(Owner.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  std::atomic<uint32_t> Blocked{5};
+  Owner.setFunctionOwnershipGateFn(
+      [](void *Ctx, uint32_t Func) {
+        return static_cast<std::atomic<uint32_t> *>(Ctx)->load() != Func;
+      }, &Blocked);
+  std::atomic<bool> Queued{false};
+  Owner.setOwnerControlQueuedTestHook(
+      [](void *Ctx) { static_cast<std::atomic<bool> *>(Ctx)->store(true); },
+      &Queued);
+  bool Aborted = false;
+  uint32_t ForeignStillPending = 0;
+  EJitSharedTaskPool::OwnerControlResult Result;
+  std::thread Requester([&] {
+    Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+        Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+          Aborted = EJitSharedTaskPoolTestAccess::abortFunctionPgoOnOwner(
+              Owner, Context, 5);
+          ForeignStillPending = state_->inFlight[6].loadAcquire();
+        });
+  });
+  EXPECT_TRUE(waitForControl([&] { return Queued.load(); }));
+  Worker.pause.store(false);
+  Requester.join();
+  EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_TRUE(Aborted);
+  EXPECT_NE(ForeignStillPending, 0u);
+  EXPECT_TRUE(waitForControl([&] {
+    EJitSharedDiagnostics D;
+    Owner.getDiagnostics(D);
+    return D.tier1Compiles == 2 && D.pendingCount == 0;
+  }));
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadAcquire(), 0u);
+  EXPECT_EQ(Owner.tryCacheHit0D(5).status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(Releases.freed.empty());
+  // Restoring ordinary dispatch compiles a different physical pointer. A
+  // logically Empty old slot is reusable, but its retired pointer is still
+  // engine/Pool-retained and must not reach the wired release callback.
+  Compile.FreshTarget.store(true);
+  Blocked.store(kEJitSharedMaxFuncIndex);
+  EXPECT_EQ(Owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  if (Borrow.hasReadToken) {
+    EXPECT_EQ(state_->buckets[Borrow.bucketIndex].readers.loadAcquire(), 1u);
+    Owner.releaseRead(Borrow.bucketIndex); // the real matching leave, not abort
+  }
+  EXPECT_TRUE(waitForControl([&] {
+    EJitSharedDiagnostics D;
+    Owner.getDiagnostics(D);
+    return D.tier1Compiles == 3 && D.pendingCount == 0;
+  }));
+  Owner.ownerShutdown();
+  EXPECT_EQ(Compile.Recorder.tier1, 3);
+  EXPECT_EQ(Compile.Recorder.tier2, 0);
+  EXPECT_TRUE(Releases.freed.empty());
+  EXPECT_FALSE(Worker.pauseExpired.load());
+}
+
+TEST_F(SharedTaskPoolTest,
+       OwnershipCloseInterruptsRealPublicationWithoutSettlingTheOldCall) {
+  ControlWorker Worker;
+  PgoRecorder Recorder;
+  ReleaseLog Releases;
+  EJitSharedTaskPool Owner;
+  Worker.pool = &Owner;
+  Owner.bind(state_.get());
+  Owner.setCompiler(mockCompileRecordPgo, &Recorder);
+  Owner.setReleaser(mockRelease, &Releases);
+  Owner.setPgoEnabled(true, 64, 2);
+  Owner.setWorkerHooks(ControlWorker::start, ControlWorker::stop, &Worker);
+  Owner.setWorkerIdleHook(ControlWorker::idle, &Worker);
+  std::atomic<uint32_t> Blocked{kEJitSharedMaxFuncIndex};
+  Owner.setFunctionOwnershipGateFn(
+      [](void *Ctx, uint32_t Func) {
+        return static_cast<std::atomic<uint32_t> *>(Ctx)->load() != Func;
+      }, &Blocked);
+  ASSERT_EQ(Owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  EXPECT_EQ(Owner.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_TRUE(waitForControl([&] {
+    EJitSharedDiagnostics D;
+    Owner.getDiagnostics(D);
+    return D.tier1Compiles == 1 && D.pendingCount == 0;
+  }));
+  uint32_t BucketIndex = kEJitSharedCacheBuckets;
+  for (uint32_t B = 0; B != kEJitSharedCacheBuckets; ++B)
+    for (const auto &Slot : state_->buckets[B].slots)
+      if (Slot.state.loadAcquire() ==
+              static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+          Slot.funcIndex == 5)
+        BucketIndex = B;
+  EXPECT_LT(BucketIndex, kEJitSharedCacheBuckets);
+  // Keep cleanup bounded even if the initial fixture failed to publish.
+  if (BucketIndex == kEJitSharedCacheBuckets) {
+    Owner.ownerShutdown();
+    return;
+  }
+  auto Borrow = Owner.tryCacheHit0D(5);
+  EXPECT_EQ(Borrow.status, EJitCompileOrGetStatus::CacheHit);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  EXPECT_FALSE(Borrow.hasReadToken);
+  EXPECT_EQ(Borrow.bucketIndex, kEJitSharedCacheBuckets);
+  struct PublishPause {
+    std::atomic<uint32_t> &Blocked;
+    std::atomic<bool> Entered{false};
+    std::atomic<bool> Expired{false};
+  } Pause{Blocked};
+  // In this branch real readers are load-only, so pause the real T2 publisher
+  // after its writer acquisition instead of inventing a token or reader count.
+  Owner.setCachePublishTestHook(
+      [](void *Context) {
+        auto &P = *static_cast<PublishPause *>(Context);
+        P.Entered.store(true, std::memory_order_release);
+        if (!waitForControl([&] { return P.Blocked.load() == 5; }))
+          P.Expired.store(true);
+      }, &Pause);
+#else
+  EXPECT_TRUE(Borrow.hasReadToken);
+  EXPECT_EQ(Borrow.bucketIndex, BucketIndex);
+#endif
+  for (uint32_t I = 1; I != 64; ++I) {
+    auto Hit = Owner.tryCacheHit0D(5);
+    EXPECT_EQ(Hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (Hit.hasReadToken)
+      Owner.releaseRead(Hit.bucketIndex);
+  }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  EXPECT_TRUE(waitForControl([&] { return Pause.Entered.load(); }));
+  EXPECT_EQ(state_->buckets[BucketIndex].readers.loadAcquire(), 0u);
+#else
+  EXPECT_TRUE(waitForControl([&] {
+    const auto &Bucket = state_->buckets[BucketIndex];
+    return Bucket.writeFlag.loadAcquire() == 1 &&
+           Bucket.readers.loadAcquire() == 1;
+  }));
+#endif
+  // The actual publisher already owns the writer. Closing ownership must let
+  // it relinquish that writer and service control without the old real leave.
+  Blocked.store(5, std::memory_order_release);
+  bool Aborted = false;
+  auto Result = EJitSharedTaskPoolTestAccess::runControlOnOwnerAndWait(
+      Owner, [&](const llvm::ejit::detail::OwnerWorkerContext &Context) {
+        Aborted = EJitSharedTaskPoolTestAccess::abortFunctionPgoOnOwner(
+            Owner, Context, 5);
+      });
+  EXPECT_EQ(Result.status, EJitSharedTaskPool::OwnerControlStatus::Completed);
+  EXPECT_TRUE(Aborted);
+  EXPECT_EQ(state_->buckets[BucketIndex].writeFlag.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadAcquire(), 0u);
+  EJitSharedDiagnostics D;
+  Owner.getDiagnostics(D);
+  EXPECT_EQ(D.tier1Compiles, 1u);
+  EXPECT_EQ(D.tier2Compiles, 0u); // linked T2 was cancelled, never published
+  EXPECT_EQ(D.pendingCount, 0u);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  EXPECT_FALSE(Pause.Expired.load());
+  EXPECT_EQ(state_->buckets[BucketIndex].publishSeq.loadAcquire() & 1u, 0u);
+#else
+  EXPECT_EQ(state_->buckets[BucketIndex].readers.loadAcquire(), 1u);
+  Owner.releaseRead(Borrow.bucketIndex); // actual old call's final leave
+  EXPECT_EQ(state_->buckets[BucketIndex].readers.loadAcquire(), 0u);
+#endif
+  Owner.ownerShutdown();
+  EXPECT_EQ(Recorder.tier1, 1);
+  EXPECT_EQ(Recorder.tier2, 1); // proves the genuine publication path ran
+  EXPECT_TRUE(Releases.freed.empty());
 }
 
 } // namespace

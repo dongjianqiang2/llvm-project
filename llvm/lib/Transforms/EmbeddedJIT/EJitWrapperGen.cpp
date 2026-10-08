@@ -33,6 +33,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <limits>
 #include <map>
 #include <string>
@@ -55,6 +56,20 @@ using namespace llvm::ejit;
 #define DEBUG_TYPE "ejit-wrapper-gen"
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
+
+// PR231: emit the small-table enter/leave hooks around a resolved specialized
+// dispatch. OFF by default: the baseline wrapper (and its frame-less inline-cache
+// dispatcher) is unchanged unless the product builds with this enabled. When it
+// is on, a resolved specialization is called under `ejit_stab_enter`/`_leave`, so
+// the runtime accounts the ACTUAL execution (aggregate sampling budget, in-flight
+// drain before freeze, generation retirement) and the sampling session's
+// protected read covers the call rather than only the pointer lookup. The hook
+// returns null for a row that is not admitted and published, in which case the
+// wrapper takes its AOT body exactly as it does for an uninitialized runtime.
+cl::opt<bool> EnableEJitSmallTableHooks(
+    "ejit-small-table-hooks", cl::init(false), cl::Hidden,
+    cl::desc("Emit the PR231 small-table ejit_stab_enter/ejit_stab_leave hooks "
+             "around a resolved specialized dispatch (default off)"));
 
 // Emit fixed-dimension taskpool fast-path C ABI calls
 // (ejit_taskpool_compile_or_get_Nd, N = dim count) for entries with <= 2 dims
@@ -91,7 +106,11 @@ static cl::opt<bool> EJitFunctionBodyTiming(
 // callable on any core. When combined with -ejit-wrapper-timing the icache hit
 // path is instrumented too (its own sentinel-status report line) so the wrapper
 // log still shows the fast path's ejit/fn overhead.
-static cl::opt<bool> EJitInlineCache(
+//
+// Not file-local (like EnableEJitSmallTableHooks): the in-process generated-IR
+// and generated-wrapper tests pin BOTH shapes by assigning the option directly,
+// because this checkout has no opt/FileCheck to drive a -passes= command line.
+cl::opt<bool> EJitInlineCache(
     "ejit-inline-cache", cl::init(false), cl::Hidden,
     cl::desc("Emit a per-function inline-cache probe (a direct load of the "
              "cached specialization pointer) before the taskpool "
@@ -604,6 +623,25 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   M.getOrInsertFunction(
       FN_TASKPOOL_RELEASE_READ,
       FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
+  // PR231 small-table hooks (emitted only under -ejit-small-table-hooks):
+  //   ptr ejit_stab_enter(i32 funcIndex, ptr dims, i32 numDims, ptr outTicket,
+  //                       ptr outWhy)
+  //   void ejit_stab_leave(i64 ticket)
+  auto *StabI64Ty = Type::getInt64Ty(Ctx);
+  if (EnableEJitSmallTableHooks) {
+    M.getOrInsertFunction(
+        FN_STAB_WRAPPER_ENTER,
+        FunctionType::get(PtrTy,
+                          {I32Ty, PtrTy, I32Ty, PtrTy, I32Ty, PtrTy, PtrTy,
+                           PtrTy},
+                          false));
+    M.getOrInsertFunction(FN_STAB_NO_POLICY_CURRENT,
+                          FunctionType::get(Type::getInt1Ty(Ctx),
+                                            {StabI64Ty}, false));
+    M.getOrInsertFunction(
+        FN_STAB_LEAVE,
+        FunctionType::get(Type::getVoidTy(Ctx), {StabI64Ty}, false));
+  }
   // With -ejit-inline-cache the wrapper reads its per-function
   // @__ejit_icache_fn_<name> slot directly (one atomic load + null-check +
   // indirect call) - no ejit_icache_try call, no per-call guards.
@@ -920,6 +958,139 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       }
     };
 
+    //=== PR231 small-table hook state ======================================
+    // Emitted only under -ejit-small-table-hooks (default off). The three slots
+    // live in the function's ENTRY block so they dominate every dispatch block
+    // and no dispatch path needs a dynamic stack adjustment (which would also
+    // rule out the frame-less musttail forms).
+    struct StabSlots {
+      Value *Dims = nullptr;   // [4 x {i32 dimType, i32 instanceId}]
+      Value *Ticket = nullptr; // i64 written by ejit_stab_enter, read by leave
+      Value *Why = nullptr;    // ptr: null => no small-table policy applies
+      Value *Entry = nullptr;  // ptr: the callable this dispatch will use
+      Value *Bounds = nullptr;
+      Value *Epoch = nullptr;
+    };
+    auto createStabSlots = [&](IRBuilder<> &B) -> StabSlots {
+      StabSlots S;
+      if (!EnableEJitSmallTableHooks)
+        return S;
+      S.Dims = B.CreateAlloca(ArrayType::get(DimPairTy, 4), nullptr,
+                              "ejit_stab_dims");
+      S.Ticket = B.CreateAlloca(I64Ty, nullptr, "ejit_stab_ticket");
+      S.Why = B.CreateAlloca(PtrTy, nullptr, "ejit_stab_why");
+      S.Entry = B.CreateAlloca(PtrTy, nullptr, "ejit_stab_entry_slot");
+      S.Epoch = B.CreateAlloca(I64Ty, nullptr, "ejit_stab_policy_epoch");
+      if (!BoundPtrs.empty())
+        S.Bounds = B.CreateAlloca(
+            ArrayType::get(StructType::get(PtrTy, I32Ty, I32Ty),
+                           BoundPtrs.size()), nullptr, "ejit_stab_bounds");
+      return S;
+    };
+
+    // The dimType/instance pair of dimension I: the wrapper's REAL dim argument
+    // value, exactly the pair the generic compile_or_get path builds, so the
+    // hook is asked about the call's own coordinate and never a re-derived one.
+    auto emitDimTypeVal = [&](IRBuilder<> &B, unsigned I) {
+      return B.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
+                          "ejit_dimtype");
+    };
+    auto emitInstanceVal = [&](IRBuilder<> &B, Function &Fn,
+                               unsigned I) -> Value * {
+      Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
+      unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
+      if (BW > 32)
+        return B.CreateTrunc(ArgVal, I32Ty);
+      if (BW < 32)
+        return B.CreateZExt(ArgVal, I32Ty);
+      return ArgVal;
+    };
+
+    // Ask the runtime whether THIS execution may run the published
+    // specialization of the row this call belongs to. One ejit_stab_enter per
+    // dispatch path, with exactly one matching ejit_stab_leave on the path that
+    // actually calls specialized code:
+    //
+    //   downstream non-null -> \p AdmittedBB: the execution is in flight under
+    //                          the host's protected read and its ticket is in
+    //                          S.Ticket. The callable is the published logical
+    //                          slot's entry (tableReady + codeReady + admitted
+    //                          + eligible), which is what S.Entry receives.
+    //   null, Why != null   -> \p RefuseBB: the small-table policy owns this
+    //                          function index and refused. The wrapper takes its
+    //                          AOT body; NO lease is open on that edge.
+    //   null, Why == null    -> \p PlainBB: no small-table policy owns this
+    //                          function index (no host installed, or a host
+    //                          bound to another entry). This path keeps its
+    //                          unchanged dispatch, so one host never disables
+    //                          specialization for the other entries of an image.
+    //
+    // The helper leaves the builder on the policy test block; callers set their
+    // own insertion point afterwards.
+    auto emitStabEnter = [&](IRBuilder<> &B, Function &Fn, const StabSlots &S,
+                             BasicBlock *RefuseBB, BasicBlock *AdmittedBB,
+                             BasicBlock *PlainBB, Value *FuncIdx,
+                             unsigned NumDims, ArrayRef<Value *> DimTypes,
+                             ArrayRef<Value *> DimInstances) -> Value * {
+      if (!EnableEJitSmallTableHooks)
+        return nullptr;
+      B.CreateStore(ConstantInt::get(I64Ty, 0), S.Ticket);
+      B.CreateStore(ConstantPointerNull::get(PtrTy), S.Why);
+      for (unsigned I = 0; I < NumDims; ++I) {
+        Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
+                         ConstantInt::get(I32Ty, I)};
+        Value *PairPtr = B.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
+                                             S.Dims, Idxs);
+        B.CreateStore(DimTypes[I], B.CreateStructGEP(DimPairTy, PairPtr, 0));
+        B.CreateStore(DimInstances[I], B.CreateStructGEP(DimPairTy, PairPtr, 1));
+      }
+      Value *DimsPtr = NumDims > 0 ? B.CreatePointerCast(S.Dims, PtrTy)
+                                   : ConstantPointerNull::get(PtrTy);
+      Value *BoundsPtr = ConstantPointerNull::get(PtrTy);
+      if (!BoundPtrs.empty()) {
+        auto *DescTy = StructType::get(PtrTy, I32Ty, I32Ty);
+        auto *ArrayTy = ArrayType::get(DescTy, BoundPtrs.size());
+        for (unsigned I = 0; I < BoundPtrs.size(); ++I) {
+          Value *Indices[] = {B.getInt32(0), B.getInt32(I)};
+          Value *Desc = B.CreateInBoundsGEP(ArrayTy, S.Bounds, Indices);
+          const auto &Info = BoundPtrs[I];
+          B.CreateStore(B.CreatePointerCast(Fn.getArg(Info.ArgIndex), PtrTy),
+                        B.CreateStructGEP(DescTy, Desc, 0));
+          B.CreateStore(B.getInt32(Info.PointeeSize),
+                        B.CreateStructGEP(DescTy, Desc, 1));
+          B.CreateStore(B.getInt32(Info.ArgIndex),
+                        B.CreateStructGEP(DescTy, Desc, 2));
+        }
+        BoundsPtr = B.CreatePointerCast(S.Bounds, PtrTy);
+      }
+      Value *Entered = B.CreateCall(
+          M.getFunction(FN_STAB_WRAPPER_ENTER),
+          {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, NumDims),
+           BoundsPtr, B.getInt32(BoundPtrs.size()),
+           B.CreatePointerCast(S.Ticket, PtrTy),
+           B.CreatePointerCast(S.Why, PtrTy),
+           B.CreatePointerCast(S.Epoch, PtrTy)},
+          "ejit_stab_entry");
+      auto *DecideBB = BasicBlock::Create(Ctx, "jit_stab_decide", &Fn);
+      B.CreateCondBr(B.CreateIsNotNull(Entered), AdmittedBB, DecideBB);
+      B.SetInsertPoint(DecideBB);
+      Value *Why = B.CreateLoad(PtrTy, S.Why, "ejit_stab_why_v");
+      B.CreateCondBr(B.CreateIsNotNull(Why), RefuseBB, PlainBB);
+      return Entered;
+    };
+
+    /// Close the execution emitStabEnter opened on the path that ran it. The
+    /// load is unconditional: the ticket is 0 unless enter admitted THIS
+    /// execution and `ejit_stab_leave(0)` is a documented no-op, so the
+    /// no-policy path and the admitted path share ONE leave site and no path
+    /// can finish with an unpaired lease.
+    auto emitStabLeave = [&](IRBuilder<> &B, const StabSlots &S) {
+      if (!EnableEJitSmallTableHooks)
+        return;
+      Value *Ticket = B.CreateLoad(I64Ty, S.Ticket, "ejit_stab_ticket_v");
+      B.CreateCall(M.getFunction(FN_STAB_LEAVE), {Ticket});
+    };
+
     // emitSlowPath: emit the funcIndex guard (EntryBB) + compile_or_get
     // (CallBB) + dispatch (DispatchBB) into Fn, using Fn's args. FallbackBB
     // already holds the spliced original body (with its own ret). Shared by
@@ -929,6 +1100,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                             BasicBlock *FallbackBB,
                             Value *WrapperBegin) -> Value * {
       IRBuilder<> B(EntryBB);
+      // PR231 hook slots (empty unless -ejit-small-table-hooks is on): the
+      // entry block, so every dispatch block's load dominates and the frame-less
+      // forms are unaffected when the flag is off.
+      StabSlots Stab = createStabSlots(B);
       // Allocas live in the entry block so they dominate the call/dispatch
       // blocks (and match the original layout: allocas precede the funcidx
       // guard).
@@ -959,19 +1134,36 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       B.CreateCondBr(IdxValid, CallBB, FallbackBB);
 
       B.SetInsertPoint(CallBB);
-      auto emitDimTypeVal = [&](unsigned I) {
-        return B.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
-                            "ejit_dimtype");
-      };
-      auto emitInstanceVal = [&](unsigned I) -> Value * {
-        Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
-        unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-        if (BW > 32)
-          return B.CreateTrunc(ArgVal, I32Ty);
-        if (BW < 32)
-          return B.CreateZExt(ArgVal, I32Ty);
-        return ArgVal;
-      };
+      // The common object owns this execution BEFORE any ordinary lookup.
+      // No generic read token or per-cell PGO session exists on this edge.
+      if (EnableEJitSmallTableHooks) {
+        auto *PlainBB = BasicBlock::Create(Ctx, "jit_plain_resolve", &Fn);
+        auto *CommonBB = BasicBlock::Create(Ctx, "jit_common_call", &Fn);
+        SmallVector<Value *, 4> Types, Instances;
+        for (unsigned I = 0; I < DimCount; ++I) {
+          Types.push_back(emitDimTypeVal(B, I));
+          Instances.push_back(emitInstanceVal(B, Fn, I));
+        }
+        Value *Entry = emitStabEnter(B, Fn, Stab, FallbackBB, CommonBB,
+                                    PlainBB, FuncIdx, DimCount, Types, Instances);
+        IRBuilder<> Common(CommonBB);
+        SmallVector<Value *, 8> CommonArgs;
+        for (unsigned I = 0; I < F->arg_size(); ++I)
+          CommonArgs.push_back(Fn.getArg(I));
+        Value *Ret = Common.CreateCall(F->getFunctionType(), Entry, CommonArgs);
+        emitStabLeave(Common, Stab);
+        if (F->getReturnType()->isVoidTy())
+          Common.CreateRetVoid();
+        else
+          Common.CreateRet(Ret);
+        B.SetInsertPoint(PlainBB);
+        auto *ResolveBB = BasicBlock::Create(Ctx, "jit_plain_current", &Fn);
+        Value *Current = B.CreateCall(
+            M.getFunction(FN_STAB_NO_POLICY_CURRENT),
+            {B.CreateLoad(I64Ty, Stab.Epoch)});
+        B.CreateCondBr(Current, ResolveBB, FallbackBB);
+        B.SetInsertPoint(ResolveBB);
+      }
       Value *TBeforeLookup = nullptr, *TAfterLookup = nullptr;
       if (EJitWrapperTiming)
         TBeforeLookup = B.CreateCall(TraceNow, {}, "ejit_t_before_lookup");
@@ -988,8 +1180,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         for (unsigned I = 0; I < DimCount; ++I) {
           ParamTys.push_back(I32Ty);
           ParamTys.push_back(I32Ty);
-          Args.push_back(emitDimTypeVal(I));
-          Args.push_back(emitInstanceVal(I));
+          Args.push_back(emitDimTypeVal(B, I));
+          Args.push_back(emitInstanceVal(B, Fn, I));
         }
         ParamTys.push_back(PtrTy);
         ParamTys.push_back(PtrTy);
@@ -1005,10 +1197,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           Value *PairPtr = B.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
                                                DimsAlloca, Idxs);
           B.CreateStore(
-              emitDimTypeVal(I),
+              emitDimTypeVal(B, I),
               B.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr"));
           B.CreateStore(
-              emitInstanceVal(I),
+              emitInstanceVal(B, Fn, I),
               B.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr"));
         }
         Value *DimsPtr = DimCount > 0 ? B.CreatePointerCast(DimsAlloca, PtrTy)
@@ -1063,12 +1255,29 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                      DispatchBB, FallbackBB);
 
       B.SetInsertPoint(DispatchBB);
+      if (EnableEJitSmallTableHooks) {
+        auto *CurrentBB = BasicBlock::Create(Ctx, "jit_plain_dispatch", &Fn);
+        auto *ChangedBB = BasicBlock::Create(Ctx, "jit_policy_changed", &Fn);
+        Value *Current = B.CreateCall(
+            M.getFunction(FN_STAB_NO_POLICY_CURRENT),
+            {B.CreateLoad(I64Ty, Stab.Epoch)});
+        B.CreateCondBr(Current, CurrentBB, ChangedBB);
+        IRBuilder<> Changed(ChangedBB);
+        Changed.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ),
+                           {Changed.CreateLoad(I32Ty, OutBucketAlloca)});
+        Changed.CreateBr(FallbackBB);
+        B.SetInsertPoint(CurrentBB);
+      }
       SmallVector<Value *, 8> Args;
       for (unsigned I = 0; I < F->arg_size(); ++I)
         Args.push_back(Fn.getArg(I));
       Value *BodyBegin = nullptr;
       if (EJitFunctionBodyTiming)
         BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
+
+      // No-policy dispatch uses only its ordinary bucket lease. The common
+      // ticketed edge has already returned above; there is no late redirection.
+      Value *Callee = OutFn;
       auto releaseAndTrace = [&]() {
         Value *BodyEnd = nullptr;
         if (EJitFunctionBodyTiming)
@@ -1081,8 +1290,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
           Value *TAfterRelease =
               B.CreateCall(TraceNow, {}, "ejit_t_after_release");
+          // The traced callee is the pointer the call ACTUALLY used: with the
+          // hooks on that is the published slot's entry when the execution was
+          // admitted, and the taskpool's own pointer otherwise. With the hooks
+          // off Callee == OutFn, so the record is byte-for-byte the previous one.
           B.CreateCall(TraceWrapper,
-                       {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
+                       {FuncIdx, Status, Callee, Bucket, TBeforeLookup,
                         TAfterLookup, TAfterFn, TAfterRelease});
           if (EJitFunctionBodyTiming)
             emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
@@ -1098,11 +1311,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         }
       };
       if (F->getReturnType()->isVoidTy()) {
-        B.CreateCall(F->getFunctionType(), OutFn, Args);
+        B.CreateCall(F->getFunctionType(), Callee, Args);
+        emitStabLeave(B, Stab);
         releaseAndTrace();
         B.CreateRetVoid();
       } else {
-        Value *RetVal = B.CreateCall(F->getFunctionType(), OutFn, Args);
+        Value *RetVal = B.CreateCall(F->getFunctionType(), Callee, Args);
+        emitStabLeave(B, Stab);
         releaseAndTrace();
         B.CreateRet(RetVal);
       }
@@ -1119,6 +1334,20 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     };
 
     if (EmitIcacheProbe) {
+      // A refused owned call must not re-enter the resolver via MissFn: a
+      // policy change there must not turn an already refused call into a miss.
+      // Keep an ABI-identical, untouched AOT body only in the opt-in hook form.
+      Function *RefusedAot = nullptr;
+      if (EnableEJitSmallTableHooks) {
+        ValueToValueMapTy Map;
+        RefusedAot = CloneFunction(F, Map);
+        RefusedAot->setName(F->getName() + "_smalltable_aot");
+        RefusedAot->setLinkage(GlobalValue::InternalLinkage);
+        SmallVector<std::pair<unsigned, MDNode *>, 4> Metadata;
+        RefusedAot->getAllMetadata(Metadata);
+        for (const auto &MD : Metadata)
+          RefusedAot->setMetadata(MD.first, nullptr);
+      }
       //=== LEVER B: frame-less wrapper (F) + noinline MissFn (slow path) =====
       // The hit path (F) is just the probe + two tail calls (br spec on hit, br
       // MissFn on miss) -- no allocas, no calls, no frame. MissFn holds the
@@ -1201,7 +1430,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       BasicBlock *JitIcacheDispatch = nullptr;
       BasicBlock *JitMiss = nullptr;
       IRBuilder<> B(JitEntry);
+      // PR231 hook slots (empty unless -ejit-small-table-hooks is on). They live
+      // in the wrapper's entry block, which is also why the frame-less
+      // single-block form cannot survive the flag (see Sentinelize below).
+      StabSlots Stab = createStabSlots(B);
       Value *WrapperBegin = nullptr;
+      BasicBlock *StabAotBB = nullptr;
       if (EJitFunctionBodyTiming)
         WrapperBegin = B.CreateCall(TraceNow, {}, "ejit_wrapper_begin");
       Value *TBeforeIcache = nullptr, *FuncIdxForTiming = nullptr;
@@ -1212,6 +1446,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         FuncIdxForTiming = B.CreateLoad(
             I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx_t");
       }
+      // The hook needs the dense funcIndex on the hit path too: the enter call
+      // must be asked about THIS function's row. Loaded in the entry block so it
+      // dominates the hit block; only under the flag.
+      Value *FuncIdxForStab = nullptr;
+      if (EnableEJitSmallTableHooks)
+        FuncIdxForStab = B.CreateLoad(
+            I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx_s");
       GlobalVariable *IcacheSlot = IcacheIt->second.GV;
       unsigned NumDims = IcacheIt->second.NumDims;
       // The sentinel initializer is a [D]^NumDims splat of &MissFn: at D=16
@@ -1221,11 +1462,50 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // begin argument into MissFn (changing its signature away from F's) and
       // emits trace calls around the specialization call, neither of which
       // survives a single-block musttail BLR.
+      //
+      // PR231: the frame-less form is a single block whose only call is a
+      // musttail BLR, so it cannot hold a paired enter/leave boundary around the
+      // execution (a `leave` before the tail jump would release the protected
+      // read BEFORE the code it protects ever runs, and there is no code after a
+      // musttail call). With the hooks on, the table therefore keeps its
+      // zero-init + null guard and the hit path is a framed dispatch with enter
+      // before the call and leave after it.
       const bool Sentinelize = !EJitWrapperTiming && !EJitFunctionBodyTiming &&
-                               NumDims <= 2;
+                               NumDims <= 2 && !EnableEJitSmallTableHooks;
       if (!Sentinelize) {
         JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
         JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
+      }
+      if (EnableEJitSmallTableHooks) {
+        auto *ProbeBB = BasicBlock::Create(Ctx, "jit_plain_probe", F);
+        auto *CommonBB = BasicBlock::Create(Ctx, "jit_common_hit_call", F);
+        auto *RefuseBB = BasicBlock::Create(Ctx, "jit_common_aot", F);
+        StabAotBB = RefuseBB;
+        SmallVector<Value *, 4> Types, Instances;
+        for (unsigned I = 0; I < DimCount; ++I) {
+          Types.push_back(emitDimTypeVal(B, I));
+          Instances.push_back(emitInstanceVal(B, *F, I));
+        }
+        Value *Entry = emitStabEnter(B, *F, Stab, RefuseBB, CommonBB,
+                                    ProbeBB, FuncIdxForStab, DimCount,
+                                    Types, Instances);
+        SmallVector<Value *, 8> Args;
+        for (auto &Arg : F->args())
+          Args.push_back(&Arg);
+        IRBuilder<> Common(CommonBB);
+        Value *Ret = Common.CreateCall(F->getFunctionType(), Entry, Args);
+        emitStabLeave(Common, Stab);
+        if (F->getReturnType()->isVoidTy())
+          Common.CreateRetVoid();
+        else
+          Common.CreateRet(Ret);
+        IRBuilder<> Refuse(RefuseBB);
+        Value *AotRet = Refuse.CreateCall(RefusedAot, Args);
+        if (F->getReturnType()->isVoidTy())
+          Refuse.CreateRetVoid();
+        else
+          Refuse.CreateRet(AotRet);
+        B.SetInsertPoint(ProbeBB);
       }
       Value *SlotPtr = IcacheSlot;
       if (NumDims > 0) {
@@ -1298,6 +1578,18 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         Value *BodyBegin = nullptr;
         if (EJitFunctionBodyTiming)
           BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
+
+        // Only no-policy reaches the ordinary cache. Do not redirect a cached
+        // ordinary T1 into common code after its PGO session has started.
+        Value *HitCallee = ICSlotLoad;
+        if (EnableEJitSmallTableHooks) {
+          auto *CurrentBB = BasicBlock::Create(Ctx, "jit_plain_hit_call", F);
+          Value *Current = B.CreateCall(
+              M.getFunction(FN_STAB_NO_POLICY_CURRENT),
+              {B.CreateLoad(I64Ty, Stab.Epoch)});
+          B.CreateCondBr(Current, CurrentBB, StabAotBB);
+          B.SetInsertPoint(CurrentBB);
+        }
         auto emitHitTiming = [&]() {
           Value *BodyEnd = nullptr;
           if (EJitFunctionBodyTiming)
@@ -1308,10 +1600,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           if (EJitWrapperTiming) {
             Value *TAfterFn =
                 BodyEnd ? BodyEnd : B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+            // Trace the callee the call actually used (the published slot's
+            // entry when admitted, the cell pointer otherwise), not the cell.
             B.CreateCall(TraceWrapper,
                          {FuncIdxForTiming,
                           ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
-                          ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
+                          HitCallee, ConstantInt::get(I32Ty, 0), TBeforeIcache,
                           TAfterIcache, TAfterFn, TAfterFn});
           }
           if (EJitFunctionBodyTiming) {
@@ -1320,15 +1614,23 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           }
         };
         if (F->getReturnType()->isVoidTy()) {
-          CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-          if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
+          CallInst *CI = B.CreateCall(F->getFunctionType(), HitCallee, ICArgs);
+          // A musttail call may only be followed by a ret, so the frame-less
+          // hit form is reserved for the no-hook case: with the hooks on, the
+          // execution boundary (leave, then the timing traces) needs the call to
+          // be an ordinary framed call.
+          if (!EJitWrapperTiming && !EJitFunctionBodyTiming &&
+              !EnableEJitSmallTableHooks)
             CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+          emitStabLeave(B, Stab);
           emitHitTiming();
           B.CreateRetVoid();
         } else {
-          CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-          if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
+          CallInst *CI = B.CreateCall(F->getFunctionType(), HitCallee, ICArgs);
+          if (!EJitWrapperTiming && !EJitFunctionBodyTiming &&
+              !EnableEJitSmallTableHooks)
             CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
+          emitStabLeave(B, Stab);
           emitHitTiming();
           B.CreateRet(CI);
         }

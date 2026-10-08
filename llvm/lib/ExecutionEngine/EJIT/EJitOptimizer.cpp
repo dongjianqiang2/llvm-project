@@ -22,6 +22,8 @@
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
 // cleanupFPM_ and the LowerExpect prefix are hand-added below.
 #include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/IPO/Inliner.h"
@@ -139,6 +141,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
                     static_cast<int>(ctx.optLevel), ctx.dimensions.size(),
                     static_cast<int>(ctx.tier), M.getName().str().c_str());
   lastCounterNames_.clear();
+  lastCounterProfileNames_.clear();
+  counterProfileNamesByRef_.clear();
   lastVpFunctions_.clear();
   scalarSiteCountsByFunc_.clear();
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -234,6 +238,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     runLightOptPipeline(M);
     ModulePassManager GenMPM;
     GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
+    GenMPM.run(M, MAM_);
+    // Gen retains the canonical name as the instrprof intrinsic's NamePtr
+    // initializer. Lowering legalizes the counter symbol and erases that name
+    // variable, so capture between the two passes, including any Gen renaming.
+    captureCounterProfileNames(M);
     // Tier-1 machine code is SHARED and executed concurrently by multiple cores
     // (shared taskpool). A plain __profc_* load/add/store would lose counts and
     // let Tier-2 profile synthesis read a torn value. Lower with atomic counter
@@ -242,8 +251,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     // / Tier-2 (PGOUse) machine code carries no profiling instrumentation.
     InstrProfOptions InstrProfOpts;
     InstrProfOpts.Atomic = true;
-    GenMPM.addPass(InstrProfilingLoweringPass(InstrProfOpts));
-    GenMPM.run(M, MAM_);
+    ModulePassManager LoweringMPM;
+    LoweringMPM.addPass(InstrProfilingLoweringPass(InstrProfOpts));
+    LoweringMPM.run(M, MAM_);
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
     // Scalar/loop-bound value sites (EJIT_VALUE_PROFILE.md §7.1): discover +
     // instrument AFTER the Gen/Lowering passes (so the CFG carries the same
@@ -343,7 +353,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline,
+                              ctx.fnName);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -402,7 +413,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier, ctx.fnName);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -414,7 +425,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier, ctx.fnName);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -639,8 +650,57 @@ void EJitOptimizer::runLightOptPipeline(Module &M) {
       FPM.run(F, FAM_);
 }
 
+void EJitOptimizer::captureCounterProfileNames(Module &M) {
+  counterProfileNamesByRef_.clear();
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    const std::string CanonicalName = getIRPGOFuncName(F);
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        auto *Counter = dyn_cast<InstrProfCntrInstBase>(&I);
+        if (!Counter)
+          continue;
+        GlobalVariable *NameVar = Counter->getName();
+        if (!NameVar || !NameVar->hasInitializer())
+          continue;
+        auto *NameData = dyn_cast<ConstantDataArray>(NameVar->getInitializer());
+        if (!NameData || !NameData->isString())
+          continue;
+        StringRef InstrumentedName = NameData->isCString()
+                                         ? NameData->getAsCString()
+                                         : NameData->getAsString();
+        const uint64_t NameRef = IndexedInstrProf::ComputeHash(InstrumentedName);
+        auto Result = counterProfileNamesByRef_.try_emplace(
+            NameRef, InstrumentedName.str());
+        // Preserve only an exact, unique canonical mapping. In particular,
+        // never reconstruct '<source>;internal' from a legalized symbol.
+        if (CanonicalName != InstrumentedName ||
+            Result.first->second != InstrumentedName)
+          Result.first->second.clear();
+      }
+  }
+}
+
 void EJitOptimizer::captureCounterGlobals(Module &M) {
   lastCounterNames_.clear();
+  lastCounterProfileNames_.clear();
+  // PR231 B2: a symbol can only be resolved by name if it is emitted GLOBAL.
+  // The instrumentation passes create the counters, the profile version flag and
+  // the runtime-hook user function with hidden visibility (and sometimes local
+  // linkage), and a hidden symbol is emitted LOCAL on COFF, so ORC's claim -
+  // made before the transform created the definition - can never be satisfied
+  // and the whole common Tier-1 module fails to materialize. These symbols exist
+  // precisely to be resolved by name, so linkage and visibility are both fixed
+  // here, after the pipeline and before codegen.
+  auto MakeResolvable = [](GlobalValue *GV) {
+    if (!GV || GV->isDeclaration())
+      return;
+    if (GV->hasLocalLinkage())
+      GV->setLinkage(GlobalValue::ExternalLinkage);
+    if (GV->getVisibility() != GlobalValue::DefaultVisibility)
+      GV->setVisibility(GlobalValue::DefaultVisibility);
+  };
   for (GlobalVariable &GV : M.globals()) {
     StringRef Name = GV.getName();
     bool IsProfc = Name.starts_with("__profc_");
@@ -649,12 +709,32 @@ void EJitOptimizer::captureCounterGlobals(Module &M) {
       continue;
     // Default InternalLinkage is invisible to ORC J->lookup (P0-3): force
     // External so the compile driver can resolve counter addresses by name.
-    if (GV.hasLocalLinkage())
-      GV.setLinkage(GlobalValue::ExternalLinkage);
-    if (IsProfc)
-      // PGOFuncName = name with the "__profc_" prefix stripped.
-      lastCounterNames_.emplace_back(Name.drop_front(strlen("__profc_")).str());
+    MakeResolvable(&GV);
+    if (IsProfc && !GV.isDeclaration()) {
+      StringRef SymbolSuffix = Name.drop_front(strlen("__profc_"));
+      lastCounterNames_.emplace_back(SymbolSuffix.str());
+      // InstrProfiling gives each counter/data pair the same actual suffix,
+      // including its optional CFG hash postfix. NameRef is the canonical
+      // name hash, not the hash of this assembler-safe suffix.
+      GlobalVariable *Data =
+          M.getNamedGlobal((Twine("__profd_") + SymbolSuffix).str());
+      auto *Init = Data && Data->hasInitializer()
+                       ? dyn_cast<ConstantStruct>(Data->getInitializer())
+                       : nullptr;
+      auto *NameRef = Init && Init->getNumOperands() != 0
+                          ? dyn_cast<ConstantInt>(Init->getOperand(0))
+                          : nullptr;
+      if (!NameRef || NameRef->getBitWidth() != 64)
+        continue;
+      auto It = counterProfileNamesByRef_.find(NameRef->getZExtValue());
+      if (It != counterProfileNamesByRef_.end() && !It->second.empty())
+        lastCounterProfileNames_[SymbolSuffix] = It->second;
+    }
   }
+  // The profile version flag and the runtime-hook user function are created by
+  // the same instrumentation pipeline and are resolvable for the same reason.
+  MakeResolvable(M.getNamedGlobal("__llvm_profile_raw_version"));
+  MakeResolvable(M.getFunction("__llvm_profile_runtime_user"));
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   // Value-profile capture (EJIT_VALUE_PROFILE.md §5.1): every function of the
@@ -783,6 +863,8 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
                                             const SpecializationContext &ctx) {
   LLVM_DEBUG(dbgs() << "ejit-optimizer: preReplacePeriodIndices, "
                     << ctx.dimensions.size() << " dim(s)\n");
+  const EJitSmallTablePlan *SmallTablePlan =
+      smallTablePlans_ ? smallTablePlans_->find(ctx.fnName) : nullptr;
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -810,6 +892,17 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
 
       unsigned argIdx = static_cast<unsigned>(IdxC->getZExtValue());
       if (argIdx >= F.arg_size())
+        continue;
+
+      // PR231: a small-table plan builds its row index from the real dynamic
+      // dimension arguments, so those parameters must stay live in the planned
+      // entry. Only the arg indices this entry's plan declares are skipped;
+      // every other ejit_period_arr_ind parameter is substituted exactly as
+      // before, and with no installed plan this is the unmodified baseline.
+      // Callees keep the baseline behavior: their index 0 is a different
+      // parameter, so the plan's arg indices do not describe them.
+      if (SmallTablePlan && F.getName() == ctx.fnName &&
+          SmallTablePlan->isDynamicDimArg(argIdx))
         continue;
 
       for (auto &dim : ctx.dimensions) {
@@ -859,6 +952,32 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
 
 void EJitOptimizer::runStructFieldPass(Module &M,
                                        const SpecializationContext &ctx) {
+  // PR231: the small-table replacement runs immediately before the existing
+  // may_const replacement in this round. An entry with no installed plan is
+  // untouched, so the baseline pipeline is unchanged.
+  //
+  // A *lowered* plan additionally blocks the legacy compile-time fold for that
+  // entry (whole-entry readiness contract): the code produced for a planned
+  // entry is shared across the plan's declared domain, so a value frozen here
+  // from the compile-time configuration would be a dependency that neither the
+  // plan's recorded uniform contract nor its projection contract describes.
+  // With the fold blocked, such loads keep their original dynamic form (spec
+  // §4.2) and the runtime entry gate only has to validate the recordable
+  // contract.
+  const bool SmallTableLowered = runSmallTablePass(M, ctx.fnName);
+  runStructFieldPassImpl(M, ctx,
+                         SmallTableLowered ? StringRef(ctx.fnName)
+                                           : StringRef());
+}
+
+void EJitOptimizer::runStructFieldPass(Module &M) {
+  SpecializationContext Empty;
+  runStructFieldPassImpl(M, Empty);
+}
+
+void EJitOptimizer::runStructFieldPassImpl(Module &M,
+                                           const SpecializationContext &ctx,
+                                           StringRef BlockLegacyFoldEntry) {
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
       ctx.boundPointers;
   if (!BoundPointers.empty()) {
@@ -892,14 +1011,101 @@ void EJitOptimizer::runStructFieldPass(Module &M,
   }
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
   structField.initFromModule(M);
+  // PR231 whole-entry readiness: a lowered small-table plan for this entry
+  // blocks the legacy compile-time fold here (see runSmallTablePass()); every
+  // other entry and every entry without a plan keeps the baseline behavior.
+  if (!BlockLegacyFoldEntry.empty())
+    structField.blockLegacyConstantFolds(BlockLegacyFoldEntry);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       structField.run(F, FAM_);
 }
 
-void EJitOptimizer::runStructFieldPass(Module &M) {
-  SpecializationContext Empty;
-  runStructFieldPass(M, Empty);
+bool EJitOptimizer::runSmallTablePass(Module &M, StringRef EntryName) {
+  lastSmallTableColumns_.clear();
+  if (EntryName.empty() || !smallTablePlans_ || smallTablePlans_->empty())
+    return false;
+  const EJitSmallTablePlan *Plan = smallTablePlans_->find(EntryName);
+  if (!Plan)
+    return false;
+
+  std::string Error;
+  if (!EJitSmallTablePass::materialize(M, *Plan, &Error)) {
+    EJIT_DIAG_VERBOSE("small-table SKIP func=%s: %s", EntryName.str().c_str(),
+                      Error.c_str());
+    return false;
+  }
+  for (const EJitSmallTableField &Field : Plan->fields)
+    if (!Field.uniformValue && !Field.columnName.empty())
+      lastSmallTableColumns_.push_back(Field.columnName);
+  EJitSmallTablePass Pass(*Plan);
+  bool Changed = false;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      Changed |= !Pass.run(F, FAM_).areAllPreserved();
+  // The pass is run directly, not through a PassManager, so invalidate the
+  // function analyses it may have invalidated by rewriting the entry.
+  if (Changed)
+    if (Function *Entry = M.getFunction(EntryName))
+      FAM_.invalidate(*Entry, PreservedAnalyses::none());
+  const EJitSmallTablePass::Stats &Stats = Pass.getStats();
+  (void)Stats;
+  // Per-field accounting (§13): original axes, retained axes, eliminated axes,
+  // the constant/table strategy and the payload before and after specialization.
+  uint64_t PerRowBytes = 0;
+  for (const EJitSmallTableField &F : Plan->fields)
+    PerRowBytes += F.accessSize;
+  const uint64_t OriginalBytes = Plan->numRows() * PerRowBytes;
+  for (unsigned I = 0; I < Plan->fields.size(); ++I) {
+    const EJitSmallTableField &Field = Plan->fields[I];
+    SmallString<32> Retained;
+    SmallString<32> Eliminated;
+    for (unsigned Dim = 0; Dim < Plan->dims.size(); ++Dim) {
+      const std::string One = ("axis" + Twine(Dim)).str();
+      if (Plan->fieldRetainsDim(Field, Dim)) {
+        if (!Retained.empty())
+          Retained += ",";
+        Retained += One;
+      } else {
+        if (!Eliminated.empty())
+          Eliminated += ",";
+        Eliminated += One;
+      }
+    }
+    EJIT_DIAG_VERBOSE(
+        "small-table-field entry=%s field=%u off=%llu access=%llu bits=%llu "
+        "kind=%u strategy=%s retained=[%s] eliminated=[%s] payload=%llu "
+        "payload_before=%llu",
+        EntryName.str().c_str(), I,
+        static_cast<unsigned long long>(Field.sourceOffset),
+        static_cast<unsigned long long>(Field.accessSize),
+        static_cast<unsigned long long>(Field.bitWidth),
+        static_cast<unsigned>(Field.kind),
+        Field.strategy == EJitSmallTableStrategy::Uniform ? "uniform" : "table",
+        Retained.c_str(), Eliminated.c_str(),
+        static_cast<unsigned long long>(Field.tableBytes),
+        static_cast<unsigned long long>(Plan->numRows() * Field.accessSize));
+  }
+  EJIT_DIAG_VERBOSE("small-table func=%s rows=%llu ready=%llu uniform=%llu "
+                    "table=%llu payload=%llu payload_before=%llu "
+                    "sites=%llu table_sites=%llu folded=%llu kept=%llu "
+                    "refused=%llu",
+                    EntryName.str().c_str(),
+                    static_cast<unsigned long long>(Plan->numRows()),
+                    static_cast<unsigned long long>(llvm::count_if(
+                        Plan->rows, [](const EJitSmallTableRow &R) {
+                          return R.ready;
+                        })),
+                    static_cast<unsigned long long>(Plan->uniformFieldCount()),
+                    static_cast<unsigned long long>(Plan->tableFieldCount()),
+                    static_cast<unsigned long long>(Plan->tableBytes()),
+                    static_cast<unsigned long long>(OriginalBytes),
+                    static_cast<unsigned long long>(Stats.mayConstSites),
+                    static_cast<unsigned long long>(Stats.tableReplaced),
+                    static_cast<unsigned long long>(Stats.uniformFolded),
+                    static_cast<unsigned long long>(Stats.keptOriginal),
+                    static_cast<unsigned long long>(Stats.refusedShape));
+  return true;
 }
 
 FunctionPassManager &
@@ -918,6 +1124,13 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             ejit::OptimizationLevel level,
                                             CompileTier tier) {
+  runOptimizationPipeline(M, level, tier, StringRef());
+}
+
+void EJitOptimizer::runOptimizationPipeline(Module &M,
+                                            ejit::OptimizationLevel level,
+                                            CompileTier tier,
+                                            StringRef EntryName) {
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -937,8 +1150,14 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
 
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
-  // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M);
+  // then fold/propagate/simplify the freshly-constant values. The small-table
+  // pass runs here too: a plan's table loads must survive the last replace
+  // round unchanged, and fields exposed only now still become table reads.
+  // A plan lowered in this round blocks the legacy fold for the same entry here
+  // as well, so the last round cannot reintroduce an unrecorded constant.
+  const bool SmallTableLowered = runSmallTablePass(M, EntryName);
+  runStructFieldPassImpl(M, SpecializationContext{},
+                         SmallTableLowered ? EntryName : StringRef());
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);

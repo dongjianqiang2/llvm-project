@@ -73,6 +73,29 @@ public:
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
 
+  /// PR231 whole-entry readiness contract: block the legacy compile-time
+  /// may_const fold for \p EntryName.
+  ///
+  /// When a small-table plan is lowered for an entry, that entry's code is
+  /// shared across the plan's declared domain, so a value frozen here from the
+  /// compile-time source would be a hidden constant dependency that neither the
+  /// plan's recorded admission contract nor its projection contract describes
+  /// or validates (spec §4.1/§6.6). With the fold blocked, the compiled entry
+  /// contains exactly two kinds of reads: plan-backed table/constant reads
+  /// (covered by !ejit.smalltable.contract) and real dynamic source reads
+  /// (spec §5 item 6, §4.2 "keep the original load"). Every blocked load is
+  /// reported through getLegacyFoldsBlocked().
+  ///
+  /// An empty name (the default) leaves the baseline behavior untouched, so an
+  /// entry without a lowered plan still gets the existing AOT fold.
+  void blockLegacyConstantFolds(StringRef EntryName) {
+    legacyFoldBlockedEntry_ = EntryName.str();
+  }
+
+  /// Number of may_const loads kept as real loads because
+  /// blockLegacyConstantFolds() applied to their function.
+  uint64_t getLegacyFoldsBlocked() const { return legacyFoldsBlocked_; }
+
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Identify loads using the same metadata and field-offset fallback as the
   /// replacement pass. The returned sites are read-only audit data.
@@ -120,6 +143,11 @@ private:
   GVPeriodMap gvPeriodMap_;
   MayConstOffsetMap mayConstFieldMap_;
   bool mapsBuilt_ = false;
+
+  /// Entry whose legacy may_const fold is blocked (see
+  /// blockLegacyConstantFolds); empty means the baseline behavior.
+  std::string legacyFoldBlockedEntry_;
+  uint64_t legacyFoldsBlocked_ = 0;
 };
 
 } // namespace ejit

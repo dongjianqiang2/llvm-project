@@ -28,10 +28,32 @@ enum class EJitCodePoolPlacement { NearFixed, FarDynamic };
 
 /// Construct an EJitCodePoolManager wired to the SRE platform: raw memory from
 /// SRE_MemDbgAlloc (partition EJIT_SRE_CODE_POOL_PTNO) and sealing via
-/// enable_ex. On a host without real SRE symbols, weak fallbacks make this a
-/// link-safe no-op-seal / aligned-host-alloc manager (see EJitSrePlatform.cpp).
+/// enable_ex. Platform primitives have no weak/no-op definitions: the final
+/// link must supply their actual implementations.
 std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager(
     EJitCodePoolPlacement Placement = EJitCodePoolPlacement::NearFixed);
+
+/// Explicit opt-in, BEFORE any near manager exists, to one shared allocator
+/// over the actual linker reservation. Default OFF. All ordinary/common near
+/// managers then claim disjoint whole pools through the same monotonic cursor.
+/// No disable/reset/recycle operation exists: shutdown, failure and destruction
+/// cannot make an old executable window available to another manager.
+Error enableSreSharedFixedCodePoolDomain();
+/// Explicit-bounds form for product validation/tests. Bounds MUST exactly
+/// identify the actual __ejit_code_start/end reservation, never guessed VAs.
+Error enableSreSharedFixedCodePoolDomain(uintptr_t ReservationStart,
+                                       uintptr_t ReservationEnd);
+bool sreSharedFixedCodePoolDomainActive();
+struct EJitSreFixedCodePoolDomainInfo {
+  bool enabled = false;
+  uintptr_t reservationStart = 0;
+  uintptr_t reservationEnd = 0;
+  uintptr_t usableBase = 0;
+  uint64_t usableBytes = 0;
+  uint64_t usedBytes = 0;
+  uint64_t poolSize = 0;
+};
+EJitSreFixedCodePoolDomainInfo getSreFixedCodePoolDomainInfo();
 
 /// Install execute permission for the legacy 2MiB code pool containing
 /// \p FnPtr in the calling core's translation context. This is intentionally a

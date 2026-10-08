@@ -29,6 +29,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h" // seal/split granule contract
 
 #include <cstdint>
+#include <limits>
+#include <type_traits>
 
 #ifndef EJIT_SRE_CODE_POOL_SIZE
 #define EJIT_SRE_CODE_POOL_SIZE                                                \
@@ -131,6 +133,84 @@ extern const unsigned char __ejit_code_end[];
 #endif
 
 namespace {
+// Same real shared mapping as the taskpool, without a dynamic constructor that
+// another core's init-array could repeat. Ready publishes every identity field.
+// State 0=unused/default OFF, 1=legacy near factory already constructed,
+// 2=shared domain ready, 3=initializing. State/cursor never reset.
+struct alignas(64) SharedFixedCodePoolDomain {
+  llvm::ejit::EJitAtomicU32 state;
+  llvm::ejit::EJitAtomicU64 signature;
+  llvm::ejit::EJitAtomicUPtr reservationStart, reservationEnd, usableBase;
+  llvm::ejit::EJitAtomicU64 usableBytes, poolSize, usedBytes;
+};
+static_assert(std::is_trivially_default_constructible<
+                  SharedFixedCodePoolDomain>::value,
+              "shared fixed domain must have no init-array constructor");
+static_assert(std::is_standard_layout<SharedFixedCodePoolDomain>::value,
+              "shared fixed domain must have fixed scalar layout");
+EJIT_SHARED_SECTION SharedFixedCodePoolDomain SharedFixedDomain;
+
+bool linkerFixedDomain(uintptr_t &Start, uintptr_t &End, uintptr_t &Base,
+                       uint64_t &Bytes, uint64_t &PoolSize) {
+#ifdef EJIT_FIXED_CODE_POOL
+  Start = reinterpret_cast<uintptr_t>(__ejit_code_start);
+  End = reinterpret_cast<uintptr_t>(__ejit_code_end);
+  if (!Start || (Start & (k4KiB - 1)) || End <= Start ||
+      (End & (k4KiB - 1)) || Start > UINTPTR_MAX - (k2MiB - 1))
+    return false;
+  Base = (Start + k2MiB - 1) & ~(static_cast<uintptr_t>(k2MiB) - 1);
+  const uintptr_t AlignedEnd = End & ~(static_cast<uintptr_t>(k2MiB) - 1);
+  if (AlignedEnd <= Base || kSrePoolSize == 0 ||
+      kSrePoolSize > std::numeric_limits<size_t>::max() - (k2MiB - 1))
+    return false;
+  PoolSize = (kSrePoolSize + k2MiB - 1) & ~(uint64_t(k2MiB) - 1);
+  Bytes = AlignedEnd - Base;
+  return PoolSize != 0 && PoolSize <= Bytes;
+#else
+  (void)Start; (void)End; (void)Base; (void)Bytes; (void)PoolSize;
+  return false;
+#endif
+}
+
+bool sharedFixedDomainMatchesLinker() {
+#if defined(EJIT_FIXED_CODE_POOL) && defined(EJIT_CODE_POOL_4K_SEAL) && \
+    defined(EJIT_SRE_ENABLE_EX)
+  uintptr_t Start = 0, End = 0, Base = 0;
+  uint64_t Bytes = 0, PoolSize = 0;
+  return SharedFixedDomain.state.loadAcquire() == 2 &&
+         SharedFixedDomain.signature.loadRelaxed() == 0x454a4658444f4d31ULL &&
+         linkerFixedDomain(Start, End, Base, Bytes, PoolSize) &&
+         SharedFixedDomain.reservationStart.loadRelaxed() == Start &&
+         SharedFixedDomain.reservationEnd.loadRelaxed() == End &&
+         SharedFixedDomain.usableBase.loadRelaxed() == Base &&
+         SharedFixedDomain.usableBytes.loadRelaxed() == Bytes &&
+         SharedFixedDomain.poolSize.loadRelaxed() == PoolSize &&
+         SharedFixedDomain.usedBytes.loadAcquire() <= Bytes;
+#else
+  return false;
+#endif
+}
+
+void *claimSharedFixedPool(size_t Size) {
+  if (!sharedFixedDomainMatchesLinker() ||
+      Size != SharedFixedDomain.poolSize.loadRelaxed())
+    return nullptr;
+  const uint64_t Capacity = SharedFixedDomain.usableBytes.loadRelaxed();
+  uint64_t Used = SharedFixedDomain.usedBytes.loadAcquire();
+  for (;;) {
+    if (Used > Capacity || Size > Capacity - Used) {
+      EJIT_DIAG("shared fixed domain exhausted used=%llu capacity=%llu "
+                "poolSize=%zu; no reuse or dynamic fallback",
+                static_cast<unsigned long long>(Used),
+                static_cast<unsigned long long>(Capacity), Size);
+      return nullptr;
+    }
+    if (SharedFixedDomain.usedBytes.compareExchange(Used, Used + Size))
+      return reinterpret_cast<void *>(
+          SharedFixedDomain.usableBase.loadRelaxed() + Used);
+  }
+}
+
 /// Make newly-written JIT code in [Va, Va + Size) observable to instruction
 /// fetch. On AArch64 the I-cache does not snoop D-cache writes, so code
 /// written into a RW page is not executable until the D-cache is cleaned and
@@ -182,6 +262,81 @@ unsigned sealAndSyncCache(uintptr_t Va, size_t Size) {
 }
 } // namespace
 
+llvm::Error llvm::ejit::enableSreSharedFixedCodePoolDomain() {
+#ifdef EJIT_FIXED_CODE_POOL
+  return enableSreSharedFixedCodePoolDomain(
+      reinterpret_cast<uintptr_t>(__ejit_code_start),
+      reinterpret_cast<uintptr_t>(__ejit_code_end));
+#else
+  return make_error<StringError>("shared fixed domain requires fixed code pool",
+                                inconvertibleErrorCode());
+#endif
+}
+
+llvm::Error llvm::ejit::enableSreSharedFixedCodePoolDomain(
+    uintptr_t ReservationStart, uintptr_t ReservationEnd) {
+#if !defined(EJIT_FIXED_CODE_POOL) || !defined(EJIT_CODE_POOL_4K_SEAL) || \
+    !defined(EJIT_SRE_ENABLE_EX)
+  (void)ReservationStart;
+  (void)ReservationEnd;
+  return make_error<StringError>(
+      "shared fixed domain requires fixed pool, 4K sealing and real execute "
+      "permissions", inconvertibleErrorCode());
+#else
+  uintptr_t Start = 0, End = 0, Base = 0;
+  uint64_t Bytes = 0, PoolSize = 0;
+  if (!linkerFixedDomain(Start, End, Base, Bytes, PoolSize) ||
+      ReservationStart != Start || ReservationEnd != End)
+    return make_error<StringError>(
+        "shared fixed domain reservation identity/alignment/bounds invalid",
+        inconvertibleErrorCode());
+  uint32_t Expected = 0;
+  if (!SharedFixedDomain.state.compareExchange(Expected, 3)) {
+    if (Expected == 2 && sharedFixedDomainMatchesLinker())
+      return Error::success(); // SAME identity, no cursor reset.
+    return make_error<StringError>(
+        "shared fixed domain must be enabled before any legacy near manager; "
+        "cannot change or reset a live allocation domain",
+        inconvertibleErrorCode());
+  }
+  SharedFixedDomain.reservationStart.storeRelaxed(Start);
+  SharedFixedDomain.reservationEnd.storeRelaxed(End);
+  SharedFixedDomain.usableBase.storeRelaxed(Base);
+  SharedFixedDomain.usableBytes.storeRelaxed(Bytes);
+  SharedFixedDomain.poolSize.storeRelaxed(PoolSize);
+  SharedFixedDomain.usedBytes.storeRelaxed(0);
+  SharedFixedDomain.signature.storeRelaxed(0x454a4658444f4d31ULL);
+  SharedFixedDomain.state.storeRelease(2);
+  EJIT_DIAG("shared fixed domain enabled: reservation=[0x%llx,0x%llx) "
+            "usable=[0x%llx,+%llu) poolSize=%llu; no reset/reuse",
+            static_cast<unsigned long long>(Start),
+            static_cast<unsigned long long>(End),
+            static_cast<unsigned long long>(Base),
+            static_cast<unsigned long long>(Bytes),
+            static_cast<unsigned long long>(PoolSize));
+  return Error::success();
+#endif
+}
+
+bool llvm::ejit::sreSharedFixedCodePoolDomainActive() {
+  return sharedFixedDomainMatchesLinker();
+}
+
+llvm::ejit::EJitSreFixedCodePoolDomainInfo
+llvm::ejit::getSreFixedCodePoolDomainInfo() {
+  EJitSreFixedCodePoolDomainInfo Info;
+  Info.enabled = sharedFixedDomainMatchesLinker();
+  if (SharedFixedDomain.state.loadAcquire() != 2)
+    return Info;
+  Info.reservationStart = SharedFixedDomain.reservationStart.loadRelaxed();
+  Info.reservationEnd = SharedFixedDomain.reservationEnd.loadRelaxed();
+  Info.usableBase = SharedFixedDomain.usableBase.loadRelaxed();
+  Info.usableBytes = SharedFixedDomain.usableBytes.loadRelaxed();
+  Info.usedBytes = SharedFixedDomain.usedBytes.loadAcquire();
+  Info.poolSize = SharedFixedDomain.poolSize.loadRelaxed();
+  return Info;
+}
+
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
 llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   EJitCodePoolManager::Options Opts;
@@ -220,6 +375,10 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   // every compile). A fixed region gives a stable JIT address range and, when
   // placed within +-128MiB of .text, lets codegen use direct bl/adrp.
   if (Placement == EJitCodePoolPlacement::NearFixed) {
+    uint32_t Unused = 0;
+    // The latch lives in shared memory: another core's factory cannot hide an
+    // earlier legacy manager (even if it has not allocated its first pool).
+    SharedFixedDomain.state.compareExchange(Unused, 1);
     uintptr_t FBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
     uintptr_t FEnd = reinterpret_cast<uintptr_t>(__ejit_code_end);
     uintptr_t AlignedBase = (FBase + (static_cast<uintptr_t>(k2MiB) - 1)) &
@@ -262,6 +421,25 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
     Opts.needsEnableRw = true;
     EJIT_DIAG(
         "makeSreCodePoolManager: code-segment placement -> needsEnableRw=1");
+  }
+  if (Placement == EJitCodePoolPlacement::NearFixed &&
+      SharedFixedDomain.state.loadAcquire() != 1) {
+    if (sharedFixedDomainMatchesLinker()) {
+      Opts.fixedBase = SharedFixedDomain.usableBase.loadRelaxed();
+      Opts.fixedSize = SharedFixedDomain.usableBytes.loadRelaxed();
+      Opts.poolSize = SharedFixedDomain.poolSize.loadRelaxed();
+      Opts.needsEnableRw = true;
+      Opts.sharedFixedAlloc = &claimSharedFixedPool;
+    } else {
+      // An in-progress/foreign domain cannot fall back to a private cursor or
+      // dynamic heap. A rejecting fixed callback makes the first allocation
+      // fail closed without handing the engine a null memory manager.
+      Opts.fixedBase = reinterpret_cast<uintptr_t>(__ejit_code_start);
+      const uintptr_t End = reinterpret_cast<uintptr_t>(__ejit_code_end);
+      Opts.fixedSize = End > Opts.fixedBase ? End - Opts.fixedBase : 1;
+      Opts.sharedFixedAlloc = [](size_t) -> void * { return nullptr; };
+      Opts.needsEnableRw = true;
+    }
   }
 #endif
 

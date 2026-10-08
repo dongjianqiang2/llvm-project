@@ -116,8 +116,29 @@ Error EJitCodePoolManager::newActivePoolLocked() {
     // there is intentionally NO fallback to RawAllocFn, which would break the
     // fixed-address guarantee (the specialization falls back to AOT instead).
     uintptr_t RegionEnd = Opts_.fixedBase + Opts_.fixedSize;
-    uintptr_t Next = alignUpAddr(Opts_.fixedBase + FixedUsed_, Opts_.poolAlign);
-    if (Next + Opts_.poolSize > RegionEnd) {
+    uintptr_t Next;
+    if (Opts_.sharedFixedAlloc) {
+      if (!Opts_.fixedBase || RegionEnd < Opts_.fixedBase)
+        return make_error<StringError>(
+            "EJitCodePool: invalid shared fixed code-pool region",
+            inconvertibleErrorCode());
+      void *Claim = Opts_.sharedFixedAlloc(Opts_.poolSize);
+      Next = addr(Claim);
+      if (!Claim)
+        return make_error<StringError>(
+            "EJitCodePool: shared fixed code-pool domain exhausted; no fallback "
+            "to dynamic allocation",
+            inconvertibleErrorCode());
+      if ((Next & (Opts_.poolAlign - 1)) || Next < Opts_.fixedBase ||
+          Next > RegionEnd || Opts_.poolSize > RegionEnd - Next)
+        return make_error<StringError>(
+            "EJitCodePool: shared fixed allocator returned an unaligned or "
+            "out-of-domain pool",
+            inconvertibleErrorCode());
+    } else {
+      Next = alignUpAddr(Opts_.fixedBase + FixedUsed_, Opts_.poolAlign);
+    }
+    if (Next > RegionEnd || Opts_.poolSize > RegionEnd - Next) {
       EJIT_DIAG("newActivePool FAIL: fixed region exhausted next=0x%llx +%zu > "
                 "end=0x%llx (used=%zu of %zu)",
                 static_cast<unsigned long long>(Next), Opts_.poolSize,
@@ -131,7 +152,9 @@ Error EJitCodePoolManager::newActivePoolLocked() {
     }
     RawBytes = reinterpret_cast<uint8_t *>(Next);
     Base = RawBytes; // already poolAlign-aligned by the carve
-    FixedUsed_ = (Next + Opts_.poolSize) - Opts_.fixedBase;
+    FixedUsed_ = Opts_.sharedFixedAlloc
+                     ? FixedUsed_ + Opts_.poolSize
+                     : (Next + Opts_.poolSize) - Opts_.fixedBase;
     EJIT_DIAG("newActivePool: fixed region base=%p size=%zu used=%zu/%zu",
               static_cast<void *>(Base), Opts_.poolSize, FixedUsed_,
               Opts_.fixedSize);

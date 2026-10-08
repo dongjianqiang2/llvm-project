@@ -1,7 +1,7 @@
 #!/bin/bash
 # EJIT x86 ejit.o pipeline — native build with clang, no bare-metal trimming.
 # Run from the llvm-project root, after building:
-#   ninja -C build_release_x86 clang LLVMEJIT lld
+#   tools/build-limited.sh ninja -C build_release_x86 clang LLVMEJIT lld
 #
 # Uses the build directory's own clang/clang++ and ld.lld (native x86).
 # No --exclude needed; the resulting ejit.o is ~37 MB (larger than the

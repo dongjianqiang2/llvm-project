@@ -12,7 +12,11 @@
 #include "llvm/ExecutionEngine/EJIT/EJitError.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#endif
 #include <memory>
 #include <string>
 
@@ -31,6 +35,10 @@ class EJitCompileDriver;
 class EJitLogger;
 class EJitTaskPool;
 class EJitSharedTaskPool;
+namespace detail {
+class OwnerWorkerContext;
+class SmallTableOwnerRequestAccess;
+}
 
 /// Main user-facing class for EmbeddedJIT. Owns all runtime components.
 class EJit {
@@ -140,6 +148,9 @@ public:
   /// shared build). May be null if the compile driver was not constructed.
   EJitSharedTaskPool *sharedTaskPool();
   const EJitSharedTaskPool *sharedTaskPool() const;
+  EJitSharedTaskPool::OwnerControlResult runControlOnOwnerAndWait(
+      std::function<void()> Work, uint32_t WaitRounds = 1u << 20);
+  bool abortFunctionPgoOnOwner(uint32_t FuncIndex);
 #endif
 
   /// Access the module loader (for funcIndex → funcName resolution in
@@ -173,7 +184,50 @@ public:
   /// A non-owner facade forwards the request to the compile-owner worker.
   bool printMayConstRanking();
 
+  //===--------------------------------------------------------------------===//
+  // PR231 small-table normal path (default OFF).
+  //
+  // Enabling constructs the one normal-path integration object for THIS
+  // instance, installs it process-wide so every application-facing dispatch
+  // entry consults its publication gate, and installs the instance's real
+  // invalidation path (shared cache/L0/inline-cache retirement) as the host's
+  // retraction hook. Until it is called, no dispatch entry is affected.
+  // `Facts` is the product configuration-commit binding; a null one means the
+  // caller cannot prove readiness and the call fails closed.
+  //===--------------------------------------------------------------------===//
+  Error enableSmallTable(std::shared_ptr<EJitSmallTableFactSource> Facts,
+                         EJitSmallTableHost::Options Opts = {});
+  Error enableSmallTable(const detail::OwnerWorkerContext &Worker,
+                         std::shared_ptr<EJitSmallTableFactSource> Facts,
+                         EJitSmallTableHost::Options Opts = {});
+  /// Tear the small-table normal path down: retract every published slot,
+  /// cancel the session and uninstall the process-wide gate.
+  void disableSmallTable();
+  void disableSmallTable(const detail::OwnerWorkerContext &Worker);
+  /// The instance's small-table integration object, or null when disabled.
+  EJitSmallTableHost *smallTableHost() { return smallTableHost_.get(); }
+  const EJitSmallTableHost *smallTableHost() const {
+    return smallTableHost_.get();
+  }
+
 private:
+  friend struct EJitWrapperRuntimeTestAccess;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  friend class detail::SmallTableOwnerRequestAccess;
+  EJitSharedTaskPool::OwnerControlResult runControlOnOwnerAndWait(
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  EJitSharedTaskPool::OwnerControlResult runControlOnOwnerAndWait(
+      const detail::OwnerWorkerContext &Worker,
+      std::function<void(const detail::OwnerWorkerContext &)> Work,
+      uint32_t WaitRounds = 1u << 20);
+  bool abortFunctionPgoOnOwner(const detail::OwnerWorkerContext &Worker,
+                               uint32_t FuncIndex);
+#endif
+  Error enableSmallTableImpl(const detail::OwnerWorkerContext *Worker,
+                             std::shared_ptr<EJitSmallTableFactSource> Facts,
+                             EJitSmallTableHost::Options Opts);
+  void disableSmallTableImpl(const detail::OwnerWorkerContext *Worker);
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;
   std::unique_ptr<EJitModuleLoader> moduleLoader_;
@@ -181,6 +235,7 @@ private:
   std::unique_ptr<EJitLogger> logger_;
 #endif
   std::unique_ptr<EJitCompileDriver> compileDriver_;
+  std::unique_ptr<EJitSmallTableHost> smallTableHost_;
 
   /// Record the first construction-time registration failure (later ones are
   /// ignored so the earliest root cause is reported).
