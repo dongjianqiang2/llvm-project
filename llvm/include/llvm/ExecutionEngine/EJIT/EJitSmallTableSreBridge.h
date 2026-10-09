@@ -155,8 +155,11 @@ typedef struct {
 /// unchanged; no call automatically enables small-table policy or changes PGO.
 int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *bindings);
 /// Validate/prepare an actual static shared-data range on the calling core.
-/// Built-in mode requires containment in the real __ejit_shared_start/end
-/// linker range. This does not authorize arbitrary heap or executable memory.
+/// Built-in mode requires containment in ONE actual PASS2 shared-object record
+/// in the existing .ejit_period registry, with compatible RO/RW access. Rebuild
+/// AOT with the existing small-table-hooks opt-in; no new linker bounds or SDK
+/// macro is needed. The existing coherent same-VA deployment remains required.
+/// This does not authorize arbitrary heap or executable memory.
 int ejit_small_table_sre_prepare_data(uintptr_t address, uint64_t bytes,
                                      uint32_t access);
 int ejit_small_table_sre_request(const ejit_small_table_sre_request_t *request);

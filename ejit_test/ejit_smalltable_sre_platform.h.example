@@ -1,8 +1,10 @@
 /* Historical custom-binding template, kept for callers of the released C ABI.
  * The stock single-C demo no longer includes this file or needs SDK macros.
  * It passes NULL prepare_shared_data/delay_ticks to use runtime's existing SRE
- * scheduler and checked static/fixed-domain data ranges. There is no task-self
- * API requirement and no default successful mapping stub.
+ * scheduler, automatic PASS2 static-object records in the existing period
+ * registry, and actual fixed-domain data ranges. No new SDK final-linker bounds,
+ * task-self API, or default successful mapping stub are required. Rebuild AOT
+ * and runtime together; registry declarations do not prove physical coherence.
  *
  * A product needing a different storage model may STILL provide a genuine
  * ejit_small_table_sre_bindings_t::prepare_shared_data callback. That optional

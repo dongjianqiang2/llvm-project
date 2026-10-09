@@ -4104,20 +4104,174 @@ TEST_F(GeneratedWrapperSreBridgeTest,
   singleTuCold(64, /*WorkerSixCallerSixteen=*/true);
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
-       MissingRealSharedBoundsRemainsFailClosedWithoutTaskId) {
+       BuiltinSetupCannotReplaceAnExistingMappingOverride) {
   ejit_small_table_sre_bindings_t Missing{};
   Missing.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
   Missing.structSize = sizeof(Missing);
   Missing.waitRounds = 65536;
   Missing.delay_ticks = bridgeLinuxDelay;
   Missing.current_task_id = nullptr;
-  EXPECT_EQ(ejit_small_table_sre_prepare(&Missing), EJIT_STAB_SRE_BLOCKED)
-      << "without genuine builtin bounds a NULL hook is not a mapping proof";
-  // Failed preparation must not clobber the existing immutable, real mapping
+  EXPECT_EQ(ejit_small_table_sre_prepare(&Missing), EJIT_STAB_SRE_BUSY)
+      << "the live mapping override remains immutable even with builtin inventory";
+  // Refused replacement must not clobber the existing immutable, real mapping
   // binding. The normal cold path must still execute actual counters/profile.
   cold(8);
 }
 #if defined(EJIT_SRE_CODE_POOL) && !defined(EJIT_FREESTANDING)
+class SharedObjectInventoryRuntimeTest : public testing::Test {
+protected:
+  uint64_t Objects[4] = {};
+  std::unique_ptr<llvm::ejit::detail::ScopedSmallTableSreStaticDomainForTest> Inventory;
+  ejit_reg_entry_t record(ejit_reg_type_t Kind, const void *Object, uint64_t Bytes) {
+    return {Kind, "inventory.test-object", nullptr, Object, Bytes};
+  }
+  void prepare(ArrayRef<ejit_reg_entry_t> Records) {
+    Inventory = std::make_unique<llvm::ejit::detail::ScopedSmallTableSreStaticDomainForTest>(Records);
+    ASSERT_TRUE(Inventory->valid());
+    ejit_small_table_sre_bindings_t B{};
+    B.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
+    B.structSize = sizeof(B);
+    ASSERT_EQ(ejit_small_table_sre_prepare(&B), EJIT_STAB_SRE_OK);
+  }
+  int check(const void *Object, uint64_t Bytes, uint32_t Access = EJIT_STAB_SRE_DATA_READ) {
+    return ejit_small_table_sre_prepare_data(reinterpret_cast<uintptr_t>(Object), Bytes, Access);
+  }
+};
+TEST_F(SharedObjectInventoryRuntimeTest, MissingInventoryRefusesExternalObjectNotBootstrap) {
+  prepare(ArrayRef<ejit_reg_entry_t>{});
+  EXPECT_EQ(check(Objects, sizeof(Objects)), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, ReadOnlyRecordAllowsReadButNeverWrite) {
+  auto R = record(EJIT_REG_SHARED_OBJECT_RO, Objects, sizeof(Objects));
+  prepare(R);
+  EXPECT_EQ(check(Objects, sizeof(Objects)), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(check(Objects, sizeof(Objects), EJIT_STAB_SRE_DATA_WRITE), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, ReadWriteRecordAllowsOnlyItsExactExtent) {
+  auto R = record(EJIT_REG_SHARED_OBJECT_RW, Objects, sizeof(Objects));
+  prepare(R);
+  EXPECT_EQ(check(Objects, sizeof(Objects), EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(check(&Objects[3], sizeof(Objects[3])), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(check(Objects, sizeof(Objects) + 1), EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(check(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(Objects) - 1), 1), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, CannotStitchAdjacentObjectsOrGrantUnknownHeap) {
+  ejit_reg_entry_t R[] = {record(EJIT_REG_SHARED_OBJECT_RW, Objects, 8),
+                          record(EJIT_REG_SHARED_OBJECT_RW, Objects + 1, 8)};
+  prepare(R);
+  EXPECT_EQ(check(Objects, 16), EJIT_STAB_SRE_BLOCKED);
+  auto Unknown = std::make_unique<uint64_t>(1);
+  EXPECT_EQ(check(Unknown.get(), 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, ExactCoalescedTuDuplicateIsOneObject) {
+  auto R = record(EJIT_REG_SHARED_OBJECT_RW, Objects, sizeof(Objects));
+  ejit_reg_entry_t Records[] = {R, R};
+  prepare(Records);
+  EXPECT_EQ(check(Objects, sizeof(Objects), EJIT_STAB_SRE_DATA_WRITE), EJIT_STAB_SRE_OK);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, ConflictingDuplicateCannotUpgradeReadOnly) {
+  ejit_reg_entry_t Records[] = {record(EJIT_REG_SHARED_OBJECT_RO, Objects, sizeof(Objects)),
+                               record(EJIT_REG_SHARED_OBJECT_RW, Objects, sizeof(Objects))};
+  prepare(Records);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(check(Objects, 8, EJIT_STAB_SRE_DATA_WRITE), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, OverlapCannotWidenAnObject) {
+  ejit_reg_entry_t Records[] = {record(EJIT_REG_SHARED_OBJECT_RW, Objects, 16),
+                               record(EJIT_REG_SHARED_OBJECT_RW, Objects + 1, 24)};
+  prepare(Records);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, MalformedRecordAfterValidMatchStillFailsClosed) {
+  ejit_reg_entry_t Records[] = {record(EJIT_REG_SHARED_OBJECT_RW, Objects, sizeof(Objects)),
+                               record(EJIT_REG_SHARED_OBJECT_RW, nullptr, 8)};
+  prepare(Records);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, OverflowingRecordAndInvalidAccessFailClosed) {
+  auto R = record(EJIT_REG_SHARED_OBJECT_RW, reinterpret_cast<const void *>(UINTPTR_MAX - 1), 8);
+  prepare(R);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(check(Objects, 8, 0), EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(check(Objects, 8, 4), EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(check(reinterpret_cast<const void *>(UINTPTR_MAX - 1), 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, OldSymbolRecordIsNotAnObjectGrant) {
+  auto R = record(EJIT_REG_SYMBOL, Objects, sizeof(Objects));
+  prepare(R);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, InventoryCapacityExhaustionFailsClosed) {
+  std::vector<ejit_reg_entry_t> Records(257,
+      record(EJIT_REG_SHARED_OBJECT_RW, Objects, sizeof(Objects)));
+  prepare(Records);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, ZeroExtentAndMissingNameAreNotDefinitions) {
+  auto R = record(EJIT_REG_SHARED_OBJECT_RW, Objects, 0);
+  prepare(R);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+  Inventory.reset();
+  R.size = sizeof(Objects);
+  R.name1 = nullptr;
+  prepare(R);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, DisabledInventoryDoesNotAuthorizeOldAddress) {
+  auto R = record(EJIT_REG_SHARED_OBJECT_RW, Objects, sizeof(Objects));
+  prepare(R);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_OK);
+  Inventory.reset();
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+  prepare(ArrayRef<ejit_reg_entry_t>{});
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, ForeignRecordSchemaFailsClosed) {
+  auto R = record(EJIT_REG_SHARED_OBJECT_RW, Objects, sizeof(Objects));
+  R.name2 = "not-a-shared-object-record";
+  prepare(R);
+  EXPECT_EQ(check(Objects, 8), EJIT_STAB_SRE_BLOCKED);
+}
+TEST_F(SharedObjectInventoryRuntimeTest, ActualPass2MachineRelocationsWorkBeforeRuntimeInit) {
+  ASSERT_TRUE(kTargetsInitialized);
+  auto Context = std::make_unique<LLVMContext>();
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(R"(
+    @actual = global { i8, i64, i8 } zeroinitializer, section ".mc_shared"
+    define ptr @inventory_object() { ret ptr @actual }
+  )", Error, *Context);
+  ASSERT_NE(M, nullptr);
+  const bool Saved = EnableEJitSmallTableHooks;
+  auto Restore = make_scope_exit([&] { EnableEJitSmallTableHooks = Saved; });
+  EnableEJitSmallTableHooks = true;
+  auto J = orc::LLJITBuilder().create();
+  ASSERT_TRUE(bool(J));
+  M->setDataLayout((*J)->getDataLayout());
+  M->setTargetTriple(Triple(sys::getDefaultTargetTriple()));
+  ModuleAnalysisManager AM;
+  EJitRegisterPeriodPass().run(*M, AM);
+  GlobalVariable *Table = nullptr;
+  for (auto &GV : M->globals())
+    if (GV.getSection() == ".ejit_period") Table = &GV;
+  ASSERT_NE(Table, nullptr);
+  auto *Getter = Function::Create(FunctionType::get(PointerType::getUnqual(*Context), false),
+      GlobalValue::ExternalLinkage, "inventory_records", *M);
+  IRBuilder<> B(BasicBlock::Create(*Context, "entry", Getter));
+  B.CreateRet(Table);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  ASSERT_FALSE(bool((*J)->addIRModule(orc::ThreadSafeModule(std::move(M), std::move(Context)))));
+  auto Get = (*J)->lookup("inventory_records");
+  auto Object = (*J)->lookup("inventory_object");
+  ASSERT_TRUE(bool(Get)); ASSERT_TRUE(bool(Object));
+  auto *Records = Get->toPtr<const ejit_reg_entry_t *(*)()>()();
+  void *Address = Object->toPtr<void *(*)()>()();
+  ASSERT_EQ(Records[0].ptr, Address);
+  ASSERT_EQ(Records[0].size, 24u);
+  prepare(ArrayRef<ejit_reg_entry_t>(Records, 1));
+  EXPECT_EQ(check(Address, 24, EJIT_STAB_SRE_DATA_WRITE), EJIT_STAB_SRE_OK);
+  EXPECT_EQ(check(Address, 25), EJIT_STAB_SRE_BLOCKED);
+  Inventory.reset(); // real code/name relocations outlive the inventory scope
+}
 // This models the product's checked static section and exclusive fixed-domain
 // data reservation using REAL native mappings. No public mapping callback and
 // no SDK task-id adapter participates; code/PGO still use actual generated

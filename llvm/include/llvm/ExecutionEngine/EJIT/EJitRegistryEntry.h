@@ -31,19 +31,27 @@ typedef enum {
   EJIT_REG_NONE = 4,      // sentinel (kept at 4 for table ABI stability)
   EJIT_REG_LIFECYCLE = 5, // lifecycle dimType-slot fixup (additive)
   EJIT_REG_FUNCINDEX = 6, // function dense-funcIndex fixup (additive)
-  EJIT_REG_ICACHE_SLOT = 7 // function inline-cache slot-pointer fixup (additive)
+  EJIT_REG_ICACHE_SLOT = 7, // function inline-cache slot-pointer fixup (additive)
+  // Exact static shared-object inventories emitted only under the existing
+  // small-table AOT opt-in. These reuse the original record layout/section;
+  // they are not ordinary JIT symbols or permission-discovery SDK hooks.
+  EJIT_REG_SHARED_OBJECT_RO = 8,
+  EJIT_REG_SHARED_OBJECT_RW = 9
 } ejit_reg_type_t;
 
 typedef struct {
   ejit_reg_type_t type;
   const char
-      *name1; // funcName / periodName / varName / symbolName / lifecycleName
+      *name1; // funcName / periodName / varName / symbolName / lifecycleName /
+              // shared object diagnostic name
   const char *name2; // varName (period/static), MissFn sentinel
                      //   (EJIT_REG_ICACHE_SLOT, branchless tables), else NULL
   const void *ptr;   // bitcode data / baseAddr / symbol addr / &i32 slot /
-                     //   &ptr icache slot base (EJIT_REG_ICACHE_SLOT)
+                     //   &ptr icache slot base (EJIT_REG_ICACHE_SLOT) /
+                     //   exact shared-object base (EJIT_REG_SHARED_OBJECT_*)
   uint64_t size;     // bitcode size / array size / numDims (EJIT_REG_ICACHE_SLOT)
-                     //   / 0
+                     //   / target DataLayout allocation bytes for a shared
+                     //   object / 0
 } ejit_reg_entry_t;
 
 #ifdef __cplusplus

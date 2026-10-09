@@ -324,18 +324,10 @@ def _check_required_sections(path, build_dir, source_sections,
                 raise RuntimeError(
                     "final lipo object did not consolidate .mc_shared inputs "
                     "into one explicit .mc_shared output section")
-            symbols = _nm_defined(path)
-            start = symbols.get("__ejit_shared_start", ())
-            stop = symbols.get("__ejit_shared_end", ())
-            if len(start) != 1 or len(stop) != 1:
-                raise RuntimeError(
-                    "final lipo object lost unique shared-data mapping bounds")
-            try:
-                if int(stop[0][1], 16) <= int(start[0][1], 16):
-                    raise RuntimeError(
-                        "final lipo object has empty shared-data mapping range")
-            except ValueError as error:
-                raise RuntimeError("cannot parse shared-data mapping bounds") from error
+            # Static shared objects are automatically described by PASS2 in
+            # the existing period registry. No additional SDK final-linker
+            # bounds are required; the final application checker verifies
+            # real record relocations, extents and access rather than names.
     if final_merge:
         for section, prefix in ((".ejit_bitcode", "ejit_bitcode"),
                                 (".ejit_period", "ejit_period")):

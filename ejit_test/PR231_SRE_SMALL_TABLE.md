@@ -20,6 +20,9 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
   对实际post-pass IR检查 `pr231_smalltable_entry` 中有
   `ejit_stab_wrapper_enter`、`ejit_stab_wrapper_no_policy_current` 和配对
   `ejit_stab_leave` 调用，不能只看到库导出了同名符号就认为业务已接入。
+  同一选项下，PASS2把真实静态 `.mc_shared` 对象的地址、实际字节数和RO/RW
+  类型自动写入已有 `.ejit_period` 注册表；不要手写登记任意地址的替代记录。
+  包含共享配置或source-state的其它TU也须经过同版PASS2，不能混用旧AOT对象。
 - 保留 `EJIT_SRE_PGO_BRANCH_AUDIT=ON`、诊断、Async 和在线 PGO。
   原产品默认不自动开启小表；本用例通过新 C setup 明确申请。
   沿用已有 BE/SRE 的 `EJIT_SRE_SHARED_TASKPOOL`、`EJIT_SRE_SHARED_CODE_POINTERS`、
@@ -38,18 +41,21 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
 - **默认不用额外 SDK 绑定头或映射宏**。与 PR230/MFS 用例一样，已有 runtime
   worker、共享节和 code pool 接线负责平台工作。用例的旧 bindings ABI 保留，
   `current_task_id`、`delay_ticks`、`prepare_shared_data` 均传 NULL；runtime
-  使用真实共享边界校验、已有 SRE delay 和实际对象权限准备，不装成功空回调。
+  使用编译器自动生成的精确静态对象库存、已有 SRE delay 和实际对象权限准备，
+  不装成功空回调，不接受任意owner堆。
   小表专用表 payload 不再依赖任意 owner `new[]` 跨核可见：显式小表路径从已有
   `__ejit_code_start/end` 固定域获取独占的数据块，在独立 RW/NX 页中分代分配；
   普通 code/T1 counter 沿原实际 range 权限路径。没有新 SDK 函数或全局 allocator
-  改造。缺少真实 bounds/domain、越界、不支持的权限或容量耗尽即拒绝/AOT。
+  改造。缺少真实对象记录/固定域、越界、不支持的权限或容量耗尽即拒绝/AOT。
 - `.mc_shared` 必须在两核映射到同一 VA、同一真正 coherent 存储；共享命令、
-  配置、source-state、output、callback槽及调测flags都在此节。最终 linker 必须
-  在完整节前后定义 `__ejit_shared_start` / `__ejit_shared_end`，runtime 检查真实
-  范围后允许访问；用例在两核setup调用薄 C API `ejit_small_table_sre_prepare_data`
-  检查所有这些实际对象。真实AOT callback代码也须在调用核可执行。固定域内
+  配置、source-state、output、callback槽及调测flags都在此节。**不再需要SDK最终
+  脚本新增 `__ejit_shared_start` / `__ejit_shared_end`，也没有新增SDK宏**。
+  runtime对照已有period注册表中的真实对象地址/sizeof/RO-RW，检查单个对象内
+  的完整范围和访问类型；用例在两核setup通过旧薄C API核对实际对象。
+  runtime自己的共享命令对象沿现有shared-section部署契约，非任意地址登记。
+  真实AOT callback代码也须在调用核可执行。固定域内
   小表页/计数器的同物理共享、cache coherence 和初始静态共享节 R/W 是产品部署
-  契约，不能用相同 VA、section 名或 fingerprint 代替真实板测证明。
+  契约，不能用自动库存、相同 VA、section 名或 fingerprint 代替真实板测证明。
 - 每核私有 runtime/构造器状态必须保持私有；两核各消费同一套注册。
   默认每核首次命令调用一次 `call_init_array_functions()`。若产品启动已经
   完整做过构造，将用例编为 `EJIT_PR231_CALL_INIT_ARRAY=0`，不能重复构造。
@@ -123,19 +129,11 @@ T2以 `test_ejit_smalltable_print` 的 `tier=2/full_profile=1`、真实入口计
 
 ## lipo / 最终对象检查
 
-SDK 最终链接脚本也要合并全部共享输入并重新定义实际边界（lipo 两阶段已保留）：
-
-```ld
-.mc_shared : ALIGN(64) {
-  __ejit_shared_start = .;
-  KEEP(*(.mc_shared .mc_shared.*))
-  __ejit_shared_end = .;
-}
-```
-
-该段应沿用现有产品共享内存 REGION/loader映射，不另放入普通核私有 `.data`。
-边界必须覆盖完整最终节，不沿用部分链接时的旧地址；检查器会拒绝缺失/重名边界、
-ABS假地址、边界与节不一致，以及对象extent越界。仅边界正确不证明同物理coherence。
+沿用PR230/MFS已有共享节REGION/loader映射，以及原 `.ejit_bitcode/.ejit_period`
+注册区的保留/边界规则即可，不新增共享节起止符号。lipo两阶段仍保留实际
+`.mc_shared` 和现有注册表，不能把共享对象放入核私有 `.data`，也不能strip符号表。
+PASS2新增记录沿已有40字节注册ABI，type8为只读、type9为读写，不改变旧记录布局。
+旧 `__ejit_shared_start/end` 若产品已有可以保留，但不再参与小表授权或检查门槛。
 
 在本次 runtime 包的 `gc-merge` 和 `merge` 都使用 `--require-small-table-sre`；
 已有 AArch64 脚本可设置 `EJIT_REQUIRE_SMALL_TABLE_SRE=1`。最终含用例的合并输入
@@ -149,7 +147,11 @@ python3 ejit_test/check_pr231_board_symbols.py merged_ejit_smalltable_test.o --r
 ```
 
 若 SDK 工程用自己的最终 linker script，仍要对**实际上板传输的文件**运行末项检查，
-其中 ET_REL 保持默认 `--kind object`，ET_EXEC/ET_DYN 显式加 `--kind linked`。
+其中 ET_REL 保持默认 `--kind object`，ET_EXEC 显式加 `--kind linked`。
+检查器会解析实际AArch64 ABS64重定位（含section-symbol+addend）验证每个对象的
+真实地址/完整sizeof/读写记录，而不是只查字符串或符号名字。ET_DYN涉及loader动态
+重定位，目前明确拒绝，不能拿ELF解析成功冒充已证明加载后的地址；对SDK中间ET_REL
+或最终ET_EXEC检查，并另外保留真实loader证据。
 并在发送/接收端核对 SHA256。检查包含真实符号表、大小端/ELF属性、唯一 hook 和 shell
-入口、非空 bitcode/period 注册边界及 `.mc_shared`。它不证明所有 SRE 未定义符号已由
+入口、非空 bitcode/period 注册边界、7个精确RW对象记录及 `.mc_shared`。它不证明所有 SRE 未定义符号已由
 SDK解析或 DLIB loader 已接受；保留最终 SDK 链接日志和板端加载结果。

@@ -11,6 +11,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
@@ -35,11 +36,11 @@ using namespace llvm::ejit;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 extern "C" {
 #ifdef EJIT_FREESTANDING
-extern const unsigned char __ejit_shared_start[];
-extern const unsigned char __ejit_shared_end[];
+extern const ejit_reg_entry_t __start_ejit_period[];
+extern const ejit_reg_entry_t __stop_ejit_period[];
 #else
-extern const unsigned char __ejit_shared_start[] __attribute__((weak));
-extern const unsigned char __ejit_shared_end[] __attribute__((weak));
+extern const ejit_reg_entry_t __start_ejit_period[] __attribute__((weak));
+extern const ejit_reg_entry_t __stop_ejit_period[] __attribute__((weak));
 #endif
 }
 namespace {
@@ -103,9 +104,8 @@ uint64_t LocalWorkerTask = 0;
 EJitSharedTaskPool *LocalWorkerPool = nullptr;
 Command LocalCommands[CommandSlots] = {}; // private scratch, never shared
 #ifndef EJIT_FREESTANDING
-constexpr uint32_t TestStaticRangeLimit = 33;
-struct StaticRangeForTest { uintptr_t address; uint64_t bytes; };
-StaticRangeForTest TestStaticRanges[TestStaticRangeLimit] = {};
+constexpr uint32_t TestStaticRangeLimit = 257; // includes capacity+1 injection
+ejit_reg_entry_t TestStaticRanges[TestStaticRangeLimit] = {};
 std::atomic<uint32_t> TestStaticRangeCount{0};
 std::atomic<bool> TestStaticDomainActive{false};
 #endif
@@ -144,36 +144,103 @@ bool isActualBridgeWorker(EJitSharedTaskPool &Pool,
   return LocalWorkerPool == &Pool && load32(&LocalPrepared) &&
          Worker.validFor(Pool);
 }
-bool staticSharedRange(uintptr_t Address, uint64_t Bytes) {
-  if (!Address || !Bytes || Bytes > UINTPTR_MAX - Address)
-    return false;
+struct DataCheck {
+  const char *reason;
+  const char *object = "unknown";
+  bool ready() const { return !reason; }
+};
+bool sharedObjectRecord(const ejit_reg_entry_t &R) {
+  return R.type == EJIT_REG_SHARED_OBJECT_RO ||
+         R.type == EJIT_REG_SHARED_OBJECT_RW;
+}
+DataCheck staticSharedRange(uintptr_t Address, uint64_t Bytes, uint32_t Access) {
+  // Runtime-owned control is an exact, statically placed POD object, not a
+  // wildcard section/heap grant. LocalCommands is intentionally NOT admitted.
+  const uintptr_t Control = reinterpret_cast<uintptr_t>(&Shared);
+  if (Address >= Control && Bytes <= sizeof(Shared) &&
+      Address - Control <= sizeof(Shared) - Bytes)
+    return {nullptr, "runtime.SharedControl"};
+  const ejit_reg_entry_t *Records = __start_ejit_period;
+  const uintptr_t Start = reinterpret_cast<uintptr_t>(Records);
+  const uintptr_t End = reinterpret_cast<uintptr_t>(__stop_ejit_period);
+  size_t Count = 0;
 #ifndef EJIT_FREESTANDING
   if (TestStaticDomainActive.load(std::memory_order_acquire)) {
-    const uint32_t Count = TestStaticRangeCount.load(std::memory_order_acquire);
-    for (uint32_t I = 0; I < Count; ++I) {
-      const auto &R = TestStaticRanges[I];
-      if (Address >= R.address && Address + Bytes <= R.address + R.bytes)
-        return true;
-    }
-    return false;
-  }
+    Records = TestStaticRanges;
+    Count = TestStaticRangeCount.load(std::memory_order_acquire);
+  } else
 #endif
-  const uintptr_t Start = reinterpret_cast<uintptr_t>(__ejit_shared_start);
-  const uintptr_t End = reinterpret_cast<uintptr_t>(__ejit_shared_end);
-  return Start && End > Start && Address >= Start && Address + Bytes <= End;
+  {
+    if (!Start || End <= Start)
+      return {"missing-period-inventory: rebuild AOT with small-table hooks"};
+    if (Start % alignof(ejit_reg_entry_t) ||
+        (End - Start) % sizeof(ejit_reg_entry_t) ||
+        (End - Start) / sizeof(ejit_reg_entry_t) > 65536)
+      return {"malformed-or-exhausted-period-inventory"};
+    Count = (End - Start) / sizeof(ejit_reg_entry_t);
+  }
+  // Validate the complete bounded inventory before approving any object.
+  // In particular, an overlapping RW record cannot upgrade an RO object.
+  const ejit_reg_entry_t *Match = nullptr;
+  const ejit_reg_entry_t *Checked[256]; // bounded scratch, no ctor/heap/cache
+  size_t SharedCount = 0;
+  for (size_t I = 0; I < Count; ++I) {
+    const auto &R = Records[I];
+    if (!sharedObjectRecord(R)) continue;
+    if (SharedCount == 256) return {"shared-object-inventory-exhausted"};
+    const uintptr_t Base = reinterpret_cast<uintptr_t>(R.ptr);
+    if (!R.name1 || R.name2 || !Base || !R.size || R.size > UINTPTR_MAX - Base)
+      return {"malformed-shared-object-record"};
+    for (size_t J = 0; J < SharedCount; ++J) {
+      const auto &Peer = *Checked[J];
+      const uintptr_t PeerBase = reinterpret_cast<uintptr_t>(Peer.ptr);
+      // Linkonce/weak definitions from distinct TUs may coalesce into ONE
+      // object. Identical extent/access is harmless; never upgrade a conflict.
+      if (Base == PeerBase && R.size == Peer.size && R.type == Peer.type)
+        continue;
+      if (Base < PeerBase + Peer.size && PeerBase < Base + R.size)
+        return {"overlapping-shared-object-records", R.name1};
+    }
+    Checked[SharedCount++] = &R;
+    if (Address >= Base && Address - Base < R.size) {
+      if (Bytes > R.size - (Address - Base))
+        return {"range-crosses-object-boundary", R.name1};
+      Match = &R;
+    }
+  }
+  if (!SharedCount)
+    return {"missing-shared-object-records: rebuild AOT with small-table hooks"};
+  if (!Match) return {"address-not-in-AOT-shared-object-inventory"};
+  if ((Access & EJIT_STAB_SRE_DATA_WRITE) &&
+      Match->type != EJIT_REG_SHARED_OBJECT_RW)
+    return {"write-request-for-read-only-object", Match->name1};
+  return {nullptr, Match->name1};
+}
+DataCheck checkData(uintptr_t Address, uint64_t Bytes, uint32_t Access) {
+  if (!Address || !Bytes || Bytes > UINTPTR_MAX - Address)
+    return {"invalid-or-overflowing-range"};
+  if (!Access || (Access & ~(EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE)))
+    return {"invalid-access-flags"};
+  if (!load32(&LocalPrepared)) return {"bridge-not-prepared"};
+  if (LocalBindings.prepare_shared_data) {
+    if (LocalBindings.prepare_shared_data(LocalBindings.context, Address,
+                                         Bytes, Access) != 0)
+      return {"platform-mapping-override-refused"};
+    return {nullptr, "platform-mapping-override"};
+  }
+  // Immutable PASS2 records prove exact object origin/size/access. The product
+  // still supplies its existing same-VA, coherent shared-data deployment; this
+  // check does not discover or invent a physical mapping/permission operation.
+  return staticSharedRange(Address, Bytes, Access);
 }
 bool dataReady(uintptr_t Address, uint64_t Bytes, uint32_t Access) {
-  if (!Address || !Bytes || Bytes > UINTPTR_MAX - Address ||
-      !Access || (Access & ~(EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE)) ||
-      !load32(&LocalPrepared))
-    return false;
-  if (LocalBindings.prepare_shared_data)
-    return LocalBindings.prepare_shared_data(LocalBindings.context, Address,
-                                              Bytes, Access) == 0;
-  // Reuse the product's existing coherent RW shared-section deployment
-  // contract. Bounds validate membership, not physical/cache-coherence
-  // discovery. Unknown heap addresses never receive automatic approval.
-  return staticSharedRange(Address, Bytes);
+  return checkData(Address, Bytes, Access).ready();
+}
+void reportDataRefusal(uintptr_t Address, uint64_t Bytes, uint32_t Access,
+                       const DataCheck &Result) {
+  EJIT_DIAG("SRE small-table data refused: object=%s address=0x%llx bytes=%llu access=0x%x reason=%s",
+            Result.object, static_cast<unsigned long long>(Address),
+            static_cast<unsigned long long>(Bytes), Access, Result.reason);
 }
 struct LocalCommand {
   Command *value = nullptr;
@@ -976,10 +1043,22 @@ namespace llvm { namespace ejit {
 #ifndef EJIT_FREESTANDING
 detail::ScopedSmallTableSreStaticDomainForTest::
 ScopedSmallTableSreStaticDomainForTest(ArrayRef<EJitWritableRange> Ranges) {
+  SmallVector<ejit_reg_entry_t, 16> Records;
+  for (const auto &R : Ranges)
+    Records.push_back({EJIT_REG_SHARED_OBJECT_RW, "hosted.static-object",
+                       nullptr, reinterpret_cast<const void *>(R.addr), R.size});
+  initialize(Records);
+}
+detail::ScopedSmallTableSreStaticDomainForTest::
+ScopedSmallTableSreStaticDomainForTest(ArrayRef<ejit_reg_entry_t> Records) {
+  initialize(Records);
+}
+void detail::ScopedSmallTableSreStaticDomainForTest::initialize(
+    ArrayRef<ejit_reg_entry_t> Records) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (smallTableSreLocalRuntime() || LocalWorkerPool ||
       TestStaticDomainActive.load(std::memory_order_acquire) ||
-      Ranges.size() >= TestStaticRangeLimit)
+      Records.size() > TestStaticRangeLimit)
     return;
   for (const auto &Token : Shared.leaseTokens)
     if (load64(&Token)) return;
@@ -987,24 +1066,19 @@ ScopedSmallTableSreStaticDomainForTest(ArrayRef<EJitWritableRange> Ranges) {
     if (load32(&C.state) != Free) return;
   for (const auto &C : LocalCommands)
     if (load32(&C.state) != Free) return;
-  for (const auto &R : Ranges)
-    if (!R.addr || !R.size || R.size > UINTPTR_MAX - R.addr)
-      return;
   // Hosted fixture boundaries may follow legacy-mapping tests in any shuffled
   // order. Only this private, quiescent test scope resets their copied local
   // setup; the public prepare API still cannot replace immutable live bindings.
   store32(&LocalPrepared, 0);
   LocalBindings = {};
   store32(&Shared.enabled, 0);
-  TestStaticRanges[0] = {reinterpret_cast<uintptr_t>(&Shared), sizeof(Shared)};
-  uint32_t Count = 1;
-  for (const auto &R : Ranges)
-    TestStaticRanges[Count++] = {R.addr, R.size};
-  TestStaticRangeCount.store(Count, std::memory_order_release);
+  for (size_t I = 0; I < Records.size(); ++I)
+    TestStaticRanges[I] = Records[I];
+  TestStaticRangeCount.store(Records.size(), std::memory_order_release);
   TestStaticDomainActive.store(true, std::memory_order_release);
   active_ = true;
 #else
-  (void)Ranges;
+  (void)Records;
 #endif
 }
 detail::ScopedSmallTableSreStaticDomainForTest::
@@ -1034,7 +1108,8 @@ bool detail::ScopedSmallTableSreStaticDomainForTest::addRange(
     return false;
   const uint32_t Count = TestStaticRangeCount.load(std::memory_order_acquire);
   if (Count >= TestStaticRangeLimit) return false;
-  TestStaticRanges[Count] = {Address, Bytes};
+  TestStaticRanges[Count] = {EJIT_REG_SHARED_OBJECT_RW, "hosted.added-object",
+                           nullptr, reinterpret_cast<const void *>(Address), Bytes};
   TestStaticRangeCount.store(Count + 1, std::memory_order_release);
   return true;
 #else
@@ -1295,11 +1370,6 @@ int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *Bindings
       Bindings->waitRounds > 65536 ||
       (Bindings->flags & ~EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN))
     return EJIT_STAB_SRE_BLOCKED;
-  if (!Bindings->prepare_shared_data &&
-      !staticSharedRange(reinterpret_cast<uintptr_t>(&Shared), sizeof(Shared))) {
-    EJIT_DIAG("SRE small-table static shared range unavailable; require real shared-section linker bounds");
-    return EJIT_STAB_SRE_BLOCKED;
-  }
   if (load32(&LocalPrepared)) {
     if (!bridgeLayoutCurrent()) return EJIT_STAB_SRE_BLOCKED;
     return LocalBindings.current_task_id == Bindings->current_task_id &&
@@ -1315,8 +1385,12 @@ int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *Bindings
   if (smallTableSreLocalRuntime()) return EJIT_STAB_SRE_BLOCKED;
   LocalBindings = *Bindings;
   store32(&LocalPrepared, 1);
-  if (!dataReady(reinterpret_cast<uintptr_t>(&Shared), sizeof(Shared),
-                 EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE)) {
+  const uint32_t ControlAccess = EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE;
+  const auto ControlCheck = checkData(reinterpret_cast<uintptr_t>(&Shared),
+                                    sizeof(Shared), ControlAccess);
+  if (!ControlCheck.ready()) {
+    reportDataRefusal(reinterpret_cast<uintptr_t>(&Shared), sizeof(Shared),
+                      ControlAccess, ControlCheck);
     store32(&LocalPrepared, 0); return EJIT_STAB_SRE_BLOCKED;
   }
   if (Bindings->flags & EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN) {
@@ -1361,8 +1435,11 @@ int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *Bindings
 int ejit_small_table_sre_prepare_data(uintptr_t Address, uint64_t Bytes,
                                      uint32_t Access) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  return bridgeLayoutCurrent() && dataReady(Address, Bytes, Access)
-             ? EJIT_STAB_SRE_OK : EJIT_STAB_SRE_BLOCKED;
+  const auto Result = bridgeLayoutCurrent()
+      ? checkData(Address, Bytes, Access) : DataCheck{"bridge-layout-not-current"};
+  if (Result.ready()) return EJIT_STAB_SRE_OK;
+  reportDataRefusal(Address, Bytes, Access, Result);
+  return EJIT_STAB_SRE_BLOCKED;
 #else
   (void)Address; (void)Bytes; (void)Access;
   return EJIT_STAB_SRE_BLOCKED;

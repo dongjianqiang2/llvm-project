@@ -6,6 +6,7 @@
 #ifndef EJIT_FREESTANDING
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #endif
 namespace llvm { namespace ejit {
 class EJit;
@@ -15,7 +16,8 @@ namespace detail { class OwnerWorkerContext; }
 #ifndef EJIT_FREESTANDING
 namespace detail {
 /// Implementation-private Linux model of the existing static shared-section
-/// deployment contract. It admits only an exact bounded range inventory plus
+/// deployment contract. It feeds the production immutable-record validator,
+/// admitting only an exact bounded object inventory plus
 /// the actual bridge POD; never a whole process/heap mapping. There is no
 /// freestanding setter or installed/public SDK hook. Join the worker and close
 /// every physical lease before destroying the scope.
@@ -23,6 +25,8 @@ class ScopedSmallTableSreStaticDomainForTest {
 public:
   explicit ScopedSmallTableSreStaticDomainForTest(
       ArrayRef<EJitWritableRange> Ranges);
+  explicit ScopedSmallTableSreStaticDomainForTest(
+      ArrayRef<ejit_reg_entry_t> Records);
   ~ScopedSmallTableSreStaticDomainForTest();
   ScopedSmallTableSreStaticDomainForTest(
       const ScopedSmallTableSreStaticDomainForTest &) = delete;
@@ -31,6 +35,7 @@ public:
   bool valid() const { return active_; }
   bool addRange(uintptr_t Address, uint64_t Bytes);
 private:
+  void initialize(ArrayRef<ejit_reg_entry_t> Records);
   bool active_ = false;
 };
 }

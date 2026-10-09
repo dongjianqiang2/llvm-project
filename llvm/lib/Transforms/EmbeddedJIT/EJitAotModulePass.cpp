@@ -28,6 +28,8 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+extern cl::opt<bool> EnableEJitSmallTableHooks;
+
 #define DEBUG_TYPE "ejit-aot-module"
 
 static cl::opt<bool> PrintIcacheDimSize(
@@ -38,12 +40,19 @@ static cl::opt<bool> PrintIcacheDimSize(
 
 namespace {
 
-static bool hasAnyEjitMetadata(Module &M) {
+static bool hasAnyEjitAotInput(Module &M) {
   for (Function &F : M.functions())
     if (F.hasMetadata(MD_EJIT_METADATA))
       return true;
   for (GlobalVariable &GV : M.globals())
-    if (GV.hasMetadata(MD_EJIT_METADATA))
+    // A shared-only controller TU may have no EJIT metadata. The already
+    // opt-in PASS2 path still needs to emit its exact static-object inventory.
+    if (GV.hasMetadata(MD_EJIT_METADATA) ||
+        (EnableEJitSmallTableHooks && !GV.isDeclaration() &&
+         !GV.hasAvailableExternallyLinkage() && !GV.isThreadLocal() &&
+         GV.getAddressSpace() == 0 &&
+         (GV.getSection() == ".mc_shared" ||
+          GV.getSection().starts_with(".mc_shared."))))
       return true;
   return false;
 }
@@ -59,8 +68,8 @@ EJitAotModulePass::run(Module &M, ModuleAnalysisManager &AM) {
     std::exit(0);
   }
 
-  if (!hasAnyEjitMetadata(M)) {
-    LLVM_DEBUG(dbgs() << "ejit-aot-module: no EJIT metadata, skip\n");
+  if (!hasAnyEjitAotInput(M)) {
+    LLVM_DEBUG(dbgs() << "ejit-aot-module: no EJIT input, skip\n");
     return PreservedAnalyses::all();
   }
 

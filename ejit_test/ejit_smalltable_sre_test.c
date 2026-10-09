@@ -66,10 +66,10 @@ ejit_entry int64_t pr231_smalltable_entry(
 
 /* Like the reuse/MFS demos, runtime owns platform dispatch and permissions.
  * No task-self API or extra SDK binding header is required. Static shared
- * objects must be inside the real __ejit_shared_start/end linker bounds;
+ * objects are registered by PASS2 in the existing .ejit_period inventory;
  * common tables use separate RW/NX pages from the existing fixed pool domain.
  * The product still owns same-VA/same-physical coherent mapping of both areas.
- * Missing bounds, unsafe ranges or refused permissions remain BLOCKED.
+ * Missing AOT records, unsafe ranges or refused permissions remain BLOCKED.
  */
 #ifndef EJIT_PR231_CALL_INIT_ARRAY
 #define EJIT_PR231_CALL_INIT_ARRAY 1
@@ -172,6 +172,17 @@ __attribute__((noinline)) void pr231_probe_inflight(void) {
   __atomic_store_n(&g_pr231_probe_result, result, __ATOMIC_RELEASE);
 }
 
+static int pr231_prepare_object(const char *name, const void *address,
+                                uint64_t bytes, uint32_t access) {
+  const int rc = ejit_small_table_sre_prepare_data((uintptr_t)address, bytes, access);
+  if (rc == EJIT_STAB_SRE_OK)
+    return 0;
+  SRE_printf("[STAB231] BLOCKED shared object=%s addr=%p bytes=%llu access=0x%x rc=%d; "
+             "inspect runtime reason (rebuild AOT with small-table hooks)\n",
+             name, address, (unsigned long long)bytes, access, rc);
+  return -20;
+}
+
 static int pr231_setup(void) {
   if (pr231_initialized)
     return 0;
@@ -205,23 +216,14 @@ static int pr231_setup(void) {
   /* Check every real static object before using it. The observer runs in AOT
    * against this core's private controller; only its slot/flags are shared. */
   const uint32_t rw = EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE;
-  if (ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_probe_dispatch,
-          sizeof(g_pr231_probe_dispatch), EJIT_STAB_SRE_DATA_READ) !=
-          EJIT_STAB_SRE_OK ||
-      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_config,
-          sizeof(g_pr231_config), rw) != EJIT_STAB_SRE_OK ||
-      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_output,
-          sizeof(g_pr231_output), rw) != EJIT_STAB_SRE_OK ||
-      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_source,
-          sizeof(g_pr231_source), rw) != EJIT_STAB_SRE_OK ||
-      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_stage,
-          sizeof(g_pr231_stage), rw) != EJIT_STAB_SRE_OK ||
-      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_probe_arm,
-          sizeof(g_pr231_probe_arm), rw) != EJIT_STAB_SRE_OK ||
-      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_probe_result,
-          sizeof(g_pr231_probe_result), rw) != EJIT_STAB_SRE_OK) {
-    SRE_printf("[STAB231] BLOCKED: real shared bounds/data permissions; "
-               "inspect runtime diagnostics (no SDK task-id binding needed)\n");
+  if (pr231_prepare_object("g_pr231_probe_dispatch", (const void *)&g_pr231_probe_dispatch,
+          sizeof(g_pr231_probe_dispatch), EJIT_STAB_SRE_DATA_READ) ||
+      pr231_prepare_object("g_pr231_config", &g_pr231_config, sizeof(g_pr231_config), rw) ||
+      pr231_prepare_object("g_pr231_output", &g_pr231_output, sizeof(g_pr231_output), rw) ||
+      pr231_prepare_object("g_pr231_source", &g_pr231_source, sizeof(g_pr231_source), rw) ||
+      pr231_prepare_object("g_pr231_stage", (const void *)&g_pr231_stage, sizeof(g_pr231_stage), rw) ||
+      pr231_prepare_object("g_pr231_probe_arm", (const void *)&g_pr231_probe_arm, sizeof(g_pr231_probe_arm), rw) ||
+      pr231_prepare_object("g_pr231_probe_result", (const void *)&g_pr231_probe_result, sizeof(g_pr231_probe_result), rw)) {
     return -20;
   }
   /* Register the actual mutable slot identically on BOTH cores, before init.

@@ -307,11 +307,10 @@ def main():
             if f"__start_{prefix}" not in merged_symbols or f"__stop_{prefix}" not in merged_symbols:
                 raise AssertionError(f"final merge lost {prefix} registry bounds")
         actual = lipo._nm_defined(str(smalltable_merged))
-        shared_start = actual.get("__ejit_shared_start", ())
-        shared_end = actual.get("__ejit_shared_end", ())
-        if len(shared_start) != 1 or len(shared_end) != 1 or \
-                int(shared_end[0][1], 16) <= int(shared_start[0][1], 16):
-            raise AssertionError("final merge lost actual nonempty shared-data bounds")
+        if "__ejit_shared_start" in actual or "__ejit_shared_end" in actual:
+            raise AssertionError("lipo fabricated obsolete shared linker dependencies")
+        if "shared_core_state" not in actual:
+            raise AssertionError("final merge lost the actual shared data definition")
 
         minimal = build_archive(root, clang, ar, (), "minimal")
         minimal_gc, _ = gc_merge(lipo, root, minimal, ar, nm, ld, "minimal")

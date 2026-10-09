@@ -15,9 +15,7 @@ SECTIONS
 {
   /* Keep this named and writable when the input section is writable. */
   .mc_shared : ALIGN(64) {
-    __ejit_shared_start = .;
     KEEP(*(.mc_shared .mc_shared.*))
-    __ejit_shared_end = .;
   }
 }
 INSERT AFTER .data;

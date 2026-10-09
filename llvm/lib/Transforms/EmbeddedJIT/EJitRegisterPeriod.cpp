@@ -8,6 +8,8 @@
 //
 //  PASS2: Scan the module for ejit_period and ejit_period_arr global
 //  variables and generate runtime registration calls in ejit_auto_register.
+//  The existing small-table opt-in also inventories exact .mc_shared object
+//  definitions into the existing static registry, without new callbacks.
 //
 //===----------------------------------------------------------------------===//
 
@@ -32,13 +34,55 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
+extern cl::opt<bool> EnableEJitSmallTableHooks;
+
+namespace {
+struct SharedObjectEntry {
+  GlobalVariable *object;
+  uint64_t bytes;
+  ejit_reg_type_t kind;
+};
+
+bool hasSharedObjectSection(const GlobalVariable &GV) {
+  return GV.getSection() == ".mc_shared" ||
+         GV.getSection().starts_with(".mc_shared.");
+}
+
+// Look at real constant records rather than global names: multiple TUs use
+// private arrays with the same stem, and the pass may run again after linking.
+// No constructor or public arbitrary-address registration path is involved.
+bool alreadyInventoried(const Module &M, const SharedObjectEntry &Object) {
+  for (const GlobalVariable &Table : M.globals()) {
+    if (Table.getSection() != SECT_EJIT_PERIOD || !Table.hasInitializer())
+      continue;
+    const auto *Rows = dyn_cast<ConstantArray>(Table.getInitializer());
+    if (!Rows)
+      continue;
+    for (const Use &RowUse : Rows->operands()) {
+      const auto *Row = dyn_cast<ConstantStruct>(RowUse.get());
+      if (!Row || Row->getNumOperands() != 5)
+        continue;
+      const auto *Kind = dyn_cast<ConstantInt>(Row->getOperand(0));
+      const auto *Bytes = dyn_cast<ConstantInt>(Row->getOperand(4));
+      if (Kind && Bytes && Kind->getBitWidth() == 32 &&
+          Bytes->getBitWidth() == 64 &&
+          Kind->getZExtValue() == Object.kind &&
+          Bytes->getZExtValue() == Object.bytes &&
+          Row->getOperand(3)->stripPointerCasts() == Object.object)
+        return true;
+    }
+  }
+  return false;
+}
+} // namespace
 
 static void
 generateRegistryTablePeriod(
     Module &M,
     const SmallVectorImpl<std::tuple<GlobalVariable *, std::string,
                                      std::string, uint32_t>> &PeriodArrays,
-    const SmallVectorImpl<std::pair<GlobalVariable *, std::string>> &StaticVars);
+    const SmallVectorImpl<std::pair<GlobalVariable *, std::string>> &StaticVars,
+    const SmallVectorImpl<SharedObjectEntry> &SharedObjects);
 
 #define DEBUG_TYPE "ejit-register-period"
 
@@ -49,8 +93,27 @@ EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
       PeriodArrays; // {GV, periodName, varName, arraySize}
   SmallVector<std::pair<GlobalVariable *, std::string>, 8>
       StaticVars; // {GV, varName}
+  SmallVector<SharedObjectEntry, 8> SharedObjects;
 
   for (GlobalVariable &GV : M.globals()) {
+    // The controller's source-state/stage/flags need not be referenced by an
+    // ejit_entry closure or carry EJIT metadata. Inventory all eligible real
+    // definitions in this TU, not just the period/JIT subset. The product's
+    // existing .mc_shared coherent mapping contract remains required; these
+    // records establish object identity, extent and declared access only.
+    if (EnableEJitSmallTableHooks && hasSharedObjectSection(GV) &&
+        !GV.isDeclaration() && !GV.hasAvailableExternallyLinkage() &&
+        !GV.isThreadLocal() && GV.getAddressSpace() == 0 &&
+        GV.getValueType()->isSized()) {
+      const TypeSize Bytes = M.getDataLayout().getTypeAllocSize(GV.getValueType());
+      if (!Bytes.isScalable() && Bytes.getFixedValue()) {
+        SharedObjectEntry Object{&GV, Bytes.getFixedValue(),
+                                 GV.isConstant() ? EJIT_REG_SHARED_OBJECT_RO
+                                                 : EJIT_REG_SHARED_OBJECT_RW};
+        if (!alreadyInventoried(M, Object))
+          SharedObjects.push_back(Object);
+      }
+    }
     MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
     if (!MD)
       continue;
@@ -68,12 +131,20 @@ EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
     }
   }
 
-  if (PeriodArrays.empty() && StaticVars.empty()) {
+  if (PeriodArrays.empty() && StaticVars.empty() && SharedObjects.empty()) {
     LLVM_DEBUG(dbgs() << "ejit-register-period: no period vars\n");
     return PreservedAnalyses::all();
   }
   LLVM_DEBUG(dbgs() << "ejit-register-period: " << PeriodArrays.size()
-                    << " arrays, " << StaticVars.size() << " static vars\n");
+                    << " arrays, " << StaticVars.size() << " static vars, "
+                    << SharedObjects.size() << " shared objects\n");
+
+  // An inventory-only TU needs no registration constructor or new callback.
+  // The bridge reads these immutable records before ejit_init on both cores.
+  if (PeriodArrays.empty() && StaticVars.empty()) {
+    generateRegistryTablePeriod(M, PeriodArrays, StaticVars, SharedObjects);
+    return PreservedAnalyses::none();
+  }
 
   LLVMContext &Ctx = M.getContext();
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -120,7 +191,7 @@ EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Always build the static registry table for bare-metal / testing fallback.
-  generateRegistryTablePeriod(M, PeriodArrays, StaticVars);
+  generateRegistryTablePeriod(M, PeriodArrays, StaticVars, SharedObjects);
 
   return PreservedAnalyses::none();
 }
@@ -135,7 +206,8 @@ generateRegistryTablePeriod(
     Module &M,
     const SmallVectorImpl<std::tuple<GlobalVariable *, std::string,
                                      std::string, uint32_t>> &PeriodArrays,
-    const SmallVectorImpl<std::pair<GlobalVariable *, std::string>> &StaticVars) {
+    const SmallVectorImpl<std::pair<GlobalVariable *, std::string>> &StaticVars,
+    const SmallVectorImpl<SharedObjectEntry> &SharedObjects) {
   LLVMContext &Ctx = M.getContext();
   auto *I32Ty = Type::getInt32Ty(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -173,6 +245,20 @@ generateRegistryTablePeriod(
         ConstantPointerNull::get(PtrTy),
         ConstantExpr::getBitCast(GV, PtrTy),
         ConstantInt::get(I64Ty, 0),
+    }));
+  }
+
+  // Additive tags, original 40-byte record on the 64-bit targets. In
+  // particular size is the true target allocation extent, not array member
+  // count; aliases, TLS, externs, non-default address spaces and unsized or
+  // scalable objects were excluded while collecting real GlobalVariables.
+  for (const SharedObjectEntry &Object : SharedObjects) {
+    Entries.push_back(ConstantStruct::get(EntryTy, {
+        ConstantInt::get(I32Ty, Object.kind),
+        makeStrGV(Object.object->getName().str()),
+        ConstantPointerNull::get(PtrTy),
+        ConstantExpr::getBitCast(Object.object, PtrTy),
+        ConstantInt::get(I64Ty, Object.bytes),
     }));
   }
 

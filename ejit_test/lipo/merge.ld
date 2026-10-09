@@ -38,9 +38,7 @@ SECTIONS
   /* Keep cross-core SRE data in a named section instead of folding it into
    * .data; board link scripts and diagnostics rely on this boundary. */
   .mc_shared : ALIGN(64) {
-    __ejit_shared_start = .;
     KEEP(*(.mc_shared .mc_shared.*))
-    __ejit_shared_end = .;
   }
   .bss            : { *(.bss .bss.* .gnu.linkonce.b.*) }
 

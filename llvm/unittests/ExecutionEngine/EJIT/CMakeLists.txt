@@ -6,6 +6,7 @@ set(LLVM_LINK_COMPONENTS
   EJIT
   ExecutionEngine
   Instrumentation
+  Linker
   OrcJIT
   Passes
   ProfileData
@@ -21,6 +22,7 @@ add_llvm_unittest(EJITTests
   EJitSmallTableHostTest.cpp
   EJitSreDataAllocatorTest.cpp
   EJitWrapperGenHooksTest.cpp
+  EJitRegisterPeriodTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
   EJitProfileLoweringTest.cpp
