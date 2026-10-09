@@ -22,6 +22,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include <algorithm>
 #include <atomic>
@@ -2130,6 +2131,54 @@ bool EJitSharedTaskPool::prepareExternalExecution(
              static_cast<uint32_t>(EJitSharedInitState::Ready) &&
          state_->generation.loadAcquire() == Generation &&
          state_->ownerCoreId.loadAcquire() == Owner;
+}
+
+bool EJitSharedTaskPool::prepareExternalSharedData(
+    const EJitSreDataAllocation &Info) {
+#ifdef EJIT_SRE_CODE_POOL
+  if (!state_ || state_->initState.loadAcquire() !=
+                     static_cast<uint32_t>(EJitSharedInitState::Ready) ||
+      !fourKSeal_ || !enableRwPageFn_ ||
+      !validateSreSmallTableStorage(Info))
+    return false;
+  const uint32_t Generation = state_->generation.loadAcquire();
+  const uint32_t Owner = state_->ownerCoreId.loadAcquire();
+  const uint32_t Self = EJitCoreId::current();
+  if (Self != Owner && !codeSharingEnabled_)
+    return false;
+  const uintptr_t Page = static_cast<uintptr_t>(kEJitSharedSealPage);
+  const uintptr_t Granule = static_cast<uintptr_t>(kEJitSharedSplitGranule);
+  // Records prove exclusive ownership; independently reject malformed byte
+  // extents before any platform permission call. A multi-block allocation is
+  // split in canonical 2MiB chunks so the existing memo key is unambiguous.
+  if (!Info.address || !Info.bytes || !Info.payloadBytes ||
+      Info.payloadBytes > Info.bytes || !Info.blockBase || !Info.blockBytes ||
+      (Info.address & (Page - 1)) || (Info.bytes & (Page - 1)) ||
+      (Info.blockBase & (Granule - 1)) || (Info.blockBytes & (Granule - 1)) ||
+      Info.bytes > UINTPTR_MAX - Info.address ||
+      Info.blockBytes > UINTPTR_MAX - Info.blockBase ||
+      Info.address < Info.blockBase ||
+      Info.address + Info.bytes > Info.blockBase + Info.blockBytes)
+    return false;
+  for (uint64_t Offset = 0; Offset < Info.blockBytes; Offset += Granule)
+    if (!ensurePoolSplitForCurrentCore(Self, Info.blockBase + Offset, Granule))
+      return false;
+  for (uint64_t Offset = 0; Offset < Info.bytes; Offset += Page)
+    if (!enableRwPageFn_(enableRwPageCtx_, Info.address + Offset)) {
+      EJIT_DIAG("prepareSharedData FAIL: core=%u data page=0x%llx", Self,
+                static_cast<unsigned long long>(Info.address + Offset));
+      return false;
+    }
+  // Data remains RW/NX. Never seal it executable or enter it in a code cache.
+  return validateSreSmallTableStorage(Info) &&
+         state_->initState.loadAcquire() ==
+             static_cast<uint32_t>(EJitSharedInitState::Ready) &&
+         state_->generation.loadAcquire() == Generation &&
+         state_->ownerCoreId.loadAcquire() == Owner;
+#else
+  (void)Info;
+  return false;
+#endif
 }
 
 bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,

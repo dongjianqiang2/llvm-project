@@ -19,6 +19,7 @@
 #ifdef EJIT_SRE_CODE_POOL
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodePool.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedData.h"
 #include <memory>
 
 namespace llvm {
@@ -54,6 +55,22 @@ struct EJitSreFixedCodePoolDomainInfo {
   uint64_t poolSize = 0;
 };
 EJitSreFixedCodePoolDomainInfo getSreFixedCodePoolDomainInfo();
+
+/// Claim independent, stable DataOnly storage from the existing shared fixed
+/// reservation. The first block is claimed on demand; disabled/unused small
+/// tables consume no bytes. Each resource is page isolated. A resource may be
+/// at most 4MiB, all historical claims at most 16MiB and 256 records. Remaining
+/// fixed-domain space is an additional hard bound. No fallback/reset/recycle.
+/// Does not split, prepare permissions, zero or publish the storage: the caller
+/// must prepare this exact descriptor on its actual core BEFORE writing.
+Error allocateSreSmallTableStorage(uint64_t PayloadBytes, uint64_t Generation,
+                                   EJitSreDataAllocation &Out);
+bool validateSreSmallTableStorage(const EJitSreDataAllocation &Allocation);
+/// Release metadata authority, not backing memory. Failed preparation creates
+/// a permanent hole, separately accounted; a duplicate release is refused.
+bool releaseSreSmallTableStorage(const EJitSreDataAllocation &Allocation,
+                                bool Failed = false);
+EJitSreDataAllocationStats getSreSmallTableStorageStats();
 
 /// Install execute permission for the legacy 2MiB code pool containing
 /// \p FnPtr in the calling core's translation context. This is intentionally a

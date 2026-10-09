@@ -31,6 +31,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
@@ -1171,6 +1172,11 @@ TEST(EJitCApiTaskpool, SingleBoundRejectsEmptyObject) {
 // ejit_init; post-init register_* calls are rejected and mutate nothing.
 TEST(EJitCApiTaskpool, RegistrationFrozenAfterInit) {
   resetTaskpoolRegState();
+  // This deliberately records a process-global registration failure. Runtime
+  // shutdown must not silently erase that diagnostic; the negative fixture,
+  // however, must not poison the next shuffled test (including direct Off
+  // construction). Close its own staging state even after a fatal assertion.
+  auto Cleanup = make_scope_exit([] { resetTaskpoolRegState(); });
   ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   // A period registered AFTER init is rejected (frozen): the name is therefore
   // not a registered period, so activate cannot find it.
@@ -1186,6 +1192,10 @@ TEST(EJitCApiTaskpool, RegistrationFrozenAfterInit) {
   int sv = 0;
   ejit_register_static_var("post_var", &sv);
   ejit_shutdown();
+  const auto Rejected = EJitRegistrationStore::instance().consumeError();
+  EXPECT_FALSE(Rejected.ok());
+  EXPECT_EQ(Rejected.funcName, "post_period");
+  EXPECT_FALSE(EJitRegistrationStore::instance().hasError());
 }
 
 // Finding (一/五): a lifecycle registered BEFORE init (constructor-phase path)

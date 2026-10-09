@@ -30,8 +30,12 @@ extern "C" {
 /// internal execution-context token. NULL reports workerTaskIdentity=0 (unknown).
 /// Dispatch authorization uses an explicit internal worker execution context;
 /// this callback does not let public shell calls bypass the command queue.
-/// prepare_shared_data proves/installs same-VA coherent readable (or writable)
-/// mapping on THIS calling core. A no-op or merely same VA is not this proof.
+/// prepare_shared_data is an optional explicit platform override. If supplied,
+/// it proves/installs same-VA coherent readable (or writable) mapping on THIS
+/// calling core and its refusal is never bypassed. NULL uses only the existing
+/// declared shared-section domain plus runtime-owned fixed DataOnly storage;
+/// it does not accept arbitrary owner heap addresses or invent a mapping.
+/// delay_ticks is optional; NULL uses the existing runtime SRE task adapter.
 typedef struct {
   uint32_t abiVersion;
   uint32_t structSize;
@@ -150,6 +154,11 @@ typedef struct {
 /// domain opt-in is requested on the worker core only. Existing ABI/defaults are
 /// unchanged; no call automatically enables small-table policy or changes PGO.
 int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *bindings);
+/// Validate/prepare an actual static shared-data range on the calling core.
+/// Built-in mode requires containment in the real __ejit_shared_start/end
+/// linker range. This does not authorize arbitrary heap or executable memory.
+int ejit_small_table_sre_prepare_data(uintptr_t address, uint64_t bytes,
+                                     uint32_t access);
 int ejit_small_table_sre_request(const ejit_small_table_sre_request_t *request);
 int ejit_small_table_sre_get_snapshot(uint32_t funcIndex,
                                     ejit_small_table_sre_snapshot_t *snapshot);

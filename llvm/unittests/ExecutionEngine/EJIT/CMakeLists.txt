@@ -19,6 +19,7 @@ add_llvm_unittest(EJITTests
   EJitFieldOffsetTest.cpp
   EJitSmallTableTest.cpp
   EJitSmallTableHostTest.cpp
+  EJitSreDataAllocatorTest.cpp
   EJitWrapperGenHooksTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp

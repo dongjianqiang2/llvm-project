@@ -22,6 +22,8 @@
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -31,9 +33,20 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+extern "C" {
+#ifdef EJIT_FREESTANDING
+extern const unsigned char __ejit_shared_start[];
+extern const unsigned char __ejit_shared_end[];
+#else
+extern const unsigned char __ejit_shared_start[] __attribute__((weak));
+extern const unsigned char __ejit_shared_end[] __attribute__((weak));
+#endif
+}
 namespace {
 constexpr uint32_t CommandSlots = 8, LeaseSlots = 32;
 constexpr uint64_t BridgeEpochBit = uint64_t{1} << 63;
+constexpr uint32_t BridgeLayoutMagic = 0x53544232u; // "STB2"
+constexpr uint32_t BridgeLayoutVersion = 2u;
 enum CommandState : uint32_t { Free, Claimed, Queued, Started, Done, Cancelled };
 enum Operation : uint32_t { Request = 1, Snapshot, Finish, Cancel, Print,
                            PrepareExecution, CommitExecution, LeaveExecution };
@@ -57,6 +70,7 @@ struct Command {
   ejit_dim_pair_t dims[EJIT_STAB_SRE_MAX_DIMS];
   ejit_bound_ptr_t bounds[8];
   EJitCompiledCodeInfo code;
+  EJitSreDataAllocation data;
   TableRange tables[32];
   ejit_small_table_sre_request_t request;
   ejit_small_table_sre_snapshot_t snapshot;
@@ -64,7 +78,13 @@ struct Command {
 static_assert(std::is_trivially_copyable<Command>::value,
               "inter-core command must contain only by-value POD metadata");
 struct SharedControl {
+  // Keep enabled at offset zero so the new image can reject an old active
+  // bridge before interpreting any old command payload. Both cores must use
+  // one matching image; this is not a C ABI or released taskpool-blob change.
   uint32_t enabled;
+  uint32_t layoutMagic;
+  uint32_t layoutVersion;
+  uint32_t layoutBytes;
   uint32_t ownerGeneration;
   uint32_t ownerCore;
   uint32_t function;
@@ -82,6 +102,13 @@ uint32_t LocalPrepared = 0;
 uint64_t LocalWorkerTask = 0;
 EJitSharedTaskPool *LocalWorkerPool = nullptr;
 Command LocalCommands[CommandSlots] = {}; // private scratch, never shared
+#ifndef EJIT_FREESTANDING
+constexpr uint32_t TestStaticRangeLimit = 33;
+struct StaticRangeForTest { uintptr_t address; uint64_t bytes; };
+StaticRangeForTest TestStaticRanges[TestStaticRangeLimit] = {};
+std::atomic<uint32_t> TestStaticRangeCount{0};
+std::atomic<bool> TestStaticDomainActive{false};
+#endif
 
 uint32_t load32(const uint32_t *P) { return EJitAtomicRef<uint32_t>(*const_cast<uint32_t *>(P)).loadAcquire(); }
 uint64_t load64(const uint64_t *P) { return EJitAtomicRef<uint64_t>(*const_cast<uint64_t *>(P)).loadAcquire(); }
@@ -89,6 +116,12 @@ void store32(uint32_t *P, uint32_t V) { EJitAtomicRef<uint32_t>(*P).storeRelease
 void store64(uint64_t *P, uint64_t V) { EJitAtomicRef<uint64_t>(*P).storeRelease(V); }
 bool cas32(uint32_t *P, uint32_t &Expected, uint32_t Desired) {
   return EJitAtomicRef<uint32_t>(*P).compareExchange(Expected, Desired);
+}
+bool bridgeLayoutCurrent() {
+  return load32(&Shared.enabled) == 1 &&
+         load32(&Shared.layoutMagic) == BridgeLayoutMagic &&
+         load32(&Shared.layoutVersion) == BridgeLayoutVersion &&
+         load32(&Shared.layoutBytes) == sizeof(Shared);
 }
 bool boundedString(const char *S, size_t N) {
   return S && std::memchr(S, 0, N) && S[0];
@@ -98,7 +131,12 @@ void copyText(char *To, size_t Capacity, StringRef Text) {
   std::memcpy(To, Text.data(), N);
   To[N] = 0;
 }
-void delay() { LocalBindings.delay_ticks(LocalBindings.context, 1); }
+void delay() {
+  if (LocalBindings.delay_ticks)
+    LocalBindings.delay_ticks(LocalBindings.context, 1);
+  else
+    EJitSreTask::delay(1);
+}
 bool isActualBridgeWorker(EJitSharedTaskPool &Pool,
                           const llvm::ejit::detail::OwnerWorkerContext &Worker) {
   // Only the private worker-entry context authorizes owner operations. An
@@ -106,10 +144,36 @@ bool isActualBridgeWorker(EJitSharedTaskPool &Pool,
   return LocalWorkerPool == &Pool && load32(&LocalPrepared) &&
          Worker.validFor(Pool);
 }
+bool staticSharedRange(uintptr_t Address, uint64_t Bytes) {
+  if (!Address || !Bytes || Bytes > UINTPTR_MAX - Address)
+    return false;
+#ifndef EJIT_FREESTANDING
+  if (TestStaticDomainActive.load(std::memory_order_acquire)) {
+    const uint32_t Count = TestStaticRangeCount.load(std::memory_order_acquire);
+    for (uint32_t I = 0; I < Count; ++I) {
+      const auto &R = TestStaticRanges[I];
+      if (Address >= R.address && Address + Bytes <= R.address + R.bytes)
+        return true;
+    }
+    return false;
+  }
+#endif
+  const uintptr_t Start = reinterpret_cast<uintptr_t>(__ejit_shared_start);
+  const uintptr_t End = reinterpret_cast<uintptr_t>(__ejit_shared_end);
+  return Start && End > Start && Address >= Start && Address + Bytes <= End;
+}
 bool dataReady(uintptr_t Address, uint64_t Bytes, uint32_t Access) {
-  return Address && Bytes && Bytes <= UINTPTR_MAX - Address &&
-         load32(&LocalPrepared) && LocalBindings.prepare_shared_data(
-             LocalBindings.context, Address, Bytes, Access) == 0;
+  if (!Address || !Bytes || Bytes > UINTPTR_MAX - Address ||
+      !Access || (Access & ~(EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE)) ||
+      !load32(&LocalPrepared))
+    return false;
+  if (LocalBindings.prepare_shared_data)
+    return LocalBindings.prepare_shared_data(LocalBindings.context, Address,
+                                              Bytes, Access) == 0;
+  // Reuse the product's existing coherent RW shared-section deployment
+  // contract. Bounds validate membership, not physical/cache-coherence
+  // discovery. Unknown heap addresses never receive automatic approval.
+  return staticSharedRange(Address, Bytes);
 }
 struct LocalCommand {
   Command *value = nullptr;
@@ -445,6 +509,8 @@ int setupRequest(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worke
   EJitSmallTableHost::Options Opts;
   Opts.runtime.sampling.aggregateLimit = R.sampleLimit;
   Opts.runtime.sampling.freezeWaitMillis = 1;
+  Opts.runtime.requireSharedDataStorage = !LocalBindings.prepare_shared_data;
+  Opts.runtime.sharedDataPool = Runtime->sharedTaskPool();
   if (Error E = Runtime->enableSmallTable(Worker, O.facts, Opts)) {
     return fail(C, EJIT_STAB_SRE_BLOCKED, toString(std::move(E)));
   }
@@ -661,6 +727,7 @@ int prepareExecution(Command &C,
   if (!Resource || Resource->columns().size() > 32) {
     return RefusePreparation("common table range inventory is unavailable or unbounded");
   }
+  C.data = Resource->sharedDataAllocation();
   C.tableCount = 0;
   for (const auto &Column : Resource->columns()) {
     const uintptr_t Address = reinterpret_cast<uintptr_t>(Resource->columnAddress(Column.fieldIndex));
@@ -668,7 +735,15 @@ int prepareExecution(Command &C,
       return RefusePreparation("common table column has no actual published storage");
     }
     C.tables[C.tableCount++] = {Address, Column.payloadBytes};
+    if (C.data.address &&
+        (C.data.payloadBytes > UINTPTR_MAX - C.data.address ||
+         Address < C.data.address ||
+         Column.payloadBytes > UINTPTR_MAX - Address ||
+         Address + Column.payloadBytes > C.data.address + C.data.payloadBytes))
+      return RefusePreparation("common table column differs from its actual DataOnly allocation");
   }
+  if (C.tableCount && !C.data.address && !LocalBindings.prepare_shared_data)
+    return RefusePreparation("common table has no validated shared DataOnly storage");
   L->epoch = smallTableSreWrapperEpoch(EJitSmallTableHost::policyEpoch());
   if (!L->ownerIdentity ||
       L->ownerIdentity != currentEJitRuntimeOwnerIdentity())
@@ -802,6 +877,18 @@ void process(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
               (unsigned long long)S.genericAsyncEnqueues,
               (unsigned long long)S.genericAsyncCompiles,
               (unsigned long long)S.genericPending);
+#ifdef EJIT_SRE_CODE_POOL
+    const auto DataStats = getSreSmallTableStorageStats();
+    EJIT_DIAG("SRE_STAB_DATA snapshot_valid=%u claimed=%llu consumed=%llu live=%llu released=%llu failed=%llu failed_claim=%llu blocks=%u records=%u; DataOnly RW/NX no reset/reuse",
+              DataStats.snapshotValid,
+              (unsigned long long)DataStats.claimedBytes,
+              (unsigned long long)DataStats.consumedBytes,
+              (unsigned long long)DataStats.liveBytes,
+              (unsigned long long)DataStats.releasedBytes,
+              (unsigned long long)DataStats.failedBytes,
+              (unsigned long long)DataStats.failedClaimBytes,
+              DataStats.blockCount, DataStats.recordCount);
+#endif
     const std::string Name = owner().runtime->smallTableHost()->entryName().str();
     // Both real engines capture to the same worker-local store. Select the
     // actual common root, never an unrelated ordinary compile dump.
@@ -814,7 +901,7 @@ void process(Command &C, const llvm::ejit::detail::OwnerWorkerContext &Worker) {
 }
 
 int transact(Command &C, bool RealLeave = false) {
-  if (!load32(&LocalPrepared) || load32(&Shared.enabled) != 1)
+  if (!load32(&LocalPrepared) || !bridgeLayoutCurrent())
     return EJIT_STAB_SRE_BLOCKED;
   const uint32_t Limit = LocalBindings.waitRounds ? LocalBindings.waitRounds : 8192u;
   uint32_t ReadyWait = 0;
@@ -864,6 +951,9 @@ int transact(Command &C, bool RealLeave = false) {
 }
 
 bool liveBridgeTicket(uint64_t Ticket) {
+  // A changed shared-layout identity cannot prove an old physical call ended.
+  // Do not inspect another image's lease offsets or fabricate reclamation.
+  if (!bridgeLayoutCurrent()) return Ticket != 0;
   for (const auto &Token : Shared.leaseTokens)
     if (load64(&Token) == Ticket) return true;
   return false;
@@ -883,9 +973,79 @@ void completeRealLeave(Command &C) {
 #endif // EJIT_SRE_SHARED_TASKPOOL
 
 namespace llvm { namespace ejit {
+#ifndef EJIT_FREESTANDING
+detail::ScopedSmallTableSreStaticDomainForTest::
+ScopedSmallTableSreStaticDomainForTest(ArrayRef<EJitWritableRange> Ranges) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (smallTableSreLocalRuntime() || LocalWorkerPool ||
+      TestStaticDomainActive.load(std::memory_order_acquire) ||
+      Ranges.size() >= TestStaticRangeLimit)
+    return;
+  for (const auto &Token : Shared.leaseTokens)
+    if (load64(&Token)) return;
+  for (const auto &C : Shared.commands)
+    if (load32(&C.state) != Free) return;
+  for (const auto &C : LocalCommands)
+    if (load32(&C.state) != Free) return;
+  for (const auto &R : Ranges)
+    if (!R.addr || !R.size || R.size > UINTPTR_MAX - R.addr)
+      return;
+  // Hosted fixture boundaries may follow legacy-mapping tests in any shuffled
+  // order. Only this private, quiescent test scope resets their copied local
+  // setup; the public prepare API still cannot replace immutable live bindings.
+  store32(&LocalPrepared, 0);
+  LocalBindings = {};
+  store32(&Shared.enabled, 0);
+  TestStaticRanges[0] = {reinterpret_cast<uintptr_t>(&Shared), sizeof(Shared)};
+  uint32_t Count = 1;
+  for (const auto &R : Ranges)
+    TestStaticRanges[Count++] = {R.addr, R.size};
+  TestStaticRangeCount.store(Count, std::memory_order_release);
+  TestStaticDomainActive.store(true, std::memory_order_release);
+  active_ = true;
+#else
+  (void)Ranges;
+#endif
+}
+detail::ScopedSmallTableSreStaticDomainForTest::
+~ScopedSmallTableSreStaticDomainForTest() {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!active_) return;
+  // This test scope represents mapping/source lifetime, not a way to retire
+  // still-running product code. A test must deliver all actual leaves first.
+  bool LeasesClosed = true;
+  for (const auto &Token : Shared.leaseTokens)
+    LeasesClosed &= load64(&Token) == 0;
+  assert(!smallTableSreLocalRuntime() && !LocalWorkerPool && LeasesClosed &&
+         "shared-domain test scope outlived neither worker nor real lease");
+  TestStaticDomainActive.store(false, std::memory_order_release);
+  TestStaticRangeCount.store(0, std::memory_order_release);
+  if (!smallTableSreLocalRuntime() && !LocalWorkerPool && LeasesClosed) {
+    store32(&LocalPrepared, 0);
+    LocalBindings = {};
+    store32(&Shared.enabled, 0);
+  }
+#endif
+}
+bool detail::ScopedSmallTableSreStaticDomainForTest::addRange(
+    uintptr_t Address, uint64_t Bytes) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!active_ || !Address || !Bytes || Bytes > UINTPTR_MAX - Address)
+    return false;
+  const uint32_t Count = TestStaticRangeCount.load(std::memory_order_acquire);
+  if (Count >= TestStaticRangeLimit) return false;
+  TestStaticRanges[Count] = {Address, Bytes};
+  TestStaticRangeCount.store(Count + 1, std::memory_order_release);
+  return true;
+#else
+  (void)Address; (void)Bytes;
+  return false;
+#endif
+}
+#endif
 void smallTableSrePolicyChanged() {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (load32(&Shared.enabled) != 1) return;
+  if (!bridgeLayoutCurrent()) return;
   uint64_t N = load64(&Shared.policyEpoch);
   while (N < BridgeEpochBit - 1 &&
          !EJitAtomicRef<uint64_t>(Shared.policyEpoch).compareExchange(N, N + 1)) {}
@@ -893,6 +1053,7 @@ void smallTableSrePolicyChanged() {
 }
 uint64_t smallTableSreWrapperEpoch(uint64_t LocalEpoch) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (load32(&Shared.enabled) && !bridgeLayoutCurrent()) return UINT64_MAX;
   if (load32(&Shared.enabled) == 1)
     return BridgeEpochBit | load64(&Shared.policyEpoch);
 #endif
@@ -903,7 +1064,8 @@ bool smallTableSreNoPolicyCurrent(uint64_t Epoch, uint64_t LocalEpoch) {
 }
 bool smallTableSreOwnsFunction(uint32_t Func) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  return load32(&Shared.enabled) == 1 && Func != UINT32_MAX &&
+  if (load32(&Shared.enabled) && !bridgeLayoutCurrent()) return Func != UINT32_MAX;
+  return bridgeLayoutCurrent() && Func != UINT32_MAX &&
          load32(&Shared.function) == Func;
 #else
   (void)Func; return false;
@@ -928,7 +1090,7 @@ void smallTableSreWorkerEnter(EJitSharedTaskPool &Pool,
 bool serviceSmallTableSreBridge(EJitSharedTaskPool &Pool,
                                 const llvm::ejit::detail::OwnerWorkerContext &Worker) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (load32(&Shared.enabled) != 1 || LocalWorkerPool != &Pool ||
+  if (!bridgeLayoutCurrent() || LocalWorkerPool != &Pool ||
       !load32(&LocalPrepared) || !Worker.activeFor(Pool))
     return false;
   bool QueuedWork = false;
@@ -983,7 +1145,7 @@ bool serviceSmallTableSreBridge(EJitSharedTaskPool &Pool,
 void smallTableSreWorkerExit(EJitSharedTaskPool &Pool,
                             const llvm::ejit::detail::OwnerWorkerContext &Worker) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (LocalWorkerPool != &Pool || !load32(&LocalPrepared) ||
+  if (!bridgeLayoutCurrent() || LocalWorkerPool != &Pool || !load32(&LocalPrepared) ||
       !Worker.activeFor(Pool)) return;
   for (Lease &L : owner().leases)
     if (L.ticket) {
@@ -1017,7 +1179,14 @@ bool smallTableSreWrapperEnter(uint32_t Func, const ejit_dim_pair_t *Dims,
                              const char **OutWhy, uint64_t *OutEpoch,
                              void *&Entry) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (load32(&Shared.enabled) != 1 || Func != load32(&Shared.function)) return false;
+  if (load32(&Shared.enabled) && !bridgeLayoutCurrent()) {
+    Entry = nullptr;
+    if (OutTicket) *OutTicket = 0;
+    if (OutWhy) *OutWhy = "SRE bridge shared layout mismatch";
+    if (OutEpoch) *OutEpoch = UINT64_MAX;
+    return true;
+  }
+  if (!bridgeLayoutCurrent() || Func != load32(&Shared.function)) return false;
   Entry = nullptr;
   if (OutTicket) *OutTicket = 0;
   if (OutWhy) *OutWhy = "SRE common policy refused admission or caller preparation";
@@ -1057,12 +1226,23 @@ bool smallTableSreWrapperEnter(uint32_t Func, const ejit_dim_pair_t *Dims,
     Prepared = dataReady(C.sourceAddress, C.sourceBytes, EJIT_STAB_SRE_DATA_READ) &&
                dataReady(C.sourceState, sizeof(ejit_small_table_sre_source_state_t),
                          EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE);
-  for (uint32_t I = 0; I < C.tableCount && Prepared; ++I)
-    Prepared = dataReady(C.tables[I].address, C.tables[I].bytes, EJIT_STAB_SRE_DATA_READ);
+  if (Prepared && C.data.address)
+    Prepared = Pool->prepareExternalSharedData(C.data);
+  if (Prepared && C.tableCount && !C.data.address &&
+      !LocalBindings.prepare_shared_data)
+    Prepared = false;
+  // Legacy explicit mappings remain an override for non-fixed hosted/custom
+  // platforms. Their refusal is respected even for a runtime-owned table.
+  for (uint32_t I = 0; I < C.tableCount && Prepared &&
+                       LocalBindings.prepare_shared_data; ++I)
+    Prepared = dataReady(C.tables[I].address, C.tables[I].bytes,
+                         EJIT_STAB_SRE_DATA_READ);
   if (Prepared) Prepared = Pool->prepareExternalExecution(reinterpret_cast<void *>(C.entry), C.code);
-  // Common writable counters need both real range permissions and coherence;
-  // the callback is for THIS caller, not borrowed ordinary-object preparation.
-  for (uint32_t I = 0; I < C.code.writableCount && Prepared; ++I)
+  // The built-in common code/counter path already uses the actual code-pool
+  // domain and caller-specific split/enable_rw preparation above. Only an
+  // explicit legacy mapping override adds its requested extra checks.
+  for (uint32_t I = 0; I < C.code.writableCount && Prepared &&
+                       LocalBindings.prepare_shared_data; ++I)
     Prepared = dataReady(C.code.writableRanges[I].addr,
                          C.code.writableRanges[I].size,
                          EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE);
@@ -1089,6 +1269,7 @@ bool smallTableSreWrapperEnter(uint32_t Func, const ejit_dim_pair_t *Dims,
 bool smallTableSreLeave(uint64_t Ticket) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!(Ticket & BridgeEpochBit) || load32(&Shared.enabled) != 1) return false;
+  if (!bridgeLayoutCurrent()) return false;
   if (!liveBridgeTicket(Ticket)) return true; // exact old token: no replacement touched
   LocalCommand Scratch;
   // A real leave is not lossy. Wait for bounded scratch occupancy to drain;
@@ -1111,11 +1292,16 @@ int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *Bindings
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (!Bindings || Bindings->abiVersion != EJIT_STAB_SRE_ABI_VERSION ||
       Bindings->structSize != sizeof(*Bindings) ||
-      !Bindings->delay_ticks || !Bindings->prepare_shared_data ||
       Bindings->waitRounds > 65536 ||
       (Bindings->flags & ~EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN))
     return EJIT_STAB_SRE_BLOCKED;
+  if (!Bindings->prepare_shared_data &&
+      !staticSharedRange(reinterpret_cast<uintptr_t>(&Shared), sizeof(Shared))) {
+    EJIT_DIAG("SRE small-table static shared range unavailable; require real shared-section linker bounds");
+    return EJIT_STAB_SRE_BLOCKED;
+  }
   if (load32(&LocalPrepared)) {
+    if (!bridgeLayoutCurrent()) return EJIT_STAB_SRE_BLOCKED;
     return LocalBindings.current_task_id == Bindings->current_task_id &&
                    LocalBindings.delay_ticks == Bindings->delay_ticks &&
                    LocalBindings.prepare_shared_data == Bindings->prepare_shared_data &&
@@ -1146,19 +1332,40 @@ int ejit_small_table_sre_prepare(const ejit_small_table_sre_bindings_t *Bindings
   }
   uint32_t Expected = 0;
   if (cas32(&Shared.enabled, Expected, 2)) {
+    store32(&Shared.layoutMagic, BridgeLayoutMagic);
+    store32(&Shared.layoutVersion, BridgeLayoutVersion);
+    store32(&Shared.layoutBytes, sizeof(Shared));
     store32(&Shared.function, UINT32_MAX);
     store64(&Shared.policyEpoch, 1);
     store32(&Shared.enabled, 1);
   } else {
     uint32_t Wait = 0;
     while (load32(&Shared.enabled) == 2) {
-      if (++Wait >= (Bindings->waitRounds ? Bindings->waitRounds : 8192u)) return EJIT_STAB_SRE_BUSY;
+      if (++Wait >= (Bindings->waitRounds ? Bindings->waitRounds : 8192u)) {
+        store32(&LocalPrepared, 0);
+        return EJIT_STAB_SRE_BUSY;
+      }
       delay();
+    }
+    if (!bridgeLayoutCurrent()) {
+      EJIT_DIAG("SRE small-table shared bridge layout mismatch: require matching image on both cores");
+      store32(&LocalPrepared, 0);
+      return EJIT_STAB_SRE_BLOCKED;
     }
   }
   return EJIT_STAB_SRE_OK;
 #else
   (void)Bindings; return EJIT_STAB_SRE_BLOCKED;
+#endif
+}
+int ejit_small_table_sre_prepare_data(uintptr_t Address, uint64_t Bytes,
+                                     uint32_t Access) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  return bridgeLayoutCurrent() && dataReady(Address, Bytes, Access)
+             ? EJIT_STAB_SRE_OK : EJIT_STAB_SRE_BLOCKED;
+#else
+  (void)Address; (void)Bytes; (void)Access;
+  return EJIT_STAB_SRE_BLOCKED;
 #endif
 }
 int ejit_small_table_sre_request(const ejit_small_table_sre_request_t *R) {

@@ -27,6 +27,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h" // seal/split granule contract
+#include "EJitSreDataAllocator.h"
 
 #include <cstdint>
 #include <limits>
@@ -149,6 +150,31 @@ static_assert(std::is_trivially_default_constructible<
 static_assert(std::is_standard_layout<SharedFixedCodePoolDomain>::value,
               "shared fixed domain must have fixed scalar layout");
 EJIT_SHARED_SECTION SharedFixedCodePoolDomain SharedFixedDomain;
+// Metadata shares the existing coherent control mapping. Only table column
+// bytes are taken from the existing fixed reservation, not owner-private heap.
+// Neither object has a constructor or reset path that another init-array can
+// repeat. Data windows are never handed to an executable pool manager.
+EJIT_SHARED_SECTION llvm::ejit::detail::SreDataOnlyState SharedDataOnlyState;
+EJIT_SHARED_SECTION llvm::ejit::EJitAtomicU64 NextDataDomainIdentity;
+#ifndef EJIT_FREESTANDING
+llvm::ejit::EJitAtomicUPtr HostedDataOnlyArena;
+#endif
+
+uint64_t dataDomainIdentity(llvm::ejit::detail::SreDataOnlyState &State) {
+  uint64_t Identity = State.domainIdentity.loadAcquire();
+  if (Identity)
+    return Identity;
+  uint64_t Last = NextDataDomainIdentity.loadAcquire();
+  for (;;) {
+    if (Last == UINT64_MAX)
+      return 0; // No wrap/address-reuse ambiguity.
+    if (NextDataDomainIdentity.compareExchange(Last, Last + 1))
+      break;
+  }
+  uint64_t Empty = 0;
+  State.domainIdentity.compareExchange(Empty, Last + 1);
+  return State.domainIdentity.loadAcquire();
+}
 
 bool linkerFixedDomain(uintptr_t &Start, uintptr_t &End, uintptr_t &Base,
                        uint64_t &Bytes, uint64_t &PoolSize) {
@@ -191,18 +217,18 @@ bool sharedFixedDomainMatchesLinker() {
 #endif
 }
 
-void *claimSharedFixedPool(size_t Size) {
-  if (!sharedFixedDomainMatchesLinker() ||
-      Size != SharedFixedDomain.poolSize.loadRelaxed())
+void *claimSharedFixedRange(uint64_t Size) {
+  if (!sharedFixedDomainMatchesLinker() || !Size || (Size & (k2MiB - 1)))
     return nullptr;
   const uint64_t Capacity = SharedFixedDomain.usableBytes.loadRelaxed();
   uint64_t Used = SharedFixedDomain.usedBytes.loadAcquire();
   for (;;) {
     if (Used > Capacity || Size > Capacity - Used) {
       EJIT_DIAG("shared fixed domain exhausted used=%llu capacity=%llu "
-                "poolSize=%zu; no reuse or dynamic fallback",
+                "claimBytes=%llu; no reuse or dynamic fallback",
                 static_cast<unsigned long long>(Used),
-                static_cast<unsigned long long>(Capacity), Size);
+                static_cast<unsigned long long>(Capacity),
+                static_cast<unsigned long long>(Size));
       return nullptr;
     }
     if (SharedFixedDomain.usedBytes.compareExchange(Used, Used + Size))
@@ -210,6 +236,23 @@ void *claimSharedFixedPool(size_t Size) {
           SharedFixedDomain.usableBase.loadRelaxed() + Used);
   }
 }
+
+void *claimSharedFixedPool(size_t Size) {
+  if (Size != SharedFixedDomain.poolSize.loadRelaxed())
+    return nullptr;
+  return claimSharedFixedRange(Size);
+}
+
+uintptr_t claimDataOnlyRange(void *, uint64_t Bytes) {
+  return reinterpret_cast<uintptr_t>(claimSharedFixedRange(Bytes));
+}
+
+#ifndef EJIT_FREESTANDING
+llvm::ejit::detail::SreDataOnlyArena *hostedDataOnlyArena() {
+  return reinterpret_cast<llvm::ejit::detail::SreDataOnlyArena *>(
+      HostedDataOnlyArena.loadAcquire());
+}
+#endif
 
 /// Make newly-written JIT code in [Va, Va + Size) observable to instruction
 /// fetch. On AArch64 the I-cache does not snoop D-cache writes, so code
@@ -336,6 +379,92 @@ llvm::ejit::getSreFixedCodePoolDomainInfo() {
   Info.poolSize = SharedFixedDomain.poolSize.loadRelaxed();
   return Info;
 }
+
+llvm::Error llvm::ejit::allocateSreSmallTableStorage(
+    uint64_t PayloadBytes, uint64_t Generation, EJitSreDataAllocation &Out) {
+  Out = {};
+#ifndef EJIT_FREESTANDING
+  if (auto *Arena = hostedDataOnlyArena())
+    return Arena->allocate(PayloadBytes, Generation, Out);
+#endif
+  if (!sharedFixedDomainMatchesLinker())
+    return make_error<StringError>(
+        "DataOnly storage requires the existing shared fixed reservation",
+        inconvertibleErrorCode());
+  detail::SreDataOnlyArena Arena(
+      SharedDataOnlyState, SharedFixedDomain.usableBase.loadRelaxed(),
+      SharedFixedDomain.usableBytes.loadRelaxed(),
+      dataDomainIdentity(SharedDataOnlyState), &claimDataOnlyRange, nullptr);
+  auto Result = Arena.allocate(PayloadBytes, Generation, Out);
+  if (!Result)
+    EJIT_DIAG("DataOnly allocation: id=%llu generation=%llu address=0x%llx "
+              "payload=%llu allocated=%llu block=[0x%llx,+%llu)",
+              static_cast<unsigned long long>(Out.identity),
+              static_cast<unsigned long long>(Out.generation),
+              static_cast<unsigned long long>(Out.address),
+              static_cast<unsigned long long>(Out.payloadBytes),
+              static_cast<unsigned long long>(Out.bytes),
+              static_cast<unsigned long long>(Out.blockBase),
+              static_cast<unsigned long long>(Out.blockBytes));
+  return Result;
+}
+
+bool llvm::ejit::validateSreSmallTableStorage(
+    const EJitSreDataAllocation &Allocation) {
+#ifndef EJIT_FREESTANDING
+  if (auto *Arena = hostedDataOnlyArena())
+    return Arena->validate(Allocation);
+#endif
+  if (!sharedFixedDomainMatchesLinker())
+    return false;
+  detail::SreDataOnlyArena Arena(
+      SharedDataOnlyState, SharedFixedDomain.usableBase.loadRelaxed(),
+      SharedFixedDomain.usableBytes.loadRelaxed(),
+      SharedDataOnlyState.domainIdentity.loadAcquire(), nullptr, nullptr);
+  return Arena.validate(Allocation);
+}
+
+bool llvm::ejit::releaseSreSmallTableStorage(
+    const EJitSreDataAllocation &Allocation, bool Failed) {
+#ifndef EJIT_FREESTANDING
+  if (auto *Arena = hostedDataOnlyArena())
+    return Arena->release(Allocation, Failed);
+#endif
+  if (!sharedFixedDomainMatchesLinker())
+    return false;
+  detail::SreDataOnlyArena Arena(
+      SharedDataOnlyState, SharedFixedDomain.usableBase.loadRelaxed(),
+      SharedFixedDomain.usableBytes.loadRelaxed(),
+      SharedDataOnlyState.domainIdentity.loadAcquire(), nullptr, nullptr);
+  return Arena.release(Allocation, Failed);
+}
+
+llvm::ejit::EJitSreDataAllocationStats
+llvm::ejit::getSreSmallTableStorageStats() {
+#ifndef EJIT_FREESTANDING
+  if (auto *Arena = hostedDataOnlyArena())
+    return Arena->stats();
+#endif
+  detail::SreDataOnlyArena Arena(
+      SharedDataOnlyState, SharedFixedDomain.usableBase.loadRelaxed(),
+      SharedFixedDomain.usableBytes.loadRelaxed(),
+      SharedDataOnlyState.domainIdentity.loadAcquire(), nullptr, nullptr);
+  return Arena.stats();
+}
+
+#ifndef EJIT_FREESTANDING
+llvm::ejit::detail::ScopedSreDataOnlyTestDomain::ScopedSreDataOnlyTestDomain(
+    SreDataOnlyState &State, uintptr_t Base, uint64_t Bytes,
+    SreDataOnlyArena::ClaimRangeFn Claim, void *Context)
+    : arena_(State, Base, Bytes, dataDomainIdentity(State), Claim, Context),
+      previous_(hostedDataOnlyArena()) {
+  HostedDataOnlyArena.storeRelease(reinterpret_cast<uintptr_t>(&arena_));
+}
+
+llvm::ejit::detail::ScopedSreDataOnlyTestDomain::~ScopedSreDataOnlyTestDomain() {
+  HostedDataOnlyArena.storeRelease(reinterpret_cast<uintptr_t>(previous_));
+}
+#endif
 
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
 llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {

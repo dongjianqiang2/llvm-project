@@ -64,20 +64,13 @@ ejit_entry int64_t pr231_smalltable_entry(
   return result;
 }
 
-/* Runtime owns worker dispatch; this demo does not require a task-self API.
- * Shared data is a SEPARATE product requirement: the table allocator is still
- * ordinary new[], not automatically made shared by the .mc_shared source.
- * Missing mapping bindings are a visible BLOCKED, never a successful no-op
- * permission check. There are no weak undefined hooks.
+/* Like the reuse/MFS demos, runtime owns platform dispatch and permissions.
+ * No task-self API or extra SDK binding header is required. Static shared
+ * objects must be inside the real __ejit_shared_start/end linker bounds;
+ * common tables use separate RW/NX pages from the existing fixed pool domain.
+ * The product still owns same-VA/same-physical coherent mapping of both areas.
+ * Missing bounds, unsafe ranges or refused permissions remain BLOCKED.
  */
-#ifdef EJIT_PR231_PLATFORM_HEADER
-#include EJIT_PR231_PLATFORM_HEADER
-#endif
-#if defined(EJIT_PR231_PREPARE_SHARED_DATA)
-#define PR231_HAVE_PLATFORM 1
-#else
-#define PR231_HAVE_PLATFORM 0
-#endif
 #ifndef EJIT_PR231_CALL_INIT_ARRAY
 #define EJIT_PR231_CALL_INIT_ARRAY 1
 #endif
@@ -127,19 +120,6 @@ static void pr231_delay(void *unused, uint32_t ticks) {
   (void)unused;
   (void)SRE_TaskDelay(ticks);
 }
-static int pr231_data(void *unused, uintptr_t address, uint64_t bytes,
-                      uint32_t access) {
-  (void)unused;
-#if PR231_HAVE_PLATFORM
-  return EJIT_PR231_PREPARE_SHARED_DATA(address, bytes, access);
-#else
-  (void)address;
-  (void)bytes;
-  (void)access;
-  return -1;
-#endif
-}
-
 static int pr231_snapshot(ejit_small_table_sre_snapshot_t *s) {
   memset(s, 0, sizeof(*s));
   s->abiVersion = EJIT_STAB_SRE_ABI_VERSION;
@@ -193,12 +173,6 @@ __attribute__((noinline)) void pr231_probe_inflight(void) {
 }
 
 static int pr231_setup(void) {
-  if (!PR231_HAVE_PLATFORM) {
-    SRE_printf("[STAB231] BLOCKED: shared-data mapping binding missing "
-               "(commands/source/state/owner-heap tables); "
-               "no SDK task-id API required\n");
-    return -20;
-  }
   if (pr231_initialized)
     return 0;
 #if EJIT_PR231_CALL_INIT_ARRAY
@@ -211,21 +185,6 @@ static int pr231_setup(void) {
     SRE_printf("[STAB231][core=%u] init-array done\n", g_ucLocalCoreID);
   }
 #endif
-  /* Both real caller/worker cores must read the actual shared callback slot.
-   * The observer itself runs in AOT against this core's private controller.
-   * Its shared flags also need real R/W mapping; section names are not proof.
-   */
-  if (pr231_data(0, (uintptr_t)&g_pr231_probe_dispatch,
-                  sizeof(g_pr231_probe_dispatch), EJIT_STAB_SRE_DATA_READ) != 0 ||
-      pr231_data(0, (uintptr_t)&g_pr231_stage, sizeof(g_pr231_stage),
-                  EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) != 0 ||
-      pr231_data(0, (uintptr_t)&g_pr231_probe_arm, sizeof(g_pr231_probe_arm),
-                  EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) != 0 ||
-      pr231_data(0, (uintptr_t)&g_pr231_probe_result, sizeof(g_pr231_probe_result),
-                  EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) != 0) {
-    SRE_printf("[STAB231] BLOCKED: callback/controller shared permissions\n");
-    return -20;
-  }
   ejit_small_table_sre_bindings_t bindings;
   memset(&bindings, 0, sizeof(bindings));
   bindings.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
@@ -234,11 +193,35 @@ static int pr231_setup(void) {
                        ? EJIT_STAB_SRE_ENABLE_FIXED_DOMAIN : 0u;
   bindings.waitRounds = EJIT_PR231_WAIT_ROUNDS;
   bindings.current_task_id = 0; /* Unknown SDK task ID; never a fabricated ID. */
-  bindings.delay_ticks = pr231_delay;
-  bindings.prepare_shared_data = pr231_data;
+  /* NULL selects runtime's existing SRE scheduler and strict shared-range
+   * preparation. It does not install a successful no-op permission hook. */
+  bindings.delay_ticks = 0;
+  bindings.prepare_shared_data = 0;
   int rc = ejit_small_table_sre_prepare(&bindings);
   if (rc != EJIT_STAB_SRE_OK) {
     SRE_printf("[STAB231] prepare BLOCKED rc=%d (fresh boot required)\n", rc);
+    return -20;
+  }
+  /* Check every real static object before using it. The observer runs in AOT
+   * against this core's private controller; only its slot/flags are shared. */
+  const uint32_t rw = EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE;
+  if (ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_probe_dispatch,
+          sizeof(g_pr231_probe_dispatch), EJIT_STAB_SRE_DATA_READ) !=
+          EJIT_STAB_SRE_OK ||
+      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_config,
+          sizeof(g_pr231_config), rw) != EJIT_STAB_SRE_OK ||
+      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_output,
+          sizeof(g_pr231_output), rw) != EJIT_STAB_SRE_OK ||
+      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_source,
+          sizeof(g_pr231_source), rw) != EJIT_STAB_SRE_OK ||
+      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_stage,
+          sizeof(g_pr231_stage), rw) != EJIT_STAB_SRE_OK ||
+      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_probe_arm,
+          sizeof(g_pr231_probe_arm), rw) != EJIT_STAB_SRE_OK ||
+      ejit_small_table_sre_prepare_data((uintptr_t)&g_pr231_probe_result,
+          sizeof(g_pr231_probe_result), rw) != EJIT_STAB_SRE_OK) {
+    SRE_printf("[STAB231] BLOCKED: real shared bounds/data permissions; "
+               "inspect runtime diagnostics (no SDK task-id binding needed)\n");
     return -20;
   }
   /* Register the actual mutable slot identically on BOTH cores, before init.
@@ -367,13 +350,8 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
       return -1;                                                          \
     }                                                                     \
   } while (0)
-  PR231_CHECK(pr231_data(0, (uintptr_t)&g_pr231_config, sizeof(g_pr231_config),
-                         EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) == 0 &&
-               pr231_data(0, (uintptr_t)&g_pr231_source, sizeof(g_pr231_source),
-                          EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) == 0 &&
-               pr231_data(0, (uintptr_t)&g_pr231_output, sizeof(g_pr231_output),
-                          EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE) == 0,
-               "shared configuration permissions");
+  /* Setup validated the actual shared source, state, output and controller
+   * ranges on this core before any configuration mutation. */
   PR231_CHECK(pr231_commit_configuration() == 0, "configuration commit");
   for (uint32_t cell = 0; cell < PR231_CELLS; ++cell)
     PR231_CHECK(ejit_activate("pr231_cell", cell) == EJIT_OK, "activate cell");

@@ -56,7 +56,10 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTableHost.h"
 #include "EJitSharedTaskPoolTestAccess.h"
 #include "../../../lib/ExecutionEngine/EJIT/EJitOwnerWorkerContext.h"
+#include "../../../lib/ExecutionEngine/EJIT/EJitSmallTableSreBridgeInternal.h"
+#include "../../../lib/ExecutionEngine/EJIT/EJitSreDataAllocator.h"
 #include "../../../lib/ExecutionEngine/EJIT/EJitWrapperRuntimeTestAccess.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -97,6 +100,7 @@
 #include <atomic>
 #include <cstdio>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -3818,7 +3822,8 @@ protected:
     for (unsigned T = 0; T < 2; ++T) if (ejit_activate("bridge_trp", T) != EJIT_OK) return false;
     return true;
   }
-  void requestCompiler2d(uint64_t Limit) {
+  virtual bool prepareCompilerSharedData() { return true; }
+  void requestCompiler2d(uint64_t Limit, bool Submit = true) {
     SourceState = {0xF00D, 1, 0, 0};
     Request = {};
     Request.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
@@ -3848,13 +3853,15 @@ protected:
       Request.members[I].configurationGeneration = 1;
       Request.members[I].fieldsInitialized = 1;
     }
-    ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+    if (Submit)
+      ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
   }
   void singleTuCold(uint64_t Limit, bool WorkerSixCallerSixteen = false) {
     auto RestoreCore = make_scope_exit([] { EJitCoreId::resetForTest(); });
     if (WorkerSixCallerSixteen)
       EJitCoreId::setCurrentForTest(6);
     ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
+    ASSERT_TRUE(prepareCompilerSharedData());
     if (WorkerSixCallerSixteen) {
       auto *Pool = EJitWrapperRuntimeTestAccess::pool();
       ASSERT_NE(Pool, nullptr);
@@ -4015,6 +4022,71 @@ protected:
     EXPECT_EQ(After.genericAsyncCompiles, 0u);
     EXPECT_EQ(After.genericPending, 0u);
   }
+  void singleTuCancelAndReplace() {
+    ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
+    ASSERT_TRUE(prepareCompilerSharedData());
+    requestCompiler2d(8);
+    for (unsigned I = 0; I < 7; ++I) {
+      const unsigned C = (I % 12) / 2, T = I % 2;
+      EXPECT_EQ(CompilerEntry(C, T, 4), wrapAotResult(CompilerRows[C][T], 4));
+    }
+    ASSERT_EQ(ObservationCount(), 7);
+    unsigned Held = 0;
+    g_observe = [&] {
+      ++Held;
+      EXPECT_EQ(ObservationCount(), 8);
+      EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_BUSY);
+      EXPECT_EQ(Before.sampleCount, 8u);
+      EXPECT_EQ(Before.physicalExecutions, 1u);
+      EXPECT_GT(Before.borrowReaders, 0u);
+      EXPECT_GT(SourceState.readers, 0u);
+      EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_BUSY);
+      EXPECT_EQ(ejit_small_table_sre_cancel(FuncIdx), EJIT_STAB_SRE_OK);
+      EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_BUSY);
+      EXPECT_EQ(After.physicalExecutions, 1u);
+      EXPECT_GT(After.borrowReaders, 0u);
+      EXPECT_GT(SourceState.readers, 0u)
+          << "cancel is not the final real return, even for the last sample";
+    };
+    EXPECT_EQ(CompilerEntry(3, 1, 4), wrapAotResult(CompilerRows[3][1], 4));
+    g_observe = nullptr;
+    EXPECT_EQ(Held, 1u);
+    EXPECT_EQ(g_aotCalls, 0u);
+    EXPECT_EQ(SourceState.readers, 0u);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(After.physicalExecutions, 0u);
+    EXPECT_EQ(After.borrowReaders, 0u);
+    EXPECT_EQ(After.genericAsyncEnqueues, 0u);
+
+    SourceState.writerBlocked = 1;
+    CompilerRows[3][1].bycell += 20;
+    SourceState.epoch = 0xF00E;
+    SourceState.revision = 2;
+    SourceState.writerBlocked = 0;
+    Request.sourceEpoch = SourceState.epoch;
+    Request.configurationRevision = SourceState.revision;
+    Request.codeGeneration = 2;
+    for (unsigned I = 0; I < 12; ++I)
+      Request.members[I].configurationGeneration = 2;
+    ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
+    for (unsigned I = 0; I < 8; ++I)
+      EXPECT_EQ(CompilerEntry(3, 1, 5), wrapAotResult(CompilerRows[3][1], 5));
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(Before.sampleCount, 8u);
+    ASSERT_EQ(Before.counterWordCount, 1u);
+    EXPECT_EQ(Before.counts[0], 8u);
+    ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
+    ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
+    EXPECT_EQ(After.codeGeneration, 2u);
+    EXPECT_EQ(After.tier, 2u);
+    EXPECT_EQ(After.fullProfileValid, 1u);
+    EXPECT_EQ(After.rootEntryCountValid, 1u);
+    EXPECT_EQ(After.rootEntryCount, 8u);
+    EXPECT_EQ(After.countersDigest, Before.countersDigest);
+    EXPECT_EQ(CompilerEntry(3, 1, 6), wrapAotResult(CompilerRows[3][1], 6));
+    EXPECT_EQ(ObservationCount(), 17);
+    EXPECT_EQ(g_aotCalls, 0u);
+  }
 };
 TEST_F(GeneratedWrapperSreBridgeTest, ColdRealWrapperFull64ProfileAndCommonT2) { cold(64); }
 TEST_F(GeneratedWrapperSreBridgeTest, ColdRealWrapperConfigurable8ProfileAndCommonT2) { cold(8); }
@@ -4032,7 +4104,7 @@ TEST_F(GeneratedWrapperSreBridgeTest,
   singleTuCold(64, /*WorkerSixCallerSixteen=*/true);
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
-       MissingSharedDataPermissionHookRemainsFailClosedWithoutTaskId) {
+       MissingRealSharedBoundsRemainsFailClosedWithoutTaskId) {
   ejit_small_table_sre_bindings_t Missing{};
   Missing.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
   Missing.structSize = sizeof(Missing);
@@ -4040,11 +4112,221 @@ TEST_F(GeneratedWrapperSreBridgeTest,
   Missing.delay_ticks = bridgeLinuxDelay;
   Missing.current_task_id = nullptr;
   EXPECT_EQ(ejit_small_table_sre_prepare(&Missing), EJIT_STAB_SRE_BLOCKED)
-      << "an unknown diagnostic task id never replaces real data preparation";
+      << "without genuine builtin bounds a NULL hook is not a mapping proof";
   // Failed preparation must not clobber the existing immutable, real mapping
   // binding. The normal cold path must still execute actual counters/profile.
   cold(8);
 }
+#if defined(EJIT_SRE_CODE_POOL) && !defined(EJIT_FREESTANDING)
+// This models the product's checked static section and exclusive fixed-domain
+// data reservation using REAL native mappings. No public mapping callback and
+// no SDK task-id adapter participates; code/PGO still use actual generated
+// wrappers and the real native Async worker. Linux's single address space is
+// explicit evidence, NOT an SRE same-physical/cache-coherence claim.
+class GeneratedWrapperBuiltinDataBridgeTest
+    : public GeneratedWrapperSreBridgeTest {
+protected:
+  static constexpr uint64_t DomainBytes = 4u << 20;
+  void *Mapping = MAP_FAILED;
+  uint64_t MappingBytes = DomainBytes + llvm::ejit::detail::SreDataBlockBytes;
+  uintptr_t DomainBase = 0;
+  uint64_t ClaimCursor = 0;
+  llvm::ejit::detail::SreDataOnlyState DataState{};
+  std::unique_ptr<llvm::ejit::detail::ScopedSreDataOnlyTestDomain> DataDomain;
+  std::unique_ptr<llvm::ejit::detail::ScopedSmallTableSreStaticDomainForTest>
+      StaticDomain;
+  std::atomic<bool> DenyDataWrite{false};
+  std::atomic<uint64_t> PreparedDataPages{0};
+  static uintptr_t claim(void *Context, uint64_t Bytes) {
+    auto &Self = *static_cast<GeneratedWrapperBuiltinDataBridgeTest *>(Context);
+    if (!Bytes || Bytes > DomainBytes - Self.ClaimCursor)
+      return 0;
+    const uintptr_t Address = Self.DomainBase + Self.ClaimCursor;
+    Self.ClaimCursor += Bytes;
+    return Address;
+  }
+  static bool split(void *, uintptr_t Base, uint64_t Bytes) {
+    // The existing actual adapter uses the native host's existing 4KiB
+    // mappings, with canonical range checks. Ordinary JIT slab preparation
+    // keeps this SAME adapter instead of becoming a blanket-success stub.
+    return ejitSreSplitPoolForCurrentCore(Base, Bytes);
+  }
+  static bool dataWrite(void *Context, uintptr_t Page) {
+    auto &Self = *static_cast<GeneratedWrapperBuiltinDataBridgeTest *>(Context);
+    if (Self.DenyDataWrite.load() || (Page & 4095))
+      return false;
+    const bool DataPage = Page >= Self.DomainBase &&
+        Page <= Self.DomainBase + DomainBytes - 4096;
+    if (!DataPage) {
+      // Preserve preparation of actual common-object writable pages, not an
+      // unrelated ordinary resolver object's authorization. Fixed-off native
+      // code normally needs no peer RW flip, but any emitted fixed-range
+      // metadata must still be accepted only through its exact allowlist.
+      auto *Host = EJitSmallTableHost::global();
+      EJitCompiledCodeInfo Info{};
+      if (!Host || !Host->activeEntry() ||
+          !Host->runtime().engine().findCodeRange(Host->activeEntry(), Info) ||
+          Info.writableCount > kEJitMaxWritableRanges)
+        return false;
+      bool ActualWritable = false;
+      for (uint32_t I = 0; I < Info.writableCount; ++I) {
+        const auto &W = Info.writableRanges[I];
+        if (!W.addr || !W.size || W.size > UINTPTR_MAX - W.addr ||
+            W.addr + W.size > UINTPTR_MAX - 4095)
+          return false;
+        const uintptr_t Begin = W.addr & ~uintptr_t(4095);
+        const uintptr_t End = (W.addr + W.size + 4095) & ~uintptr_t(4095);
+        if (Page >= Begin && Page < End)
+          ActualWritable = true;
+      }
+      if (!ActualWritable)
+        return false;
+    }
+    if (::mprotect(reinterpret_cast<void *>(Page), 4096,
+                   PROT_READ | PROT_WRITE) != 0)
+      return false;
+    if (DataPage)
+      ++Self.PreparedDataPages;
+    return true;
+  }
+  void SetUp() override {
+    ejit_shutdown();
+    gBridgeDenyCallerMapping = false;
+    gBridgeCallerTask = bridgeLinuxTask(nullptr);
+    // Pages begin genuinely inaccessible; table preparation must make only
+    // recorded data pages RW/NX before the common Host can zero/write them.
+    Mapping = ::mmap(nullptr, MappingBytes, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(Mapping, MAP_FAILED);
+    DomainBase = (reinterpret_cast<uintptr_t>(Mapping) +
+        llvm::ejit::detail::SreDataBlockBytes - 1) &
+        ~(llvm::ejit::detail::SreDataBlockBytes - 1);
+    DataDomain = std::make_unique<
+        llvm::ejit::detail::ScopedSreDataOnlyTestDomain>(
+            DataState, DomainBase, DomainBytes, &claim, this);
+    EJitWritableRange Ranges[] = {
+        {reinterpret_cast<uintptr_t>(g_wrap), sizeof(g_wrap)},
+        {reinterpret_cast<uintptr_t>(&SourceState), sizeof(SourceState)},
+        {reinterpret_cast<uintptr_t>(CompilerRows), sizeof(CompilerRows)},
+        {reinterpret_cast<uintptr_t>(CompilerOutput), sizeof(CompilerOutput)}};
+    StaticDomain = std::make_unique<
+        llvm::ejit::detail::ScopedSmallTableSreStaticDomainForTest>(Ranges);
+    ASSERT_TRUE(StaticDomain->valid());
+    ejit_small_table_sre_bindings_t Bindings{};
+    Bindings.abiVersion = EJIT_STAB_SRE_ABI_VERSION;
+    Bindings.structSize = sizeof(Bindings);
+    Bindings.waitRounds = 65536;
+    ASSERT_EQ(ejit_small_table_sre_prepare(&Bindings), EJIT_STAB_SRE_OK);
+    GeneratedWrapperTest::SetUp();
+  }
+  bool prepareCompilerSharedData() override {
+    if (!StaticDomain || !ProbeDispatch ||
+        !StaticDomain->addRange(reinterpret_cast<uintptr_t>(ProbeDispatch),
+                                sizeof(*ProbeDispatch)))
+      return false;
+    auto *Pool = EJitWrapperRuntimeTestAccess::pool();
+    if (!Pool) return false;
+    Pool->setSealMode(true);
+    Pool->setSplitPoolCallback(&split, this);
+    Pool->setEnableRwPageCallback(&dataWrite, this);
+    return true;
+  }
+  void TearDown() override {
+    GeneratedWrapperTest::TearDown();
+    // Both scope destructors occur AFTER the real worker join and the last
+    // physical leave, never as a replacement for runtime shutdown/leave.
+    StaticDomain.reset();
+    DataDomain.reset();
+    if (Mapping != MAP_FAILED) {
+      EXPECT_EQ(::munmap(Mapping, MappingBytes), 0);
+      Mapping = MAP_FAILED;
+    }
+  }
+};
+TEST_F(GeneratedWrapperBuiltinDataBridgeTest,
+       NoSdkCallbacksWorkerSixCallerSixteenCold64CompleteProfileToCommonT2) {
+  EXPECT_EQ(bridgeLinuxMapping(nullptr, DomainBase, 4096,
+                              EJIT_STAB_SRE_DATA_READ), -1);
+  singleTuCold(64, /*WorkerSixCallerSixteen=*/true);
+  EXPECT_GT(PreparedDataPages.load(), 0u);
+  const auto Stats = DataDomain->arena().stats();
+  EXPECT_EQ(Stats.snapshotValid, 1u);
+  EXPECT_GT(Stats.allocationCount, 0u);
+  EXPECT_GT(Stats.claimedBytes, 0u);
+  EXPECT_LE(Stats.claimedBytes, DomainBytes);
+  EXPECT_EQ(Stats.failedCount, 0u);
+}
+TEST_F(GeneratedWrapperBuiltinDataBridgeTest,
+       NoSdkCallbacksUnknownStaticRangeIsRefusedWithoutChangingBinding) {
+  uint64_t Unknown = 0;
+  EXPECT_EQ(ejit_small_table_sre_prepare_data(
+      reinterpret_cast<uintptr_t>(&Unknown), sizeof(Unknown),
+      EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE),
+      EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(ejit_small_table_sre_prepare_data(
+      reinterpret_cast<uintptr_t>(&SourceState), sizeof(SourceState),
+      EJIT_STAB_SRE_DATA_READ | EJIT_STAB_SRE_DATA_WRITE), EJIT_STAB_SRE_OK);
+  const uintptr_t Source = reinterpret_cast<uintptr_t>(&SourceState);
+  EXPECT_EQ(ejit_small_table_sre_prepare_data(
+      Source + sizeof(SourceState) - 1, 1, EJIT_STAB_SRE_DATA_READ),
+      EJIT_STAB_SRE_OK);
+  EXPECT_EQ(ejit_small_table_sre_prepare_data(
+      Source, sizeof(SourceState) + 1, EJIT_STAB_SRE_DATA_READ),
+      EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(ejit_small_table_sre_prepare_data(Source, sizeof(SourceState), 0),
+      EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(ejit_small_table_sre_prepare_data(Source, sizeof(SourceState), 4),
+      EJIT_STAB_SRE_BLOCKED);
+  EXPECT_EQ(ejit_small_table_sre_prepare_data(
+      UINTPTR_MAX - 1, 4, EJIT_STAB_SRE_DATA_READ), EJIT_STAB_SRE_BLOCKED);
+  singleTuCold(8);
+}
+TEST_F(GeneratedWrapperBuiltinDataBridgeTest,
+       NoSdkCallbacksLastRealLeaveAndReplacementRetainActualDataStorage) {
+  singleTuCancelAndReplace();
+  const auto Stats = DataDomain->arena().stats();
+  EXPECT_EQ(Stats.allocationCount, 2u);
+  EXPECT_EQ(Stats.failedCount, 0u);
+  EXPECT_GT(PreparedDataPages.load(), 0u);
+}
+TEST_F(GeneratedWrapperBuiltinDataBridgeTest,
+       NoSdkCallbacksDataPermissionDenialFailsBeforeTableWrite) {
+  ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
+  ASSERT_TRUE(prepareCompilerSharedData());
+  DenyDataWrite = true;
+  requestCompiler2d(8, /*Submit=*/false);
+  EXPECT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_FAILED);
+  EXPECT_EQ(PreparedDataPages.load(), 0u);
+  EXPECT_EQ(SourceState.readers, 0u);
+  EXPECT_EQ(bridgeLinuxMapping(nullptr, DomainBase, 4096,
+                              EJIT_STAB_SRE_DATA_READ), -1);
+  const auto Stats = DataDomain->arena().stats();
+  EXPECT_EQ(Stats.liveBytes, 0u);
+  EXPECT_EQ(Stats.failedCount, 1u);
+  EXPECT_GE(Stats.failedBytes, 4096u);
+  ejit_taskpool_stats_t Generic{};
+  ASSERT_EQ(ejit_taskpool_get_stats(&Generic), EJIT_OK);
+  EXPECT_EQ(Generic.asyncEnqueues, 0u);
+  EXPECT_EQ(Generic.pendingEntries, 0u);
+}
+TEST_F(GeneratedWrapperBuiltinDataBridgeTest,
+       NoSdkCallbacksMissingActualDataDomainDoesNotUseOwnerHeap) {
+  ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
+  ASSERT_TRUE(prepareCompilerSharedData());
+  // No live allocations/calls exist, so dropping only the injected domain is
+  // safe. Production's absent fixed reservation must fail instead of new[].
+  DataDomain.reset();
+  requestCompiler2d(8, /*Submit=*/false);
+  EXPECT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_FAILED);
+  EXPECT_EQ(PreparedDataPages.load(), 0u);
+  EXPECT_EQ(SourceState.readers, 0u);
+  EXPECT_EQ(DataState.stats.allocationCount, 0u);
+  ejit_taskpool_stats_t Generic{};
+  ASSERT_EQ(ejit_taskpool_get_stats(&Generic), EJIT_OK);
+  EXPECT_EQ(Generic.asyncEnqueues, 0u);
+  EXPECT_EQ(Generic.pendingEntries, 0u);
+}
+#endif
 TEST_F(GeneratedWrapperSreBridgeTest,
        PublicPrepareCannotReplaceExistingUnknownTaskIdBinding) {
   ejit_small_table_sre_bindings_t Changed{};
@@ -4059,68 +4341,7 @@ TEST_F(GeneratedWrapperSreBridgeTest,
 }
 TEST_F(GeneratedWrapperSreBridgeTest,
        SingleTuActualPass1LastCallCancelRetainsBorrowUntilRealLeave) {
-  ASSERT_TRUE(buildActualCompilerRegistry2d(/*SingleTuCallback=*/true));
-  requestCompiler2d(8);
-  for (unsigned I = 0; I < 7; ++I) {
-    const unsigned C = (I % 12) / 2, T = I % 2;
-    EXPECT_EQ(CompilerEntry(C, T, 4), wrapAotResult(CompilerRows[C][T], 4));
-  }
-  ASSERT_EQ(ObservationCount(), 7);
-  unsigned Held = 0;
-  g_observe = [&] {
-    ++Held;
-    EXPECT_EQ(ObservationCount(), 8);
-    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_BUSY);
-    EXPECT_EQ(Before.sampleCount, 8u);
-    EXPECT_EQ(Before.physicalExecutions, 1u);
-    EXPECT_GT(Before.borrowReaders, 0u);
-    EXPECT_GT(SourceState.readers, 0u);
-    EXPECT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_BUSY);
-    EXPECT_EQ(ejit_small_table_sre_cancel(FuncIdx), EJIT_STAB_SRE_OK);
-    EXPECT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_BUSY);
-    EXPECT_EQ(After.physicalExecutions, 1u);
-    EXPECT_GT(After.borrowReaders, 0u);
-    EXPECT_GT(SourceState.readers, 0u)
-        << "cancel is not the final real return, even for the last sample";
-  };
-  EXPECT_EQ(CompilerEntry(3, 1, 4), wrapAotResult(CompilerRows[3][1], 4));
-  g_observe = nullptr;
-  EXPECT_EQ(Held, 1u);
-  EXPECT_EQ(g_aotCalls, 0u);
-  EXPECT_EQ(SourceState.readers, 0u);
-  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
-  EXPECT_EQ(After.physicalExecutions, 0u);
-  EXPECT_EQ(After.borrowReaders, 0u);
-  EXPECT_EQ(After.genericAsyncEnqueues, 0u);
-
-  SourceState.writerBlocked = 1;
-  CompilerRows[3][1].bycell += 20;
-  SourceState.epoch = 0xF00E;
-  SourceState.revision = 2;
-  SourceState.writerBlocked = 0;
-  Request.sourceEpoch = SourceState.epoch;
-  Request.configurationRevision = SourceState.revision;
-  Request.codeGeneration = 2;
-  for (unsigned I = 0; I < 12; ++I)
-    Request.members[I].configurationGeneration = 2;
-  ASSERT_EQ(ejit_small_table_sre_request(&Request), EJIT_STAB_SRE_OK);
-  for (unsigned I = 0; I < 8; ++I)
-    EXPECT_EQ(CompilerEntry(3, 1, 5), wrapAotResult(CompilerRows[3][1], 5));
-  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &Before), EJIT_STAB_SRE_OK);
-  EXPECT_EQ(Before.sampleCount, 8u);
-  ASSERT_EQ(Before.counterWordCount, 1u);
-  EXPECT_EQ(Before.counts[0], 8u);
-  ASSERT_EQ(ejit_small_table_sre_finish(FuncIdx), EJIT_STAB_SRE_OK);
-  ASSERT_EQ(ejit_small_table_sre_get_snapshot(FuncIdx, &After), EJIT_STAB_SRE_OK);
-  EXPECT_EQ(After.codeGeneration, 2u);
-  EXPECT_EQ(After.tier, 2u);
-  EXPECT_EQ(After.fullProfileValid, 1u);
-  EXPECT_EQ(After.rootEntryCountValid, 1u);
-  EXPECT_EQ(After.rootEntryCount, 8u);
-  EXPECT_EQ(After.countersDigest, Before.countersDigest);
-  EXPECT_EQ(CompilerEntry(3, 1, 6), wrapAotResult(CompilerRows[3][1], 6));
-  EXPECT_EQ(ObservationCount(), 17);
-  EXPECT_EQ(g_aotCalls, 0u);
+  singleTuCancelAndReplace();
 }
 TEST_F(GeneratedWrapperSreBridgeTest, ActualCompilerOuterCountSixByTwoCold64CompleteProfileAndT2) {
   ASSERT_TRUE(buildActualCompilerRegistry2d());

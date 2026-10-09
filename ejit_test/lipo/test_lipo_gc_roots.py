@@ -29,6 +29,7 @@ SMALL_TABLE_HOOKS = (
 )
 SMALL_TABLE_SRE_HOOKS = (
     "ejit_small_table_sre_prepare",
+    "ejit_small_table_sre_prepare_data",
     "ejit_small_table_sre_request",
     "ejit_small_table_sre_get_snapshot",
     "ejit_small_table_sre_finish",
@@ -305,6 +306,12 @@ def main():
         for prefix in ("ejit_bitcode", "ejit_period"):
             if f"__start_{prefix}" not in merged_symbols or f"__stop_{prefix}" not in merged_symbols:
                 raise AssertionError(f"final merge lost {prefix} registry bounds")
+        actual = lipo._nm_defined(str(smalltable_merged))
+        shared_start = actual.get("__ejit_shared_start", ())
+        shared_end = actual.get("__ejit_shared_end", ())
+        if len(shared_start) != 1 or len(shared_end) != 1 or \
+                int(shared_end[0][1], 16) <= int(shared_start[0][1], 16):
+            raise AssertionError("final merge lost actual nonempty shared-data bounds")
 
         minimal = build_archive(root, clang, ar, (), "minimal")
         minimal_gc, _ = gc_merge(lipo, root, minimal, ar, nm, ld, "minimal")

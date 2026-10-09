@@ -35,6 +35,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSHAREDTASKPOOL_H
 
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedData.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
@@ -491,6 +492,11 @@ public:
   /// Prepare the actual common object, not a generic cache slot's range.
   /// The caller holds a real small-table execution ticket for its lifetime.
   bool prepareExternalExecution(void *Entry, const EJitCompiledCodeInfo &Info);
+  /// Prepare an actual runtime-owned DataOnly allocation on this caller. The
+  /// allocation must belong to the shared fixed data domain, never arbitrary
+  /// heap storage or an executable code range. Split/enable_rw use the same
+  /// per-core adapters as ordinary PGO; no executable range is fabricated.
+  bool prepareExternalSharedData(const EJitSreDataAllocation &Info);
   enum class OwnerControlStatus : uint8_t {
     Completed, CancelledBeforeStart, Rejected
   };

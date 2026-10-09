@@ -3,11 +3,38 @@
 #ifndef LLVM_LIB_EXECUTIONENGINE_EJIT_EJITSMALLTABLESREBRIDGEINTERNAL_H
 #define LLVM_LIB_EXECUTIONENGINE_EJIT_EJITSMALLTABLESREBRIDGEINTERNAL_H
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#ifndef EJIT_FREESTANDING
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
+#endif
 namespace llvm { namespace ejit {
 class EJit;
 class EJitSharedTaskPool;
 class EJitSmallTableHost;
 namespace detail { class OwnerWorkerContext; }
+#ifndef EJIT_FREESTANDING
+namespace detail {
+/// Implementation-private Linux model of the existing static shared-section
+/// deployment contract. It admits only an exact bounded range inventory plus
+/// the actual bridge POD; never a whole process/heap mapping. There is no
+/// freestanding setter or installed/public SDK hook. Join the worker and close
+/// every physical lease before destroying the scope.
+class ScopedSmallTableSreStaticDomainForTest {
+public:
+  explicit ScopedSmallTableSreStaticDomainForTest(
+      ArrayRef<EJitWritableRange> Ranges);
+  ~ScopedSmallTableSreStaticDomainForTest();
+  ScopedSmallTableSreStaticDomainForTest(
+      const ScopedSmallTableSreStaticDomainForTest &) = delete;
+  ScopedSmallTableSreStaticDomainForTest &operator=(
+      const ScopedSmallTableSreStaticDomainForTest &) = delete;
+  bool valid() const { return active_; }
+  bool addRange(uintptr_t Address, uint64_t Bytes);
+private:
+  bool active_ = false;
+};
+}
+#endif
 EJit *smallTableSreLocalRuntime();
 // An ownership acquisition, not a raw observation. With no pool argument only
 // the live facade is selected. Owner service may also acquire the deferred

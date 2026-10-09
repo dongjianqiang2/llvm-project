@@ -3870,6 +3870,21 @@ TEST(SmallTableTableResourceTest, EachResourceSnapshotsItsPlanByteOrder) {
   EXPECT_EQ(Little->accounting().publishedCells, 1u);
 }
 
+TEST(SmallTableTableResourceTest, RequiredSharedStorageNeverFallsBackToHeap) {
+  auto Plan = endianResourcePlan(false);
+  std::string Error;
+  auto Resource = EJitSmallTableTableResource::create(
+      Plan, 31, 82, Error, nullptr, true);
+  EXPECT_EQ(Resource, nullptr);
+  EXPECT_NE(Error.find("DataOnly"), std::string::npos);
+  // The same valid layout is still supported by the explicitly hosted
+  // component backend; refusing shared storage must not weaken that layout.
+  auto Hosted = EJitSmallTableTableResource::create(Plan, 32, 82, Error);
+  ASSERT_NE(Hosted, nullptr) << Error;
+  EXPECT_EQ(Hosted->allocatedBytes(), 82u);
+  EXPECT_EQ(Hosted->sharedDataAllocation().identity, 0u);
+}
+
 TEST(SmallTableTableResourceTest, UniformOnlyPlanAllocatesNoEndianPayload) {
   for (bool Little : {true, false}) {
     auto Plan = endianResourcePlan(Little);
@@ -3894,6 +3909,12 @@ TEST(SmallTableTableResourceTest, UniformOnlyPlanAllocatesNoEndianPayload) {
     EXPECT_EQ(Resource->accounting().publishedCells, 0u);
     EXPECT_EQ(Resource->publish(0, 0, Plan.rows[0].bits[0]),
               EJitSmallTableTableResource::PublishResult::NotATable);
+    auto SharedUniform = EJitSmallTableTableResource::create(
+        Plan, 42, 0, Error, nullptr, true);
+    ASSERT_NE(SharedUniform, nullptr) << Error;
+    EXPECT_EQ(SharedUniform->base(), nullptr);
+    EXPECT_EQ(SharedUniform->allocatedBytes(), 0u);
+    EXPECT_EQ(SharedUniform->sharedDataAllocation().identity, 0u);
   }
 }
 

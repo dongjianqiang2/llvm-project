@@ -1,22 +1,19 @@
-/* Copy to an SDK-owned header and replace the mapping #error directive with
- * bindings to the actual product APIs. No SDK signature is guessed here.
- * Compile the demo with:
- *   -DEJIT_PR231_PLATFORM_HEADER='"your_pr231_sre_bindings.h"'
- * This template is intentionally not a linkable mock or a product default.
+/* Historical custom-binding template, kept for callers of the released C ABI.
+ * The stock single-C demo no longer includes this file or needs SDK macros.
+ * It passes NULL prepare_shared_data/delay_ticks to use runtime's existing SRE
+ * scheduler and checked static/fixed-domain data ranges. There is no task-self
+ * API requirement and no default successful mapping stub.
+ *
+ * A product needing a different storage model may STILL provide a genuine
+ * ejit_small_table_sre_bindings_t::prepare_shared_data callback. That optional
+ * ABI is unchanged; it must prove/install same-VA same-physical coherent
+ * READ/WRITE on the actual calling core, reject unknown/private ranges, and
+ * return zero only on success. Use the product's real SDK signature rather
+ * than inventing an interface here. The stock demo does not require it.
  */
 #ifndef YOUR_PR231_SRE_BINDINGS_H
 #define YOUR_PR231_SRE_BINDINGS_H
 
-/* No task-self API is required. Worker dispatch is internal to the runtime;
- * the optional old current_task_id C ABI field is diagnostic only. */
-
-/* Return zero only after proving/installing same-VA coherent READ and/or WRITE
- * mapping on this actual calling core. Handle shared commands, source/state,
- * tables allocated by the common engine, and actual common PGO counter ranges.
- * Must reject unknown/unmapped/private/unsafe ranges. Merely checking the VA
- * or returning zero unconditionally is NOT a valid implementation.
- * access uses EJIT_STAB_SRE_DATA_READ / EJIT_STAB_SRE_DATA_WRITE.
- */
-#error "Bind EJIT_PR231_PREPARE_SHARED_DATA(address,bytes,access) to product mappings"
+/* No code is supplied: this is not a no-op permission implementation. */
 
 #endif

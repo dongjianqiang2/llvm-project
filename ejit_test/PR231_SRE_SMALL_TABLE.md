@@ -22,8 +22,11 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
   `ejit_stab_leave` 调用，不能只看到库导出了同名符号就认为业务已接入。
 - 保留 `EJIT_SRE_PGO_BRANCH_AUDIT=ON`、诊断、Async 和在线 PGO。
   原产品默认不自动开启小表；本用例通过新 C setup 明确申请。
+  沿用已有 BE/SRE 的 `EJIT_SRE_SHARED_TASKPOOL`、`EJIT_SRE_SHARED_CODE_POINTERS`、
+  `EJIT_SRE_CODE_POOL`、`EJIT_FIXED_CODE_POOL` 和 `EJIT_CODE_POOL_4K_SEAL=ON`
+  能力组合；这些是既有 runtime 的共享/权限能力，不是新的用例 SDK 绑定。
 - 用例仅替换一个现有 period demo。不要同时链接另一个定义
-  `test_ejit_period` 的对象。小表 runtime 七个 hook、新桥接六个 C API
+  `test_ejit_period` 的对象。小表 runtime 七个 hook、新桥接七个 C API
   和两个 shell 入口必须在最终合并对象中有唯一真实定义；严格 demo roots
   同时保留 `g_pr231_probe_dispatch` 共享 OBJECT 和 `pr231_probe_inflight`
   真实 AOT FUNC，缺任一即报错，不依赖碰巧被别的引用留下。
@@ -32,20 +35,21 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
   不可公开构造的执行上下文，校验 pool、启动代际和重启 epoch，避免自排队。
   旧 bindings ABI 不变；可选 `current_task_id` 仅供真实 SDK 身份诊断，未提供时
   `workerTaskIdentity=0`（未知），不把内部上下文或核号冒充任务 ID。
-- 共享数据映射是**独立未完成的平台接入**。现有 code pool 能准备真实共同
-  代码和 T1 计数器权限，但 RuntimeOwned 小表仍使用普通 `new[]`；配置放入
-  `.mc_shared` 不能证明 owner 堆中的表也共享。本轮不新增共享区、不改变 allocator
-  或扩大权限范围。需产品证明 commands/source/state、共同表及计数器的同物理
-  coherent backing，并在实际调用核准备权限。可用
-  `ejit_smalltable_sre_platform.h.example` 绑定真实映射接口，定义
-  `EJIT_PR231_PLATFORM_HEADER` 指向它；无需任何 task-id 绑定。
-  缺少该能力时明确打印 `BLOCKED: shared-data mapping binding missing`，
-  不继续初始化；不能将权限检查写成固定返回零。
+- **默认不用额外 SDK 绑定头或映射宏**。与 PR230/MFS 用例一样，已有 runtime
+  worker、共享节和 code pool 接线负责平台工作。用例的旧 bindings ABI 保留，
+  `current_task_id`、`delay_ticks`、`prepare_shared_data` 均传 NULL；runtime
+  使用真实共享边界校验、已有 SRE delay 和实际对象权限准备，不装成功空回调。
+  小表专用表 payload 不再依赖任意 owner `new[]` 跨核可见：显式小表路径从已有
+  `__ejit_code_start/end` 固定域获取独占的数据块，在独立 RW/NX 页中分代分配；
+  普通 code/T1 counter 沿原实际 range 权限路径。没有新 SDK 函数或全局 allocator
+  改造。缺少真实 bounds/domain、越界、不支持的权限或容量耗尽即拒绝/AOT。
 - `.mc_shared` 必须在两核映射到同一 VA、同一真正 coherent 存储；共享命令、
-  配置、source-state、output、callback槽及调测flags都在此节。用例在两核setup
-  分别检查callback槽READ及调测flagsR/W权限，不用成功空实现替代。真实AOT
-  callback代码也须在调用核可执行。共同表/计数器堆对象须可共享，并通过
-  调用核的真实权限接口。仅有 section 名或 fingerprint 一致不证明这个前提。
+  配置、source-state、output、callback槽及调测flags都在此节。最终 linker 必须
+  在完整节前后定义 `__ejit_shared_start` / `__ejit_shared_end`，runtime 检查真实
+  范围后允许访问；用例在两核setup调用薄 C API `ejit_small_table_sre_prepare_data`
+  检查所有这些实际对象。真实AOT callback代码也须在调用核可执行。固定域内
+  小表页/计数器的同物理共享、cache coherence 和初始静态共享节 R/W 是产品部署
+  契约，不能用相同 VA、section 名或 fingerprint 代替真实板测证明。
 - 每核私有 runtime/构造器状态必须保持私有；两核各消费同一套注册。
   默认每核首次命令调用一次 `call_init_array_functions()`。若产品启动已经
   完整做过构造，将用例编为 `EJIT_PR231_CALL_INIT_ARRAY=0`，不能重复构造。
@@ -54,6 +58,11 @@ SDK 最终链接或真实板测**。组件模拟器结果另列，不替代这�
   `__ejit_code_start/end` 使用产品真实保留区、4K 对齐，程序在其范围内向上
   2M 对齐；建议至少 32MiB 以容纳普通、共同及换代池。不要把其它代码/数据放进
   这块保留区。不要假造地址、删除 guard 或另启动态分配绕过。
+- 小表数据预算：使用固定域内独占2MiB块（按需领取），每代按4KiB页分配，
+  总数据块预算最多16MiB且受固定域剩余空间约束；最多256个分配记录，单次资源
+  仍受4MiB容量上限约束。固定域/数据页不与任何代码页重叠，不封为RX、不回收
+  复用旧地址；真实最后leave之前表/borrow仍保活，retire只改变生命周期账目。
+  容量、权限或range描述拒绝时回AOT，不放宽尺寸、不静默动态堆回退。
 - 函数级普通 PGO 交接在真正 owner worker 完成后才使 Host 生效。测试的
   `owner` 指配置/调用侧16号核；runtime pool 的编译 owner/worker 为6号核。
 - 本次新增 C 调测桥是有界接口，最多32成员、32 counter pair、256 counter word，
@@ -113,6 +122,20 @@ T2以 `test_ejit_smalltable_print` 的 `tier=2/full_profile=1`、真实入口计
 12个published slot为准。普通enqueue/pending保持0正是这条冷启动用例的判据。
 
 ## lipo / 最终对象检查
+
+SDK 最终链接脚本也要合并全部共享输入并重新定义实际边界（lipo 两阶段已保留）：
+
+```ld
+.mc_shared : ALIGN(64) {
+  __ejit_shared_start = .;
+  KEEP(*(.mc_shared .mc_shared.*))
+  __ejit_shared_end = .;
+}
+```
+
+该段应沿用现有产品共享内存 REGION/loader映射，不另放入普通核私有 `.data`。
+边界必须覆盖完整最终节，不沿用部分链接时的旧地址；检查器会拒绝缺失/重名边界、
+ABS假地址、边界与节不一致，以及对象extent越界。仅边界正确不证明同物理coherence。
 
 在本次 runtime 包的 `gc-merge` 和 `merge` 都使用 `--require-small-table-sre`；
 已有 AArch64 脚本可设置 `EJIT_REQUIRE_SMALL_TABLE_SRE=1`。最终含用例的合并输入

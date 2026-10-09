@@ -30,8 +30,11 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#if defined(EJIT_FREESTANDING) && defined(EJIT_FIXED_CODE_POOL)
+#ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
+#endif
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+#include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #endif
 #include "llvm/IR/Module.h"
 #include "llvm/ProfileData/InstrProf.h"
@@ -162,7 +165,16 @@ uint64_t projectCoordinate(ArrayRef<EJitSmallTableDim> Dims,
 } // namespace
 
 EJitSmallTableTableResource::~EJitSmallTableTableResource() {
-  delete[] base_;
+  if (sharedAllocation_.identity) {
+#ifdef EJIT_SRE_CODE_POOL
+    // Logical retirement occurs only after the existing real-reader drain.
+    // The DataOnly backend never recycles the physical address, even then.
+    if (!releaseSreSmallTableStorage(sharedAllocation_))
+      EJIT_DIAG("small-table DataOnly retirement identity refused; physical storage retained");
+#endif
+  } else {
+    delete[] base_;
+  }
   base_ = nullptr;
 }
 
@@ -171,6 +183,16 @@ EJitSmallTableTableResource::create(const EJitSmallTablePlan &Plan,
                                     uint64_t Generation,
                                     uint64_t CapacityLimit,
                                     std::string &Error) {
+  return create(Plan, Generation, CapacityLimit, Error, nullptr, false);
+}
+
+std::unique_ptr<EJitSmallTableTableResource>
+EJitSmallTableTableResource::create(const EJitSmallTablePlan &Plan,
+                                   uint64_t Generation,
+                                   uint64_t CapacityLimit,
+                                   std::string &Error,
+                                   EJitSharedTaskPool *SharedDataPool,
+                                   bool RequireSharedData) {
   auto Refuse = [&](const Twine &Msg)
       -> std::unique_ptr<EJitSmallTableTableResource> {
     Error = Msg.str();
@@ -222,7 +244,29 @@ EJitSmallTableTableResource::create(const EJitSmallTablePlan &Plan,
     return Res;
   }
 
-  Res->base_ = new uint8_t[static_cast<size_t>(Offset)]();
+  if (RequireSharedData) {
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_SRE_SHARED_TASKPOOL)
+    if (!SharedDataPool)
+      return Refuse("small-table DataOnly storage has no owner preparation pool");
+    EJitSreDataAllocation Allocation{};
+    if (llvm::Error E = allocateSreSmallTableStorage(Offset, Generation, Allocation))
+      return Refuse(toString(std::move(E)));
+    if (!SharedDataPool->prepareExternalSharedData(Allocation)) {
+      if (!releaseSreSmallTableStorage(Allocation, true))
+        EJIT_DIAG("small-table DataOnly failed preparation could not close its exact metadata record; storage remains charged and retained");
+      return Refuse("small-table DataOnly permissions refused before initialization");
+    }
+    Res->sharedAllocation_ = Allocation;
+    Res->base_ = reinterpret_cast<uint8_t *>(Allocation.address);
+    Res->allocatedBytes_ = Allocation.bytes;
+    std::memset(Res->base_, 0, static_cast<size_t>(Allocation.bytes));
+#else
+    return Refuse("small-table DataOnly storage requires the shared SRE code-pool adapter");
+#endif
+  } else {
+    Res->base_ = new uint8_t[static_cast<size_t>(Offset)]();
+    Res->allocatedBytes_ = Offset;
+  }
   Res->capacityBytes_ = Offset;
   return Res;
 }
@@ -315,7 +359,7 @@ EJitSmallTableTableResource::publishedValues(unsigned FieldIndex) const {
 EJitSmallTableTableResource::Accounting
 EJitSmallTableTableResource::accounting() const {
   Accounting A;
-  A.allocatedBytes = capacityBytes_;
+  A.allocatedBytes = allocatedBytes_;
   for (const Column &C : columns_) {
     A.payloadBytes += C.payloadBytes;
     const std::vector<std::pair<bool, uint64_t>> &State =
@@ -356,6 +400,7 @@ EJitSmallTableRuntime::create(
     return make_error<StringError>(
         "small-table fixed code pool requires a non-overlapping allocation domain",
         inconvertibleErrorCode());
+  Opts.requireSharedDataStorage = true;
 #endif
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, Registry, State);
   if (!EngineOrErr)
@@ -454,7 +499,8 @@ EJitSmallTableRuntime::prepare(Module &M, StringRef EntryName,
     return make_error<StringError>(Error, inconvertibleErrorCode());
 
   auto Res = EJitSmallTableTableResource::create(
-      *Planned, Epoch, options_.resourceCapacityLimit, Error);
+      *Planned, Epoch, options_.resourceCapacityLimit, Error,
+      options_.sharedDataPool, options_.requireSharedDataStorage);
   if (!Res)
     return make_error<StringError>(Error, inconvertibleErrorCode());
   resource_ = std::move(Res);
@@ -604,24 +650,25 @@ EJitSmallTableRuntime::beginNextGeneration(
   if (!Planned->verifyProjections(&Error))
     return make_error<StringError>(Error, inconvertibleErrorCode());
 
-  auto NewResource = EJitSmallTableTableResource::create(
-      *Planned, resource_->generation() + 1, options_.resourceCapacityLimit,
-      Error);
-  if (!NewResource)
-    return make_error<StringError>(Error, inconvertibleErrorCode());
-
   // Retention budget (spec §8): the previous generation stays alive for code
-  // that may still dispatch to it, so it is accounted before it is retained.
-  if (retainedBytes_ + resource_->capacityBytes() >
-      options_.retentionCapacityLimit) {
+  // that may still dispatch to it. Check before claiming another monotonic
+  // allocation; charge the actual page-rounded backing, not only its payload.
+  if (retainedBytes_ > options_.retentionCapacityLimit ||
+      resource_->allocatedBytes() > options_.retentionCapacityLimit - retainedBytes_) {
     Error = ("retention budget exceeded: keeping generation " +
              Twine(resource_->generation()) + " alive needs " +
-             Twine(retainedBytes_ + resource_->capacityBytes()) +
+             Twine(retainedBytes_ + resource_->allocatedBytes()) +
              " bytes, above the limit of " +
              Twine(options_.retentionCapacityLimit))
                 .str();
     return make_error<StringError>(Error, inconvertibleErrorCode());
   }
+
+  auto NewResource = EJitSmallTableTableResource::create(
+      *Planned, resource_->generation() + 1, options_.resourceCapacityLimit,
+      Error, options_.sharedDataPool, options_.requireSharedDataStorage);
+  if (!NewResource)
+    return make_error<StringError>(Error, inconvertibleErrorCode());
 
   // Migrate every union member into the NEW resource before anything is
   // committed: reading, validation and publication all happen against the new
@@ -673,7 +720,7 @@ EJitSmallTableRuntime::beginNextGeneration(
   // its columns in the freshly parsed module.
   resource_.swap(NewResource);
   retained_.push_back(std::move(NewResource));
-  retainedBytes_ += retained_.back()->capacityBytes();
+  retainedBytes_ += retained_.back()->allocatedBytes();
   plan_ = std::make_shared<const EJitSmallTablePlan>(std::move(*Planned));
   contract_ = std::move(NewContract);
   {
@@ -742,7 +789,7 @@ void EJitSmallTableRuntime::freeRetainedUpTo(uint64_t Generation) {
       ++It;
       continue;
     }
-    retainedBytes_ -= (*It)->capacityBytes();
+    retainedBytes_ -= (*It)->allocatedBytes();
     It = retained_.erase(It);
     stats_.retiredGenerations++;
   }
@@ -755,7 +802,7 @@ void EJitSmallTableRuntime::freeIfUnread(uint64_t Generation) {
   for (auto It = retained_.begin(); It != retained_.end(); ++It) {
     if ((*It)->generation() != Generation)
       continue;
-    retainedBytes_ -= (*It)->capacityBytes();
+    retainedBytes_ -= (*It)->allocatedBytes();
     retained_.erase(It);
     stats_.retiredGenerations++;
     break;
@@ -796,7 +843,7 @@ uint64_t EJitSmallTableRuntime::pendingRetireBytes() const {
   for (const auto &Entry : retired_)
     for (const std::unique_ptr<EJitSmallTableTableResource> &R : retained_)
       if (R->generation() == Entry.first)
-        Bytes += R->capacityBytes();
+        Bytes += R->allocatedBytes();
   return Bytes;
 }
 

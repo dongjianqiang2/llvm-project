@@ -36,6 +36,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedData.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSmallTable.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
@@ -62,6 +63,7 @@ class EJitSmallTableReadBorrow;
 class EJitSmallTableReadinessProvider;
 class EJitSmallTableTableResource;
 class EJitSmallTableHost;
+class EJitSharedTaskPool;
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct SpecializationContext;
@@ -237,7 +239,7 @@ private:
 //===----------------------------------------------------------------------===//
 
 /// One shared, fixed-capacity data resource for one plan generation (spec §8):
-/// a stable address outside the code pool, a real generation identity, one
+/// a stable address outside executable allocation managers, a real generation identity, one
 /// contiguous column region per table field, and incremental publication of
 /// validated rows. The same resource is bound into every compile of the code
 /// generation (T1 and T2), so a symbol name alone is never taken as proof that
@@ -288,9 +290,20 @@ public:
   create(const EJitSmallTablePlan &Plan, uint64_t Generation,
          uint64_t CapacityLimit, std::string &Error);
 
+  /// SRE runtime-owned backing. A supported DataOnly domain and the actual
+  /// owner's preparation pool are required; failure never falls back to heap.
+  static std::unique_ptr<EJitSmallTableTableResource>
+  create(const EJitSmallTablePlan &Plan, uint64_t Generation,
+         uint64_t CapacityLimit, std::string &Error,
+         EJitSharedTaskPool *SharedDataPool, bool RequireSharedData);
+
   uint64_t generation() const { return generation_; }
   const uint8_t *base() const { return base_; }
   uint64_t capacityBytes() const { return capacityBytes_; }
+  uint64_t allocatedBytes() const { return allocatedBytes_; }
+  const EJitSreDataAllocation &sharedDataAllocation() const {
+    return sharedAllocation_;
+  }
   ArrayRef<Column> columns() const { return columns_; }
   const Column *findColumn(StringRef Symbol) const;
   /// Address of \p FieldIndex's column, or nullptr for a uniform field.
@@ -317,6 +330,8 @@ private:
 
   uint8_t *base_ = nullptr;
   uint64_t capacityBytes_ = 0;
+  uint64_t allocatedBytes_ = 0;
+  EJitSreDataAllocation sharedAllocation_{};
   uint64_t generation_ = 0;
   SmallVector<Column, 8> columns_;
   /// Per column: published[coordinate] = {known, value}.
@@ -387,6 +402,12 @@ public:
     /// dispatch to them (spec §8 retention budget). A generation that would
     /// exceed it is refused instead of silently dropping an older one.
     uint64_t retentionCapacityLimit = 16u << 20;
+    /// Owner-private runtime wiring, not a product mapping callback. The
+    /// freestanding fixed-pool path always requires DataOnly backing, including
+    /// when a legacy mapping override is installed. Hosted component tests
+    /// retain their ordinary heap backend unless this mode is explicitly set.
+    bool requireSharedDataStorage = false;
+    EJitSharedTaskPool *sharedDataPool = nullptr;
     OptimizationLevel optLevel = OptimizationLevel::L2;
   };
 
@@ -412,8 +433,9 @@ public:
     /// NOT a freed resource: the bytes stay accounted until the last reader
     /// returns, which is when the reclamation happens.
     uint64_t deferredRetirements = 0;
-    /// Generations whose storage was really released after their last physical
-    /// reader left (the safe-reclamation half of `deferredRetirements`).
+    /// Generations whose resource ownership was released after their last
+    /// physical reader left. A NO_RECLAIM backend still retains its physical
+    /// bytes; those are separately charged by the DataOnly domain statistics.
     uint64_t reclaimedAfterReaders = 0;
   };
 

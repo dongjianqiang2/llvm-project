@@ -24,6 +24,7 @@ GLOBAL_SHARED_OBJECTS = (
     "g_pr231_output",
     "g_pr231_probe_dispatch",
 )
+SHARED_BOUNDS = ("__ejit_shared_start", "__ejit_shared_end")
 
 
 def main():
@@ -103,7 +104,7 @@ def main():
                 endian + "IBBHQQ", entries, off)
             if index != 0:
                 attributes.setdefault(string(strings, name), []).append(
-                    (info >> 4, info & 15, index))
+                    (info >> 4, info & 15, index, value, size))
     for name in roots:
         expected_type = 1 if name in GLOBAL_SHARED_OBJECTS else 2
         if attributes.get(name) is None or len(attributes[name]) != 1 or \
@@ -128,6 +129,24 @@ def main():
         defs = attributes.get(name, ())
         if len(defs) != 1 or defs[0][0] != 1:
             raise RuntimeError("shared API object is not a unique strong global: " + name)
+    # A real linker-defined section-relative range, not unrelated guessed VAs
+    # or an ABS alias. The product final linker must re-export both bounds
+    # around ALL shared inputs after layout, not retain stale partial-link VAs.
+    for name in SHARED_BOUNDS:
+        defs = attributes.get(name, ())
+        if len(defs) != 1 or defs[0][:3] != (1, 0, shared_index):
+            raise RuntimeError("missing/nonunique/invalid actual shared bound: " + name)
+    shared_start = attributes[SHARED_BOUNDS[0]][0][3]
+    shared_end = attributes[SHARED_BOUNDS[1]][0][3]
+    if shared_start != shared[3] or shared_end != shared[3] + shared[5] or \
+            shared_end <= shared_start:
+        raise RuntimeError("shared bounds do not exactly cover actual .mc_shared")
+    for name in SHARED_OBJECTS:
+        definition = attributes[name][0]
+        value, size = definition[3:5]
+        if size == 0 or value < shared_start or value >= shared_end or \
+                size > shared_end - value:
+            raise RuntimeError("shared object extent outside actual bounds: " + name)
     sections = set(lipo._readelf_section_names(str(obj), str(obj.parent)))
     if not {".symtab", ".strtab", ".init_array", ".mc_shared"} <= sections:
         raise RuntimeError("missing symtab/strtab/init-array/shared section")
@@ -139,9 +158,9 @@ def main():
     table = subprocess.check_output(["readelf", "-sW", str(obj)], text=True)
     if not re.search(r"Symbol table '\.symtab'", table):
         raise RuntimeError("readelf cannot read the actual symbol table")
-    distinct_required = len(set(roots) | set(SHARED_OBJECTS))
+    distinct_required = len(set(roots) | set(SHARED_OBJECTS) | set(SHARED_BOUNDS))
     print(f"[PR231_SYMBOLS] PASS {len(roots)} strong roots + "
-          f"{len(SHARED_OBJECTS)} unique shared objects; "
+          f"{len(SHARED_OBJECTS)} unique shared objects + {len(SHARED_BOUNDS)} exact bounds; "
           f"{distinct_required} distinct required symbols; ELF64 "
           f"{order}-endian {args.kind}; symbol tables + nonempty registries/init + shared placement")
     print(f"[PR231_SYMBOLS] sha256={hashlib.sha256(data).hexdigest()} file={obj}")
