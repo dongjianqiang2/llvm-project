@@ -208,6 +208,8 @@ struct EJitSharedCacheSlot {
   uint64_t poolSize;      ///< usable pool size
   uint32_t poolId;   ///< stable pool index within its near/far manager
   uint32_t poolKind; ///< EJitCodePoolKind: unknown=0, near=1, far=2
+  /// Optional MFS companion. Published and snapshotted with the hot range.
+  EJitColdCodeRange cold;
   /// Runtime-writable extents of the published code (v9): the pages the JIT
   /// body writes at runtime (e.g. Tier-1 __profc_ counters). A non-owner core
   /// in 4K-seal mode MUST enable_rw exactly these in its own translation
@@ -379,7 +381,7 @@ struct EJitSharedCodePoolStats {
     EJitAtomicU64 sealInvocations;
     EJitAtomicU64 splitInvocations;
     EJitAtomicU64 finalizedRangeCount;
-  } near, far;
+  } near, far, cold;
 };
 
 /// Plain (non-atomic) snapshot of code-pool stats, used as the callback
@@ -409,6 +411,7 @@ struct EJitCodePoolStatsOut {
   uint64_t finalizedRangeCount = 0;
   Detail near;
   Detail far;
+  Detail cold;
 };
 
 //===----------------------------------------------------------------------===//

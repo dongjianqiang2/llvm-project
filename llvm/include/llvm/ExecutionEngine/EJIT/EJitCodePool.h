@@ -251,8 +251,15 @@ public:
   bool recordPendingRange(const void *Base, size_t Size,
                           const EJitWritableRange *Writables = nullptr,
                           uint32_t WritableCount = 0);
+  /// Remove an exact staged range after a finalize-time transaction fails.
+  /// The bump allocation is intentionally retained, but the range can no
+  /// longer be promoted or resolved as executable.
+  void discardPendingRange(const void *Base, size_t Size);
   void notePendingAllocation();
   Error flushPendingRanges();
+  /// Seal and promote only the staged range containing Ptr. Cold MFS ranges
+  /// are page-disjoint; this avoids committing unrelated pending companions.
+  Error flushPendingRange(const void *Ptr);
   size_t pendingRangeCount() const;
 
   /// Record the executable extent of a finalized JITLink allocation
@@ -288,6 +295,12 @@ public:
   /// any recorded finalized range owned by a known pool — the caller must then
   /// take a clean fallback and never publish a shared pointer with no range.
   bool findRange(const void *Ptr, EJitCompiledCodeInfo &Out) const;
+  /// Diagnostic/allocation lookup only: a pending range is NOT executable.
+  bool findPendingRange(const void *Ptr, EJitCompiledCodeInfo &Out) const;
+  bool isRangeReady(const void *Ptr) const {
+    EJitCompiledCodeInfo Info{};
+    return findRange(Ptr, Info);
+  }
 
   /// True if `Ptr` falls inside the usable range of any owned pool.
   bool contains(const void *Ptr) const;
@@ -299,6 +312,7 @@ private:
   CodePool *findPoolLocked(const void *Ptr);
   Error newActivePoolLocked();
   Error sealPoolLocked(CodePool &P);
+  Error flushPendingRangesLocked(const void *OnlyPtr);
   bool poolHasRoomLocked(const CodePool &P, size_t Size, size_t Align) const;
 
   Options Opts_;

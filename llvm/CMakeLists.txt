@@ -753,6 +753,13 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
                  "(size is __ejit_code_end - __ejit_code_start from the linker script's .text.ejit block)")
 endif()
 
+option(EJIT_T2_MFS
+  "Split genuine zero-count Tier-2 blocks into an independent cold pool" OFF)
+if(EJIT_T2_MFS AND (NOT EJIT_SRE_CODE_POOL OR NOT EJIT_CODE_POOL_4K_SEAL OR
+                   NOT EJIT_FIXED_CODE_POOL OR NOT EJIT_CODE_POOL_BATCHED_PUBLISH))
+  message(FATAL_ERROR "EJIT_T2_MFS requires code pool, 4K seal, fixed code pool and batched publication")
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

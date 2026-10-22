@@ -141,6 +141,7 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
     };
     CopyDetail(out->near, tiered.near);
     CopyDetail(out->far, tiered.far);
+    CopyDetail(out->cold, tiered.cold);
     return true;
   }
   return false;
