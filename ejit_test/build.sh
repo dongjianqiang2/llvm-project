@@ -163,11 +163,11 @@ else
   _set_min_libs "${ARCH}"
   OTHER_LIBS=$(echo "${MIN_LIBS}" | sed '/^$/d' | tr '\n' ' ')
 fi
-# EJitLibcallStubs references the stack-protector ABI symbol __stack_chk_guard
-# by address; host glibc on x86_64 (TLS canary) no longer exports it as data.
-# Define it at 0 for the static link - the test binaries themselves compile
-# without stack protector, so nothing ever loads the value.
-LINK_LIBS="-lz -lpthread -ldl -Wl,--defsym,__stack_chk_guard=0"
+# EJitLibcallStubs uses a weak reference to __stack_chk_guard: resolve the
+# platform guard where available and leave it undefined otherwise (e.g. x86
+# glibc uses a TLS canary). Do not define it at address zero: that interposes
+# libc's own guard on AArch64 and can crash the loader before main.
+LINK_LIBS="-lz -lpthread -ldl"
 STRIP_FLAG="-Wl,--strip-all"
 if ${NO_STRIP}; then STRIP_FLAG=""; fi
 
@@ -213,6 +213,15 @@ ALL_TESTS=(
   ejit_vp_multicore_test
   ejit_sentinel_smoke_test
 )
+
+# Substitution-verifier test: the ejit_verify_* entry points exist only in a
+# runtime built with EJIT_VERIFY_SUBSTITUTION, so building it against a normal
+# runtime is an undefined-reference link failure, not a skip.
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && \
+   grep -q "^EJIT_VERIFY_SUBSTITUTION:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+  ALL_TESTS+=(ejit_verify_subst_test ejit_verify_indirect_test)
+  echo "Verifier:       EJIT_VERIFY_SUBSTITUTION=ON (verifier tests enabled)"
+fi
 
 # Per-test compile flags (e.g. for disabling global constructors)
 declare -A COMPILE_FLAGS

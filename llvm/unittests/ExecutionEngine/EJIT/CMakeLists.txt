@@ -27,6 +27,15 @@ add_llvm_unittest(EJITTests
   PARTIAL_SOURCES_INTENDED
   )
 
+# Keep verifier coverage independent of optional PGO integration tests.
+if(EJIT_VERIFY_SUBSTITUTION)
+  add_llvm_unittest(EJITVerifyTests
+    EJitVerifySiteTest.cpp
+    PARTIAL_SOURCES_INTENDED
+  )
+  target_compile_definitions(EJITVerifyTests PRIVATE EJIT_VERIFY_SUBSTITUTION)
+endif()
+
 # The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
 # matching the LLVMEJIT build; without these definitions they compile to empty
 # translation units.
