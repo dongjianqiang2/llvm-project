@@ -146,7 +146,8 @@ private:
   /// constant-index GEPs, then does a final cleanup. `level` is accepted for
   /// ABI compatibility and does not affect the pipeline.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
-                               CompileTier tier);
+                               CompileTier tier,
+                               const SpecializationContext *context = nullptr);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,

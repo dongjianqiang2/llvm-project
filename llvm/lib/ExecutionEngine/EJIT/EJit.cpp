@@ -849,7 +849,9 @@ void EJit::printFuncMeta(const std::string &funcName) {
     return;
   }
   auto Ctx = std::make_unique<LLVMContext>();
-  auto Buf = MemoryBuffer::getMemBuffer(*bc, "meta_" + std::to_string(idx) + ".bc");
+  auto Buf = MemoryBuffer::getMemBuffer(
+      *bc, "meta_" + std::to_string(idx) + ".bc",
+      /*RequiresNullTerminator=*/false);
   auto MOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!MOrErr) {
     EJIT_DIAG_RAW("func_meta: name=%s funcIdx=%u parse bitcode error",

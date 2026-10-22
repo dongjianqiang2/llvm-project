@@ -14,6 +14,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Sema/ParsedAttr.h"
 #include "clang/Sema/Sema.h"
@@ -222,8 +223,9 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 
 /// handleEjitFreeDimAttr - Process the ejit_free_dim attribute.
 /// Checks:
-///   1. Applies only to ParmVarDecl
-///   2. Parameter type must be integer
+///   1. Integer parameters retain their existing declaration-merge checks.
+///   2. Integer locals require automatic storage directly in an entry; full
+///      initialization/read-only/lifecycle validation runs after the body.
 ///
 /// No width limit: unlike a specialization dimension, a free dim never reaches
 /// the runtime ABI, so there is no narrowing that two values could alias
@@ -235,20 +237,30 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// parameter attribute written AFTER this one has not been processed yet. Both
 /// run once the merged declaration is complete -- see checkEjitFreeDim.
 void handleEjitFreeDimAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
-  auto *PVD = dyn_cast<ParmVarDecl>(D);
-  if (!PVD) {
-    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
-        << AL << AL.isRegularKeywordAttribute() << "function parameters";
+  auto *VD = dyn_cast<VarDecl>(D);
+  if (!VD)
+    return;
+  if (!isa<ParmVarDecl>(VD)) {
+    const auto *FD = dyn_cast<FunctionDecl>(VD->getDeclContext());
+    StringRef Reason;
+    if (!VD->hasLocalStorage() || VD->getTLSKind() != VarDecl::TLS_None)
+      Reason = "automatic storage duration";
+    else if (!VD->getType()->isIntegerType() ||
+             VD->getType().isVolatileQualified() ||
+             VD->getType()->isAtomicType())
+      Reason = "non-volatile, non-atomic integer scalar type";
+    else if (!FD || !FD->hasAttr<EjitEntryAttr>())
+      Reason = "a declaration directly in an ejit_entry function";
+    if (!Reason.empty()) {
+      S.Diag(AL.getLoc(), diag::err_ejit_free_dim_local) << VD << Reason;
+      return;
+    }
+  } else if (!VD->getType()->isIntegerType()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_free_dim_invalid_type) << VD;
     return;
   }
 
-  QualType PT = PVD->getType();
-  if (!PT->isIntegerType()) {
-    S.Diag(AL.getLoc(), diag::err_ejit_free_dim_invalid_type) << PVD;
-    return;
-  }
-
-  PVD->addAttr(::new (S.Context) EjitFreeDimAttr(S.Context, AL));
+  VD->addAttr(::new (S.Context) EjitFreeDimAttr(S.Context, AL));
 }
 
 void handleEjitBoundPtrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
@@ -407,6 +419,100 @@ void checkEjitFreeDim(Sema &S, const FunctionDecl *FD) {
       }))
     S.Diag(FirstFree->getLocation(), diag::warn_ejit_free_dim_no_dimension)
         << FD << FirstFreeParm;
+}
+
+namespace {
+class LocalFreeDimVisitor : public RecursiveASTVisitor<LocalFreeDimVisitor> {
+  Sema &S;
+  const FunctionDecl &FD;
+  llvm::SmallPtrSet<const VarDecl *, 8> Diagnosed;
+
+  void reject(const VarDecl *VD, SourceLocation Loc, StringRef Reason) {
+    if (Diagnosed.insert(VD).second)
+      S.Diag(Loc, diag::err_ejit_free_dim_local) << VD << Reason;
+  }
+
+public:
+  LocalFreeDimVisitor(Sema &S, const FunctionDecl &FD) : S(S), FD(FD) {}
+
+  bool VisitVarDecl(VarDecl *VD) {
+    if (isa<ParmVarDecl>(VD) || !VD->hasAttr<EjitFreeDimAttr>())
+      return true;
+    if (!VD->hasInit())
+      reject(VD, VD->getLocation(), "an initializer at its declaration");
+    else if (!llvm::any_of(FD.parameters(), [](const ParmVarDecl *P) {
+               return P->hasAttr<EjitPeriodArrIndAttr>();
+             }))
+      reject(VD, VD->getLocation(), "a managed ejit_dim lifecycle");
+    return true;
+  }
+
+  bool VisitDeclRefExpr(DeclRefExpr *Ref) {
+    auto *VD = dyn_cast<VarDecl>(Ref->getDecl());
+    if (!VD || isa<ParmVarDecl>(VD) || !VD->hasAttr<EjitFreeDimAttr>())
+      return true;
+    DynTypedNode Node = DynTypedNode::create(*Ref);
+    // Only value reads are permitted. This also rejects reference binding,
+    // address escape, writes and increment, even for const-qualified locals.
+    while (true) {
+      auto Parents = S.Context.getParents(Node);
+      if (Parents.size() != 1)
+        break;
+      if (auto *Cast = Parents[0].get<ImplicitCastExpr>())
+        if (Cast->getCastKind() == CK_LValueToRValue)
+          return true;
+      if (!Parents[0].get<ParenExpr>())
+        break;
+      Node = Parents[0];
+    }
+    reject(VD, Ref->getExprLoc(), "value reads only (no mutation or address/reference escape)");
+    return true;
+  }
+
+  void rejectCaptureInit(Stmt *Init, SourceLocation Loc) {
+    if (!Init)
+      return;
+    SmallVector<Stmt *, 8> Work{Init};
+    while (!Work.empty()) {
+      Stmt *Current = Work.pop_back_val();
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(Current))
+        if (const auto *VD = dyn_cast<VarDecl>(Ref->getDecl()))
+          if (!isa<ParmVarDecl>(VD) && VD->hasAttr<EjitFreeDimAttr>())
+            reject(VD, Loc, "no closure capture");
+      for (Stmt *Child : Current->children())
+        if (Child)
+          Work.push_back(Child);
+    }
+  }
+
+  bool VisitLambdaExpr(LambdaExpr *LE) {
+    for (const auto &Capture : LE->captures())
+      if (Capture.capturesVariable())
+        if (auto *VD = dyn_cast<VarDecl>(Capture.getCapturedVar()))
+          if (VD->hasAttr<EjitFreeDimAttr>())
+            reject(VD, LE->getBeginLoc(), "no closure capture");
+    for (Expr *Init : LE->capture_inits())
+      rejectCaptureInit(Init, LE->getBeginLoc());
+    return true;
+  }
+
+  bool VisitBlockExpr(BlockExpr *BE) {
+    for (const auto &Capture : BE->getBlockDecl()->captures()) {
+      const VarDecl *VD = Capture.getVariable();
+      if (VD->hasAttr<EjitFreeDimAttr>())
+        reject(VD, BE->getBeginLoc(), "no closure capture");
+    }
+    return true;
+  }
+};
+} // namespace
+
+void checkEjitLocalFreeDims(Sema &S, const FunctionDecl *FD, Stmt *Body) {
+  if (FD && Body && FD->hasAttr<EjitEntryAttr>() &&
+      !FD->isDependentContext()) {
+    S.Context.getParentMapContext().clear();
+    LocalFreeDimVisitor(S, *FD).TraverseStmt(Body);
+  }
 }
 
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
