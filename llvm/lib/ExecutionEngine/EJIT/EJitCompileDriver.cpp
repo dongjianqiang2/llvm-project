@@ -6,6 +6,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include <algorithm>
 #include <cassert>
 #ifndef EJIT_FREESTANDING
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
@@ -30,6 +31,25 @@ using namespace llvm::ejit;
 
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
+std::string layoutProfileIdentity(const EJitCompileRequest &R) {
+  std::string Identity = std::to_string(R.generation) + "_" +
+      std::to_string(stripReqTier(R.funcIndex)) + "_d" + std::to_string(R.numDims);
+  for (uint32_t I = 0; I < R.numDims; ++I)
+    Identity += "_" + std::to_string(R.dims[I].dimType) + "_" +
+        std::to_string(R.dims[I].instanceId) + "_" + std::to_string(R.versions[I]);
+  Identity += "_b" + std::to_string(R.boundCount);
+  SmallVector<EJitBoundPtrDescriptor, 4> Bounds(
+      R.boundPointers, R.boundPointers + R.boundCount);
+  std::sort(Bounds.begin(), Bounds.end(), [](const auto &A, const auto &B) {
+    return A.argIndex < B.argIndex;
+  });
+  for (const auto &B : Bounds)
+    Identity += "_" + std::to_string(B.argIndex) + "_" +
+        std::to_string(reinterpret_cast<uintptr_t>(B.rawPtr)) +
+        "_" + std::to_string(B.size);
+  return Identity;
+}
+
 /// Adapter so the taskpool can call back into the driver's cold compile path
 /// through a plain function pointer (never std::function). The produced JIT
 /// pointer still comes from the OrcJIT engine (SRE code pool when enabled).
@@ -151,6 +171,39 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
 #endif
 }
 
+bool sharedPrepareArtifact(void *ctx, const EJitCompileRequest &req, void **out,
+                           uint64_t *bytes) {
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  auto *object =
+      static_cast<EJitOrcEngine::PreparedObject *>(drv->prepareNow(req));
+  *out = object;
+  if (!object)
+    return false;
+  *bytes = object->ownedBytes;
+  return true;
+}
+
+bool sharedLinkArtifact(void *ctx, void *artifact, void **out) {
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  auto Result = drv->getJitEngine()->linkPreparedObject(
+      *static_cast<EJitOrcEngine::PreparedObject *>(artifact));
+  if (!Result) {
+    EJIT_DIAG("global layout link failed: %s",
+              toString(Result.takeError()).c_str());
+    return false;
+  }
+  *out = *Result;
+  return true;
+}
+
+void sharedSamplingPrepared(void *ctx, const EJitCompileRequest &req) {
+  static_cast<EJitCompileDriver *>(ctx)->notifyTaskpoolPrepared(req);
+}
+
+void sharedDropArtifact(void *, void *artifact) {
+  delete static_cast<EJitOrcEngine::PreparedObject *>(artifact);
+}
+
 bool sharedMayConstRankingThunk(void *ctx) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
   EJitOrcEngine *engine = drv->getJitEngine();
@@ -263,6 +316,10 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // EJIT_SRE_SHARED_CODE_POINTERS (default OFF -> clean fallback for non-owner
   // cores). Only the platform may assert same-VA + sealed + I/D-cache-coherent
   // code (spec §11); we never auto-detect it.
+  if (!config_.globalLayout.empty())
+    sharedPool_.configurePgoForInit(
+        config_.enablePgo || config_.enableProfileAudit,
+        (config_.enablePgo || config_.enableProfileAudit) ? 64 : 0);
 #ifdef EJIT_SRE_CODE_POOL
   // Owner side (always useful when a code pool exists): resolve each compiled
   // pointer to its real executable range so the published cache slot carries
@@ -304,6 +361,13 @@ EJitCompileDriver::~EJitCompileDriver() {
   // Stop + join the single shared worker (if this driver is the owner) BEFORE
   // owner-private ORC/driver state is destroyed — no use-after-free.
   sharedPool_.ownerShutdown();
+  if (sharedPool_.isOwner() && !config_.globalLayout.empty()) {
+    // Direct C++ destruction violated the real-return shutdown boundary. The
+    // shared domain remains Stopping; retain this one compiler rather than
+    // destroy resources still referenced by an executing T1 body.
+    (void)jitEngine_.release();
+    EJIT_DIAG("global layout compiler retained after unreturned T1 shutdown");
+  }
 #endif
 }
 
@@ -338,26 +402,254 @@ void EJitCompileDriver::sharedWorkerIdle(void * /*ctx*/, uint32_t ticks) {
 }
 
 bool EJitCompileDriver::sharedOwnerElected(void *ctx) {
-  return static_cast<EJitCompileDriver *>(ctx)->ensureJitEngine();
+  auto *drv = static_cast<EJitCompileDriver *>(ctx);
+  const auto &config = drv->getConfig();
+#ifdef EJIT_SRE_CODE_POOL
+  if (!drv->sharedTaskPool()->checkGlobalLayoutReservationHistory(
+          !config.globalLayout.empty())) {
+    EJIT_DIAG("global/legacy allocation history is incompatible; cold reset "
+              "required");
+    return false;
+  }
+#endif
+  if (!drv->ensureJitEngine())
+    return false;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  ejitVpSetLosslessMode(!config.globalLayout.empty() && config.enablePgo);
+#endif
+  if (config.globalLayout.empty())
+    return true;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  if (!ejitVpResetDrained())
+    return false;
+#endif
+#if !defined(EJIT_SRE_CODE_POOL) ||                                            \
+    !defined(EJIT_CODE_POOL_BATCHED_PUBLISH) ||                                \
+    !defined(EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  EJIT_DIAG("global layout requires the batched NO_RECLAIM SRE code pool");
+  return false;
+#else
+  if (config.compileMode != CompileMode::Async)
+    return false;
+  drv->getJitEngine()->setLayoutReservationProviders(
+      [drv](size_t bytes) {
+        return drv->sharedTaskPool()->reserveGlobalLayoutCodeBytes(
+            bytes, true, drv->getConfig().globalLayoutBudgets.maxNearCodeBytes);
+      },
+      [drv](size_t bytes) {
+        return drv->sharedTaskPool()->reserveGlobalLayoutCodeBytes(
+            bytes, false, drv->getConfig().globalLayoutBudgets.maxFarCodeBytes);
+      });
+  std::vector<EJitCompileRequest> manifest;
+  if (!drv->buildGlobalLayoutManifest(config.globalLayout, manifest))
+    return false;
+  drv->sharedTaskPool()->setLayoutResetCallback([](void *ctx) {
+    return static_cast<EJitCompileDriver *>(ctx)->resetGlobalLayoutProfiles();
+  });
+  return drv->sharedTaskPool()->configureGlobalLayout(
+      manifest, config.globalLayoutBudgets, sharedPrepareArtifact,
+      sharedLinkArtifact, sharedDropArtifact, drv, sharedSamplingPrepared);
+#endif
+}
+
+bool EJitCompileDriver::buildGlobalLayoutManifest(
+    const std::vector<EJitLayoutTarget> &targets,
+    std::vector<EJitCompileRequest> &manifest) {
+  if (targets.empty() ||
+      targets.size() > config_.globalLayoutBudgets.maxMembers) {
+    EJIT_DIAG("global layout manifest rejected: count=%zu maxMembers=%u",
+              targets.size(), config_.globalLayoutBudgets.maxMembers);
+    return false;
+  }
+  const uint32_t registered = EJitFuncRegistry::instance().count();
+  for (size_t I = 0; I < targets.size(); ++I) {
+    const auto &target = targets[I];
+    // A manifest entry must name a registered function, but the manifest no
+    // longer has to cover every registered function: unlisted functions keep
+    // compiling through the ordinary shared-pool paths and are appended after
+    // the manifest bodies at the collective allocation point.
+    uint32_t index = EJitFuncRegistry::instance().lookup(target.entryName);
+    if (index == kEJitInvalidFuncIndex || index >= registered) {
+      EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s not "
+                "registered",
+                I, target.entryName.c_str());
+      return false;
+    }
+    const auto &Meta = getLoader().getOrCacheFuncMeta(index);
+    // A name-only entry (no dims, no bounds) needs no shape check: the pool
+    // captures the identity of the first admitted request of this function,
+    // and the function's other identities then route as unlisted. An entry
+    // that declares ANY identity must match the registered shape exactly.
+    const bool NameOnly =
+        target.identity.numDims == 0 && target.identity.boundCount == 0;
+    if (!NameOnly) {
+      if (target.identity.numDims != Meta.dimCount) {
+        EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s dim "
+                  "count mismatch declared=%u registered=%u",
+                  I, target.entryName.c_str(), target.identity.numDims,
+                  Meta.dimCount);
+        return false;
+      }
+      for (uint32_t D = 0; D < Meta.dimCount; ++D)
+        if (target.identity.dims[D].dimType != Meta.dimTypes[D]) {
+          EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s dim=%u "
+                    "type mismatch declared=%u registered=%u",
+                    I, target.entryName.c_str(), D,
+                    target.identity.dims[D].dimType, Meta.dimTypes[D]);
+          return false;
+        }
+      if (target.identity.boundCount != Meta.boundPointerArgIndices.size()) {
+        EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s bound "
+                  "count mismatch declared=%u registered=%u",
+                  I, target.entryName.c_str(), target.identity.boundCount,
+                  static_cast<unsigned>(Meta.boundPointerArgIndices.size()));
+        return false;
+      }
+      for (uint32_t B = 0; B < target.identity.boundCount; ++B)
+        if (target.identity.boundPointers[B].argIndex !=
+            Meta.boundPointerArgIndices[B]) {
+          EJIT_DIAG("global layout manifest rejected: rank=%zu name=%s "
+                    "bound=%u arg index mismatch declared=%u registered=%u",
+                    I, target.entryName.c_str(), B,
+                    target.identity.boundPointers[B].argIndex,
+                    Meta.boundPointerArgIndices[B]);
+          return false;
+        }
+    }
+    EJitCompileRequest req = target.identity;
+    req.funcIndex =
+        encodeReqTier(index, (config_.enablePgo || config_.enableProfileAudit)
+                                 ? kEJitTierPgoUse
+                                 : kEJitTierBaseline);
+    manifest.push_back(req);
+  }
+  return true;
+}
+
+bool EJitCompileDriver::refreshGlobalLayout(
+    const std::vector<EJitLayoutTarget> &targets) {
+  if (config_.globalLayout.empty() || !sharedPool_.isOwner())
+    return false;
+  std::vector<EJitCompileRequest> manifest;
+  return buildGlobalLayoutManifest(targets, manifest) &&
+         sharedPool_.requestGlobalLayoutRefresh(
+             manifest, globalLayoutFingerprint(targets));
+}
+
+bool EJitCompileDriver::resetGlobalLayoutProfiles() {
+  // Worker only, after every real T1 return. Keep the engine/JDs/pools alive.
+  tier1Counters_.clear();
+  layoutProfiles_.clear();
+  layoutProfileBytes_ = 0;
+  layoutProfileCaptureFailed_ = false;
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  tier1MayConst_.clear();
+#endif
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  tier1Vp_.clear();
+  std::vector<EJitVpSiteSample>().swap(layoutVpPending_);
+  vpRoundsActive_ = 0;
+  layoutVpRounds_.clear();
+  ejitVpSetArmed(false);
+  ejitVpSetLosslessMode(config_.enablePgo || config_.enableProfileAudit);
+  layoutPreparedValueSamples_ = 0;
+  if (!ejitVpResetDrained())
+    return false;
+#endif
+  return true;
 }
 
 void EJitCompileDriver::sharedOwnerReleased(void *ctx) {
   static_cast<EJitCompileDriver *>(ctx)->releaseJitEngine();
 }
 
+uint64_t EJitCompileDriver::globalLayoutFingerprint(
+    const std::vector<EJitLayoutTarget> &targets) {
+  uint64_t Fingerprint =
+      EJitFuncRegistry::instance().fingerprint() * 0x9e3779b97f4a7c15ULL ^
+      EJitLifecycleRegistry::instance().fingerprint();
+  if (!targets.empty()) {
+    auto Add = [&](uint64_t Value) {
+      for (unsigned I = 0; I < 8; ++I) {
+        Fingerprint ^= static_cast<uint8_t>(Value >> (I * 8));
+        Fingerprint *= 0x100000001b3ULL;
+      }
+    };
+    Add(0x24504);
+    Add(targets.size());
+    Add(config_.enablePgo);
+    Add(config_.enableProfileAudit);
+    Add(static_cast<uint32_t>(config_.optLevel));
+    Add(config_.globalLayoutBudgets.maxMembers);
+    Add(config_.globalLayoutBudgets.maxArtifactBytes);
+    Add(config_.globalLayoutBudgets.maxProfileBytes);
+    Add(config_.globalLayoutBudgets.maxNearCodeBytes);
+    Add(config_.globalLayoutBudgets.maxFarCodeBytes);
+    Add(config_.globalLayoutBudgets.maxCollectionPolls);
+    for (const auto &T : targets) {
+      for (unsigned char C : T.entryName)
+        Add(C);
+      Add(T.entryName.size());
+      Add(T.identity.layoutVersionPolicy);
+      Add(T.identity.numDims);
+      for (uint32_t I = 0; I < T.identity.numDims && I < 4; ++I) {
+        Add(T.identity.dims[I].dimType);
+        Add(T.identity.dims[I].instanceId);
+        Add(T.identity.layoutVersionPolicy ? T.identity.versions[I] : 0);
+      }
+      Add(T.identity.boundCount);
+      for (uint32_t I = 0;
+           I < T.identity.boundCount && I < kEJitMaxBoundPointers; ++I) {
+        Add(reinterpret_cast<uintptr_t>(T.identity.boundPointers[I].rawPtr));
+        Add(T.identity.boundPointers[I].size);
+        Add(T.identity.boundPointers[I].argIndex);
+      }
+      uint32_t Index = EJitFuncRegistry::instance().lookup(T.entryName);
+      if (auto BC = loader_.getBitcodeByFuncIdx(Index))
+        for (unsigned char C : *BC)
+          Add(C);
+      else
+        consumeError(BC.takeError());
+    }
+  }
+  return Fingerprint;
+}
+
 bool EJitCompileDriver::startSharedTaskPool() {
   // Publish this core's funcIndex/dimType registration digest so a peer with a
   // divergent mapping is cleanly rejected at attach (spec §11), never silently
   // running against mismatched indices.
-  sharedPool_.setRegistrationFingerprint(
-      EJitFuncRegistry::instance().fingerprint() * 0x9e3779b97f4a7c15ULL ^
-      EJitLifecycleRegistry::instance().fingerprint());
+  lastSharedStartError_ = SharedStartError::None;
+  std::vector<EJitCompileRequest> declaredManifest;
+  if (!config_.globalLayout.empty() &&
+      !buildGlobalLayoutManifest(config_.globalLayout, declaredManifest)) {
+    // The manifest was rejected before the pool's init()/election ever ran:
+    // the shared blob stays untouched (generation 0 / Uninitialized). Record
+    // the class so the caller does not misread that blob state as a
+    // worker-core deployment failure.
+    lastSharedStartError_ = SharedStartError::ManifestRejected;
+    return false;
+  }
+  uint64_t Fingerprint = globalLayoutFingerprint(config_.globalLayout);
+  sharedPool_.setRegistrationFingerprint(Fingerprint);
   EJitSharedTaskPool::InitResult r = sharedPool_.init();
+  // Every result except the two attach/own successes failed inside the
+  // pool's init()/election; classify once instead of per case.
+  if (r != EJitSharedTaskPool::InitResult::BecameOwner &&
+      r != EJitSharedTaskPool::InitResult::AttachedReady)
+    lastSharedStartError_ = SharedStartError::PoolInitFailed;
   switch (r) {
   case EJitSharedTaskPool::InitResult::BecameOwner:
     EJIT_DIAG("shared taskpool init: became owner");
     return true;
   case EJitSharedTaskPool::InitResult::AttachedReady:
+    // init() has validated magic/version/size before any new-layout fields
+    // are inspected. A rejected peer cannot change the installed manifest.
+    if (!declaredManifest.empty() &&
+        !sharedPool_.validateGlobalLayoutAttachment(declaredManifest)) {
+      lastSharedStartError_ = SharedStartError::PoolInitFailed;
+      return false;
+    }
     EJIT_DIAG("shared taskpool init: attached ready");
     return true;
   case EJitSharedTaskPool::InitResult::OwnerFailed:
@@ -433,7 +725,8 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                                      bool storeLru,
-                                     const EJitCompileRequest *request) {
+                                     const EJitCompileRequest *request,
+                                     bool prepareOnly) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
   uint8_t dims[4] = {
@@ -511,6 +804,17 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.fnName = funcName;
   ctx.cacheKey = cacheKey;
   ctx.optLevel = config_.optLevel;
+  ctx.globalLayoutCompilation = !config_.globalLayout.empty();
+#ifdef EJIT_SRE_TASKPOOL
+  if (ctx.globalLayoutCompilation &&
+      (config_.enablePgo || config_.enableProfileAudit) && request)
+    ctx.profileIdentity = layoutProfileIdentity(*request);
+#endif
+  // The legacy code key omits bindings. Drained unlisted identities can coexist
+  // until collective compilation, so their counter/VP inventories cannot use it.
+  const std::string ProfileKey = ctx.globalLayoutCompilation
+                                     ? ctx.profileIdentity
+                                     : std::to_string(cacheKey);
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
   if (request && request->boundCount) {
@@ -548,6 +852,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   // (Instrumented); a Tier-2 (PGOUse) recompile synthesizes the in-memory
   // profile from Tier-1's captured counters BEFORE loadBitcode (§5.3: PGOUse
   // consumes ctx.profileData during the JIT transform).
+  uint64_t CapturedValueSamples = 0;
   const bool RunProfileStages =
       config_.enablePgo ||
       (config_.enableProfileAudit && config_.compileMode == CompileMode::Async);
@@ -556,7 +861,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       ctx.tier = CompileTier::PGOUse;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
-      auto mayConstIt = tier1MayConst_.find(cacheKey);
+      auto mayConstIt = tier1MayConst_.find(ProfileKey);
       if (mayConstIt != tier1MayConst_.end()) {
         ctx.mayConstLoadSites = mayConstIt->second.sites;
         const uint64_t SampleEnd = ejit_taskpool_trace_now();
@@ -573,13 +878,28 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         }
       }
 #endif
-      auto it = tier1Counters_.find(cacheKey);
-      if (it != tier1Counters_.end() && !it->second.empty()) {
+      auto it = tier1Counters_.find(ProfileKey);
+      auto Cached = layoutProfiles_.find(ctx.profileIdentity);
+      if (ctx.globalLayoutCompilation && Cached == layoutProfiles_.end()) {
+        if (layoutProfileCaptureFailed_)
+          return nullptr;
+        // Snapshotting consumes collector data. A failed capture cannot be
+        // retried as a partial profile; only a fresh generation may restart it.
+        layoutProfileCaptureFailed_ = true;
+      }
+      if (ctx.globalLayoutCompilation && Cached != layoutProfiles_.end()) {
+        ctx.profileData = Cached->second.data;
+        ctx.scalarValueSites = Cached->second.scalars;
+      } else if (it != tier1Counters_.end() && !it->second.empty()) {
         std::vector<PgoCounterRef> refs;
         refs.reserve(it->second.size());
         for (const auto &c : it->second)
           refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
+        if (ctx.globalLayoutCompilation && ejitVpLosslessFailed()) {
+          EJIT_DIAG("global layout VP capacity or preempting-writer failure");
+          return nullptr;
+        }
         // Value-profile merge (EJIT_VALUE_PROFILE.md §5): snapshot every
         // core's retired payload half, aggregate per site, map verified
         // indirect-call targets to IR-PGO-name MD5s, and carry the official
@@ -589,7 +909,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         SmallVector<PgoValueSite, 8> valueSites;
         SmallVector<PgoValueFunction, 8> vpFuncs;
         SmallVector<PgoScalarSite, 8> scalarSites;
-        auto vpIt = tier1Vp_.find(cacheKey);
+        auto vpIt = tier1Vp_.find(ProfileKey);
         bool haveVp =
             vpIt != tier1Vp_.end() && readValueSiteInventory(refs, vpFuncs);
         if (haveVp) {
@@ -605,8 +925,39 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
           std::vector<EJitVpSiteSample> samples;
           haveVp = ejitVpTakeSnapshot(samples);
           if (haveVp) {
-            (void)aggregateValueSamples(samples, vpFuncs, vpIt->second.targets,
-                                        valueSites, scalarSites);
+            if (ctx.globalLayoutCompilation) {
+              const size_t MaxRecords =
+                  (config_.globalLayoutBudgets.maxProfileBytes -
+                   layoutProfileBytes_) /
+                  (4 * sizeof(EJitVpSiteSample));
+              if (samples.size() > MaxRecords ||
+                  layoutVpPending_.size() > MaxRecords - samples.size())
+                return nullptr;
+              layoutVpPending_.insert(layoutVpPending_.end(), samples.begin(),
+                                      samples.end());
+              DenseMap<uint64_t, bool> OwnKeys;
+              for (const auto &F : vpFuncs) {
+                uint32_t Counts[] = {F.numIcSites, F.numMemSites,
+                                     F.numScalarSites};
+                for (uint32_t Kind = 0; Kind < 3; ++Kind)
+                  for (uint32_t Site = 0; Site < Counts[Kind]; ++Site)
+                    OwnKeys[ejitVpSiteKey(F.pgoNameHash, Kind, Site)] = true;
+              }
+              samples.clear();
+              size_t Keep = 0;
+              for (const auto &Sample : layoutVpPending_)
+                if (OwnKeys.count(Sample.siteKey))
+                  samples.push_back(Sample);
+                else
+                  layoutVpPending_[Keep++] = Sample;
+              layoutVpPending_.resize(Keep);
+            }
+            if (!aggregateValueSamples(samples, vpFuncs, vpIt->second.targets,
+                                       valueSites, scalarSites))
+              return nullptr;
+            for (const auto &Site : valueSites)
+              for (const auto &Value : Site.values)
+                CapturedValueSamples += Value.Count;
             const size_t totalScalar = scalarSites.size();
             size_t dropped = 0;
             for (PgoScalarSite &s : scalarSites) {
@@ -645,6 +996,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
           }
         }
         if (!haveVp) {
+          if (ctx.globalLayoutCompilation)
+            return nullptr; // Required VP data must not silently become
+                            // edge-only.
           // Edge-only profile: value data unavailable (no snapshot / no
           // capture). Tier-2 still consumes the edge counters.
           EJIT_DIAG_DEBUG("VP merge key=0x%016lx: value data unavailable, "
@@ -663,6 +1017,31 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
             "compileCold Tier-2 key=0x%016lx: no Tier-1 counters captured",
             cacheKey);
       }
+      if (ctx.globalLayoutCompilation) {
+        if (ctx.profileData.empty())
+          return nullptr;
+        if (Cached == layoutProfiles_.end()) {
+          const uint64_t Bytes = ctx.profileData.size() +
+              ctx.scalarValueSites.size() * sizeof(PgoScalarSite) +
+              ctx.profileIdentity.size() + sizeof(LayoutProfile);
+          uint64_t RetainedBytes = layoutProfileBytes_;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+          RetainedBytes +=
+              layoutVpPending_.capacity() * sizeof(EJitVpSiteSample);
+#endif
+          if (Bytes > config_.globalLayoutBudgets.maxProfileBytes ||
+              RetainedBytes >
+                  config_.globalLayoutBudgets.maxProfileBytes - Bytes)
+            return nullptr;
+          layoutProfiles_.emplace(ctx.profileIdentity,
+              LayoutProfile{ctx.profileData, ctx.scalarValueSites, Bytes});
+          layoutProfileBytes_ += Bytes;
+          layoutProfileCaptureFailed_ = false;
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+          layoutPreparedValueSamples_ += CapturedValueSamples;
+#endif
+        }
+      }
     } else {
       ctx.tier = CompileTier::Instrumented;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -680,6 +1059,43 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                    std::to_string(cacheKey));
 #endif
     return nullptr;
+  }
+
+  if (prepareOnly) {
+    size_t ProfileBytes = ctx.profileData.size() +
+                          ctx.scalarValueSites.size() * sizeof(PgoScalarSite);
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+    ProfileBytes += ctx.mayConstLoadSites.size() * sizeof(EJitMayConstLoadSite);
+#endif
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    ProfileBytes += layoutVpPending_.capacity() * sizeof(EJitVpSiteSample);
+#endif
+    if (ProfileBytes > config_.globalLayoutBudgets.maxProfileBytes ||
+        (ctx.tier == CompileTier::PGOUse && ctx.profileData.empty()))
+      return nullptr;
+    const uint64_t PrepareStart = ejit_taskpool_trace_now();
+    jitEngine_->setActiveContext(&ctx);
+    auto Object = jitEngine_->prepareBitcodeModule(bitcode, cacheKey, funcName);
+    jitEngine_->setActiveContext(nullptr);
+    if (!Object) {
+      EJIT_DIAG("global layout prepare failed key=0x%016lx: %s", cacheKey,
+                toString(Object.takeError()).c_str());
+      return nullptr;
+    }
+    if (ctx.tier == CompileTier::PGOUse) {
+      tier1Counters_.erase(ProfileKey);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+      tier1Vp_.erase(ProfileKey);
+#endif
+    }
+    EJIT_DIAG("global layout prepared func=%s key=0x%016lx ticks=%llu "
+              "profileBytes=%zu objectBytes=%zu vpSamples=%llu",
+              funcName.c_str(), cacheKey,
+              static_cast<unsigned long long>(ejit_taskpool_trace_now() -
+                                              PrepareStart),
+              ProfileBytes, (*Object)->ownedBytes,
+              static_cast<unsigned long long>(CapturedValueSamples));
+    return Object->release();
   }
 
   jitEngine_->setActiveContext(&ctx);
@@ -722,7 +1138,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   // captureCounterGlobals during the transform; resolve them by name in the
   // specialization JITDylib.
   if (ctx.tier == CompileTier::Instrumented) {
-    auto &counters = tier1Counters_[cacheKey];
+    auto &counters = tier1Counters_[ProfileKey];
     counters.clear();
     for (const std::string &name : jitEngine_->getLastCounterNames()) {
       auto profc = jitEngine_->lookup(cacheKey, "__profc_" + name);
@@ -737,11 +1153,17 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
           consumeError(profd.takeError());
       }
     }
+    if (ctx.globalLayoutCompilation &&
+        (counters.empty() ||
+         counters.size() != jitEngine_->getLastCounterNames().size())) {
+      EJIT_DIAG("global layout incomplete Tier-1 counter inventory");
+      return nullptr;
+    }
     EJIT_DIAG("compileCold Tier-1 key=0x%016lx: captured %zu counter set(s)",
               cacheKey, counters.size());
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-    Tier1MayConstState &MayConst = tier1MayConst_[cacheKey];
+    Tier1MayConstState &MayConst = tier1MayConst_[ProfileKey];
     MayConst.counterBase = 0;
     MayConst.sampleStart = 0;
     MayConst.sites.assign(jitEngine_->getLastMayConstLoadSites().begin(),
@@ -754,7 +1176,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
     EJIT_DIAG("mayconst T0 published key=0x%016lx func=%s sites=%zu", cacheKey,
               funcName.c_str(), MayConst.sites.size());
-    pendingTier1MayConstKey_ = cacheKey;
+    pendingTier1MayConstKey_ = ProfileKey;
     hasPendingTier1MayConstKey_ = true;
 #endif
 
@@ -765,7 +1187,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     // externals) mapped to the MD5 of its IR-level PGO name. Addresses that
     // resolve to nothing are simply absent from the table, so the merge can
     // never pass an unverified raw address as a profile value.
-    Tier1VpState &vp = tier1Vp_[cacheKey];
+    Tier1VpState &vp = tier1Vp_[ProfileKey];
     vp.targets.clear();
     vp.functions.clear();
     for (const EJitVpFunctionInfo &f : jitEngine_->getLastVpFunctions()) {
@@ -797,6 +1219,30 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
         refs.push_back({c.pgoName.c_str(), c.profcAddr, c.profdAddr});
       SmallVector<PgoValueFunction, 8> inv;
       if (readValueSiteInventory(refs, inv)) {
+        if (!config_.globalLayout.empty()) {
+          DenseMap<uint64_t, uint32_t> Scalars;
+          for (const auto &F : vp.functions)
+            Scalars[F.pgoNameHash] = F.numScalarSites;
+          for (auto &F : inv)
+            F.numScalarSites = Scalars.lookup(F.pgoNameHash);
+          // Shared VP site keys cannot distinguish concurrently sampled copies.
+          // Refuse that generation instead of mixing private specialization
+          // data.
+          for (const auto &Other : tier1Vp_) {
+            if (Other.first == ProfileKey)
+              continue;
+            for (const auto &F : inv)
+              for (const auto &G : Other.second.functions)
+                if (F.pgoNameHash == G.pgoNameHash &&
+                    (F.numIcSites || F.numMemSites || F.numScalarSites) &&
+                    (G.numIcSites || G.numMemSites || G.numScalarSites)) {
+                  EJIT_DIAG(
+                      "global layout ambiguous concurrent VP site identity");
+                  return nullptr;
+                }
+          }
+          vp.functions.assign(inv.begin(), inv.end());
+        }
         for (const PgoValueFunction &pf : inv) {
           EJitVpKindSiteCount counts[] = {{kEJitVpIndirectCall, pf.numIcSites},
                                           {kEJitVpMemOpSize, pf.numMemSites},
@@ -809,7 +1255,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     if (config_.enablePgo) {
       ejitVpEnsureInitialized();
       ejitVpSetArmed(true);
-      ++vpRoundsActive_;
+      if (config_.globalLayout.empty() ||
+          layoutVpRounds_.insert(ctx.profileIdentity).second)
+        ++vpRoundsActive_;
     }
     EJIT_DIAG_DEBUG("VP capture key=0x%016lx: %zu function(s), %zu verified "
                     "target(s)",
@@ -819,7 +1267,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
   // PGO Tier-2: profile consumed; drop the captured counters (§7.1).
   if (ctx.tier == CompileTier::PGOUse)
-    tier1Counters_.erase(cacheKey);
+    tier1Counters_.erase(ProfileKey);
 
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
@@ -828,6 +1276,15 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
 #ifdef EJIT_SRE_TASKPOOL
 void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
+  return compileRequest(req, false);
+}
+
+void *EJitCompileDriver::prepareNow(const EJitCompileRequest &req) {
+  return compileRequest(req, true);
+}
+
+void *EJitCompileDriver::compileRequest(const EJitCompileRequest &req,
+                                        bool prepareOnly) {
   // PGO tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it to
   // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
   // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
@@ -902,27 +1359,64 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
   EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
             funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
-  return compileCold(cacheKey, tier, /*storeLru=*/false, &req);
+  return compileCold(cacheKey, tier, /*storeLru=*/false, &req, prepareOnly);
+}
+
+void EJitCompileDriver::notifyTaskpoolPrepared(const EJitCompileRequest &req) {
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  // This is a drained sampling round, not a T2 publication notification.
+  if (decodeReqTier(req.funcIndex) == kEJitTierPgoUse &&
+      layoutVpRounds_.erase(layoutProfileIdentity(req)) && vpRoundsActive_ > 0 &&
+      --vpRoundsActive_ == 0) {
+    ejitVpSetArmed(false);
+    std::vector<EJitVpSiteSample>().swap(layoutVpPending_);
+  }
+#else
+  (void)req;
+#endif
 }
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
+  if (!config_.globalLayout.empty() && published &&
+      decodeReqTier(req.funcIndex) == kEJitTierPgoUse) {
+    const std::string Identity = layoutProfileIdentity(req);
+    auto It = layoutProfiles_.find(Identity);
+    if (It != layoutProfiles_.end()) {
+      layoutProfileBytes_ -= It->second.bytes;
+      layoutProfiles_.erase(It);
+    }
+    tier1Counters_.erase(Identity);
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+    tier1Vp_.erase(Identity);
+#endif
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+    tier1MayConst_.erase(Identity);
+#endif
+    notifyTaskpoolPrepared(req); // Idempotent for a manifest's prepared round.
+  }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {
-    if (published && hasPendingTier1MayConstKey_) {
-      auto It = tier1MayConst_.find(pendingTier1MayConstKey_);
+    if (published &&
+        (!config_.globalLayout.empty() || hasPendingTier1MayConstKey_)) {
+      auto It = tier1MayConst_.find(config_.globalLayout.empty()
+                                      ? pendingTier1MayConstKey_
+                                      : layoutProfileIdentity(req));
       if (It != tier1MayConst_.end())
         It->second.sampleStart = ejit_taskpool_trace_now();
     }
-    pendingTier1MayConstKey_ = 0;
+    pendingTier1MayConstKey_.clear();
     hasPendingTier1MayConstKey_ = false;
   }
 #endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   const uint32_t tier = decodeReqTier(req.funcIndex);
-  const bool consumesRound = (tier == kEJitTierPgoUse && published) ||
-                             (tier == kEJitTierInstrumented && !published);
+  const bool consumesRound =
+      (tier == kEJitTierPgoUse && published && config_.globalLayout.empty()) ||
+      (tier == kEJitTierInstrumented && !published &&
+       (config_.globalLayout.empty() ||
+        layoutVpRounds_.erase(layoutProfileIdentity(req))));
   if (consumesRound && vpRoundsActive_ > 0 && --vpRoundsActive_ == 0)
     ejitVpSetArmed(false);
 #else

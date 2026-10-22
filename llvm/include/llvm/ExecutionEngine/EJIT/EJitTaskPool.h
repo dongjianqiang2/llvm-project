@@ -189,6 +189,7 @@ enum class EJitPublishStatus : uint32_t {
   VersionMismatch, ///< A version changed before/at publish: nothing written.
   InvalidParam,    ///< Null fn or numDims > 4.
   Failed,          ///< No slot available (should not happen with chaining).
+  Retry,           ///< Transient T1 return lease; retry without relinking.
 };
 
 class EJitTaskPoolCache {

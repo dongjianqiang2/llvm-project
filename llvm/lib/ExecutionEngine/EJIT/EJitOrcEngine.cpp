@@ -10,8 +10,12 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLinkDiagPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+#include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
+#include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
@@ -135,6 +139,33 @@ static void collectReferencedExternalDecls(
   }
 }
 
+static SmallPtrSet<GlobalVariable *, 16>
+entryDataDependencies(Module &M, StringRef EntryName) {
+  SmallPtrSet<GlobalVariable *, 16> Data;
+  SmallPtrSet<Value *, 32> Seen;
+  SmallVector<Value *, 32> Work;
+  if (auto *F = M.getFunction(EntryName))
+    Work.push_back(F);
+  while (!Work.empty()) {
+    Value *V = Work.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    if (auto *GV = dyn_cast<GlobalVariable>(V))
+      Data.insert(GV);
+    if (auto *F = dyn_cast<Function>(V)) {
+      if (!F->isDeclaration())
+        for (auto &BB : *F)
+          for (auto &I : BB)
+            for (auto &Op : I.operands())
+              Work.push_back(Op.get());
+    } else if (auto *U = dyn_cast<User>(V)) {
+      for (auto &Op : U->operands())
+        Work.push_back(Op.get());
+    }
+  }
+  return Data;
+}
+
 static void isolateSpecializationEntry(Module &M, StringRef EntryName) {
   for (Function &F : M.functions()) {
     if (F.getName() == EntryName || F.isDeclaration() ||
@@ -175,6 +206,7 @@ struct EJitOrcEngine::Impl {
   /// independently compiled and symbols from different specializations
   /// never conflict.
   std::map<uint64_t, orc::JITDylib *> specDylibs;
+  uint64_t layoutLinkSerial = 0;
   /// User-registered symbols (functions + globals) for bare-metal.
   /// Populated via ejit_register_symbol() / addUserSymbol().
   std::map<std::string, void *> userSymbols;
@@ -850,121 +882,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
       [engine = engine.get()](orc::ThreadSafeModule TSM,
                               orc::MaterializationResponsibility &R)
           -> Expected<orc::ThreadSafeModule> {
-        TSM.withModuleDo([engine](Module &M) {
-          LLVM_DEBUG(dbgs() << "ejit-orc-engine: JIT transform on "
-                            << M.getName() << "\n");
-          const SpecializationContext *ctx = engine->P->activeCtx;
-          if (!ctx)
-            return;
-
-          // Clear stale analysis results from previous compilations
-          // (each compilation uses a fresh Module with new IR unit pointers).
-          engine->P->optimizer->clearAnalyses();
-
-          // Dump pre-optimization IR (before the JIT pipeline runs).
-          if (!engine->P->dumpJITDir.empty()) {
-            std::string prePath = engine->P->dumpJITDir + "/" + ctx->fnName +
-                                  "_" + std::to_string(ctx->cacheKey) +
-                                  "_pre.ll";
-            std::error_code EC;
-            llvm::raw_fd_ostream preOS(prePath, EC);
-            if (!EC)
-              M.print(preOS, nullptr);
-          }
-
-          engine->P->optimizer->runPipeline(M, *ctx);
-
-          // Dump post-optimization IR.
-          if (!engine->P->dumpJITDir.empty()) {
-            std::string path = engine->P->dumpJITDir + "/" + ctx->fnName + "_" +
-                               std::to_string(ctx->cacheKey) + "_opt.ll";
-            std::error_code EC;
-            llvm::raw_fd_ostream OS(path, EC);
-            if (!EC)
-              M.print(OS, nullptr);
-          }
-
-          // Name-filtered IR+ASM capture for later selective printing. Filter
-          // set via ejit_dump_func(); captured entries printed on demand via
-          // ejit_print_dumped(). Bare-metal-safe (strings only, no
-          // raw_fd_ostream). Captures the post-optimization IR and the emitted
-          // assembly (from the same TargetMachine the JIT compiles with).
-          // Capture is exact-name only. The local dump store keeps one dynamic
-          // IR/ASM payload per captured function name (overwritten on
-          // re-compile); the shared dump table keeps cross-core visible dynamic
-          // payloads for recent captures.
-          {
-            std::string DumpFilter;
-            bool hasFilter = getActiveDumpFilter(DumpFilter);
-            // Tier-1 is temporary profiling code. Capturing it doubles the
-            // already expensive diagnostic ASM codegen and lengthens the
-            // lifecycle race window before publish. The public dump APIs show
-            // executable final code: Baseline when PGO is off, Tier-2 when on.
-            bool match = hasFilter && detail::shouldCaptureDump(
-                                          ctx->tier, DumpFilter, ctx->fnName);
-            EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
-                            "key_lo=0x%08x match=%d &filter=%p",
-                            hasFilter ? DumpFilter.c_str() : "(off)",
-                            ctx->fnName.c_str(),
-                            (uint32_t)(ctx->cacheKey >> 32),
-                            (uint32_t)(ctx->cacheKey & 0xffffffffu),
-                            match ? 1 : 0, (void *)&dumpFuncFilter());
-            if (match) {
-              // IR capture always runs first so it succeeds even if the ASM
-              // diagnostic path is disabled or fails. Capture only the entry
-              // definition: M also contains its full direct-call closure.
-              std::string FunctionIR;
-              if (!detail::renderDumpFunctionIR(M, ctx->fnName, FunctionIR))
-                EJIT_DIAG("dump capture: function not found fn=%s",
-                          ctx->fnName.c_str());
-              std::string ModuleIR;
-              detail::renderDumpModuleIR(M, ModuleIR);
-
-              std::string FunctionAsm;
-              std::string ModuleAsm;
-          // Textual ASM emit goes through addPassesToEmitFile ->
-          // addAsmPrinter -> createMCStreamer(AssemblyFile). Under
-          // EJIT_TRIM_LLVM_BACKEND that path is compile-time removed and
-          // createMCStreamer returns "textual assembly output unavailable";
-          // addAsmPrinter reports it via MCContext::reportError ->
-          // llvm::errs() (raw_fd_ostream fd 2), whose constructor is
-          // unmapped on bare-metal/SRE and crashes. So under trim we skip
-          // ASM (IR is still captured — M.print to a string stream is
-          // SRE-safe). To get ASM on target, build with EJIT_DUMP_ASM=ON
-          // (re-enables the textual asm backend under trim). The ASM emit's
-          // InstPrinter needs snprintf/vsnprintf: link a libc that provides
-          // them, OR ejit_test/stubs/ejit_sre_format_stubs.cpp if the SRE
-          // libc lacks them (not both — strong-symbol conflict). The success
-          // path of the emit does not call errs(), so once the path is
-          // compiled in it is SRE-safe.
-#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
-              if (engine->P->dumpFunctionTM && engine->P->dumpModuleTM) {
-                EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
-                bool FunctionOK = renderDumpAssembly(
-                    *engine->P->dumpFunctionTM,
-                    cloneDumpFunctionModule(M, ctx->fnName), FunctionAsm);
-                bool ModuleOK = renderDumpAssembly(*engine->P->dumpModuleTM,
-                                                   CloneModule(M), ModuleAsm);
-                if (!FunctionOK || !ModuleOK) {
-                  EJIT_DIAG_DEBUG("dump asm addPassesToEmitFile failed fn=%s",
-                                  ctx->fnName.c_str());
-                }
-                EJIT_DIAG_DEBUG("dump asm sizes function=%u module=%u fn=%s",
-                                (unsigned)FunctionAsm.size(),
-                                (unsigned)ModuleAsm.size(),
-                                ctx->fnName.c_str());
-              }
-#else
-              EJIT_DIAG_DEBUG("dump asm skipped (EJIT_TRIM_LLVM_BACKEND, "
-                              "EJIT_DUMP_ASM off) fn=%s; IR captured",
-                              ctx->fnName.c_str());
-#endif
-              captureDump(ctx->fnName, ctx->cacheKey, ctx->tier,
-                          std::move(FunctionIR), std::move(FunctionAsm),
-                          std::move(ModuleIR), std::move(ModuleAsm));
-            }
-          }
-        });
+        TSM.withModuleDo([engine](Module &M) { engine->optimizeModule(M); });
         // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
         // Gen creates them inside runPipeline (after addIRModule), so the
         // MR's claim - computed at addIRModule from the original module -
@@ -997,8 +915,141 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   return engine;
 }
 
+void EJitOrcEngine::optimizeModule(Module &M) {
+  LLVM_DEBUG(dbgs() << "ejit-orc-engine: JIT transform on " << M.getName()
+                    << "\n");
+  const SpecializationContext *ctx = P->activeCtx;
+  if (!ctx)
+    return;
+
+  // Clear stale analysis results from previous compilations
+  // (each compilation uses a fresh Module with new IR unit pointers).
+  P->optimizer->clearAnalyses();
+
+  // Dump pre-optimization IR (before the JIT pipeline runs).
+  if (!P->dumpJITDir.empty()) {
+    std::string prePath = P->dumpJITDir + "/" + ctx->fnName + "_" +
+                          std::to_string(ctx->cacheKey) + "_pre.ll";
+    std::error_code EC;
+    llvm::raw_fd_ostream preOS(prePath, EC);
+    if (!EC)
+      M.print(preOS, nullptr);
+  }
+
+  P->optimizer->runPipeline(M, *ctx);
+
+  // Dump post-optimization IR.
+  if (!P->dumpJITDir.empty()) {
+    std::string path = P->dumpJITDir + "/" + ctx->fnName + "_" +
+                       std::to_string(ctx->cacheKey) + "_opt.ll";
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(path, EC);
+    if (!EC)
+      M.print(OS, nullptr);
+  }
+
+  // Name-filtered IR+ASM capture for later selective printing. Filter
+  // set via ejit_dump_func(); captured entries printed on demand via
+  // ejit_print_dumped(). Bare-metal-safe (strings only, no
+  // raw_fd_ostream). Captures the post-optimization IR and the emitted
+  // assembly (from the same TargetMachine the JIT compiles with).
+  // Capture is exact-name only. The local dump store keeps one dynamic
+  // IR/ASM payload per captured function name (overwritten on
+  // re-compile); the shared dump table keeps cross-core visible dynamic
+  // payloads for recent captures.
+  {
+    std::string DumpFilter;
+    bool hasFilter = getActiveDumpFilter(DumpFilter);
+    // Tier-1 is temporary profiling code. Capturing it doubles the
+    // already expensive diagnostic ASM codegen and lengthens the
+    // lifecycle race window before publish. The public dump APIs show
+    // executable final code: Baseline when PGO is off, Tier-2 when on.
+    bool match = hasFilter &&
+                 detail::shouldCaptureDump(ctx->tier, DumpFilter, ctx->fnName);
+    EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
+                    "key_lo=0x%08x match=%d &filter=%p",
+                    hasFilter ? DumpFilter.c_str() : "(off)",
+                    ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
+                    (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
+                    (void *)&dumpFuncFilter());
+    if (match) {
+      // IR capture always runs first so it succeeds even if the ASM
+      // diagnostic path is disabled or fails. Capture only the entry
+      // definition: M also contains its full direct-call closure.
+      std::string FunctionIR;
+      if (!detail::renderDumpFunctionIR(M, ctx->fnName, FunctionIR))
+        EJIT_DIAG("dump capture: function not found fn=%s",
+                  ctx->fnName.c_str());
+      std::string ModuleIR;
+      detail::renderDumpModuleIR(M, ModuleIR);
+
+      std::string FunctionAsm;
+      std::string ModuleAsm;
+      // Textual ASM emit goes through addPassesToEmitFile ->
+      // addAsmPrinter -> createMCStreamer(AssemblyFile). Under
+      // EJIT_TRIM_LLVM_BACKEND that path is compile-time removed and
+      // createMCStreamer returns "textual assembly output unavailable";
+      // addAsmPrinter reports it via MCContext::reportError ->
+      // llvm::errs() (raw_fd_ostream fd 2), whose constructor is
+      // unmapped on bare-metal/SRE and crashes. So under trim we skip
+      // ASM (IR is still captured — M.print to a string stream is
+      // SRE-safe). To get ASM on target, build with EJIT_DUMP_ASM=ON
+      // (re-enables the textual asm backend under trim). The ASM emit's
+      // InstPrinter needs snprintf/vsnprintf: link a libc that provides
+      // them, OR ejit_test/stubs/ejit_sre_format_stubs.cpp if the SRE
+      // libc lacks them (not both — strong-symbol conflict). The success
+      // path of the emit does not call errs(), so once the path is
+      // compiled in it is SRE-safe.
+#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
+      if (P->dumpFunctionTM && P->dumpModuleTM) {
+        EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
+        bool FunctionOK = renderDumpAssembly(
+            *P->dumpFunctionTM, cloneDumpFunctionModule(M, ctx->fnName),
+            FunctionAsm);
+        bool ModuleOK =
+            renderDumpAssembly(*P->dumpModuleTM, CloneModule(M), ModuleAsm);
+        if (!FunctionOK || !ModuleOK) {
+          EJIT_DIAG_DEBUG("dump asm addPassesToEmitFile failed fn=%s",
+                          ctx->fnName.c_str());
+        }
+        EJIT_DIAG_DEBUG("dump asm sizes function=%u module=%u fn=%s",
+                        (unsigned)FunctionAsm.size(),
+                        (unsigned)ModuleAsm.size(), ctx->fnName.c_str());
+      }
+#else
+      EJIT_DIAG_DEBUG("dump asm skipped (EJIT_TRIM_LLVM_BACKEND, "
+                      "EJIT_DUMP_ASM off) fn=%s; IR captured",
+                      ctx->fnName.c_str());
+#endif
+      captureDump(ctx->fnName, ctx->cacheKey, ctx->tier, std::move(FunctionIR),
+                  std::move(FunctionAsm), std::move(ModuleIR),
+                  std::move(ModuleAsm));
+    }
+  }
+}
+
 Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
                                        const std::string &origFnName) {
+  return loadBitcodeModuleImpl(bitcodeData, cacheKey, origFnName, nullptr);
+}
+
+Expected<std::unique_ptr<EJitOrcEngine::PreparedObject>>
+EJitOrcEngine::prepareBitcodeModule(StringRef bitcode, uint64_t cacheKey,
+                                    const std::string &entryName) {
+  if (!P->activeCtx || P->activeCtx->tier == CompileTier::Instrumented)
+    return make_error<StringError>("layout preparation requires a final tier",
+                                   inconvertibleErrorCode());
+  auto Object = std::make_unique<PreparedObject>();
+  if (auto Err =
+          loadBitcodeModuleImpl(bitcode, cacheKey, entryName, Object.get()))
+    return std::move(Err);
+  return std::move(Object);
+}
+
+Error EJitOrcEngine::loadBitcodeModuleImpl(StringRef bitcodeData,
+                                           uint64_t cacheKey,
+                                           const std::string &origFnName,
+                                           PreparedObject *Prepared) {
   EJIT_DIAG_VERBOSE("loadBitcode key=0x%016lx func=%s size=%zu", cacheKey,
                     origFnName.c_str(), bitcodeData.size());
   auto Ctx = std::make_unique<LLVMContext>();
@@ -1013,6 +1064,50 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   // Do this before addIRModule so ORC's materialization-unit symbol claims
   // match the definitions that codegen will actually emit.
   isolateSpecializationEntry(**ModuleOrErr, origFnName);
+
+  if (P->activeCtx && P->activeCtx->globalLayoutCompilation) {
+    // Other entries were isolated above. Do not emit their now-unused private
+    // data into every artifact (it can otherwise falsely exhaust one graph).
+    for (auto It = (*ModuleOrErr)->global_begin();
+         It != (*ModuleOrErr)->global_end();) {
+      auto &GV = *It++;
+      if (GV.hasLocalLinkage() && GV.use_empty())
+        GV.eraseFromParent();
+    }
+    auto Needed = entryDataDependencies(**ModuleOrErr, origFnName);
+    for (GlobalVariable &GV : (*ModuleOrErr)->globals()) {
+      if (GV.isDeclaration() || !Needed.count(&GV) ||
+          GV.getName().starts_with("llvm."))
+        continue;
+      void *Backing = nullptr;
+      if (auto *Info = P->periodReg->getArrayInfo(GV.getName().str()))
+        Backing = Info->baseAddr;
+      else
+        Backing = P->periodReg->getStaticVarAddr(GV.getName().str());
+      if (!Backing) {
+        auto It = P->userSymbols.find(GV.getName().str());
+        if (It != P->userSymbols.end())
+          Backing = It->second;
+      }
+      if (!Backing && GV.isConstant() && GV.hasGlobalUnnamedAddr())
+        continue; // Address-insignificant immutable compiler data is safe.
+      if (!Backing)
+        return make_error<StringError>(
+            "global layout requires canonical backing for data: " +
+                GV.getName().str(),
+            inconvertibleErrorCode());
+      // Keep the real registered backing. Never duplicate mutable state merely
+      // to obtain a different physical body address.
+      GV.setInitializer(nullptr);
+      GV.setLinkage(GlobalValue::ExternalLinkage);
+      GV.setDSOLocal(true);
+    }
+    if (!P->activeCtx->profileIdentity.empty())
+      for (Function &F : (*ModuleOrErr)->functions())
+        if (!F.isDeclaration() && F.getName() != origFnName)
+          F.setName(F.getName().str() + ".ejit_layout_" +
+                    P->activeCtx->profileIdentity);
+  }
 
   Triple TT((*ModuleOrErr)->getTargetTriple());
   if (TT.isAArch64() && TT.isOSBinFormatELF()) {
@@ -1079,36 +1174,6 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
       continue;
     globalSymbols[P->J->mangleAndIntern(GV.getName())] = orc::ExecutorSymbolDef(
         orc::ExecutorAddr::fromPtr(addr), JITSymbolFlags::Exported);
-  }
-
-  // Each specialization gets its own JITDylib so that symbols from
-  // different specializations (same TU bitcode loaded multiple times)
-  // never conflict. Remove any stale JD from a previous compilation
-  // of the same cacheKey (e.g., after ejit_clear_cache).
-  // PGO: a Tier-2 recompile for the same cacheKey removes the Tier-1
-  // JITDylib BEFORE the new compile.  This is safe under code-pool v1
-  // (NO_RECLAIM) where slab memory is never freed, so existing Tier-1
-  // fnPtrs in the cache remain valid.  A future retain-until-publish
-  // path (deferring removeJITDylib until after cachePublish succeeds)
-  // would be needed for reclaimable memory managers (§5 JD lifecycle).
-  auto it = P->specDylibs.find(cacheKey);
-  if (it != P->specDylibs.end()) {
-    if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
-      EJIT_DIAG("loadBitcode key=0x%016lx: remove stale JD FAILED: %s",
-                cacheKey, toString(std::move(Err)).c_str());
-    P->specDylibs.erase(it);
-  }
-
-  const char *TierTag =
-      P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented
-          ? "t1"
-          : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse ? "t2"
-                                                                      : "base";
-  auto JDOrErr = P->J->createJITDylib("spec_" + std::string(TierTag) + "_" +
-                                      std::to_string(cacheKey));
-  if (!JDOrErr) {
-    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
-    return JDOrErr.takeError();
   }
 
   // Resolve undefined function symbols from user-registered table.
@@ -1182,6 +1247,81 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     globalSymbols[P->J->mangleAndIntern(LCS.name)] = orc::ExecutorSymbolDef(
         orc::ExecutorAddr::fromPtr(LCS.addr), JITSymbolFlags::Exported);
 
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  if (P->activeCtx && P->activeCtx->globalLayoutCompilation) {
+    globalSymbols[P->J->mangleAndIntern("ejit_vp_record_scalar")] =
+        orc::ExecutorSymbolDef(
+            orc::ExecutorAddr::fromPtr(&ejit_vp_record_scalar),
+            JITSymbolFlags::Exported);
+    globalSymbols[P->J->mangleAndIntern("__llvm_profile_instrument_memop")] =
+        orc::ExecutorSymbolDef(
+            orc::ExecutorAddr::fromPtr(&__llvm_profile_instrument_memop),
+            JITSymbolFlags::Exported);
+  }
+#endif
+
+  if (Prepared) {
+    Module &M = **ModuleOrErr;
+    M.setDataLayout(P->J->getDataLayout());
+    M.setTargetTriple(P->J->getTargetTriple());
+    optimizeModule(M);
+    Function *Entry = M.getFunction(origFnName);
+    if (!Entry || Entry->isDeclaration())
+      return make_error<StringError>(
+          "layout entry body missing after optimization",
+          inconvertibleErrorCode());
+    auto Object = P->J->getIRCompileLayer().getCompiler()(M);
+    if (!Object)
+      return Object.takeError();
+    // Charge container capacity and bookkeeping conservatively, not just
+    // executable bytes. Profile ownership is separately budgeted; LLVM compiler
+    // scratch is not a hard-bounded allocation domain.
+    Prepared->ownedBytes = (*Object)->getBufferSize() + origFnName.size() +
+                           sizeof(PreparedObject) + 1024 +
+                           globalSymbols.size() * 256;
+    for (const auto &Import : globalSymbols)
+      Prepared->ownedBytes += sizeof(Import) + (*Import.first).size();
+    Prepared->object = std::move(*Object);
+    Prepared->imports = std::move(globalSymbols);
+    Prepared->cacheKey = cacheKey;
+    Prepared->entryName = origFnName;
+    Prepared->tier = P->activeCtx->tier;
+    return Error::success();
+  }
+
+  // Each specialization gets its own JITDylib so that symbols from
+  // different specializations (same TU bitcode loaded multiple times)
+  // never conflict. Remove any stale JD from a previous compilation
+  // of the same cacheKey (e.g., after ejit_clear_cache).
+  // PGO: a Tier-2 recompile for the same cacheKey removes the Tier-1
+  // JITDylib BEFORE the new compile.  This is safe under code-pool v1
+  // (NO_RECLAIM) where slab memory is never freed, so existing Tier-1
+  // fnPtrs in the cache remain valid.  A future retain-until-publish
+  // path (deferring removeJITDylib until after cachePublish succeeds)
+  // would be needed for reclaimable memory managers (§5 JD lifecycle).
+  auto it = P->specDylibs.find(cacheKey);
+  if (it != P->specDylibs.end() &&
+      !(P->activeCtx && P->activeCtx->globalLayoutCompilation)) {
+    if (auto Err = P->J->getExecutionSession().removeJITDylib(*it->second))
+      EJIT_DIAG("loadBitcode key=0x%016lx: remove stale JD FAILED: %s",
+                cacheKey, toString(std::move(Err)).c_str());
+    P->specDylibs.erase(it);
+  }
+
+  const char *TierTag =
+      P->activeCtx && P->activeCtx->tier == CompileTier::Instrumented ? "t1"
+      : P->activeCtx && P->activeCtx->tier == CompileTier::PGOUse     ? "t2"
+                                                                      : "base";
+  std::string Name =
+      "spec_" + std::string(TierTag) + "_" + std::to_string(cacheKey);
+  if (P->activeCtx && P->activeCtx->globalLayoutCompilation)
+    Name += "_layout_" + std::to_string(++P->layoutLinkSerial);
+  auto JDOrErr = P->J->createJITDylib(Name);
+  if (!JDOrErr) {
+    EJIT_DIAG("loadBitcode FAIL key=0x%016lx: create JITDylib error", cacheKey);
+    return JDOrErr.takeError();
+  }
+
   // Define all collected symbols in the spec JITDylib before loading the
   // IR module so the JIT linker can resolve external references.
   if (!globalSymbols.empty()) {
@@ -1204,6 +1344,25 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   EJIT_DIAG_VERBOSE("loadBitcode OK key=0x%016lx func=%s", cacheKey,
                     origFnName.c_str());
   return Error::success();
+}
+
+Expected<void *> EJitOrcEngine::linkPreparedObject(PreparedObject &Object) {
+  if (!Object.object)
+    return make_error<StringError>("layout object already consumed",
+                                   inconvertibleErrorCode());
+  const char *Tier = Object.tier == CompileTier::PGOUse ? "t2" : "base";
+  auto JD = P->J->createJITDylib("spec_" + std::string(Tier) + "_layout_" +
+                                 std::to_string(++P->layoutLinkSerial));
+  if (!JD)
+    return JD.takeError();
+  if (auto Err = JD->define(orc::absoluteSymbols(std::move(Object.imports))))
+    return std::move(Err);
+  if (auto Err = P->J->addObjectFile(*JD, std::move(Object.object)))
+    return std::move(Err);
+  // Retain older JITDylibs. Replacing this lookup map does not retire live
+  // code.
+  P->specDylibs[Object.cacheKey] = &*JD;
+  return lookup(Object.cacheKey, Object.entryName);
 }
 
 Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
@@ -1315,6 +1474,12 @@ EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJIT_SUM_STAT(finalizedRangeCount);
 #undef EJIT_SUM_STAT
   return Out;
+}
+
+void EJitOrcEngine::setLayoutReservationProviders(
+    std::function<uint64_t(size_t)> near, std::function<uint64_t(size_t)> far) {
+  P->nearCodePool->setReservationProvider(std::move(near));
+  P->farCodePool->setReservationProvider(std::move(far));
 }
 
 bool EJitOrcEngine::findCodeRange(const void *FnPtr,

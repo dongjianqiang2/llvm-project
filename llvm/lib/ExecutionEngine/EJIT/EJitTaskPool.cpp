@@ -745,6 +745,8 @@ void EJitTaskPool::runCompile(const EJitCompileRequest &req) {
     EJIT_DIAG("worker publish drop func=%u: version mismatch", req.funcIndex);
     return;
   case EJitPublishStatus::InvalidParam:
+  case EJitPublishStatus::Retry: // Only the shared cache currently returns
+                                 // Retry.
   case EJitPublishStatus::Failed:
     if (publishFn_)
       publishFn_(publishCtx_, PublishReq, false);

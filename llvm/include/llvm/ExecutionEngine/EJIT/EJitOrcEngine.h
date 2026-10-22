@@ -18,6 +18,7 @@
 #endif
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -111,6 +112,9 @@ struct SpecializationContext {
   /// EJitProfileMerge before loadBitcode). Empty for Baseline/Instrumented.
   /// Owned by the context; lives through the JIT transform that consumes it.
   std::string profileData;
+  bool globalLayoutCompilation = false;
+  /// Complete profiling domain, tier-independent and never shortened.
+  std::string profileIdentity;
   /// Scalar/loop-bound specialization side table (EJIT_VALUE_PROFILE.md §7):
   /// filled by the Tier-2 merge with the top-1 dominant value per qualifying
   /// site (min samples + confidence thresholds applied by the driver). Empty
@@ -146,6 +150,22 @@ public:
   /// from the same TU bitcode can be defined multiple times without conflict.
   Error loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
                           const std::string &origFnName);
+
+  struct PreparedObject {
+    std::unique_ptr<MemoryBuffer> object;
+    orc::SymbolMap imports;
+    uint64_t cacheKey = 0;
+    std::string entryName;
+    CompileTier tier = CompileTier::Baseline;
+    size_t ownedBytes = 0;
+  };
+
+  /// Emit an optimized relocatable object without executable allocation.
+  Expected<std::unique_ptr<PreparedObject>>
+  prepareBitcodeModule(StringRef bitcode, uint64_t cacheKey,
+                       const std::string &entryName);
+  /// Materialize an owned object through the ordinary JITLink allocator.
+  Expected<void *> linkPreparedObject(PreparedObject &object);
 
   /// Look up a compiled function symbol in the specialization JITDylib
   /// identified by cacheKey.
@@ -185,6 +205,8 @@ public:
   /// zeroed snapshot if no pool is active. Available only with
   /// EJIT_SRE_CODE_POOL.
   EJitCodePoolManager::Stats getCodePoolStats() const;
+  void setLayoutReservationProviders(std::function<uint64_t(size_t)> near,
+                                     std::function<uint64_t(size_t)> far);
 
   /// Snapshot aggregate and placement-specific statistics. Tier-1 uses the
   /// far dynamic pool; final Baseline/Tier-2 code uses the near fixed pool.
@@ -200,6 +222,10 @@ public:
 #endif
 
 private:
+  void optimizeModule(Module &M);
+  Error loadBitcodeModuleImpl(StringRef bitcode, uint64_t cacheKey,
+                              const std::string &entryName,
+                              PreparedObject *prepared);
   struct Impl;
   std::unique_ptr<Impl> P;
 };

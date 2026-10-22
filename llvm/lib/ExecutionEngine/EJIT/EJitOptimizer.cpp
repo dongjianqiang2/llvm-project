@@ -1,6 +1,7 @@
 //===-- EJitOptimizer.cpp - JIT Optimization Pipeline ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
+#include "llvm/ADT/ScopeExit.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #include "llvm/ADT/DenseSet.h"
@@ -201,6 +202,22 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           : 0;
 #endif
 
+  // Keep the exported entry name stable, but give Gen/Use and VP the same full
+  // identity. Helpers are qualified at load time; roots need this too when
+  // several bound identities of one function wait for collective compilation.
+  std::string ProfileEntryName = ctx.fnName;
+  if (ctx.globalLayoutCompilation && !ctx.profileIdentity.empty())
+    if (auto *Entry = M.getFunction(ctx.fnName)) {
+      Entry->setName(ctx.fnName + ".ejit_layout_" + ctx.profileIdentity);
+      ProfileEntryName = Entry->getName().str();
+    }
+  auto RestoreEntry = [&] {
+    if (ProfileEntryName != ctx.fnName)
+      if (auto *Entry = M.getFunction(ProfileEntryName))
+        Entry->setName(ctx.fnName);
+  };
+  auto RestoreEntryOnExit = make_scope_exit(RestoreEntry);
+
   if (ctx.tier == CompileTier::Instrumented) {
     // The counter increment lowers to `atomicrmw add i64` (§5, InstrProfOpts
     // .Atomic). AOT bitcode compiled for generic AArch64 carries
@@ -264,6 +281,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     }
 #endif
     captureCounterGlobals(M);
+    for (auto &F : lastVpFunctions_)
+      if (F.name == ProfileEntryName)
+        F.name = ctx.fnName; // ORC lookup uses the restored exported name.
     EJIT_DIAG_VERBOSE(
         "pipeline done (Tier-1) func=%s key=0x%016lx counters=%zu",
         ctx.fnName.c_str(), ctx.cacheKey, lastCounterNames_.size());
@@ -295,7 +315,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           IntrusiveRefCntPtr<vfs::FileSystem>(InMemFS)));
       UseMPM.run(*ProfileModule, MAM_);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-      auto Summaries = analyzeBranchProfiles(*ProfileModule, ctx.fnName);
+      auto Summaries = analyzeBranchProfiles(*ProfileModule, ProfileEntryName);
       uint64_t Instructions = 0;
       uint32_t Branches = 0;
       uint32_t Profiled = 0;
@@ -344,6 +364,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
       runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      RestoreEntry();
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -403,6 +424,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     }
 #endif
     runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    RestoreEntry();
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,

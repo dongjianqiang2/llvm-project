@@ -399,6 +399,10 @@ def doit_gc_merge(args):
         # reachable from this root + ejit_init's .ejit_period walk, no explicit
         # root needed.
         "ejit_register_icache_slot",
+        # These APIs are called by application code after runtime gc-merge.
+        # Keep them when defined; older archives must not gain undefined roots.
+        "ejit_init_global_layout", "ejit_get_global_layout_status",
+        "ejit_refresh_global_layout", "ejit_shutdown_checked",
     ]
 
     defined = set()

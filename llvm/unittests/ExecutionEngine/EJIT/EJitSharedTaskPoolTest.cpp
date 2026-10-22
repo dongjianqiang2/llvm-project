@@ -281,7 +281,13 @@ struct BatchTimelineIdleCtx {
 
 void mockBatchTimelineIdle(void *ctx, uint32_t ticks) {
   auto *T = static_cast<BatchTimelineIdleCtx *>(ctx);
-  if (ticks != 1u && T->batch->recordTimeline)
+  if (ticks == 1u) {
+    // The publish-wait caller shares this hook with the worker. It must not
+    // read the worker-owned timeline while the worker appends to it.
+    std::this_thread::yield();
+    return;
+  }
+  if (T->batch->recordTimeline)
     T->batch->timeline.push_back('D');
   // Stop the real worker loop after the post-publish throttle has run.
   if (!T->batch->timeline.empty() && T->batch->timeline.back() == 'D' &&
@@ -1951,6 +1957,41 @@ TEST_F(SharedTaskPoolTest, AbiMismatchRefused) {
   EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AbiMismatch);
 }
 
+TEST_F(SharedTaskPoolTest, RefreshingDoesNotMaskAbiVersionMismatch) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  state_->abiVersion = kEJitSharedAbiVersion + 1;
+  state_->globalLayoutState.storeRelease(
+      static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AbiMismatch);
+}
+
+TEST_F(SharedTaskPoolTest, RefreshingDoesNotMaskStructSizeMismatch) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  state_->structSize = sizeof(EJitSharedTaskPoolState) - 1;
+  state_->globalLayoutState.storeRelease(
+      static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AbiMismatch);
+}
+
+TEST_F(SharedTaskPoolTest, MatchingAbiRefreshingRemainsInProgress) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  state_->globalLayoutState.storeRelease(
+      static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing));
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(1);
+  EXPECT_EQ(peer.init(), EJitSharedTaskPool::InitResult::InitInProgress);
+}
+
 //===----------------------------------------------------------------------===//
 // Instance-disabled producers fall back and never enqueue.
 //===----------------------------------------------------------------------===//
@@ -3138,7 +3179,8 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   // per-version post-publish reuse tracking; v16 adds near/far placement.
   // v17 adds explicit batch publish state.
   // v18 replaces the inline bound-pointer payload with borrowed descriptors.
-  EXPECT_EQ(kEJitSharedAbiVersion, 18u);
+  // v19 adds complete layout status, retained budgets and real T1 leases.
+  EXPECT_EQ(kEJitSharedAbiVersion, 21u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -5705,7 +5747,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
   EJitCoreId::setCurrentForTest(0);
-  pool.setPgoEnabled(true, 2);
+  pool.setPgoEnabled(true, 2, /*maxConcurrentProfiles=*/1);
   EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 1u);
 
   // The first miss owns staged profiling and is explicitly queued as Tier-1.
