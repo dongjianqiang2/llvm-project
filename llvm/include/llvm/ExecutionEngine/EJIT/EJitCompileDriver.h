@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSwitchCase.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -192,6 +193,9 @@ private:
     uintptr_t profdAddr = 0;
   };
   std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+  /// Tier-1's switch-case arms per cacheKey, for Tier-2 to replay
+  /// (EJIT_SWITCH_CASE.md §10). Same lifetime as tier1Counters_.
+  std::unordered_map<uint64_t, EJitSwitchCaseDecision> tier1SwitchCase_;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct Tier1MayConstState {
     uintptr_t counterBase = 0;

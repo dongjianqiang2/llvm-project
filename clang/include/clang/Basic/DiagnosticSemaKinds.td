@@ -13510,6 +13510,20 @@ def warn_ejit_free_dim_no_dimension : Warning<
   "ejit_may_const values frozen through ejit_free_dim parameter %1 can "
   "never be invalidated">,
   InGroup<EmbeddedJIT>;
+def err_ejit_runtime_dim_invalid_type : Error<
+  "ejit_runtime_dim parameter %0 must have integer type of at most 32 bits">;
+def err_ejit_runtime_dim_kind_conflict : Error<
+  "parameter %0 cannot be both ejit_runtime_dim and %1">;
+def err_ejit_runtime_dim_not_entry : Error<
+  "ejit_runtime_dim parameter %0 requires function %1 to be ejit_entry">;
+def err_ejit_runtime_dim_too_many : Error<
+  "function %0 has more than one ejit_runtime_dim parameter">;
+def err_ejit_runtime_dim_max_arms : Error<
+  "ejit_runtime_dim arm limit must be between 1 and %0">;
+def warn_ejit_runtime_dim_ignored : Warning<
+  "ejit_runtime_dim is ignored: this compiler was built without "
+  "EJIT_SWITCH_CASE">,
+  InGroup<EmbeddedJIT>;
 def err_ejit_bound_ptr_invalid_type : Error<
   "ejit_bound_ptr parameter %0 must be a pointer to a complete object type">;
 def err_ejit_bound_ptr_duplicate

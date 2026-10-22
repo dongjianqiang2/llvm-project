@@ -25,6 +25,10 @@
 #endif
 
 namespace llvm {
+class Constant;
+class DataLayout;
+class LoadInst;
+
 namespace ejit {
 
 struct GVPeriodInfo {
@@ -95,7 +99,22 @@ public:
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
+#ifdef EJIT_SWITCH_CASE
+  /// Switch-case key selection (EJIT_SWITCH_CASE.md §4.3): evaluate a load as
+  /// run() would, with the arguments in \p Extra also assumed to take their
+  /// mapped values. Never changes the IR.
+  bool isMayConstCandidate(LoadInst *LI, const AssumedArgMap &Extra);
+  Constant *resolveMayConstLoad(LoadInst *LI, const AssumedArgMap &Extra);
+#endif
+
 private:
+  /// The per-load halves of run(): is \p LI a may_const access at all, and
+  /// the constant it resolves to under \p Assumed, or null.
+  bool isMayConstCandidate(LoadInst *LI, const DataLayout &DL,
+                           const AssumedArgMap &Assumed);
+  Constant *resolveMayConstLoad(LoadInst *LI, const DataLayout &DL,
+                                const AssumedArgMap &Assumed);
+
   PeriodArrayRegistry &registry_;
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;
   std::string boundRootFunction_;

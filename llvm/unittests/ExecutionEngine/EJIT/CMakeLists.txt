@@ -23,6 +23,7 @@ add_llvm_unittest(EJITTests
   EJitVpMergeTest.cpp
   EJitVpScalarSpecTest.cpp
   EJitVpPipelineTest.cpp
+  EJitSwitchCaseTest.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
@@ -45,6 +46,11 @@ endif()
 
 if(EJIT_SRE_PGO_BRANCH_AUDIT)
   target_compile_definitions(EJITTests PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
+endif()
+
+# EJitSwitchCaseTest.cpp is #ifdef EJIT_SWITCH_CASE-gated like LLVMEJIT.
+if(EJIT_SWITCH_CASE)
+  target_compile_definitions(EJITTests PRIVATE EJIT_SWITCH_CASE)
 endif()
 
 # EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only

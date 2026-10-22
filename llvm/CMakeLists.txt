@@ -598,6 +598,16 @@ if(EJIT_STATS_ENABLE)
   add_definitions(-DEJIT_STATS_ENABLE)
 endif()
 
+# Switch-case mode (jit_design_doc/EJIT_SWITCH_CASE.md). Declared here because
+# clang's Sema reads it too.
+option(EJIT_SWITCH_CASE "Build EJIT switch-case mode (ejit_runtime_dim arms; default OFF)" OFF)
+set(EJIT_SWITCH_CASE_MAX_ARMS "8" CACHE STRING
+  "Switch-case arms per specialization (overridable per entry)")
+set(EJIT_SWITCH_CASE_MAX_REGION "2000" CACHE STRING
+  "Switch-case IR instructions in one arm's region (provisional)")
+set(EJIT_SWITCH_CASE_MAX_CLONED "8000" CACHE STRING
+  "Switch-case IR instructions added by cloning in one compile (provisional)")
+
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)

@@ -554,6 +554,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (RunProfileStages) {
     if (static_cast<CompileTier>(tier) == CompileTier::PGOUse) {
       ctx.tier = CompileTier::PGOUse;
+      if (auto It = tier1SwitchCase_.find(cacheKey);
+          It != tier1SwitchCase_.end())
+        ctx.switchCaseReplay = It->second;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
       auto mayConstIt = tier1MayConst_.find(cacheKey);
@@ -739,6 +742,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
     EJIT_DIAG("compileCold Tier-1 key=0x%016lx: captured %zu counter set(s)",
               cacheKey, counters.size());
+    if (EJitSwitchCaseDecision SC = jitEngine_->getLastSwitchCase(); SC.valid)
+      tier1SwitchCase_[cacheKey] = std::move(SC);
+    else
+      tier1SwitchCase_.erase(cacheKey);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     Tier1MayConstState &MayConst = tier1MayConst_[cacheKey];
@@ -818,8 +825,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   }
 
   // PGO Tier-2: profile consumed; drop the captured counters (§7.1).
-  if (ctx.tier == CompileTier::PGOUse)
+  if (ctx.tier == CompileTier::PGOUse) {
     tier1Counters_.erase(cacheKey);
+    tier1SwitchCase_.erase(cacheKey);
+  }
 
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);

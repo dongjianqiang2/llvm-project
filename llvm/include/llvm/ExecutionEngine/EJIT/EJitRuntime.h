@@ -39,6 +39,8 @@
 #define EJIT_DIM(x)
 #define EJIT_BOUND_PTR(x)
 #define ejit_free_dim
+#define ejit_runtime_dim
+#define ejit_runtime_dim_n(n)
 #define ejit_period_arr_ind(x)
 #define EJIT_ENTRY
 #define ejit_entry
@@ -59,6 +61,11 @@
 // expanding to the same __attribute__ would not be protected — it would rewrite
 // the inner ejit_free_dim token and emit __attribute__((__attribute__(...))).
 #define ejit_free_dim __attribute__((ejit_free_dim))
+// Same self-reference trick. The _n form must use the __x__ spelling: its body
+// is not inside ejit_runtime_dim's own expansion, so a bare ejit_runtime_dim
+// token there would be rewritten by the macro above.
+#define ejit_runtime_dim __attribute__((ejit_runtime_dim))
+#define ejit_runtime_dim_n(n) __attribute__((__ejit_runtime_dim__(n)))
 // Old names (aliases — use new macros to avoid double expansion)
 #define ejit_may_const EJIT_PERIOD_CONST
 #define ejit_period(x) EJIT_IN_PERIOD(x)

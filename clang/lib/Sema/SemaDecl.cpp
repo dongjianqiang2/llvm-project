@@ -77,6 +77,7 @@ using namespace sema;
 void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD);
 void checkEjitFreeDim(Sema &S, const FunctionDecl *FD);
+void checkEjitRuntimeDim(Sema &S, const FunctionDecl *FD);
 
 // Forward declaration for EmbeddedJIT always_inline conflict check.
 // Defined in SemaEJIT.cpp.
@@ -12310,6 +12311,7 @@ bool Sema::CheckFunctionDeclaration(Scope *S, FunctionDecl *NewFD,
   checkEjitPeriodLcIndex(*this, NewFD);
   checkEjitBoundPtrIndex(*this, NewFD);
   checkEjitFreeDim(*this, NewFD);
+  checkEjitRuntimeDim(*this, NewFD);
 
   // A function defined without ejit_entry / ejit_period_lc even though a
   // prior declaration carries the attribute is not JIT-specialized: warn and

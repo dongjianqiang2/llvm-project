@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSwitchCase.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -116,6 +117,8 @@ struct SpecializationContext {
   /// site (min samples + confidence thresholds applied by the driver). Empty
   /// for Baseline/Instrumented and when value profiling is not built.
   std::vector<PgoScalarSite> scalarValueSites;
+  /// Tier-2 only: Tier-1's switch-case arms, to rebuild as they were.
+  EJitSwitchCaseDecision switchCaseReplay;
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
   /// the compile driver before the final compile starts.
@@ -165,6 +168,9 @@ public:
   /// EJitOptimizer::getLastVpFunctions). Empty unless the Tier-1 compile ran
   /// with EJIT_SRE_PGO_VALUE_PROFILE.
   ArrayRef<EJitVpFunctionInfo> getLastVpFunctions() const;
+
+  /// Switch-case arms of the last compile (EJitOptimizer::getLastSwitchCase).
+  EJitSwitchCaseDecision getLastSwitchCase() const;
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   ArrayRef<EJitMayConstLoadSite> getLastMayConstLoadSites() const;
