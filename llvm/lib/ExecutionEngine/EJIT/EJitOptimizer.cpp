@@ -40,6 +40,8 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
+#include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include <limits>
 #include <optional>
 
@@ -72,11 +74,12 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 }
 #endif
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
+    : registry_(reg) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
-  PassBuilder PB;
+  PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
   PB.registerCGSCCAnalyses(CGAM_);
@@ -89,7 +92,7 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
   // every may_const field into a compile-time constant. The post-specialization
   // cleanup is the real LLVM -O2 function-simplification pipeline (SROA,
   // InstCombine, SCCP, GVN, CorrelatedValuePropagation, BDCE, DSE, loop-rotate,
-  // LICM, loop-unroll, ... - NO vectorization), which exploits those constants
+  // LICM, loop-unroll, ...), which exploits those constants
   // far more aggressively than the old hand-rolled 8-pass sequence. One cached
   // FPM per tier; runOptimizationPipeline picks by ctx.optLevel.
   //
@@ -123,6 +126,13 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
   cleanupFPM_.addPass(SCCPPass());
   cleanupFPM_.addPass(SimplifyCFGPass());
   cleanupFPM_.addPass(ADCEPass());
+
+  // Vectorize only after the second field substitution and cleanup, so the
+  // cost model sees the final loop body. PassBuilder(TM) supplies the JIT
+  // target's TTI instead of the generic target-independent cost model.
+  vectorFPM_.addPass(LoopVectorizePass());
+  vectorFPM_.addPass(SLPVectorizerPass());
+  vectorFPM_.addPass(InstCombinePass());
 }
 
 void EJitOptimizer::clearAnalyses() {
@@ -141,6 +151,25 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   lastCounterNames_.clear();
   lastVpFunctions_.clear();
   scalarSiteCountsByFunc_.clear();
+
+  // AOT bitcode can carry per-function target features that override the JIT
+  // target machine. Keep every AArch64 function on the SRE's AdvSIMD baseline.
+  if (M.getTargetTriple().isAArch64()) {
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      SmallVector<StringRef, 8> Feats;
+      Attribute A = F.getFnAttribute("target-features");
+      if (A.isValid())
+        A.getValueAsString().split(Feats, ',');
+      llvm::erase_if(Feats, [](StringRef S) {
+        return S == "+neon" || S == "-neon" ||
+               S.starts_with("+sve") || S.starts_with("-sve");
+      });
+      Feats.append({"+neon", "-sve", "-sve2"});
+      F.addFnAttr("target-features", join(Feats, ","));
+    }
+  }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   lastMayConstLoadSites_.clear();
 #endif
@@ -945,6 +974,10 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // then fold/propagate/simplify the freshly-constant values.
   runStructFieldPass(M);
   for (Function &F : M.functions())
-    if (!F.isDeclaration())
+    if (!F.isDeclaration()) {
       cleanupFPM_.run(F, FAM_);
+      if (level != ejit::OptimizationLevel::L1 &&
+          M.getTargetTriple().isAArch64())
+        vectorFPM_.run(F, FAM_);
+    }
 }

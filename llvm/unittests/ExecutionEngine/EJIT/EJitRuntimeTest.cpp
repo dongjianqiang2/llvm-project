@@ -33,16 +33,20 @@
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Config/Targets.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -1872,6 +1876,98 @@ TEST(EJitOptimizer, OptimizationPipelineL3) {
   // L3 should not crash
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 }
+
+#if LLVM_HAS_AARCH64_TARGET
+TEST(EJitOptimizer, VectorizesAArch64LoopForNeon) {
+  LLVMInitializeAArch64TargetInfo();
+  LLVMInitializeAArch64Target();
+  LLVMInitializeAArch64TargetMC();
+
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+target triple = "aarch64-unknown-linux-gnu"
+define void @add_arrays(ptr noalias %dst, ptr noalias %src, i64 %n) #0 {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %a = getelementptr i32, ptr %src, i64 %i
+  %b = getelementptr i32, ptr %dst, i64 %i
+  %x = load i32, ptr %a, align 4
+  %y = load i32, ptr %b, align 4
+  %sum = add i32 %x, %y
+  store i32 %sum, ptr %b, align 4
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %n
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+attributes #0 = { "target-features"="+sve2,-neon" }
+)", Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  MDNode *Entry = MDNode::get(Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY));
+  M->getFunction("add_arrays")
+      ->setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
+
+  std::string TargetError;
+  const Target *T =
+      TargetRegistry::lookupTarget(M->getTargetTriple(), TargetError);
+  ASSERT_NE(T, nullptr) << TargetError;
+  std::unique_ptr<TargetMachine> TM(T->createTargetMachine(
+      M->getTargetTriple(), "generic", "+neon,-sve,-sve2", TargetOptions(),
+      std::nullopt, std::nullopt, CodeGenOptLevel::Default));
+  ASSERT_TRUE(TM);
+
+  PeriodArrayRegistry Reg;
+  EJitOptimizerTestAccess Opt(Reg, TM.get());
+  SpecializationContext Spec;
+  Spec.fnName = "add_arrays";
+  Spec.optLevel = llvm::ejit::OptimizationLevel::L2;
+  Opt.runPipeline(*M, Spec);
+
+  StringRef Features = M->getFunction("add_arrays")
+                           ->getFnAttribute("target-features")
+                           .getValueAsString();
+  EXPECT_TRUE(Features.contains("+neon"));
+  EXPECT_FALSE(Features.contains("+sve"));
+
+  std::string IR;
+  raw_string_ostream OS(IR);
+  M->print(OS, nullptr);
+  EXPECT_NE(IR.find("vector.body"), std::string::npos) << IR;
+  EXPECT_NE(IR.find("<4 x i32>"), std::string::npos) << IR;
+
+  std::string Bitcode;
+  raw_string_ostream BC(Bitcode);
+  WriteBitcodeToFile(*M, BC);
+  BC.flush();
+  EJitRuntimeState State;
+  Config Cfg;
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+  Spec.cacheKey = 1;
+  Engine->setActiveContext(&Spec);
+  ASSERT_FALSE(errorToBool(
+      Engine->loadBitcodeModule(Bitcode, Spec.cacheKey, Spec.fnName)));
+  auto FnOrErr = Engine->lookup(Spec.cacheKey, Spec.fnName);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr));
+  Engine->setActiveContext(nullptr);
+
+  int32_t Src[64], Dst[64];
+  for (int I = 0; I < 64; ++I) {
+    Src[I] = I + 1;
+    Dst[I] = 2 * I;
+  }
+  auto *Fn = reinterpret_cast<void (*)(int32_t *, int32_t *, uint64_t)>(
+      *FnOrErr);
+  Fn(Dst, Src, 64);
+  for (int I = 0; I < 64; ++I)
+    EXPECT_EQ(Dst[I], 3 * I + 1);
+}
+#endif
 
 TEST(EJitOptimizer, FullPipelineEndToEnd) {
   LLVMContext Ctx;

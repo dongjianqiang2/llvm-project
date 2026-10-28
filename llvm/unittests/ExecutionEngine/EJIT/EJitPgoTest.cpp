@@ -76,6 +76,7 @@ static void markEJitEntry(Function &F) {
   F.setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
 }
 
+#ifdef EJIT_SRE_CODE_POOL
 namespace {
 constexpr uint32_t RealCompileStressFunctions = 20;
 
@@ -306,6 +307,7 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   RecordProperty("heartbeat_count", Heartbeats.load());
   RecordProperty("heartbeat_max_gap_us", MaxHeartbeatGapUs.load());
 }
+#endif // EJIT_SRE_CODE_POOL
 
 static std::string findCapturedPgoName(const EJitOptimizer &Opt,
                                        StringRef FunctionName) {

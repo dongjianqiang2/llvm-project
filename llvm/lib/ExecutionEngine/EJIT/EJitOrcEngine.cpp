@@ -181,12 +181,12 @@ struct EJitOrcEngine::Impl {
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
-  std::unique_ptr<EJitOptimizer> optimizer;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
   /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
   /// emitted assembly matches the real JIT output). Null if creation failed.
   std::unique_ptr<TargetMachine> dumpFunctionTM;
   std::unique_ptr<TargetMachine> dumpModuleTM;
+  std::unique_ptr<EJitOptimizer> optimizer;
 };
 
 namespace llvm {
@@ -722,6 +722,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
     return JTMBOrErr.takeError();
   }
 
+  if (JTMBOrErr->getTargetTriple().isAArch64())
+    JTMBOrErr->addFeatures({"+neon", "-sve", "-sve2"});
+
   // Use Small code model so data accesses use ADRP+LDR (2 insns/global, ±4GB
   // PC-relative) instead of movz/movk absolute (5 insns/global). The JIT slab
   // is ~1.5-2.2GB from .text (within ADRP's ±4GB range), confirmed by
@@ -819,7 +822,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
-  engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  engine->P->optimizer = std::make_unique<EJitOptimizer>(
+      periodReg, engine->P->dumpFunctionTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
