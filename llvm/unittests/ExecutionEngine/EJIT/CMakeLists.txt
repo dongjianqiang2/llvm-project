@@ -13,6 +13,21 @@ set(LLVM_LINK_COMPONENTS
   TargetParser
   )
 
+if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL AND EJIT_CODE_POOL_BATCHED_PUBLISH
+   AND UNIX AND NOT EJIT_FREESTANDING AND "AArch64" IN_LIST LLVM_TARGETS_TO_BUILD)
+  add_llvm_unittest(EJITMfsIntegrationTests EJitMfsIntegrationTest.cpp
+    PARTIAL_SOURCES_INTENDED)
+  get_target_property(_ejit_mfs_product_defs LLVMEJIT COMPILE_DEFINITIONS)
+  target_compile_definitions(EJITMfsIntegrationTests PRIVATE
+    ${_ejit_mfs_product_defs} EJIT_TEST_MFS_ENABLED=$<BOOL:${EJIT_T2_MFS}>)
+  foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
+    target_link_libraries(EJITMfsIntegrationTests PRIVATE LLVM${ejit_target}CodeGen)
+    if(TARGET LLVM${ejit_target}AsmParser)
+      target_link_libraries(EJITMfsIntegrationTests PRIVATE LLVM${ejit_target}AsmParser)
+    endif()
+  endforeach()
+endif()
+
 add_llvm_unittest(EJITTests
   EJitOrcEngineHeaderTest.cpp
   EJitRuntimeTest.cpp

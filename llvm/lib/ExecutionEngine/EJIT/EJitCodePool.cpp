@@ -560,6 +560,20 @@ bool EJitCodePoolManager::recordPendingRange(const void *Base, size_t Size,
   return true;
 }
 
+void EJitCodePoolManager::discardPendingRange(const void *Base, size_t Size) {
+  if (!Opts_.batchedPageSeal || !Base || Size == 0)
+    return;
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  const uintptr_t Start = addr(Base);
+  for (size_t I = PendingRanges_.size(); I != 0; --I) {
+    const FinalizedRange &R = PendingRanges_[I - 1];
+    if (R.start == Start && R.size == Size)
+      PendingRanges_.erase(PendingRanges_.begin() + I - 1);
+  }
+}
+
 void EJitCodePoolManager::notePendingAllocation() {
   if (!Opts_.batchedPageSeal)
     return;
@@ -580,8 +594,25 @@ Error EJitCodePoolManager::flushPendingRanges() {
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
 #endif
+  return flushPendingRangesLocked(nullptr);
+}
+
+Error EJitCodePoolManager::flushPendingRange(const void *Ptr) {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  if (!Ptr)
+    return make_error<StringError>("EJitCodePool: null pending range pointer",
+                                   inconvertibleErrorCode());
+  return flushPendingRangesLocked(Ptr);
+}
+
+Error EJitCodePoolManager::flushPendingRangesLocked(const void *OnlyPtr) {
   if (!Opts_.batchedPageSeal || PendingRanges_.empty())
-    return Error::success();
+    return OnlyPtr ? make_error<StringError>(
+                         "EJitCodePool: requested pending range not found",
+                         inconvertibleErrorCode())
+                   : Error::success();
 
   // The batch's final partial page becomes RX and must never be allocated
   // again. Only Active_ can receive a future bump allocation, so advancing its
@@ -591,8 +622,14 @@ Error EJitCodePoolManager::flushPendingRanges() {
     Active_->used = alignUp(Active_->used, Opts_.sealPageSize);
 
   std::vector<uintptr_t> Pages;
+  std::vector<size_t> Selected;
   [[maybe_unused]] size_t Bytes = 0;
-  for (const FinalizedRange &R : PendingRanges_) {
+  const uintptr_t Only = addr(OnlyPtr);
+  for (size_t I = 0; I < PendingRanges_.size(); ++I) {
+    const FinalizedRange &R = PendingRanges_[I];
+    if (OnlyPtr && !(Only >= R.start && Only - R.start < R.size))
+      continue;
+    Selected.push_back(I);
     CodePool *P = findPoolLocked(reinterpret_cast<void *>(R.start));
     if (!P || !rangeFitsPool(*P, reinterpret_cast<void *>(R.start),
                              static_cast<size_t>(R.size)))
@@ -605,6 +642,10 @@ Error EJitCodePoolManager::flushPendingRanges() {
     for (uintptr_t VA = Begin; VA < End; VA += Opts_.sealPageSize)
       Pages.push_back(VA);
   }
+  if (Selected.empty())
+    return make_error<StringError>(
+        "EJitCodePool: requested pending range not found",
+        inconvertibleErrorCode());
   std::sort(Pages.begin(), Pages.end());
   Pages.erase(std::unique(Pages.begin(), Pages.end()), Pages.end());
 
@@ -621,7 +662,8 @@ Error EJitCodePoolManager::flushPendingRanges() {
     ++SealInvocations_;
   }
 
-  for (const FinalizedRange &R : PendingRanges_) {
+  for (size_t I : Selected) {
+    const FinalizedRange &R = PendingRanges_[I];
     bool Duplicate = false;
     for (const FinalizedRange &F : FinalizedRanges_)
       if (F.start == R.start && F.size == R.size) {
@@ -634,10 +676,18 @@ Error EJitCodePoolManager::flushPendingRanges() {
 
   EJIT_DIAG_DEBUG("batch enable OK: allocations=%zu ranges=%zu pages=%zu "
                   "codeBytes=%zu",
-                  PendingAllocations_, PendingRanges_.size(), Pages.size(),
-                  Bytes);
-  PendingRanges_.clear();
-  PendingAllocations_ = 0;
+                  PendingAllocations_, Selected.size(), Pages.size(), Bytes);
+  if (!OnlyPtr) {
+    PendingRanges_.clear();
+    PendingAllocations_ = 0;
+  } else {
+    // The selection is ascending; erase back-to-front without generic search.
+    for (size_t I = Selected.size(); I != 0; --I)
+      PendingRanges_.erase(PendingRanges_.begin() + Selected[I - 1]);
+    PendingAllocations_ = PendingAllocations_ > Selected.size()
+                              ? PendingAllocations_ - Selected.size()
+                              : 0;
+  }
   return Error::success();
 }
 
@@ -767,6 +817,7 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
     const CodePool &P = *Pools_[I];
     uintptr_t B = addr(P.base);
     if (A >= B && A < B + P.size) {
+      Out = {};
       Out.fnPtr = const_cast<void *>(Ptr);
       Out.codeStart = Found->start;
       Out.codeSize = Found->size;
@@ -798,6 +849,69 @@ bool EJitCodePoolManager::findRange(const void *Ptr,
   }
   EJIT_DIAG_DEBUG(
       "findRange miss: ptr=%p in finalized range but not in any pool", Ptr);
+  return false;
+}
+
+bool EJitCodePoolManager::findPendingRange(const void *Ptr,
+                                           EJitCompiledCodeInfo &Out) const {
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  uintptr_t A = addr(Ptr);
+
+  // The pointer must resolve to a real, recorded executable allocation — never
+  // a guessed extent. Find the pending range that contains it.
+  const FinalizedRange *Found = nullptr;
+  for (const FinalizedRange &R : PendingRanges_) {
+    if (A >= R.start && A < R.start + R.size) {
+      Found = &R;
+      break;
+    }
+  }
+  if (!Found) {
+    EJIT_DIAG_DEBUG("findPendingRange miss: ptr=%p not in any pending range", Ptr);
+    return false;
+  }
+
+  // The allocation must also belong to a known pool (so a peer learns the
+  // 2MiB split granule). An address resolved outside the pools (e.g. a
+  // process/absolute symbol) is not handled.
+  for (size_t I = 0; I < Pools_.size(); ++I) {
+    const CodePool &P = *Pools_[I];
+    uintptr_t B = addr(P.base);
+    if (A >= B && A < B + P.size) {
+      Out = {};
+      Out.fnPtr = const_cast<void *>(Ptr);
+      Out.codeStart = Found->start;
+      Out.codeSize = Found->size;
+      Out.poolBase = B;
+      Out.poolSize = static_cast<uint64_t>(P.size);
+      Out.poolId = static_cast<uint32_t>(I);
+      // Runtime-writable extents of this allocation (e.g. __profc_): a peer
+      // core enable_rw's exactly these before executing. Copied by value.
+      Out.writableCount = Found->writableCount;
+      for (uint32_t W = 0; W < kEJitMaxWritableRanges; ++W)
+        Out.writableRanges[W] = (W < Found->writableCount)
+                                    ? Found->writables[W]
+                                    : EJitWritableRange{};
+      // Whether a peer must actually enable_rw those pages depends on the pool
+      // kind: only a fixed RX code-segment pool (needsEnableRw) needs it; a
+      // dynamic SRE_MemDbgAlloc pool is already RW, so the ranges are then
+      // diagnostic only.
+      Out.requiresPeerEnableRw = Opts_.needsEnableRw ? 1u : 0u;
+      Out.poolKind = Opts_.kind;
+      EJIT_DIAG_DEBUG(
+          "findPendingRange OK: ptr=%p codeStart=0x%llx codeSize=%llu poolId=%u "
+          "kind=%u writable=%u peerRw=%u",
+          Ptr, static_cast<unsigned long long>(Out.codeStart),
+          static_cast<unsigned long long>(Out.codeSize), Out.poolId,
+          static_cast<unsigned>(Out.poolKind), Out.writableCount,
+          Out.requiresPeerEnableRw);
+      return true;
+    }
+  }
+  EJIT_DIAG_DEBUG(
+      "findPendingRange miss: ptr=%p in pending range but not in any pool", Ptr);
   return false;
 }
 

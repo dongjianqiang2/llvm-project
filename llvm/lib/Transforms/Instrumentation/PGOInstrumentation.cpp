@@ -748,9 +748,15 @@ void FuncPGOInstrumentation<Edge, BBInfo>::computeCFGHash() {
                     << ", High32 CRC = " << JCH.getCRC()
                     << ", Hash = " << FunctionHash << "\n";);
 
+#ifndef EJIT_FREESTANDING
+  // This optional command-line trace is not guarded by LLVM_DEBUG. In release
+  // builds dbgs() aliases errs(), whose first use constructs a file-descriptor
+  // stream (lseek/fstat). Bare-metal JIT compilation must not take that path.
+  // Keep instrumentation and profile diagnostics intact; only omit the trace.
   if (PGOTraceFuncHash != "-" && F.getName().contains(PGOTraceFuncHash))
     dbgs() << "Funcname=" << F.getName() << ", Hash=" << FunctionHash
            << " in building " << F.getParent()->getSourceFileName() << "\n";
+#endif
 }
 
 // Check if we can safely rename this Comdat function.

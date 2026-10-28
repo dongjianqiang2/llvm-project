@@ -31,7 +31,11 @@ enum class EJitCodePoolPlacement { NearFixed, FarDynamic };
 /// enable_ex. On a host without real SRE symbols, weak fallbacks make this a
 /// link-safe no-op-seal / aligned-host-alloc manager (see EJitSrePlatform.cpp).
 std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager(
-    EJitCodePoolPlacement Placement = EJitCodePoolPlacement::NearFixed);
+    EJitCodePoolPlacement Placement = EJitCodePoolPlacement::NearFixed,
+    uintptr_t ColdBase = 0, size_t ColdSize = 0);
+
+/// Dedicated linker-reserved cold pool. Missing/invalid reservation fails.
+std::unique_ptr<EJitCodePoolManager> makeSreColdCodePoolManager();
 
 /// Install execute permission for the legacy 2MiB code pool containing
 /// \p FnPtr in the calling core's translation context. This is intentionally a

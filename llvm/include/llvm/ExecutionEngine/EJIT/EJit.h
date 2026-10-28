@@ -161,6 +161,7 @@ public:
 
   /// Fill aggregate plus near/far placement-specific code-pool statistics.
   bool getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const;
+  bool getColdCodePoolStats(ejit_code_pool_stats_t *out) const;
 
   /// Print code pool usage stats through EJIT_DIAG. For
   /// ejit_print_code_pool_stats().
