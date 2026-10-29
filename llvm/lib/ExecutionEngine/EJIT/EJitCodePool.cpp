@@ -105,6 +105,27 @@ bool EJitCodePoolManager::poolHasRoomLocked(const CodePool &P, size_t Size,
 Error EJitCodePoolManager::newActivePoolLocked() {
   uint8_t *RawBytes = nullptr;
   uint8_t *Base = nullptr;
+  const size_t Charge = Opts_.fixedSize > 0 ? Opts_.poolSize
+                                            : Opts_.poolSize + Opts_.poolAlign -
+                                                  (Opts_.fourKSeal ? 0 : 1);
+  uint64_t ReservationOffset = 0;
+  if (Reservation_) {
+    ReservationOffset = Reservation_(Charge);
+    if (ReservationOffset == UINT64_MAX)
+      return make_error<StringError>(
+          "EJitCodePool: retained layout budget exhausted",
+          inconvertibleErrorCode());
+    // A failed allocation/split remains a charged hole. Fixed offsets persist
+    // across compiler-owner changes and never overwrite a retired generation.
+    if (Opts_.fixedSize > 0) {
+      if (ReservationOffset > Opts_.fixedSize ||
+          Charge > Opts_.fixedSize - ReservationOffset)
+        return make_error<StringError>(
+            "EJitCodePool: retained fixed region exhausted",
+            inconvertibleErrorCode());
+      FixedUsed_ = static_cast<size_t>(ReservationOffset);
+    }
+  }
 
   if (Opts_.fixedSize > 0) {
     // Fixed-region mode: carve the next poolAlign-aligned pool from the

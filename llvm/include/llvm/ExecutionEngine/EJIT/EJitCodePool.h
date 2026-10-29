@@ -156,6 +156,12 @@ public:
     bool needsEnableRw = false;
   };
 
+  /// Cold owner-only ledger. Returns a persistent byte offset or UINT64_MAX.
+  /// Reservations include alignment slack and failed NO_RECLAIM holes.
+  void setReservationProvider(std::function<uint64_t(size_t)> provider) {
+    Reservation_ = std::move(provider);
+  }
+
   struct Stats {
     size_t poolCount = 0;       ///< total pools created
     size_t sealedCount = 0;     ///< pools currently sealed (RX)
@@ -334,6 +340,7 @@ private:
   std::vector<FinalizedRange> FinalizedRanges_;
   std::vector<FinalizedRange> PendingRanges_;
   size_t PendingAllocations_ = 0;
+  std::function<uint64_t(size_t)> Reservation_;
 
 #ifndef EJIT_FREESTANDING
   mutable std::mutex Mutex_;

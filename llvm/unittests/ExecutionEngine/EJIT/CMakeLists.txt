@@ -20,6 +20,7 @@ add_llvm_unittest(EJITTests
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp
   EJitPgoTest.cpp
+  EJitGlobalLayoutIntegrationTest.cpp
   EJitVpMergeTest.cpp
   EJitVpScalarSpecTest.cpp
   EJitVpPipelineTest.cpp
@@ -46,6 +47,19 @@ endif()
 if(EJIT_SRE_PGO_BRANCH_AUDIT)
   target_compile_definitions(EJITTests PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
 endif()
+
+# The production layout integration TU uses the same private pool/routing
+# feature definitions as LLVMEJIT; otherwise it silently skips real execution.
+foreach(layout_flag EJIT_CODE_POOL_4K_SEAL EJIT_CODE_POOL_BATCHED_PUBLISH
+                    EJIT_FIXED_CODE_POOL EJIT_SRE_SHARED_CODE_POINTERS
+                    EJIT_SRE_TASKPOOL_NO_RECLAIM)
+  if(${layout_flag})
+    target_compile_definitions(EJITTests PRIVATE ${layout_flag})
+  endif()
+endforeach()
+target_compile_definitions(EJITTests PRIVATE
+  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+  EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
 
 # EJit.cpp calls InitializeAllAsmParsers(); a target's AsmParser lib is only
 # referenced at runtime (no CMake dependency edge), so when listed via
@@ -131,7 +145,9 @@ set(EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
 set(LLVM_LINK_COMPONENTS Support)
 add_llvm_unittest(EJITSharedTaskPoolTests
   EJitSharedTaskPoolTest.cpp
+  EJitGlobalLayoutStateTest.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitGlobalLayout.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
   # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
   # two sources above). Needed when the global EJIT_DIAG_ENABLE is ON: without
@@ -218,6 +234,24 @@ if(EJIT_TEST_FIXED_WORKER_CORE)
 endif()
 
 # Convenience target: build + run only the cross-core shared taskpool tests.
+set(EJIT_LAYOUT_LINK_SAVED "${LLVM_LINK_COMPONENTS}")
+set(LLVM_LINK_COMPONENTS Support)
+add_llvm_unittest(EJITLayoutNoReclaimTests
+  EJitGlobalLayoutStateTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitGlobalLayout.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  PARTIAL_SOURCES_INTENDED
+  )
+set(LLVM_LINK_COMPONENTS "${EJIT_LAYOUT_LINK_SAVED}")
+get_target_property(EJIT_LAYOUT_TEST_DEFS EJITSharedTaskPoolTests COMPILE_DEFINITIONS)
+target_compile_definitions(EJITLayoutNoReclaimTests PRIVATE
+  ${EJIT_LAYOUT_TEST_DEFS}
+  EJIT_SRE_TASKPOOL_NO_RECLAIM
+  EJIT_SRE_SHARED_CODE_POINTERS
+  )
+
 add_custom_target(check-ejit-shared-taskpool
   COMMAND $<TARGET_FILE:EJITSharedTaskPoolTests>
   DEPENDS EJITSharedTaskPoolTests
@@ -241,6 +275,7 @@ add_llvm_unittest(EJITTier1WritableIntegrationTests
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitGlobalLayout.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
   # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
   # sources above). Required since "Harden shared online PGO" (ea80ca36) made
@@ -337,6 +372,7 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
   add_llvm_executable(EJITSharedCacheQueryBench
     EJitSharedCacheQueryBench.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitGlobalLayout.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
 

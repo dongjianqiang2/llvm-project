@@ -37,13 +37,15 @@ void resetVpStateForTest() {
   gEJitVpState.magic.storeRelaxed(0);
   gEJitVpState.abiVersion.storeRelaxed(0);
   gEJitVpState.structSize.storeRelaxed(0);
-  gEJitVpState.headerReserved = 0;
+  gEJitVpState.losslessMode.storeRelaxed(0);
+  gEJitVpState.losslessFailed.storeRelaxed(0);
   gEJitVpState.armed.storeRelaxed(0);
   for (uint32_t c = 0; c < kEJitVpMaxCores; ++c) {
     gEJitVpState.shards[c].generation.storeRelaxed(0);
     gEJitVpState.shards[c].writers[0].storeRelaxed(0);
     gEJitVpState.shards[c].writers[1].storeRelaxed(0);
-    for (uint32_t h = 0; h < 2; ++h)
+    for (uint32_t h = 0; h < 2; ++h) {
+      gEJitVpState.shards[c].payload[h].updateBusy.storeRelaxed(0);
       for (uint32_t s = 0; s < kEJitVpSitesPerCore; ++s) {
         EJitVpSite &site = gEJitVpState.shards[c].payload[h].sites[s];
         site.siteKey.storeRelaxed(0);
@@ -53,6 +55,7 @@ void resetVpStateForTest() {
           site.cand[i].count.storeRelaxed(0);
         }
       }
+    }
   }
 }
 
@@ -99,6 +102,44 @@ TEST_F(VpCollectorTest, ArmedGate) {
   EXPECT_EQ(snap[0].total, 1u);
   EXPECT_EQ(snap[0].values[0], 42u);
   EXPECT_EQ(snap[0].counts[0], 1u);
+}
+
+TEST_F(VpCollectorTest, StrictSitesPreserveCollidingKeys) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  ejitVpSetLosslessMode(true);
+  ejitVpSetArmed(true);
+  EJitCoreId::setCurrentForTest(0);
+  for (uint32_t i = 1; i <= kEJitVpSitesPerCore; ++i)
+    ejit_vp_record_scalar(i, 0, i + 100);
+  EXPECT_FALSE(ejitVpLosslessFailed());
+  std::vector<EJitVpSiteSample> samples;
+  ASSERT_TRUE(ejitVpTakeSnapshot(samples));
+  EXPECT_EQ(samples.size(), kEJitVpSitesPerCore);
+  for (const auto &sample : samples)
+    EXPECT_EQ(sample.total, 1u);
+}
+
+TEST_F(VpCollectorTest, StrictFullTableFailsRatherThanDisplacingSites) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  ejitVpSetLosslessMode(true);
+  ejitVpSetArmed(true);
+  EJitCoreId::setCurrentForTest(0);
+  for (uint32_t i = 1; i <= kEJitVpSitesPerCore + 1; ++i)
+    ejit_vp_record_scalar(i, 0, i + 100);
+  EXPECT_TRUE(ejitVpLosslessFailed());
+}
+
+TEST_F(VpCollectorTest, StrictPreemptedWriterFailsWithoutSpinning) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  ejitVpSetLosslessMode(true);
+  ejitVpSetArmed(true);
+  EJitCoreId::setCurrentForTest(0);
+  auto &shard = gEJitVpState.shards[0];
+  shard.payload[shard.generation.loadAcquire() & 1].updateBusy.storeRelaxed(1);
+  ejit_vp_record_scalar(1, 0, 123);
+  EXPECT_TRUE(ejitVpLosslessFailed());
+  EXPECT_EQ(shard.writers[0].loadAcquire(), 0u);
+  shard.payload[0].updateBusy.storeRelaxed(0);
 }
 
 TEST_F(VpCollectorTest, KWayHeavyHitter) {
@@ -394,3 +435,17 @@ TEST_F(VpCollectorTest, ConcurrentProducersSnapshotStability) {
   EJitCoreId::resetForTest();
 }
 #endif // !EJIT_FREESTANDING
+
+TEST_F(VpCollectorTest,
+       GenerationResetRequiresDrainedWritersAndClearsBothHalves) {
+  ASSERT_TRUE(ejitVpEnsureInitialized());
+  ejitVpSetArmed(true);
+  ejit_vp_record_scalar(123, 0, 7);
+  gEJitVpState.shards[0].writers[0].storeRelaxed(1);
+  EXPECT_FALSE(ejitVpResetDrained());
+  gEJitVpState.shards[0].writers[0].storeRelaxed(0);
+  EXPECT_TRUE(ejitVpResetDrained());
+  std::vector<EJitVpSiteSample> samples;
+  ASSERT_TRUE(ejitVpTakeSnapshot(samples));
+  EXPECT_TRUE(samples.empty());
+}

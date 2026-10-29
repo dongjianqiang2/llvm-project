@@ -91,7 +91,7 @@ static_assert(kEJitVpMaxCores >= 1 && kEJitVpMaxCores <= 256,
 // taskpool blob; bump abiVersion on any layout change.
 //===----------------------------------------------------------------------===//
 constexpr uint32_t kEJitVpAbiMagic = 0x5650524Fu; // "VPRO"
-constexpr uint32_t kEJitVpAbiVersion = 2u;
+constexpr uint32_t kEJitVpAbiVersion = 3u;
 
 /// Our value-site kinds. 0/1 mirror LLVM's IPVK_IndirectCallTarget /
 /// IPVK_MemOPSize; kind 2 is the EJIT-only scalar/loop-bound site that travels
@@ -144,6 +144,7 @@ struct EJitVpSite {
 };
 
 struct EJitVpPayload {
+  EJitAtomicU32 updateBusy; // bounded try-claim, never spin under preemption
   EJitVpSite sites[kEJitVpSitesPerCore];
 };
 
@@ -193,7 +194,7 @@ struct alignas(kEJitVpCacheLine) EJitVpSharedState {
   EJitAtomicU32 magic;
   EJitAtomicU32 abiVersion;
   EJitAtomicU32 structSize;
-  uint32_t headerReserved; // write-once, never read by peers
+  EJitAtomicU32 losslessMode; // global-layout sampling only
   /// Global collection gate (read-mostly). Set once PGO+Tier-1 collection is
   /// armed; per-record cost is ONE acquire load of a shared, read-only line.
   EJitAtomicU32 armed;
@@ -202,7 +203,8 @@ struct alignas(kEJitVpCacheLine) EJitVpSharedState {
   uint32_t k;            ///< kEJitVpK
   uint32_t maxCores;     ///< kEJitVpMaxCores
   uint32_t drainTicks;   ///< kEJitVpDrainTicks
-  uint32_t headerPad[3];
+  EJitAtomicU32 losslessFailed;
+  uint32_t headerPad[2];
   /// Merge/transform counters (cold path; single worker writer).
   EJitVpStats stats;
   EJitVpShard shards[kEJitVpMaxCores];
@@ -312,6 +314,12 @@ void ejitVpBumpScalarSpecialized(uint64_t n);
 
 /// Snapshot the VP stats into \p out (atomic reads; any core).
 void ejitVpStatsSnapshot(EJitVpStatsOut &out);
+void ejitVpSetLosslessMode(bool enabled);
+bool ejitVpLosslessFailed();
+/// Owner only, with T1 dispatch closed and every true return complete. Refuses
+/// active writers; preserves aggregate diagnostics but clears both payload
+/// halves.
+bool ejitVpResetDrained();
 
 /// Process-global collector blob. Placed in the cross-core shared section on
 /// real multi-core builds (EJIT_SHARED_SECTION); ordinary .bss on host.

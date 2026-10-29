@@ -78,6 +78,13 @@ static void markEJitEntry(Function &F) {
 
 #ifdef EJIT_SRE_CODE_POOL
 namespace {
+// The real-ORC worker stress test drives the SRE code pool's batched
+// publish/flush machinery end to end (codeReady gating, flush callback,
+// owner-stop simulation inside the delay hook). Without EJIT_SRE_CODE_POOL
+// that machinery does not exist and the worker loop has no legal exit, so
+// the whole stress region is compiled only in pool builds; the IR/pipeline
+// tests below it remain available everywhere.
+#ifdef EJIT_SRE_CODE_POOL
 constexpr uint32_t RealCompileStressFunctions = 20;
 
 struct RealCompileStressCtx {
@@ -182,8 +189,10 @@ static uint32_t applyStressArithmetic(uint32_t Value, uint32_t Func) {
     Value = Value * (33u + ((Func + I) & 7u)) + (Func * 17u + I);
   return Value;
 }
+#endif // EJIT_SRE_CODE_POOL
 } // namespace
 
+#ifdef EJIT_SRE_CODE_POOL
 TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();

@@ -357,16 +357,61 @@ static_assert(sizeof(ejit_config_t) ==
 static_assert(std::is_standard_layout<ejit_config_t>::value,
               "ejit_config_t must be standard-layout for a stable C ABI");
 
+static ejit_status_t
+copyGlobalLayoutTargets(Config &cfg, const ejit_layout_target_t *targets,
+                        uint32_t count) {
+  if (targets || count) {
+    if (!targets || count == 0 || count > cfg.globalLayoutBudgets.maxMembers)
+      return EJIT_ERR_INVALID_PARAM;
+    for (uint32_t I = 0; I < count; ++I) {
+      const auto &T = targets[I];
+      if (!T.entryName || T.numDims > 4 || T.boundCount > kEJitMaxBoundPointers)
+        return EJIT_ERR_INVALID_PARAM;
+      size_t NameSize = 0;
+      while (NameSize <= 65536 && T.entryName[NameSize])
+        ++NameSize;
+      if (NameSize == 0 || NameSize > 65536)
+        return EJIT_ERR_INVALID_PARAM;
+      EJitLayoutTarget Member;
+      Member.entryName.assign(T.entryName, NameSize);
+      Member.identity.numDims = T.numDims;
+      if (T.versionPolicy > 1)
+        return EJIT_ERR_INVALID_PARAM;
+      Member.identity.layoutVersionPolicy = T.versionPolicy;
+      for (uint32_t D = 0; D < T.numDims; ++D) {
+        Member.identity.dims[D] = {T.dims[D].dimType, T.dims[D].instanceId};
+        Member.identity.versions[D] = T.versions[D];
+      }
+      Member.identity.boundCount = T.boundCount;
+      for (uint32_t B = 0; B < T.boundCount; ++B)
+        Member.identity.boundPointers[B] = {
+            T.bounds[B].rawPtr, T.bounds[B].size, T.bounds[B].argIndex};
+      if (!validateBoundPtrDescriptors(Member.identity.boundPointers,
+                                       Member.identity.boundCount))
+        return EJIT_ERR_INVALID_PARAM;
+      cfg.globalLayout.push_back(std::move(Member));
+    }
+  }
+  return EJIT_OK;
+}
+
 // Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
 // the online-PGO auto-trigger on regardless of the (unversioned) config.
-static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
+static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
+                                  const ejit_layout_target_t *targets = nullptr,
+                                  uint32_t count = 0) {
   if (gEJIT) {
+    if (targets || count)
+      return EJIT_ERR_INVALID_PARAM; // A new manifest is never silently
+                                     // ignored.
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
   }
 
   Config cfg;
   parseConfig(config, cfg);
+  if (copyGlobalLayoutTargets(cfg, targets, count) != EJIT_OK)
+    return EJIT_ERR_INVALID_PARAM;
 #if defined(EJIT_SRE_SHARED_TASKPOOL) &&                                  \
     defined(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
   // Fixed-worker deployments may skip EJIT constructors on producer cores.
@@ -419,8 +464,90 @@ ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
   return ejitInitImpl(config, /*forcePgo=*/true);
 }
 
+ejit_status_t ejit_init_global_layout(const ejit_config_t *config,
+                                      const ejit_layout_target_t *targets,
+                                      uint32_t count, bool enablePgo) {
+  if (!targets || count == 0)
+    return EJIT_ERR_INVALID_PARAM;
+#if !defined(EJIT_SRE_SHARED_TASKPOOL) || !defined(EJIT_SRE_CODE_POOL) ||      \
+    !defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  return EJIT_ERR_INVALID_PARAM;
+#else
+  return ejitInitImpl(config, enablePgo, targets, count);
+#endif
+}
+
+ejit_status_t ejit_get_global_layout_status(ejit_global_layout_status_t *out) {
+  if (!out)
+    return EJIT_ERR_INVALID_PARAM;
+  *out = {};
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!gEJIT || !gEJIT->sharedTaskPool())
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *pool = gEJIT->sharedTaskPool();
+  uint32_t before = pool->globalLayoutGeneration();
+  EJitSharedDiagnostics D{};
+  pool->getDiagnostics(D);
+  uint32_t after = pool->globalLayoutGeneration();
+  if (before != after || D.generation != after ||
+      D.globalLayoutState != static_cast<uint32_t>(pool->globalLayoutState())) {
+    out->state = static_cast<uint32_t>(EJitGlobalLayoutState::Refreshing);
+    out->generation = after;
+    return EJIT_OK; // Never mix a COMPLETE flag with another generation's set.
+  }
+  out->state = D.globalLayoutState;
+  out->generation = D.generation;
+  out->required = D.globalLayoutRequired;
+  out->ready = D.globalLayoutReady;
+  out->published = D.globalLayoutPublished;
+  out->unlistedReady = D.globalLayoutUnlistedReady;
+  out->unlistedAppended = D.globalLayoutUnlistedAppended;
+  out->error = D.globalLayoutError;
+  out->errorRank = D.globalLayoutErrorRank;
+  out->activeProfiles = D.pgoActiveFunctionCount;
+  out->artifactBytes = D.globalLayoutArtifactBytes;
+  out->retainedNearBytes = D.globalLayoutRetainedNearBytes;
+  out->retainedFarBytes = D.globalLayoutRetainedFarBytes;
+  return EJIT_OK;
+#else
+  return EJIT_ERR_NOT_ACTIVE;
+#endif
+}
+
+ejit_status_t ejit_refresh_global_layout(const ejit_layout_target_t *targets,
+                                         uint32_t count) {
+  if (!targets || !count)
+    return EJIT_ERR_INVALID_PARAM;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  Config cfg;
+  auto parsed = copyGlobalLayoutTargets(cfg, targets, count);
+  if (parsed != EJIT_OK)
+    return parsed;
+  return gEJIT->refreshGlobalLayout(cfg.globalLayout) ? EJIT_PENDING
+                                                      : EJIT_ERR_INVALID_PARAM;
+#else
+  return EJIT_ERR_NOT_ACTIVE;
+#endif
+}
+
+ejit_status_t ejit_shutdown_checked(void) {
+  ejit_shutdown();
+  return gEJIT ? EJIT_PENDING : EJIT_OK;
+}
+
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (gEJIT && gEJIT->sharedTaskPool()) {
+    gEJIT->sharedTaskPool()->ownerShutdown();
+    if (gEJIT->sharedTaskPool()->isOwner()) {
+      EJIT_DIAG("shutdown deferred: release real T1 calls before retrying");
+      return;
+    }
+  }
+#endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   setDumpSharedState(nullptr);
 #endif
@@ -1244,6 +1371,8 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, dims, 2, &l0Fn)) {
+    EJIT_DIAG_VERBOSE("2d l0 hit func=%u dims=[%u:%u,%u:%u] fn=%p", funcIndex,
+                      dim0, inst0, dim1, inst1, l0Fn);
     if (outFn)
       *outFn = l0Fn;
     if (outBucket)
@@ -1252,6 +1381,9 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   }
   auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
   if (fast.fastPathTerminal) {
+    EJIT_DIAG_VERBOSE("2d fast func=%u dims=[%u:%u,%u:%u] status=%u fn=%p",
+                      funcIndex, dim0, inst0, dim1, inst1,
+                      static_cast<unsigned>(fast.status), fast.fnPtr);
     if (outFn)
       *outFn = fast.fnPtr;
     if (outBucket)
@@ -1262,6 +1394,9 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
+  EJIT_DIAG_VERBOSE("2d slow func=%u dims=[%u:%u,%u:%u] status=%u fn=%p",
+                    funcIndex, dim0, inst0, dim1, inst1,
+                    static_cast<unsigned>(r.status), r.fnPtr);
   if (outFn)
     *outFn = r.fnPtr;
   if (outBucket)

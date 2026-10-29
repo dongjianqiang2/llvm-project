@@ -57,6 +57,9 @@ struct EJitCompileRequest {
   uint32_t numDims;
   EJitDimPair dims[4];
   uint32_t versions[4];
+  // Layout declaration only: 0 captures live versions at admission, 1 asserts
+  // explicit active versions. Ordinary queue requests leave this zero.
+  uint32_t layoutVersionPolicy;
   uintptr_t fallbackPtr;
   // Shared-taskpool owner generation captured at enqueue time. A worker drops a
   // request whose generation no longer equals the shared state's generation
@@ -74,7 +77,7 @@ struct EJitCompileRequest {
 // Size is stable per pointer width and independent of pointee size: 200 bytes
 // on 64-bit targets and 164 bytes on 32-bit targets.
 static_assert(
-    sizeof(EJitCompileRequest) == (sizeof(uintptr_t) == 8 ? 200u : 164u),
+    sizeof(EJitCompileRequest) == (sizeof(uintptr_t) == 8 ? 208u : 168u),
     "EJitCompileRequest size must stay fixed and payload-independent");
 static_assert(alignof(EJitCompileRequest) <= 8,
               "EJitCompileRequest alignment must stay <= 8 bytes");

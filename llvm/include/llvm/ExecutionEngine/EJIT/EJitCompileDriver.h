@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,8 @@ public:
   /// taskpool's compile callback (the taskpool owns its own fixed cache).
   /// Returns the JIT function pointer or nullptr.
   void *compileNow(const EJitCompileRequest &req);
+  void *prepareNow(const EJitCompileRequest &req);
+  void notifyTaskpoolPrepared(const EJitCompileRequest &req);
 
   /// Taskpool commit notification. A value-profile round is consumed only
   /// after Tier-2 is actually published, so failed commits keep collecting.
@@ -102,6 +105,27 @@ public:
   /// (owner worker-start failed / ABI mismatch). Idempotent across instances.
   bool startSharedTaskPool();
 
+  /// Why the most recent startSharedTaskPool() failed. A manifest rejected
+  /// BEFORE the pool's init()/election ever ran leaves the shared blob
+  /// untouched (generation 0 / Uninitialized); without this discriminator a
+  /// caller inspecting only the blob would misreport that as a worker-core
+  /// deployment failure.
+  enum class SharedStartError : uint8_t {
+    None,
+    ManifestRejected,
+    PoolInitFailed
+  };
+  SharedStartError lastSharedStartError() const {
+    return lastSharedStartError_;
+  }
+
+  uint64_t
+  globalLayoutFingerprint(const std::vector<EJitLayoutTarget> &targets);
+  bool buildGlobalLayoutManifest(const std::vector<EJitLayoutTarget> &targets,
+                                 std::vector<EJitCompileRequest> &manifest);
+  bool refreshGlobalLayout(const std::vector<EJitLayoutTarget> &targets);
+  bool resetGlobalLayoutProfiles();
+
   /// Owner-only orderly shutdown of the shared worker (soft-stop + join).
   void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
 #endif
@@ -110,6 +134,11 @@ public:
   EJitModuleLoader &getLoader() { return loader_; }
   const Config &getConfig() { return config_; }
   EJitOrcEngine *getJitEngine() { return jitEngine_.get(); }
+#ifdef EJIT_SRE_PGO_VALUE_PROFILE
+  uint64_t layoutPreparedValueSamples() const {
+    return layoutPreparedValueSamples_;
+  }
+#endif
 #ifndef EJIT_FREESTANDING
   EJitLogger *getLogger() { return logger_; }
 #else
@@ -155,6 +184,7 @@ private:
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   EJitSharedTaskPool sharedPool_;
   EJitSreTask sharedWorkerTask_;
+  SharedStartError lastSharedStartError_ = SharedStartError::None;
   // Worker start/stop adapters bridging the shared pool to the platform task
   // abstraction (host std::thread / SRE platform task). Static so the shared
   // pool can call them through plain function pointers (never std::function).
@@ -180,7 +210,9 @@ private:
   /// the request's funcIndex high bits (EJitSreQueue.h); gated by
   /// Config::enablePgo (off => Baseline regardless).
   void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru,
-                    const EJitCompileRequest *request = nullptr);
+                    const EJitCompileRequest *request = nullptr,
+                    bool prepareOnly = false);
+  void *compileRequest(const EJitCompileRequest &req, bool prepareOnly);
 
   /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md
   /// §5.2). Filled after a Tier-1 compile (ORC lookup of __profc_/__profd_
@@ -191,17 +223,27 @@ private:
     uintptr_t profcAddr = 0;
     uintptr_t profdAddr = 0;
   };
-  std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+  std::unordered_map<std::string, std::vector<Tier1CounterInfo>> tier1Counters_;
+  // A drained profile survives artifact/link/publication failure until its
+  // exact identity publishes T2 or the generation retires.
+  struct LayoutProfile {
+    std::string data;
+    std::vector<PgoScalarSite> scalars;
+    uint64_t bytes = 0;
+  };
+  std::unordered_map<std::string, LayoutProfile> layoutProfiles_;
+  uint64_t layoutProfileBytes_ = 0;
+  bool layoutProfileCaptureFailed_ = false;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct Tier1MayConstState {
     uintptr_t counterBase = 0;
     uint64_t sampleStart = 0;
     std::vector<EJitMayConstLoadSite> sites;
   };
-  std::unordered_map<uint64_t, Tier1MayConstState> tier1MayConst_;
+  std::unordered_map<std::string, Tier1MayConstState> tier1MayConst_;
   /// The owner worker compiles and publishes serially, so the publish callback
   /// can use this key to timestamp the Tier-1 sample window exactly at publish.
-  uint64_t pendingTier1MayConstKey_ = 0;
+  std::string pendingTier1MayConstKey_;
   bool hasPendingTier1MayConstKey_ = false;
 #endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
@@ -215,11 +257,16 @@ private:
     std::vector<PgoValueTarget> targets;
     std::vector<PgoValueFunction> functions;
   };
-  std::unordered_map<uint64_t, Tier1VpState> tier1Vp_;
+  std::unordered_map<std::string, Tier1VpState> tier1Vp_;
   /// Active collection rounds (Tier-1 publishes not yet consumed by a Tier-2
   /// merge), touched only by the single owner worker: the collector is armed
   /// at the first Tier-1 capture and disarmed once the last round merged.
   uint32_t vpRoundsActive_ = 0;
+  std::unordered_set<std::string> layoutVpRounds_;
+  /// Whole-collector snapshots contain sibling rounds. Preserve, then consume
+  /// only the current complete inventory. Bounded by the layout profile budget.
+  std::vector<EJitVpSiteSample> layoutVpPending_;
+  uint64_t layoutPreparedValueSamples_ = 0;
 #endif
 };
 

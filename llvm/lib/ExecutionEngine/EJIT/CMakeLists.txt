@@ -141,6 +141,7 @@ endif()
 if(EJIT_SRE_SHARED_TASKPOOL)
   list(APPEND EJIT_SOURCES
     EJitSharedTaskPool.cpp
+    EJitGlobalLayout.cpp
     EJitSharedPlatform.cpp
   )
 endif()

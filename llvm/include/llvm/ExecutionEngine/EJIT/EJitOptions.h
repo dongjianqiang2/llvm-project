@@ -9,9 +9,11 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITOPTIONS_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITOPTIONS_H
 
+#include "llvm/ExecutionEngine/EJIT/EJitGlobalLayout.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace llvm {
 namespace ejit {
@@ -25,6 +27,10 @@ enum class CompileMode { Off, Sync, Async };
 enum class OptimizationLevel { L1 = 1, L2 = 2, L3 = 3 };
 
 struct Config {
+  /// Empty preserves ordinary compilation. Nonempty is a COMPLETE expanded
+  /// manifest, installed before the shared worker starts, never sorted.
+  std::vector<EJitLayoutTarget> globalLayout;
+  EJitLayoutBudgets globalLayoutBudgets;
   CompileMode compileMode = CompileMode::Async;
   OptimizationLevel optLevel = OptimizationLevel::L2;
   size_t maxCodeMemory = 2 * 1024 * 1024;

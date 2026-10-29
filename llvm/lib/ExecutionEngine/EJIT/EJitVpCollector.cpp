@@ -71,8 +71,11 @@ static inline void ejitVpRecord(uint64_t value, uint64_t functionIdentity,
       st.structSize.loadAcquire() != sizeof(EJitVpSharedState))
     return;
   const uint32_t core = EJitCoreId::current();
-  if (core >= st.maxCores)
+  if (core >= st.maxCores) {
+    if (st.losslessMode.loadAcquire())
+      st.losslessFailed.storeRelease(1);
     return;
+  }
 
   EJitVpShard &shard = st.shards[core];
   const uint64_t key = ejitVpSiteKey(functionIdentity, kind, siteIdx);
@@ -93,8 +96,37 @@ static inline void ejitVpRecord(uint64_t value, uint64_t functionIdentity,
   }
 
   EJitVpPayload &payload = shard.payload[half];
-  EJitVpSite &site =
-      payload.sites[key & (static_cast<uint64_t>(kEJitVpSitesPerCore) - 1u)];
+  const bool Lossless = st.losslessMode.loadAcquire() != 0;
+  EJitVpSite *Selected = nullptr;
+  if (Lossless) {
+    uint32_t expected = 0;
+    if (!payload.updateBusy.compareExchange(expected, 1)) {
+      // A preempting same-core writer must not wait for the interrupted writer.
+      // Latch an unusable round instead of silently publishing missing data.
+      st.losslessFailed.storeRelease(1);
+      shard.writers[half].fetchSub(1);
+      return;
+    }
+    const uint64_t Mask = static_cast<uint64_t>(kEJitVpSitesPerCore) - 1u;
+    for (uint32_t Probe = 0; Probe < kEJitVpSitesPerCore; ++Probe) {
+      auto &Candidate = payload.sites[(key + Probe) & Mask];
+      uint64_t Existing = Candidate.siteKey.loadAcquire();
+      if (Existing == key || Existing == 0) {
+        Selected = &Candidate;
+        break;
+      }
+    }
+    if (!Selected) {
+      st.losslessFailed.storeRelease(1);
+      payload.updateBusy.storeRelease(0);
+      shard.writers[half].fetchSub(1);
+      return;
+    }
+  } else {
+    Selected =
+        &payload.sites[key & (static_cast<uint64_t>(kEJitVpSitesPerCore) - 1u)];
+  }
+  EJitVpSite &site = *Selected;
 
   // Direct-mapped site table: a different key displaces the slot wholesale
   // (bounded approximation, documented in EJIT_VALUE_PROFILE.md §3.2).
@@ -130,6 +162,8 @@ static inline void ejitVpRecord(uint64_t value, uint64_t functionIdentity,
     site.cand[victim].count.storeRelaxed(1);
   }
   site.total.fetchAddRelaxed(1);
+  if (Lossless)
+    payload.updateBusy.storeRelease(0);
   shard.writers[half].fetchSub(1);
 }
 
@@ -180,20 +214,22 @@ bool ejit::ejitVpEnsureInitialized() {
   // Field-initialize the zero-filled blob. Every racing initializer writes the
   // same constants, so this is idempotent; producers never touch the blob
   // before it is armed (armed starts 0).
-  st.headerReserved = 0;
+  st.losslessMode.storeRelaxed(0);
+  st.losslessFailed.storeRelaxed(0);
   st.armed.storeRelease(0);
   st.shardStride = static_cast<uint32_t>(sizeof(EJitVpShard));
   st.sitesPerCore = kEJitVpSitesPerCore;
   st.k = kEJitVpK;
   st.maxCores = kEJitVpMaxCores;
   st.drainTicks = kEJitVpDrainTicks;
-  for (uint32_t i = 0; i < 3; ++i)
+  for (uint32_t i = 0; i < 2; ++i)
     st.headerPad[i] = 0;
   for (uint32_t c = 0; c < kEJitVpMaxCores; ++c) {
     st.shards[c].generation.storeRelaxed(0);
     st.shards[c].writers[0].storeRelaxed(0);
     st.shards[c].writers[1].storeRelaxed(0);
-    for (uint32_t h = 0; h < 2; ++h)
+    for (uint32_t h = 0; h < 2; ++h) {
+      st.shards[c].payload[h].updateBusy.storeRelaxed(0);
       for (uint32_t s = 0; s < kEJitVpSitesPerCore; ++s) {
         EJitVpSite &site = st.shards[c].payload[h].sites[s];
         site.siteKey.storeRelaxed(0);
@@ -203,6 +239,7 @@ bool ejit::ejitVpEnsureInitialized() {
           site.cand[i].count.storeRelaxed(0);
         }
       }
+    }
   }
   st.structSize.storeRelaxed(static_cast<uint32_t>(sizeof(EJitVpSharedState)));
   st.abiVersion.storeRelaxed(kEJitVpAbiVersion);
@@ -244,18 +281,25 @@ void ejit::ejitVpResetFunction(uint64_t nameHash,
           continue;
         for (uint32_t idx = 0; idx < sc.count; ++idx) {
           const uint64_t key = ejitVpSiteKey(nameHash, sc.kind, idx);
-          EJitVpSite &site =
-              gEJitVpState.shards[c]
-                  .payload[h]
-                  .sites[key &
-                         (static_cast<uint64_t>(kEJitVpSitesPerCore) - 1u)];
-          if (site.siteKey.loadRelaxed() != key)
-            continue;
-          site.siteKey.storeRelaxed(0);
-          site.total.storeRelaxed(0);
-          for (uint32_t i = 0; i < kEJitVpK; ++i) {
-            site.cand[i].value.storeRelaxed(0);
-            site.cand[i].count.storeRelaxed(0);
+          const bool Lossless = gEJitVpState.losslessMode.loadAcquire() != 0;
+          const uint32_t Probes = Lossless ? kEJitVpSitesPerCore : 1;
+          for (uint32_t Probe = 0; Probe < Probes; ++Probe) {
+            auto &site =
+                gEJitVpState.shards[c]
+                    .payload[h]
+                    .sites[(key + Probe) &
+                           (static_cast<uint64_t>(kEJitVpSitesPerCore) - 1u)];
+            if (site.siteKey.loadRelaxed() != key)
+              continue;
+            site.total.storeRelaxed(0);
+            for (uint32_t i = 0; i < kEJitVpK; ++i) {
+              site.cand[i].value.storeRelaxed(0);
+              site.cand[i].count.storeRelaxed(0);
+            }
+            // Publish emptiness LAST: a sibling's different key may reuse
+            // this slot as soon as it observes zero.
+            site.siteKey.storeRelease(0);
+            break;
           }
         }
       }
@@ -369,4 +413,38 @@ void ejit::ejitVpStatsSnapshot(EJitVpStatsOut &out) {
   out.scalarValueSites = gEJitVpState.stats.scalarValueSites.loadRelaxed();
   out.scalarDropped = gEJitVpState.stats.scalarDropped.loadRelaxed();
   out.scalarSpecialized = gEJitVpState.stats.scalarSpecialized.loadRelaxed();
+}
+
+void ejit::ejitVpSetLosslessMode(bool enabled) {
+  if (!ejitVpEnsureInitialized())
+    return;
+  gEJitVpState.losslessFailed.storeRelaxed(0);
+  gEJitVpState.losslessMode.storeRelease(enabled ? 1 : 0);
+}
+
+bool ejit::ejitVpLosslessFailed() {
+  return gEJitVpState.losslessFailed.loadAcquire() != 0;
+}
+
+bool ejit::ejitVpResetDrained() {
+  if (!ejitVpEnsureInitialized())
+    return false;
+  ejitVpSetArmed(false);
+  for (const auto &S : gEJitVpState.shards)
+    if (S.writers[0].loadAcquire() || S.writers[1].loadAcquire())
+      return false;
+  for (auto &S : gEJitVpState.shards)
+    for (auto &P : S.payload) {
+      P.updateBusy.storeRelaxed(0);
+      for (auto &Site : P.sites) {
+        Site.total.storeRelaxed(0);
+        for (auto &C : Site.cand) {
+          C.value.storeRelaxed(0);
+          C.count.storeRelaxed(0);
+        }
+        Site.siteKey.storeRelease(0);
+      }
+    }
+  gEJitVpState.losslessFailed.storeRelease(0);
+  return true;
 }
