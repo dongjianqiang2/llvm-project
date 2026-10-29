@@ -147,7 +147,8 @@ private:
   /// constant-index GEPs, then does a final cleanup and vectorization at
   /// L2/L3 for AArch64.
   void runOptimizationPipeline(Module &M, OptimizationLevel level,
-                               CompileTier tier);
+                               CompileTier tier,
+                               const SpecializationContext *context = nullptr);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,

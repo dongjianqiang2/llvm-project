@@ -896,6 +896,9 @@ static std::string extractAndSerialize(Module &M,
       continue;
     GV.setInitializer(nullptr);
     GV.setLinkage(GlobalValue::ExternalLinkage);
+    // The imported AOT object may be arbitrarily far from JIT code. Do not
+    // retain the frontend's image-local direct-addressing assumption.
+    GV.setDSOLocal(false);
   }
   // Pre-internalize non-entry definitions so the JIT's IRMaterializationUnit
   // does not advertise them in MR->getSymbols().  The JIT-side
@@ -1003,7 +1006,8 @@ static void generateSymbolRegisters(
         // External function calls
         if (auto *CI = dyn_cast<CallInst>(&I)) {
           if (Function *Callee = CI->getCalledFunction()) {
-            if (Callee->isDeclaration() && !Callee->isIntrinsic()) {
+            if (Callee->isDeclaration() && !Callee->isIntrinsic() &&
+                !isEJitLocalFreeDimFunction(*Callee)) {
               std::string Name = Callee->getName().str();
               if (registered.insert(Name).second) {
                 IRBuilder<> Builder(InsertBefore);
@@ -1215,7 +1219,8 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   SmallPtrSet<const Function *, 8> SymbolsDone;
   auto addSymbol = [&](const Function *F, bool RequireDeclaration = true,
                        StringRef RegistrationName = {}) {
-    if (!F->isIntrinsic() && (!RequireDeclaration || F->isDeclaration())) {
+    if (!F->isIntrinsic() && !isEJitLocalFreeDimFunction(*F) &&
+        (!RequireDeclaration || F->isDeclaration())) {
       if (SymbolsDone.insert(F).second) {
         StringRef Name = RegistrationName.empty() ? F->getName()
                                                    : RegistrationName;

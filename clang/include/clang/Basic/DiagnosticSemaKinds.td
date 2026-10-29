@@ -13499,6 +13499,8 @@ def err_ejit_period_arr_ind_invalid_type : Error<
 def err_ejit_period_arr_ind_too_many : Error<
   "function %0 has %1 ejit_period_arr_ind parameters, "
   "which exceeds the maximum of 4">;
+def err_ejit_free_dim_local : Error<
+  "ejit_free_dim local %0 requires %1">;
 def err_ejit_free_dim_invalid_type : Error<
   "ejit_free_dim parameter %0 must have integer type">;
 def err_ejit_free_dim_kind_conflict : Error<

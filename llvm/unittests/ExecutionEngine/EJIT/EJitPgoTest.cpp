@@ -309,6 +309,12 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
 }
 #endif // EJIT_SRE_CODE_POOL
 
+#else
+TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
+  GTEST_SKIP() << "requires the SRE code-pool readiness/flush interface";
+}
+#endif
+
 static std::string findCapturedPgoName(const EJitOptimizer &Opt,
                                        StringRef FunctionName) {
   for (const std::string &Name : Opt.getLastCounterNames())

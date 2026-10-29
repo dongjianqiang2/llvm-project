@@ -9514,6 +9514,19 @@ may be marked with this attribute.
 def EjitFreeDimDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{
+Initialized automatic integer locals directly in an `ejit_entry` body can also
+carry this attribute. Both const and unmodified nonconst locals are supported.
+Locals must not be volatile/atomic, reassigned, incremented, addressed, bound to
+a reference or captured by a closure; a managed `ejit_dim` is required.
+The value can vary on every call. Only its value boundary authorizes the zero
+address-evaluation witness: sibling uses of its initializer are not authorized.
+Initializer side effects and volatile/atomic source reads retain ordinary
+language semantics. All marked fields must be invariant over legal local values
+and stable throughout the managed generation; the joint zero address must be
+valid and designate the same semantic field. Unsupported address chains retain
+their real loads. No source ABI, SDK symbol or cache dimension is added.
+
+
 EmbeddedJIT: marks a parameter that the ``ejit_may_const`` data behind it does
 not depend on.
 

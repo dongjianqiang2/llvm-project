@@ -25,6 +25,8 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/IPO/Inliner.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
@@ -143,6 +145,16 @@ void EJitOptimizer::clearAnalyses() {
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
+  // All tier exits, including temporary PGO Gen and audit-only Baseline, must
+  // return executable IR with real runtime inputs and no private marker.
+  auto LowerFreeDims = make_scope_exit([&] {
+    if (lowerEJitLocalFreeDims(M))
+      EJIT_DIAG_VERBOSE("local-free-dim remaining boundaries lowered to real inputs");
+    // ORC destroys the module/context after materialization. MemorySSA and
+    // other cached analysis results must die while their IR is still alive,
+    // including unmarked modules and rejected-boundary fallback paths.
+    clearAnalyses();
+  });
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
@@ -372,7 +384,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline, &ctx);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -431,7 +443,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier, &ctx);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -443,7 +455,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier, &ctx);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -919,7 +931,10 @@ void EJitOptimizer::runStructFieldPass(Module &M,
       }
     }
   }
-  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
+  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
+  for (const auto &Dim : ctx.dimensions)
+    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
+  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName, LocalPeriods);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
@@ -951,7 +966,8 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             ejit::OptimizationLevel level,
-                                            CompileTier tier) {
+                                            CompileTier tier,
+                                            const SpecializationContext *context) {
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -972,7 +988,10 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M);
+  if (context)
+    runStructFieldPass(M, *context);
+  else
+    runStructFieldPass(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
       cleanupFPM_.run(F, FAM_);
