@@ -372,7 +372,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx, CompileTier::Baseline);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -431,7 +431,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -443,7 +443,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -931,11 +931,6 @@ void EJitOptimizer::runStructFieldPass(Module &M,
     }
 }
 
-void EJitOptimizer::runStructFieldPass(Module &M) {
-  SpecializationContext Empty;
-  runStructFieldPass(M, Empty);
-}
-
 FunctionPassManager &
 EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
   switch (level) {
@@ -950,8 +945,9 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 }
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            ejit::OptimizationLevel level,
+                                            const SpecializationContext &ctx,
                                             CompileTier tier) {
+  const auto level = ctx.optLevel;
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -972,7 +968,7 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M);
+  runStructFieldPass(M, ctx);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
       cleanupFPM_.run(F, FAM_);

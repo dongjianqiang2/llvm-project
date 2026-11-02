@@ -145,9 +145,14 @@ Install it on every image, including the compiler worker. The compiler calls it
 for the current pointee while compiling, never on cache hits, so it must be
 thread-safe and must not call back into EJIT. Reported allocations must stay
 mapped until shutdown. Explicit bounds take precedence over the lookup.
-Discovered sizes only add folds for witness-indexed loads: constant-index loads
-fold as they do without a lookup, and a discovered match is only used when no
-other registration matches. Shutdown discards the lookup.
+Discovered sizes add strict folds for witness-indexed loads and for absolute
+constant-index loads that the legacy matcher cannot authorize (for example, a
+field in a nonzero pointee element). Existing successful legacy constant-index
+folds retain precedence and do not acquire a new layout or lifecycle requirement.
+A discovered match is only used when no pre-existing eligible registration
+matches and exactly one discovered candidate passes all strict checks. Shutdown
+discards the lookup. See `EJIT_POINTER_PERIOD_STRICT_SPEC.md` for the decision
+order and deployment/acceptance requirements.
 
 Both APIs are pre-init only. Identical repeats succeed; invalid, conflicting
 or post-init calls return `EJIT_ERR_INVALID_PARAM`.

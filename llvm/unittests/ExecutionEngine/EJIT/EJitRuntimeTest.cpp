@@ -252,6 +252,19 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::runInterproceduralPropagation;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
+
+  // Isolated pass tests without a specialization supply an empty context;
+  // production callers must carry the actual entry and bound-pointer views.
+  void runStructFieldPass(Module &M) {
+    EJitOptimizer::runStructFieldPass(M, SpecializationContext{});
+  }
+  void runOptimizationPipeline(Module &M, OptimizationLevel Level,
+                               CompileTier Tier) {
+    SpecializationContext Context;
+    Context.optLevel = Level;
+    Context.tier = Tier;
+    EJitOptimizer::runOptimizationPipeline(M, Context, Tier);
+  }
 };
 } // namespace ejit
 } // namespace llvm
