@@ -20,6 +20,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include <limits>
 
 using namespace clang;
 using namespace CodeGen;
@@ -309,21 +310,42 @@ void clang::CodeGen::emitEjitGlobalMetadata(CodeGenModule &CGM,
   QualType VT = VD->getType();
   if (const auto *AT = CGM.getContext().getAsArrayType(VT))
     VT = AT->getElementType();
-  if (VT->isPointerType())
+  const bool HasPointerElements = VT->isPointerType();
+  if (HasPointerElements)
     VT = VT->getPointeeType();
-  if (const auto *RD = VT->getAsRecordDecl()) {
-    if (RD->isCompleteDefinition()) {
-      SmallVector<uint64_t, 4> Offsets;
-      collectMayConstFieldOffsets(CGM.getContext(), RD, 0, Offsets);
-      for (uint64_t Off : Offsets) {
-        Entries.push_back(llvm::MDNode::get(Ctx, {
-            llvm::MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
-            llvm::ConstantAsMetadata::get(
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Off))
-        }));
+  SmallVector<uint64_t, 4> Offsets;
+  if (HasPointerElements) {
+    // Keep the legacy pointer offset fallback unchanged. Strict pointer
+    // layouts below already use complete, bounded field ranges. Arrays of
+    // pointer slots must not acquire the pointee's expanded object layout.
+    if (const auto *RD = VT->getAsRecordDecl()) {
+      if (RD->isCompleteDefinition())
+        collectMayConstFieldOffsets(CGM.getContext(), RD, 0, Offsets);
+    }
+  } else {
+    // Absolute-address matching needs every nested array element's field
+    // offset. Reuse the bounded range walker rather than stopping at arrays.
+    SmallVector<std::pair<uint64_t, uint64_t>, 16> Fields;
+    unsigned Budget = 4096;
+    if (collectPointerPeriodFields(CGM.getContext(), VT, 0, Fields, Budget)) {
+      for (const auto &Field : Fields) {
+        uint64_t Offset = Field.first;
+        // The legacy metadata format stores offsets in i32. Never truncate a
+        // large offset into an unrelated, otherwise authorized field.
+        if (Offset > std::numeric_limits<uint32_t>::max()) {
+          Offsets.clear();
+          break;
+        }
+        Offsets.push_back(Offset);
       }
     }
   }
+  for (uint64_t Off : Offsets)
+    Entries.push_back(llvm::MDNode::get(Ctx, {
+        llvm::MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Off))
+    }));
 
   if (!Entries.empty() && VD->getType()->isPointerType()) {
     QualType Pointee = VD->getType()->getPointeeType();

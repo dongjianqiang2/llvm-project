@@ -1522,7 +1522,7 @@ static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
 /// field whose complete root-to-leaf GEP witness is valid. Pointer-form objects
 /// with explicit allocation bounds and compiler field ranges use the same
 /// witness checks. Unbounded pointers retain the legacy constant-index path.
-/// Allocator-discovered bounds only add witness folds.
+/// Allocator-discovered bounds add strict folds only after legacy matching.
 static Constant *tryReplacePeriodAbsoluteAddress(
     LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
     const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
@@ -1564,45 +1564,58 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       const uintptr_t PointeeBase = reinterpret_cast<uintptr_t>(Pointee);
       const std::string Name = GV->getName().str();
       const bool Explicit = reg.getPointerPeriodBounds(Name);
-      // Explicit bounds select the strict path even for a constant index.
-      // Discovered bounds are only consulted for witness-derived addresses,
-      // so constant addresses keep the legacy decision below.
-      std::optional<PointerPeriodBounds> Bounds;
-      if (Explicit || UsedAssumption)
-        Bounds = reg.resolvePointerPeriodBounds(Name, Pointee);
-      if (Bounds) {
-        uint64_t Relative = 0;
-        if (Pointee == Bounds->base &&
-            hasAbsoluteAddressContract(F, Info.periodName) &&
-            absoluteRangeContains(PointeeBase, Bounds->size, Target,
-                                  AccessSize, Relative) &&
-            absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed,
-                                       PointeeBase, Bounds->size) &&
-            boundedPointerFieldAuthorized(*GV, Bounds->size, Relative,
-                                          AccessSize)) {
-          if (Explicit) {
-            Candidate = reinterpret_cast<const uint8_t *>(Target);
-            ++Matches;
-          } else {
-            DiscoveredCandidate = reinterpret_cast<const uint8_t *>(Target);
-            ++DiscoveredMatches;
-          }
+      // Preserve existing constant-address matches before consulting discovery.
+      // Explicit bounds always select strict checking, including on failure.
+      if (!Explicit && !UsedAssumption && PointeeBase &&
+          Target >= PointeeBase) {
+        const uint64_t FieldOffset = Target - PointeeBase;
+        auto FieldIt = mayConstFieldMap.find(GV);
+        if (FieldIt != mayConstFieldMap.end() &&
+            llvm::is_contained(FieldIt->second, FieldOffset) &&
+            AccessSize <= std::numeric_limits<uintptr_t>::max() - Target) {
+          Candidate = reinterpret_cast<const uint8_t *>(Target);
+          ++Matches;
+          continue;
         }
-        // A failed strict check never falls through to the legacy matcher.
+      }
+
+      // Discovery can also prove a nonzero constant element that the legacy
+      // element-relative offset matcher missed. It grants no new lifecycle,
+      // field-width or witness permissions: every strict check still applies.
+      auto Bounds = reg.resolvePointerPeriodBounds(Name, Pointee);
+      uint64_t Relative = 0;
+      const char *Rejection = nullptr;
+      if (!Bounds)
+        Rejection = "unknown-bounds";
+      else if (Pointee != Bounds->base)
+        Rejection = "stale-pointer-base";
+      else if (!hasAbsoluteAddressContract(F, Info.periodName))
+        Rejection = "missing-entry-contract";
+      else if (!absoluteRangeContains(PointeeBase, Bounds->size, Target,
+                                      AccessSize, Relative))
+        Rejection = "access-out-of-bounds";
+      else if (!absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed,
+                                           PointeeBase, Bounds->size))
+        Rejection = "invalid-gep-witness";
+      else if (!boundedPointerFieldAuthorized(*GV, Bounds->size, Relative,
+                                              AccessSize))
+        Rejection = "layout-or-field-unauthorized";
+      if (Rejection) {
+        // This is a candidate rejection, not the result for the entire load:
+        // another registered object may still be its unique authorized match.
+        EJIT_DIAG_VERBOSE("pointer-period candidate rejected fn=%s gv=%s "
+                          "period=%s reason=%s",
+                          F.getName().str().c_str(), Name.c_str(),
+                          Info.periodName.c_str(), Rejection);
         continue;
       }
-      if (UsedAssumption)
-        continue;
-      if (!PointeeBase || Target < PointeeBase)
-        continue;
-      const uint64_t FieldOffset = Target - PointeeBase;
-      auto FieldIt = mayConstFieldMap.find(GV);
-      if (FieldIt == mayConstFieldMap.end() ||
-          !llvm::is_contained(FieldIt->second, FieldOffset) ||
-          AccessSize > std::numeric_limits<uintptr_t>::max() - Target)
-        continue;
-      Candidate = reinterpret_cast<const uint8_t *>(Target);
-      ++Matches;
+      if (Explicit) {
+        Candidate = reinterpret_cast<const uint8_t *>(Target);
+        ++Matches;
+      } else {
+        DiscoveredCandidate = reinterpret_cast<const uint8_t *>(Target);
+        ++DiscoveredMatches;
+      }
       continue;
     }
 
@@ -1636,6 +1649,10 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   // overlap remains ambiguous.
   if (!Matches && DiscoveredMatches == 1)
     return createConstantFromMemory(DiscoveredCandidate, LI->getType(), DL);
+  if (Matches > 1 || (!Matches && DiscoveredMatches > 1))
+    EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
+                      "reason=ambiguous-registration matches=%u discovered=%u",
+                      F.getName().str().c_str(), Matches, DiscoveredMatches);
   if (Matches != 1)
     return nullptr;
   return createConstantFromMemory(Candidate, LI->getType(), DL);

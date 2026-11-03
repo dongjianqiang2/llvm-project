@@ -7,19 +7,29 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
+#include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
+#include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
+#include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
+#include <chrono>
 #include <limits>
 #include <sstream>
+#include <thread>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -125,16 +135,222 @@ static unsigned markedLoads(Module &M) {
 }
 
 static void optimize(Module &M, PeriodArrayRegistry &Registry,
-                     CompileTier Tier = CompileTier::Baseline) {
+                      CompileTier Tier = CompileTier::Baseline,
+                      ejit::OptimizationLevel Level =
+                          ejit::OptimizationLevel::L2) {
   SpecializationContext Context;
   Context.fnName = "probe";
   Context.dimensions.push_back({"cell", 1});
   Context.tier = Tier;
+  Context.optLevel = Level;
   EJitOptimizer Optimizer(Registry);
   Optimizer.runPipeline(M, Context);
   EXPECT_FALSE(verifyModule(M, &errs()));
 }
+
+static void useLiveSlotStores(Module &M, const PointerFixture &Fixture) {
+  Function *F = M.getFunction("probe");
+  // Marked fields are immutable while active; exercise writes through the
+  // real slot using a separate, unmarked byte in each element.
+  SmallVector<Instruction *, 4> Erase;
+  for (Instruction &I : instructions(F))
+    if (isa<CallInst>(I) || isa<StoreInst>(I))
+      Erase.push_back(&I);
+  for (Instruction *I : Erase)
+    I->eraseFromParent();
+  IRBuilder<> B(F->getEntryBlock().getTerminator());
+  auto *Base = ConstantExpr::getIntToPtr(
+      B.getInt64(reinterpret_cast<uintptr_t>(Fixture.Pointer)), B.getPtrTy());
+  Value *Slot = B.CreateZExt(
+      B.CreateURem(F->getArg(1), B.getInt16(Fixture.Slots)), B.getInt64Ty());
+  Value *Offset = B.CreateAdd(B.CreateMul(Slot, B.getInt64(4)),
+                              B.getInt64(Fixture.Stride + 8));
+  Value *Live = B.CreateGEP(B.getInt8Ty(), Base, Offset);
+  Value *Count = B.CreateLoad(B.getInt8Ty(), Live);
+  B.CreateStore(B.CreateAdd(Count, B.getInt8(1)), Live);
+}
 } // namespace
+
+TEST(EJitPointerPeriod, NestedGlobalAbsoluteSlotRequiresCompleteFieldMetadata) {
+  enum Case {
+    Complete,
+    NoFields,
+    NoFreeDim,
+    Neighbor,
+    Wide,
+    Volatile,
+    Atomic,
+    Unregistered
+  };
+  for (bool BE : {false, true})
+    for (auto Level :
+         {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3})
+      for (auto Tier : {CompileTier::Baseline, CompileTier::Instrumented,
+                        CompileTier::PGOUse})
+        for (unsigned Mode = Complete; Mode <= Unregistered; ++Mode) {
+          SCOPED_TRACE(BE);
+          SCOPED_TRACE(static_cast<unsigned>(Level));
+          SCOPED_TRACE(static_cast<unsigned>(Tier));
+          SCOPED_TRACE(Mode);
+          std::vector<uint8_t> Data(1280, 0);
+          for (unsigned S = 0; S != 5; ++S)
+            Data[640 + S * 128 + 31] = 1;
+          std::ostringstream IR;
+          IR << "target datalayout = \"" << (BE ? 'E' : 'e')
+             << "-p:64:64-i64:64\"\n"
+                "%Slot = type { [31 x i8], i8, [96 x i8] }\n"
+                "%Cell = type { [5 x %Slot] }\n"
+                "@cfg = external global [2 x %Cell], !ejit.metadata !0\n"
+                "@gate = external global i8\n"
+                "declare void @observe(i16, i16)\n"
+                "define void @probe(i8 %cell, i8 %other, i16 %frame, "
+                "i16 %slot, i32 %mode, ptr %ctx) !ejit.metadata !3 {\n"
+                "entry:\n"
+                "  %g = load i8, ptr @gate\n"
+                "  %cond = icmp ugt i8 %g, 1\n"
+                "  %phase = urem i16 %slot, 5\n"
+                "  %index = zext nneg i16 %phase to i64\n"
+                "  br i1 %cond, label %read, label %exit\n"
+                "read:\n"
+                "  %offset = shl nuw nsw i64 %index, 7\n"
+                "  %field = getelementptr i8, ptr inttoptr (i64 "
+             << reinterpret_cast<uintptr_t>(Data.data() + 640 +
+                                            (Mode == Neighbor ? 32 : 31))
+             << " to ptr), i64 %offset\n"
+                "  %v = load "
+             << (Mode == Atomic     ? "atomic "
+                 : Mode == Volatile ? "volatile "
+                                    : "")
+             << (Mode == Wide ? "i16" : "i8") << ", ptr %field"
+             << (Mode == Atomic ? " monotonic" : "")
+             << ", align 1, !ejit.may_const !7\n";
+          if (Mode != Wide)
+            IR << "  %extended = zext i8 %v to i16\n";
+          IR << "  call void @observe(i16 "
+             << (Mode == Wide ? "%v" : "%extended")
+             << ", i16 %slot)\n  br label %exit\nexit:\n  ret void\n}\n"
+                "!0 = !{!1";
+          if (Mode != NoFields)
+            IR << ", !10, !11, !12, !13, !14";
+          IR << "}\n!1 = !{!\"ejit_period_arr\", !\"cell\", i32 2}\n"
+                "!3 = !{!4, !5";
+          if (Mode != NoFreeDim)
+            IR << ", !6";
+          IR << "}\n!4 = !{!\"ejit_entry\"}\n"
+                "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+                "!6 = !{!\"ejit_free_dim\", !\"\", i32 3}\n!7 = !{}\n";
+          for (unsigned S = 0; S != 5; ++S)
+            IR << '!' << 10 + S << " = !{!\"ejit_may_const_field\", i32 "
+               << 31 + S * 128 << "}\n";
+          LLVMContext Ctx;
+          SMDiagnostic Err;
+          auto M = parseAssemblyString(IR.str(), Err, Ctx);
+          ASSERT_NE(M, nullptr) << Err.getMessage().str();
+          ASSERT_FALSE(verifyModule(*M, &errs()));
+          PeriodArrayRegistry Registry;
+          if (Mode != Unregistered)
+            Registry.registerArray("cell", "cfg", Data.data(), 2);
+          optimize(*M, Registry, Tier, Level);
+          EXPECT_EQ(markedLoads(*M), Mode == Complete ? 0U : 1U);
+          unsigned Calls = 0;
+          for (Instruction &I : instructions(M->getFunction("probe")))
+            if (auto *Call = dyn_cast<CallInst>(&I))
+              if (Call->getCalledFunction() &&
+                  Call->getCalledFunction()->getName() == "observe") {
+                ++Calls;
+                EXPECT_EQ(Call->getArgOperand(1),
+                          M->getFunction("probe")->getArg(3));
+                auto *Value = dyn_cast<ConstantInt>(Call->getArgOperand(0));
+                if (Mode == Complete) {
+                  ASSERT_NE(Value, nullptr);
+                  EXPECT_EQ(Value->getZExtValue(), 1U);
+                } else {
+                  EXPECT_EQ(Value, nullptr);
+                }
+              }
+          EXPECT_EQ(Calls, 1U);
+        }
+}
+
+TEST(EJitPointerPeriod, PreservesBoundPointerContextAfterLoopUnrolling) {
+  for (bool BigEndian : {false, true})
+    for (unsigned Mode : {0U, 1U, 2U})
+      for (auto Level :
+           {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3})
+        for (bool WithSnapshot : {false, true}) {
+          SCOPED_TRACE(BigEndian);
+          SCOPED_TRACE(Mode);
+          SCOPED_TRACE(static_cast<unsigned>(Level));
+          SCOPED_TRACE(WithSnapshot);
+          LLVMContext Ctx;
+          SMDiagnostic Err;
+          auto M = parseAssemblyString(R"(
+          declare void @observe(i8, i16)
+          define void @probe(i8 %cell, i16 %slot, ptr %cfg)
+              !ejit.metadata !0 {
+          entry:
+            br label %loop
+          loop:
+            %i = phi i64 [0, %entry], [%next, %loop]
+            %p = getelementptr inbounds i8, ptr %cfg, i64 %i
+            %v = load i8, ptr %p, !ejit.may_const !7
+            call void @observe(i8 %v, i16 %slot)
+            %next = add nuw nsw i64 %i, 1
+            %more = icmp ult i64 %next, 4
+            br i1 %more, label %loop, label %exit, !llvm.loop !8
+          exit:
+            ret void
+          }
+          !0 = !{!1, !2, !3}
+          !1 = !{!"ejit_entry"}
+          !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+          !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4,
+                  !4, !5, !6, !10}
+          !4 = !{i64 0, i64 1}
+          !5 = !{i64 1, i64 1}
+          !6 = !{i64 2, i64 1}
+          !7 = !{}
+          !8 = distinct !{!8, !9}
+          !9 = !{!"llvm.loop.unroll.full"}
+          !10 = !{i64 3, i64 1}
+        )",
+                                       Err, Ctx);
+          ASSERT_NE(M, nullptr) << Err.getMessage().str();
+          M->setDataLayout(BigEndian ? "E-p:64:64-i64:64" : "e-p:64:64-i64:64");
+          const uint8_t Data[] = {7, 9, 11, 13};
+          SpecializationContext Context;
+          Context.fnName = "probe";
+          Context.dimensions.push_back({"cell", 1});
+          if (WithSnapshot)
+            Context.boundPointers.push_back({Data, sizeof(Data), 2, 1});
+          Context.tier = Mode ? CompileTier::PGOUse : CompileTier::Baseline;
+          Context.profileAuditOnly = Mode == 2;
+          Context.optLevel = Level;
+          PeriodArrayRegistry Registry;
+          EJitOptimizer Optimizer(Registry);
+          Optimizer.runPipeline(*M, Context);
+          ASSERT_FALSE(verifyModule(*M, &errs()));
+          EXPECT_EQ(markedLoads(*M), WithSnapshot ? 0U : 4U);
+          unsigned Calls = 0;
+          for (Instruction &I : instructions(M->getFunction("probe")))
+            if (auto *Call = dyn_cast<CallInst>(&I))
+              if (Call->getCalledFunction() &&
+                  Call->getCalledFunction()->getName() == "observe") {
+                auto *Value = dyn_cast<ConstantInt>(Call->getArgOperand(0));
+                ASSERT_LT(Calls, std::size(Data));
+                if (WithSnapshot) {
+                  ASSERT_NE(Value, nullptr);
+                  EXPECT_EQ(Value->getZExtValue(), Data[Calls]);
+                } else {
+                  EXPECT_EQ(Value, nullptr);
+                }
+                ++Calls;
+                EXPECT_EQ(Call->getArgOperand(1),
+                          M->getFunction("probe")->getArg(1));
+              }
+          EXPECT_EQ(Calls, 4U);
+        }
+}
 
 TEST(EJitPointerPeriod, FoldsNestedN5N10AcrossPipelineTiers) {
   for (unsigned Slots : {5U, 10U})
@@ -626,4 +842,390 @@ TEST(EJitPointerPeriod, AllocationLookupDoesNotMakeExistingFoldAmbiguous) {
     optimize(*M, Registry);
     EXPECT_EQ(markedLoads(*M), 0U);
   }
+}
+
+TEST(EJitPointerPeriod, DiscoversAbsoluteConstantElementsAcrossTiersAndLevels) {
+  for (unsigned Slots : {5U, 10U})
+    for (bool BigEndian : {false, true})
+      for (CompileTier Tier : {CompileTier::Baseline, CompileTier::Instrumented,
+                               CompileTier::PGOUse})
+        for (auto Level :
+             {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3}) {
+          SCOPED_TRACE(Slots);
+          SCOPED_TRACE(BigEndian);
+          SCOPED_TRACE(static_cast<unsigned>(Tier));
+          SCOPED_TRACE(static_cast<unsigned>(Level));
+          PointerFixture Fixture(Slots);
+          AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
+          LLVMContext Ctx;
+          auto M = Fixture.module(Ctx, true, false, true, true, BigEndian, 1,
+                                  "add i16 0, 3");
+          ASSERT_NE(M, nullptr);
+          PeriodArrayRegistry Registry;
+          Fixture.registerRoot(Registry);
+          Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+          optimize(*M, Registry, Tier, Level);
+          EXPECT_GT(Record.Queries, 0U);
+          EXPECT_EQ(markedLoads(*M), 0U);
+          for (Instruction &I : instructions(M->getFunction("probe")))
+            if (auto *Call = dyn_cast<CallInst>(&I))
+              if (auto *Callee = Call->getCalledFunction())
+                EXPECT_NE(Callee->getName(), "no");
+        }
+}
+
+TEST(EJitPointerPeriod, DiscoversFlattenedConstantElementAddress) {
+  for (bool BigEndian : {false, true}) {
+    PointerFixture Fixture(10);
+    AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true, false, true, true, BigEndian, 1,
+                            "add i16 0, 3");
+    ASSERT_NE(M, nullptr);
+    for (Instruction &I : instructions(M->getFunction("probe")))
+      if (auto *Load = dyn_cast<LoadInst>(&I))
+        if (Load->hasMetadata("ejit.may_const")) {
+          IRBuilder<> B(Load);
+          auto *Base = ConstantExpr::getIntToPtr(
+              B.getInt64(reinterpret_cast<uintptr_t>(Fixture.Pointer)),
+              B.getPtrTy());
+          Load->setOperand(
+              0, B.CreateGEP(B.getInt8Ty(), Base,
+                             B.getInt64(Fixture.Stride + 8 + 3 * 4 + 1)));
+        }
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+    optimize(*M, Registry);
+    EXPECT_GT(Record.Queries, 0U);
+    EXPECT_EQ(markedLoads(*M), 0U);
+  }
+}
+
+TEST(EJitPointerPeriod, ConstantDiscoveryRequiresStrictAuthorization) {
+  for (unsigned Rejection = 0; Rejection < 10; ++Rejection) {
+    SCOPED_TRACE(Rejection);
+    PointerFixture Fixture(5);
+    AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
+    if (Rejection == 0)
+      Record.Size = 0;
+    if (Rejection == 1)
+      Record.Size = Fixture.Stride;
+    if (Rejection == 2)
+      --Record.Size;
+    if (Rejection == 3)
+      Record.Size = std::numeric_limits<uint64_t>::max();
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true, false, Rejection != 4, Rejection != 5,
+                            false, Rejection == 6 ? 0 : 1, "add i16 0, 3");
+    ASSERT_NE(M, nullptr);
+    SmallVector<LoadInst *, 4> Loads;
+    for (Instruction &I : instructions(M->getFunction("probe")))
+      if (auto *Load = dyn_cast<LoadInst>(&I))
+        if (Load->hasMetadata("ejit.may_const"))
+          Loads.push_back(Load);
+    for (LoadInst *Load : Loads) {
+      if (Rejection == 7)
+        Load->setVolatile(true);
+      if (Rejection == 8)
+        Load->setAtomic(AtomicOrdering::Acquire);
+      if (Rejection == 9) {
+        IRBuilder<> B(Load);
+        auto *Wide = B.CreateAlignedLoad(B.getInt16Ty(),
+                                         Load->getPointerOperand(), Align(1));
+        Wide->setMetadata("ejit.may_const",
+                          Load->getMetadata("ejit.may_const"));
+        Load->replaceAllUsesWith(B.CreateTrunc(Wide, B.getInt8Ty()));
+        Load->eraseFromParent();
+      }
+    }
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+    optimize(*M, Registry);
+    EXPECT_EQ(markedLoads(*M), 1U);
+  }
+}
+
+TEST(EJitPointerPeriod, ConstantDiscoveryRejectsAmbiguousAllocations) {
+  PointerFixture Fixture(5);
+  AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
+  LLVMContext Ctx;
+  auto M =
+      Fixture.module(Ctx, true, false, true, true, false, 1, "add i16 0, 3");
+  ASSERT_NE(M, nullptr);
+  auto *Alias =
+      new GlobalVariable(*M, PointerType::getUnqual(Ctx), false,
+                         GlobalValue::ExternalLinkage, nullptr, "alias");
+  Alias->setMetadata("ejit.metadata",
+                     M->getGlobalVariable("cfg")->getMetadata("ejit.metadata"));
+  PeriodArrayRegistry Registry;
+  Fixture.registerRoot(Registry);
+  Registry.registerArray("cell", "alias", &Fixture.Pointer, 0);
+  Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+  optimize(*M, Registry);
+  EXPECT_EQ(markedLoads(*M), 1U);
+}
+
+TEST(EJitPointerPeriod, ConstantDiscoveryCannotOverrideExplicitBounds) {
+  for (bool Stale : {false, true}) {
+    SCOPED_TRACE(Stale);
+    PointerFixture Fixture(5);
+    AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
+    std::vector<uint8_t> Other(Fixture.Data.size());
+    LLVMContext Ctx;
+    auto M =
+        Fixture.module(Ctx, true, false, true, true, false, 1, "add i16 0, 3");
+    ASSERT_NE(M, nullptr);
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    ASSERT_TRUE(Registry.registerPointerPeriodBounds(
+        "cfg", Stale ? Other.data() : Fixture.Pointer,
+        Stale ? Fixture.Data.size() : Fixture.Stride));
+    Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+    optimize(*M, Registry);
+    EXPECT_EQ(markedLoads(*M), 1U);
+    EXPECT_EQ(Record.Queries, 0U);
+  }
+}
+
+TEST(EJitPointerPeriod, AbsoluteConstantElementWithoutBoundsStaysDynamic) {
+  PointerFixture Fixture(5);
+  LLVMContext Ctx;
+  auto M =
+      Fixture.module(Ctx, true, false, true, true, false, 1, "add i16 0, 3");
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Fixture.registerRoot(Registry);
+  optimize(*M, Registry);
+  EXPECT_EQ(markedLoads(*M), 1U);
+}
+
+TEST(EJitPointerPeriod, ReportsStrictCandidateRejectionReasons) {
+#ifndef EJIT_DIAG_ENABLE
+  GTEST_SKIP() << "requires EJIT diagnostics";
+#else
+  const char *Reasons[] = {"unknown-bounds", "stale-pointer-base",
+                           "missing-entry-contract", "access-out-of-bounds",
+                           "layout-or-field-unauthorized"};
+  for (unsigned Case = 0; Case < std::size(Reasons); ++Case) {
+    SCOPED_TRACE(Reasons[Case]);
+    PointerFixture Fixture(5);
+    std::vector<uint8_t> Other(Fixture.Data.size());
+    LLVMContext Ctx;
+    auto M = Fixture.module(Ctx, true, false, Case != 4, Case != 2, false, 1,
+                            "add i16 0, 3");
+    ASSERT_NE(M, nullptr);
+    PeriodArrayRegistry Registry;
+    Fixture.registerRoot(Registry);
+    if (Case)
+      ASSERT_TRUE(Registry.registerPointerPeriodBounds(
+          "cfg", Case == 1 ? Other.data() : Fixture.Pointer,
+          Case == 3 ? Fixture.Stride : Fixture.Data.size()));
+    const auto OldLevel = ejit_get_log_level();
+    ejit_set_log_level(EJIT_LOG_VERBOSE);
+    testing::internal::CaptureStdout();
+    optimize(*M, Registry);
+    std::string Output = testing::internal::GetCapturedStdout();
+    ejit_set_log_level(OldLevel);
+    EXPECT_EQ(markedLoads(*M), 1U);
+    EXPECT_NE(Output.find(std::string("reason=") + Reasons[Case]),
+              std::string::npos)
+        << Output;
+    EXPECT_NE(Output.find("candidate rejected fn=probe gv=cfg period=cell"),
+              std::string::npos)
+        << Output;
+  }
+#endif
+}
+
+TEST(EJitPointerPeriod,
+     ConstantDiscoveryExecutesRealTier1AndTier2WithLiveSlots) {
+  for (auto Level :
+       {ejit::OptimizationLevel::L2, ejit::OptimizationLevel::L3}) {
+    SCOPED_TRACE(static_cast<unsigned>(Level));
+    PointerFixture Fixture(10);
+    AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
+    LLVMContext Ctx;
+    auto M =
+        Fixture.module(Ctx, true, false, true, true, false, 1, "add i16 0, 3");
+    ASSERT_NE(M, nullptr);
+    useLiveSlotStores(*M, Fixture);
+    ASSERT_FALSE(verifyModule(*M, &errs()));
+    EJitRuntimeState State;
+    auto &Registry = State.getRegistry();
+    Fixture.registerRoot(Registry);
+    Registry.setAllocationSizeLookup({lookupAllocationSize, &Record});
+    Config Cfg;
+    Cfg.optLevel = Level;
+    auto EngineOrErr = EJitOrcEngine::Create(Cfg, Registry, State);
+    ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+    auto Engine = std::move(*EngineOrErr);
+    auto JTMB = orc::JITTargetMachineBuilder::detectHost();
+    ASSERT_TRUE(static_cast<bool>(JTMB));
+    auto NativeLayout = JTMB->getDefaultDataLayoutForTarget();
+    ASSERT_TRUE(static_cast<bool>(NativeLayout));
+    M->setDataLayout(*NativeLayout);
+    std::string Bitcode;
+    raw_string_ostream OS(Bitcode);
+    WriteBitcodeToFile(*M, OS);
+    OS.flush();
+    SpecializationContext Context;
+    Context.fnName = "probe";
+    Context.cacheKey = 1;
+    Context.dimensions.push_back({"cell", 1});
+    Context.optLevel = Level;
+    Context.tier = CompileTier::Instrumented;
+    Engine->setActiveContext(&Context);
+    if (auto Err = Engine->loadBitcodeModule(Bitcode, 1, "probe"))
+      FAIL() << toString(std::move(Err));
+    auto Tier1 = Engine->lookup(1, "probe");
+    ASSERT_TRUE(static_cast<bool>(Tier1));
+#ifdef EJIT_SRE_CODE_POOL
+    if (auto Err = Engine->flushPendingCode())
+      FAIL() << toString(std::move(Err));
+#endif
+    auto Profc = Engine->lookup(1, "__profc_probe");
+    auto Profd = Engine->lookup(1, "__profd_probe");
+    ASSERT_TRUE(static_cast<bool>(Profc));
+    ASSERT_TRUE(static_cast<bool>(Profd));
+    using Probe = uint8_t (*)(uint8_t, uint16_t);
+    for (uint16_t SlotNo = 0; SlotNo < 64; ++SlotNo)
+      EXPECT_EQ(reinterpret_cast<Probe>(*Tier1)(1, SlotNo), 1U);
+
+    PgoCounterRef Ref{"probe", reinterpret_cast<uintptr_t>(*Profc),
+                      reinterpret_cast<uintptr_t>(*Profd)};
+    Context.profileData = synthesizeProfileBuffer({Ref});
+    ASSERT_FALSE(Context.profileData.empty());
+    Context.tier = CompileTier::PGOUse;
+    if (auto Err = Engine->loadBitcodeModule(Bitcode, 1, "probe"))
+      FAIL() << toString(std::move(Err));
+    auto Tier2 = Engine->lookup(1, "probe");
+    ASSERT_TRUE(static_cast<bool>(Tier2));
+#ifdef EJIT_SRE_CODE_POOL
+    if (auto Err = Engine->flushPendingCode())
+      FAIL() << toString(std::move(Err));
+#endif
+    for (uint16_t SlotNo = 64; SlotNo < 96; ++SlotNo)
+      EXPECT_EQ(reinterpret_cast<Probe>(*Tier2)(1, SlotNo), 1U);
+    for (unsigned I = 0; I < Fixture.Slots; ++I) {
+      EXPECT_EQ(Fixture.Data[Fixture.Stride + 8 + I * 4],
+                96 / Fixture.Slots + (I < 96 % Fixture.Slots));
+      EXPECT_EQ(Fixture.Data[Fixture.Stride + 8 + I * 4 + 1], 1U);
+      EXPECT_EQ(Fixture.Data[8 + I * 4], 0U);
+    }
+
+    auto Optimized = CloneModule(*M);
+    EJitOptimizer Optimizer(Registry);
+    Optimizer.runPipeline(*Optimized, Context);
+    EXPECT_FALSE(verifyModule(*Optimized, &errs()));
+    EXPECT_EQ(markedLoads(*Optimized), 0U);
+    auto Entries = Optimized->getFunction("probe")->getEntryCount();
+    ASSERT_TRUE(Entries.has_value());
+    EXPECT_EQ(Entries->getCount(), 64U);
+    Engine->setActiveContext(nullptr);
+  }
+}
+
+TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {
+#ifndef EJIT_SRE_SHARED_TASKPOOL
+  GTEST_SKIP() << "requires the shared taskpool runtime";
+#else
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  PointerFixture Fixture(10);
+  AllocationRecord Record{Fixture.Pointer, Fixture.Data.size()};
+  LLVMContext Ctx;
+  auto M =
+      Fixture.module(Ctx, true, false, true, true, false, 1, "add i16 0, 3");
+  ASSERT_NE(M, nullptr);
+  useLiveSlotStores(*M, Fixture);
+  auto JTMB = orc::JITTargetMachineBuilder::detectHost();
+  ASSERT_TRUE(static_cast<bool>(JTMB));
+  auto Layout = JTMB->getDefaultDataLayoutForTarget();
+  ASSERT_TRUE(static_cast<bool>(Layout));
+  M->setDataLayout(*Layout);
+  std::string Bitcode;
+  raw_string_ostream OS(Bitcode);
+  WriteBitcodeToFile(*M, OS);
+  OS.flush();
+
+  auto Reset = [] {
+    ejit_shutdown();
+    EJitLifecycleRegistry::instance().reset();
+    EJitFuncRegistry::instance().reset();
+    EJitRegistrationStore::instance().consume();
+    EJitRegistrationStore::instance().consumeError();
+  };
+  Reset();
+  struct RuntimeCleanup {
+    decltype(Reset) &ResetState;
+    ~RuntimeCleanup() { ResetState(); }
+  } Cleanup{Reset};
+  uint32_t CellDim = kEJitInvalidDimType, Func = 0;
+  ejit_register_lifecycle("cell", &CellDim);
+  ejit_register_funcindex("probe", &Func);
+  ASSERT_NE(CellDim, kEJitInvalidDimType);
+  auto &Store = EJitRegistrationStore::instance();
+  Store.registerBitcode("probe",
+                        reinterpret_cast<const uint8_t *>(Bitcode.data()),
+                        Bitcode.size());
+  Store.registerPeriodArray("cell", "cfg", &Fixture.Pointer, 0);
+  ASSERT_EQ(ejit_set_allocation_size_lookup(lookupAllocationSize, &Record),
+            EJIT_OK);
+  ASSERT_EQ(ejit_init_pgo(nullptr), EJIT_OK);
+  const ejit_dim_pair_t Dim{CellDim, 1};
+  using Probe = uint8_t (*)(uint8_t, uint16_t);
+  uint16_t SlotNo = 0;
+  void *PreviousTier2 = nullptr;
+  for (uint8_t Value : {1, 2}) {
+    SCOPED_TRACE(static_cast<unsigned>(Value));
+    // No invocation or compiler request is outstanding at the update point.
+    // The previous round reached T2, and every read token was released.
+    for (unsigned I = 0; I < Fixture.Slots; ++I)
+      Fixture.Data[Fixture.Stride + 8 + I * 4 + 1] = Value;
+    ASSERT_EQ(ejit_activate("cell", 1), EJIT_OK);
+    void *Tier1 = nullptr, *Tier2 = nullptr;
+    unsigned Tier1Executions = 0;
+    const auto Deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!Tier2 && std::chrono::steady_clock::now() < Deadline) {
+      void *Fn = nullptr;
+      uint32_t Bucket = 0;
+      auto Status = ejit_taskpool_compile_or_get(Func, &Dim, 1, &Fn, &Bucket);
+      if (Status == EJIT_OK && Fn) {
+        uint8_t Actual = reinterpret_cast<Probe>(Fn)(1, SlotNo++);
+        ejit_taskpool_release_read(Bucket);
+        ASSERT_EQ(Actual, Value);
+        ASSERT_NE(Fn, PreviousTier2);
+        if (!Tier1)
+          Tier1 = Fn;
+        if (Fn == Tier1)
+          ++Tier1Executions;
+        else
+          Tier2 = Fn;
+      } else {
+        ASSERT_EQ(Status, EJIT_PENDING);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_NE(Tier1, nullptr);
+    ASSERT_NE(Tier2, nullptr)
+        << "online PGO did not publish T2 before deadline";
+    EXPECT_EQ(Tier1Executions, 64U);
+    PreviousTier2 = Tier2;
+    ASSERT_EQ(ejit_deactivate("cell", 1), EJIT_OK);
+    void *Disabled = nullptr;
+    uint32_t Bucket = 0;
+    EXPECT_EQ(ejit_taskpool_compile_or_get(Func, &Dim, 1, &Disabled, &Bucket),
+              EJIT_ERR_INSTANCE_DISABLED);
+    EXPECT_EQ(Disabled, nullptr);
+  }
+  for (unsigned I = 0; I < Fixture.Slots; ++I) {
+    EXPECT_EQ(Fixture.Data[Fixture.Stride + 8 + I * 4],
+              SlotNo / Fixture.Slots + (I < SlotNo % Fixture.Slots));
+    EXPECT_EQ(Fixture.Data[Fixture.Stride + 8 + I * 4 + 1], 2U);
+    EXPECT_EQ(Fixture.Data[8 + I * 4], 0U);
+  }
+#endif
 }
