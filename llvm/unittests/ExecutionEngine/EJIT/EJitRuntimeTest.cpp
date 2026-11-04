@@ -252,6 +252,19 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::runInterproceduralPropagation;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
+
+  // Isolated pass tests without a specialization supply an empty context;
+  // production callers must carry the actual entry and bound-pointer views.
+  void runStructFieldPass(Module &M) {
+    EJitOptimizer::runStructFieldPass(M, SpecializationContext{});
+  }
+  void runOptimizationPipeline(Module &M, OptimizationLevel Level,
+                               CompileTier Tier) {
+    SpecializationContext Context;
+    Context.optLevel = Level;
+    Context.tier = Tier;
+    EJitOptimizer::runOptimizationPipeline(M, Context, Tier);
+  }
 };
 } // namespace ejit
 } // namespace llvm
@@ -1269,7 +1282,8 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                             &missFnStandIn);
   ejit_register_icache_slot("guarded_c_fn", &guardedCells[0], 1, nullptr);
 
-  EJit ejit(Config{});
+  Config Cfg;
+  EJit ejit(Cfg);
   ASSERT_FALSE(ejit.initFailed());
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
@@ -1281,8 +1295,15 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                  sp->icacheBeginResolve());
   sp->icacheFill(guardedIdx, reinterpret_cast<void *>(0x3000), id, 1,
                  sp->icacheBeginResolve());
-  ASSERT_EQ(sentinelCells[3], 0x2000u);
-  ASSERT_EQ(guardedCells[3], 0x3000u);
+  if (Cfg.enablePgo || Cfg.enableProfileAudit) {
+    // Audit sampling must not let unregistered mock pointers bypass Tier-1.
+    // Real Tier-2 publication/fill is covered by the production PGO tests.
+    ASSERT_EQ(sentinelCells[3], reinterpret_cast<uintptr_t>(&missFnStandIn));
+    ASSERT_EQ(guardedCells[3], 0u);
+  } else {
+    ASSERT_EQ(sentinelCells[3], 0x2000u);
+    ASSERT_EQ(guardedCells[3], 0x3000u);
+  }
 
   // The public activate path drains: sentinel slot -> &MissFn, guarded slot
   // -> 0. This is the C-ABI end of the contract the SharedTaskPool tests pin
@@ -4087,7 +4108,7 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   auto AuditSites = sp.collectMayConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u)
       << "audit must recognize metadata-marked may_const loads";
-  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
+  EXPECT_EQ(AuditSites.front().globalName, "g_plain");
   EXPECT_TRUE(AuditSites.front().hasFieldOffset);
 #endif
   auto PA = sp.run(*F, H.FAM);

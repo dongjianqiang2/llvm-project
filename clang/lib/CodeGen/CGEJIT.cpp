@@ -20,6 +20,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 using namespace clang;
 using namespace CodeGen;
@@ -173,50 +174,75 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   }
 }
 
-/// Recursively collect byte offsets of ejit_may_const fields in a record type.
-static void collectMayConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
-                                        uint64_t BaseOffset,
-                                        SmallVectorImpl<uint64_t> &Offsets) {
-  // Union members all share an offset, so an offset cannot identify one member:
-  // recording a may_const member would also match a load of a mutable sibling.
-  // The per-load !ejit.may_const marker stays, so a genuine may_const union
-  // member is still specialized; only the offset-based fallback is withheld.
-  if (RD->isUnion())
+// Share the traversal for global offsets and bound-object field extents.
+// Arrays of records matter for a local witness selecting slots within a cell.
+// The budget bounds metadata growth; omitted descriptors only miss folding.
+static void collectMayConstFields(
+    ASTContext &Ctx, QualType Type, uint64_t BaseOffset,
+    llvm::function_ref<void(uint64_t, QualType)> Emit, unsigned &Budget,
+    bool ExpandArrays = true) {
+  if (!Budget || Type.isVolatileQualified())
     return;
-
+  --Budget;
+  if (const auto *Array = Ctx.getAsConstantArrayType(Type)) {
+    if (!ExpandArrays)
+      return;
+    if (Array->getSize().getActiveBits() > 64)
+      return;
+    QualType Element = Array->getElementType();
+    const uint64_t Stride = Ctx.getTypeSizeInChars(Element).getQuantity();
+    for (uint64_t I = 0, Count = Array->getSize().getZExtValue();
+         I < Count && Budget; ++I) {
+      if (Stride && I > (UINT64_MAX - BaseOffset) / Stride)
+        break;
+      collectMayConstFields(Ctx, Element, BaseOffset + I * Stride, Emit, Budget,
+                            ExpandArrays);
+    }
+    return;
+  }
+  const auto *RD = Type->getAsRecordDecl();
+  // A union's shared offset cannot authorize mutable sibling members.
+  if (!RD || !RD->isCompleteDefinition() || RD->isUnion())
+    return;
   const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
   for (const FieldDecl *FD : RD->fields()) {
+    if (!Budget)
+      break;
     if (FD->isBitField())
       continue;
-    uint64_t FieldOff = BaseOffset + Layout.getFieldOffset(FD->getFieldIndex()) / 8;
-    // A volatile field is read exactly as written and can never be folded, so
-    // clang withholds its per-load marker (see EmitLValueForField). Recording
-    // its offset would let the fallback hand that marker back.
-    if (FD->hasAttr<EjitMayConstAttr>() && !FD->getType().isVolatileQualified())
-      Offsets.push_back(FieldOff);
-    if (const auto *InnerRD = FD->getType()->getAsRecordDecl())
-      collectMayConstFieldOffsets(Ctx, InnerRD, FieldOff, Offsets);
+    uint64_t Relative = Layout.getFieldOffset(FD->getFieldIndex()) / 8;
+    if (Relative > UINT64_MAX - BaseOffset)
+      continue;
+    const uint64_t Offset = BaseOffset + Relative;
+    QualType FieldType = FD->getType();
+    if (FD->hasAttr<EjitMayConstAttr>() && !FieldType.isVolatileQualified())
+      Emit(Offset, FieldType);
+    collectMayConstFields(Ctx, FieldType, Offset, Emit, Budget, ExpandArrays);
   }
+}
+
+static void collectMayConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
+                                        uint64_t BaseOffset,
+                                        SmallVectorImpl<uint64_t> &Offsets,
+                                        bool ExpandArrays) {
+  unsigned Budget = 4096;
+  collectMayConstFields(Ctx, Ctx.getRecordType(RD), BaseOffset,
+                       [&](uint64_t Offset, QualType) {
+                         // Preserve the existing i32 global-offset encoding.
+                         if (Offset <= UINT32_MAX)
+                           Offsets.push_back(Offset);
+                       }, Budget, ExpandArrays);
 }
 
 static void collectBoundMayConstFields(
     ASTContext &Ctx, const RecordDecl *RD, uint64_t BaseOffset,
     SmallVectorImpl<std::pair<uint64_t, uint64_t>> &Fields) {
-  if (RD->isUnion())
-    return;
-  const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
-  for (const FieldDecl *FD : RD->fields()) {
-    if (FD->isBitField())
-      continue;
-    uint64_t Offset =
-        BaseOffset + Layout.getFieldOffset(FD->getFieldIndex()) / 8;
-    QualType FieldType = FD->getType();
-    if (FD->hasAttr<EjitMayConstAttr>() && !FieldType.isVolatileQualified())
-      Fields.push_back(
-          {Offset, Ctx.getTypeSizeInChars(FieldType).getQuantity()});
-    if (const auto *InnerRD = FieldType->getAsRecordDecl())
-      collectBoundMayConstFields(Ctx, InnerRD, Offset, Fields);
-  }
+  unsigned Budget = 4096;
+  collectMayConstFields(Ctx, Ctx.getRecordType(RD), BaseOffset,
+                       [&](uint64_t Offset, QualType Type) {
+                         Fields.push_back(
+                             {Offset, Ctx.getTypeSizeInChars(Type).getQuantity()});
+                       }, Budget);
 }
 
 /// Record complete field ranges in one pointee element, including nested slot
@@ -309,12 +335,18 @@ void clang::CodeGen::emitEjitGlobalMetadata(CodeGenModule &CGM,
   QualType VT = VD->getType();
   if (const auto *AT = CGM.getContext().getAsArrayType(VT))
     VT = AT->getElementType();
+  const bool IsPointerRoot = VT->isPointerType();
   if (VT->isPointerType())
     VT = VT->getPointeeType();
   if (const auto *RD = VT->getAsRecordDecl()) {
     if (RD->isCompleteDefinition()) {
       SmallVector<uint64_t, 4> Offsets;
-      collectMayConstFieldOffsets(CGM.getContext(), RD, 0, Offsets);
+      // Pointer roots already have the complete, budget-checked layout below.
+      // Preserve their legacy non-array offsets: expanding nested arrays here
+      // would rescue a rejected layout with partial offset-only descriptors,
+      // and could also mislabel the pointer-slot load as pointee field zero.
+      collectMayConstFieldOffsets(CGM.getContext(), RD, 0, Offsets,
+                                  !IsPointerRoot);
       for (uint64_t Off : Offsets) {
         Entries.push_back(llvm::MDNode::get(Ctx, {
             llvm::MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
