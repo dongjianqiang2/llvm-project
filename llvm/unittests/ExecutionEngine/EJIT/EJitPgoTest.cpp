@@ -307,6 +307,10 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
   RecordProperty("heartbeat_count", Heartbeats.load());
   RecordProperty("heartbeat_max_gap_us", MaxHeartbeatGapUs.load());
 }
+#else
+TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
+  GTEST_SKIP() << "requires the SRE code-pool readiness/flush interface";
+}
 #endif // EJIT_SRE_CODE_POOL
 
 static std::string findCapturedPgoName(const EJitOptimizer &Opt,

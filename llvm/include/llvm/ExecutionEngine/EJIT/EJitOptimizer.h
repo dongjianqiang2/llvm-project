@@ -115,7 +115,6 @@ private:
   void runInstCombine(Module &M);
 
   /// Run EJitStructFieldPass on all functions.
-  void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
@@ -146,7 +145,7 @@ private:
   /// constant, re-specializes the array accesses that unrolling turns into
   /// constant-index GEPs, then does a final cleanup and vectorization at
   /// L2/L3 for AArch64.
-  void runOptimizationPipeline(Module &M, OptimizationLevel level,
+  void runOptimizationPipeline(Module &M, const SpecializationContext &ctx,
                                CompileTier tier);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)

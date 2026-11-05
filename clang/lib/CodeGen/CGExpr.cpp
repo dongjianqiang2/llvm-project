@@ -1792,6 +1792,10 @@ CodeGenFunction::ConstantEmission
 CodeGenFunction::tryEmitAsConstant(const DeclRefExpr *RefExpr) {
   const ValueDecl *Value = RefExpr->getDecl();
 
+  if (const auto *VD = dyn_cast<VarDecl>(Value))
+    if (!isa<ParmVarDecl>(VD) && VD->hasAttr<EjitFreeDimAttr>())
+      return ConstantEmission();
+
   // The value needs to be an enum constant or a constant variable.
   ConstantEmissionKind CEK;
   if (isa<ParmVarDecl>(Value)) {
