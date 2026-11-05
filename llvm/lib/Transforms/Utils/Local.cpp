@@ -3283,6 +3283,20 @@ bool llvm::removeUnreachableBlocks(Function &F, DomTreeUpdater *DTU,
   return Changed;
 }
 
+static bool canPreserveEJitMayConst(const Instruction *K, const Instruction *J,
+                                   const MDNode *KMD, const MDNode *JMD) {
+  const auto *KL = dyn_cast<LoadInst>(K);
+  const auto *JL = dyn_cast<LoadInst>(J);
+  // This is specialization permission, not a constant value or an audit ID.
+  // Intersect it only for complete, same-type ordinary loads. Never transfer
+  // permission from a marked arm to an unmarked or differently sized access.
+  return KL && JL && KL->isSimple() && JL->isSimple() &&
+         KL->getType() == JL->getType() &&
+         KL->getPointerAddressSpace() == JL->getPointerAddressSpace() &&
+         KMD && JMD && KMD->getNumOperands() == 0 &&
+         JMD->getNumOperands() == 0;
+}
+
 /// If AAOnly is set, only intersect alias analysis metadata and preserve other
 /// known metadata. Unknown metadata is always dropped.
 static void combineMetadata(Instruction *K, const Instruction *J,
@@ -3297,6 +3311,9 @@ static void combineMetadata(Instruction *K, const Instruction *J,
     // TODO: Assert that this switch is exhaustive for fixed MD kinds.
     switch (Kind) {
       default:
+        if (Kind == K->getContext().getMDKindID("ejit.may_const") &&
+            canPreserveEJitMayConst(K, J, KMD, JMD))
+          break;
         K->setMetadata(Kind, nullptr); // Remove unknown metadata
         break;
       case LLVMContext::MD_dbg:

@@ -59,6 +59,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/HipStdPar/HipStdPar.h"
 #include "llvm/Transforms/IPO/EmbedBitcodePass.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 #include "llvm/Transforms/IPO/LowerTypeTests.h"
 #include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
@@ -1226,6 +1227,9 @@ void EmitAssemblyHelper::RunCodegenPipeline(
   case Backend_EmitAssembly:
   case Backend_EmitMCNull:
   case Backend_EmitObj:
+    // Also cover machine output with -disable-llvm-passes. Raw IR/bitcode
+    // intentionally keeps the boundary, but AOT objects cannot import it.
+    lowerEJitLocalFreeDims(*TheModule);
     CodeGenPasses.add(
         createTargetTransformInfoWrapperPass(getTargetIRAnalysis()));
     if (!CodeGenOpts.SplitDwarfOutput.empty()) {

@@ -111,7 +111,7 @@ int all_indexed_attrs(
 // ABI-DAG: ![[ALL_META]] = distinct !{![[ABI_ENTRY]], ![[ALL_IND:[0-9]+]], ![[ALL_FREE:[0-9]+]], ![[ALL_BOUND:[0-9]+]]}
 // ABI-DAG: ![[ALL_IND]] = !{!"ejit_period_arr_ind", !"unit", i32 2}
 // ABI-DAG: ![[ALL_FREE]] = !{!"ejit_free_dim", !"", i32 4}
-// ABI-DAG: ![[ALL_BOUND]] = !{!"ejit_bound_ptr", !"unit", i32 3, i64 8, ![[ALL_FIELD:[0-9]+]]}
+// ABI-DAG: ![[ALL_BOUND]] = !{!"ejit_bound_ptr", !"unit", i32 3, i64 8, i64 4, ![[ALL_FIELD:[0-9]+]]}
 // ABI-DAG: ![[ALL_FIELD]] = !{i64 0, i64 4}
 
 // A parameter the target passes indirectly has no single IR argument holding

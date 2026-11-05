@@ -16,9 +16,11 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -27,6 +29,7 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "ejit-struct-field"
 
@@ -201,7 +204,13 @@ static bool hasMatchingBoundArgumentContract(
 
 static std::optional<uint64_t>
 accumulateArgumentOffset(const DataLayout &DL, const Value *PtrOp,
-                         const Argument *Root, const AssumedArgMap &Assumed);
+                         const Argument *Root,
+                         const EJitFreeDimAssumptions &Assumed);
+
+static bool usesLocalFreeDim(const Value *V,
+                             const EJitFreeDimAssumptions &Assumed) {
+  return usesEJitLocalFreeDim(V, Assumed.hasLocalMarkers);
+}
 
 /// Depth cap for evalWithAssumed. An index expression that needs more than this
 /// is not one this pass should be reasoning about.
@@ -221,16 +230,29 @@ static constexpr unsigned kMaxAssumedEvalDepth = 16;
 /// wants a byte offset to read process memory at, and the IR must be left
 /// exactly as it was so the stores through the same address stay correct.
 static std::optional<APInt>
-evalWithAssumed(const Value *V, const AssumedArgMap &Assumed, unsigned Depth) {
+evalWithAssumed(const Value *V, const EJitFreeDimAssumptions &Assumed,
+                unsigned Depth) {
   if (Depth > kMaxAssumedEvalDepth || !V->getType()->isIntegerTy())
     return std::nullopt;
 
   if (const auto *CI = dyn_cast<ConstantInt>(V))
     return CI->getValue();
 
+  // Stop at the declaration's value boundary. Never evaluate the initializer
+  // or transfer witness authorization to its input SSA value.
+  if (isEJitLocalFreeDim(V) && Assumed.values.contains(V))
+    return APInt(V->getType()->getIntegerBitWidth(), 0);
+
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    auto It = Assumed.phiInputs.find(PN);
+    if (It == Assumed.phiInputs.end())
+      return std::nullopt;
+    return evalWithAssumed(It->second, Assumed, Depth + 1);
+  }
+
   if (const auto *Arg = dyn_cast<Argument>(V)) {
-    auto It = Assumed.find(Arg);
-    if (It == Assumed.end())
+    auto It = Assumed.values.find(Arg);
+    if (It == Assumed.values.end())
       return std::nullopt;
     return APInt(V->getType()->getIntegerBitWidth(), It->second);
   }
@@ -292,8 +314,14 @@ evalWithAssumed(const Value *V, const AssumedArgMap &Assumed, unsigned Depth) {
     auto C = evalWithAssumed(Op->getOperand(0), Assumed, Depth + 1);
     if (!C)
       return std::nullopt;
-    // Only the taken arm is evaluated: the other one may be unfoldable and is
-    // irrelevant at this witness.
+    // Local authorization must not cross a merge containing an unmarked
+    // dynamic arm, even if zero would choose the marked arm. Keep the legacy
+    // parameter-only behavior unchanged.
+    if (usesLocalFreeDim(V, Assumed) &&
+        (!evalWithAssumed(Op->getOperand(1), Assumed, Depth + 1) ||
+         !evalWithAssumed(Op->getOperand(2), Assumed, Depth + 1)))
+      return std::nullopt;
+    // Only the taken arm determines the value at this witness.
     return evalWithAssumed(Op->getOperand(C->isZero() ? 2 : 1), Assumed,
                            Depth + 1);
   }
@@ -412,18 +440,32 @@ evalWithAssumed(const Value *V, const AssumedArgMap &Assumed, unsigned Depth) {
   }
 }
 
+static std::optional<APInt>
+computeAbsoluteGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
+                         const EJitFreeDimAssumptions &Assumed,
+                         const APInt *BaseAddress,
+                         SmallVectorImpl<APInt> *IntermediateAddresses,
+                         bool *HasNonZeroIndex, bool *UsedAssumption);
+
 /// Compute the cumulative byte offset of a GEP. Every index must be a
 /// ConstantInt, or fold to one under \p Assumed.
 static std::optional<uint64_t>
 computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
-                 const AssumedArgMap &Assumed, bool *UsedAssumption = nullptr) {
+                 const EJitFreeDimAssumptions &Assumed,
+                 bool *UsedAssumption = nullptr) {
+  if (usesLocalFreeDim(GEP, Assumed)) {
+    auto Offset = computeAbsoluteGEPOffset(GEP, DL, Assumed, nullptr, nullptr,
+                                           nullptr, UsedAssumption);
+    return Offset ? std::optional<uint64_t>(Offset->getZExtValue())
+                  : std::nullopt;
+  }
   SmallVector<Value *, 4> IdxList;
   for (auto I = GEP->idx_begin(), E = GEP->idx_end(); I != E; ++I) {
     if (isa<ConstantInt>(*I)) {
       IdxList.push_back(*I);
       continue;
     }
-    if (Assumed.empty())
+    if (Assumed.values.empty() && Assumed.phiInputs.empty())
       return std::nullopt;
     auto Folded = evalWithAssumed(*I, Assumed, 0);
     if (!Folded)
@@ -444,7 +486,7 @@ computeGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
 /// or fold to constants under \p Assumed.
 static std::optional<uint64_t>
 accumulateFullOffset(const DataLayout &DL, const Value *PtrOp,
-                     const AssumedArgMap &Assumed,
+                     const EJitFreeDimAssumptions &Assumed,
                      bool *UsedAssumption = nullptr) {
   APInt total(DL.getPointerSizeInBits(0), 0);
 
@@ -460,7 +502,14 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp,
     auto off = computeGEPOffset(GEP, DL, Assumed, UsedAssumption);
     if (!off)
       return std::nullopt;
-    total += APInt(total.getBitWidth(), *off);
+    if (usesLocalFreeDim(PtrOp, Assumed)) {
+      bool Overflow = false;
+      total = total.sadd_ov(APInt(total.getBitWidth(), *off), Overflow);
+      if (Overflow)
+        return std::nullopt;
+    } else {
+      total += APInt(total.getBitWidth(), *off);
+    }
 
     PtrOp = GEP->getPointerOperand();
   }
@@ -470,7 +519,8 @@ accumulateFullOffset(const DataLayout &DL, const Value *PtrOp,
 
 static std::optional<uint64_t>
 accumulateArgumentOffset(const DataLayout &DL, const Value *PtrOp,
-                         const Argument *Root, const AssumedArgMap &Assumed) {
+                         const Argument *Root,
+                         const EJitFreeDimAssumptions &Assumed) {
   APInt Total(DL.getPointerSizeInBits(0), 0);
   while (PtrOp) {
     PtrOp = PtrOp->stripPointerCasts();
@@ -490,7 +540,8 @@ accumulateArgumentOffset(const DataLayout &DL, const Value *PtrOp,
 
 static std::optional<uint64_t>
 getBoundPointerOffset(const Value *V, const AssumedArgMap &BoundArguments,
-                      const DataLayout &DL, const AssumedArgMap &Assumed) {
+                      const DataLayout &DL,
+                      const EJitFreeDimAssumptions &Assumed) {
   const Argument *Root = findRootArgument(V);
   if (!Root)
     return std::nullopt;
@@ -613,8 +664,15 @@ callUsesSameBoundDimension(const CallBase &CB, StringRef BoundPeriodName,
 /// simply absent from the map; the assumption does not propagate across a call
 /// that survived inlining.
 void EJitStructFieldPass::initFreeDimAssumptions(Module &M) {
-  freeDimArgs_.clear();
+  freeDimAssumptions_.values.clear();
+  freeDimAssumptions_.hasLocalMarkers = false;
   for (Function &F : M) {
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (isEJitLocalFreeDim(&I)) {
+          freeDimAssumptions_.values[&I] = 0;
+          freeDimAssumptions_.hasLocalMarkers = true;
+        }
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (!MD)
       continue;
@@ -634,10 +692,11 @@ void EJitStructFieldPass::initFreeDimAssumptions(Module &M) {
       Argument *Arg = F.getArg(static_cast<unsigned>(ArgIdx));
       if (!Arg->getType()->isIntegerTy())
         continue;
-      freeDimArgs_[Arg] = 0;
+      freeDimAssumptions_.values[Arg] = 0;
     }
   }
-  EJIT_DIAG_VERBOSE("struct-field free dims: %zu", freeDimArgs_.size());
+  EJIT_DIAG_VERBOSE("struct-field free dims: %u",
+                    freeDimAssumptions_.values.size());
 }
 
 void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
@@ -651,7 +710,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
   // prove an argument relationship: two calls whose offsets differ in the free
   // parameter would map one formal to one of them. Address computation for a
   // may_const LOAD does use the assumption — see run().
-  const AssumedArgMap NoAssumed;
+  const EJitFreeDimAssumptions NoAssumed;
   const DataLayout &DL = M.getDataLayout();
   SmallVector<CallBase *, 32> DirectCalls;
   DenseMap<const Function *, SmallVector<CallBase *, 4>> CallsByCallee;
@@ -763,7 +822,8 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
       do {
         Changed = false;
         SmallVector<const Argument *, 8> Invalid;
-        for (const auto &[Formal, ExpectedOffset] : State.boundArguments) {
+        for (const auto &[FormalValue, ExpectedOffset] : State.boundArguments) {
+          const auto *Formal = cast<Argument>(FormalValue);
           if (Formal == RootArgument)
             continue;
           const Function *Callee = Formal->getParent();
@@ -823,14 +883,16 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
 static bool
 isBoundMayConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
                     ArrayRef<std::pair<uint64_t, uint64_t>> MayConstFields,
-                    const DataLayout &DL, const AssumedArgMap &Assumed) {
+                    const DataLayout &DL,
+                    const EJitFreeDimAssumptions &Assumed) {
   if (LI->isVolatile() || LI->isAtomic())
     return false;
   auto Offset = getBoundPointerOffset(LI->getPointerOperand(), BoundArguments,
                                       DL, Assumed);
   if (!Offset)
     return false;
-  if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+  if (LI->hasMetadata(MD_EJIT_MAY_CONST) &&
+      !usesLocalFreeDim(LI->getPointerOperand(), Assumed))
     return true;
 
   TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
@@ -843,10 +905,14 @@ isBoundMayConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
   return false;
 }
 
+static bool offsetFitsInObject(const GlobalVariable *GV, uint64_t ByteOffset,
+                                Type *LoadTy, const DataLayout &DL);
+
 /// Check whether a load is (or can be treated as) a may_const access.
-static bool
-isMayConstLoad(const LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
-               const DataLayout &DL) {
+static bool isMayConstLoad(const LoadInst *LI,
+                           const MayConstOffsetMap &mayConstFieldMap,
+                           const DataLayout &DL,
+                           const EJitFreeDimAssumptions &Assumed) {
   // Never substituted. Checked ahead of the metadata, not just ahead of the
   // fallback, so that a pass which copies !ejit.may_const onto a volatile or
   // atomic load cannot defeat the frontend's exclusion.
@@ -862,6 +928,19 @@ isMayConstLoad(const LoadInst *LI, const MayConstOffsetMap &mayConstFieldMap,
   // field it starts at.
   const GlobalVariable *RootGV = nullptr;
   auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
+  if (!Off && usesLocalFreeDim(LI->getPointerOperand(), Assumed)) {
+    RootGV = findRootGV(LI->getPointerOperand());
+    auto Witness = accumulateFullOffset(DL, LI->getPointerOperand(), Assumed);
+    if (RootGV && Witness &&
+        offsetFitsInObject(RootGV, *Witness, LI->getType(), DL)) {
+      Type *Element = RootGV->getValueType();
+      if (auto *Array = dyn_cast<ArrayType>(Element))
+        Element = Array->getElementType();
+      TypeSize Stride = DL.getTypeAllocSize(Element);
+      if (!Stride.isScalable() && Stride.getFixedValue())
+        Off = *Witness % Stride.getFixedValue();
+    }
+  }
   if (Off && RootGV) {
     auto It = mayConstFieldMap.find(RootGV);
     if (It != mayConstFieldMap.end() && is_contained(It->second, *Off)) {
@@ -887,7 +966,8 @@ EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
     for (const BasicBlock &BB : F) {
       for (const Instruction &I : BB) {
         const auto *LI = dyn_cast<LoadInst>(&I);
-        if (!LI || !isMayConstLoad(LI, mayConstFieldMap_, DL))
+        if (!LI ||
+            !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
           continue;
 
         EJitMayConstLoadSite Site;
@@ -939,7 +1019,8 @@ EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         auto *LI = dyn_cast<LoadInst>(&I);
-        if (!LI || !isMayConstLoad(LI, mayConstFieldMap_, DL))
+        if (!LI ||
+            !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
           continue;
 
         const uint64_t SiteID = SiteIndex + 1;
@@ -983,6 +1064,9 @@ void EJitStructFieldPass::removeMayConstLoadInstrumentation(Module &M) {
     if (Address)
       RecursivelyDeleteTriviallyDeadInstructions(Address);
   }
+  // Nonzero site addresses may be uniqued ConstantExpr GEPs, not Instructions.
+  // Removing the atomic users does not itself destroy those dead constants.
+  Counters->removeDeadConstantUsers();
   assert(Counters->use_empty() && "may_const counter still has users");
   Counters->eraseFromParent();
 }
@@ -1114,13 +1198,11 @@ static bool absoluteAddressAddSignedOffsetNoWrap(const APInt &Address,
 /// obligation carried by the GEP and optionally return the address after each
 /// individual index. This matters because a valid final address does not make
 /// an earlier flagged step valid.
-static std::optional<APInt>
-computeAbsoluteGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
-                        const AssumedArgMap &Assumed,
-                        const APInt *BaseAddress = nullptr,
-                        SmallVectorImpl<APInt> *IntermediateAddresses = nullptr,
-                        bool *HasNonZeroIndex = nullptr,
-                        bool *UsedAssumption = nullptr) {
+static std::optional<APInt> computeAbsoluteGEPOffset(
+    const GEPOperator *GEP, const DataLayout &DL,
+    const EJitFreeDimAssumptions &Assumed, const APInt *BaseAddress = nullptr,
+    SmallVectorImpl<APInt> *IntermediateAddresses = nullptr,
+    bool *HasNonZeroIndex = nullptr, bool *UsedAssumption = nullptr) {
   constexpr unsigned HostPointerBits = sizeof(uintptr_t) * 8;
   if (!GEP->getType()->isPointerTy() ||
       DL.getIndexTypeSizeInBits(GEP->getType()) != HostPointerBits)
@@ -1140,7 +1222,7 @@ computeAbsoluteGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
       Indices.push_back(CI->getValue());
       continue;
     }
-    if (Assumed.empty())
+    if (Assumed.values.empty() && Assumed.phiInputs.empty())
       return std::nullopt;
     auto Folded = evalWithAssumed(*I, Assumed, 0);
     if (!Folded || Folded->getBitWidth() > 64)
@@ -1296,7 +1378,8 @@ collectAbsoluteGEPChain(const Value *Ptr, const DataLayout &DL) {
 
 static std::optional<APInt>
 getAbsoluteTarget(const Value *Ptr, const DataLayout &DL,
-                 const AssumedArgMap &Assumed, bool *UsedAssumption = nullptr) {
+                  const EJitFreeDimAssumptions &Assumed,
+                  bool *UsedAssumption = nullptr) {
   constexpr unsigned HostPointerBits = sizeof(uintptr_t) * 8;
   auto Chain = collectAbsoluteGEPChain(Ptr, DL);
   if (!Chain)
@@ -1414,7 +1497,7 @@ static bool absoluteAddressInObject(const APInt &Address, uintptr_t ObjectBase,
 /// same allocation, and an inbounds GEP's base must already be in that
 /// allocation (or one-past it).
 static bool absoluteGEPChainFitsObject(const Value *Ptr, const DataLayout &DL,
-                                       const AssumedArgMap &Assumed,
+                                       const EJitFreeDimAssumptions &Assumed,
                                        uintptr_t ObjectBase,
                                        uint64_t ObjectSize) {
   auto Chain = collectAbsoluteGEPChain(Ptr, DL);
@@ -1466,54 +1549,177 @@ static bool absoluteFieldAuthorized(
          ejitAccessFitsMayConstField(GV, FieldOffset, AccessSize, DL);
 }
 
-/// Authorize a complete access within one compiler-described pointee element.
-/// Field ranges include nested arrays; the allocation may hold several
-/// pointee elements.
-static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
-                                          uint64_t AllocationSize,
-                                          uint64_t Relative,
-                                          uint64_t AccessSize) {
+struct PointerFieldLayout {
+  uint64_t Stride;
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> Fields;
+
+  bool authorizes(uint64_t Offset, uint64_t AccessSize) const {
+    for (const auto &[Begin, Size] : Fields)
+      if (Offset >= Begin && Offset - Begin <= Size &&
+          AccessSize <= Size - (Offset - Begin))
+        return true;
+    return false;
+  }
+};
+
+// Distinguish absent legacy metadata from malformed present metadata: a bad
+// layout must not be rescued by the older offset-only representation.
+static std::optional<PointerFieldLayout>
+getPointerFieldLayout(const GlobalVariable &GV, bool &Present) {
+  Present = false;
   MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
   if (!MD)
-    return false;
+    return std::nullopt;
   const MDNode *Layout = nullptr;
   for (const MDOperand &Op : MD->operands()) {
     auto *Node = dyn_cast<MDNode>(Op.get());
-    if (!Node || Node->getNumOperands() < 2)
+    if (!Node || !Node->getNumOperands())
       continue;
     auto *Tag = dyn_cast<MDString>(Node->getOperand(0));
     if (Tag && Tag->getString() == "ejit_pointer_layout") {
+      Present = true;
       if (Layout)
-        return false;
+        return std::nullopt;
       Layout = Node;
     }
   }
-  if (!Layout)
-    return false;
+  if (!Layout || Layout->getNumOperands() < 2)
+    return std::nullopt;
   auto *StrideMD = mdconst::dyn_extract<ConstantInt>(Layout->getOperand(1));
   if (!StrideMD || StrideMD->getBitWidth() > 64)
-    return false;
+    return std::nullopt;
   uint64_t Stride = StrideMD->getZExtValue();
-  if (!Stride || AllocationSize % Stride)
-    return false;
-  uint64_t Offset = Relative % Stride;
-  bool Authorized = false;
+  if (!Stride)
+    return std::nullopt;
+  PointerFieldLayout Result{Stride, {}};
   for (unsigned I = 2; I < Layout->getNumOperands(); ++I) {
     auto *Field = dyn_cast<MDNode>(Layout->getOperand(I));
     if (!Field || Field->getNumOperands() != 2)
-      return false;
+      return std::nullopt;
     auto *BeginMD = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
     auto *SizeMD = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
     if (!BeginMD || !SizeMD || BeginMD->getBitWidth() > 64 ||
         SizeMD->getBitWidth() > 64)
-      return false;
+      return std::nullopt;
     uint64_t Begin = BeginMD->getZExtValue(), Size = SizeMD->getZExtValue();
     if (!Size || Begin > Stride || Size > Stride - Begin)
-      return false;
-    Authorized |= Offset >= Begin && Offset - Begin <= Size &&
-                  AccessSize <= Size - (Offset - Begin);
+      return std::nullopt;
+    Result.Fields.emplace_back(Begin, Size);
   }
-  return Authorized;
+  return Result;
+}
+
+/// Authorize a complete access within one compiler-described pointee element.
+static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
+                                          uint64_t AllocationSize,
+                                          uint64_t Relative,
+                                          uint64_t AccessSize) {
+  bool Present = false;
+  auto Layout = getPointerFieldLayout(GV, Present);
+  return Layout && AllocationSize % Layout->Stride == 0 &&
+         Layout->authorizes(Relative % Layout->Stride, AccessSize);
+}
+
+// Retain a fixed outer-element selector, not just a nonzero result obtained
+// by setting an arbitrary dynamic outer index to its free-dim witness.
+static bool hasConstantWitnessElement(const AbsoluteGEPChain &Chain,
+                                      uintptr_t Base, uint64_t Stride,
+                                      uint64_t Element, const DataLayout &DL,
+                                      const EJitFreeDimAssumptions &Assumed) {
+  APInt Current = Chain.RootAddress;
+  EJitFreeDimAssumptions NoAssumed;
+  NoAssumed.phiInputs = Assumed.phiInputs;
+  for (auto It = Chain.LeafToRoot.rbegin(); It != Chain.LeafToRoot.rend();
+       ++It) {
+    const GEPOperator *GEP = *It;
+    const uint64_t Address = Current.getZExtValue();
+    auto Offset = computeAbsoluteGEPOffset(GEP, DL, Assumed, &Current);
+    if (!Offset)
+      return false;
+    if (Address >= Base && Address - Base < Stride) {
+      TypeSize SourceSize = DL.getTypeAllocSize(GEP->getSourceElementType());
+      if (!SourceSize.isScalable() && SourceSize.getFixedValue() == Stride)
+        if (auto Index = evalWithAssumed(GEP->getOperand(1), NoAssumed, 0))
+          if (!Index->isNegative() && Index->getActiveBits() <= 64 &&
+              Index->getZExtValue() == Element)
+            return true;
+      // A separate constant byte/field GEP can also select the outer element.
+      auto Fixed = computeAbsoluteGEPOffset(GEP, DL, NoAssumed, &Current);
+      if (Fixed) {
+        const uint64_t Next = (Current + *Fixed).getZExtValue();
+        if (Next >= Base && (Next - Base) / Stride == Element)
+          return true;
+      }
+    }
+    Current += *Offset;
+  }
+  return false;
+}
+
+// The deployment guarantees a live, compile-readable prefix through the
+// selected witness element and the existing period/free-dim invariants.
+// This trusted minimum extent is never registered or used by strict checking.
+static const char *checkLightweightPointerWitness(
+    const GlobalVariable &GV, LoadInst *LI, uintptr_t Base, uintptr_t Target,
+    uint64_t AccessSize, const MayConstOffsetMap &Fields, const DataLayout &DL,
+    const EJitFreeDimAssumptions &Assumed) {
+  if (!Base)
+    return "null-pointer-base";
+  if (Target < Base)
+    return "witness-before-pointer-base";
+  const uint64_t Relative = Target - Base;
+  auto Chain = collectAbsoluteGEPChain(LI->getPointerOperand(), DL);
+  if (!Chain || Chain->LeafToRoot.empty())
+    return "invalid-gep-witness";
+  bool Present = false;
+  auto Layout = getPointerFieldLayout(GV, Present);
+  uint64_t Stride = 0;
+  if (Present) {
+    if (!Layout)
+      return "layout-or-field-unauthorized";
+    Stride = Layout->Stride;
+    if (!Layout->authorizes(Relative % Stride, AccessSize))
+      return "layout-or-field-unauthorized";
+  } else {
+    // Legacy offsets alone do not describe a field's width. Preserve typed
+    // witnesses; opaque byte chains without layout stay live.
+    if (Chain->RootAddress.getZExtValue() != Base)
+      return "legacy-witness-missing-type";
+    Type *RootTy = Chain->LeafToRoot.back()->getSourceElementType();
+    if (!RootTy->isAggregateType() || !RootTy->isSized())
+      return "legacy-witness-missing-type";
+    TypeSize RootSize = DL.getTypeAllocSize(RootTy);
+    if (RootSize.isScalable() || !RootSize.getFixedValue())
+      return "layout-or-field-unauthorized";
+    Stride = RootSize.getFixedValue();
+    const uint64_t FieldOffset = Relative % Stride;
+    auto It = Fields.find(&GV);
+    auto FieldSize = ejitMayConstFieldSizeInType(RootTy, FieldOffset, DL);
+    if (It == Fields.end() || !llvm::is_contained(It->second, FieldOffset) ||
+        !FieldSize || AccessSize > *FieldSize)
+      return "layout-or-field-unauthorized";
+  }
+  // Modulo checks field identity, not allocation identity. A later element
+  // must still be reached from a root in this registration's first element;
+  // otherwise every earlier unrelated allocation could appear eligible.
+  const uintptr_t Root = Chain->RootAddress.getZExtValue();
+  if (Relative >= Stride && (Root < Base || Root - Base >= Stride))
+    return "nonzero-witness-unanchored-root";
+  if (Relative >= Stride &&
+      !hasConstantWitnessElement(*Chain, Base, Stride, Relative / Stride, DL,
+                                 Assumed))
+    return "nonzero-witness-dynamic-element";
+  const uint64_t ElementOffset = Relative - Relative % Stride;
+  if (ElementOffset > std::numeric_limits<uint64_t>::max() - Stride)
+    return "witness-extent-overflow";
+  const uint64_t Extent = ElementOffset + Stride;
+  uint64_t CheckedRelative = 0;
+  if (!absoluteRangeContains(Base, Extent, Target, AccessSize, CheckedRelative))
+    return "witness-extent-overflow";
+  if (!absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed, Base,
+                                  Extent))
+    return "invalid-gep-witness";
+  return nullptr;
 }
 
 /// Resolve a may_const load after IPSCCP/InstCombine has propagated a period
@@ -1521,12 +1727,13 @@ static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
 /// non-pointer registered object, accept only a unique, bounded and authorized
 /// field whose complete root-to-leaf GEP witness is valid. Pointer-form objects
 /// with explicit allocation bounds and compiler field ranges use the same
-/// witness checks. Unbounded pointers retain the legacy constant-index path.
-/// Allocator-discovered bounds only add witness folds.
+/// witness checks. Unbounded pointers additionally accept anchored free-dim
+/// witnesses under the deployment's readable-pointee and lifecycle contract.
+/// Allocator-discovered bounds add strict folds only after legacy matching.
 static Constant *tryReplacePeriodAbsoluteAddress(
     LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
     const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
-    const DataLayout &DL, const AssumedArgMap &Assumed) {
+    const DataLayout &DL, const EJitFreeDimAssumptions &Assumed) {
   if (LI->isVolatile() || LI->isAtomic())
     return nullptr;
   TypeSize AccessTypeSize = DL.getTypeStoreSize(LI->getType());
@@ -1539,6 +1746,11 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   if (!TargetValue)
     return nullptr;
   const uintptr_t Target = static_cast<uintptr_t>(TargetValue->getZExtValue());
+  if ((usesLocalFreeDim(LI->getPointerOperand(), Assumed) ||
+       !Assumed.phiInputs.empty()) &&
+      (Target % LI->getAlign().value() ||
+       Target % DL.getABITypeAlign(LI->getType()).value()))
+    return nullptr;
 
   unsigned Matches = 0;
   const uint8_t *Candidate = nullptr;
@@ -1546,14 +1758,16 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   // match that exists without an allocation lookup.
   unsigned DiscoveredMatches = 0;
   const uint8_t *DiscoveredCandidate = nullptr;
+  SmallVector<uintptr_t, 4> LightweightBases;
+  SmallVector<uintptr_t, 4> StrictBases;
   for (const auto &[GV, Info] : gvMap) {
     if (GV->getValueType()->isPointerTy()) {
       // Preserve the pre-existing constant-address path for pointer-valued
       // periods. It deliberately does not require the helper itself to carry
       // the consuming entry's lifecycle metadata: the pointer materialization
       // and the old absolute-address fold are also used through non-inlined
-      // helpers. Only supplied bounds below allow a free-dim witness; the
-      // legacy registration does not describe the pointee's extent.
+      // helpers. The lightweight witness path shares that lifecycle contract;
+      // it does not invent a new entry metadata requirement for such helpers.
       if (DL.getPointerSize(0) != sizeof(void *))
         continue;
       void *PointerSlot = resolveBase(GV, Info, reg);
@@ -1564,45 +1778,71 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       const uintptr_t PointeeBase = reinterpret_cast<uintptr_t>(Pointee);
       const std::string Name = GV->getName().str();
       const bool Explicit = reg.getPointerPeriodBounds(Name);
-      // Explicit bounds select the strict path even for a constant index.
-      // Discovered bounds are only consulted for witness-derived addresses,
-      // so constant addresses keep the legacy decision below.
-      std::optional<PointerPeriodBounds> Bounds;
-      if (Explicit || UsedAssumption)
-        Bounds = reg.resolvePointerPeriodBounds(Name, Pointee);
-      if (Bounds) {
-        uint64_t Relative = 0;
-        if (Pointee == Bounds->base &&
-            hasAbsoluteAddressContract(F, Info.periodName) &&
-            absoluteRangeContains(PointeeBase, Bounds->size, Target,
-                                  AccessSize, Relative) &&
-            absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed,
-                                       PointeeBase, Bounds->size) &&
-            boundedPointerFieldAuthorized(*GV, Bounds->size, Relative,
-                                          AccessSize)) {
-          if (Explicit) {
-            Candidate = reinterpret_cast<const uint8_t *>(Target);
-            ++Matches;
-          } else {
-            DiscoveredCandidate = reinterpret_cast<const uint8_t *>(Target);
-            ++DiscoveredMatches;
-          }
+      // Preserve existing constant-address matches before consulting discovery.
+      // Explicit bounds always select strict checking, including on failure.
+      if (!Explicit && !UsedAssumption && PointeeBase &&
+          Target >= PointeeBase) {
+        const uint64_t FieldOffset = Target - PointeeBase;
+        auto FieldIt = mayConstFieldMap.find(GV);
+        if (FieldIt != mayConstFieldMap.end() &&
+            llvm::is_contained(FieldIt->second, FieldOffset) &&
+            AccessSize <= std::numeric_limits<uintptr_t>::max() - Target) {
+          Candidate = reinterpret_cast<const uint8_t *>(Target);
+          ++Matches;
+          continue;
         }
-        // A failed strict check never falls through to the legacy matcher.
+      }
+
+      // Discovery can also prove a nonzero constant element that the legacy
+      // element-relative offset matcher missed. It grants no new lifecycle,
+      // field-width or witness permissions: every strict check still applies.
+      auto Bounds = reg.resolvePointerPeriodBounds(Name, Pointee);
+      if (Explicit || Bounds) {
+        StrictBases.push_back(PointeeBase);
+        if (Bounds)
+          StrictBases.push_back(reinterpret_cast<uintptr_t>(Bounds->base));
+      }
+      uint64_t Relative = 0;
+      const char *Rejection = nullptr;
+      if (!Bounds && !Explicit && UsedAssumption) {
+        Rejection = checkLightweightPointerWitness(*GV, LI, PointeeBase, Target,
+                                                   AccessSize, mayConstFieldMap,
+                                                   DL, Assumed);
+        if (!Rejection) {
+          LightweightBases.push_back(PointeeBase);
+          continue;
+        }
+      } else if (!Bounds)
+        Rejection = "unknown-bounds";
+      else if (Pointee != Bounds->base)
+        Rejection = "stale-pointer-base";
+      else if (!hasAbsoluteAddressContract(F, Info.periodName))
+        Rejection = "missing-entry-contract";
+      else if (!absoluteRangeContains(PointeeBase, Bounds->size, Target,
+                                      AccessSize, Relative))
+        Rejection = "access-out-of-bounds";
+      else if (!absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed,
+                                           PointeeBase, Bounds->size))
+        Rejection = "invalid-gep-witness";
+      else if (!boundedPointerFieldAuthorized(*GV, Bounds->size, Relative,
+                                              AccessSize))
+        Rejection = "layout-or-field-unauthorized";
+      if (Rejection) {
+        // This is a candidate rejection, not the result for the entire load:
+        // another registered object may still be its unique authorized match.
+        EJIT_DIAG_VERBOSE("pointer-period candidate rejected fn=%s gv=%s "
+                          "period=%s reason=%s",
+                          F.getName().str().c_str(), Name.c_str(),
+                          Info.periodName.c_str(), Rejection);
         continue;
       }
-      if (UsedAssumption)
-        continue;
-      if (!PointeeBase || Target < PointeeBase)
-        continue;
-      const uint64_t FieldOffset = Target - PointeeBase;
-      auto FieldIt = mayConstFieldMap.find(GV);
-      if (FieldIt == mayConstFieldMap.end() ||
-          !llvm::is_contained(FieldIt->second, FieldOffset) ||
-          AccessSize > std::numeric_limits<uintptr_t>::max() - Target)
-        continue;
-      Candidate = reinterpret_cast<const uint8_t *>(Target);
-      ++Matches;
+      if (Explicit) {
+        Candidate = reinterpret_cast<const uint8_t *>(Target);
+        ++Matches;
+      } else {
+        DiscoveredCandidate = reinterpret_cast<const uint8_t *>(Target);
+        ++DiscoveredMatches;
+      }
       continue;
     }
 
@@ -1636,6 +1876,31 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   // overlap remains ambiguous.
   if (!Matches && DiscoveredMatches == 1)
     return createConstantFromMemory(DiscoveredCandidate, LI->getType(), DL);
+  // Existing strict/legacy winners keep their precedence. A second global
+  // name must not rescue strict rejection of the same pointer allocation.
+  if (!Matches && !DiscoveredMatches && !LightweightBases.empty()) {
+    for (uintptr_t Base : LightweightBases)
+      if (llvm::is_contained(StrictBases, Base)) {
+        EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
+                          "reason=strict-pointer-alias",
+                          F.getName().str().c_str());
+        return nullptr;
+      }
+    if (LightweightBases.size() == 1) {
+      EJIT_DIAG_VERBOSE("period absolute load folded fn=%s "
+                        "reason=lightweight-anchored-element-witness",
+                        F.getName().str().c_str());
+      return createConstantFromMemory(reinterpret_cast<const uint8_t *>(Target),
+                                      LI->getType(), DL);
+    }
+    EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
+                      "reason=ambiguous-lightweight-registration matches=%zu",
+                      F.getName().str().c_str(), LightweightBases.size());
+  }
+  if (Matches > 1 || (!Matches && DiscoveredMatches > 1))
+    EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
+                      "reason=ambiguous-registration matches=%u discovered=%u",
+                      F.getName().str().c_str(), Matches, DiscoveredMatches);
   if (Matches != 1)
     return nullptr;
   return createConstantFromMemory(Candidate, LI->getType(), DL);
@@ -1645,7 +1910,7 @@ static Constant *tryReplaceBoundPointer(LoadInst *LI, const uint8_t *Data,
                                         uint32_t Size,
                                         const AssumedArgMap &BoundArguments,
                                         const DataLayout &DL,
-                                        const AssumedArgMap &Assumed) {
+                                        const EJitFreeDimAssumptions &Assumed) {
   if (!Data || !Size)
     return nullptr;
   auto Offset = getBoundPointerOffset(LI->getPointerOperand(), BoundArguments,
@@ -1654,6 +1919,12 @@ static Constant *tryReplaceBoundPointer(LoadInst *LI, const uint8_t *Data,
   if (!Offset || AccessSize.isScalable() || *Offset > Size ||
       AccessSize.getFixedValue() > Size - *Offset)
     return nullptr;
+  if (usesLocalFreeDim(LI->getPointerOperand(), Assumed)) {
+    uintptr_t Address = reinterpret_cast<uintptr_t>(Data + *Offset);
+    if (Address % LI->getAlign().value() ||
+        Address % DL.getABITypeAlign(LI->getType()).value())
+      return nullptr;
+  }
   return createConstantFromMemory(Data + *Offset, LI->getType(), DL);
 }
 
@@ -1700,13 +1971,104 @@ tryReplaceDirectGV(LoadInst *LI, const GlobalVariable *GV,
   return createConstantFromMemory(base, LI->getType(), DL);
 }
 
+// Local witnesses use the checked pointer-index evaluator, not the legacy
+// int64 offset helper: intermediate inbounds steps and pointer arithmetic must
+// be valid too, even when the final address happens to be inside the object.
+static Constant *tryReplaceLocalWitnessGEP(
+    LoadInst *LI, const Value *Ptr, const GlobalVariable *GV,
+    const GVPeriodInfo &Info, const MayConstOffsetMap &Fields,
+    PeriodArrayRegistry &Registry, const DataLayout &DL,
+    const EJitFreeDimAssumptions &Assumed, std::optional<uint8_t> KnownCell) {
+  auto Fail = [&](const char *Reason) -> Constant * {
+    EJIT_DIAG_DEBUG("local-free-dim missed fn=%s reason=%s",
+                    LI->getFunction()->getName().str().c_str(), Reason);
+    return nullptr;
+  };
+  if (!hasAbsoluteAddressContract(*LI->getFunction(), Info.periodName))
+    return Fail("lifecycle-untracked");
+  auto Object = getRegisteredNonPointerObject(GV, Info, Registry, DL);
+  if (!Object)
+    return Fail("witness-extent-or-registration-unavailable");
+  SmallVector<const GEPOperator *, 8> Chain;
+  const Value *Root = Ptr;
+  while (Root != GV) {
+    Root = Root->stripPointerCasts();
+    if (Root == GV)
+      break;
+    auto *GEP = dyn_cast<GEPOperator>(Root);
+    if (!GEP || Chain.size() == 16)
+      return Fail("unsupported-address-chain");
+    Chain.push_back(GEP);
+    Root = GEP->getPointerOperand();
+  }
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(Object->base);
+  uintptr_t SelectedBase = Base;
+  uint64_t SelectedSize = Object->size;
+  if (Info.isArray) {
+    auto *Array = dyn_cast<ArrayType>(GV->getValueType());
+    const GEPOperator *RootGEP = Chain.empty() ? nullptr : Chain.back();
+    std::optional<APInt> Cell;
+    if (KnownCell) {
+      Cell = APInt(64, *KnownCell);
+    } else {
+      if (!Array || !RootGEP || RootGEP->getSourceElementType() != Array ||
+          RootGEP->getNumIndices() < 2 ||
+          !match(RootGEP->getOperand(1), m_Zero()) ||
+          usesLocalFreeDim(RootGEP->getOperand(2), Assumed))
+        return Fail("untracked-cell-identity");
+      Cell = evalWithAssumed(RootGEP->getOperand(2), Assumed, 0);
+    }
+    TypeSize Stride = DL.getTypeAllocSize(Array->getElementType());
+    if (!Cell || Cell->isNegative() || Cell->getActiveBits() > 64 ||
+        Cell->getZExtValue() >= Array->getNumElements() || Stride.isScalable())
+      return nullptr;
+    SelectedSize = Stride.getFixedValue();
+    if (Object->size > std::numeric_limits<uintptr_t>::max() - Base)
+      return nullptr;
+    SelectedBase += Cell->getZExtValue() * SelectedSize;
+  }
+  APInt Current(sizeof(uintptr_t) * 8, Base);
+  for (const GEPOperator *GEP : llvm::reverse(Chain)) {
+    SmallVector<APInt, 4> Intermediate;
+    bool NonZero = false;
+    auto Offset = computeAbsoluteGEPOffset(GEP, DL, Assumed, &Current,
+                                           &Intermediate, &NonZero);
+    if (!Offset)
+      return nullptr;
+    if (GEP->isInBounds() && NonZero) {
+      if (!absoluteAddressInObject(Current, Base, Object->size))
+        return nullptr;
+      for (const APInt &Address : Intermediate)
+        if (!absoluteAddressInObject(Address, Base, Object->size))
+          return nullptr;
+    }
+    Current += *Offset;
+  }
+  TypeSize Size = DL.getTypeStoreSize(LI->getType());
+  if (Size.isScalable())
+    return nullptr;
+  uintptr_t Target = Current.getZExtValue();
+  uint64_t Relative = 0;
+  if (Target % LI->getAlign().value() ||
+      Target % DL.getABITypeAlign(LI->getType()).value() ||
+      !absoluteRangeContains(SelectedBase, SelectedSize, Target,
+                             Size.getFixedValue(), Relative) ||
+      !absoluteRangeContains(Base, Object->size, Target, Size.getFixedValue(),
+                             Relative) ||
+      !absoluteFieldAuthorized(GV, Info, Fields, Relative, Size.getFixedValue(),
+                               DL))
+    return Fail("invalid-witness-field-range-or-alignment");
+  return createConstantFromMemory(reinterpret_cast<const void *>(Target),
+                                  LI->getType(), DL);
+}
+
 /// Pattern 2: load via a GEP chain rooted at a GlobalVariable.
 /// e.g. @g_cellCfg → GEP 0, idx → GEP 0, fieldIdx → load
-static Constant *tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp,
-                                     const GVPeriodMap &gvMap,
-                                     PeriodArrayRegistry &reg,
-                                     const DataLayout &DL,
-                                     const AssumedArgMap &Assumed) {
+static Constant *
+tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp, const GVPeriodMap &gvMap,
+                    const MayConstOffsetMap &Fields, PeriodArrayRegistry &reg,
+                    const DataLayout &DL, const EJitFreeDimAssumptions &Assumed,
+                    const StringMap<uint8_t> *LocalPeriods) {
   const GlobalVariable *GV = findRootGV(PtrOp);
   if (!GV)
     return nullptr;
@@ -1714,6 +2076,18 @@ static Constant *tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp,
   auto it = gvMap.find(GV);
   if (it == gvMap.end())
     return nullptr;
+
+  if (usesLocalFreeDim(PtrOp, Assumed)) {
+    std::optional<uint8_t> Cell;
+    if (LocalPeriods &&
+        hasAbsoluteAddressContract(*LI->getFunction(), it->second.periodName)) {
+      auto P = LocalPeriods->find(it->second.periodName);
+      if (P != LocalPeriods->end())
+        Cell = P->second;
+    }
+    return tryReplaceLocalWitnessGEP(LI, PtrOp, GV, it->second, Fields, reg,
+                                     DL, Assumed, Cell);
+  }
 
   bool UsedAssumption = false;
   auto byteOffset = accumulateFullOffset(DL, PtrOp, Assumed, &UsedAssumption);
@@ -1739,9 +2113,77 @@ static Constant *tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp,
   return createConstantFromMemory(fieldAddr, LI->getType(), DL);
 }
 
-/// Pattern 3: load via an indirect pointer — first load a pointer from a GV,
-/// then GEP into the pointed-to data.
-/// e.g. %ptr = load ptr, ptr @g_pCfg  → GEP %S, ptr %ptr, i32 0, i32 0
+/// Upper bound on the GEPs and pointer loads resolveIndirectAddress walks
+/// through for one access.
+static constexpr unsigned kMaxIndirectWalkDepth = 16;
+
+struct IndirectAddress {
+  const uint8_t *addr;
+  unsigned reads; // pointer loads followed to reach addr
+};
+
+/// Resolve the runtime address \p Ptr denotes by walking from the access back
+/// to a period GlobalVariable, then reading every pointer on the way down.
+///
+/// The first pointer read out of the period global needs no marker: for a
+/// pointer-form period that slot is the period object itself. Every read past
+/// it must be a may_const load, since only a may_const pointer is promised not
+/// to change within the period. A null pointer ends the walk.
+static std::optional<IndirectAddress>
+resolveIndirectAddress(const Value *Ptr, const GVPeriodMap &gvMap,
+                       PeriodArrayRegistry &reg, const DataLayout &DL,
+                       unsigned Depth = 0) {
+  if (Depth >= kMaxIndirectWalkDepth)
+    return std::nullopt;
+  Ptr = Ptr->stripPointerCasts();
+
+  if (auto *GV = dyn_cast<GlobalVariable>(Ptr)) {
+    auto It = gvMap.find(GV);
+    // Pointer materialization exposes the strict absolute-address path on
+    // the next pass. Do not bypass its bounds/field checks here.
+    if (It == gvMap.end() || reg.getPointerPeriodBounds(GV->getName().str()))
+      return std::nullopt;
+    void *Base = resolveBase(GV, It->second, reg);
+    if (!Base)
+      return std::nullopt;
+    return IndirectAddress{static_cast<const uint8_t *>(Base), 0};
+  }
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+    auto Base = resolveIndirectAddress(GEP->getPointerOperand(), gvMap, reg,
+                                       DL, Depth + 1);
+    if (!Base)
+      return std::nullopt;
+    // See tryReplaceIndirect for why no free-dim assumption is used.
+    auto Off = computeGEPOffset(GEP, DL, EJitFreeDimAssumptions());
+    if (!Off)
+      return std::nullopt;
+    Base->addr += *Off;
+    return Base;
+  }
+
+  auto *Load = dyn_cast<LoadInst>(Ptr);
+  if (!Load || Load->isVolatile() || Load->isAtomic() ||
+      DL.getPointerSize(Load->getType()->getPointerAddressSpace()) !=
+          sizeof(void *))
+    return std::nullopt;
+  auto Slot = resolveIndirectAddress(Load->getPointerOperand(), gvMap, reg, DL,
+                                     Depth + 1);
+  if (!Slot || (Slot->reads && !Load->hasMetadata(MD_EJIT_MAY_CONST)))
+    return std::nullopt;
+  void *Pointee = nullptr;
+  std::memcpy(&Pointee, Slot->addr, sizeof(Pointee));
+  if (!Pointee)
+    return std::nullopt;
+  return IndirectAddress{static_cast<const uint8_t *>(Pointee),
+                         Slot->reads + 1};
+}
+
+/// Pattern 3: load through one or more pointers — a pointer read from a GV,
+/// optionally followed by may_const pointer fields, then a GEP into the
+/// pointed-to data.
+/// e.g. %p = load ptr, ptr @g_pCfg → %q = load ptr, (GEP %p), !ejit.may_const
+///      → load (GEP %q), !ejit.may_const
 static Constant *
 tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
                    const GVPeriodMap &gvMap, PeriodArrayRegistry &reg,
@@ -1752,76 +2194,106 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
   // tryReplaceDirectGEP bounds one. Declining the assumption is the
   // conservative half of that trade: a constant index still resolves exactly
   // as before, and no address the program may never form is dereferenced.
-  const AssumedArgMap Assumed;
-  // Walk the GEP chain from the load's pointer operand to find
-  // the base LoadInst that reads the pointer value from a GV.
-  const Value *V = PtrOp;
-  SmallVector<const GEPOperator *, 4> FieldGEPs;
-  while (V) {
-    V = V->stripPointerCasts();
-    if (auto *GEP = dyn_cast<GEPOperator>(V)) {
-      FieldGEPs.push_back(GEP);
-      V = GEP->getPointerOperand();
-      continue;
-    }
-    break;
+  auto Field = resolveIndirectAddress(PtrOp, gvMap, reg, DL);
+  if (!Field || !Field->reads)
+    return nullptr;
+  return createConstantFromMemory(Field->addr, LI->getType(), DL);
+}
+
+//===----------------------------------------------------------------------===//
+// Bounded PHI witness comparison
+//===----------------------------------------------------------------------===//
+
+static constexpr unsigned kMaxPhiWitnesses = 16;
+static constexpr unsigned kMaxPhiWitnessNodes = 64;
+
+static bool collectPhiWitnesses(
+    const Value *V, SmallPtrSetImpl<const Value *> &Active,
+    SmallPtrSetImpl<const Value *> &Visited,
+    SmallVectorImpl<const PHINode *> &Phis, unsigned &Witnesses,
+    unsigned Depth = 0) {
+  if (Depth > kMaxAssumedEvalDepth)
+    return false;
+  // A local free-dim call is a value boundary. In particular, do not inspect
+  // its initializer and accidentally authorize an unmarked sibling input.
+  if (isa<Constant, Argument, LoadInst, CallBase>(V))
+    return true;
+  if (Visited.contains(V))
+    return true;
+  if (Visited.size() + Active.size() >= kMaxPhiWitnessNodes ||
+      !Active.insert(V).second)
+    return false;
+  const auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return false;
+  if (const auto *PN = dyn_cast<PHINode>(I)) {
+    unsigned Count = PN->getNumIncomingValues();
+    if (!PN->getType()->isIntegerTy() || !Count ||
+        Count > kMaxPhiWitnesses / Witnesses)
+      return false;
+    Witnesses *= Count;
+    Phis.push_back(PN);
   }
+  for (const Use &Op : I->operands())
+    if (!collectPhiWitnesses(Op.get(), Active, Visited, Phis, Witnesses,
+                             Depth + 1))
+      return false;
+  Active.erase(V);
+  Visited.insert(V);
+  return true;
+}
 
-  auto *BaseLoad = dyn_cast<LoadInst>(V);
-  if (!BaseLoad)
+static Constant *tryReplacePhiWitness(
+    LoadInst *LI, const GVPeriodMap &Globals, const MayConstOffsetMap &Fields,
+    PeriodArrayRegistry &Registry, const DataLayout &DL,
+    const EJitFreeDimAssumptions &Assumed,
+    const StringMap<uint8_t> *LocalPeriods) {
+  if (!LI->isSimple() || !LI->getType()->isIntegerTy() ||
+      LI->getType()->getIntegerBitWidth() > 64)
+    return nullptr;
+  SmallPtrSet<const Value *, 16> Active, Visited;
+  SmallVector<const PHINode *, 4> Phis;
+  unsigned Witnesses = 1;
+  if (!collectPhiWitnesses(LI->getPointerOperand(), Active, Visited, Phis,
+                           Witnesses) || Phis.empty())
     return nullptr;
 
-  // Resolve the pointer-valued GV that BaseLoad reads from.
-  const Value *LoadPtr = BaseLoad->getPointerOperand()->stripPointerCasts();
-  const GlobalVariable *PtrGV = nullptr;
-  uint64_t ptrArrayByteOff = 0;
-
-  if (auto *DirectGV = dyn_cast<GlobalVariable>(LoadPtr)) {
-    PtrGV = DirectGV;
-  } else if (auto *PtrGEP = dyn_cast<GEPOperator>(LoadPtr)) {
-    PtrGV = dyn_cast<GlobalVariable>(
-        PtrGEP->getPointerOperand()->stripPointerCasts());
-    if (PtrGV) {
-      auto off = computeGEPOffset(PtrGEP, DL, Assumed);
-      if (!off)
-        return nullptr;
-      ptrArrayByteOff = *off;
-    }
+  const GlobalVariable *GV = findRootGV(LI->getPointerOperand());
+  auto Global = Globals.find(GV);
+  std::optional<uint8_t> Cell;
+  if (GV && Global != Globals.end() && LocalPeriods) {
+    auto P = LocalPeriods->find(Global->second.periodName);
+    if (P != LocalPeriods->end())
+      Cell = P->second;
   }
-  if (!PtrGV)
-    return nullptr;
-
-  // Pointer materialization exposes the strict absolute-address path on the
-  // next pass. Do not bypass its bounds/field checks in this legacy fallback.
-  if (reg.getPointerPeriodBounds(PtrGV->getName().str()))
-    return nullptr;
-
-  auto it = gvMap.find(PtrGV);
-  if (it == gvMap.end())
-    return nullptr;
-
-  void *gvBase = resolveBase(PtrGV, it->second, reg);
-  if (!gvBase)
-    return nullptr;
-
-  // Read the stored pointer: *(void**)(gvBase + ptrArrayByteOff)
-  uintptr_t ptrSlot = reinterpret_cast<uintptr_t>(gvBase) + ptrArrayByteOff;
-  void *dataBase = nullptr;
-  std::memcpy(&dataBase, reinterpret_cast<void *>(ptrSlot), sizeof(void *));
-  if (!dataBase)
-    return nullptr;
-
-  // Compute field offset from the GEPs past the pointer dereference.
-  uint64_t fieldOff = 0;
-  for (auto It = FieldGEPs.rbegin(); It != FieldGEPs.rend(); ++It) {
-    auto off = computeGEPOffset(*It, DL, Assumed);
-    if (!off)
+  EJitFreeDimAssumptions Selected = Assumed;
+  Constant *Common = nullptr;
+  // Enumerate a bounded superset of feasible edges. This may reject an
+  // infeasible combination, but never infer equality from only one path.
+  for (unsigned N = 0; N < Witnesses; ++N) {
+    unsigned Choice = N;
+    for (const PHINode *PN : Phis) {
+      unsigned Count = PN->getNumIncomingValues();
+      Selected.phiInputs[PN] = PN->getIncomingValue(Choice % Count);
+      Choice /= Count;
+    }
+    Constant *C = tryReplacePeriodAbsoluteAddress(
+        LI, *LI->getFunction(), Globals, Fields, Registry, DL, Selected);
+    if (!C && GV && Global != Globals.end())
+      C = tryReplaceLocalWitnessGEP(LI, LI->getPointerOperand(), GV,
+                                    Global->second, Fields, Registry, DL,
+                                    Selected, Cell);
+    if (!C || (Common && Common != C)) {
+      EJIT_DIAG_DEBUG("phi-witness missed fn=%s reason=%s",
+                      LI->getFunction()->getName().str().c_str(),
+                      C ? "different-incoming-values" : "unresolved-incoming");
       return nullptr;
-    fieldOff += *off;
+    }
+    Common = C;
   }
-
-  auto *fieldAddr = static_cast<const uint8_t *>(dataBase) + fieldOff;
-  return createConstantFromMemory(fieldAddr, LI->getType(), DL);
+  EJIT_DIAG_DEBUG("phi-witness folded fn=%s witnesses=%u",
+                  LI->getFunction()->getName().str().c_str(), Witnesses);
+  return Common;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1841,7 +2313,7 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
 ///   unsupported-type  — createConstantFromMemory cannot build the load type
 static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
                               PeriodArrayRegistry &reg, const DataLayout &DL,
-                              const AssumedArgMap &Assumed) {
+                              const EJitFreeDimAssumptions &Assumed) {
   Value *Ptr = LI->getPointerOperand();
   const GlobalVariable *GV = findRootGV(Ptr);
   if (!GV) {
@@ -1900,8 +2372,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // 1. Use cached module-level metadata maps (built once per module by
   //    initFromModule(), reused across all function runs).
 
-  // 2. Scan all loads and collect replacements.
+  // 2. Give legacy and strict paths their existing first attempt.
   struct Replacement { LoadInst *LI; Constant *ConstVal; };
+  SmallVector<Replacement, 8> Roots;
+  SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
 #ifdef EJIT_DIAG_ENABLE
   size_t totalLoads = 0, mayConstLoads = 0;
@@ -1923,21 +2397,19 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       ++totalLoads;
 #endif
 
-      // A pointer-form period global is itself the root needed to reach nested
-      // may_const fields. It has no may_const marker of its own, but replacing
-      // it here exposes a concrete address to IPSCCP and later StructFieldPass
-      // rounds, including when the field access lives in a non-inlined helper.
       if (Constant *C = tryReplacePeriodPointerBase(
               LI, gvPeriodMap_, registry_, DL)) {
-        replacements.push_back({LI, C});
+        Roots.push_back({LI, C});
         continue;
       }
 
       bool BoundMayConst = false;
       for (const BoundPointerState &State : boundStates_)
-        BoundMayConst |= isBoundMayConstLoad(
-            LI, State.boundArguments, State.mayConstFields, DL, freeDimArgs_);
-      if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
+        BoundMayConst |=
+            isBoundMayConstLoad(LI, State.boundArguments, State.mayConstFields,
+                                DL, freeDimAssumptions_);
+      if (!BoundMayConst &&
+          !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
         continue;
 #ifdef EJIT_DIAG_ENABLE
       ++mayConstLoads;
@@ -1948,7 +2420,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Try each access pattern in order.
       Constant *C = tryReplacePeriodAbsoluteAddress(
           LI, F, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
-          freeDimArgs_);
+          freeDimAssumptions_);
 
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
       // from the shared object; the pointer argument and all dynamic fields
@@ -1956,7 +2428,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (!C) {
         for (const BoundPointerState &State : boundStates_) {
           C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
-                                     State.boundArguments, DL, freeDimArgs_);
+                                     State.boundArguments, DL,
+                                     freeDimAssumptions_);
           if (C)
             break;
         }
@@ -1970,24 +2443,51 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       // Pattern 2: GEP-based access (array or struct field).
       if (!C)
-        C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, registry_, DL,
-                                freeDimArgs_);
+        C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, mayConstFieldMap_,
+                                registry_, DL, freeDimAssumptions_,
+                                F.getName() == boundRootFunction_
+                                    ? &localWitnessPeriods_
+                                    : nullptr);
 
-      // Pattern 3: indirect pointer access (pointer-type period variable).
+      // Pattern 3: indirect pointer access (pointer-type period variable,
+      // then any number of may_const pointer fields).
       if (!C)
         C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
 
       if (C)
         replacements.push_back({LI, C});
-#ifdef EJIT_DIAG_ENABLE
       else
-        logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimArgs_);
-#endif
+        PendingFields.push_back(LI);
     }
   }
 
-  // 3. Apply replacements.
-  bool changed = false;
+  // 3. Retry unresolved fields after materializing roots, before InstCombine
+  // can absorb a nonzero cell offset and lose the registration anchor. Do not
+  // preempt legacy constant-index matches or change any live slot address.
+  for (auto &R : Roots)
+    R.LI->replaceAllUsesWith(R.ConstVal);
+  for (LoadInst *LI : PendingFields) {
+    Constant *C = Roots.empty() ? nullptr
+                                : tryReplacePeriodAbsoluteAddress(
+                                      LI, F, gvPeriodMap_, mayConstFieldMap_,
+                                      registry_, DL, freeDimAssumptions_);
+    if (!C)
+      C = tryReplacePhiWitness(
+          LI, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
+          freeDimAssumptions_,
+          F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr);
+    if (C)
+      replacements.push_back({LI, C});
+#ifdef EJIT_DIAG_ENABLE
+    else
+      logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimAssumptions_);
+#endif
+  }
+  for (auto &R : Roots)
+    R.LI->eraseFromParent();
+
+  // 4. Apply field replacements.
+  bool changed = !Roots.empty();
   for (auto &R : replacements) {
     R.LI->replaceAllUsesWith(R.ConstVal);
     R.LI->eraseFromParent();
@@ -2001,16 +2501,17 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   // callees with no may_const activity stay silent, eliminating the bulk of
   // the struct-field log volume while preserving locatability for the
   // functions that matter. Raise the log level to VERBOSE to see this detail.
-  if (isEjitEntry || mayConstLoads > 0 || !replacements.empty()) {
+  if (isEjitEntry || mayConstLoads > 0 || changed) {
     EJIT_DIAG_VERBOSE("struct-field run func=%s entry=%d replaced=%zu",
                       F.getName().str().c_str(), isEjitEntry ? 1 : 0,
-                      replacements.size());
+                      Roots.size() + replacements.size());
     EJIT_DIAG_VERBOSE("  loads total=%zu may_const=%zu replaced=%zu",
-                      totalLoads, mayConstLoads, replacements.size());
+                      totalLoads, mayConstLoads,
+                      Roots.size() + replacements.size());
   }
 #endif
   LLVM_DEBUG(if (changed) dbgs() << "ejit-struct-field: replaced "
-                                 << replacements.size() << " load(s) in "
-                                 << F.getName() << "\n");
+                                 << Roots.size() + replacements.size()
+                                 << " load(s) in " << F.getName() << "\n");
   return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

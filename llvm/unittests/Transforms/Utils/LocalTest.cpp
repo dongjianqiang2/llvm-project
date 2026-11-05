@@ -28,6 +28,67 @@
 
 using namespace llvm;
 
+TEST(Local, CombineEJitMayConstMetadata) {
+  for (unsigned Mode = 0; Mode != 3; ++Mode)
+    for (unsigned Case = 0; Case != 15; ++Case) {
+      SCOPED_TRACE(::testing::Message() << "mode=" << Mode << " case=" << Case);
+      LLVMContext C;
+      Module M("may-const-merge", C);
+      IRBuilder<> B(C);
+      auto *F = Function::Create(
+          FunctionType::get(B.getVoidTy(), {B.getPtrTy(), B.getPtrTy(1)},
+                            false),
+          GlobalValue::ExternalLinkage, "f", M);
+      B.SetInsertPoint(BasicBlock::Create(C, "entry", F));
+      Type *Ty =
+          Case == 14 ? static_cast<Type *>(B.getPtrTy()) : B.getInt64Ty();
+      Instruction *K = B.CreateAlignedLoad(Ty, F->getArg(0), Align(8));
+      Instruction *J =
+          B.CreateAlignedLoad(Case == 10 ? B.getInt32Ty() : Ty,
+                              F->getArg(Case == 11 ? 1 : 0), Align(8));
+      if (Case == 4 || Case == 6)
+        cast<LoadInst>(K)->setVolatile(Case == 4);
+      if (Case == 5 || Case == 7)
+        cast<LoadInst>(J)->setVolatile(Case == 5);
+      if (Case == 6)
+        cast<LoadInst>(K)->setAtomic(AtomicOrdering::Acquire);
+      if (Case == 7)
+        cast<LoadInst>(J)->setAtomic(AtomicOrdering::Acquire);
+      if (Case == 8) {
+        K->eraseFromParent();
+        K = B.CreateStore(B.getInt64(0), F->getArg(0));
+      }
+      if (Case == 9) {
+        J->eraseFromParent();
+        J = B.CreateStore(B.getInt64(0), F->getArg(0));
+      }
+      auto *Empty = MDNode::get(C, {});
+      auto *Payload = MDNode::get(C, MDString::get(C, "not-a-marker"));
+      if (Case != 2 && Case != 3)
+        K->setMetadata("ejit.may_const", Case == 12 ? Payload : Empty);
+      if (Case != 1 && Case != 3)
+        J->setMetadata("ejit.may_const", Case == 13 ? Payload : Empty);
+      K->setMetadata("ejit.mayconst.audit.site",
+                     MDNode::get(C, ConstantAsMetadata::get(B.getInt64(1))));
+      J->setMetadata("ejit.mayconst.audit.site",
+                     MDNode::get(C, ConstantAsMetadata::get(B.getInt64(2))));
+      K->setMetadata("unknown.test", Empty);
+      J->setMetadata("unknown.test", Empty);
+      B.CreateRetVoid();
+      ASSERT_FALSE(verifyModule(M, &errs()));
+
+      if (Mode == 2)
+        combineAAMetadata(K, J);
+      else
+        combineMetadataForCSE(K, J, Mode == 1);
+      EXPECT_EQ(K->hasMetadata("ejit.may_const"), Case == 0 || Case == 14);
+      // Site IDs describe individual loads, not the new merged instruction.
+      EXPECT_FALSE(K->hasMetadata("ejit.mayconst.audit.site"));
+      EXPECT_FALSE(K->hasMetadata("unknown.test"));
+      EXPECT_FALSE(verifyModule(M, &errs()));
+    }
+}
+
 TEST(Local, RecursivelyDeleteDeadPHINodes) {
   LLVMContext C;
 
