@@ -37,6 +37,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -1992,6 +1993,56 @@ TEST(EJitOptimizer, FullPipelineEndToEnd) {
 
   // 4. Optimization pipeline at L3
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
+}
+
+TEST(EJitOptimizer, ErasesPrefetches) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    define i32 @entry(ptr %p, i32 %n) {
+    b:
+      br label %head
+    head:
+      %i = phi i32 [ 0, %b ], [ %i.n, %body ]
+      %acc = phi i32 [ 0, %b ], [ %acc.n, %body ]
+      %c = icmp slt i32 %i, %n
+      br i1 %c, label %body, label %exit
+    body:
+      %ahead = add i32 %i, 8
+      %pf = getelementptr i32, ptr %p, i32 %ahead
+      call void @llvm.prefetch.p0(ptr %pf, i32 0, i32 3, i32 1)
+      %q = getelementptr i32, ptr %p, i32 %i
+      %v = load i32, ptr %q
+      %acc.n = add i32 %acc, %v
+      %i.n = add i32 %i, 1
+      br label %head
+    exit:
+      ret i32 %acc
+    }
+    declare void @llvm.prefetch.p0(ptr, i32, i32, i32)
+  )",
+                               Err, Ctx);
+  ASSERT_NE(M, nullptr) << Err.getMessage().str();
+  M->setTargetTriple(Triple("aarch64-unknown-linux-gnu"));
+  Function *F = M->getFunction("entry");
+  addEntryMetadata(F);
+
+  PeriodArrayRegistry Reg;
+  SpecializationContext SCtx;
+  SCtx.fnName = "entry";
+  SCtx.optLevel = llvm::ejit::OptimizationLevel::L2;
+  SCtx.tier = CompileTier::Baseline;
+  EJitOptimizerTestAccess Opt(Reg);
+  Opt.runPipeline(*M, SCtx);
+
+  bool HasPrefetch = false, HasLoad = false;
+  for (Instruction &I : instructions(*F)) {
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      HasPrefetch |= II->getIntrinsicID() == Intrinsic::prefetch;
+    HasLoad |= isa<LoadInst>(&I);
+  }
+  EXPECT_FALSE(HasPrefetch);
+  EXPECT_TRUE(HasLoad);
 }
 
 /// Verify the optimization pipeline folds llvm.expect-guarded constant

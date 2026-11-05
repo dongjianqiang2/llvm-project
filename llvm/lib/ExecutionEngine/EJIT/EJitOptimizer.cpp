@@ -14,6 +14,7 @@
 #endif
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -135,6 +136,24 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
   vectorFPM_.addPass(InstCombinePass());
 }
 
+/// Drop every llvm.prefetch. A prefetch is only a hint with no effect on
+/// program behavior; erasing it before simplification also lets the pipeline
+/// delete the address arithmetic that fed it.
+static void erasePrefetches(Module &M, FunctionAnalysisManager &FAM) {
+  PreservedAnalyses PA;
+  PA.preserveSet<CFGAnalyses>();
+  for (Function &Prefetch : M) {
+    if (Prefetch.getIntrinsicID() != Intrinsic::prefetch)
+      continue;
+    for (User *U : make_early_inc_range(Prefetch.users())) {
+      auto *Call = cast<CallInst>(U);
+      Function &Parent = *Call->getFunction();
+      Call->eraseFromParent();
+      FAM.invalidate(Parent, PA);
+    }
+  }
+}
+
 void EJitOptimizer::clearAnalyses() {
   FAM_.clear();
   LAM_.clear();
@@ -222,6 +241,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   runInstCombine(M);
   runStructFieldPass(M, ctx);
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
+  erasePrefetches(M, FAM_);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint64_t AuditSpecializedMayConstLoads =
