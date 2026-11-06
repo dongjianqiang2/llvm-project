@@ -15,6 +15,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitDimPair layout
+#include "llvm/ExecutionEngine/EJIT/EJitVerify.h"
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
@@ -36,6 +37,7 @@
 #include <cstdio>
 #endif
 #include <cstddef>
+#include <cstring>
 #include <type_traits>
 
 using namespace llvm;
@@ -357,10 +359,21 @@ static_assert(sizeof(ejit_config_t) ==
 static_assert(std::is_standard_layout<ejit_config_t>::value,
               "ejit_config_t must be standard-layout for a stable C ABI");
 
-// Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
-// the online-PGO auto-trigger on regardless of the (unversioned) config.
-static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
+// Shared init implementation for ejit_init / ejit_init_pgo /
+// ejit_init_verify. \p forcePgo forces the online-PGO auto-trigger on and
+// \p forceVerify the substitution verifier, both regardless of the
+// (unversioned) config.
+static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
+                                  bool forceVerify = false) {
   if (gEJIT) {
+#ifdef EJIT_VERIFY_SUBSTITUTION
+    if (forceVerify != gEJIT->isSubstitutionVerificationEnabled() ||
+        (forceVerify && forcePgo != gEJIT->isOnlinePgoEnabled())) {
+      EJIT_DIAG("init rejected: verifier/PGO mode differs from active runtime; "
+                "select the initializer before first init on both cores");
+      return EJIT_ERR_INVALID_PARAM;
+    }
+#endif
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
   }
@@ -377,6 +390,12 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 #endif
   if (forcePgo)
     cfg.enablePgo = true;
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  cfg.verifySubstitution = forceVerify;
+#else
+  // Neither verifier initializer is defined in a build without the flag.
+  (void)forceVerify;
+#endif
 
   gEJIT = new (std::nothrow) EJit(cfg);
   if (!gEJIT) {
@@ -419,8 +438,29 @@ ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
   return ejitInitImpl(config, /*forcePgo=*/true);
 }
 
+#ifdef EJIT_VERIFY_SUBSTITUTION
+ejit_status_t ejit_init_verify(const ejit_config_t *config) {
+  return ejitInitImpl(config, /*forcePgo=*/false, /*forceVerify=*/true);
+}
+ejit_status_t ejit_init_verify_pgo(const ejit_config_t *config) {
+  return ejitInitImpl(config, /*forcePgo=*/true, /*forceVerify=*/true);
+}
+#endif
+
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
+#ifdef EJIT_VERIFY_SUBSTITUTION
+  {
+    // The totals are the whole point of the run, and a caller that forgets to
+    // read them would otherwise get nothing.
+    llvm::ejit::VerifyStats vs;
+    llvm::ejit::ejitVerifyGetStats(&vs);
+    if (vs.sites || vs.checks)
+      EJIT_DIAG("verify totals: sites=%llu checks=%llu mismatches=%llu",
+                (unsigned long long)vs.sites, (unsigned long long)vs.checks,
+                (unsigned long long)vs.mismatches);
+  }
+#endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   setDumpSharedState(nullptr);
 #endif
@@ -749,6 +789,80 @@ void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn) {
             cacheKey);
   return nullptr;
 }
+
+#ifdef EJIT_VERIFY_SUBSTITUTION
+
+void ejit_verify_get_stats(ejit_verify_stats_t *out) {
+  if (!out)
+    return;
+  // Deliberately NOT gated on gEJIT: the counters live in the verifier's own
+  // storage, so a caller can still read a completed run after ejit_shutdown.
+  llvm::ejit::VerifyStats st;
+  llvm::ejit::ejitVerifyGetStats(&st);
+  out->sites = st.sites;
+  out->checks = st.checks;
+  out->mismatches = st.mismatches;
+}
+
+int ejit_verify_available(void) { return 1; }
+
+size_t ejit_verify_get_sites(ejit_verify_site_t *out, size_t max) {
+  if (!out || max == 0)
+    return 0;
+  static_assert(sizeof(out->site) == llvm::ejit::kVerifySiteNameMax,
+                "EJIT_VERIFY_SITE_NAME_MAX must match kVerifySiteNameMax");
+
+  // Copied field by field rather than reinterpreted: the C struct is an ABI
+  // the caller compiles against, not the runtime's internal record.
+  const size_t have = llvm::ejit::ejitVerifySiteCount();
+  size_t n = 0;
+  for (size_t i = 0; i < have && n < max; ++i) {
+    llvm::ejit::VerifySite tmp;
+    if (!llvm::ejit::ejitVerifyGetSite(i, &tmp))
+      continue;
+    std::memcpy(out[n].site, tmp.site, sizeof(out[n].site));
+    out[n].site[sizeof(out[n].site) - 1] = '\0';
+    out[n].checks = tmp.checks;
+    out[n].mismatches = tmp.mismatches;
+    out[n].lastFrozen = tmp.lastFrozen;
+    out[n].lastActual = tmp.lastActual;
+    ++n;
+  }
+  return n;
+}
+
+void ejit_verify_reset_stats(void) { llvm::ejit::ejitVerifyResetStats(); }
+
+void ejit_verify_dump(void) {
+  llvm::ejit::VerifyStats Stats{};
+  llvm::ejit::ejitVerifyGetStats(&Stats);
+  const size_t Count = llvm::ejit::ejitVerifySiteCount();
+  EJIT_DIAG("verify: sites=%llu checks=%llu mismatches=%llu records=%zu/%zu",
+            (unsigned long long)Stats.sites, (unsigned long long)Stats.checks,
+            (unsigned long long)Stats.mismatches, Count,
+            llvm::ejit::kVerifyMaxSites);
+  if (Stats.checks == 0)
+    EJIT_DIAG("verify: no checks executed; no verification coverage");
+  else if (Stats.mismatches == 0)
+    EJIT_DIAG("verify: no mismatch in executed checks only; "
+              "unexecuted paths and unresolved loads are not verified");
+  if (Count == llvm::ejit::kVerifyMaxSites)
+    EJIT_DIAG("verify: site table full; extra sites still count in totals "
+              "but may have no retained row");
+  for (size_t I = 0; I < Count; ++I) {
+    llvm::ejit::VerifySite Row{};
+    if (!llvm::ejit::ejitVerifyGetSite(I, &Row))
+      continue;
+    EJIT_DIAG("verify row=%zu site=%s checks=%llu mismatches=%llu "
+              "lastFrozen=0x%llx lastActual=0x%llx", I, Row.site,
+              (unsigned long long)Row.checks,
+              (unsigned long long)Row.mismatches,
+              (unsigned long long)Row.lastFrozen,
+              (unsigned long long)Row.lastActual);
+  }
+}
+
+#endif // EJIT_VERIFY_SUBSTITUTION
 
 void ejit_clear_cache(void) {
   EJIT_DIAG("clear_cache");

@@ -48,7 +48,10 @@ struct EJitVpFunctionInfo {
 /// every compilation.
 class EJitOptimizer {
 public:
-  EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM = nullptr);
+  /// \p verifySubstitution forwards the EJitStructFieldPass diagnostic mode
+  /// (EJitVerify.h): check the may_const values instead of freezing them.
+  EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM = nullptr,
+                bool verifySubstitution = false);
 
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
@@ -115,7 +118,6 @@ private:
   void runInstCombine(Module &M);
 
   /// Run EJitStructFieldPass on all functions.
-  void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
@@ -146,7 +148,7 @@ private:
   /// constant, re-specializes the array accesses that unrolling turns into
   /// constant-index GEPs, then does a final cleanup and vectorization at
   /// L2/L3 for AArch64.
-  void runOptimizationPipeline(Module &M, OptimizationLevel level,
+  void runOptimizationPipeline(Module &M, const SpecializationContext &ctx,
                                CompileTier tier);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -161,6 +163,7 @@ private:
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
+  bool verifySubstitution_ = false;
 
   // Persistent analysis managers — registered once, reused across compilations.
   // Invalidated per-function by the pass infrastructure as needed.

@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
@@ -37,11 +38,24 @@ using GVPeriodMap = DenseMap<const GlobalVariable *, GVPeriodInfo>;
 using MayConstOffsetMap =
     DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>>;
 
-/// Arguments the pass may assume a value for while computing the address of a
+/// Value boundaries the pass may assume while computing the address of a
 /// may_const load. Used for both ejit_bound_ptr roots (where the value is the
 /// offset of the borrowed object) and ejit_free_dim parameters (where it is the
-/// witness the address is evaluated at).
-using AssumedArgMap = DenseMap<const Argument *, uint64_t>;
+/// witness the address is evaluated at). Local free-dim operation results also
+/// appear here; their initializer inputs are deliberately absent.
+using AssumedArgMap = DenseMap<const Value *, uint64_t>;
+
+struct EJitFreeDimAssumptions {
+  AssumedArgMap values;
+  // Set only while collecting validated local marker calls. The pass never
+  // creates markers, so marker-free modules need no dependency graph walks.
+  bool hasLocalMarkers = false;
+};
+
+struct EJitLocalWitnessPeriod {
+  StringRef periodName;
+  uint8_t instance;
+};
 
 /// PASS6: JIT-time specialization pass. Scans the module for load instructions
 /// with !ejit.may_const metadata, reads the actual runtime values from process
@@ -49,26 +63,52 @@ using AssumedArgMap = DenseMap<const Argument *, uint64_t>;
 /// replaces the loads with LLVM constants.
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
 public:
+  /// \p verify selects the diagnostic mode described in EJitVerify.h: keep
+  /// each may_const load and check it at run time instead of substituting it.
   EJitStructFieldPass(PeriodArrayRegistry &reg,
                       ArrayRef<EJitBoundPointerView> boundPointers,
-                      StringRef boundRootFunction = {})
+                      StringRef boundRootFunction = {},
+                      ArrayRef<EJitLocalWitnessPeriod> localPeriods = {},
+                      bool verify = false)
       : registry_(reg),
         boundPointers_(boundPointers.begin(), boundPointers.end()),
-        boundRootFunction_(boundRootFunction.str()) {}
+        boundRootFunction_(boundRootFunction.str()), verify_(verify) {
+    for (const auto &Period : localPeriods)
+      localWitnessPeriods_.try_emplace(Period.periodName, Period.instance);
+  }
 
   /// Compatibility constructor for direct pass users. The data pointer is
   /// borrowed for the duration of the pass and is never copied or freed.
   EJitStructFieldPass(PeriodArrayRegistry &reg, const uint8_t *rawPtr = nullptr,
                       uint32_t rawSize = 0, uint32_t boundArgIndex = 0,
                       StringRef boundRootFunction = {},
-                      std::optional<uint8_t> boundPeriodInstance = std::nullopt)
-      : registry_(reg), boundRootFunction_(boundRootFunction.str()) {
+                      std::optional<uint8_t> boundPeriodInstance = std::nullopt,
+                      bool verify = false)
+      : registry_(reg), boundRootFunction_(boundRootFunction.str()),
+        verify_(verify) {
     if (rawPtr && rawSize)
       boundPointers_.push_back({rawPtr, rawSize, boundArgIndex,
                                 boundPeriodInstance
                                     ? *boundPeriodInstance
                                     : std::numeric_limits<uint32_t>::max()});
   }
+
+  /// Preserve the verifier's pre-multi-pointer signature: without this, the
+  /// bool would bind to the StringRef parameter of the constructor above.
+  EJitStructFieldPass(PeriodArrayRegistry &reg, const uint8_t *rawPtr,
+                      uint32_t rawSize, uint32_t boundArgIndex, bool verify)
+      : EJitStructFieldPass(reg, rawPtr, rawSize, boundArgIndex, StringRef(),
+                            std::nullopt, verify) {}
+
+  /// Keep string literals from selecting the legacy bool overload above.
+  EJitStructFieldPass(PeriodArrayRegistry &reg, const uint8_t *rawPtr,
+                      uint32_t rawSize, uint32_t boundArgIndex,
+                      const char *boundRootFunction,
+                      std::optional<uint8_t> boundPeriodInstance = std::nullopt,
+                      bool verify = false)
+      : EJitStructFieldPass(reg, rawPtr, rawSize, boundArgIndex,
+                            StringRef(boundRootFunction), boundPeriodInstance,
+                            verify) {}
 
   /// Pre-build GV metadata maps from the Module (call once before run()).
   void initFromModule(Module &M);
@@ -99,6 +139,7 @@ private:
   PeriodArrayRegistry &registry_;
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;
   std::string boundRootFunction_;
+  StringMap<uint8_t> localWitnessPeriods_;
 
   struct BoundPointerState {
     EJitBoundPointerView view;
@@ -113,8 +154,12 @@ private:
   /// a may_const load: the argument itself is never replaced, so the stores and
   /// the address arithmetic the source performs keep the live parameter. See
   /// initFreeDimAssumptions().
-  AssumedArgMap freeDimArgs_;
+  EJitFreeDimAssumptions freeDimAssumptions_;
   void initFreeDimAssumptions(Module &M);
+
+  /// Unread without EJIT_VERIFY_SUBSTITUTION; kept in the interface so callers
+  /// need no #ifdef.
+  [[maybe_unused]] bool verify_ = false;
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;

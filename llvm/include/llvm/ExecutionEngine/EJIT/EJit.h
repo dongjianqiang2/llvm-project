@@ -85,6 +85,10 @@ public:
   CompileMode getCompileMode() const;
   void setOptimizationLevel(OptimizationLevel level);
   OptimizationLevel getOptimizationLevel() const;
+  bool isSubstitutionVerificationEnabled() const {
+    return config_.verifySubstitution;
+  }
+  bool isOnlinePgoEnabled() const { return config_.enablePgo; }
 
   /// Register a user-defined external symbol for JIT resolution.
   /// Required for bare-metal where dlsym is unavailable.
