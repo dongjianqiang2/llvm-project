@@ -75,14 +75,20 @@ def bullets(s, x, y, w, items, size, gap):
               (body, size, GRAY, False, FONT)]])
         yy += gap
 
-def node(s, x, y, w, h, title, details=(), accent=False, title_sz=8.5, det_sz=7.2):
-    """流程图节点: 圆角矩形, 文字内嵌于 shape (PowerPoint 中可直接编辑)。"""
-    sp = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, IN(x), IN(y), IN(w), IN(h))
+def node(s, x, y, w, h, title, details=(), accent=False, blank=False,
+         shape=MSO_SHAPE.ROUNDED_RECTANGLE, title_sz=8.5, det_sz=7.2,
+         title_color=None, det_color=None):
+    """流程图节点: 文字内嵌于 shape (PowerPoint 中可直接编辑)。
+    accent=红框强调; blank=虚线边框留白(待填)。"""
+    sp = s.shapes.add_shape(shape, IN(x), IN(y), IN(w), IN(h))
     try: sp.adjustments[0] = 0.10
     except Exception: pass
     sp.fill.solid(); sp.fill.fore_color.rgb = WHITE
     sp.line.color.rgb = RED if accent else NODE_LINE
     sp.line.width = Pt(1.25 if accent else 1.0)
+    if blank:
+        ln = sp.line._get_or_add_ln()
+        ln.append(ln.makeelement(qn('a:prstDash'), {'val': 'dash'}))
     sp.shadow.inherit = False
     tf = sp.text_frame; tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -91,12 +97,12 @@ def node(s, x, y, w, h, title, details=(), accent=False, title_sz=8.5, det_sz=7.
     p = tf.paragraphs[0]; p.alignment = PP_ALIGN.CENTER
     r = p.add_run(); r.text = title
     r.font.size = Pt(title_sz); r.font.bold = True
-    r.font.color.rgb = DARK; r.font.name = FONT
+    r.font.color.rgb = title_color or DARK; r.font.name = FONT
     for d in details:
         p2 = tf.add_paragraph(); p2.alignment = PP_ALIGN.CENTER
         r2 = p2.add_run(); r2.text = d
         r2.font.size = Pt(det_sz); r2.font.bold = False
-        r2.font.color.rgb = GRAY; r2.font.name = FONT
+        r2.font.color.rgb = det_color or (GRAY_L if blank else GRAY); r2.font.name = FONT
     return sp
 
 def connect(s, x1, y1, x2, y2, color=ARROW, width=1.25, dashed=False):
@@ -259,7 +265,136 @@ def page():
            8, GRAY, False, FONT)]])
 
 
+# ════════════════════════════════════════════════════════════════
+# 第二页: 多小区 iCache Miss 消减方案 (6187/6188/6189 留白)
+# ════════════════════════════════════════════════════════════════
+def page2():
+    s = slide()
+
+    # ── 标题区 ──
+    rect(s, 0, 0, 13.333, 0.055, RED)
+    txt(s, 0.6, 0.14, 12.0, 0.42,
+        [[("多小区 iCache Miss 消减方案", 22, DARK, True, FONT)]],
+        anchor=MSO_ANCHOR.MIDDLE)
+    rect(s, 0.62, 0.60, 0.55, 0.028, RED)
+    txt(s, 0.6, 0.66, 12.4, 0.24,
+        [[("多小区特化版本并存 × I-cache 容量/冲突 —— 6187 / 6188 / 6189 cache 与核间共享情况留白待填 · 2026.11",
+           10.5, GRAY, False, FONT)]])
+    rect(s, 0, 0.94, 13.333, 0.012, BORDER)
+
+    # ══════════ 左栏: 问题背景 / 关键技术 / 进展 ══════════
+    lx = 0.35; lw = 5.35
+
+    y = 1.06; h = 1.46
+    card(s, lx, y, lw, h)
+    txt(s, lx + 0.18, y + 0.04, lw, 0.28,
+        [[("问题背景", 12, DARK, True, FONT)]])
+    bullets(s, lx + 0.18, y + 0.36, lw - 0.32, [
+        ("多小区并存  ", "每小区一个生命周期实例, 同一函数按小区特化出多版本, 版本数随活跃小区数增长"),
+        ("容量非瓶颈  ", "单热点路径 2–5 KB << L1 I 32–64 KB; 风险在多版本叠加的 set 冲突与换入换出"),
+        ("布局半成品  ", "dispatcher 聚类与 cold 隔离已做, 多小区版本在代码池内的排布未按 cache 友好组织"),
+    ], size=8.8, gap=0.35)
+
+    y = 2.64; h = 2.58
+    card(s, lx, y, lw, h)
+    txt(s, lx + 0.18, y + 0.04, lw, 0.28,
+        [[("关键技术 (已具备的消减基础)", 12, DARK, True, FONT)]])
+    bullets(s, lx + 0.18, y + 0.36, lw - 0.32, [
+        ("多版本 Inline Cache  ", "(funcIndex × dims) 直接索引, 每身份一槽, 多小区各自直跳特化版本"),
+        ("跨核共享 cell 表  ", "表入共享段, toggle 置零即跨核失效; 各核命中同一份, 无每核回收会合"),
+        ("Dispatcher 聚类  ", "独立 .text.ejit_dispatch 段 64B 对齐, 单 line 容 1–4 个, 空间局部性命中 (PR #124)"),
+        ("Cold 隔离  ", "miss 函数体 → .text.unlikely, 减少热路径 cache 污染 (PR #124)"),
+        ("PMU 测量优先  ", "L1I_CACHE_REFILL / L1I_CACHE 定基线; <1% 健康, >5% 才需投入 (待上板)"),
+        ("占用观测  ", "slot dump 整表 icache 占用报告, 支撑多小区版本体量评估"),
+    ], size=8.4, gap=0.368)
+
+    y = 5.34; h = 2.0
+    card(s, lx, y, lw, h)
+    txt(s, lx + 0.18, y + 0.04, lw, 0.28,
+        [[("进展 / 待填", 12, DARK, True, FONT)]])
+    bullets(s, lx + 0.18, y + 0.33, lw - 0.32, [
+        ("✓  ", "dispatcher 聚类 + cold miss 隔离已合入 (PR #124), 待上板验证", GREEN),
+        ("✓  ", "多版本 Inline Cache + 跨核共享 cell 表已实现", GREEN),
+        ("✓  ", "slot dump 整表 icache 占用报告已合入", GREEN),
+        ("□  ", "6187 / 6188 / 6189 cache 参数 (容量/相联度/映射) —— 待填", GRAY_L),
+        ("□  ", "是否核间共享及对应失效/布局策略 —— 待确认", GRAY_L),
+    ], size=8.4, gap=0.33)
+
+    # ══════════ 右栏: 整体方案 (消减框架, cache 部分留白) ══════════
+    rx = 5.95; rw = 7.05
+
+    rect(s, rx, 1.00, rw, 0.36, BG_GRAY, line=BORDER, line_w=0.5)
+    rect(s, rx, 1.00, 0.05, 0.36, RED)
+    txt(s, rx + 0.15, 1.00, rw - 0.3, 0.36,
+        [[("整体方案 · 消减框架 (6187 / 6188 / 6189 cache 与核间共享留白待填)",
+           10.5, DARK, True, FONT)]], anchor=MSO_ANCHOR.MIDDLE)
+
+    # ── 泳道 1: 多小区特化版本来源 ──
+    lane(s, rx, 1.44, rw, 1.30, "多小区特化版本来源 (业务核 → taskpool → 代码池)")
+    node(s, rx + 0.12, 1.78, 1.50, 0.62, "小区 0..N 并发调用",
+         ("每小区独立生命周期",))
+    node(s, rx + 1.82, 1.78, 1.55, 0.62, "IC 探测 per-identity",
+         ("命中直跳 · miss 入队",))
+    node(s, rx + 3.57, 1.78, 1.50, 0.62, "taskpool 编译多版本",
+         ("worker 核特化",))
+    node(s, rx + 5.27, 1.78, 1.60, 0.62, ".text.ejit 多版本驻留",
+         ("代码池 near-hot 64B 对齐",))
+    connect(s, rx + 1.62, 2.09, rx + 1.80, 2.09)
+    connect(s, rx + 3.37, 2.09, rx + 3.55, 2.09)
+    connect(s, rx + 5.07, 2.09, rx + 5.25, 2.09)
+    connect(s, rx + 6.05, 2.40, rx + 6.05, 2.92, dashed=True)   # 驻留 → I-cache
+    label(s, rx + 4.40, 2.56, "多版本驻留进入 I-cache", w=1.60, align=PP_ALIGN.RIGHT)
+
+    # ── 泳道 2: I-cache 现状 (6187/6188/6189 留白) ──
+    lane(s, rx, 2.92, rw, 2.16, "I-cache 现状 · 6187 / 6188 / 6189 (参数待填)")
+    blank_fields = ("容量: ＿＿＿ 相联度: ＿",
+                    "行大小: ＿ 服务核: ＿＿",
+                    "多小区版本占用: ＿＿")
+    node(s, rx + 0.12, 3.24, 2.20, 1.10, "6187 cache",
+         blank_fields, blank=True, title_sz=9.5)
+    node(s, rx + 2.44, 3.24, 2.20, 1.10, "6188 cache",
+         blank_fields, blank=True, title_sz=9.5)
+    node(s, rx + 4.76, 3.24, 2.16, 1.10, "6189 cache",
+         blank_fields, blank=True, title_sz=9.5)
+    # 是否核间共享: 决策菱形 + 两条留白分支
+    node(s, rx + 0.30, 4.40, 1.45, 0.66, "核间共享?",
+         shape=MSO_SHAPE.DIAMOND, title_sz=8)
+    node(s, rx + 2.15, 4.24, 4.75, 0.40, "若核间共享: ＿＿＿＿＿＿＿",
+         blank=True, title_sz=7.5, title_color=GRAY)
+    node(s, rx + 2.15, 4.80, 4.75, 0.40, "若每核私有: ＿＿＿＿＿＿＿",
+         blank=True, title_sz=7.5, title_color=GRAY)
+    connect(s, rx + 1.75, 4.58, rx + 2.13, 4.44)
+    connect(s, rx + 1.75, 4.88, rx + 2.13, 4.98)
+
+    # ── 泳道 3: 消减手段 (分层) ──
+    lane(s, rx, 5.26, rw, 1.42, "消减手段 · 分层推进")
+    node(s, rx + 0.12, 5.62, 1.48, 0.66, "Tier 1 链接偏移验证",
+         ("非 2^n 偏移规避冲突",))
+    node(s, rx + 1.76, 5.62, 1.58, 0.66, "Tier 2 聚类 + 隔离 ✓",
+         ("dispatcher 段 / .text.unlikely",))
+    node(s, rx + 3.50, 5.62, 1.52, 0.66, "Tier 3 高阶手段",
+         ("PGO 排布 · cache 着色",))
+    node(s, rx + 5.18, 5.62, 1.74, 0.66, "多小区布局策略",
+         ("＿＿＿＿＿ 待基线后定",), blank=True)
+    connect(s, rx + 1.60, 5.95, rx + 1.74, 5.95)
+    connect(s, rx + 3.34, 5.95, rx + 3.48, 5.95)
+    connect(s, rx + 5.02, 5.95, rx + 5.16, 5.95)
+    connect(s, rx + 6.05, 5.20, rx + 6.05, 5.60, dashed=True)   # 共享情况/基线 → 选型
+    label(s, rx + 4.30, 5.26, "基线与共享情况 → 选型", w=1.70, align=PP_ALIGN.RIGHT)
+    txt(s, rx + 0.28, 6.36, rw - 0.5, 0.22,
+        [[("Tier 1/2 为通用手段 · Tier 3 与多小区布局策略需 6187 / 6188 / 6189 基线数据支撑",
+           7.5, GRAY_L, False, FONT)]])
+
+    # ── 底部脚注 ──
+    rect(s, rx, 6.78, rw, 0.52, BG_GRAY, line=BORDER, line_w=0.5)
+    rect(s, rx, 6.78, 0.05, 0.52, RED)
+    txt(s, rx + 0.16, 6.82, rw - 0.3, 0.46,
+        [[("测量优先: PMU L1I_CACHE_REFILL / L1I_CACHE 建基线 —— miss 率 <1% 健康 / >5% 需投入", 8, GRAY, False, FONT)],
+         [("待补: 6187 / 6188 / 6189 cache 实测 miss 基线 · 核间共享确认 · 多小区版本布局选型", 8, GRAY, False, FONT)]])
+
+
 page()
+page2()
 
 _today = datetime.now().strftime("%Y%m%d")
 out = Path(__file__).resolve().parent / f"EJIT异步编译_{_today}.pptx"
