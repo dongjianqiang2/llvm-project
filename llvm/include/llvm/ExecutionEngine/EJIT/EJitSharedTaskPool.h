@@ -147,15 +147,26 @@ enum class EJitWorkerStep : uint32_t {
 // EJIT_SRE_SHARED_CODE_POINTERS always wires either fourKSeal_ or
 // prepareCodeFn_. The taskpool's own cross-core path still uses it.)
 //
-// THE 0-DIM EXCEPTION. An entry with no ejit_dim params has ONE cell and no
-// identity to partition it by, so everything above simply does not apply to it:
-// every core reads and writes that same scalar however well behaved the
-// deployment is. It is not a contract violation, it is the shape. So for
-// numDims == 0 icacheFill DOES consult icacheCrossCoreExecutable() and declines
-// unless a resolved pointer is callable on every core the instant it exists.
-// Where it declines the cell stays empty, the probe keeps missing, and the
-// taskpool -- which prepares -- serves every call. The AOT pass still emits the
-// 0D probe: the code is platform independent, only the fill is not.
+// THE SCALAR-SLOT EXCEPTION. A slot registered with numDims == 0 -- a 0-dim
+// entry, or a single-slot-mode function (-ejit-icache-single-slot collapsed its
+// [D]^N table to one cell while its MissFn still resolves with the REAL dim
+// count) -- has ONE cell and no identity to partition it by, so everything above
+// simply does not apply to it: every core reads and writes that same scalar
+// however well behaved the deployment is. It is not a contract violation, it is
+// the shape. So for a scalar slot icacheFill DOES consult
+// icacheCrossCoreExecutable() and declines unless a resolved pointer is
+// callable on every core the instant it exists. Where it declines the cell
+// stays empty, the probe keeps missing, and the taskpool -- which prepares --
+// serves every call. The AOT pass still emits the scalar probe: the code is
+// platform independent, only the fill is not.
+//
+// THE SINGLE-SLOT CONTRACT (correctness, deployment-side): a scalar slot has
+// no key, so unlike a dimensioned cell it does not self-isolate by dim
+// identity. All marked dims must share ONE value per run, and a value change
+// must cross a process/board boundary or a lifecycle activate/deactivate
+// (which drains the cell). A same-process bare value switch serves the stale
+// specialization -- see the -ejit-icache-single-slot flag documentation and
+// EJIT_ICACHE_MULTIVERSION.md §13.
 //
 // THE RACE, and why it is bounded: core A's drain stores 0 while core B's probe
 // loads the cell. Both are naturally-aligned word accesses, so B reads the old
@@ -975,10 +986,13 @@ public:
   // is retained for unit tests / diagnostics: on a
   // hit it sets *outFn to the cached specialization for the given dims (call
   // with NO releaseRead) and returns true; on a miss returns false. It keeps
-  // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
+  // the reclamation-safety, pool-Ready, and cross-core code-sharing gates
   // (the latter matters in non-shared test builds; the wrapper's inline probe is
   // only enabled under EJIT_SRE_SHARED_CODE_POINTERS, where the gate is
-  // compile-time true).
+  // compile-time true). For a SCALAR slot (registered numDims == 0: a 0-dim
+  // entry, or -ejit-icache-single-slot) the per-dim range gate does not apply
+  // and cell 0 serves every identity, so \p numDims may differ from the
+  // registration's.
   bool icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
                  uint32_t numDims, void **outFn);
   // Fill the per-function icache cell at [i0][i1]... (linearized from \p dims,
@@ -987,8 +1001,11 @@ public:
   // successful compile). One-shot per cell: the first resolver for an identity
   // wins; later resolves of the same identity (same invariant pointer) no-op;
   // a different identity fills a different cell. No-op when reclamation is not
-  // safe, the function is unregistered (no base wired) or numDims mismatches,
-  // funcIndex is out of range, or fnPtr is null.
+  // safe, the function is unregistered (no base wired), funcIndex is out of
+  // range, or fnPtr is null. A DIMENSIONED registration requires the caller's
+  // numDims to match the registered table shape; a SCALAR slot (registered
+  // numDims == 0: a 0-dim entry, or -ejit-icache-single-slot) accepts any
+  // caller dim count and always writes cell 0.
   /// Per-core L0 dispatch cache: serves the (funcIndex, dims) identity the
   /// bucket lookup would resolve, skipping the rwlock and the 16-slot scan.
   ///

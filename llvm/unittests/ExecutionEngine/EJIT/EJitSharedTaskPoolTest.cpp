@@ -5221,6 +5221,171 @@ TEST_F(SharedTaskPoolTest, InlineCacheClearAllDropsTheSentinelRegistration) {
   EXPECT_EQ(slot, 0u) << "clearAll must drop the missFn, not leak it";
 }
 
+// SINGLE-SLOT MODE (-ejit-icache-single-slot on the AOT side). The wrapper's
+// @__ejit_icache_fn_<name> is ONE scalar cell even though the function marks
+// several ejit_dim params, so registration is numDims == 0 while MissFn still
+// resolves through the taskpool with the REAL dim count. These tests pin the
+// runtime half: a scalar slot accepts a dimensioned resolve into cell 0 and
+// only cell 0, keeps the drain / retract / token contracts, and still respects
+// the cross-core gate for the SHARED scalar shape.
+//
+// The mode's own correctness contract -- all marked dims share one value per
+// run, and values change only across a process boundary or a lifecycle toggle
+// (which drains) -- is a deployment contract; it is documented with the flag,
+// not checkable here.
+
+// A dimensioned resolve on a scalar slot fills cell 0 and nothing else; a later
+// tuple (the next test with a different shared value) simply rewrites the same
+// cell, and a toggle returns it to the registered sentinel.
+TEST_F(SharedTaskPoolTest, InlineCacheScalarSlotFillsFromAnyDimResolve) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  // cells[1] is a canary for the ADJACENT word: a scalar slot has exactly one
+  // cell and nothing here may write past it. (A genuine linearize-by-caller-
+  // dims bug would index far out of bounds and crash on its own; this pins the
+  // sane boundary.)
+  uintptr_t cells[2] = {testSentinel(), 0};
+  registerSlot(kFunc, &cells[0], 0, testSentinelPtr());
+  const EJitDimPair d3a[3] = {{0, 1}, {1, 1}, {2, 1}};
+  const EJitDimPair d3b[3] = {{0, 3}, {1, 3}, {2, 3}};
+
+  void *out = nullptr;
+  EXPECT_FALSE(pool.icacheTry(kFunc, d3a, 3, &out)) << "sentinel: miss";
+
+  pool.icacheFill(kFunc, codeFor(kFunc), d3a, 3, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(codeFor(kFunc)));
+  EXPECT_EQ(cells[1], 0u) << "the fill must not walk past the scalar cell";
+  ASSERT_TRUE(pool.icacheTry(kFunc, d3a, 3, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
+
+  // A different tuple rewrites the SAME cell: last-wins is the mode's
+  // semantics, benign under the all-equal-per-run contract.
+  pool.icacheFill(kFunc, codeFor(kFunc + 1), d3b, 3, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(codeFor(kFunc + 1)));
+  EXPECT_EQ(cells[1], 0u);
+  ASSERT_TRUE(pool.icacheTry(kFunc, d3b, 3, &out));
+  EXPECT_EQ(out, codeFor(kFunc + 1));
+
+  // The drain reaches the scalar cell exactly as for a 0-dim entry: back to
+  // the sentinel, next probe misses. Cross-value isolation rides on the
+  // lifecycle boundary.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_EQ(cells[0], testSentinel());
+  EXPECT_FALSE(pool.icacheTry(kFunc, d3b, 3, &out));
+}
+
+// The cross-core gate must key on the SLOT's shape, not the caller's dim
+// count: under per-core execute preparation a scalar cell is exactly as shared
+// as a 0-dim one, so a dimensioned resolve on it must be declined -- keying the
+// gate on the caller's numDims (3 here) would let these fills through and
+// publish code a peer core has not sealed.
+TEST_F(SharedTaskPoolTest, InlineCacheScalarSlotDeclinesUnderPerCorePrepare) {
+  ejitIcacheClearAll();
+  constexpr uint32_t kFunc = 6;
+  void *fn = codeFor(kFunc);
+  const EJitDimPair d3[3] = {{0, 1}, {1, 1}, {2, 1}};
+
+  // Legacy whole-2MiB path: a wired prepareCodeFn_ is real per-core work.
+  {
+    EJitSharedTaskPool coreA;
+    bringUpOwner(coreA);
+    PrepareLog prepare;
+    coreA.setPrepareCodeCallback(&mockPrepareCode, &prepare);
+    uintptr_t scalar = 0;
+    registerSlot(kFunc, &scalar, 0);
+    ASSERT_FALSE(coreA.icacheCrossCoreExecutable());
+
+    coreA.icacheFill(kFunc, fn, d3, 3, coreA.icacheBeginResolve());
+    EXPECT_EQ(scalar, 0u)
+        << "a dimensioned resolve on a scalar slot publishes to every core "
+           "just like a 0-dim one: decline under per-core preparation";
+    void *out = reinterpret_cast<void *>(0x1234);
+    EXPECT_FALSE(coreA.icacheTry(kFunc, d3, 3, &out));
+    EXPECT_EQ(out, nullptr);
+    coreA.ownerShutdown();
+  }
+
+  // 4K-seal mode: the production board shape. The seal is not per-core
+  // preparation, so the fill goes through -- or single-slot mode is dead on
+  // every real target.
+  {
+    ejitIcacheClearAll();
+    FourKLog fourK;
+    RangeCtx range;
+    EJitSharedTaskPool sealPool;
+    bringUpOwner4K(sealPool, fourK, range);
+    uintptr_t scalar = 0;
+    registerSlot(kFunc, &scalar, 0);
+    ASSERT_TRUE(sealPool.icacheCrossCoreExecutable());
+    sealPool.icacheFill(kFunc, fn, d3, 3, sealPool.icacheBeginResolve());
+    EXPECT_NE(scalar, 0u)
+        << "4K seal must not block a scalar-slot fill from a dimensioned "
+           "resolve";
+    sealPool.ownerShutdown();
+  }
+}
+
+// The drain-race contracts hold for the mismatched shape too: a fill whose
+// resolve predates a drain is dropped (token gate), a fill whose store races
+// the drain is retracted to the SENTINEL (not to 0), and the slot is not
+// poisoned afterwards.
+TEST_F(SharedTaskPoolTest, InlineCacheScalarSlotKeepsTheDrainRaceContracts) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  const EJitDimPair d3[3] = {{0, 1}, {1, 1}, {2, 1}};
+  uintptr_t slot = testSentinel();
+  registerSlot(kFunc, &slot, 0, testSentinelPtr());
+
+  // Stale token: a resolve started before a drain must not fill afterwards.
+  const uint64_t staleTok = pool.icacheBeginResolve();
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  EXPECT_EQ(slot, testSentinel());
+  pool.icacheFill(kFunc, codeFor(kFunc), d3, 3, staleTok);
+  EXPECT_EQ(slot, testSentinel())
+      << "a scalar-slot fill from a resolve older than the drain is dropped";
+
+  // Mid-store race: a drain that begins after the fill's pre-store checks
+  // retracts the cell to the sentinel.
+  pool.setIcacheFillMidpointForTest(
+      [](void *ctx) {
+        static_cast<EJitSharedTaskPool *>(ctx)->setInstanceEnabled(0, 6, true);
+      },
+      &pool);
+  pool.icacheFill(kFunc, codeFor(kFunc), d3, 3, pool.icacheBeginResolve());
+  pool.setIcacheFillMidpointForTest(nullptr, nullptr);
+  EXPECT_EQ(slot, testSentinel())
+      << "a retracted scalar-slot fill must reset the cell to &MissFn, not 0";
+
+  // Not poisoned: a fresh resolve after the toggle refills and serves.
+  pool.icacheFill(kFunc, codeFor(kFunc), d3, 3, pool.icacheBeginResolve());
+  void *out = nullptr;
+  ASSERT_TRUE(pool.icacheTry(kFunc, d3, 3, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
+}
+
+// A scalar slot has one cell for every identity, so the per-dim range check
+// does not apply: an instance id >= D has no cell in a [D]^N table (the fill
+// declines there), but a scalar slot still has its one cell. Declining here
+// would silently disable single-slot mode for values the taskpool accepts.
+TEST_F(SharedTaskPoolTest, InlineCacheScalarSlotAcceptsOutOfRangeInstanceIds) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  uintptr_t scalar = 0;
+  registerSlot(kFunc, &scalar, 0);
+  const EJitDimPair dBig[1] = {{0, EJIT_ICACHE_DIM_SIZE + 4}};
+
+  pool.icacheFill(kFunc, codeFor(kFunc), dBig, 1, pool.icacheBeginResolve());
+  EXPECT_NE(scalar, 0u)
+      << "the scalar cell has no identity, so an out-of-range id still has a "
+         "place to land";
+  void *out = nullptr;
+  EXPECT_TRUE(pool.icacheTry(kFunc, dBig, 1, &out));
+  EXPECT_EQ(out, codeFor(kFunc));
+}
+
 //===----------------------------------------------------------------------===//
 // Per-core L0 dispatch cache
 //
@@ -5607,6 +5772,58 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheRequiresExactTier2Identity) {
   EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(tier2.fnPtr));
   if (tier2.hasReadToken)
     pool.releaseRead(tier2.bucketIndex);
+  ejitIcacheClearAll();
+}
+
+// SINGLE-SLOT x PGO composition: the slot registers numDims == 0 while the
+// wrapper still resolves with the REAL dim count. The PGO fill gate
+// (isPublishedTier2) keys on the caller's real tuple and never on the
+// registered shape, so the composed flow must hold: a Tier-1 pointer from a
+// 3-dims resolve must NOT fill the scalar cell, and the published Tier-2 for
+// that same tuple must. Covers the mismatched caller-vs-registered shape the
+// two tests above leave unpinned (both register matching shapes).
+TEST_F(SharedTaskPoolTest, SharedPgoSingleSlotWaitsForTier2FromDimResolve) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  constexpr uint32_t kFunc = 5;
+  // Scalar slot (single-slot shape) + a canary word the fill must not touch.
+  uintptr_t cells[2] = {testSentinel(), 0};
+  ejitIcacheRegisterSlot(kFunc, &cells[0], 0, testSentinelPtr());
+  pool.setPgoEnabled(true, 1);
+  pool.setInstanceEnabled(1, 1, true);
+  EJitDimPair d3[3] = {dim(1, 1), dim(1, 1), dim(1, 1)};
+
+  // Tier-1 (instrumented) publishes; its 3-dims resolve must NOT fill the
+  // scalar cell while PGO is training.
+  ASSERT_EQ(pool.compileOrGet(kFunc, d3, 3, codeFor(kFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  auto tier1 = pool.tryCacheHit3D(kFunc, 1, 1, 1, 1, 1, 1);
+  ASSERT_EQ(tier1.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier1.fnPtr, d3, 3, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[0], testSentinel())
+      << "a Tier-1 pointer must not fill the scalar cell from a 3-dims resolve";
+  EXPECT_EQ(cells[1], 0u);
+  if (tier1.hasReadToken)
+    pool.releaseRead(tier1.bucketIndex);
+
+  // Tier-2 publishes for the SAME tuple; the next resolve's fill passes the
+  // gate and writes cell 0 (registered numDims 0, caller dims 3).
+  ASSERT_TRUE(pool.pollOne());
+  auto tier2 = pool.tryCacheHit3D(kFunc, 1, 1, 1, 1, 1, 1);
+  ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier2.fnPtr, d3, 3, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(tier2.fnPtr));
+  EXPECT_EQ(cells[1], 0u) << "the fill must not walk past the scalar cell";
+  EXPECT_NE(tier2.fnPtr, tier1.fnPtr);
+  if (tier2.hasReadToken)
+    pool.releaseRead(tier2.bucketIndex);
+
+  void *out = nullptr;
+  EXPECT_TRUE(pool.icacheTry(kFunc, d3, 3, &out));
+  EXPECT_EQ(out, tier2.fnPtr);
   ejitIcacheClearAll();
 }
 
