@@ -160,6 +160,10 @@ private:
   /// Pick the cached function-simplification FPM for an EJIT optimization tier.
   FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
+  /// Build the vectorization FPM, optionally with the -extra-vectorizer-passes
+  /// cleanup around the loop and SLP vectorizers.
+  static FunctionPassManager buildVectorFPM(bool ExtraPasses);
+
   PeriodArrayRegistry &registry_;
 
   // Persistent analysis managers — registered once, reused across compilations.
@@ -177,12 +181,18 @@ private:
   //                   (Phase 3), one per tier.
   //   cleanupFPM_     light fold after the second StructFieldPass (Phase 5).
   //   vectorFPM_      target-aware loop and SLP vectorization (L2/L3 only).
+  //   vectorExtraFPM_ vectorFPM_ plus the -extra-vectorizer-passes cleanup.
+  //   loopVersioningLicmFPM_, loopDistributeFPM_
+  //                   enabled by EJIT_JIT_* macros.
   FunctionPassManager lowerExpectFPM_;
   FunctionPassManager simplifyO1_;
   FunctionPassManager simplifyO2_;
   FunctionPassManager simplifyO3_;
   FunctionPassManager cleanupFPM_;
   FunctionPassManager vectorFPM_;
+  FunctionPassManager vectorExtraFPM_;
+  FunctionPassManager loopVersioningLicmFPM_;
+  FunctionPassManager loopDistributeFPM_;
   // Tier-2-only profile-guided memory-operation specialization. The main
   // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
   FunctionPassManager pgoUseFPM_;

@@ -16,6 +16,7 @@ set(LLVM_LINK_COMPONENTS
 add_llvm_unittest(EJITTests
   EJitOrcEngineHeaderTest.cpp
   EJitRuntimeTest.cpp
+  EJitJitOptionsTest.cpp
   EJitPointerPeriodTest.cpp
   EJitFieldOffsetTest.cpp
   EJitLinkOptimizationPluginTest.cpp

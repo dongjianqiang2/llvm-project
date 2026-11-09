@@ -558,4 +558,88 @@ ejit_compile_mode_t ejit_get_compile_mode(void);
 }
 #endif
 
+//===----------------------------------------------------------------------===//
+// LLVM options for JIT compiles.
+//
+// `-mllvm` flags on the compile line only configure the AOT compiler. To apply
+// one to the JIT, pass the matching macro on the same compile line:
+//
+//   -DEJIT_JIT_AARCH64_LOAD_STORE_SCAN_LIMIT=N  -aarch64-load-store-scan-limit
+//   -DEJIT_JIT_AARCH64_UPDATE_SCAN_LIMIT=N      -aarch64-update-scan-limit
+//   -DEJIT_JIT_AARCH64_ENABLE_GEP_OPT=0|1       -aarch64-enable-gep-opt
+//   -DEJIT_JIT_ENABLE_INTERLEAVED_MEM_ACCESSES=0|1
+//                                     -enable-interleaved-mem-accesses
+//   -DEJIT_JIT_SLP_VECTORIZE_HOR_STORE=0|1      -slp-vectorize-hor-store
+//   -DEJIT_JIT_ENABLE_PARTIAL_INLINING=0|1      -enable-partial-inlining
+//   -DEJIT_JIT_EXTRA_VECTORIZER_PASSES=0|1      -extra-vectorizer-passes
+//   -DEJIT_JIT_ENABLE_LOOP_VERSIONING_LICM=0|1  -enable-loop-versioning-licm
+//   -DEJIT_JIT_ENABLE_LOOP_DISTRIBUTE=0|1       -enable-loop-distribute
+//
+// A bare -DNAME means 1. Unset options keep LLVM's default. The values are
+// recorded in every TU that includes this header and applied by ejit_init,
+// which fails if two TUs disagree, a value is out of range, or an option does
+// not exist in the runtime's LLVM build. Extra vectorizer passes and loop
+// distribution only run at EJIT_OPT_L2/L3 on AArch64.
+//===----------------------------------------------------------------------===//
+
+#define EJIT_JIT_OPTIONS_MAGIC 0x504F4A45u /* "EJOP" */
+#define EJIT_JIT_OPTION_COUNT 9
+#define EJIT_JIT_DEFAULT (-1)
+
+typedef struct {
+  uint32_t magic;
+  uint32_t count;
+  int32_t values[EJIT_JIT_OPTION_COUNT];
+} ejit_jit_options_record_t;
+
+#if defined(__ELF__) &&                                                        \
+    (defined(EJIT_JIT_AARCH64_LOAD_STORE_SCAN_LIMIT) ||                        \
+     defined(EJIT_JIT_AARCH64_UPDATE_SCAN_LIMIT) ||                            \
+     defined(EJIT_JIT_AARCH64_ENABLE_GEP_OPT) ||                               \
+     defined(EJIT_JIT_ENABLE_INTERLEAVED_MEM_ACCESSES) ||                      \
+     defined(EJIT_JIT_SLP_VECTORIZE_HOR_STORE) ||                              \
+     defined(EJIT_JIT_ENABLE_PARTIAL_INLINING) ||                              \
+     defined(EJIT_JIT_EXTRA_VECTORIZER_PASSES) ||                              \
+     defined(EJIT_JIT_ENABLE_LOOP_VERSIONING_LICM) ||                          \
+     defined(EJIT_JIT_ENABLE_LOOP_DISTRIBUTE))
+#ifndef EJIT_JIT_AARCH64_LOAD_STORE_SCAN_LIMIT
+#define EJIT_JIT_AARCH64_LOAD_STORE_SCAN_LIMIT EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_AARCH64_UPDATE_SCAN_LIMIT
+#define EJIT_JIT_AARCH64_UPDATE_SCAN_LIMIT EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_AARCH64_ENABLE_GEP_OPT
+#define EJIT_JIT_AARCH64_ENABLE_GEP_OPT EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_ENABLE_INTERLEAVED_MEM_ACCESSES
+#define EJIT_JIT_ENABLE_INTERLEAVED_MEM_ACCESSES EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_SLP_VECTORIZE_HOR_STORE
+#define EJIT_JIT_SLP_VECTORIZE_HOR_STORE EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_ENABLE_PARTIAL_INLINING
+#define EJIT_JIT_ENABLE_PARTIAL_INLINING EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_EXTRA_VECTORIZER_PASSES
+#define EJIT_JIT_EXTRA_VECTORIZER_PASSES EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_ENABLE_LOOP_VERSIONING_LICM
+#define EJIT_JIT_ENABLE_LOOP_VERSIONING_LICM EJIT_JIT_DEFAULT
+#endif
+#ifndef EJIT_JIT_ENABLE_LOOP_DISTRIBUTE
+#define EJIT_JIT_ENABLE_LOOP_DISTRIBUTE EJIT_JIT_DEFAULT
+#endif
+__attribute__((used, retain, section("ejit_jit_options"),
+               aligned(4))) static const ejit_jit_options_record_t
+    ejit_jit_options_record = {
+        EJIT_JIT_OPTIONS_MAGIC,
+        EJIT_JIT_OPTION_COUNT,
+        {EJIT_JIT_AARCH64_LOAD_STORE_SCAN_LIMIT,
+         EJIT_JIT_AARCH64_UPDATE_SCAN_LIMIT, EJIT_JIT_AARCH64_ENABLE_GEP_OPT,
+         EJIT_JIT_ENABLE_INTERLEAVED_MEM_ACCESSES,
+         EJIT_JIT_SLP_VECTORIZE_HOR_STORE, EJIT_JIT_ENABLE_PARTIAL_INLINING,
+         EJIT_JIT_EXTRA_VECTORIZER_PASSES, EJIT_JIT_ENABLE_LOOP_VERSIONING_LICM,
+         EJIT_JIT_ENABLE_LOOP_DISTRIBUTE}};
+#endif
+
 #endif

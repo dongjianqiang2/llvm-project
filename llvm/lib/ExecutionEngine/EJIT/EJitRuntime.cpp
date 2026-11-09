@@ -8,6 +8,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h" // contract constants + kEJitMax*
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
+#include "llvm/ExecutionEngine/EJIT/EJitJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
@@ -377,6 +378,9 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 #endif
   if (forcePgo)
     cfg.enablePgo = true;
+
+  if (!applyJitOptionsFromImage())
+    return EJIT_ERR_INVALID_PARAM;
 
   gEJIT = new (std::nothrow) EJit(cfg);
   if (!gEJIT) {

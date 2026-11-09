@@ -8,6 +8,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
@@ -25,19 +26,28 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/IPO/Inliner.h"
+#include "llvm/Transforms/IPO/PartialInlining.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
 #include "llvm/Transforms/Instrumentation/PGOInstrumentation.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/CorrelatedValuePropagation.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/IndVarSimplify.h"
+#include "llvm/Transforms/Scalar/LICM.h"
 #include "llvm/Transforms/Scalar/LoopDeletion.h"
+#include "llvm/Transforms/Scalar/LoopDistribute.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
+#include "llvm/Transforms/Scalar/LoopVersioningLICM.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
+#include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/ExtraPassManager.h"
+#include "llvm/Transforms/Utils/LCSSA.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
@@ -130,9 +140,51 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
   // Vectorize only after the second field substitution and cleanup, so the
   // cost model sees the final loop body. PassBuilder(TM) supplies the JIT
   // target's TTI instead of the generic target-independent cost model.
-  vectorFPM_.addPass(LoopVectorizePass());
-  vectorFPM_.addPass(SLPVectorizerPass());
-  vectorFPM_.addPass(InstCombinePass());
+  vectorFPM_ = buildVectorFPM(/*ExtraPasses=*/false);
+  vectorExtraFPM_ = buildVectorFPM(/*ExtraPasses=*/true);
+
+  // Passes enabled by EJIT_JIT_* macros. LLVM only schedules them in its
+  // module optimization pipeline, which EJIT does not run.
+  PipelineTuningOptions PTO;
+  loopVersioningLicmFPM_.addPass(
+      createFunctionToLoopPassAdaptor(LoopVersioningLICMPass()));
+  loopVersioningLicmFPM_.addPass(createFunctionToLoopPassAdaptor(
+      LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,
+               /*AllowSpeculation=*/true),
+      /*UseMemorySSA=*/true));
+  // Unlike LV, LoopDistribute needs loops already in simplified form.
+  loopDistributeFPM_.addPass(LoopSimplifyPass());
+  loopDistributeFPM_.addPass(LCSSAPass());
+  loopDistributeFPM_.addPass(LoopDistributePass());
+}
+
+FunctionPassManager EJitOptimizer::buildVectorFPM(bool ExtraPasses) {
+  // ExtraPasses mirrors -extra-vectorizer-passes in
+  // PassBuilder::addVectorPasses.
+  FunctionPassManager FPM;
+  FPM.addPass(LoopVectorizePass());
+  if (ExtraPasses) {
+    PipelineTuningOptions PTO;
+    ExtraFunctionPassManager<ShouldRunExtraVectorPasses> Extra;
+    Extra.addPass(EarlyCSEPass());
+    Extra.addPass(CorrelatedValuePropagationPass());
+    Extra.addPass(InstCombinePass());
+    LoopPassManager LPM;
+    LPM.addPass(LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,
+                         /*AllowSpeculation=*/true));
+    LPM.addPass(SimpleLoopUnswitchPass());
+    Extra.addPass(createFunctionToLoopPassAdaptor(
+        std::move(LPM), /*UseMemorySSA=*/true, /*UseBlockFrequencyInfo=*/true));
+    Extra.addPass(
+        SimplifyCFGPass(SimplifyCFGOptions().convertSwitchRangeToICmp(true)));
+    Extra.addPass(InstCombinePass());
+    FPM.addPass(std::move(Extra));
+  }
+  FPM.addPass(SLPVectorizerPass());
+  if (ExtraPasses)
+    FPM.addPass(EarlyCSEPass());
+  FPM.addPass(InstCombinePass());
+  return FPM;
 }
 
 void EJitOptimizer::clearAnalyses() {
@@ -969,15 +1021,35 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
         pgoUseFPM_.run(F, FAM_);
     }
 
+  // Phase 3b (EJIT_JIT_* macros): partial inlining and loop versioning LICM,
+  // placed as in LLVM's module optimization pipeline.
+  if (jitOptionEnabled(JitOption::EnablePartialInlining)) {
+    ModulePassManager PartialInlineMPM;
+    PartialInlineMPM.addPass(PartialInlinerPass());
+    PartialInlineMPM.run(M, MAM_);
+  }
+  if (jitOptionEnabled(JitOption::EnableLoopVersioningLicm))
+    for (Function &F : M.functions())
+      if (!F.isDeclaration())
+        loopVersioningLicmFPM_.run(F, FAM_);
+
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
   runStructFieldPass(M);
+  const bool vectorize =
+      level != ejit::OptimizationLevel::L1 && M.getTargetTriple().isAArch64();
+  const bool distribute =
+      vectorize && jitOptionEnabled(JitOption::EnableLoopDistribute);
+  FunctionPassManager &vectorFPM =
+      jitOptionEnabled(JitOption::ExtraVectorizerPasses) ? vectorExtraFPM_
+                                                         : vectorFPM_;
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
       cleanupFPM_.run(F, FAM_);
-      if (level != ejit::OptimizationLevel::L1 &&
-          M.getTargetTriple().isAArch64())
-        vectorFPM_.run(F, FAM_);
+      if (distribute)
+        loopDistributeFPM_.run(F, FAM_);
+      if (vectorize)
+        vectorFPM.run(F, FAM_);
     }
 }

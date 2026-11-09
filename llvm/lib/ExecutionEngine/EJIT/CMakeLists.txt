@@ -110,6 +110,7 @@ set(EJIT_SOURCES
   EJitRegistrationStore.cpp
   EJitStructFieldPass.cpp
   EJitOptimizer.cpp
+  EJitJitOptions.cpp
   EJitPassBuilder.cpp
   EJitProfileMerge.cpp
   EJitCodePool.cpp
