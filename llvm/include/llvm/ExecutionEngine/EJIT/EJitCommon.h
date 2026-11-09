@@ -114,6 +114,10 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 // ejit_register_icache_slot(const char *name, void *slot, uint32_t numDims,
 // void *missFn), where missFn is the slot's sentinel for branchless tables
 // (drain/fill-retract write it back instead of 0) and null for guarded ones.
+// numDims names a SCALAR slot when 0: a 0-dim entry, or a single-slot-mode
+// function (-ejit-icache-single-slot) whose wrapper still resolves through the
+// taskpool with its real dim count -- icacheFill then writes cell 0 for any
+// dim tuple.
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";

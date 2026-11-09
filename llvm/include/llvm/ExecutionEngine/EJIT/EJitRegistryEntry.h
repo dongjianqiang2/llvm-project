@@ -42,7 +42,10 @@ typedef struct {
                      //   (EJIT_REG_ICACHE_SLOT, branchless tables), else NULL
   const void *ptr;   // bitcode data / baseAddr / symbol addr / &i32 slot /
                      //   &ptr icache slot base (EJIT_REG_ICACHE_SLOT)
-  uint64_t size;     // bitcode size / array size / numDims (EJIT_REG_ICACHE_SLOT)
+  uint64_t size;     // bitcode size / array size / numDims (EJIT_REG_ICACHE_SLOT;
+                     //   0 names a scalar slot -- a 0-dim entry, or a
+                     //   -ejit-icache-single-slot function whose wrapper still
+                     //   resolves with its real dim count)
                      //   / 0
 } ejit_reg_entry_t;
 

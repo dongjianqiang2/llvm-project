@@ -73,6 +73,28 @@ L0, the bucket lookup, the compile scheduler — is out of line in `MissFn`.
 The index is `icacheLinearize(dims)` — row-major Horner over the `instanceId`s,
 which must match the AOT GEP's dimension order (`dim0` = leftmost `ejit_dim`).
 
+**D-cache clustering (`-ejit-icache-cluster`).** In the embedded shape each TU
+contributes ONE cell table, and the shared section also carries that TU's
+toggle-written period arrays plus the MB-scale taskpool blob — so the
+probe-hot cell lines sit next to frequently-written neighbors that keep
+evicting them, and cells from different TUs scatter across the shared window.
+With the flag ON and a non-empty section, the pass instead emits every cell
+table into the DERIVED subsection `<EJIT_ICACHE_SECTION>.ejit_icache` (default
+`.mc_shared.ejit_icache`): the linker concatenates same-named input sections
+in link order — the only mechanism that can group cells across TUs (a
+per-module array would degenerate to size 1 under one-entry-per-TU). The
+grouping works with or without `-fdata-sections`; an explicit section name is
+the grouping key either way. Per-cell alignment stays 8 (a cell never
+straddles a 64B line; eight scalar cells pack one line), and line-granularity
+isolation is the deployment script's `ALIGN(64)` — the same split as
+`.text.ejit_dispatch`. The cells are read-mostly (probes only load; a fill is
+once per specialization and a drain writes every cell whatever the layout),
+so packing them on shared lines creates no false sharing — it moves them AWAY
+from the high-frequency neighbor writes that do. Optional hardening, NOT
+built: per-cell 64B alignment on top of clustering would give each cell its
+own line (N*64B memory, 8x resident lines) to remove an effect that only
+occurs at fill frequency — see ejit_registry.ld for the script entry.
+
 ### 3.2 Invalidation
 
 `setInstanceEnabled` calls `icacheDrainAll()` at both ends of the period mutation
@@ -196,6 +218,15 @@ symbol resolves to the same address either way, so the mistake is undetectable
 from code. CMake warns when `EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING` is
 configured with an empty section. See §8.
 
+With `-ejit-icache-cluster` P2 gains a second, script-shape-dependent clause:
+the derived `<section>.ejit_icache` name must ALSO be mapped into the shared
+region. An exact-match script (`*(.mc_shared)`) leaves the derived fragments as
+orphans — lld's longest-name-prefix heuristic usually lands them adjacent to
+`.mc_shared`, but the region assignment is not contractual; a globbing script
+(`*(.mc_shared*)`) swallows the name back into the shared section INTERLEAVED,
+and the feature silently no-ops. Both shapes degrade without any diagnostic;
+the only detector is the link-time check in §8.
+
 **P3 — `ejit_dim` values stay in `[0, D)`.** The accepted ranges never agreed: the
 taskpool takes instance ids up to 256 and a period array may declare up to 100
 entries, against a `D` of 16. The probe indexes with the raw argument, so an id of
@@ -252,6 +283,7 @@ can, turn the cache off.
 |---|---|---|
 | `-ejit-inline-cache` | off | emit the probe |
 | `EJIT_ICACHE_SECTION` (`-mllvm -ejit-icache-section=` overrides) | `.mc_shared` | section for the cell table; `""` = per-core `.bss` |
+| `-mllvm -ejit-icache-cluster` | off | emit the cell tables into the derived `<section>.ejit_icache` so the linker concatenates them into one D-cache-contiguous region; requires a matching deployment-script entry (P2); no-op with an empty section |
 | `EJIT_ICACHE_DIM_SIZE` | 16 | per-dim bound D |
 | `EJIT_ICACHE_MAX_DIMS` | 4 | max cached dims |
 | `EJIT_ICACHE_FUNC_SLOTS` | 4096 | registration table size (must be ≥ `EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX`) |
@@ -299,10 +331,29 @@ readelf -SW app.o   | grep mc_shared           # is that index .mc_shared?
 readelf -SW image.elf | grep mc_shared         # linked address + size
 nm image.elf | grep __ejit_icache_fn_          # must fall inside that range
 objdump -d image.elf --disassemble=<entry> | head -8   # adrp/add/ldr/cbz/br, no bl
+# with -ejit-icache-cluster, additionally:
+readelf -SW image.elf | grep ejit_icache      # ONE output section, addr % 64 == 0,
+                                              # inside the shared window
+nm image.elf | grep __ejit_icache_fn_         # consecutive addresses inside it
 ```
 
 The linked-address check is the one the code cannot do for you: land outside the
 shared window and the cache silently degrades to per-core.
+
+Cluster script fix-up, by current shape — an entry is required either way:
+
+```ld
+# exact-match script (*(.mc_shared)) — add:
+.mc_shared.ejit_icache : ALIGN(64)
+{
+  KEEP(*(.mc_shared.ejit_icache))
+} > <the same inter-core shared region .mc_shared maps into>
+
+# globbing script (*(.mc_shared*)) — the glob swallows the derived name back
+# unclustered, so split it first, then add the same entry:
+#   *(.mc_shared)                                  # everything else
+#   .mc_shared.ejit_icache : ALIGN(64) { KEEP(*(.mc_shared.ejit_icache)) } > <shared region>
+```
 
 At run time, `-mllvm -ejit-wrapper-timing` prints one line per 100000 icache hits
 (`status=254` is the hit sentinel); or watch `ejit_print_stats` — once warm,
