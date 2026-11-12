@@ -1,119 +1,115 @@
-# Cell/TRP Final-Version Switch Merge on spec4
+# Ordinary Cell/TRP Final-T2 Switch Merge
 
-Status: requirements confirmed; base migration and final-body assembly
-prototype implemented. Production merge and board acceptance pending.
-This is not the per-identity runtime-dimension
-transform in `EJIT_SWITCH_CASE.md`.
+## Baseline
 
-## Confirmed goal
+Branch: `codex/spec5-cell-trp-switch-verify`.
+Base: bruteforceboy #244 `ejit_switch_case_v1` at `4b0b21b80`.
+Integrated: #262 at `34c187340`, including its folding/local-free-dim,
+pointer-witness/PHI and verifier ancestry. Keep spec5's pipeline and pools.
+The spec4 workspace is a preserved checkpoint, NOT the delivery target.
 
-Different configurations of the same entry must be represented by one final
-JIT function. Ordinary cell and TRP arguments select specialized arms. Equal
-final code is NOT required (unlike representative exact-code reuse).
+This adds ordinary cell/TRP merging with DIFFERENT configurations. It is not
+#230 equal-code sharing or #244's existing TTI remainder/mask specialization.
+The latter remains available independently.
+
+## Runtime behavior
+
+Each member follows independent T1 sampling and its own PGOUse pipeline.
+The existing worker retains bounded final T2 bitcode, imports eligible members,
+inlines entry bodies into exact cell/TRP switch arms, and publishes ONE entry
+address to the included member cache slots. No hidden calls to separately
+emitted member JIT functions. Live arguments, writes and returns are preserved.
 
 ```c
-int merged_entry(unsigned cell, unsigned trp, int x) {
+int merged(unsigned cell, unsigned trp, int live) {
   switch (cell) {
-  case 0:
-    switch (trp) {
-    case 2: return x * 3 + 7;
-    case 5: return x * 9 + 11;
-    }
-    break;
-  case 3:
-    if (trp == 5) return x * 2 + 13;
-    break;
+  case 0: if (trp == 2) return 11 + 41 + live; break;
+  case 3: if (trp == 5) return 14 * 3 + 47 + live; break;
   }
-  return original_aot(cell, trp, x);
+  return original_aot(cell, trp, live);
 }
 ```
 
-The constants above are illustrative, not workload measurements. Passing
-cell=3 must never execute cell=0's constants. Runtime uses of either argument,
-stores, calls, and return values retain their original semantics. Neither
-argument becomes `free_dim`, and neither is reduced modulo a slot period.
+This illustrates unequal values, not a measurement. Cell/TRP are not free_dim
+and are not reduced modulo a slot period. Each arm keeps its own applied
+profile and branch weights; no cross-member frequency distribution is invented.
 
-## Online PGO
+## Enable
 
-Confirmed on 2026-11-12: retain independent Tier-1 sampling for each member,
-then combine the prepared final Tier-2 bodies. Do not introduce shared Tier-1
-counters, a shared sample quota, or a second independent profiling scheduler.
+Build with `EJIT_SWITCH_CASE`, shared taskpool/shared code pointers, code pool
+and `EJIT_SRE_TASKPOOL_NO_RECLAIM`. Compile entry translation units with
+`-mllvm -ejit-final-version-merge`, plus normal wrapper flags such as
+`-mllvm -ejit-inline-cache`. The compiler registers an ABI-identical unwrapped
+AOT body through the EXISTING symbol registry, including static `.ejit_period`
+registration. No SDK callbacks or additional platform headers are required.
 
-Apply each member's own profile before merging. Never replay another member's
-profile hash/counters. Unprepared members keep their existing AOT/T1 path;
-their configuration must not be read speculatively to manufacture extra arms.
+Before init on EVERY participating core, checking return values:
 
-## Implementation boundaries
+```c
+ejit_set_final_version_merge(1);
+ejit_init_pgo(&cfg); /* cfg.compileMode = EJIT_COMPILE_ASYNC */
+/* Or ejit_init_verify_pgo(&cfg) for diagnostics. */
+```
 
-1. Keep the original per-member identity, activation state, version checks,
-   request token, and PGO accounting.
-2. Prepare final member IR under the existing compile/publication contract.
-   Retain only bounded, owned artifacts, not borrowed configuration pointers.
-3. Combine eligible bodies into one dispatched function, not a trampoline
-   that calls separately emitted physical per-member JIT functions.
-4. Emit/seal one final code resource and publish that same function address to
-   the included member cache entries through their own current-version gates.
-5. Handle in-flight inline-cache fills and invalidate stale cached pointers.
-   Do not free old executable memory: spec4's NO_RECLAIM policy remains.
-6. A failed merge leaves usable existing member versions intact. Invalidated,
-   unready, unsupported, or over-budget members must not enter frozen arms.
-7. Keep module-private state, external bindings, bound-pointer contracts and
-   verifier identities distinct unless equivalence is independently proven.
-8. Use existing worker, permission preparation and code-pool interfaces. No
-   mandatory SDK task-id API, arbitrary shared-heap callback, or demo adapter.
+`ejit_config_t` ABI is unchanged. Runtime mode is immutable after init and
+included in the cross-core fingerprint. Default OFF; `EJIT_SWITCH_CASE` alone
+does not enable merging. Old compiler output without the registered AOT body
+keeps independent T2 with `final-merge no AOT fallback`, not silent success.
+The compiler opt-in costs an additional retained AOT body.
 
-The grouping/admission and publication implementation must explicitly document
-late join, partial groups, eviction and rebuild budgets before being enabled
-in a product preset. Enabling `EJIT_SWITCH_CASE` alone does not enable this
-new capability.
+## Publication and bounds
 
-## Current implementation checkpoint
+- Use the existing worker, near-code pool, sealing and peer permissions.
+- Replace only an existing Ready T2 with matching full identity, versions,
+  generation and expected pointer. Reject inactive/evicted/stale members.
+  Drain inline caches with the existing drain sequence after replacement.
+- Late members rebuild an eligible cohort. Cold members keep AOT/T1. Config
+  changes require the existing deactivate/synchronize/update/activate contract.
+- Failed assembly/emission/sealing/publication keeps existing versions usable.
+  Partial publication updates only members that pass their own commit gates.
+- NO_RECLAIM retains old independent T2 and merged generations. V1 initially
+  emits independent T2 before incremental merging: fewer active entry addresses
+  does NOT mean fewer retained code-pool bytes. Prepare-only emission and
+  physical reclamation are separate future work.
+- One/two named cell/TRP integer arguments; scalar C ABI. Full tuple matching,
+  no modulo/key truncation. Existing runtime/wrapper dimension capacities apply.
+- Limits: 8 arms, 8,000 instructions, 512 KiB/member artifact and constants,
+  64 retained artifacts/4 MiB aggregate, 64 merged emission attempts (failed
+  emissions included) per driver lifetime. Extra members remain independent;
+  this is not an unlimited all-cell merge.
+- Reject private writable/TLS state, observable private object/function
+  identity, aliases/ifuncs/module asm, entry recursion, incompatible ABI/targets,
+  and indirect calls without verified target remapping. These use independent
+  T2, not unsafe sharing. Imported helpers/constants are member-namespaced.
+- Verifier live reads, calls and site identities stay in their selected arms.
 
-`EJitVersionMerge` assembles already-prepared member functions in one module.
-It uses full-width one/two-dimensional switches, inlines member entry bodies,
-and keeps one AOT default edge. It does not reread configuration or synthesize
-profiles. It rejects conflicting tuples, unsupported ABIs/control flow,
-member recursion/address identity, and exceeded instruction/arm budgets.
-It preserves member branch weights and diagnostic calls without propagating
-member-specific inferred attributes onto the dispatcher or AOT edge.
+## 6/16/6 example
 
-This API is not called by `EJitCompileDriver` yet. Importing independently
-prepared T2 artifacts, bounded group storage, cache publication, inline-cache
-refresh, and lifecycle integration are still pending. The native execution
-test exercises the assembly result, not that missing online workflow.
+`ejit_test/ejit_cell_trp_merge_sre_test.c`, fresh standalone image, existing
+shared-section/init-array setup. No `main`, no default wait cutoff.
 
-## Acceptance gates
+```text
+core[6]  -> test_ejit_period
+core[16] -> test_ejit_period
+core[6]  -> test_ejit_cell_trp_merge_print
+```
 
-- Single cell, single TRP, and cell+TRP tuples with unequal configuration.
-- Nonzero/non-one IDs and unsupported tuples; no narrowing/key collisions.
-- Equal and unequal configurations, one final entry address, no out-of-line
-  member-body calls hidden behind a dispatcher.
-- Runtime arguments also used outside configuration loads and in stores.
-- Actual independent T1 executions, profile-use success, combined T2 results.
-- A cold/unvisited member does not block or acquire another member's profile.
-- Deactivate/change/reactivate while compile or publish is in progress.
-- Late joins, eviction, stale request completion and owner-generation change.
-- Allocation/seal failures and bounded retained/retired resources.
-- Verifier: unchanged configuration passes; a deliberately changed authorized
-  field is detected at the original live read in the selected arm.
-- Feature OFF leaves the original dispatch and PGO behavior unchanged.
-- BE compile/link check and a standalone SRE example: core 6 worker, core 16
-  owner, core 6 print; no `main`, no default wall-clock cutoff.
+Expected: WORKER_READY, four PHASE lines (single, pair merge, late third,
+deactivate/change/retrain), OWNER_DONE, FUNCTIONAL_PASS. It checks numerical
+results, live stores, equal entry pointers, and an unvisited tuple's AOT default.
+Inspect the merged IR/ASM as well.
 
-Host/IR tests do not establish product readiness or real multicore board
-acceptance. Existing #244 slot tests do not satisfy these merge gates.
+Optional `-DMERGE_VERIFY_MODE=1`: verifies real coverage with zero initial
+mismatches, deliberately changes one isolated test field, requires a mismatch
+from the merged arm, restores it, and prints VERIFY_PASS. Do not reproduce this
+unsynchronized negative in production. `MERGE_WAIT_ROUNDS` defaults to zero
+(unlimited); only the host runner sets a finite bound.
 
-## Migration ledger
+## Validation boundary
 
-Base: `ejit_dev_spec4` at `6d0d402cdcbbc05730d98c3147ac8e64510552f1`.
-Branch: `codex/spec4-cell-trp-switch-verify`.
-
-Ported: #247 local free-dim, #249 bounded pointer period, #252 pointer-context
-folding, #256 pointer witnesses and board examples, #258 may-const pointer
-chains, #260 fused-index folding, #262 verifier, and #244 runtime-dimension
-switch arms with its PGO replay. Keep spec4's fixed-pool and no-vectorization
-pipeline. #250's spec5 NEON pipeline, #261's independent fixes, and unrelated
-spec5 runtime features are not silently included.
-
-The new cell/TRP merge remains a separate deliverable; this migration must not
-be reported as already providing that capability.
+See the task validation report for native tests, feature-off, batching, host
+wrapper simulation and BE probes. Host core-ID simulation is NOT real SRE
+multicore acceptance. BE objects are NOT a final SDK link. A matching full
+toolchain/package build, actual shared-memory/permission validation and the
+6/16/6 board run remain product acceptance gates. No performance percentage or
+physical reclamation claim is made.

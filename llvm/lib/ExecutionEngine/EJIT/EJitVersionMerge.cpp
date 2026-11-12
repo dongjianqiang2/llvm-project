@@ -25,6 +25,10 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+namespace {
+AttributeList scalarABI(const Function &F);
+}
+
 Error llvm::ejit::validateFinalVersionModule(const Module &M, StringRef Entry) {
   const Function *Root = M.getFunction(Entry);
   if (!Root || Root->isDeclaration() || !M.alias_empty() || !M.ifunc_empty() ||
@@ -151,10 +155,27 @@ Expected<std::string> llvm::ejit::assembleFinalVersionModules(
         F.setVisibility(GlobalValue::DefaultVisibility);
       }
     Names.push_back(Root->getName().str());
-    // Per-member function metadata and branch weights remain on the bodies.
-    // Do not merge module-level EJIT registration named metadata.
-    while (!M.named_metadata_empty())
-      M.eraseNamedMetadata(&*M.named_metadata_begin());
+    // Keep target/ABI flags and debug compile units. Only member-local EJIT
+    // registration and whole-module profile summaries do not describe a cohort.
+    SmallVector<NamedMDNode *, 4> Registration;
+    for (NamedMDNode &MD : M.named_metadata())
+      if (MD.getName().starts_with("ejit."))
+        Registration.push_back(&MD);
+    for (auto *MD : Registration)
+      M.eraseNamedMetadata(MD);
+    if (auto *Flags = M.getNamedMetadata("llvm.module.flags")) {
+      SmallVector<MDNode *, 8> Kept;
+      for (MDNode *Flag : Flags->operands()) {
+        auto *Key = Flag->getNumOperands() > 1
+                        ? dyn_cast_or_null<MDString>(Flag->getOperand(1))
+                        : nullptr;
+        if (!Key || Key->getString() != "ProfileSummary")
+          Kept.push_back(Flag);
+      }
+      Flags->clearOperands();
+      for (auto *Flag : Kept)
+        Flags->addOperand(Flag);
+    }
     if (Linker::linkModules(*Combined, std::move(*Parsed)))
       return make_error<StringError>("member link failed",
                                     inconvertibleErrorCode());
@@ -165,6 +186,7 @@ Expected<std::string> llvm::ejit::assembleFinalVersionModules(
   auto *Fallback = Function::Create(Arms[0].body->getFunctionType(),
                                     GlobalValue::ExternalLinkage,
                                     "__ejit_merge_aot", *Combined);
+  Fallback->setAttributes(scalarABI(*Arms[0].body));
   auto Merged = assembleFinalVersionSwitch(Entry, *Fallback, DimensionArgs, Arms);
   if (!Merged)
     return Merged.takeError();
@@ -199,7 +221,7 @@ bool supportedScalar(Type *Ty) {
   return Ty->isIntegerTy() || Ty->isFloatingPointTy() || Ty->isPointerTy();
 }
 
-// Restrict the prototype until aggregate/special calling-convention lowering
+// Restrict the ABI until aggregate/special calling-convention lowering
 // has dedicated coverage. Do not copy inferred range/nonnull/memory attributes
 // from a specialized member onto the generic dispatcher or its AOT edge.
 bool supportedPrototype(const Function &F) {

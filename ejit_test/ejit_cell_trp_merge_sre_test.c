@@ -1,6 +1,7 @@
 // Fresh standalone image: core6 test_ejit_period; core16 test_ejit_period;
 // core6 test_ejit_cell_trp_merge_print. No main and no default timeout.
-// Compile with matching EJIT Clang -O2 -c and the normal wrapper options.
+// Compile with matching EJIT Clang -O2 -c -mllvm -ejit-final-version-merge
+// and the normal wrapper options (e.g. -mllvm -ejit-inline-cache).
 // Runtime: SWITCH_CASE + shared taskpool + NO_RECLAIM + code pool + stats.
 #ifndef __has_attribute
 #define __has_attribute(x) 0
@@ -23,6 +24,9 @@ extern uint8_t g_ucLocalCoreID;
 #endif
 #ifndef MERGE_WAIT_ROUNDS
 #define MERGE_WAIT_ROUNDS 0u
+#endif
+#ifndef MERGE_VERIFY_MODE
+#define MERGE_VERIFY_MODE 0
 #endif
 struct MergeConfig {
   ejit_may_const uint32_t bias;
@@ -105,7 +109,7 @@ static int stats(ejit_taskpool_stats_t *s) {
 static int phase(unsigned member, unsigned trained, unsigned shared_count,
                  void **shared) {
   // The very first request uses the actual generated wrapper, including AOT
-  // fallback registration. No direct-API prewarm substitutes for this step.
+  // dispatch path. No direct-API prewarm substitutes for this step.
   if (wrapper_call(cells[member], trps[member], 13))
     return -1;
   for (unsigned round = 0; !MERGE_WAIT_ROUNDS || round < MERGE_WAIT_ROUNDS;
@@ -175,8 +179,11 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
   cfg.enableLogger = cfg.forceStaticRegistry = true;
-  if (ejit_set_final_version_merge(1) != EJIT_OK ||
-      ejit_init_pgo(&cfg) != EJIT_OK || ejit_taskpool_get_worker_core() != 6u)
+  if (ejit_set_final_version_merge(1) != EJIT_OK)
+    return fail("merge init failed");
+  ejit_status_t init = MERGE_VERIFY_MODE ? ejit_init_verify_pgo(&cfg)
+                                       : ejit_init_pgo(&cfg);
+  if (init != EJIT_OK || ejit_taskpool_get_worker_core() != 6u)
     return fail("merge/PGO init or worker core mismatch");
   ejit_taskpool_stats_t s = {0};
   if (stats(&s) || s.asyncCompiles || s.asyncEnqueues || s.readyEntries)
@@ -215,6 +222,26 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_activate("cell", 0);
   if (phase(0, 4, 3, &merge_result.renewed_shared))
     return -1;
+#if MERGE_VERIFY_MODE
+  // Standalone diagnostic negative: no concurrent writer, restore afterwards.
+  // Verifier executes live loads, so output stays correct while mismatch rises.
+  ejit_verify_stats_t initial = {0}, changed = {0};
+  ejit_verify_get_stats(&initial);
+  if (!initial.checks || initial.mismatches)
+    return fail("verifier has no coverage or unexpected mismatch");
+  uint32_t saved = merge_cells[3].bias;
+  merge_cells[3].bias = saved + 2u;
+  void *probe = 0;
+  int probed = query_call(1, 43, &probe);
+  merge_cells[3].bias = saved;
+  ejit_verify_get_stats(&changed);
+  if (probed != 1 || probe != merge_result.renewed_shared ||
+      changed.checks <= initial.checks || changed.mismatches <= initial.mismatches)
+    return fail("merged arm did not detect deliberate verifier mismatch");
+  SRE_printf("[CELLTRP] VERIFY_PASS checks=%llu intentional_mismatches=%llu\n",
+             (unsigned long long)changed.checks,
+             (unsigned long long)changed.mismatches);
+#endif
   __atomic_store_n(&merge_stage, DONE, __ATOMIC_RELEASE);
   SRE_printf("[CELLTRP] OWNER_DONE checks=%u; core6 test_ejit_cell_trp_merge_print\n",
              merge_result.checked);

@@ -2525,6 +2525,13 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     bucketWriteRelease(B);
     return EJitPublishStatus::VersionMismatch;
   }
+  if (expectedFinal)
+    for (uint32_t I = 0; I < req.numDims; ++I)
+      if (target->versions[I] != req.versions[I] ||
+          !isInstanceActive(req.dims[I].dimType, req.dims[I].instanceId)) {
+        bucketWriteRelease(B);
+        return EJitPublishStatus::VersionMismatch;
+      }
   if (!target)
     target = firstEmpty ? firstEmpty : evict; // bucket full → evict slot 0-ish.
   if (!target) {

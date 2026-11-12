@@ -838,6 +838,12 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   SmallVector<unsigned, 2> FinalArgs;
   uintptr_t FinalAot = request ? request->fallbackPtr : 0;
   if (config_.enableFinalVersionMerge && request) {
+    if (!FinalAot)
+      for (const auto &Symbol : userSymbols_)
+        if (Symbol.first == std::string(FINAL_MERGE_AOT_PREFIX) + funcName) {
+          FinalAot = reinterpret_cast<uintptr_t>(Symbol.second);
+          break;
+        }
     if (ctx.tier == CompileTier::Instrumented && FinalAot &&
         finalFallbacks_.size() < 64)
       finalFallbacks_[cacheKey] = {FinalAot, *request};
@@ -856,6 +862,11 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     ctx.finalMergeBitcode = &FinalBitcode;
     ctx.finalMergeDimensionArgs = &FinalArgs;
   }
+  if (config_.enableFinalVersionMerge && ctx.tier == CompileTier::PGOUse &&
+      !FinalAot)
+    EJIT_DIAG("final-merge no AOT fallback entry=%s: rebuild entry with "
+              "-mllvm -ejit-final-version-merge; keeping independent T2",
+              funcName.c_str());
 #endif
   jitEngine_->setActiveContext(&ctx);
 

@@ -891,7 +891,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             if (Args)
               *ctx->finalMergeDimensionArgs = std::move(*Args);
             else
-              consumeError(Args.takeError());
+              EJIT_DIAG("final-merge dimensions ineligible entry=%s: %s",
+                        ctx->fnName.c_str(), toString(Args.takeError()).c_str());
           }
 #endif
           if (!ctx->preparedFinalMerge)

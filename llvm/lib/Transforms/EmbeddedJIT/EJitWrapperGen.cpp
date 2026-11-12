@@ -33,6 +33,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <limits>
 #include <map>
 #include <string>
@@ -560,6 +561,52 @@ emitIcacheSlotRegistration(Module &M,
 
 } // anonymous namespace
 
+static cl::opt<bool> EJitFinalVersionMerge(
+    "ejit-final-version-merge", cl::init(false),
+    cl::desc("Retain and register an ABI-identical AOT fallback for final cell/TRP merging"));
+
+static void registerFinalMergeAot(Module &M, Function &F) {
+  LLVMContext &C = M.getContext();
+  const std::string Key = std::string(FINAL_MERGE_AOT_PREFIX) + F.getName().str();
+  const std::string Record = ".ejit.final.aot." + F.getName().str();
+  if (M.getNamedGlobal(Record))
+    return;
+  ValueToValueMapTy Map;
+  Function *Aot = CloneFunction(&F, Map);
+  Aot->setName(Key);
+  Aot->setLinkage(GlobalValue::InternalLinkage);
+  Aot->setVisibility(GlobalValue::DefaultVisibility);
+  Aot->setComdat(nullptr);
+  Aot->setMetadata(MD_EJIT_METADATA, nullptr);
+  auto *Ptr = PointerType::getUnqual(C);
+  auto *I32 = Type::getInt32Ty(C);
+  auto *I64 = Type::getInt64Ty(C);
+  auto Register = M.getOrInsertFunction(
+      FN_REGISTER_SYMBOL,
+      FunctionType::get(Type::getVoidTy(C), {Ptr, Ptr}, false));
+  Function *Auto = M.getFunction(FN_AUTO_REGISTER);
+  if (!Auto) {
+    Auto = Function::Create(FunctionType::get(Type::getVoidTy(C), false),
+                            GlobalValue::InternalLinkage, FN_AUTO_REGISTER, M);
+    ReturnInst::Create(C, BasicBlock::Create(C, "entry", Auto));
+    if (EnableEJitGlobalCtors)
+      appendToGlobalCtors(M, Auto, EJIT_CTOR_PRIORITY);
+  }
+  IRBuilder<> B(Auto->getEntryBlock().getTerminator());
+  Constant *Name = B.CreateGlobalString(Key);
+  B.CreateCall(Register, {Name, Aot});
+  // Reuse the existing symbol registry ABI, including static-only SRE init.
+  auto *Entry = StructType::get(C, {I32, Ptr, Ptr, Ptr, I64});
+  auto *Payload = ConstantStruct::get(
+      Entry, {ConstantInt::get(I32, EJIT_REG_SYMBOL), Name,
+              ConstantPointerNull::get(Ptr), Aot, ConstantInt::get(I64, 0)});
+  auto *GV = new GlobalVariable(M, Entry, true, GlobalValue::PrivateLinkage,
+                                Payload, Record);
+  GV->setSection(SECT_EJIT_PERIOD);
+  GV->setAlignment(M.getDataLayout().getABITypeAlign(Entry));
+  appendToUsed(M, {GV});
+}
+
 PreservedAnalyses EJitWrapperGenPass::run(Module &M,
                                           ModuleAnalysisManager &AM) {
   LLVMContext &Ctx = M.getContext();
@@ -809,6 +856,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     if (Invalid)
       continue;
+
+    if (EJitFinalVersionMerge && DimCount >= 1 && DimCount <= 2)
+      registerFinalMergeAot(M, *F);
 
     // Save original entry block
     BasicBlock &OrigEntry = F->getEntryBlock();

@@ -95,6 +95,7 @@ constexpr const char *GV_EJIT_BITCODE = "__ejit_bitcode";
 constexpr const char *SECT_EJIT_BITCODE = ".ejit_bitcode";
 constexpr const char *SECT_EJIT_PERIOD = ".ejit_period";
 constexpr const char *FN_AUTO_REGISTER = "ejit_auto_register";
+constexpr const char *FINAL_MERGE_AOT_PREFIX = "__ejit_final_merge_aot_";
 constexpr const char *CTORS_GLOBAL = "llvm.global_ctors";
 
 //===----------------------------------------------------------------------===//

@@ -994,11 +994,6 @@ void EJitOptimizer::runSwitchCase(Module &M, const SpecializationContext &ctx) {
 }
 #endif
 
-void EJitOptimizer::runStructFieldPass(Module &M) {
-  SpecializationContext Empty;
-  runStructFieldPass(M, Empty);
-}
-
 FunctionPassManager &
 EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
   switch (level) {

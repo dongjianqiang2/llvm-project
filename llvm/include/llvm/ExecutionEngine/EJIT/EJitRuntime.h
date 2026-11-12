@@ -209,6 +209,9 @@ ejit_status_t ejit_init_pgo(const ejit_config_t *config);
 /// participating core. Then use ejit_init_pgo (or ejit_init_verify_pgo).
 /// Keeps ejit_config_t ABI unchanged. Requires SWITCH_CASE, shared taskpool,
 /// code pool and NO_RECLAIM; T1 sampling remains independent per member.
+/// Compile entries with -mllvm -ejit-final-version-merge to register their AOT
+/// fallback. Missing fallback or ineligible members retain independent T2.
+/// Merging does not reclaim previously emitted code under NO_RECLAIM.
 ejit_status_t ejit_set_final_version_merge(int enabled);
 void ejit_shutdown(void);
 

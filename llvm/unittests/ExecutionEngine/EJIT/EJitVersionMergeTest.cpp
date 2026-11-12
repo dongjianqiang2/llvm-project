@@ -97,6 +97,8 @@ TEST(EJitVersionMerge, ColdIndependentPgoToSharedFinalAndLifecycle) {
   Cfg.enableFinalVersionMerge = true;
   EJitRuntimeState State;
   EJitCompileDriver Driver(Cfg, State, Loader, nullptr);
+  Driver.registerSymbol(std::string(FINAL_MERGE_AOT_PREFIX) + "merge_runtime",
+                        reinterpret_cast<void *>(&runtimeMergeAot));
   auto *Pool = Driver.sharedTaskPool();
   // Run the real worker state machine deterministically, without a second
   // host thread. No compiler, publication or PGO callback is replaced.
@@ -120,8 +122,8 @@ TEST(EJitVersionMerge, ColdIndependentPgoToSharedFinalAndLifecycle) {
   };
   auto Call = [&](uint32_t Cell, uint32_t Trp) {
     EJitDimPair Dims[] = {{CellType, Cell}, {TrpType, Trp}};
-    auto R = Pool->compileOrGet(Func, Dims, 2,
-                                reinterpret_cast<void *>(&runtimeMergeAot));
+    // Generated wrappers use the C API, whose queue request has no fallback.
+    auto R = Pool->compileOrGet(Func, Dims, 2, nullptr);
     auto F = reinterpret_cast<Fn>(R.fnPtr ? R.fnPtr :
                                   reinterpret_cast<void *>(&runtimeMergeAot));
     EXPECT_EQ(F(Cell, Trp, 7), runtimeMergeAot(Cell, Trp, 7));
@@ -164,6 +166,12 @@ TEST(EJitVersionMerge, ColdIndependentPgoToSharedFinalAndLifecycle) {
   auto BadVersion = A.request;
   ++BadVersion.versions[0];
   EXPECT_FALSE(Pool->replaceFinalVersion(BadVersion, A.pointer, First.pointer, Info));
+  auto BadGeneration = A.request;
+  ++BadGeneration.generation;
+  EXPECT_FALSE(Pool->replaceFinalVersion(BadGeneration, A.pointer, First.pointer, Info));
+  EJitCompiledCodeInfo Unsealed;
+  EXPECT_FALSE(Pool->replaceFinalVersion(A.request, A.pointer, First.pointer, Unsealed));
+  EXPECT_EQ(Snapshot(0, 2).pointer, A.pointer);
   EXPECT_FALSE(Pool->replaceFinalVersion(A.request, First.pointer, A.pointer, Info));
   Pool->setInstanceEnabled(CellType, 0, false);
   EXPECT_FALSE(Pool->finalVersionCurrent(A.request, A.pointer));
@@ -454,6 +462,41 @@ TEST(EJitVersionMerge, ModuleImportKeepsPrivateHelpersAndConstantsSeparate) {
   EXPECT_EQ(cast<ConstantInt>((*M)->getNamedGlobal("__ejit_merge_1_data")
                                 ->getInitializer())->getZExtValue(), 11u);
   EXPECT_FALSE(verifyModule(**M, &errs()));
+}
+
+TEST(EJitVersionMerge, ModuleImportPreservesScalarAbiOnAotEdge) {
+  LLVMContext C;
+  SMDiagnostic D;
+  auto M = parseAssemblyString(R"(
+    define signext i8 @entry(i8 zeroext %cell, i8 signext %x) {
+      ret i8 %x
+    }
+    !llvm.module.flags = !{!0}
+    !0 = !{i32 1, !"wchar_size", i32 4}
+  )", D, C);
+  ASSERT_TRUE(M);
+  std::string BC;
+  raw_string_ostream OS(BC);
+  WriteBitcodeToFile(*M, OS);
+  EJitFinalModuleArm Arms[] = {{BC, {0}}, {BC, {3}}};
+  auto Result = assembleFinalVersionModules("entry", 4096, {0}, Arms);
+  ASSERT_TRUE(static_cast<bool>(Result)) << toString(Result.takeError());
+  auto Parsed = parseBitcodeFile(MemoryBufferRef(*Result, "merged"), C);
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  auto *Entry = (*Parsed)->getFunction("entry");
+  ASSERT_TRUE(Entry);
+  EXPECT_TRUE((*Parsed)->getModuleFlag("wchar_size"));
+  EXPECT_TRUE(Entry->hasRetAttribute(Attribute::SExt));
+  EXPECT_TRUE(Entry->hasParamAttribute(0, Attribute::ZExt));
+  bool Found = false;
+  for (auto &I : instructions(Entry))
+    if (auto *Call = dyn_cast<CallInst>(&I)) {
+      Found = true;
+      EXPECT_TRUE(Call->hasRetAttr(Attribute::SExt));
+      EXPECT_TRUE(Call->paramHasAttr(0, Attribute::ZExt));
+      EXPECT_TRUE(Call->paramHasAttr(1, Attribute::SExt));
+    }
+  EXPECT_TRUE(Found);
 }
 
 TEST(EJitVersionMerge, MutableAndAddressObservablePrivateStateStayIndependent) {
