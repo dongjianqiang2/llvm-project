@@ -180,6 +180,8 @@ add_llvm_component_library(LLVMEJIT
 
   LINK_COMPONENTS
   BitReader
+  BitWriter
+  Linker
   Core
   OrcJIT
   JITLink

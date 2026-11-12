@@ -119,6 +119,11 @@ struct SpecializationContext {
   std::vector<PgoScalarSite> scalarValueSites;
   /// Tier-2 only: Tier-1's switch-case arms, to rebuild as they were.
   EJitSwitchCaseDecision switchCaseReplay;
+  /// Worker-owned outputs, valid only during this synchronous compilation.
+  std::string *finalMergeBitcode = nullptr;
+  SmallVector<unsigned, 2> *finalMergeDimensionArgs = nullptr;
+  /// Already optimized member bodies: never specialize/profile them again.
+  bool preparedFinalMerge = false;
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
   /// the compile driver before the final compile starts.

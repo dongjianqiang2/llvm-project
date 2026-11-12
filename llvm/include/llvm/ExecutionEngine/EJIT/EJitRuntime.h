@@ -204,6 +204,12 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
+
+/// Select ordinary cell/TRP final-T2 switch merging BEFORE init, on every
+/// participating core. Then use ejit_init_pgo (or ejit_init_verify_pgo).
+/// Keeps ejit_config_t ABI unchanged. Requires SWITCH_CASE, shared taskpool,
+/// code pool and NO_RECLAIM; T1 sampling remains independent per member.
+ejit_status_t ejit_set_final_version_merge(int enabled);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)

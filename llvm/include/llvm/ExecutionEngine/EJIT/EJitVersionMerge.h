@@ -1,5 +1,4 @@
-//===-- EJitVersionMerge.h - Final member body assembly ----------*- C++
-//-*-===//
+//===-- EJitVersionMerge.h - Final member body assembly ----------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -15,9 +14,11 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
+#include <string>
 
 namespace llvm {
 class Function;
+class Module;
 
 namespace ejit {
 
@@ -46,6 +47,18 @@ Expected<Function *> assembleFinalVersionSwitch(
     StringRef Name, Function &AotFallback, ArrayRef<unsigned> DimensionArgs,
     ArrayRef<EJitFinalMergeArm> Arms,
     const EJitFinalMergeLimits &Limits = EJitFinalMergeLimits());
+
+/// Bounded owned post-PGO artifact. No borrowed configuration or profile data.
+Error validateFinalVersionModule(const Module &M, StringRef Entry);
+Expected<SmallVector<unsigned, 2>> finalVersionDimensionArgs(
+    const Function &F, ArrayRef<std::string> Periods);
+struct EJitFinalModuleArm {
+  StringRef bitcode;
+  SmallVector<uint32_t, 2> dimensions;
+};
+Expected<std::string> assembleFinalVersionModules(
+    StringRef Entry, uintptr_t AotFallback, ArrayRef<unsigned> DimensionArgs,
+    ArrayRef<EJitFinalModuleArm> Arms);
 
 } // namespace ejit
 } // namespace llvm

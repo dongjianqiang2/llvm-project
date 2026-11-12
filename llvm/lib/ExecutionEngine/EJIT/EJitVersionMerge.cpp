@@ -1,5 +1,4 @@
-//===-- EJitVersionMerge.cpp - Final member body assembly
-//-------------------===//
+//===-- EJitVersionMerge.cpp - Final member body assembly -------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -9,10 +8,15 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitVersionMerge.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Linker/Linker.h"
+#include "llvm/Support/MemoryBufferRef.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <map>
 #include <set>
@@ -20,6 +24,170 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+Error llvm::ejit::validateFinalVersionModule(const Module &M, StringRef Entry) {
+  const Function *Root = M.getFunction(Entry);
+  if (!Root || Root->isDeclaration() || !M.alias_empty() || !M.ifunc_empty() ||
+      !M.getModuleInlineAsm().empty())
+    return make_error<StringError>("unsupported final module identity",
+                                  inconvertibleErrorCode());
+  for (const GlobalVariable &G : M.globals())
+    if (G.isThreadLocal() ||
+        (!G.isDeclaration() && (!G.isConstant() || !G.hasLocalLinkage() ||
+                                !G.hasGlobalUnnamedAddr())))
+      return make_error<StringError>("private state or observable global: " +
+                                        G.getName(),
+                                    inconvertibleErrorCode());
+  unsigned Instructions = 0;
+  uint64_t ConstantBytes = 0;
+  for (const GlobalVariable &G : M.globals()) {
+    if (G.isDeclaration())
+      continue;
+    if (!G.getValueType()->isSized())
+      return make_error<StringError>("unsized constant", inconvertibleErrorCode());
+    TypeSize Size = M.getDataLayout().getTypeAllocSize(G.getValueType());
+    if (Size.isScalable() || Size.getFixedValue() > 512 * 1024 ||
+        (ConstantBytes += Size.getFixedValue()) > 512 * 1024)
+      return make_error<StringError>("constant byte budget", inconvertibleErrorCode());
+  }
+  for (const Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (F.hasAddressTaken() || F.hasComdat())
+      return make_error<StringError>("observable function identity",
+                                    inconvertibleErrorCode());
+    for (const Instruction &I : instructions(F)) {
+      if (++Instructions > 8000)
+        return make_error<StringError>("member instruction budget",
+                                      inconvertibleErrorCode());
+      // Absolute indirect VP targets may point into a retiring private T1.
+      // Keep those members independent until target remapping is implemented.
+      if (const auto *CB = dyn_cast<CallBase>(&I))
+        if (!CB->getCalledFunction())
+          return make_error<StringError>("indirect call target identity",
+                                        inconvertibleErrorCode());
+    }
+  }
+  return Error::success();
+}
+
+Expected<SmallVector<unsigned, 2>> llvm::ejit::finalVersionDimensionArgs(
+    const Function &F, ArrayRef<std::string> Periods) {
+  if (Periods.empty() || Periods.size() > 2)
+    return make_error<StringError>("expected one or two cell/TRP dimensions",
+                                  inconvertibleErrorCode());
+  auto *MD = F.getMetadata("ejit.metadata");
+  if (!MD)
+    return make_error<StringError>("missing entry metadata",
+                                  inconvertibleErrorCode());
+  SmallVector<unsigned, 2> Result;
+  for (const std::string &Period : Periods) {
+    if (Period != "cell" && Period != "trp")
+      return make_error<StringError>("not an ordinary cell/TRP dimension",
+                                    inconvertibleErrorCode());
+    unsigned Arg = F.arg_size();
+    for (const MDOperand &Op : MD->operands()) {
+      auto *N = dyn_cast_or_null<MDNode>(Op.get());
+      if (!N || N->getNumOperands() < 3)
+        continue;
+      auto *Tag = dyn_cast<MDString>(N->getOperand(0));
+      auto *PN = dyn_cast<MDString>(N->getOperand(1));
+      if (!Tag || !PN || Tag->getString() != "ejit_period_arr_ind" ||
+          PN->getString() != Period)
+        continue;
+      auto *Idx = mdconst::dyn_extract<ConstantInt>(N->getOperand(2));
+      if (!Idx || Arg != F.arg_size() || Idx->getZExtValue() >= F.arg_size())
+        return make_error<StringError>("ambiguous dimension argument",
+                                      inconvertibleErrorCode());
+      Arg = Idx->getZExtValue();
+    }
+    if (Arg == F.arg_size() || !F.getArg(Arg)->getType()->isIntegerTy() ||
+        F.getArg(Arg)->getType()->getIntegerBitWidth() > 32)
+      return make_error<StringError>("unsupported dimension argument",
+                                    inconvertibleErrorCode());
+    Result.push_back(Arg);
+  }
+  return Result;
+}
+
+Expected<std::string> llvm::ejit::assembleFinalVersionModules(
+    StringRef Entry, uintptr_t AotFallback, ArrayRef<unsigned> DimensionArgs,
+    ArrayRef<EJitFinalModuleArm> Inputs) {
+  if (!AotFallback || Inputs.size() < 2 || Inputs.size() > 8)
+    return make_error<StringError>("invalid final merge cohort",
+                                  inconvertibleErrorCode());
+  LLVMContext C;
+  auto Combined = std::make_unique<Module>("ejit.final.merge", C);
+  SmallVector<std::string, 8> Names;
+  size_t Bytes = 0;
+  for (unsigned I = 0; I < Inputs.size(); ++I) {
+    Bytes += Inputs[I].bitcode.size();
+    if (Bytes > 4 * 1024 * 1024)
+      return make_error<StringError>("artifact budget", inconvertibleErrorCode());
+    auto Parsed = parseBitcodeFile(MemoryBufferRef(Inputs[I].bitcode, Entry), C);
+    if (!Parsed)
+      return Parsed.takeError();
+    auto &M = **Parsed;
+    if (auto E = validateFinalVersionModule(M, Entry))
+      return E;
+    if (I == 0) {
+      Combined->setDataLayout(M.getDataLayout());
+      Combined->setTargetTriple(M.getTargetTriple());
+    } else if (M.getDataLayout() != Combined->getDataLayout() ||
+               M.getTargetTriple() != Combined->getTargetTriple()) {
+      return make_error<StringError>("member target mismatch",
+                                    inconvertibleErrorCode());
+    }
+    Function *Root = M.getFunction(Entry);
+    std::string Prefix = "__ejit_merge_" + std::to_string(I) + "_";
+    // Namespace every private definition before LLVM's structured linker.
+    for (GlobalVariable &G : M.globals())
+      if (!G.isDeclaration())
+        G.setName(Prefix + G.getName().str());
+    for (Function &F : M)
+      if (!F.isDeclaration()) {
+        F.setName(Prefix + F.getName().str());
+        F.setLinkage(GlobalValue::ExternalLinkage);
+        F.setVisibility(GlobalValue::DefaultVisibility);
+      }
+    Names.push_back(Root->getName().str());
+    // Per-member function metadata and branch weights remain on the bodies.
+    // Do not merge module-level EJIT registration named metadata.
+    while (!M.named_metadata_empty())
+      M.eraseNamedMetadata(&*M.named_metadata_begin());
+    if (Linker::linkModules(*Combined, std::move(*Parsed)))
+      return make_error<StringError>("member link failed",
+                                    inconvertibleErrorCode());
+  }
+  SmallVector<EJitFinalMergeArm, 8> Arms;
+  for (unsigned I = 0; I < Inputs.size(); ++I)
+    Arms.push_back({Combined->getFunction(Names[I]), Inputs[I].dimensions});
+  auto *Fallback = Function::Create(Arms[0].body->getFunctionType(),
+                                    GlobalValue::ExternalLinkage,
+                                    "__ejit_merge_aot", *Combined);
+  auto Merged = assembleFinalVersionSwitch(Entry, *Fallback, DimensionArgs, Arms);
+  if (!Merged)
+    return Merged.takeError();
+  auto *PtrTy = Fallback->getType();
+  auto *IntTy = Combined->getDataLayout().getIntPtrType(C);
+  Fallback->replaceAllUsesWith(ConstantExpr::getIntToPtr(
+      ConstantInt::get(IntTy, AotFallback), PtrTy));
+  Fallback->eraseFromParent();
+  for (auto &Arm : Arms)
+    Arm.body->eraseFromParent();
+  for (Function &F : *Combined)
+    if (&F != *Merged && !F.isDeclaration()) {
+      F.setLinkage(GlobalValue::InternalLinkage);
+      F.setVisibility(GlobalValue::DefaultVisibility);
+    }
+  if (verifyModule(*Combined))
+    return make_error<StringError>("invalid final module",
+                                  inconvertibleErrorCode());
+  std::string Result;
+  raw_string_ostream OS(Result);
+  WriteBitcodeToFile(*Combined, OS);
+  return Result;
+}
 
 namespace {
 Error reject(const Twine &Reason) {
@@ -46,11 +214,11 @@ bool supportedPrototype(const Function &F) {
     if (!supportedScalar(A.getType()))
       return false;
     AttributeSet AS = F.getAttributes().getParamAttrs(A.getArgNo());
-    for (auto Kind :
-         {Attribute::ByVal, Attribute::StructRet, Attribute::ByRef,
-          Attribute::InAlloca, Attribute::Preallocated, Attribute::InReg,
-          Attribute::SwiftSelf, Attribute::SwiftError, Attribute::SwiftAsync,
-          Attribute::Nest, Attribute::ImmArg})
+    for (auto Kind : {Attribute::ByVal, Attribute::StructRet, Attribute::ByRef,
+                      Attribute::InAlloca, Attribute::Preallocated,
+                      Attribute::InReg, Attribute::SwiftSelf,
+                      Attribute::SwiftError, Attribute::SwiftAsync,
+                      Attribute::Nest, Attribute::ImmArg})
       if (AS.hasAttribute(Kind))
         return false;
   }
@@ -67,8 +235,8 @@ AttributeList scalarABI(const Function &F) {
 }
 
 const char *checkMemberCalls(Function &F,
-                             const SmallPtrSetImpl<Function *> &Members,
-                             unsigned Budget) {
+                            const SmallPtrSetImpl<Function *> &Members,
+                            unsigned Budget) {
   SmallPtrSet<Function *, 16> Seen;
   SmallVector<Function *, 16> Work{&F};
   uint64_t Visited = 0;
@@ -153,12 +321,11 @@ Expected<Function *> llvm::ejit::assembleFinalVersionSwitch(
       return reject("instruction-budget");
   }
   for (const auto &Arm : Arms) {
-    if (const char *Reason =
-            checkMemberCalls(*Arm.body, Members, Limits.maxInstructions))
+    if (const char *Reason = checkMemberCalls(*Arm.body, Members,
+                                             Limits.maxInstructions))
       return reject(Reason);
     for (StringRef Attr : {"target-cpu", "target-features"})
-      if (Arm.body->getFnAttribute(Attr) !=
-          Arms.front().body->getFnAttribute(Attr))
+      if (Arm.body->getFnAttribute(Attr) != Arms.front().body->getFnAttribute(Attr))
         return reject("target-attribute-mismatch");
   }
 
@@ -205,9 +372,8 @@ Expected<Function *> llvm::ejit::assembleFinalVersionSwitch(
     auto *Switch = B.CreateSwitch(Selector, Default, Groups.size());
     for (const auto &KV : Groups) {
       auto *Case = BasicBlock::Create(M->getContext(), "member", Merged);
-      Switch->addCase(
-          ConstantInt::get(cast<IntegerType>(Selector->getType()), KV.first),
-          Case);
+      Switch->addCase(ConstantInt::get(cast<IntegerType>(Selector->getType()),
+                                      KV.first), Case);
       Self(Self, Case, Depth + 1, KV.second);
     }
   };

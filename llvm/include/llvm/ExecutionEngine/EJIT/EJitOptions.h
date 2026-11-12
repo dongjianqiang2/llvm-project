@@ -46,6 +46,9 @@ struct Config {
   /// (~640 KB stripped runtime, P0-1) is incurred whenever the PGO component
   /// libs are linked, regardless of this flag; this flag only gates behavior.
   bool enablePgo = false;
+  /// Ordinary cell/TRP members keep independent T1 profiles; eligible final
+  /// T2 bodies are assembled into a shared switch entry on the shared worker.
+  bool enableFinalVersionMerge = false;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   /// Build-option-gated runtime sampling. This reuses the temporary
   /// instrumented tier but does not require profile-guided optimization.

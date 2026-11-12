@@ -172,6 +172,29 @@ private:
   static bool sharedOwnerElected(void *ctx);
   /// Owner-release hook: the counterpart of sharedOwnerElected.
   static void sharedOwnerReleased(void *ctx);
+#ifdef EJIT_SWITCH_CASE
+  struct FinalMember {
+    EJitCompileRequest request{};
+    uint64_t key = 0;
+    std::string entry;
+    std::string bitcode;
+    SmallVector<unsigned, 2> args;
+    SmallVector<uint32_t, 2> dimensions;
+    void *published = nullptr;
+    bool ready = false;
+    bool dirty = false;
+  };
+  std::vector<FinalMember> finalMembers_;
+  struct FinalFallback {
+    uintptr_t pointer = 0;
+    EJitCompileRequest request{};
+  };
+  std::unordered_map<uint64_t, FinalFallback> finalFallbacks_;
+  size_t finalArtifactBytes_ = 0;
+  uint64_t finalMergeSerial_ = 0;
+  static bool sharedFinalMergeService(void *ctx);
+  bool serviceFinalMerge();
+#endif
 #endif
   // Async compiler will be added in EJitAsyncCompiler phase
 
