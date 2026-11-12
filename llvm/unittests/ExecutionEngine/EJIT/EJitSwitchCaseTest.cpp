@@ -1175,6 +1175,12 @@ TEST(EJitSwitchCase, DispatchFreezesAMaybePoisonParameter) {
 TEST(EJitSwitchCaseExec, UnkeptKeysRunTheDefaultArm) {
   static int32_t Tab[2][4] = {{0}, {10, 11, 12, 13}};
   static int32_t Idx = 3;
+  // This test deliberately mutates static storage; reset it for gtest_repeat.
+  for (unsigned I = 0; I < 4; ++I) {
+    Tab[0][I] = 0;
+    Tab[1][I] = 10 + I;
+  }
+  Idx = 3;
   LLVMContext Ctx;
   auto M = parse(R"(
     @g_tab4 = external global [2 x [4 x i32]], !ejit.metadata !0

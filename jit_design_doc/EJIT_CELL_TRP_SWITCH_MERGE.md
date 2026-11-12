@@ -2,10 +2,13 @@
 
 ## Baseline
 
-Branch: `codex/spec5-cell-trp-switch-verify`.
+Branch: `codex/spec5-cell-trp-switch-pr261`.
 Base: bruteforceboy #244 `ejit_switch_case_v1` at `4b0b21b80`.
-Integrated: #262 at `34c187340`, including its folding/local-free-dim,
-pointer-witness/PHI and verifier ancestry. Keep spec5's pipeline and pools.
+Integrated: #261 at `960a96793`, including its #258/local-free-dim and
+pointer-witness ancestry, may_const metadata preservation, and bounded equal
+PHI witness folding. Keep spec5's pipeline and pools. #260 and #262 verifier
+are NOT dependencies of this branch. The older `-verify` branch is preserved
+as a separate checkpoint, not this delivery's baseline.
 The spec4 workspace is a preserved checkpoint, NOT the delivery target.
 
 This adds ordinary cell/TRP merging with DIFFERENT configurations. It is not
@@ -48,7 +51,6 @@ Before init on EVERY participating core, checking return values:
 ```c
 ejit_set_final_version_merge(1);
 ejit_init_pgo(&cfg); /* cfg.compileMode = EJIT_COMPILE_ASYNC */
-/* Or ejit_init_verify_pgo(&cfg) for diagnostics. */
 ```
 
 `ejit_config_t` ABI is unchanged. Runtime mode is immutable after init and
@@ -88,7 +90,7 @@ The compiler opt-in costs an additional retained AOT body.
   identity, aliases/ifuncs/module asm, entry recursion, incompatible ABI/targets,
   and indirect calls without verified target remapping. These use independent
   T2, not unsafe sharing. Imported helpers/constants are member-namespaced.
-- Verifier live reads, calls and site identities stay in their selected arms.
+- No verifier initializer or runtime is required by this branch.
 
 ## 6/16/6 example
 
@@ -106,17 +108,35 @@ deactivate/change/retrain), OWNER_DONE, FUNCTIONAL_PASS. It checks numerical
 results, live stores, equal entry pointers, and an unvisited tuple's AOT default.
 Inspect the merged IR/ASM as well.
 
-Optional `-DMERGE_VERIFY_MODE=1`: verifies real coverage with zero initial
-mismatches, deliberately changes one isolated test field, requires a mismatch
-from the merged arm, restores it, and prints VERIFY_PASS. Do not reproduce this
-unsynchronized negative in production. `MERGE_WAIT_ROUNDS` defaults to zero
-(unlimited); only the host runner sets a finite bound.
+`MERGE_WAIT_ROUNDS` defaults to zero (unlimited); only the host runner sets a
+finite bound. This demo uses ordinary online PGO, not verifier mode.
 
 ## Validation boundary
 
-See the task validation report for native tests, feature-off, batching, host
-wrapper simulation and BE probes. Host core-ID simulation is NOT real SRE
-multicore acceptance. BE objects are NOT a final SDK link. A matching full
-toolchain/package build, actual shared-memory/permission validation and the
-6/16/6 board run remain product acceptance gates. No performance percentage or
-physical reclamation claim is made.
+Revalidated on the PR261-based branch on 2026-11-12:
+
+- Native component suite: 298 passed, one expected batch-only skip. Four
+  PHI-witness tests cover 484 combinations, including unequal/unauthorized
+  negative controls. The metadata merge suite passes 17/17.
+- Five shuffled rounds: 297 passed per round, one batch-only skip, with the
+  existing registration-freeze order-dependent producer excluded. A mutable
+  static fixture in the inherited default-arm test was reset per invocation;
+  its frozen-arm/live-default assertions are unchanged.
+- Batch publication: 20/20 focused merge/PHI/20-function worker tests passed.
+  Switch feature OFF: 260 passed, one expected batch-only skip.
+- Real native independent T1/T2 processing publishes all 36 cell/TRP tuples
+  to one entry. The 64-arm execution and 65-arm rejection tests also pass.
+- Actual board-demo C through generated wrappers/native worker: all four
+  phases pass with normal and batched publication, using ordinary online PGO.
+- Frontend RAW/AOT/embedded metadata checks pass for LE/BE x O2/O3. Final
+  merge wrapper opt-in, repeated execution and default-OFF checks pass.
+- Seventeen BE production/demo objects compile with audit enabled; checked
+  architecture/endian and undefined symbols have no wmemchr/main/verifier
+  dependencies. The demo has no main and retains its shared section.
+
+Validation uses task-owned component builds and compiler archive overlays,
+reusing compatible retained LLVM/Clang support libraries rather than a fresh
+complete toolchain build. Host core-ID simulation is NOT real SRE multicore
+acceptance. BE objects are NOT a final SDK link. A matching full package build,
+actual shared-memory/permission validation and the 6/16/6 board run remain
+product acceptance gates. No performance or physical reclamation claim is made.

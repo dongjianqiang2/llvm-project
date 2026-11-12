@@ -25,9 +25,6 @@ extern uint8_t g_ucLocalCoreID;
 #ifndef MERGE_WAIT_ROUNDS
 #define MERGE_WAIT_ROUNDS 0u
 #endif
-#ifndef MERGE_VERIFY_MODE
-#define MERGE_VERIFY_MODE 0
-#endif
 struct MergeConfig {
   ejit_may_const uint32_t bias;
   uint32_t visits;
@@ -181,8 +178,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   cfg.enableLogger = cfg.forceStaticRegistry = true;
   if (ejit_set_final_version_merge(1) != EJIT_OK)
     return fail("merge init failed");
-  ejit_status_t init = MERGE_VERIFY_MODE ? ejit_init_verify_pgo(&cfg)
-                                       : ejit_init_pgo(&cfg);
+  ejit_status_t init = ejit_init_pgo(&cfg);
   if (init != EJIT_OK || ejit_taskpool_get_worker_core() != 6u)
     return fail("merge/PGO init or worker core mismatch");
   ejit_taskpool_stats_t s = {0};
@@ -222,26 +218,6 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_activate("cell", 0);
   if (phase(0, 4, 3, &merge_result.renewed_shared))
     return -1;
-#if MERGE_VERIFY_MODE
-  // Standalone diagnostic negative: no concurrent writer, restore afterwards.
-  // Verifier executes live loads, so output stays correct while mismatch rises.
-  ejit_verify_stats_t initial = {0}, changed = {0};
-  ejit_verify_get_stats(&initial);
-  if (!initial.checks || initial.mismatches)
-    return fail("verifier has no coverage or unexpected mismatch");
-  uint32_t saved = merge_cells[3].bias;
-  merge_cells[3].bias = saved + 2u;
-  void *probe = 0;
-  int probed = query_call(1, 43, &probe);
-  merge_cells[3].bias = saved;
-  ejit_verify_get_stats(&changed);
-  if (probed != 1 || probe != merge_result.renewed_shared ||
-      changed.checks <= initial.checks || changed.mismatches <= initial.mismatches)
-    return fail("merged arm did not detect deliberate verifier mismatch");
-  SRE_printf("[CELLTRP] VERIFY_PASS checks=%llu intentional_mismatches=%llu\n",
-             (unsigned long long)changed.checks,
-             (unsigned long long)changed.mismatches);
-#endif
   __atomic_store_n(&merge_stage, DONE, __ATOMIC_RELEASE);
   SRE_printf("[CELLTRP] OWNER_DONE checks=%u; core6 test_ejit_cell_trp_merge_print\n",
              merge_result.checked);

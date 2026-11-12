@@ -206,7 +206,7 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
 
 /// Select ordinary cell/TRP final-T2 switch merging BEFORE init, on every
-/// participating core. Then use ejit_init_pgo (or ejit_init_verify_pgo).
+/// participating core. Then use ejit_init_pgo.
 /// Keeps ejit_config_t ABI unchanged. Requires SWITCH_CASE, shared taskpool,
 /// code pool and NO_RECLAIM; T1 sampling remains independent per member.
 /// Compile entries with -mllvm -ejit-final-version-merge to register their AOT
