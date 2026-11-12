@@ -50,8 +50,8 @@ Error llvm::ejit::validateFinalVersionModule(const Module &M, StringRef Entry) {
     if (!G.getValueType()->isSized())
       return make_error<StringError>("unsized constant", inconvertibleErrorCode());
     TypeSize Size = M.getDataLayout().getTypeAllocSize(G.getValueType());
-    if (Size.isScalable() || Size.getFixedValue() > 512 * 1024 ||
-        (ConstantBytes += Size.getFixedValue()) > 512 * 1024)
+    if (Size.isScalable() || Size.getFixedValue() > kEJitFinalMergeMaxMemberBytes ||
+        (ConstantBytes += Size.getFixedValue()) > kEJitFinalMergeMaxMemberBytes)
       return make_error<StringError>("constant byte budget", inconvertibleErrorCode());
   }
   for (const Function &F : M) {
@@ -61,7 +61,7 @@ Error llvm::ejit::validateFinalVersionModule(const Module &M, StringRef Entry) {
       return make_error<StringError>("observable function identity",
                                     inconvertibleErrorCode());
     for (const Instruction &I : instructions(F)) {
-      if (++Instructions > 8000)
+      if (++Instructions > kEJitFinalMergeMaxMemberInstructions)
         return make_error<StringError>("member instruction budget",
                                       inconvertibleErrorCode());
       // Absolute indirect VP targets may point into a retiring private T1.
@@ -117,7 +117,8 @@ Expected<SmallVector<unsigned, 2>> llvm::ejit::finalVersionDimensionArgs(
 Expected<std::string> llvm::ejit::assembleFinalVersionModules(
     StringRef Entry, uintptr_t AotFallback, ArrayRef<unsigned> DimensionArgs,
     ArrayRef<EJitFinalModuleArm> Inputs) {
-  if (!AotFallback || Inputs.size() < 2 || Inputs.size() > 8)
+  if (!AotFallback || Inputs.size() < 2 ||
+      Inputs.size() > kEJitFinalMergeMaxArms)
     return make_error<StringError>("invalid final merge cohort",
                                   inconvertibleErrorCode());
   LLVMContext C;
@@ -125,9 +126,10 @@ Expected<std::string> llvm::ejit::assembleFinalVersionModules(
   SmallVector<std::string, 8> Names;
   size_t Bytes = 0;
   for (unsigned I = 0; I < Inputs.size(); ++I) {
-    Bytes += Inputs[I].bitcode.size();
-    if (Bytes > 4 * 1024 * 1024)
+    if (Inputs[I].bitcode.size() > kEJitFinalMergeMaxMemberBytes ||
+        Inputs[I].bitcode.size() > kEJitFinalMergeMaxArtifactBytes - Bytes)
       return make_error<StringError>("artifact budget", inconvertibleErrorCode());
+    Bytes += Inputs[I].bitcode.size();
     auto Parsed = parseBitcodeFile(MemoryBufferRef(Inputs[I].bitcode, Entry), C);
     if (!Parsed)
       return Parsed.takeError();
@@ -208,6 +210,9 @@ Expected<std::string> llvm::ejit::assembleFinalVersionModules(
   std::string Result;
   raw_string_ostream OS(Result);
   WriteBitcodeToFile(*Combined, OS);
+  if (Result.size() > kEJitFinalMergeMaxArtifactBytes)
+    return make_error<StringError>("combined artifact budget",
+                                  inconvertibleErrorCode());
   return Result;
 }
 

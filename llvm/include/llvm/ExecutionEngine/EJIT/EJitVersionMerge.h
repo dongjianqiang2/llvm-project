@@ -22,14 +22,23 @@ class Module;
 
 namespace ejit {
 
+// Count full dimension tuples, not values on each switch level. This covers
+// the product's 6x6 grid with room for an 8x8 grid; allocation stays demand-led.
+constexpr unsigned kEJitFinalMergeMaxArms = 64;
+constexpr unsigned kEJitFinalMergeMaxMemberInstructions = 8000;
+constexpr unsigned kEJitFinalMergeMaxInstructions = 64000;
+constexpr uint64_t kEJitFinalMergeMaxMemberBytes = 512 * 1024;
+constexpr uint64_t kEJitFinalMergeMaxArtifactBytes =
+    kEJitFinalMergeMaxArms * kEJitFinalMergeMaxMemberBytes;
+
 struct EJitFinalMergeArm {
   Function *body = nullptr;
   SmallVector<uint32_t, 2> dimensions;
 };
 
 struct EJitFinalMergeLimits {
-  unsigned maxArms = 8;
-  unsigned maxInstructions = 8000;
+  unsigned maxArms = kEJitFinalMergeMaxArms;
+  unsigned maxInstructions = kEJitFinalMergeMaxInstructions;
 };
 
 /// Assemble already-specialized, already-profiled bodies in one module into

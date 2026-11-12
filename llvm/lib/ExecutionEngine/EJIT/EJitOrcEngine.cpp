@@ -906,7 +906,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             } else {
               raw_string_ostream OS(*ctx->finalMergeBitcode);
               WriteBitcodeToFile(M, OS);
-              if (ctx->finalMergeBitcode->size() > 512 * 1024)
+              if (ctx->finalMergeBitcode->size() > kEJitFinalMergeMaxMemberBytes)
                 ctx->finalMergeBitcode->clear();
             }
           }

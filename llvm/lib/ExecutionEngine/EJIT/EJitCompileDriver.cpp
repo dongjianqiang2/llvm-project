@@ -84,7 +84,7 @@ bool EJitCompileDriver::serviceFinalMerge() {
           M.request.fallbackPtr != Trigger.request.fallbackPtr ||
           M.request.generation != Trigger.request.generation)
         continue;
-      if (Members.size() == 8)
+      if (Members.size() == kEJitFinalMergeMaxArms)
         break;
       Members.push_back(&M);
       Arms.push_back({M.bitcode, M.dimensions});
@@ -912,7 +912,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       }
     }
     if (finalMembers_.size() < 64 &&
-        finalArtifactBytes_ + FinalBitcode.size() <= 4 * 1024 * 1024) {
+        finalArtifactBytes_ + FinalBitcode.size() <=
+            kEJitFinalMergeMaxArtifactBytes) {
       FinalMember M;
       M.request = *request;
       M.request.fallbackPtr = FinalAot;

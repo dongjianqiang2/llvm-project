@@ -73,10 +73,17 @@ The compiler opt-in costs an additional retained AOT body.
   physical reclamation are separate future work.
 - One/two named cell/TRP integer arguments; scalar C ABI. Full tuple matching,
   no modulo/key truncation. Existing runtime/wrapper dimension capacities apply.
-- Limits: 8 arms, 8,000 instructions, 512 KiB/member artifact and constants,
-  64 retained artifacts/4 MiB aggregate, 64 merged emission attempts (failed
-  emissions included) per driver lifetime. Extra members remain independent;
-  this is not an unlimited all-cell merge.
+- Capacity: 64 full tuples per cohort, sufficient for 6 cell x 6 TRP (36)
+  with headroom for 8 x 8 (64). This is not a restriction on the numeric IDs.
+  These final-member limits are separate from `EJIT_SWITCH_CASE_MAX_ARMS`,
+  which controls #244's original runtime-dimension remainder/mask transform.
+- Budgets: 64,000 combined entry instructions; unchanged 8,000 instructions
+  and 512 KiB artifact/constants per member. Retained artifacts stay capped
+  at 64 PER DRIVER (across all entries), now with a 32 MiB aggregate byte cap;
+  allocation remains on demand, not an upfront reservation. The 64 merged
+  emission-attempt cap per driver lifetime is unchanged (failures count).
+  Thus tuple capacity is not a guarantee for arbitrary code size or unlimited
+  simultaneous entry groups. Ineligible/over-budget members stay independent.
 - Reject private writable/TLS state, observable private object/function
   identity, aliases/ifuncs/module asm, entry recursion, incompatible ABI/targets,
   and indirect calls without verified target remapping. These use independent

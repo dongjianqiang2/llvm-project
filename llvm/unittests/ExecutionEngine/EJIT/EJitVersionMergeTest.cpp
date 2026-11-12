@@ -21,6 +21,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -62,7 +63,7 @@ void snapshotFinal(const EJitSharedCacheSlot &S, void *Opaque) {
 }
 } // namespace
 
-TEST(EJitVersionMerge, ColdIndependentPgoToSharedFinalAndLifecycle) {
+TEST(EJitVersionMerge, ColdIndependentPgoToSixBySixFinalAndLifecycle) {
   EJitFuncRegistry::instance().reset();
   EJitLifecycleRegistry::instance().reset();
   const uint32_t CellType = EJitLifecycleRegistry::instance().resolveAssign("cell");
@@ -181,6 +182,29 @@ TEST(EJitVersionMerge, ColdIndependentPgoToSharedFinalAndLifecycle) {
   Pool->setInstanceEnabled(CellType, 0, true);
   Train(0, 2);
   EXPECT_EQ(Snapshot(0, 2).pointer, Snapshot(3, 5).pointer);
+  // The product has six values per dimension, not six total tuples. Exercise
+  // all 36 through real independent T1 execution and the worker merge path.
+  const uint32_t Cells[] = {0, 3, 7, 9, 11, 13};
+  const uint32_t Trps[] = {2, 5, 9, 10, 12, 15};
+  for (uint32_t Cell : Cells)
+    Pool->setInstanceEnabled(CellType, Cell, true);
+  for (uint32_t Trp : Trps)
+    Pool->setInstanceEnabled(TrpType, Trp, true);
+  for (uint32_t Cell : Cells)
+    for (uint32_t Trp : Trps)
+      if (!Snapshot(Cell, Trp).pointer)
+        Train(Cell, Trp);
+  void *Grid = Snapshot(13, 15).pointer;
+  ASSERT_NE(Grid, nullptr);
+  for (uint32_t Cell : Cells)
+    for (uint32_t Trp : Trps) {
+      SCOPED_TRACE(std::to_string(Cell) + "," + std::to_string(Trp));
+      ASSERT_EQ(Snapshot(Cell, Trp).pointer, Grid);
+      EXPECT_EQ(reinterpret_cast<Fn>(Grid)(Cell, Trp, 19),
+                runtimeMergeAot(Cell, Trp, 19));
+    }
+  EXPECT_EQ(reinterpret_cast<Fn>(Grid)(15, 0, 19), runtimeMergeAot(15, 0, 19));
+  RecordProperty("shared_grid_members", 36);
   Pool->ownerShutdown();
   EJitFuncRegistry::instance().reset();
   EJitLifecycleRegistry::instance().reset();
@@ -299,6 +323,111 @@ TEST(EJitVersionMerge, OneNativeEntryExecutesBothArmsAndExactTupleFallback) {
         EXPECT_EQ(Fn(Cell, Trp, X, &Out), Expected);
         EXPECT_EQ(Out, Expected);
       }
+}
+
+TEST(EJitVersionMerge, SixtyFourModuleArmsExecuteAndSixtyFiveReject) {
+  LLVMContext C;
+  std::vector<std::string> Storage;
+  SmallVector<EJitFinalModuleArm, 8> Arms;
+  Storage.reserve(64);
+  for (unsigned Cell = 0; Cell < 8; ++Cell)
+    for (unsigned Trp = 0; Trp < 8; ++Trp) {
+      auto M = std::make_unique<Module>("grid", C);
+      auto *I8 = Type::getInt8Ty(C);
+      auto *I32 = Type::getInt32Ty(C);
+      auto *F = Function::Create(FunctionType::get(I32, {I8, I8, I32}, false),
+                                 Function::ExternalLinkage, "grid_entry", *M);
+      IRBuilder<> B(BasicBlock::Create(C, "entry", F));
+      B.CreateRet(B.CreateAdd(F->getArg(2),
+                              B.getInt32(1000 + Cell * 100 + Trp * 10)));
+      Storage.emplace_back();
+      raw_string_ostream OS(Storage.back());
+      WriteBitcodeToFile(*M, OS);
+      Arms.push_back({Storage.back(), {Cell, Trp}});
+    }
+  auto Aot = +[](uint8_t Cell, uint8_t Trp, uint32_t X) -> uint32_t {
+    return Cell * 100u + Trp * 10u + X;
+  };
+  auto Prepared = assembleFinalVersionModules(
+      "grid_entry", reinterpret_cast<uintptr_t>(Aot), {0, 1}, Arms);
+  ASSERT_TRUE(bool(Prepared)) << toString(Prepared.takeError());
+  auto Parsed = parseBitcodeFile(MemoryBufferRef(*Prepared, "grid"), C);
+  ASSERT_TRUE(bool(Parsed)) << toString(Parsed.takeError());
+  unsigned Definitions = 0;
+  for (auto &F : **Parsed)
+    Definitions += !F.isDeclaration();
+  EXPECT_EQ(Definitions, 1u);
+  EJitRuntimeState State;
+  Config Cfg;
+  auto Engine = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(bool(Engine)) << toString(Engine.takeError());
+  auto E = (*Engine)->loadBitcodeModule(*Prepared, 778, "grid_entry");
+  ASSERT_FALSE(bool(E)) << toString(std::move(E));
+  auto Address = (*Engine)->lookup(778, "grid_entry");
+  ASSERT_TRUE(bool(Address)) << toString(Address.takeError());
+#ifdef EJIT_SRE_CODE_POOL
+  E = (*Engine)->flushPendingCode();
+  ASSERT_FALSE(bool(E)) << toString(std::move(E));
+#endif
+  auto Fn = reinterpret_cast<uint32_t (*)(uint8_t, uint8_t, uint32_t)>(*Address);
+  for (unsigned Cell = 0; Cell < 8; ++Cell)
+    for (unsigned Trp = 0; Trp < 8; ++Trp)
+      EXPECT_EQ(Fn(Cell, Trp, 23), 1000 + Aot(Cell, Trp, 23));
+  EXPECT_EQ(Fn(8, 0, 23), Aot(8, 0, 23));
+  EXPECT_EQ(Fn(0, 8, 23), Aot(0, 8, 23));
+  Arms.push_back({Storage.front(), {8, 0}});
+  auto TooMany = assembleFinalVersionModules(
+      "grid_entry", reinterpret_cast<uintptr_t>(Aot), {0, 1}, Arms);
+  ASSERT_FALSE(bool(TooMany));
+  EXPECT_NE(toString(TooMany.takeError()).find("cohort"), std::string::npos);
+}
+
+TEST(EJitVersionMerge, SixBySixExceedsFormerByteAndInstructionBudgets) {
+  LLVMContext C;
+  std::vector<std::string> Storage;
+  SmallVector<EJitFinalModuleArm, 8> Arms;
+  Storage.reserve(36);
+  uint64_t Bytes = 0;
+  for (unsigned I = 0; I < 36; ++I) {
+    auto M = std::make_unique<Module>("grid_budget", C);
+    auto *I32 = Type::getInt32Ty(C);
+    auto *Ptr = PointerType::getUnqual(C);
+    std::vector<uint8_t> Data(128 * 1024);
+    for (unsigned J = 0; J < Data.size(); ++J)
+      Data[J] = static_cast<uint8_t>(J * 37u + (J >> 8) + I * 13u);
+    auto *Init = ConstantDataArray::get(C, Data);
+    auto *Table = new GlobalVariable(*M, Init->getType(), true,
+                                     GlobalValue::PrivateLinkage, Init, "table");
+    Table->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    auto Consume = M->getOrInsertFunction("consume", Type::getVoidTy(C), Ptr);
+    auto *F = Function::Create(FunctionType::get(I32, {I32, I32}, false),
+                               Function::ExternalLinkage, "entry", *M);
+    IRBuilder<> B(BasicBlock::Create(C, "entry", F));
+    for (unsigned J = 0; J < 250; ++J)
+      B.CreateCall(Consume, {Table});
+    B.CreateRet(B.getInt32(I));
+    Storage.emplace_back();
+    raw_string_ostream OS(Storage.back());
+    WriteBitcodeToFile(*M, OS);
+    ASSERT_LE(Storage.back().size(), kEJitFinalMergeMaxMemberBytes);
+    Bytes += Storage.back().size();
+    Arms.push_back({Storage.back(), {I / 6, I % 6}});
+  }
+  ASSERT_GT(Bytes, 4u * 1024 * 1024);
+  auto Prepared = assembleFinalVersionModules("entry", 4096, {0, 1}, Arms);
+  ASSERT_TRUE(bool(Prepared)) << toString(Prepared.takeError());
+  auto Parsed = parseBitcodeFile(MemoryBufferRef(*Prepared, "grid_budget"), C);
+  ASSERT_TRUE(bool(Parsed)) << toString(Parsed.takeError());
+  auto *Entry = (*Parsed)->getFunction("entry");
+  ASSERT_TRUE(Entry);
+  EXPECT_GT(Entry->getInstructionCount(), 8000u);
+  EXPECT_LE(Entry->getInstructionCount(), kEJitFinalMergeMaxInstructions);
+  std::string Oversize(kEJitFinalMergeMaxMemberBytes + 1, 'x');
+  Arms[0].bitcode = Oversize;
+  auto Rejected = assembleFinalVersionModules("entry", 4096, {0, 1}, Arms);
+  ASSERT_FALSE(bool(Rejected));
+  EXPECT_NE(toString(Rejected.takeError()).find("artifact budget"),
+            std::string::npos);
 }
 
 TEST(EJitVersionMerge, SingleDimensionKeepsOtherArgumentsLive) {
