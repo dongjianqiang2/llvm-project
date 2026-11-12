@@ -338,24 +338,20 @@ ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
   return Off;
 }
 
-/// Size in bytes of the may_const field beginning at \p Off inside the period
-/// element of \p RootGV, or nullopt when \p Off is not the start of a field.
+/// Size in bytes of the field beginning at \p Off inside \p Ty, or nullopt
+/// when \p Off is not the start of a field.
 ///
 /// The `ejit_may_const_field` metadata records offsets and nothing else, so it
-/// cannot bound how many bytes an access may read; the aggregate layout supplies
-/// that bound. A nested aggregate shares its offset with its own first field, so
-/// the descent continues to the innermost field starting at \p Off. That is the
-/// conservative choice, and it is what rejects a widened load (say an i64 formed
-/// from a memcpy over a may_const i32 and the mutable i32 beside it).
+/// cannot bound how many bytes an access may read; the aggregate layout
+/// supplies that bound. A nested aggregate shares its offset with its own first
+/// field, so the descent continues to the innermost field starting at \p Off.
+/// That is the conservative choice, and it is what rejects a widened load (say
+/// an i64 formed from a memcpy over a may_const i32 and the mutable i32 beside
+/// it).
 inline std::optional<uint64_t>
-ejitMayConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
-                      const DataLayout &DL) {
-  if (!RootGV)
+ejitMayConstFieldSizeInType(Type *Ty, uint64_t Off, const DataLayout &DL) {
+  if (!Ty || !Ty->isSized())
     return std::nullopt;
-  Type *Ty = RootGV->getValueType();
-  if (const auto *ATy = dyn_cast<ArrayType>(Ty))
-    Ty = ATy->getElementType();
-
   // Descend into whichever element contains Off, rebasing Off as we go. Only at
   // the leaf does Off == 0 mean "this is where a field begins".
   while (true) {
@@ -390,6 +386,17 @@ ejitMayConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
   if (TS.isScalable())
     return std::nullopt;
   return TS.getFixedValue();
+}
+
+inline std::optional<uint64_t>
+ejitMayConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
+                      const DataLayout &DL) {
+  if (!RootGV)
+    return std::nullopt;
+  Type *Ty = RootGV->getValueType();
+  if (const auto *ATy = dyn_cast<ArrayType>(Ty))
+    Ty = ATy->getElementType();
+  return ejitMayConstFieldSizeInType(Ty, Off, DL);
 }
 
 /// True when [\p Off, \p Off + \p AccessSize) lies entirely within the may_const

@@ -102,6 +102,33 @@ typedef enum {
   EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE,
 } ejit_status_t;
 
+/// Register the allocation behind a pointer-valued period global before
+/// ejit_init. \p varName is the global's symbol name, \p base is the pointer's
+/// value (not its address), and \p size is the allocation size in bytes. The
+/// allocation must stay mapped until ejit_shutdown; bounds do not follow the
+/// pointer to a different allocation. Repeating identical bounds succeeds;
+/// invalid, conflicting, or post-init calls return EJIT_ERR_INVALID_PARAM.
+ejit_status_t ejit_register_pointer_period_bounds(const char *varName,
+                                                  const void *base,
+                                                  uint64_t size);
+
+/// Return the size in bytes of the allocation starting exactly at \p base, or
+/// zero if unknown. Reported allocations must stay mapped until ejit_shutdown.
+/// Called from the compiler worker, so it must be thread-safe, and it must not
+/// call back into EJIT.
+typedef uint64_t (*ejit_allocation_size_lookup_t)(const void *base,
+                                               void *context);
+
+/// Install an allocator size lookup before ejit_init, on every image including
+/// the compiler worker. Compilation queries it for pointer-valued period
+/// globals so free_dim loads through them can fold without per-global bounds.
+/// Explicit bounds take precedence, and folds made without a lookup are
+/// unchanged. Compiled code is not invalidated when allocations change.
+/// Repeating an identical install succeeds; null, conflicting, or post-init
+/// installs return EJIT_ERR_INVALID_PARAM. Install again after ejit_shutdown.
+ejit_status_t ejit_set_allocation_size_lookup(ejit_allocation_size_lookup_t lookup,
+                                             void *context);
+
 typedef enum {
   EJIT_COMPILE_SYNC = 0,
   EJIT_COMPILE_ASYNC = 1,

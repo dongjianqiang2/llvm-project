@@ -10,6 +10,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLinkDiagPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -181,12 +182,12 @@ struct EJitOrcEngine::Impl {
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
   /// Persistent optimizer — analysis managers are registered once and reused.
-  std::unique_ptr<EJitOptimizer> optimizer;
   /// TargetMachine used for the name-filtered ASM diagnostic dump (created
   /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
   /// emitted assembly matches the real JIT output). Null if creation failed.
   std::unique_ptr<TargetMachine> dumpFunctionTM;
   std::unique_ptr<TargetMachine> dumpModuleTM;
+  std::unique_ptr<EJitOptimizer> optimizer;
 };
 
 namespace llvm {
@@ -722,6 +723,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
     return JTMBOrErr.takeError();
   }
 
+  if (JTMBOrErr->getTargetTriple().isAArch64())
+    JTMBOrErr->addFeatures({"+neon", "-sve", "-sve2"});
+
   // Use Small code model so data accesses use ADRP+LDR (2 insns/global, ±4GB
   // PC-relative) instead of movz/movk absolute (5 insns/global). The JIT slab
   // is ~1.5-2.2GB from .text (within ADRP's ±4GB range), confirmed by
@@ -819,7 +823,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
 
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
-  engine->P->optimizer = std::make_unique<EJitOptimizer>(periodReg);
+  engine->P->optimizer = std::make_unique<EJitOptimizer>(
+      periodReg, engine->P->dumpFunctionTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -1003,7 +1008,8 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
                     origFnName.c_str(), bitcodeData.size());
   auto Ctx = std::make_unique<LLVMContext>();
   auto Buf = MemoryBuffer::getMemBuffer(
-      bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"));
+      bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"),
+      /*RequiresNullTerminator=*/false);
   auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!ModuleOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
@@ -1125,7 +1131,8 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   collectReferencedExternalDecls(**ModuleOrErr, ReferencedExternalFuncs,
                                  ReferencedExternalGlobals);
   for (Function &F : (*ModuleOrErr)->functions()) {
-    if (!F.isDeclaration() || F.getName().empty())
+    if (!F.isDeclaration() || F.getName().empty() ||
+        isEJitLocalFreeDimFunction(F))
       continue;
     std::string name = F.getName().str();
     if (globalSymbols.count(P->J->mangleAndIntern(name)))

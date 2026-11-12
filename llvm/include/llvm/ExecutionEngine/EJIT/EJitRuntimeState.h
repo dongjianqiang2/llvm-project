@@ -9,8 +9,10 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITRUNTIMESTATE_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITRUNTIMESTATE_H
 
+#include "llvm/ExecutionEngine/EJIT/EJitAllocationBounds.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBareMetal.h"
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +35,14 @@ struct StaticVarInfo {
   void *varAddr;
 };
 
+/// An allocation extent behind a pointer-valued period global. Explicit bounds
+/// stay pinned to their registered base; discovered bounds describe the
+/// current pointee.
+struct PointerPeriodBounds {
+  const void *base;
+  uint64_t size;
+};
+
 /// Registry of period arrays and static variables. Initialized once
 /// at ejit_init time from StoredData, then read-only at runtime.
 class PeriodArrayRegistry {
@@ -41,6 +51,19 @@ public:
                      const std::string &varName,
                      void *baseAddr, size_t size);
   void registerStaticVar(const std::string &varName, void *varAddr);
+  bool registerPointerPeriodBounds(const std::string &varName, const void *base,
+                                   uint64_t size);
+  const PointerPeriodBounds *
+  getPointerPeriodBounds(const std::string &varName) const;
+  /// Initialization only; the provider is immutable while workers run.
+  void setAllocationSizeLookup(AllocationSizeLookup Lookup) {
+    allocationSizeLookup_ = Lookup;
+  }
+  /// Explicit bounds win, even if stale. Otherwise ask the allocation lookup
+  /// about \p Pointee.
+  std::optional<PointerPeriodBounds>
+  resolvePointerPeriodBounds(const std::string &varName,
+                            const void *Pointee) const;
 
   const std::vector<PeriodArrayInfo> *getArrays(const std::string &periodName) const;
   const std::vector<StaticVarInfo> &getStaticVars() const { return staticVars_; }
@@ -63,6 +86,8 @@ private:
   // invalidate pointers to vector elements on reallocation).
   std::unordered_map<std::string, PeriodArrayInfo> varNameIndex_;
   std::unordered_map<std::string, void *> staticVarIndex_;
+  std::unordered_map<std::string, PointerPeriodBounds> pointerBounds_;
+  AllocationSizeLookup allocationSizeLookup_;
   std::unordered_map<uintptr_t, PeriodArrayInfo> baseAddrIndex_;
 };
 

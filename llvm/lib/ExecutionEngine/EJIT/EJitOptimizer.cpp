@@ -28,6 +28,8 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/IPO/Inliner.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
@@ -43,6 +45,8 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
+#include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include <limits>
 #include <optional>
 
@@ -75,11 +79,12 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 }
 #endif
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
+    : registry_(reg) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
-  PassBuilder PB;
+  PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
   PB.registerCGSCCAnalyses(CGAM_);
@@ -92,7 +97,7 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
   // every may_const field into a compile-time constant. The post-specialization
   // cleanup is the real LLVM -O2 function-simplification pipeline (SROA,
   // InstCombine, SCCP, GVN, CorrelatedValuePropagation, BDCE, DSE, loop-rotate,
-  // LICM, loop-unroll, ... - NO vectorization), which exploits those constants
+  // LICM, loop-unroll, ...), which exploits those constants
   // far more aggressively than the old hand-rolled 8-pass sequence. One cached
   // FPM per tier; runOptimizationPipeline picks by ctx.optLevel.
   //
@@ -126,6 +131,13 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg) : registry_(reg) {
   cleanupFPM_.addPass(SCCPPass());
   cleanupFPM_.addPass(SimplifyCFGPass());
   cleanupFPM_.addPass(ADCEPass());
+
+  // Vectorize only after the second field substitution and cleanup, so the
+  // cost model sees the final loop body. PassBuilder(TM) supplies the JIT
+  // target's TTI instead of the generic target-independent cost model.
+  vectorFPM_.addPass(LoopVectorizePass());
+  vectorFPM_.addPass(SLPVectorizerPass());
+  vectorFPM_.addPass(InstCombinePass());
 }
 
 void EJitOptimizer::clearAnalyses() {
@@ -136,6 +148,16 @@ void EJitOptimizer::clearAnalyses() {
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
+  // All tier exits, including temporary PGO Gen and audit-only Baseline, must
+  // return executable IR with real runtime inputs and no private marker.
+  auto LowerFreeDims = make_scope_exit([&] {
+    if (lowerEJitLocalFreeDims(M))
+      EJIT_DIAG_VERBOSE("local-free-dim remaining boundaries lowered to real inputs");
+    // ORC destroys the module/context after materialization. MemorySSA and
+    // other cached analysis results must die while their IR is still alive,
+    // including unmarked modules and rejected-boundary fallback paths.
+    clearAnalyses();
+  });
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
@@ -145,6 +167,25 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   lastVpFunctions_.clear();
   scalarSiteCountsByFunc_.clear();
   lastSwitchCase_ = {};
+
+  // AOT bitcode can carry per-function target features that override the JIT
+  // target machine. Keep every AArch64 function on the SRE's AdvSIMD baseline.
+  if (M.getTargetTriple().isAArch64()) {
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      SmallVector<StringRef, 8> Feats;
+      Attribute A = F.getFnAttribute("target-features");
+      if (A.isValid())
+        A.getValueAsString().split(Feats, ',');
+      llvm::erase_if(Feats, [](StringRef S) {
+        return S == "+neon" || S == "-neon" ||
+               S.starts_with("+sve") || S.starts_with("-sve");
+      });
+      Feats.append({"+neon", "-sve", "-sve2"});
+      F.addFnAttr("target-features", join(Feats, ","));
+    }
+  }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   lastMayConstLoadSites_.clear();
 #endif
@@ -352,7 +393,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx, CompileTier::Baseline);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -411,7 +452,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+    runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -423,7 +464,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
+  runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -904,12 +945,17 @@ EJitOptimizer::boundPointerViews(Module &M, const SpecializationContext &ctx) {
 
 void EJitOptimizer::runStructFieldPass(Module &M,
                                        const SpecializationContext &ctx) {
+  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
+  for (const auto &Dim : ctx.dimensions)
+    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
   EJitStructFieldPass structField(registry_, boundPointerViews(M, ctx),
-                                  ctx.fnName);
+                                  ctx.fnName, LocalPeriods);
   structField.initFromModule(M);
   for (Function &F : M.functions())
-    if (!F.isDeclaration())
-      structField.run(F, FAM_);
+    if (!F.isDeclaration()) {
+      PreservedAnalyses PA = structField.run(F, FAM_);
+      FAM_.invalidate(F, PA);
+    }
 }
 
 #ifdef EJIT_SWITCH_CASE
@@ -924,8 +970,11 @@ void EJitOptimizer::runSwitchCase(Module &M, const SpecializationContext &ctx) {
           ? &ctx.switchCaseReplay
           : nullptr;
   // Configured like phase 1c, so the keys selected are the ones 1f folds.
+  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
+  for (const auto &Dim : ctx.dimensions)
+    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
   EJitStructFieldPass Resolver(registry_, boundPointerViews(M, ctx),
-                               ctx.fnName);
+                               ctx.fnName, LocalPeriods);
   Resolver.initFromModule(M);
   EJitSwitchCaseResult R = llvm::ejit::runSwitchCase(
       *Root, Resolver, FAM_, EJitSwitchCaseLimits::fromBuild(), Replay);
@@ -964,8 +1013,9 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 }
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            ejit::OptimizationLevel level,
+                                            const SpecializationContext &ctx,
                                             CompileTier tier) {
+  const auto level = ctx.optLevel;
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -986,8 +1036,12 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M);
+  runStructFieldPass(M, ctx);
   for (Function &F : M.functions())
-    if (!F.isDeclaration())
+    if (!F.isDeclaration()) {
       cleanupFPM_.run(F, FAM_);
+      if (level != ejit::OptimizationLevel::L1 &&
+          M.getTargetTriple().isAArch64())
+        vectorFPM_.run(F, FAM_);
+    }
 }

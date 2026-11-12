@@ -107,6 +107,77 @@ specialization.
 
 ---
 
+### Bounded pointer-valued period globals
+
+A free-dimension witness can only freeze a marked load through a
+pointer-valued period global when the runtime knows the pointee's allocation
+size. The application supplies it before `ejit_init` in one of two ways.
+
+**Explicit bounds** name each global:
+
+```c
+ejit_period_arr(cell) CellConfig *configs;
+
+configs = calloc(cellCount, sizeof(*configs));
+ejit_register_pointer_period_bounds("configs", configs,
+                                    cellCount * sizeof(*configs));
+```
+
+The base is the pointer's value, not `&configs`, and the size is the
+allocation size in bytes. The generated period registration still supplies
+`&configs` and its lifecycle, with constructor or forced linker-table
+registration. Bounds are pinned to that base: they do not follow the pointer
+to a new allocation. To change allocations, shut down, register new bounds and
+reinitialize.
+
+**An allocation lookup** covers every pointer period without naming globals:
+
+```c
+static uint64_t allocation_size(const void *base, void *context) {
+  // Size of the allocation starting exactly at base, or 0 if unknown.
+  return platform_allocator_lookup(base, context);
+}
+
+ejit_set_allocation_size_lookup(allocation_size, allocator_context);
+```
+
+Install it on every image, including the compiler worker. The compiler calls it
+for the current pointee while compiling, never on cache hits, so it must be
+thread-safe and must not call back into EJIT. Reported allocations must stay
+mapped until shutdown. Explicit bounds take precedence over the lookup.
+Discovered sizes add strict folds for witness-indexed loads and for absolute
+constant-index loads that the legacy matcher cannot authorize (for example, a
+field in a nonzero pointee element). Existing successful legacy constant-index
+folds retain precedence and do not acquire a new layout or lifecycle requirement.
+A discovered match is only used when no pre-existing eligible registration
+matches and exactly one discovered candidate passes all strict checks. Shutdown
+discards the lookup. See `EJIT_POINTER_PERIOD_STRICT_SPEC.md` for the decision
+order and deployment/acceptance requirements.
+
+Both APIs are pre-init only. Identical repeats succeed; invalid, conflicting
+or post-init calls return `EJIT_ERR_INVALID_PARAM`.
+
+Clang emits an `ejit_pointer_layout` node on pointer-period globals: the
+pointee stride followed by `(offset, size)` ranges of marked fields, including
+fields inside nested fixed arrays. Bitfields, unions, volatile or atomic fields,
+incomplete types and base subobjects are not described. Each array element type
+is visited once; if the type walk and expanded ranges exceed a 4096-unit budget,
+no layout is emitted. Without bounds, marked loads through the pointer keep the
+legacy constant-index behavior. Explicit bounds without a layout leave them
+dynamic.
+
+With bounds and a layout, the optimizer requires that the pointee still equals
+the bounded base, that the consuming entry has the period's lifecycle contract,
+that every GEP step and the full access stay inside the allocation, that the
+allocation holds a whole number of pointee elements, and that the access fits
+in a marked field. Ambiguous matches do not fold. Only the marked load is
+replaced; slot-dependent stores, calls and other loads stay dynamic.
+
+Bounds do not prove value invariance. Lifecycle transitions must still retire
+specializations before marked values change, and `ejit_free_dim` remains the
+application's promise that the marked value is the same for every witness.
+Recompile AOT bitcode with the updated Clang to get the layout metadata.
+
 ## 4. Not a dimension on the wire
 
 `ejit_free_dim` is not part of the specialization identity:

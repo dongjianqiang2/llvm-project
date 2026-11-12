@@ -33,16 +33,20 @@
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Config/Targets.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -248,6 +252,19 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::runInterproceduralPropagation;
   using EJitOptimizer::runOptimizationPipeline;
   using EJitOptimizer::runStructFieldPass;
+
+  // Isolated pass tests without a specialization supply an empty context;
+  // production callers must carry the actual entry and bound-pointer views.
+  void runStructFieldPass(Module &M) {
+    EJitOptimizer::runStructFieldPass(M, SpecializationContext{});
+  }
+  void runOptimizationPipeline(Module &M, OptimizationLevel Level,
+                               CompileTier Tier) {
+    SpecializationContext Context;
+    Context.optLevel = Level;
+    Context.tier = Tier;
+    EJitOptimizer::runOptimizationPipeline(M, Context, Tier);
+  }
 };
 } // namespace ejit
 } // namespace llvm
@@ -1265,7 +1282,8 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                             &missFnStandIn);
   ejit_register_icache_slot("guarded_c_fn", &guardedCells[0], 1, nullptr);
 
-  EJit ejit(Config{});
+  Config Cfg;
+  EJit ejit(Cfg);
   ASSERT_FALSE(ejit.initFailed());
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
@@ -1277,8 +1295,15 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
                  sp->icacheBeginResolve());
   sp->icacheFill(guardedIdx, reinterpret_cast<void *>(0x3000), id, 1,
                  sp->icacheBeginResolve());
-  ASSERT_EQ(sentinelCells[3], 0x2000u);
-  ASSERT_EQ(guardedCells[3], 0x3000u);
+  if (Cfg.enablePgo || Cfg.enableProfileAudit) {
+    // Audit sampling must not let unregistered mock pointers bypass Tier-1.
+    // Real Tier-2 publication/fill is covered by the production PGO tests.
+    ASSERT_EQ(sentinelCells[3], reinterpret_cast<uintptr_t>(&missFnStandIn));
+    ASSERT_EQ(guardedCells[3], 0u);
+  } else {
+    ASSERT_EQ(sentinelCells[3], 0x2000u);
+    ASSERT_EQ(guardedCells[3], 0x3000u);
+  }
 
   // The public activate path drains: sentinel slot -> &MissFn, guarded slot
   // -> 0. This is the C-ABI end of the contract the SharedTaskPool tests pin
@@ -1872,6 +1897,98 @@ TEST(EJitOptimizer, OptimizationPipelineL3) {
   // L3 should not crash
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L3, CompileTier::Baseline);
 }
+
+#if LLVM_HAS_AARCH64_TARGET
+TEST(EJitOptimizer, VectorizesAArch64LoopForNeon) {
+  LLVMInitializeAArch64TargetInfo();
+  LLVMInitializeAArch64Target();
+  LLVMInitializeAArch64TargetMC();
+
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+target triple = "aarch64-unknown-linux-gnu"
+define void @add_arrays(ptr noalias %dst, ptr noalias %src, i64 %n) #0 {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %a = getelementptr i32, ptr %src, i64 %i
+  %b = getelementptr i32, ptr %dst, i64 %i
+  %x = load i32, ptr %a, align 4
+  %y = load i32, ptr %b, align 4
+  %sum = add i32 %x, %y
+  store i32 %sum, ptr %b, align 4
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %n
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+attributes #0 = { "target-features"="+sve2,-neon" }
+)", Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  MDNode *Entry = MDNode::get(Ctx, MDString::get(Ctx, TAG_EJIT_ENTRY));
+  M->getFunction("add_arrays")
+      ->setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
+
+  std::string TargetError;
+  const Target *T =
+      TargetRegistry::lookupTarget(M->getTargetTriple(), TargetError);
+  ASSERT_NE(T, nullptr) << TargetError;
+  std::unique_ptr<TargetMachine> TM(T->createTargetMachine(
+      M->getTargetTriple(), "generic", "+neon,-sve,-sve2", TargetOptions(),
+      std::nullopt, std::nullopt, CodeGenOptLevel::Default));
+  ASSERT_TRUE(TM);
+
+  PeriodArrayRegistry Reg;
+  EJitOptimizerTestAccess Opt(Reg, TM.get());
+  SpecializationContext Spec;
+  Spec.fnName = "add_arrays";
+  Spec.optLevel = llvm::ejit::OptimizationLevel::L2;
+  Opt.runPipeline(*M, Spec);
+
+  StringRef Features = M->getFunction("add_arrays")
+                           ->getFnAttribute("target-features")
+                           .getValueAsString();
+  EXPECT_TRUE(Features.contains("+neon"));
+  EXPECT_FALSE(Features.contains("+sve"));
+
+  std::string IR;
+  raw_string_ostream OS(IR);
+  M->print(OS, nullptr);
+  EXPECT_NE(IR.find("vector.body"), std::string::npos) << IR;
+  EXPECT_NE(IR.find("<4 x i32>"), std::string::npos) << IR;
+
+  std::string Bitcode;
+  raw_string_ostream BC(Bitcode);
+  WriteBitcodeToFile(*M, BC);
+  BC.flush();
+  EJitRuntimeState State;
+  Config Cfg;
+  auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
+  ASSERT_TRUE(static_cast<bool>(EngineOrErr));
+  auto Engine = std::move(*EngineOrErr);
+  Spec.cacheKey = 1;
+  Engine->setActiveContext(&Spec);
+  ASSERT_FALSE(errorToBool(
+      Engine->loadBitcodeModule(Bitcode, Spec.cacheKey, Spec.fnName)));
+  auto FnOrErr = Engine->lookup(Spec.cacheKey, Spec.fnName);
+  ASSERT_TRUE(static_cast<bool>(FnOrErr));
+  Engine->setActiveContext(nullptr);
+
+  int32_t Src[64], Dst[64];
+  for (int I = 0; I < 64; ++I) {
+    Src[I] = I + 1;
+    Dst[I] = 2 * I;
+  }
+  auto *Fn = reinterpret_cast<void (*)(int32_t *, int32_t *, uint64_t)>(
+      *FnOrErr);
+  Fn(Dst, Src, 64);
+  for (int I = 0; I < 64; ++I)
+    EXPECT_EQ(Dst[I], 3 * I + 1);
+}
+#endif
 
 TEST(EJitOptimizer, FullPipelineEndToEnd) {
   LLVMContext Ctx;
@@ -3299,6 +3416,100 @@ TEST(EJitStructFieldPass, FreeDimRejectsUnknownIndirectExtent) {
   EXPECT_TRUE(MayConstSurvives)
       << "used a witness where the pointed-to object extent is unknown";
 }
+
+namespace {
+struct TwoHopInner {
+  int32_t c;
+  int32_t d;
+};
+struct TwoHopOuter {
+  int32_t a;
+  TwoHopInner *b[2];
+};
+static_assert(offsetof(TwoHopOuter, b) + sizeof(void *) == 16 &&
+                  offsetof(TwoHopInner, d) == 4,
+              "offsets hard-coded in parseTwoHopModule");
+} // namespace
+
+/// Run the pass on g_struct[0]->b[1]->d, with g_struct[0] = &Outer.
+static std::unique_ptr<Module> foldTwoHop(LLVMContext &Ctx,
+                                          bool MarkInnerPointer,
+                                          TwoHopOuter &Outer) {
+  std::string IR = R"(
+    @g_struct = external global [3 x ptr], !ejit.metadata !0
+    define i32 @two_hop() {
+    entry:
+      %outer = load ptr, ptr @g_struct
+      %slot = getelementptr inbounds i8, ptr %outer, i64 16
+      %inner = load ptr, ptr %slot)";
+  if (MarkInnerPointer)
+    IR += ", !ejit.may_const !2";
+  IR += R"(
+      %field = getelementptr inbounds i8, ptr %inner, i64 4
+      %d = load i32, ptr %field, !ejit.may_const !2
+      ret i32 %d
+    }
+    !0 = !{!1}
+    !1 = !{!"ejit_period_arr", !"cell", i32 3}
+    !2 = !{}
+  )";
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(IR, Err, Ctx);
+  if (!M) {
+    ADD_FAILURE() << Err.getMessage().str();
+    return M;
+  }
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+  TwoHopOuter *Slots[3] = {&Outer, nullptr, nullptr};
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "g_struct", Slots, 3);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*M->getFunction("two_hop"), Pass);
+  return M;
+}
+
+static bool hasMayConstLoad(Function &F) {
+  for (Instruction &I : instructions(F))
+    if (auto *LI = dyn_cast<LoadInst>(&I))
+      if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+        return true;
+  return false;
+}
+
+TEST(EJitStructFieldPass, IndirectFoldsThroughMayConstPointerField) {
+  LLVMContext Ctx;
+  TwoHopInner Inner = {0, 7};
+  TwoHopOuter Outer = {0, {nullptr, &Inner}};
+  auto M = foldTwoHop(Ctx, /*MarkInnerPointer=*/true, Outer);
+  ASSERT_TRUE(M);
+  Function *F = M->getFunction("two_hop");
+  // A single run resolves both hops.
+  EXPECT_FALSE(hasMayConstLoad(*F));
+  auto *Ret = cast<ReturnInst>(F->getEntryBlock().getTerminator());
+  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ(Value->getSExtValue(), 7);
+}
+
+TEST(EJitStructFieldPass, IndirectDoesNotFollowUnmarkedPointerField) {
+  LLVMContext Ctx;
+  TwoHopInner Inner = {0, 7};
+  TwoHopOuter Outer = {0, {nullptr, &Inner}};
+  auto M = foldTwoHop(Ctx, /*MarkInnerPointer=*/false, Outer);
+  ASSERT_TRUE(M);
+  EXPECT_TRUE(hasMayConstLoad(*M->getFunction("two_hop")))
+      << "b[1] may change within the period; d must not be read through it";
+}
+
+TEST(EJitStructFieldPass, IndirectStopsAtNullMayConstPointer) {
+  LLVMContext Ctx;
+  TwoHopOuter Outer = {0, {nullptr, nullptr}};
+  auto M = foldTwoHop(Ctx, /*MarkInnerPointer=*/true, Outer);
+  ASSERT_TRUE(M);
+  EXPECT_TRUE(hasMayConstLoad(*M->getFunction("two_hop")));
+}
+
 /// Build `g_arr[<idx expr>]` with a may_const load, where the index expression
 /// is supplied by \p MakeIndex. Used for the witness-validity and
 /// poison-flag cases, which both turn on what the index evaluates to.
@@ -3991,7 +4202,7 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   auto AuditSites = sp.collectMayConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u)
       << "audit must recognize metadata-marked may_const loads";
-  EXPECT_EQ(AuditSites.front().globalName, "g_arr");
+  EXPECT_EQ(AuditSites.front().globalName, "g_plain");
   EXPECT_TRUE(AuditSites.front().hasFieldOffset);
 #endif
   auto PA = sp.run(*F, H.FAM);

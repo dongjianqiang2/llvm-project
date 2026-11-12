@@ -40,6 +40,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 #include "llvm/IR/Type.h"
 #include <optional>
 
@@ -791,6 +792,12 @@ void CodeGenFunction::EmitScalarInit(const Expr *init, const ValueDecl *D,
     if (capturedByInit)
       drillIntoBlockVariable(*this, lvalue, cast<VarDecl>(D));
     EmitNullabilityCheck(lvalue, Value, init->getExprLoc());
+    if (const auto *VD = dyn_cast_or_null<VarDecl>(D))
+      if (!isa<ParmVarDecl>(VD) && VD->hasAttr<EjitFreeDimAttr>())
+        Value = Builder.CreateCall(
+            llvm::getEJitLocalFreeDim(CGM.getModule(),
+                                     cast<llvm::IntegerType>(Value->getType())),
+            {Value}, "ejit.free.dim");
     EmitStoreThroughLValue(RValue::get(Value), lvalue, true);
     return;
   }

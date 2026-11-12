@@ -5261,7 +5261,7 @@ def EjitPeriodArrInd : InheritableParamAttr {
 // depend on. Not a specialization dimension: it adds no clone and no cache axis.
 def EjitFreeDim : InheritableParamAttr {
   let Spellings = [Clang<"ejit_free_dim">];
-  let Subjects = SubjectList<[ParmVar]>;
+  let Subjects = SubjectList<[Var]>;
   let Documentation = [EjitFreeDimDocs];
 }
 

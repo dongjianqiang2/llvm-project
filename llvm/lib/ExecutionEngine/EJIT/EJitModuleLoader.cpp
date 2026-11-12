@@ -113,7 +113,8 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
 
   auto Ctx = std::make_unique<LLVMContext>();
   auto Buf = MemoryBuffer::getMemBuffer(
-      *bitcode, "meta_" + std::to_string(funcIdx) + ".bc");
+      *bitcode, "meta_" + std::to_string(funcIdx) + ".bc",
+      /*RequiresNullTerminator=*/false);
   auto MOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!MOrErr) {
     EJIT_DIAG("getOrCacheFuncMeta FAIL funcIdx=%u func=%s: parse bitcode error",

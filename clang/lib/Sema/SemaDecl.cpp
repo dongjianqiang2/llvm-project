@@ -78,6 +78,7 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD);
 void checkEjitFreeDim(Sema &S, const FunctionDecl *FD);
 void checkEjitRuntimeDim(Sema &S, const FunctionDecl *FD);
+void checkEjitLocalFreeDims(Sema &S, const FunctionDecl *FD, Stmt *Body);
 
 // Forward declaration for EmbeddedJIT always_inline conflict check.
 // Defined in SemaEJIT.cpp.
@@ -16367,8 +16368,10 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body,
       // the same storage; don't overwrite the latter if the former is null
       // (the body is initialised to null anyway, so even if the latter isn't
       // present, this would still be a no-op).
-      if (Body)
+      if (Body) {
         FD->setBody(Body);
+        checkEjitLocalFreeDims(*this, FD, Body);
+      }
       FD->setWillHaveBody(false);
 
       if (getLangOpts().CPlusPlus14) {

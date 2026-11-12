@@ -26,6 +26,7 @@
 #include "llvm/IR/Module.h"
 
 namespace llvm {
+class TargetMachine;
 namespace ejit {
 
 struct EJitMayConstLoadSite;
@@ -47,7 +48,7 @@ struct EJitVpFunctionInfo {
 /// every compilation.
 class EJitOptimizer {
 public:
-  EJitOptimizer(PeriodArrayRegistry &reg);
+  EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM = nullptr);
 
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
@@ -119,7 +120,6 @@ private:
   void runInstCombine(Module &M);
 
   /// Run EJitStructFieldPass on all functions.
-  void runStructFieldPass(Module &M);
   void runStructFieldPass(Module &M, const SpecializationContext &ctx);
 
   /// The bound-pointer views a StructFieldPass run for \p ctx reads through,
@@ -159,9 +159,9 @@ private:
   /// the just-substituted period-index / may_const constants to their fixed
   /// point (scalar fold/propagate/simplify), folds loops whose bounds became
   /// constant, re-specializes the array accesses that unrolling turns into
-  /// constant-index GEPs, then does a final cleanup. `level` is accepted for
-  /// ABI compatibility and does not affect the pipeline.
-  void runOptimizationPipeline(Module &M, OptimizationLevel level,
+  /// constant-index GEPs, then does a final cleanup and vectorization at
+  /// L2/L3 for AArch64.
+  void runOptimizationPipeline(Module &M, const SpecializationContext &ctx,
                                CompileTier tier);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -189,13 +189,15 @@ private:
   //                   Pipeline); runs before the O2 pipeline (Phase 2).
   //   simplifyO1/2/3_ the real LLVM -O1/-O2/-O3 function-simplification
   //   pipeline
-  //                   (Phase 3), one per tier; NO vectorization.
+  //                   (Phase 3), one per tier.
   //   cleanupFPM_     light fold after the second StructFieldPass (Phase 5).
+  //   vectorFPM_      target-aware loop and SLP vectorization (L2/L3 only).
   FunctionPassManager lowerExpectFPM_;
   FunctionPassManager simplifyO1_;
   FunctionPassManager simplifyO2_;
   FunctionPassManager simplifyO3_;
   FunctionPassManager cleanupFPM_;
+  FunctionPassManager vectorFPM_;
   // Tier-2-only profile-guided memory-operation specialization. The main
   // O1/O2/O3 simplification pipeline already contains profile-aware unrolling.
   FunctionPassManager pgoUseFPM_;

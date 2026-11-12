@@ -206,6 +206,8 @@ ALL_TESTS=(
   ejit_fixed_dim_test
   ejit_perf_bench
   ejit_ptr_period_test
+  ejit_pointer_period_bounds_test
+  ejit_pointer_period_lookup_test
   ejit_trace_test
   ejit_volatile_test
   ejit_l0_dispatch_test
