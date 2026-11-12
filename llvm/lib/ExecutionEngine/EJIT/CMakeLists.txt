@@ -164,7 +164,7 @@ endif()
 
 # Switch-case mode (option declared in llvm/CMakeLists.txt).
 if(EJIT_SWITCH_CASE)
-  list(APPEND EJIT_SOURCES EJitSwitchCase.cpp)
+  list(APPEND EJIT_SOURCES EJitSwitchCase.cpp EJitVersionMerge.cpp)
 endif()
 
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
