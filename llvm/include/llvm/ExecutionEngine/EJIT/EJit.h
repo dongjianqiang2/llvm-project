@@ -39,11 +39,12 @@ public:
   ~EJit();
 
   // Lifecycle — period-level (fans out to all arrays under periodName).
-  // Returns false only in a taskpool build when periodName is not a registered
-  // lifecycle (no state is changed), or when cellIdx >= kEJitMaxInstances;
-  // always true in the legacy build. cellIdx is uint32_t so an out-of-range
-  // instance index is rejected here instead of being truncated at the ABI
-  // boundary (see ejit_activate in EJitRuntime.h).
+  // Returns false when cellIdx >= kEJitMaxInstances, or in a taskpool build
+  // when periodName names neither a registered lifecycle nor a registered
+  // period array. Rejection leaves state unchanged.
+  // Without EJIT_SRE_TASKPOOL any in-range cellIdx succeeds. cellIdx is
+  // uint32_t so an out-of-range instance index is rejected here instead of
+  // being truncated at the ABI boundary (see ejit_activate in EJitRuntime.h).
   bool activate(const std::string &periodName, uint32_t cellIdx);
   bool deactivate(const std::string &periodName, uint32_t cellIdx);
 

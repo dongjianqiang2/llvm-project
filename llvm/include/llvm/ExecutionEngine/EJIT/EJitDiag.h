@@ -24,7 +24,7 @@
 //   VERBOSE(2)— per-item detail: each first-time registration, per-function
 //               struct-field stats, per-call compile_or_get, taskpool requests
 //   DEBUG(3)  — internals: idempotent registration skips, per-load replace
-//               failures, staging internals, funcMeta caching
+//               failures, staging internals
 //
 // The level mirrors enum ejit_log_level in EJitRuntime.h; raise it at runtime
 // via ejit_set_log_level() to recover full detail without recompiling.  All

@@ -388,9 +388,9 @@ unsigned ejit_taskpool_poll_one(void);
 unsigned ejit_taskpool_poll_budget(unsigned maxItems);
 #endif
 
-// SRE taskpool statistics. Separate from ejit_stats_t (which reports the legacy
-// LRU EJitCache); these counters describe the taskpool cache/dedup/queue
-// pipeline used when EJIT_SRE_TASKPOOL is built. Fixed layout
+// SRE taskpool statistics. Separate from ejit_stats_t, which ejit_get_stats()
+// always reports as zero; these counters describe the taskpool
+// cache/dedup/queue pipeline used when EJIT_SRE_TASKPOOL is built. Fixed layout
 // (uint64_t/uint32_t only) for stable ABI across the aarch64_be target.
 typedef struct {
   uint64_t cacheHits;      ///< Calls served from the taskpool cache.

@@ -135,10 +135,9 @@ static cl::opt<bool> EJitMissFnCold(
     cl::desc("Mark the icache MissFn as cold to isolate the AOT fallback "
              "body from hot I-cache"));
 
-// Wrapper generation now unconditionally uses the unified taskpool API
-// (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
-// and Async modes are runtime-configurable — the AOT wrapper code is
-// identical for both. The -ejit-wrapper-async flag has been retired.
+// Wrappers always use the unified taskpool API (ejit_taskpool_compile_or_get +
+// ejit_taskpool_release_read). Sync and Async are selected at runtime, so the
+// AOT wrapper code is identical for both.
 
 namespace {
 

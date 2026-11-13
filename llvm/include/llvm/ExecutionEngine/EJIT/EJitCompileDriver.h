@@ -54,15 +54,10 @@ public:
 
   ~EJitCompileDriver();
 
-  /// Hot path: cache lookup on pre-computed uint64_t cacheKey.
-  /// Cold path: decode cacheKey → load bitcode → JIT compile.
-  /// Returns nullptr on miss that cannot be compiled (time window not
-  /// active, no bitcode, or compile failure).
-
 #ifdef EJIT_SRE_TASKPOOL
-  /// Cold compile path WITHOUT storing into the LRU EJitCache. Used as the
-  /// taskpool's compile callback (the taskpool owns its own fixed cache).
-  /// Returns the JIT function pointer or nullptr.
+  /// Cold compile path, used as the taskpool's compile callback (the taskpool
+  /// owns the cache). Returns the JIT function pointer, or nullptr when the
+  /// time window is not active, there is no bitcode, or compilation fails.
   void *compileNow(const EJitCompileRequest &req);
 
   /// Taskpool commit notification. A value-profile round is consumed only
@@ -172,8 +167,6 @@ private:
   /// Owner-release hook: the counterpart of sharedOwnerElected.
   static void sharedOwnerReleased(void *ctx);
 #endif
-  // Async compiler will be added in EJitAsyncCompiler phase
-
   /// Cold compile path (decode → verify active → load bitcode → JIT compile).
   /// When \p storeLru is true the result is inserted into the LRU EJitCache.
   /// \p tier is the CompileTier (uint32_t, EJitOrcEngine.h) decoded from

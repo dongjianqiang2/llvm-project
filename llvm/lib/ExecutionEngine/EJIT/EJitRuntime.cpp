@@ -44,9 +44,8 @@ using namespace llvm::ejit;
 //===----------------------------------------------------------------------===//
 // Compile-time contract checks: each assert locks two independently defined
 // copies of one config value (AOT pass vs runtime, or runtime header vs
-// runtime header). Editing one copy without the other now fails the LLVMEJIT
-// build instead of silently desynchronizing — the exact class of bug that
-// shipped as EJIT_ICACHE_FUNC_SLOTS=64 vs a 4096 funcIndex space.
+// runtime header). Editing one copy without the other fails the LLVMEJIT
+// build instead of silently desynchronizing them.
 //===----------------------------------------------------------------------===//
 
 // Log-level gate thresholds (EJitDiag.h macros) vs the public C ABI enum
@@ -343,11 +342,11 @@ static void parseConfig(const ejit_config_t *src, Config &dst) {
 #endif
 }
 
-// Compile-time regression guard: the public ejit_config_t layout MUST stay
-// exactly as originally released (no new tail field), so ejit_init() never
-// over-reads an old caller's smaller struct. Online PGO is exposed additively
-// via ejit_init_pgo(), never by growing this struct. If a field is added,
-// these asserts fire and force an explicit, versioned ABI decision.
+// ABI guard: the public ejit_config_t layout MUST NOT change (no new tail
+// field), so ejit_init() never over-reads an old caller's smaller struct.
+// Online PGO is exposed additively via ejit_init_pgo(), never by growing this
+// struct. If a field is added, these asserts fire and force an explicit,
+// versioned ABI decision.
 static_assert(offsetof(ejit_config_t, compileMode) == 0,
               "ejit_config_t.compileMode must stay first (ABI)");
 static_assert(sizeof(ejit_config_t) ==
@@ -670,7 +669,7 @@ ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
   }
   // The AOT call site passes the instance index as an i32; reject anything the
   // runtime tables cannot hold instead of silently activating the wrong
-  // instance (the pre-fix uint8_t signature truncated at the call boundary).
+  // instance.
   if (cellIdx >= kEJitMaxInstances) {
     EJIT_DIAG("activate(%s,%u) failed: instance index >= kEJitMaxInstances=%u",
               periodName, cellIdx, kEJitMaxInstances);
@@ -678,8 +677,8 @@ ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
   }
   EJIT_DIAG("activate(%s,%u)", periodName, cellIdx);
   // In a taskpool build this also syncs the SwitchController and returns false
-  // for an unknown lifecycle (no state changed). In the legacy build it always
-  // succeeds.
+  // for an unknown lifecycle (no state changed). Without EJIT_SRE_TASKPOOL it
+  // always succeeds.
   if (!gEJIT->activate(periodName, cellIdx))
     return EJIT_ERR_INVALID_PARAM;
   return EJIT_OK;
@@ -732,7 +731,7 @@ bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
     return false;
   }
   // Reject out-of-range indices instead of truncating at the ABI boundary and
-  // querying the wrong instance (pre-fix uint8_t signature).
+  // querying the wrong instance.
   if (cellIdx >= kEJitMaxInstances) {
     EJIT_DIAG(
         "is_active(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",
@@ -766,7 +765,7 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT)
     return;
   // Reject out-of-range indices instead of truncating at the ABI boundary and
-  // invalidating the wrong instance (pre-fix uint8_t signature).
+  // invalidating the wrong instance.
   if (cellIdx >= kEJitMaxInstances) {
     EJIT_DIAG(
         "invalidate(%s,%u) rejected: instance index >= kEJitMaxInstances=%u",

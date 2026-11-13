@@ -94,9 +94,8 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
   // every may_const field into a compile-time constant. The post-specialization
   // cleanup is the real LLVM -O2 function-simplification pipeline (SROA,
   // InstCombine, SCCP, GVN, CorrelatedValuePropagation, BDCE, DSE, loop-rotate,
-  // LICM, loop-unroll, ...), which exploits those constants
-  // far more aggressively than the old hand-rolled 8-pass sequence. One cached
-  // FPM per tier; runOptimizationPipeline picks by ctx.optLevel.
+  // LICM, loop-unroll, ...), which exploits those constants. One cached FPM
+  // per optimization level; runOptimizationPipeline picks by ctx.optLevel.
   //
   // LowerExpectIntrinsic must run FIRST: it is NOT in
   // buildFunctionSimplificationPipeline, and the AOT IR carries llvm.expect
@@ -118,19 +117,19 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
   // the additional Tier-2 memory-operation specialization here.
   pgoUseFPM_.addPass(PGOMemOPSizeOpt());
 
-  // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling
-  // turns a loop-variant array access g_arr[k].field into constant-index GEPs
-  // (g_arr[0]/[1]/...), which only then become substitutable. Once
-  // StructFieldPass replaces them, this fold/propagate/simplify pass collapses
-  // the freshly-constant values and drops what became dead — the same treatment
-  // Phase 2 gave the first wave of constants.
+  // cleanupFPM_ — Phase 4, run after the post-unrolling StructFieldPass.
+  // Unrolling turns a loop-variant array access g_arr[k].field into
+  // constant-index GEPs (g_arr[0]/[1]/...), which only then become substitutable.
+  // Once StructFieldPass replaces them, this fold/propagate/simplify pass
+  // collapses the freshly-constant values and drops what became dead — the same
+  // treatment Phase 2 gave the first wave of constants.
   cleanupFPM_.addPass(InstCombinePass());
   cleanupFPM_.addPass(SCCPPass());
   cleanupFPM_.addPass(SimplifyCFGPass());
   cleanupFPM_.addPass(ADCEPass());
 
-  // Vectorize only after the second field substitution and cleanup, so the
-  // cost model sees the final loop body. PassBuilder(TM) supplies the JIT
+  // Vectorize only after the post-unrolling field substitution and cleanup,
+  // so the cost model sees the final loop body. PassBuilder(TM) supplies the JIT
   // target's TTI instead of the generic target-independent cost model.
   vectorFPM_.addPass(LoopVectorizePass());
   vectorFPM_.addPass(SLPVectorizerPass());
@@ -271,7 +270,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 
     // Tier-1 (PGO Gen): lightOpt then instrument. lightOpt is the shared
     // Gen/Use prefix (identical to Tier-2) so the CFG - and thus the PGO
-    // hash - matches. No mainFPM_: Tier-1 is temporary, lightly optimized.
+    // hash - matches. Tier-1 code is temporary, so it skips the full -Ox
+    // pipeline.
     runLightOptPipeline(M);
     ModulePassManager GenMPM;
     GenMPM.addPass(PGOInstrumentationGen(PGOInstrumentationType::FDO));
@@ -454,7 +454,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     return;
   }
 
-  // Baseline (PGO off): the existing full specialization pipeline.
+  // Baseline (PGO off): the full specialization pipeline.
   runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);

@@ -158,11 +158,11 @@ void bucketWrite(EJitSharedCacheBucket &b, bool pgoClearExclusive = false) {
   // acquire loads in the seqlock read leave the subsequent CAS unable to make
   // forward progress with the target's exclusive monitor sequence. The PGO
   // path therefore uses an atomic exchange for the writer word in NO_RECLAIM.
-  // Unlike the former direct store, exchange remains an indivisible lock
-  // acquisition and preserves writer/writer exclusion. Its target lowering and
-  // forward progress are platform properties that must be checked on the SRE
-  // board; readers remain load-only in this build, so no reader drain is needed
-  // after the writer is acquired.
+  // Unlike a plain store, the exchange is an indivisible lock acquisition and
+  // so preserves writer/writer exclusion. Its target lowering and forward
+  // progress are platform properties that must be checked on the SRE board;
+  // readers remain load-only in this build, so no reader drain is needed after
+  // the writer is acquired.
   if (pgoClearExclusive) {
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
     while (b.writeFlag.exchange(1) != 0)
@@ -366,8 +366,8 @@ void llvm::ejit::ejitDumpIcacheSlots(const EJitModuleLoader *loader) {
     const uintptr_t empty = reinterpret_cast<uintptr_t>(reg.missFn);
     // cell[0] is the [0]...[0] identity (or the scalar cell for 0-dim). It is
     // NOT representative: an application that only ever uses instance id 1
-    // leaves cell[0] at its empty value forever, so the old cell[0]-only check
-    // reported "nothing filled" while the identities in use were populated.
+    // leaves cell[0] at its empty value forever, so checking cell[0] alone
+    // would report "nothing filled" while the identities in use are populated.
     // Walk every cell instead (at most EJIT_ICACHE_DIM_SIZE^4 per slot; this
     // is a diagnostic path).
     uintptr_t occupied = 0;
