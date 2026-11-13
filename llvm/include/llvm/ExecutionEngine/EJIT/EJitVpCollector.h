@@ -279,7 +279,6 @@ bool ejitVpEnsureInitialized();
 
 /// Arm / disarm the global collection gate. Records are no-ops while disarmed.
 void ejitVpSetArmed(bool armed);
-bool ejitVpIsArmed();
 
 /// Per-kind site count of one function, used to recompute the function's exact
 /// site keys (the stored key is a mixed hash, so reset/merge probe by

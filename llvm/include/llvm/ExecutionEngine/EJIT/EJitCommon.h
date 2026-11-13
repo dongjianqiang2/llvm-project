@@ -91,7 +91,6 @@ constexpr const char *GV_EJIT_BITCODE = "__ejit_bitcode";
 constexpr const char *SECT_EJIT_BITCODE = ".ejit_bitcode";
 constexpr const char *SECT_EJIT_PERIOD = ".ejit_period";
 constexpr const char *FN_AUTO_REGISTER = "ejit_auto_register";
-constexpr const char *CTORS_GLOBAL = "llvm.global_ctors";
 
 //===----------------------------------------------------------------------===//
 // Runtime function names (extern symbols called by AOT-generated code)

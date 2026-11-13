@@ -232,16 +232,6 @@ public:
   /// per whole 2MiB pool).
   bool usesPageSeal() const { return Opts_.fourKSeal; }
 
-  /// True when this pool is a fixed RX code-segment region whose slabs must be
-  /// enable_rw'd (RX -> RW) before writing (Options::needsEnableRw). A peer
-  /// core executing this pool's code must therefore make the runtime-writable
-  /// pages writable in its own translation context. False for a dynamic pool
-  /// (SRE_MemDbgAlloc), whose backing memory is already RW, so a peer needs no
-  /// enable_rw. findRange() stamps this into EJitCompiledCodeInfo::
-  /// requiresPeerEnableRw so the shared cache can gate per-core enable_rw
-  /// correctly (the same JITLink layout is used by both pool kinds).
-  bool needsPeerEnableRw() const { return Opts_.needsEnableRw; }
-
   bool usesBatchedPageSeal() const { return Opts_.batchedPageSeal; }
   size_t codeAlignment() const { return Opts_.minCodeAlign; }
 

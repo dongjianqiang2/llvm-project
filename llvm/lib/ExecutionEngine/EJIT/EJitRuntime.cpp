@@ -267,7 +267,6 @@ findFunctionBodyTimingSlot(const char *Name, uint32_t Path, bool Create) {
   return nullptr;
 }
 
-static TimingSpinLock gWrapperTimingLock;
 static WrapperTimingSlot gWrapperTimingSlots[32];
 
 static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,

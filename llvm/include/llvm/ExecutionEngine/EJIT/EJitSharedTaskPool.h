@@ -1098,7 +1098,6 @@ public:
 
   //--- diagnostics ------------------------------------------------------------
   void getDiagnostics(EJitSharedDiagnostics &out) const;
-  uint32_t sharedInitState() const;
   /// In-flight dedup count (used by the taskpool C ABI pending_count).
   uint32_t pendingCount() const;
   /// Owner-side explicit flush for deterministic tests. Production callers use

@@ -31,7 +31,6 @@ class EJitSharedBarrier {
 public:
   static inline void fenceAcquire() { __atomic_thread_fence(__ATOMIC_ACQUIRE); }
   static inline void fenceRelease() { __atomic_thread_fence(__ATOMIC_RELEASE); }
-  static inline void fenceFull() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 };
 
 class EJitIpcBucketLock {

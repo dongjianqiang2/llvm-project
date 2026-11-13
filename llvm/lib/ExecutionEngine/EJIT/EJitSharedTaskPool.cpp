@@ -4124,11 +4124,6 @@ void EJitSharedTaskPool::workerEntryThunk(void *ctx) {
 //===----------------------------------------------------------------------===//
 // Diagnostics (§11 observability).
 //===----------------------------------------------------------------------===//
-uint32_t EJitSharedTaskPool::sharedInitState() const {
-  return state_ ? state_->initState.loadAcquire()
-                : static_cast<uint32_t>(EJitSharedInitState::Uninitialized);
-}
-
 uint32_t EJitSharedTaskPool::pendingCount() const {
   if (!state_)
     return 0;

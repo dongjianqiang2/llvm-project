@@ -43,12 +43,6 @@ class EJitLogger;
 /// compilation dispatch.
 class EJitCompileDriver {
 public:
-  struct Result {
-    void *funcPtr = nullptr;
-    size_t compileTimeMs = 0;
-    size_t codeSize = 0;
-  };
-
   EJitCompileDriver(const Config &config, EJitRuntimeState &runtimeState,
                     EJitModuleLoader &loader, EJitLogger *logger = nullptr);
 
@@ -77,11 +71,6 @@ public:
   /// false if the worker could not be started.
   bool startTaskPoolWorker() { return taskPool_ && taskPool_->startWorker(); }
 
-  /// Whether the taskpool worker is currently running (test/diagnostic).
-  bool isTaskPoolWorkerRunning() const {
-    return taskPool_ && taskPool_->isWorkerRunning();
-  }
-
   bool hasJitEngine() const { return jitEngine_ != nullptr; }
 
   void stopTaskPoolWorker() {
@@ -101,20 +90,9 @@ public:
   /// owner, start the ONE shared worker. Returns false on a clean init failure
   /// (owner worker-start failed / ABI mismatch). Idempotent across instances.
   bool startSharedTaskPool();
-
-  /// Owner-only orderly shutdown of the shared worker (soft-stop + join).
-  void stopSharedTaskPool() { sharedPool_.ownerShutdown(); }
 #endif
 
-  EJitRuntimeState &getRuntimeState() { return runtimeState_; }
-  EJitModuleLoader &getLoader() { return loader_; }
-  const Config &getConfig() { return config_; }
   EJitOrcEngine *getJitEngine() { return jitEngine_.get(); }
-#ifndef EJIT_FREESTANDING
-  EJitLogger *getLogger() { return logger_; }
-#else
-  EJitLogger *getLogger() { return nullptr; }
-#endif
 
   void setJitEngine(std::unique_ptr<EJitOrcEngine> engine);
 
@@ -175,11 +153,10 @@ private:
   // Async compiler will be added in EJitAsyncCompiler phase
 
   /// Cold compile path (decode → verify active → load bitcode → JIT compile).
-  /// When \p storeLru is true the result is inserted into the LRU EJitCache.
   /// \p tier is the CompileTier (uint32_t, EJitOrcEngine.h) decoded from
   /// the request's funcIndex high bits (EJitSreQueue.h); gated by
   /// Config::enablePgo (off => Baseline regardless).
-  void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru,
+  void *compileCold(uint64_t cacheKey, uint32_t tier,
                     const EJitCompileRequest *request = nullptr);
 
   /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md

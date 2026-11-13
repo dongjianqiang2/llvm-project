@@ -145,7 +145,6 @@ namespace {
 struct PeriodArrIndInfo {
   std::string PeriodName;
   unsigned ArgIndex;
-  uint32_t DimType;
 };
 
 struct BoundPtrInfo {
@@ -192,7 +191,7 @@ static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
         if (PN && IdxC)
           if (auto *CI = dyn_cast<ConstantInt>(IdxC->getValue()))
             Result.push_back({PN->getString().str(),
-                              static_cast<unsigned>(CI->getZExtValue()), 0});
+                              static_cast<unsigned>(CI->getZExtValue())});
       }
     }
   }

@@ -106,8 +106,6 @@ public:
   /// cannot return a status (the void ejit_register_* C ABI).
   void recordError(int code, const std::string &message,
                    const std::string &funcName);
-  /// True if a registration error has been recorded and not yet consumed.
-  bool hasError() const;
   /// Return and clear the recorded error (code 0 when none). ejit_init consumes
   /// it so each init cycle starts from a clean error state.
   RegistrationError consumeError();

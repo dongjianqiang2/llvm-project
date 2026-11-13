@@ -1266,10 +1266,6 @@ void EJitOrcEngine::setActiveContext(const SpecializationContext *ctx) {
   P->activeCtx = ctx;
 }
 
-const SpecializationContext *EJitOrcEngine::getActiveContext() const {
-  return P->activeCtx;
-}
-
 ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
   if (P->optimizer)
     return P->optimizer->getLastCounterNames();

@@ -225,10 +225,6 @@ void ejit::ejitVpSetArmed(bool armed) {
   gEJitVpState.armed.storeRelease(armed ? 1u : 0u);
 }
 
-bool ejit::ejitVpIsArmed() {
-  return ejitVpEnsureInitialized() && gEJitVpState.armed.loadAcquire() != 0;
-}
-
 void ejit::ejitVpResetFunction(uint64_t nameHash,
                                ArrayRef<EJitVpKindSiteCount> siteCounts) {
   if (!ejitVpEnsureInitialized())

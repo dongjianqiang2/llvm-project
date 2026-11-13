@@ -153,7 +153,6 @@ public:
 
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);
-  const SpecializationContext *getActiveContext() const;
 
   /// PGO: PGOFuncNames captured by the last Tier-1 compile (the suffix of each
   /// __profc_<name> that captureCounterGlobals forced external). The compile

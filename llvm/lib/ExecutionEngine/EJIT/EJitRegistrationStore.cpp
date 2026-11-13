@@ -89,12 +89,6 @@ void EJitRegistrationStore::recordError(int code, const std::string &message,
             funcName.c_str(), message.c_str());
 }
 
-bool EJitRegistrationStore::hasError() const {
-  // error_ is only written under mutex_; a relaxed read of the code is fine for
-  // the single-threaded startup registration phase.
-  return error_.code != 0;
-}
-
 RegistrationError EJitRegistrationStore::consumeError() {
   std::lock_guard<decltype(mutex_)> lock(mutex_);
   RegistrationError taken = error_;
