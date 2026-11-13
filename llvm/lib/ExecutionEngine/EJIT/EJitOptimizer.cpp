@@ -9,6 +9,9 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#ifdef EJIT_SWITCH_CASE
+#include "llvm/ExecutionEngine/EJIT/EJitSwitchCase.h"
+#endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitValueProfile.h"
 #endif
@@ -163,6 +166,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   lastCounterNames_.clear();
   lastVpFunctions_.clear();
   scalarSiteCountsByFunc_.clear();
+  lastSwitchCase_ = {};
 
   // AOT bitcode can carry per-function target features that override the JIT
   // target machine. Keep every AArch64 function on the SRE's AdvSIMD baseline.
@@ -220,6 +224,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   //   (c) Replace the may_const loads with their runtime constant values.
   runStructFieldPass(M, ctx);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
+#ifdef EJIT_SWITCH_CASE
+  //   (c') Switch-case arms on an ejit_runtime_dim (EJIT_SWITCH_CASE.md §4.3);
+  //       1d-1f then fold each arm like the rest.
+  runSwitchCase(M, ctx);
+#endif
   //   (d) Push the constants across call edges. Wherever the AOT inliner kept
   //       a call, the callee still re-derives cell addressing and re-tests
   //       guards from its arguments — which phases 1a-1c just made constant at
@@ -898,8 +907,8 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
   MPM.run(M, MAM_);
 }
 
-void EJitOptimizer::runStructFieldPass(Module &M,
-                                       const SpecializationContext &ctx) {
+SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers>
+EJitOptimizer::boundPointerViews(Module &M, const SpecializationContext &ctx) {
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
       ctx.boundPointers;
   if (!BoundPointers.empty()) {
@@ -931,20 +940,59 @@ void EJitOptimizer::runStructFieldPass(Module &M,
       }
     }
   }
+  return BoundPointers;
+}
+
+void EJitOptimizer::runStructFieldPass(Module &M,
+                                       const SpecializationContext &ctx) {
   SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
   for (const auto &Dim : ctx.dimensions)
     LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
-  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName, LocalPeriods);
+  EJitStructFieldPass structField(registry_, boundPointerViews(M, ctx),
+                                  ctx.fnName, LocalPeriods);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
-      // This pass is invoked directly rather than through a pass manager.
-      // Honor its invalidation result: in particular LastRunTrackingAnalysis
-      // must not tell the next InstCombine that no IR changed since its run.
       PreservedAnalyses PA = structField.run(F, FAM_);
       FAM_.invalidate(F, PA);
     }
 }
+
+#ifdef EJIT_SWITCH_CASE
+void EJitOptimizer::runSwitchCase(Module &M, const SpecializationContext &ctx) {
+  Function *Root = M.getFunction(ctx.fnName);
+  if (!Root || Root->isDeclaration() || !getEJitRuntimeDim(*Root))
+    return;
+  // Every tier builds arms here, in the prefix PGO Gen and Use share; Tier-2
+  // replays Tier-1's keys so both see the same CFG (§10).
+  const EJitSwitchCaseDecision *Replay =
+      ctx.tier == CompileTier::PGOUse && ctx.switchCaseReplay.valid
+          ? &ctx.switchCaseReplay
+          : nullptr;
+  // Configured like phase 1c, so the keys selected are the ones 1f folds.
+  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
+  for (const auto &Dim : ctx.dimensions)
+    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
+  EJitStructFieldPass Resolver(registry_, boundPointerViews(M, ctx),
+                               ctx.fnName, LocalPeriods);
+  Resolver.initFromModule(M);
+  EJitSwitchCaseResult R = llvm::ejit::runSwitchCase(
+      *Root, Resolver, FAM_, EJitSwitchCaseLimits::fromBuild(), Replay);
+  lastSwitchCase_.valid = true;
+  if (R.path == EJitSwitchCaseResult::Path::Eager) {
+    lastSwitchCase_.projection = R.projection;
+    lastSwitchCase_.keys = R.keptKeys;
+  }
+  if (ctx.tier == CompileTier::Baseline)
+    return;
+  const char *KeysFrom = Replay ? "tier1"
+                         : ctx.tier == CompileTier::PGOUse ? "none-recorded"
+                                                           : "-";
+  EJIT_DIAG("rtdim func=%s key=0x%016llx tier=%d arms=%zu replay=%s",
+            ctx.fnName.c_str(), static_cast<unsigned long long>(ctx.cacheKey),
+            static_cast<int>(ctx.tier), lastSwitchCase_.keys.size(), KeysFrom);
+}
+#endif
 
 FunctionPassManager &
 EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {

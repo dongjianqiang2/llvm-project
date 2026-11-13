@@ -513,6 +513,14 @@ public:
     publishFn_ = fn;
     publishCtx_ = ctx;
   }
+  /// Runs only from the owner worker, outside publication/queue locks.
+  void setFinalMergeService(bool (*fn)(void *), void *ctx) {
+    finalMergeService_ = fn;
+    finalMergeServiceCtx_ = ctx;
+  }
+  bool finalVersionCurrent(const EJitCompileRequest &req, void *expected);
+  bool replaceFinalVersion(const EJitCompileRequest &req, void *expected,
+                           void *replacement, const EJitCompiledCodeInfo &info);
   void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
     mayConstRankingFn_ = fn;
     mayConstRankingCtx_ = ctx;
@@ -1270,7 +1278,8 @@ private:
                                  bool enqueueTier2 = true);
   EJitPublishStatus cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info,
-                                 bool pgoClearExclusive = false);
+                                 bool pgoClearExclusive = false,
+                                 void *expectedFinal = nullptr);
   EJitPublishStatus cacheStagePending(const EJitCompileRequest &req,
                                       void *fnPtr);
   /// Reserve the request's complete identity in the shared cache before the
@@ -1370,6 +1379,8 @@ private:
   PublishCallback publishFn_ = nullptr;
   void *publishCtx_ = nullptr;
   ReleaseCallback releaseFn_ = nullptr;
+  bool (*finalMergeService_)(void *) = nullptr;
+  void *finalMergeServiceCtx_ = nullptr;
   void *releaseCtx_ = nullptr;
   PrepareCodeCallback prepareCodeFn_ = nullptr;
   void *prepareCodeCtx_ = nullptr;

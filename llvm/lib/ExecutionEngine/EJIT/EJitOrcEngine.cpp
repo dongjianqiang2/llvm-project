@@ -3,6 +3,10 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
+#ifdef EJIT_SWITCH_CASE
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/ExecutionEngine/EJIT/EJitVersionMerge.h"
+#endif
 #include "llvm/Config/Targets.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
@@ -877,7 +881,36 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
               M.print(preOS, nullptr);
           }
 
-          engine->P->optimizer->runPipeline(M, *ctx);
+#ifdef EJIT_SWITCH_CASE
+          if (ctx->finalMergeDimensionArgs && M.getFunction(ctx->fnName)) {
+            SmallVector<std::string, 2> Periods;
+            for (const auto &D : ctx->dimensions)
+              Periods.push_back(D.periodName);
+            auto Args = finalVersionDimensionArgs(*M.getFunction(ctx->fnName),
+                                                  Periods);
+            if (Args)
+              *ctx->finalMergeDimensionArgs = std::move(*Args);
+            else
+              EJIT_DIAG("final-merge dimensions ineligible entry=%s: %s",
+                        ctx->fnName.c_str(), toString(Args.takeError()).c_str());
+          }
+#endif
+          if (!ctx->preparedFinalMerge)
+            engine->P->optimizer->runPipeline(M, *ctx);
+#ifdef EJIT_SWITCH_CASE
+          if (ctx->finalMergeBitcode && ctx->finalMergeDimensionArgs &&
+              !ctx->finalMergeDimensionArgs->empty()) {
+            if (auto E = validateFinalVersionModule(M, ctx->fnName)) {
+              EJIT_DIAG("final-merge ineligible entry=%s: %s",
+                        ctx->fnName.c_str(), toString(std::move(E)).c_str());
+            } else {
+              raw_string_ostream OS(*ctx->finalMergeBitcode);
+              WriteBitcodeToFile(M, OS);
+              if (ctx->finalMergeBitcode->size() > kEJitFinalMergeMaxMemberBytes)
+                ctx->finalMergeBitcode->clear();
+            }
+          }
+#endif
 
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
@@ -1279,6 +1312,12 @@ ArrayRef<std::string> EJitOrcEngine::getLastCounterNames() const {
 ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {
   if (P->optimizer)
     return P->optimizer->getLastVpFunctions();
+  return {};
+}
+
+EJitSwitchCaseDecision EJitOrcEngine::getLastSwitchCase() const {
+  if (P->optimizer)
+    return P->optimizer->getLastSwitchCase();
   return {};
 }
 

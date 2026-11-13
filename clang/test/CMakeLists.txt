@@ -27,6 +27,7 @@ llvm_canonicalize_cmake_booleans(
   LLVM_TOOL_LLVM_DRIVER_BUILD
   LLVM_INCLUDE_SPIRV_TOOLS_TESTS
   LLVM_EXPERIMENTAL_KEY_INSTRUCTIONS
+  EJIT_SWITCH_CASE
   )
 
 # Run tests requiring Z3 headers only if LLVM was built with Z3

@@ -78,6 +78,21 @@ EJit::EJit(const Config &config) : config_(config) {
 #endif
   compileDriver_ = std::make_unique<EJitCompileDriver>(
       config_, *runtimeState_, *moduleLoader_, logger);
+  if (config_.enableFinalVersionMerge) {
+#if !defined(EJIT_SWITCH_CASE) || !defined(EJIT_SRE_SHARED_TASKPOOL) || \
+    !defined(EJIT_SRE_TASKPOOL_NO_RECLAIM) || !defined(EJIT_SRE_CODE_POOL)
+    recordInitError(EJIT_ERR_INVALID_PARAM,
+                    "final version merge requires SWITCH_CASE, shared taskpool, "
+                    "NO_RECLAIM and code pool", "");
+    return;
+#else
+    if (!config_.enablePgo || config_.compileMode != CompileMode::Async) {
+      recordInitError(EJIT_ERR_INVALID_PARAM,
+                      "final version merge requires Async online PGO", "");
+      return;
+    }
+#endif
+  }
 
   // Consume registration data from the staging store (constructor path).
   StoredData data = EJitRegistrationStore::instance().consume();

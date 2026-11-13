@@ -2355,6 +2355,83 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
 }
 #endif
 
+bool EJitStructFieldPass::isMayConstCandidate(LoadInst *LI,
+                                              const DataLayout &DL,
+                                              const EJitFreeDimAssumptions &Assumed) {
+  bool BoundMayConst = false;
+  for (const BoundPointerState &State : boundStates_)
+    BoundMayConst |= isBoundMayConstLoad(LI, State.boundArguments,
+                                         State.mayConstFields, DL, Assumed);
+  return BoundMayConst || isMayConstLoad(LI, mayConstFieldMap_, DL, Assumed);
+}
+
+Constant *
+EJitStructFieldPass::resolveMayConstLoad(LoadInst *LI, const DataLayout &DL,
+                                         const EJitFreeDimAssumptions &Assumed) {
+  const Function &F = *LI->getFunction();
+  Value *PtrOp = LI->getPointerOperand();
+
+  // Try each access pattern in order.
+  Constant *C = tryReplacePeriodAbsoluteAddress(
+      LI, F, gvPeriodMap_, mayConstFieldMap_, registry_, DL, Assumed);
+
+  // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
+  // from the shared object; the pointer argument and all dynamic fields
+  // remain live inputs to the specialization.
+  if (!C) {
+    for (const BoundPointerState &State : boundStates_) {
+      C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
+                                 State.boundArguments, DL, Assumed);
+      if (C)
+        break;
+    }
+  }
+
+  // Pattern 1: direct GlobalVariable load (scalar static variable).
+  if (!C) {
+    if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts()))
+      C = tryReplaceDirectGV(LI, GV, gvPeriodMap_, registry_, DL);
+  }
+
+  // Pattern 2: GEP-based access (array or struct field).
+  if (!C)
+    C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, mayConstFieldMap_,
+                            registry_, DL, Assumed,
+                            F.getName() == boundRootFunction_
+                                ? &localWitnessPeriods_ : nullptr);
+
+  // Pattern 3: indirect pointer access (pointer-type period variable).
+  if (!C)
+    C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
+  return C;
+}
+
+#ifdef EJIT_SWITCH_CASE
+/// The live assumptions plus \p Extra. Extra never names a free-dim argument:
+/// Sema rejects a parameter carrying both attributes.
+static EJitFreeDimAssumptions mergeAssumed(const EJitFreeDimAssumptions &Base,
+                                  const AssumedArgMap &Extra) {
+  EJitFreeDimAssumptions Merged = Base;
+  for (const auto &[Arg, Value] : Extra)
+    Merged.values[Arg] = Value;
+  return Merged;
+}
+
+bool EJitStructFieldPass::isMayConstCandidate(LoadInst *LI,
+                                              const AssumedArgMap &Extra) {
+  assert(mapsBuilt_ && "initFromModule() must precede switch-case queries");
+  return isMayConstCandidate(LI, LI->getDataLayout(),
+                             mergeAssumed(freeDimAssumptions_, Extra));
+}
+
+Constant *EJitStructFieldPass::resolveMayConstLoad(LoadInst *LI,
+                                                   const AssumedArgMap &Extra) {
+  assert(mapsBuilt_ && "initFromModule() must precede switch-case queries");
+  return resolveMayConstLoad(LI, LI->getDataLayout(),
+                             mergeAssumed(freeDimAssumptions_, Extra));
+}
+#endif
+
 PreservedAnalyses
 EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();

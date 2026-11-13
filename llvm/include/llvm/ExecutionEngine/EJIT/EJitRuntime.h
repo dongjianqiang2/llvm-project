@@ -39,6 +39,8 @@
 #define EJIT_DIM(x)
 #define EJIT_BOUND_PTR(x)
 #define ejit_free_dim
+#define ejit_runtime_dim
+#define ejit_runtime_dim_n(n)
 #define ejit_period_arr_ind(x)
 #define EJIT_ENTRY
 #define ejit_entry
@@ -59,6 +61,11 @@
 // expanding to the same __attribute__ would not be protected — it would rewrite
 // the inner ejit_free_dim token and emit __attribute__((__attribute__(...))).
 #define ejit_free_dim __attribute__((ejit_free_dim))
+// Same self-reference trick. The _n form must use the __x__ spelling: its body
+// is not inside ejit_runtime_dim's own expansion, so a bare ejit_runtime_dim
+// token there would be rewritten by the macro above.
+#define ejit_runtime_dim __attribute__((ejit_runtime_dim))
+#define ejit_runtime_dim_n(n) __attribute__((__ejit_runtime_dim__(n)))
 // Old names (aliases — use new macros to avoid double expansion)
 #define ejit_may_const EJIT_PERIOD_CONST
 #define ejit_period(x) EJIT_IN_PERIOD(x)
@@ -197,6 +204,15 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
+
+/// Select ordinary cell/TRP final-T2 switch merging BEFORE init, on every
+/// participating core. Then use ejit_init_pgo.
+/// Keeps ejit_config_t ABI unchanged. Requires SWITCH_CASE, shared taskpool,
+/// code pool and NO_RECLAIM; T1 sampling remains independent per member.
+/// Compile entries with -mllvm -ejit-final-version-merge to register their AOT
+/// fallback. Missing fallback or ineligible members retain independent T2.
+/// Merging does not reclaim previously emitted code under NO_RECLAIM.
+ejit_status_t ejit_set_final_version_merge(int enabled);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)

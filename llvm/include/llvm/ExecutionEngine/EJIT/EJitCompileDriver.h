@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSwitchCase.h"
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -171,6 +172,29 @@ private:
   static bool sharedOwnerElected(void *ctx);
   /// Owner-release hook: the counterpart of sharedOwnerElected.
   static void sharedOwnerReleased(void *ctx);
+#ifdef EJIT_SWITCH_CASE
+  struct FinalMember {
+    EJitCompileRequest request{};
+    uint64_t key = 0;
+    std::string entry;
+    std::string bitcode;
+    SmallVector<unsigned, 2> args;
+    SmallVector<uint32_t, 2> dimensions;
+    void *published = nullptr;
+    bool ready = false;
+    bool dirty = false;
+  };
+  std::vector<FinalMember> finalMembers_;
+  struct FinalFallback {
+    uintptr_t pointer = 0;
+    EJitCompileRequest request{};
+  };
+  std::unordered_map<uint64_t, FinalFallback> finalFallbacks_;
+  size_t finalArtifactBytes_ = 0;
+  uint64_t finalMergeSerial_ = 0;
+  static bool sharedFinalMergeService(void *ctx);
+  bool serviceFinalMerge();
+#endif
 #endif
   // Async compiler will be added in EJitAsyncCompiler phase
 
@@ -192,6 +216,9 @@ private:
     uintptr_t profdAddr = 0;
   };
   std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
+  /// Tier-1's switch-case arms per cacheKey, for Tier-2 to replay
+  /// (EJIT_SWITCH_CASE.md §10). Same lifetime as tier1Counters_.
+  std::unordered_map<uint64_t, EJitSwitchCaseDecision> tier1SwitchCase_;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct Tier1MayConstState {
     uintptr_t counterBase = 0;

@@ -5265,6 +5265,15 @@ def EjitFreeDim : InheritableParamAttr {
   let Documentation = [EjitFreeDimDocs];
 }
 
+// Keys switch-case arms on a projection of the parameter, inside the entry's
+// one specialization. Not a dimension. MaxArms 0 is the build default.
+def EjitRuntimeDim : InheritableParamAttr {
+  let Spellings = [Clang<"ejit_runtime_dim">];
+  let Subjects = SubjectList<[ParmVar]>;
+  let Args = [UnsignedArgument<"MaxArms", /*opt=*/1>];
+  let Documentation = [EjitRuntimeDimDocs];
+}
+
 // Binds a pointer parameter's pointee to one specialization dimension.
 def EjitBoundPtr : InheritableParamAttr {
   let Spellings = [Clang<"ejit_bound_ptr">];

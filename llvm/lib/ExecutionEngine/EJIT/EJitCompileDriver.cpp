@@ -14,6 +14,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#ifdef EJIT_SWITCH_CASE
+#include "llvm/ExecutionEngine/EJIT/EJitVersionMerge.h"
+#endif
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #endif
@@ -27,6 +30,134 @@
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+namespace {
+bool sameFinalIdentity(const EJitCompileRequest &A,
+                       const EJitCompileRequest &B) {
+  if (stripReqTier(A.funcIndex) != stripReqTier(B.funcIndex) ||
+      A.numDims != B.numDims || A.numDims > 4 ||
+      A.generation != B.generation)
+    return false;
+  for (uint32_t I = 0; I < A.numDims; ++I)
+    if (A.dims[I].dimType != B.dims[I].dimType ||
+        A.dims[I].instanceId != B.dims[I].instanceId ||
+        A.versions[I] != B.versions[I])
+      return false;
+  return true;
+}
+} // namespace
+
+bool EJitCompileDriver::sharedFinalMergeService(void *Ctx) {
+  return static_cast<EJitCompileDriver *>(Ctx)->serviceFinalMerge();
+}
+
+bool EJitCompileDriver::serviceFinalMerge() {
+#ifndef EJIT_SRE_CODE_POOL
+  return false;
+#else
+  if (!config_.enableFinalVersionMerge || !jitEngine_)
+    return false;
+  bool Dirty = false;
+  for (const auto &M : finalMembers_)
+    Dirty |= M.ready && M.dirty;
+  if (!Dirty)
+    return false;
+  // Revalidate artifacts against the actual cache, never against a stale
+  // compilation-success flag. Failed/evicted/retired members cannot rejoin.
+  for (auto I = finalMembers_.begin(); I != finalMembers_.end();) {
+    if (I->ready && !sharedPool_.finalVersionCurrent(I->request, I->published)) {
+      finalArtifactBytes_ -= I->bitcode.size();
+      I = finalMembers_.erase(I);
+    } else {
+      ++I;
+    }
+  }
+  for (auto &Trigger : finalMembers_) {
+    if (!Trigger.ready || !Trigger.dirty)
+      continue;
+    Trigger.dirty = false;
+    SmallVector<FinalMember *, 8> Members;
+    SmallVector<EJitFinalModuleArm, 8> Arms;
+    for (auto &M : finalMembers_) {
+      if (!M.ready || M.entry != Trigger.entry || M.args != Trigger.args ||
+          M.request.fallbackPtr != Trigger.request.fallbackPtr ||
+          M.request.generation != Trigger.request.generation)
+        continue;
+      if (Members.size() == kEJitFinalMergeMaxArms)
+        break;
+      Members.push_back(&M);
+      Arms.push_back({M.bitcode, M.dimensions});
+    }
+    if (Members.size() < 2)
+      continue;
+    bool SamePointer = true;
+    for (auto *M : Members) {
+      M->dirty = false;
+      SamePointer &= M->published == Members.front()->published;
+    }
+    if (SamePointer)
+      continue;
+    // NO_RECLAIM includes failed allocations. Limit emission attempts too;
+    // repeated invalidation must not create unbounded retained generations.
+    if (finalMergeSerial_ >= 64) {
+      EJIT_DIAG("final-merge emission budget: retaining independent T2");
+      return true;
+    }
+    auto Prepared = assembleFinalVersionModules(
+        Trigger.entry, Trigger.request.fallbackPtr, Trigger.args, Arms);
+    if (!Prepared) {
+      EJIT_DIAG("final-merge rejected entry=%s: %s", Trigger.entry.c_str(),
+                toString(Prepared.takeError()).c_str());
+      return true;
+    }
+    SpecializationContext C;
+    C.fnName = Trigger.entry;
+    C.cacheKey = (uint64_t{1} << 63) | ++finalMergeSerial_;
+    C.tier = CompileTier::PGOUse;
+    C.optLevel = config_.optLevel;
+    C.preparedFinalMerge = true;
+    jitEngine_->setActiveContext(&C);
+    auto E = jitEngine_->loadBitcodeModule(*Prepared, C.cacheKey, C.fnName);
+    if (E) {
+      jitEngine_->setActiveContext(nullptr);
+      EJIT_DIAG("final-merge emission failed: %s", toString(std::move(E)).c_str());
+      return true;
+    }
+    auto Address = jitEngine_->lookup(C.cacheKey, C.fnName);
+    jitEngine_->setActiveContext(nullptr);
+    if (!Address) {
+      EJIT_DIAG("final-merge lookup failed: %s",
+                toString(Address.takeError()).c_str());
+      return true;
+    }
+    EJitCompiledCodeInfo Info;
+    // Use the normal pool's seal/publication operation, not a parallel mapper.
+    if (auto FlushError = jitEngine_->flushPendingCode()) {
+      EJIT_DIAG("final-merge seal failed: %s",
+                toString(std::move(FlushError)).c_str());
+      return true;
+    }
+    if (!jitEngine_->isCodeReady(*Address) ||
+        !jitEngine_->findCodeRange(*Address, Info)) {
+      EJIT_DIAG("final-merge missing finalized code range");
+      return true;
+    }
+    unsigned Published = 0;
+    for (auto *M : Members)
+      if (sharedPool_.replaceFinalVersion(M->request, M->published, *Address, Info)) {
+        M->published = *Address;
+        ++Published;
+      }
+    EJIT_DIAG("final-merge entry=%s arms=%zu published=%u fn=%p generation=%llu",
+              C.fnName.c_str(), Members.size(), Published, *Address,
+              static_cast<unsigned long long>(finalMergeSerial_));
+    return true;
+  }
+  return false;
+#endif
+}
+#endif
 
 #ifdef EJIT_SRE_TASKPOOL
 namespace {
@@ -240,6 +371,11 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
+#ifdef EJIT_SWITCH_CASE
+  if (config_.enableFinalVersionMerge)
+    sharedPool_.setFinalMergeService(&EJitCompileDriver::sharedFinalMergeService,
+                                    this);
+#endif
   sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
@@ -351,7 +487,8 @@ bool EJitCompileDriver::startSharedTaskPool() {
   // running against mismatched indices.
   sharedPool_.setRegistrationFingerprint(
       EJitFuncRegistry::instance().fingerprint() * 0x9e3779b97f4a7c15ULL ^
-      EJitLifecycleRegistry::instance().fingerprint());
+      EJitLifecycleRegistry::instance().fingerprint() ^
+      (config_.enableFinalVersionMerge ? 0x7c3ad97144e2019bULL : 0ULL));
   EJitSharedTaskPool::InitResult r = sharedPool_.init();
   switch (r) {
   case EJitSharedTaskPool::InitResult::BecameOwner:
@@ -419,6 +556,11 @@ bool EJitCompileDriver::ensureJitEngine() {
 }
 
 void EJitCompileDriver::releaseJitEngine() {
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+  finalMembers_.clear();
+  finalArtifactBytes_ = 0;
+  finalFallbacks_.clear();
+#endif
   if (!jitEngine_)
     return;
   EJIT_DIAG("OrcJIT engine released: ownership given up");
@@ -426,6 +568,12 @@ void EJitCompileDriver::releaseJitEngine() {
 }
 
 void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+  // Never combine artifacts captured against different external bindings.
+  finalMembers_.clear();
+  finalArtifactBytes_ = 0;
+  finalFallbacks_.clear();
+#endif
   userSymbols_.emplace_back(name, addr);
   if (jitEngine_)
     jitEngine_->addUserSymbol(name, addr);
@@ -554,6 +702,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (RunProfileStages) {
     if (static_cast<CompileTier>(tier) == CompileTier::PGOUse) {
       ctx.tier = CompileTier::PGOUse;
+      if (auto It = tier1SwitchCase_.find(cacheKey);
+          It != tier1SwitchCase_.end())
+        ctx.switchCaseReplay = It->second;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
       auto mayConstIt = tier1MayConst_.find(cacheKey);
@@ -682,6 +833,41 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     return nullptr;
   }
 
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+  std::string FinalBitcode;
+  SmallVector<unsigned, 2> FinalArgs;
+  uintptr_t FinalAot = request ? request->fallbackPtr : 0;
+  if (config_.enableFinalVersionMerge && request) {
+    if (!FinalAot)
+      for (const auto &Symbol : userSymbols_)
+        if (Symbol.first == std::string(FINAL_MERGE_AOT_PREFIX) + funcName) {
+          FinalAot = reinterpret_cast<uintptr_t>(Symbol.second);
+          break;
+        }
+    if (ctx.tier == CompileTier::Instrumented && FinalAot &&
+        finalFallbacks_.size() < 64)
+      finalFallbacks_[cacheKey] = {FinalAot, *request};
+    if (ctx.tier == CompileTier::PGOUse) {
+      auto I = finalFallbacks_.find(cacheKey);
+      if (I != finalFallbacks_.end()) {
+        if (sameFinalIdentity(I->second.request, *request))
+          FinalAot = I->second.pointer;
+        finalFallbacks_.erase(I);
+      }
+    }
+  }
+  if (config_.enableFinalVersionMerge && request &&
+      ctx.tier == CompileTier::PGOUse && FinalAot &&
+      dimCount >= 1 && dimCount <= 2) {
+    ctx.finalMergeBitcode = &FinalBitcode;
+    ctx.finalMergeDimensionArgs = &FinalArgs;
+  }
+  if (config_.enableFinalVersionMerge && ctx.tier == CompileTier::PGOUse &&
+      !FinalAot)
+    EJIT_DIAG("final-merge no AOT fallback entry=%s: rebuild entry with "
+              "-mllvm -ejit-final-version-merge; keeping independent T2",
+              funcName.c_str());
+#endif
   jitEngine_->setActiveContext(&ctx);
 
   if (auto Err = jitEngine_->loadBitcodeModule(bitcode, cacheKey, funcName)) {
@@ -714,6 +900,40 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   }
 
   void *funcPtr = *addrOrErr;
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+  if (request && !FinalBitcode.empty() && FinalArgs.size() == dimCount) {
+    for (auto I = finalMembers_.begin(); I != finalMembers_.end();) {
+      if (I->key == cacheKey ||
+          (I->ready && !sharedPool_.finalVersionCurrent(I->request, I->published))) {
+        finalArtifactBytes_ -= I->bitcode.size();
+        I = finalMembers_.erase(I);
+      } else {
+        ++I;
+      }
+    }
+    if (finalMembers_.size() < 64 &&
+        finalArtifactBytes_ + FinalBitcode.size() <=
+            kEJitFinalMergeMaxArtifactBytes) {
+      FinalMember M;
+      M.request = *request;
+      M.request.fallbackPtr = FinalAot;
+      M.request.boundCount = 0;
+      for (auto &B : M.request.boundPointers)
+        B = {};
+      M.key = cacheKey;
+      M.entry = funcName;
+      M.bitcode = std::move(FinalBitcode);
+      M.args = std::move(FinalArgs);
+      for (unsigned I = 0; I < dimCount; ++I)
+        M.dimensions.push_back(dims[I]);
+      M.published = funcPtr;
+      finalArtifactBytes_ += M.bitcode.size();
+      finalMembers_.push_back(std::move(M));
+    } else {
+      EJIT_DIAG("final-merge artifact budget: retaining independent T2");
+    }
+  }
+#endif
 
   // PGO Tier-1: capture counter addresses for a later Tier-2 synthesis (§5.2).
   // The __profc_*/__profd_* globals were forced External by
@@ -737,6 +957,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     }
     EJIT_DIAG("compileCold Tier-1 key=0x%016lx: captured %zu counter set(s)",
               cacheKey, counters.size());
+    if (EJitSwitchCaseDecision SC = jitEngine_->getLastSwitchCase(); SC.valid)
+      tier1SwitchCase_[cacheKey] = std::move(SC);
+    else
+      tier1SwitchCase_.erase(cacheKey);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     Tier1MayConstState &MayConst = tier1MayConst_[cacheKey];
@@ -816,8 +1040,10 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   }
 
   // PGO Tier-2: profile consumed; drop the captured counters (§7.1).
-  if (ctx.tier == CompileTier::PGOUse)
+  if (ctx.tier == CompileTier::PGOUse) {
     tier1Counters_.erase(cacheKey);
+    tier1SwitchCase_.erase(cacheKey);
+  }
 
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
@@ -905,6 +1131,28 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
+#if defined(EJIT_SWITCH_CASE) && defined(EJIT_SRE_SHARED_TASKPOOL)
+  if (!published)
+    for (auto I = finalFallbacks_.begin(); I != finalFallbacks_.end();) {
+      if (sameFinalIdentity(I->second.request, req))
+        I = finalFallbacks_.erase(I);
+      else
+        ++I;
+    }
+  for (auto I = finalMembers_.begin(); I != finalMembers_.end(); ++I) {
+    if (I->request.funcIndex != req.funcIndex ||
+        !sameFinalIdentity(I->request, req))
+      continue;
+    if (published) {
+      I->ready = true;
+      I->dirty = true;
+    } else {
+      finalArtifactBytes_ -= I->bitcode.size();
+      finalMembers_.erase(I);
+    }
+    break;
+  }
+#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {
