@@ -1076,9 +1076,8 @@ public:
 /// ejit_period_arr_ind parameter. Called from ActOnFinishFunctionBody after
 /// the function body is parsed.
 ///
-/// Replaces the former AOT-pass check (EJitAotModulePass) that printed the
-/// same warning to stderr: Sema can point at the exact reference site and the
-/// diagnostic is controlled by -Wembedded-jit-undeclared-period-dep.
+/// Checked in Sema so the warning points at the exact reference site and is
+/// controlled by -Wembedded-jit-undeclared-period-dep.
 ///
 /// Note: only the entry function's own body is checked (pre-inline state).
 /// A dependency hidden in a callee that is later inlined is not detected
@@ -1088,8 +1087,7 @@ void checkEjitUndeclaredPeriodDeps(Sema &S, const FunctionDecl *FD,
   if (!FD || !Body || FD->isInvalidDecl() || FD->isDependentContext())
     return;
 
-  // Only ejit_entry functions declare dependencies, mirroring the former
-  // AOT-pass check which only looked at TAG_EJIT_ENTRY metadata.
+  // Only ejit_entry functions declare dependencies.
   if (!FD->hasAttr<EjitEntryAttr>())
     return;
 

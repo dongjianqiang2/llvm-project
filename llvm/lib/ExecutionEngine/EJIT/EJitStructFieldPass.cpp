@@ -1762,10 +1762,10 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   SmallVector<uintptr_t, 4> StrictBases;
   for (const auto &[GV, Info] : gvMap) {
     if (GV->getValueType()->isPointerTy()) {
-      // Preserve the pre-existing constant-address path for pointer-valued
-      // periods. It deliberately does not require the helper itself to carry
-      // the consuming entry's lifecycle metadata: the pointer materialization
-      // and the old absolute-address fold are also used through non-inlined
+      // Constant-address path for pointer-valued periods. It deliberately
+      // does not require the helper itself to carry the consuming entry's
+      // lifecycle metadata: the pointer materialization and the
+      // absolute-address fold are also used through non-inlined
       // helpers. The lightweight witness path shares that lifecycle contract;
       // it does not invent a new entry metadata requirement for such helpers.
       if (DL.getPointerSize(0) != sizeof(void *))

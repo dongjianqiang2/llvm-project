@@ -299,7 +299,7 @@ struct EJitSharedPoolSplit {
 //===----------------------------------------------------------------------===//
 // EJitSharedDumpState: fixed-size cross-core diagnostic metadata.
 //
-// Full IR/ASM text remains in the owner worker's private gDumpStore. Shared
+// Full IR/ASM text remains in the owner worker's private dumpStore(). Shared
 // memory carries only the active filter and enough metadata to direct a
 // non-owner caller to the worker core that owns the latest capture.
 //===----------------------------------------------------------------------===//
@@ -568,7 +568,7 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
 // Layout/ABI guarantees. NOTE on trivially-copyable: EJitAtomic<T> deliberately
 // deletes its copy/move (an atomic cell identifies a fixed memory slot), so the
 // blob is NOT trivially copyable and must NEVER be memcpy'd. It is instead
-// initialized field-by-field in place (EJitSharedTaskPool::ownerInit) so it
+// initialized field-by-field in place (EJitSharedTaskPool::init) so it
 // works on raw, uninitialized shared memory too. We therefore assert the
 // properties that DO hold and matter for shared placement: standard layout (no
 // vtable, predictable field offsets across cores) and trivial destruction (no

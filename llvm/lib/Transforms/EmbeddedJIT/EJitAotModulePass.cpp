@@ -10,10 +10,6 @@
 //  in order (PASS1 is an independent early pass) and manages
 //  PreservedAnalyses composition.
 //
-//  The undeclared-period-dependency warning that used to be printed here
-//  now lives in clang Sema (warn_ejit_undeclared_period_dep), where it
-//  gets a source location and -W flag control.
-//
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"

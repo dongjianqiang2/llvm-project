@@ -841,8 +841,8 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
     return nullptr;
   }
 
-  // Validate the request: instanceIds must be encodable in the legacy 8-bit
-  // cacheKey slots, and no two dims may share a dimType (a duplicated lifecycle
+  // Validate the request: instanceIds must be encodable in the 8-bit cacheKey
+  // slots, and no two dims may share a dimType (a duplicated lifecycle
   // dimension).
   uint32_t seenDimTypes[4] = {};
   uint32_t seenCount = 0;

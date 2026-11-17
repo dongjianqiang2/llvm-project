@@ -6,8 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The bare-metal registry no longer uses single, fixed-named global arrays.
-//
 // PASS1 (EJitRegisterBitcode), PASS2 (EJitRegisterPeriod), and PASS3
 // (EJitWrapperGen) emit their per-translation-unit entries as *private* arrays
 // placed in dedicated registry sections. The linker concatenates these input
@@ -17,13 +15,12 @@
 // brackets the sections, which the runtime (EJit.cpp) walks as [start, stop)
 // ranges.
 //
-// Current layout:
+// Layout:
 //   .ejit_bitcode : embedded bitcode and symbol entries
 //   .ejit_period  : period/static entries plus lifecycle/funcIndex fixups
 //
-// This avoids the "duplicate symbol" link errors that arose when more than one
-// TU defined ejit_entry functions: previously every such TU emitted a strong
-// __ejit_registry_*[] definition under the same external name.
+// Because the entries are private per TU, several TUs can define ejit_entry
+// functions without "duplicate symbol" link errors.
 //
 // EJit.cpp declares the __start_/__stop_ symbols weak in hosted builds
 // (!EJIT_FREESTANDING), so a program with no ejit_entry functions (sections

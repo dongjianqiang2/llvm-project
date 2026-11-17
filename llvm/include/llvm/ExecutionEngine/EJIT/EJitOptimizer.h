@@ -51,15 +51,18 @@ public:
   EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM = nullptr);
 
   /// Run the full JIT specialization pipeline:
-  ///   1. Parameter substitution (ejit_period_arr_ind → constants)
-  ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
-  ///   4. StructFieldPass (may_const loads → runtime constants)
-  ///   5. Core optimization pipeline (L1/L2/L3)
+  ///   1. Specialize: substitute ejit_period_arr_ind parameters, InstCombine,
+  ///      StructFieldPass (may_const loads -> runtime constants), IPSCCP across
+  ///      the call edges the AOT inliner kept, then InstCombine +
+  ///      StructFieldPass again for the callees.
+  ///   2. Lower llvm.expect.
+  ///   3. The LLVM -O1/-O2/-O3 function-simplification pipeline.
+  ///   4. Another StructFieldPass for accesses exposed by unrolling, a light
+  ///      cleanup, and (L2/L3 on AArch64) vectorization.
   ///
-  /// ctx.tier selects the PGO branch (EJIT_ONLINE_PGO.md §4): Baseline (no
-  /// PGO), Instrumented (Tier-1: + PGOGen/Lowering/capture), PGOUse (Tier-2:
-  /// + PGOUse(profile) then the core pipeline).
+  /// ctx.tier selects the PGO branch: Baseline (no PGO), Instrumented (Tier-1:
+  /// light optimization + instrumentation), or PGOUse (Tier-2: profile use and
+  /// a profile-guided module inliner before steps 2-4).
   void runPipeline(Module &M, const SpecializationContext &ctx);
 
   /// Clear all cached analysis results. Must be called between compilations
@@ -169,13 +172,14 @@ private:
   ModuleAnalysisManager MAM_;
 
   // Cached pass managers, built once and reused across compilations:
-  //   lowerExpectFPM_ lower llvm.expect (not in buildFunctionSimplification
-  //                   Pipeline); runs before the O2 pipeline (Phase 2).
-  //   simplifyO1/2/3_ the real LLVM -O1/-O2/-O3 function-simplification
-  //   pipeline
-  //                   (Phase 3), one per tier.
-  //   cleanupFPM_     light fold after the second StructFieldPass (Phase 5).
-  //   vectorFPM_      target-aware loop and SLP vectorization (L2/L3 only).
+  //   lowerExpectFPM_ lower llvm.expect (not in
+  //                   buildFunctionSimplificationPipeline); Phase 2.
+  //   simplifyO1/2/3_ the LLVM -O1/-O2/-O3 function-simplification pipeline,
+  //                   one per optimization level; Phase 3.
+  //   cleanupFPM_     light fold after the post-unrolling StructFieldPass;
+  //                   Phase 4.
+  //   vectorFPM_      target-aware loop and SLP vectorization (L2/L3 on
+  //                   AArch64 only).
   FunctionPassManager lowerExpectFPM_;
   FunctionPassManager simplifyO1_;
   FunctionPassManager simplifyO2_;

@@ -33,9 +33,9 @@ using namespace llvm::ejit;
 // The leading-dot section names are not valid C identifiers, so the linker
 // does NOT auto-synthesize the __start_/__stop_ bounds — a linker script must
 // define these four symbols and bracket the sections (see the example
-// llvm/lib/ExecutionEngine/EJIT/ejit_registry.ld).  This replaces the old
-// single external __ejit_registry_*[] arrays, which produced duplicate-symbol
-// link errors across multiple TUs.
+// llvm/lib/ExecutionEngine/EJIT/ejit_registry.ld). Because each TU's entries
+// are private, several TUs can define ejit_entry functions without
+// duplicate-symbol link errors.
 //
 // Hosted builds (!EJIT_FREESTANDING): the bounds are declared weak so a
 // program with no ejit_entry functions — or no linker script — resolves them
@@ -426,9 +426,8 @@ bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
   // Taskpool build: a registered lifecycle updates the time-window activation
   // state AND the SwitchController (kept consistent; setEnabled bumps the
   // version only when the enabled bit actually flips). A name that is a
-  // registered period but not a JIT lifecycle still drives the legacy
-  // time-window state only. A name that is neither is unknown -> clean error,
-  // no state change.
+  // registered period but not a JIT lifecycle drives the time-window state
+  // only. A name that is neither is unknown -> clean error, no state change.
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -472,9 +471,8 @@ bool EJit::deactivate(const std::string &periodName, uint32_t cellIdx) {
     // Cross-core: deactivation writes the shared enabled/version. The version
     // bump drives the three-layer lazy invalidation (producer early-reject,
     // worker checkpoint discard, cache-lookup version-mismatch miss) — see
-    // shared compileOrGet / runCompile / cacheLookup. invalidateByPeriod below
-    // still drains the per-instance LRU; the shared POD cache is invalidated by
-    // version alone.
+    // shared compileOrGet / runCompile / cacheLookup. The shared POD cache is
+    // invalidated by the version bump alone.
     if (EJitSharedTaskPool *sp = sharedTaskPool())
       sp->setInstanceEnabled(dt, cellIdx, /*enabled=*/false);
 #else
@@ -577,12 +575,14 @@ bool EJit::isActive(const std::string &periodName, uint32_t cellIdx) const {
                                  static_cast<uint8_t>(cellIdx));
 }
 
-void EJit::clearCache() { /* Legacy LRU cache retired */ }
+// EJit owns no cache. With EJIT_SRE_SHARED_TASKPOOL, ejit_clear_cache()
+// retires the dispatch cache if a shared taskpool is bound.
+void EJit::clearCache() {}
 
 void EJit::invalidateByPeriod(const std::string &periodName, uint32_t cellIdx) {
   // Range-check BEFORE any narrowing: a truncated 256 would invalidate
-  // instance 0. Legacy invalidation is a no-op, but the ABI contract is the
-  // same as the taskpool path.
+  // instance 0. Invalidation is a no-op here, but the range contract matches
+  // the taskpool path.
   if (cellIdx >= kEJitMaxInstances)
     return;
   (void)periodName; (void)cellIdx;
@@ -667,7 +667,7 @@ bool EJit::setCompileMode(CompileMode mode) {
 
   if (mode == CompileMode::Async) {
     // Do not expose Async until a compiler and a consumer exist. Failure
-    // preserves the old mode, so callers cannot enqueue permanent pending work
+    // keeps the current mode, so callers cannot enqueue permanent pending work
     // into a taskpool nothing drains.
 #ifdef EJIT_SRE_SHARED_TASKPOOL
     // A peer has NO local engine by design -- the elected owner compiles for
@@ -1048,7 +1048,7 @@ void EJit::printActive() const {
   for (const auto &kv : reg.arraysByPeriod()) {
     const std::string &period = kv.first;
     // Count first so every period leads with its active-cell count; zero
-    // prints "active=0" (replaces the old "(no active cells)" marker).
+    // prints "active=0".
     // isActive() is a table lookup, so the second 256-cell scan per period
     // is negligible next to the per-line print throttle.
     uint32_t activeCells = 0;
