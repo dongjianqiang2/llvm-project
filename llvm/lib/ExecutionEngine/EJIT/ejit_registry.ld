@@ -118,6 +118,33 @@ SECTIONS
     KEEP(*(.text.ejit_dispatch))
   } > CODE
 
+  /* --- EmbeddedJIT D-cache cell clustering (enable: -mllvm -ejit-icache-cluster) ---
+   * Every per-function @__ejit_icache_fn_<name> cell table is emitted into the
+   * derived input section "<shared-section>.ejit_icache" (default
+   * .mc_shared.ejit_icache) so the linker concatenates all cells into ONE
+   * contiguous region, instead of interleaving them with each TU's
+   * toggle-written period arrays in the shared section.  The cells are
+   * read-mostly (probes only load; fills are once per specialization and a
+   * drain writes every cell whatever the layout), so packing them 8-per-64B
+   * line creates no false sharing -- and escapes the high-frequency neighbor
+   * writes of the shared section.  Per-cell alignment stays 8; ALIGN(64)
+   * isolates the region's start/end lines, as with .text.ejit_dispatch above.
+   *
+   * The "> REGION" token MUST be YOUR inter-core shared memory region -- the
+   * same one .mc_shared maps into; this example cannot name it for you.  A
+   * script that does not know the name leaves the fragments as ORPHANS
+   * (heuristic placement, possibly outside the shared window), or, with a
+   * *(.mc_shared*) glob, folds them back into the shared section unclustered
+   * -- either way the cache silently degrades to per-core.  Split such a glob
+   * into *(.mc_shared) plus this entry.  KEEP() is belt-and-braces under
+   * --gc-sections (the probe and the registration already reference the
+   * cells).  Verify: readelf -SW image | grep ejit_icache; nm image |
+   * grep __ejit_icache_fn_ (must be consecutive inside that one section). */
+  .mc_shared.ejit_icache : ALIGN(64)
+  {
+    KEEP(*(.mc_shared.ejit_icache))
+  } > SHARED     /* your inter-core shared memory region token */
+
   .text.ejit : ALIGN(4096)
   {
     __ejit_code_start = .;

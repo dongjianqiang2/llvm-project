@@ -247,6 +247,7 @@ present period values. Under NO_RECLAIM the cached fnPtr never dangles.
 | Flag / define | Default | Effect |
 |---|---|---|
 | `-ejit-inline-cache` (AOT cl::opt) | off | emit the multi-version probe |
+| `-ejit-icache-cluster` (AOT cl::opt) | off | emit the cell tables into the derived `<section>.ejit_icache` subsection so the linker concatenates them into one D-cache-contiguous region (see EJIT_ICACHE_SHARED_TABLE.md §3.1/§4); needs a matching deployment-script entry (P2); no-op with an empty section |
 | `EJIT_ICACHE_DIM_SIZE` (CMake -> `#define` on both LLVMEmbeddedJIT + LLVMEJIT) | 16 (power-of-2) | uniform per-dim bound D |
 | `EJIT_ICACHE_MAX_DIMS` (header `#define`) | 4 | max cached dims; >N -> compile error |
 | `EJIT_ICACHE_FUNC_SLOTS` | 64 | registration table size (unchanged) |
@@ -434,3 +435,64 @@ br    x2
   budget. If this bites, lower D for high-dim functions or cap maxDims at 2.
 - **Polymorphic multi-slot within one identity** (e.g. adaptive): out of scope;
   direct-indexed one-cell-per-identity is monomorphic per identity by design.
+
+## 13. Single-slot mode (`-ejit-icache-single-slot`)
+
+An opt-in LAYOUT variant for deployments whose entries mark several
+`ejit_dim` params that provably share ONE value per run (e.g. `f(v, v, v)`):
+the per-function `@__ejit_icache_fn_<name>` table is ONE scalar cell (the
+0-dim shape) no matter how many dims are marked, and the slot registers as
+`numDims == 0`. Everything else is unchanged: MissFn still resolves through
+the taskpool with the REAL dim tuple, so specialization identity, lifecycle
+retirement, the drain/retract protocol, and the cross-core scalar gate all
+keep their §5/§6 meaning.
+
+- Flag: `-mllvm -ejit-icache-single-slot` (module-level, default off, no effect
+  without `-ejit-inline-cache`). Module scope == per-function scope under the
+  one-entry-per-TU deployment shape. The mode does NOT lift the <= 4 marked
+  ejit_dim cap: the Sema limit and the wrapper's hard error are keyed on the
+  real param count, which the C ABI's _0d.._4d variants cap anyway.
+- Emission: the map's table dimensionality collapses to 0, so the global is a
+  plain `ptr`, the probe is a single load (no GEP chain, always sentinel-form
+  when timing is off), and the registration carries `numDims=0` +
+  `&MissFn`. 0-dim entries are byte-identical either way.
+- Runtime: `icacheFill`/`icacheTry` key on the SLOT's shape
+  (`scalarSlot = reg.numDims == 0`): a scalar slot accepts a resolve with ANY
+  caller dim count into cell 0, skips the per-dim range check, and is subject
+  to `icacheCrossCoreExecutable()` exactly like a 0-dim entry. For every
+  pre-existing registration the relaxed path is behaviour-identical.
+- Footprint (per function, shared section): `16^N * 8B` -> `8B`
+  (128B / 2KB / 32KB / 512KB for 1/2/3/4 dims); drain writes `16^N` -> `1`;
+  probe: N GEPs + load -> load (§11: 0-dim is the 4-cycle floor). Also immune
+  to the dimensioned probe's unchecked-GEP hazard for ids >= 16.
+
+**Contract (review-flagged spec change).** A dimensioned table self-isolates:
+the probe for tuple T only ever reads the cell filled for T. A scalar slot has
+no key. Correctness across values therefore rests entirely on the deployment
+contract: every marked dim carries the same value within one run, and a value
+change happens ONLY at a process/board boundary or across a lifecycle
+activate/deactivate (which drains the cell, so the next probe re-resolves).
+A same-process bare value switch -- no boundary, no toggle -- serves the stale
+specialization: WRONG CODE, silently, because the sentinel probe is guardless
+by design. The contract is stated in the flag's `cl::desc` and must travel
+with any deployment that enables the mode.
+
+Compatibility: additive in both directions. Old runtime + new AOT: the
+mismatched fills are declined (today's shape-mismatch rule), the cell stays
+at its sentinel, and MissFn + taskpool serve correct results with no icache
+speedup -- a graceful degradation, not a hazard. New runtime + old AOT: the
+relaxed path is unreachable.
+
+Clustering composes: `-ejit-icache-cluster` moves the scalar cells into the
+derived `<section>.ejit_icache` region (EJIT_ICACHE_SHARED_TABLE.md §3.1), and
+the 8B cells pack EIGHT per 64B line -- an image-wide cell region of a few
+lines, fetched once and resident, with the script's `ALIGN(64)` making the
+line isolation exact. The two flags are otherwise decoupled: single-slot sets
+the table's shape, cluster sets only its section name.
+
+Future (out of scope here):
+- Witness-checked slot (`{fn, witness}` cell + all-equal probe check) restores
+  "violation = miss" at the cost of the compare this mode exists to avoid.
+- Per-function override via a clang attribute (Attr.td -> SemaEJIT -> a
+  `!ejit.metadata` tag -> read next to `getPeriodArrIndInfo` in PASS3), for
+  modules mixing scalar and dimensioned shapes.

@@ -601,9 +601,13 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
   if (!state_ || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
     return false;
   EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
-  // Unregistered function, or shape mismatch (caller's numDims != registered):
-  // miss.
-  if (!reg.base || numDims != reg.numDims)
+  // A scalar slot (registered numDims == 0: a 0-dim entry, or a single-slot-mode
+  // function whose wrapper still resolves with the real dim count) has one cell
+  // and no identity, so it serves any caller count from cell 0.
+  const bool scalarSlot = (reg.numDims == 0);
+  // Unregistered function, or shape mismatch between two dimensioned shapes
+  // (caller's numDims != registered): miss.
+  if (!reg.base || (!scalarSlot && numDims != reg.numDims))
     return false;
   // The cache is only meaningful once the pool is Ready.
   if (state_->initState.loadAcquire() != kReady)
@@ -620,14 +624,14 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
 #endif
   if (!mayReadPtr)
     return false;
-  if (!icacheDimsInRange(dims, numDims))
+  if (!scalarSlot && !icacheDimsInRange(dims, numDims))
     return false;
   // Read this identity's cell. Relaxed is enough, and is what the AOT probe
   // emits: the cell holds a self-contained pointer, the caller's indirect call
   // depends on the value loaded (data dependency), and the only cross-core
   // write is a drain storing the slot's empty value -- which yields a miss
   // (the sentinel IS MissFn), never a bad pointer.
-  uintptr_t idx = icacheLinearize(dims, numDims);
+  uintptr_t idx = scalarSlot ? 0 : icacheLinearize(dims, numDims);
   uintptr_t p = icacheCell(reg.base, idx).loadRelaxed();
   if (p == 0 || p == reinterpret_cast<uintptr_t>(reg.missFn))
     return false;
@@ -761,10 +765,17 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
     return;
   }
   EJitIcacheSlotReg &reg = gIcacheSlots[funcIndex];
-  if (!reg.base || numDims != reg.numDims) {
-    // Unregistered, or shape mismatch: nowhere to write. A null base means this
-    // core never ran ejit_register_icache_slot for this function -- the AOT
-    // .ejit_period entry is missing, or the name did not resolve to funcIndex.
+  // A scalar slot (registered numDims == 0) is either a 0-dim entry or a
+  // single-slot-mode function (-ejit-icache-single-slot collapsed its [D]^N
+  // table to one cell, while the wrapper's MissFn still resolves with the
+  // REAL dim count). The cell has no identity: every dim tuple writes cell 0,
+  // so the caller-vs-registered equality and the range check do not apply.
+  const bool scalarSlot = (reg.numDims == 0);
+  if (!reg.base || (!scalarSlot && numDims != reg.numDims)) {
+    // Unregistered, or shape mismatch between two dimensioned shapes: nowhere
+    // to write. A null base means this core never ran
+    // ejit_register_icache_slot for this function -- the AOT .ejit_period
+    // entry is missing, or the name did not resolve to funcIndex.
     if (!gIcacheFillRejectLogged[kFillRejectUnregistered]) {
       gIcacheFillRejectLogged[kFillRejectUnregistered] = true;
       EJIT_DIAG("icacheFill DECLINE func=%u: base=%p registeredDims=%u "
@@ -773,25 +784,26 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
     }
     return;
   }
-  // A 0-dim entry has exactly ONE cell and no identity to partition it by, so
+  // A scalar slot has exactly ONE cell and no identity to partition it by, so
   // the disjointness argument above does not reach this shape: every core reads
   // and writes that same scalar, by construction, no matter how well behaved
   // the deployment is. Core A can fill it having prepared the code only for A,
   // and core B then loads a non-null pointer on its very first call and
-  // branches to a page it never sealed.
+  // branches to a page it never sealed. (Scalar slots arise from 0-dim
+  // entries and from single-slot-mode functions alike; both share the shape.)
   //
   // There is no per-core information in the cell to recover the implication
   // from, so the only sound rule is the platform one: allow the shared scalar
   // only where a resolved pointer is callable everywhere the instant it exists.
   // Elsewhere the probe simply keeps missing and the taskpool -- which does the
   // per-core preparation -- serves every call. The AOT side still emits the
-  // probe for 0D entries; it is the fill, not the code, that is platform
+  // probe for scalar slots; it is the fill, not the code, that is platform
   // dependent.
-  if (numDims == 0 && !icacheCrossCoreExecutable()) {
+  if (scalarSlot && !icacheCrossCoreExecutable()) {
     if (!gIcacheFillRejectLogged[kFillRejectScalarShared]) {
       gIcacheFillRejectLogged[kFillRejectScalarShared] = true;
       EJIT_DIAG(
-          "icacheFill DECLINE func=%u: 0-dim entry shares one cell across "
+          "icacheFill DECLINE func=%u: scalar slot shares one cell across "
           "cores and this platform prepares execute permission per core, "
           "so a peer could branch to code it has not sealed",
           funcIndex);
@@ -799,7 +811,10 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
     return;
   }
   // No cell for this identity. The taskpool serves it; never index anyway.
-  if (!icacheDimsInRange(dims, numDims)) {
+  // (A scalar slot has one cell for every identity, so it is exempt: an
+  // instance id >= D would otherwise silently disable single-slot mode for
+  // values the taskpool happily accepts.)
+  if (!scalarSlot && !icacheDimsInRange(dims, numDims)) {
     if (!gIcacheFillRejectLogged[kFillRejectDimRange]) {
       gIcacheFillRejectLogged[kFillRejectDimRange] = true;
       EJIT_DIAG("icacheFill DECLINE func=%u: an instance id is >= the table's "
@@ -845,7 +860,7 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // non-null is guaranteed to see the flag set and therefore walk. Setting it
   // after the store would let a drain read 0, skip, and leave the cell behind.
   state_->icacheArmed.storeRelease(1);
-  const uintptr_t idx = icacheLinearize(dims, numDims);
+  const uintptr_t idx = scalarSlot ? 0 : icacheLinearize(dims, numDims);
   EJitAtomicUPtr &cell = icacheCell(reg.base, idx);
   cell.storeRelaxed(reinterpret_cast<uintptr_t>(fnPtr));
 #ifdef EJIT_SRE_TASKPOOL_TESTING

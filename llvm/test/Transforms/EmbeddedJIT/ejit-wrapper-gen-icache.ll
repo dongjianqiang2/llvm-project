@@ -30,6 +30,13 @@
 ;     section, which is what lets a deactivate on one core zero the cells every
 ;     other core probes. Nothing else about the wrapper changes. ---
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section=.mc_shared -S %s | FileCheck %s --check-prefix=SECTION
+; --- -ejit-icache-cluster: every cell table moves to the DERIVED subsection
+;     <section>.ejit_icache so same-named fragments concatenate in link order;
+;     type, initializer, alignment, probe and registration are unchanged. ---
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section=.mc_shared -ejit-icache-cluster -S %s | FileCheck %s --check-prefix=CLUSTER
+; --- cluster is a NO-OP when the section flag is empty (per-core .bss): the
+;     globals keep the exact plain-.bss shape the ICACHE prefix pins. ---
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-icache-cluster -S %s | FileCheck %s --check-prefix=CLUSTERNOOP
 
 ; --- icache globals: [D]^numDims, D=16 (EJIT_ICACHE_DIM_SIZE). 0D is scalar.
 ;     Every cell is DEFINED as &<name>_miss - the sentinel that makes the
@@ -105,6 +112,26 @@
 ; SECTION-LABEL: define i32 @one_dim_entry(
 ; SECTION: load atomic ptr, ptr {{.*}} monotonic, align 8
 ; SECTION: musttail call {{.*}} %ejit_ic_fn
+
+; --- Cluster: 0D scalar, 1D [16] and 2D [16]^2 tables all carry the DERIVED
+;     section (align stays 8 -- 8 scalar cells pack one 64B line); the wrapper
+;     keeps its GEP + load + musttail and the registration is byte-identical. ---
+; CLUSTER-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr @zero_dim_entry_miss, section ".mc_shared.ejit_icache", align 8
+; CLUSTER-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] [ptr @one_dim_entry_miss, {{.*}}], section ".mc_shared.ejit_icache", align 8
+; CLUSTER-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] {{.*}}@two_dim_entry_miss{{.*}}, section ".mc_shared.ejit_icache", align 8
+; CLUSTER-LABEL: define i32 @one_dim_entry(
+; CLUSTER: getelementptr {{.*}} ptr @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
+; CLUSTER: load atomic ptr, ptr {{.*}} monotonic, align 8
+; CLUSTER: musttail call {{.*}} %ejit_ic_fn
+; CLUSTER-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1, ptr @one_dim_entry_miss)
+
+; --- Cluster no-op (empty section): the globals have NO section attribute and
+;     the wrapper is the plain-.bss probe. ---
+; CLUSTERNOOP-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr @zero_dim_entry_miss, align 8
+; CLUSTERNOOP-LABEL: define i32 @zero_dim_entry(
+; CLUSTERNOOP-NOT: section
+; CLUSTERNOOP: load atomic ptr, ptr @__ejit_icache_fn_zero_dim_entry monotonic, align 8
+; CLUSTERNOOP: musttail call {{.*}} %ejit_ic_fn
 
 ; --- Default (flag OFF): no icache anywhere; original compile_or_get path. ---
 ; NOICACHE-LABEL: define i32 @one_dim_entry(

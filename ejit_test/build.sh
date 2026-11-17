@@ -212,6 +212,7 @@ ALL_TESTS=(
   ejit_pgo_sre_multicore_test
   ejit_vp_multicore_test
   ejit_sentinel_smoke_test
+  ejit_icache_single_slot_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -224,6 +225,11 @@ COMPILE_FLAGS[ejit_fixed_dim_test]=""
 # Sentinel-wrapper smoke: icache ON so the wrapper takes the branchless
 # (NumDims <= 2, cell table defined pre-filled with &MissFn) form.
 COMPILE_FLAGS[ejit_sentinel_smoke_test]="-mllvm -ejit-inline-cache"
+# Single-slot smoke: icache ON + the per-function table collapsed to ONE
+# scalar cell regardless of marked dims. All of this test's dims share one
+# value per run and the value switch goes through the lifecycle (which drains
+# the scalar cell), which is exactly the contract the mode documents.
+COMPILE_FLAGS[ejit_icache_single_slot_test]="-mllvm -ejit-inline-cache -mllvm -ejit-icache-single-slot"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.
@@ -248,6 +254,7 @@ declare -A EXTRA_SRCS
 EXTRA_SRCS[ejit_multi_tu_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_baremetal_link_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_sentinel_smoke_test]="ejit_sentinel_smoke_test_1d.c ejit_sentinel_smoke_test_3d.c"
+EXTRA_SRCS[ejit_icache_single_slot_test]="ejit_icache_single_slot_test_3d.c"
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"
