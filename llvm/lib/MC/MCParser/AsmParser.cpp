@@ -10,6 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if defined(EJIT_TRIM_LLVM_BACKEND) && !defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+#define EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
+#endif
+
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -803,6 +807,10 @@ AsmParser::AsmParser(SourceMgr &SM, MCContext &Ctx, MCStreamer &Out,
   case MCContext::IsDXContainer:
     report_fatal_error("DXContainer is not supported yet");
     break;
+#else
+  default:
+    report_fatal_error("only ELF assembly is parsed in an "
+                       "EJIT_TRIM_LLVM_BACKEND build");
 #endif
   }
 

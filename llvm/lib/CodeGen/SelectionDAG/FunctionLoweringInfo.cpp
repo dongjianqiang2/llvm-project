@@ -108,12 +108,17 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
   if (isFuncletEHPersonality(Personality)) {
     // Calculate state numbers if we haven't already.
     WinEHFuncInfo &EHInfo = *MF->getWinEHFuncInfo();
+#ifndef EJIT_TRIM_LLVM_BACKEND
     if (Personality == EHPersonality::MSVC_CXX)
       calculateWinCXXEHStateNumbers(&fn, EHInfo);
     else if (isAsynchronousEHPersonality(Personality))
       calculateSEHStateNumbers(&fn, EHInfo);
     else if (Personality == EHPersonality::CoreCLR)
       calculateClrEHStateNumbers(&fn, EHInfo);
+#else
+    report_fatal_error("funclet-based EH is unavailable in an "
+                       "EJIT_TRIM_LLVM_BACKEND build");
+#endif
 
     // Map all BB references in the WinEH data to MBBs.
     for (WinEHTryBlockMapEntry &TBME : EHInfo.TryBlockMap) {

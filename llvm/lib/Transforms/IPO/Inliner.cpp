@@ -177,6 +177,7 @@ InlinerPass::getAdvisor(const ModuleAnalysisManagerCGSCCProxy::Result &MAM,
         M, FAM, getInlineParams(),
         InlineContext{LTOPhase, InlinePass::CGSCCInliner});
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
     if (!CGSCCInlineReplayFile.empty())
       OwnedAdvisor = getReplayInlineAdvisor(
           M, FAM, M.getContext(), std::move(OwnedAdvisor),
@@ -186,6 +187,7 @@ InlinerPass::getAdvisor(const ModuleAnalysisManagerCGSCCProxy::Result &MAM,
                                 {CGSCCInlineReplayFormat}},
           /*EmitRemarks=*/true,
           InlineContext{LTOPhase, InlinePass::ReplayCGSCCInliner});
+#endif
 
     return *OwnedAdvisor;
   }

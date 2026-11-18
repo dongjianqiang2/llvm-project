@@ -10,6 +10,10 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#if defined(EJIT_TRIM_LLVM_BACKEND) && !defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+#define EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
+#endif
+
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Demangle/StringViewExtras.h"
 #include <cstdlib>

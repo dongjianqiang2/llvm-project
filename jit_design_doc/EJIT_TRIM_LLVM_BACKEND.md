@@ -148,6 +148,37 @@ assembly under a trimmed build. Off by default because those tables have a size
 cost. The dump path takes `snprintf` from either libc or the SRE format stubs —
 never both.
 
+### 2.6 Opt-In and Non-ELF Paths
+
+These guards remove code that only runs behind a non-default option, for a
+non-ELF or Windows target, or for debugging. Default codegen is unchanged:
+`llc -O2` objects and `opt default<O2>/<O3>` output are byte-identical with and
+without the guards.
+
+| Removed | Guard site | Effect of the guard |
+|---|---|---|
+| GVNHoist, GVNSink, NewGVN, DFAJumpThreading | `PassBuilderPipelines.cpp` | `-enable-gvn-hoist`, `-enable-gvn-sink`, `-enable-newgvn`, `-enable-dfa-jump-thread` are ignored |
+| Flow-sensitive AutoFDO (MIRSampleProfile, MIRFSDiscriminator, sample-profile reader) | `TargetPassConfig.cpp` | `-enable-fs-discriminator` / `-fs-profile-file` are ignored |
+| Machine debugify, ImplicitNullChecks | `TargetPassConfig.cpp` | `-debugify-and-strip-all-safe` / `-enable-implicit-null-checks` are ignored |
+| Unused legacy codegen registrations (EH prepare for SjLj/WinEH/Wasm, BB sections, MFS, static-data splitter, MachineRegionInfo, ModuloSchedule test, machine uniformity, CFG/cycle printers, HardwareLoops, CFGuardLongjmp) | `CodeGen.cpp` | only reachable through non-default options or non-ELF targets |
+| Windows CFGuard longjmp / EHCont targets | `AArch64TargetMachine.cpp` | Windows triples only |
+| WinEH state numbering | `FunctionLoweringInfo.cpp` | funclet (MSVC / SEH / CoreCLR) personalities hit a fatal error |
+| MIR serialization (MIRPrinter, YAML) | `CodeGenTargetMachineImpl.cpp` | `-stop-before` / `-stop-after` hit a fatal error |
+| ML-release and replay inline advisors | `InlineAdvisor.cpp`, `Inliner.cpp` | `-enable-ml-inliner=release` fails; inline replay files are ignored |
+| DXIL, DDG, IR2Vec and function-properties analyses and printers | `PassRegistry.def` | consumed only by DirectX, DDG printing and the ML inliner |
+| Itanium profile remapper (ItaniumManglingCanonicalizer) | `InstrProfReader.cpp` | a profile remapping file is rejected |
+| CodeGenData file reader (YAML) | `CodeGenData.cpp` | `-codegen-data-use-path` is ignored |
+| RuntimeDyld fallback layer | `LLJIT.cpp` | EJIT targets always select JITLink; other triples get an error |
+| Legacy `-debugify` registrations | `Debugify.cpp` | new-PM `debugify` is unaffected |
+| MS / Rust / D demanglers, Arm64EC mangling, non-ELF asm-parser extensions | `Demangle.cpp`, `Mangler.cpp`, `MCParser/AsmParser.cpp` | these files now map the stable flag to their existing `EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL` guards |
+
+`CtxProfAnalysis` stays registered because the AOT `buildModuleInlinerPipeline`
+requests it, and `RegionInfoAnalysis` stays because ControlHeightReduction uses
+it under PGO.
+
+On native AArch64 this removes about 1.0 MB of `.text`/`.rodata`/`.data` from
+`ejit.o` (19.57 MB → 18.51 MB loadable; file 38.1 MB → 35.6 MB).
+
 ---
 
 ## 3. Relationship with `EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL`
@@ -402,7 +433,7 @@ The following passes are still registered and pulled into `ejit.o`.  They are ca
 
 ### 6.5 RuntimeDyld / OrcTargetProcess
 
-These (~0.8 MB and ~0.01 MB respectively) are pulled in by the OrcJIT layer.  Removing them requires a custom `ExecutorProcessControl` and `JITLinkMemoryManager` implementation for the bare-metal target.  This is tracked as a separate workstream (see EJIT_LIBRARY_TRIMMING.md §7.4).
+The RuntimeDyld fallback in `LLJIT` is now compiled out (§2.6). OrcTargetProcess (~0.01 MB) is still pulled in by the OrcJIT layer.  Removing it requires a custom `ExecutorProcessControl` and `JITLinkMemoryManager` implementation for the bare-metal target.  This is tracked as a separate workstream (see EJIT_LIBRARY_TRIMMING.md §7.4).
 
 ---
 

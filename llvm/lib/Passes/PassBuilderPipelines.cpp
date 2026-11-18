@@ -597,6 +597,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
   if (EnableKnowledgeRetention)
     FPM.addPass(AssumeSimplifyPass());
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
   // Hoisting of scalars and load expressions.
   if (EnableGVNHoist)
     FPM.addPass(GVNHoistPass());
@@ -607,6 +608,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
     FPM.addPass(
         SimplifyCFGPass(SimplifyCFGOptions().convertSwitchRangeToICmp(true)));
   }
+#endif // EJIT_TRIM_LLVM_BACKEND
 
   // Speculative execution if the target has divergent branches; otherwise nop.
   FPM.addPass(SpeculativeExecutionPass(/* OnlyIfDivergentTarget =*/true));
@@ -735,10 +737,14 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
 
   // Eliminate redundancies.
   FPM.addPass(MergedLoadStoreMotionPass());
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (RunNewGVN)
     FPM.addPass(NewGVNPass());
   else
     FPM.addPass(GVNPass());
+#else
+  FPM.addPass(GVNPass());
+#endif
 
   // Sparse conditional constant propagation.
   // FIXME: It isn't clear why we do this *after* loop passes rather than
@@ -757,8 +763,10 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
 
   // Re-consider control flow based optimizations after redundancy elimination,
   // redo DCE, etc.
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (EnableDFAJumpThreading)
     FPM.addPass(DFAJumpThreadingPass());
+#endif
 
   FPM.addPass(JumpThreadingPass());
   FPM.addPass(CorrelatedValuePropagationPass());

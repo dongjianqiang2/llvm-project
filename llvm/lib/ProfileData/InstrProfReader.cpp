@@ -1335,11 +1335,18 @@ Error IndexedInstrProfReader::readHeader() {
 
   // Load the remapping table now if requested.
   if (RemappingBuffer) {
+#ifdef EJIT_TRIM_LLVM_BACKEND
+    // Symbol remapping (Itanium mangling canonicalizer) is compiled out.
+    return make_error<InstrProfError>(
+        instrprof_error::unrecognized_format,
+        "profile remapping unavailable in EJIT_TRIM_LLVM_BACKEND build");
+#else
     Remapper =
         std::make_unique<InstrProfReaderItaniumRemapper<OnDiskHashTableImplV3>>(
             std::move(RemappingBuffer), *IndexPtr);
     if (Error E = Remapper->populateRemappings())
       return E;
+#endif
   } else {
     Remapper = std::make_unique<InstrProfReaderNullRemapper>(*IndexPtr);
   }

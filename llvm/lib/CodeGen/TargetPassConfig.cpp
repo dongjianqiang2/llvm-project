@@ -346,6 +346,7 @@ static IdentifyingPassPtr overridePass(AnalysisID StandardID,
   return TargetID;
 }
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
 // Find the FSProfile file name. The internal option takes the precedence
 // before getting from TargetMachine.
 static std::string getFSProfileFile(const TargetMachine *TM) {
@@ -367,6 +368,7 @@ static std::string getFSRemappingFile(const TargetMachine *TM) {
     return std::string();
   return PGOOpt->ProfileRemappingFile;
 }
+#endif // EJIT_TRIM_LLVM_BACKEND
 
 //===---------------------------------------------------------------------===//
 /// TargetPassConfig
@@ -817,13 +819,18 @@ void TargetPassConfig::addCheckDebugPass() {
 }
 
 void TargetPassConfig::addMachinePrePasses(bool AllowDebugify) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (AllowDebugify && DebugifyIsSafe &&
       (DebugifyAndStripAll == cl::BOU_TRUE ||
        DebugifyCheckAndStripAll == cl::BOU_TRUE))
     addDebugifyPass();
+#else
+  (void)AllowDebugify;
+#endif
 }
 
 void TargetPassConfig::addMachinePostPasses(const std::string &Banner) {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (DebugifyIsSafe) {
     if (DebugifyCheckAndStripAll == cl::BOU_TRUE) {
       addCheckDebugPass();
@@ -831,6 +838,7 @@ void TargetPassConfig::addMachinePostPasses(const std::string &Banner) {
     } else if (DebugifyAndStripAll == cl::BOU_TRUE)
       addStripDebugPass();
   }
+#endif
   addVerifyPass(Banner);
 }
 
@@ -1156,6 +1164,7 @@ void TargetPassConfig::addMachinePasses() {
   // where it becomes safe again so stop debugifying here.
   DebugifyIsSafe = false;
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
   // Add a FSDiscriminator pass right before RA, so that we could get
   // more precise SampleFDO profile for RA.
   if (EnableFSDiscriminator) {
@@ -1167,6 +1176,7 @@ void TargetPassConfig::addMachinePasses() {
                                          sampleprof::FSDiscriminatorPass::Pass1,
                                          nullptr));
   }
+#endif // EJIT_TRIM_LLVM_BACKEND
 
   // Run register allocation and passes that are tightly coupled with it,
   // including phi elimination and scheduling.
@@ -1203,8 +1213,10 @@ void TargetPassConfig::addMachinePasses() {
   // Run pre-sched2 passes.
   addPreSched2();
 
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (EnableImplicitNullChecks)
     addPass(&ImplicitNullChecksID);
+#endif
 
   // Second pass scheduler.
   // Let Target optionally insert this pass by itself at some other
@@ -1579,6 +1591,7 @@ bool TargetPassConfig::addGCPasses() {
 
 /// Add standard basic block placement passes.
 void TargetPassConfig::addBlockPlacement() {
+#ifndef EJIT_TRIM_LLVM_BACKEND
   if (EnableFSDiscriminator) {
     addPass(createMIRAddFSDiscriminatorsPass(
         sampleprof::FSDiscriminatorPass::Pass2));
@@ -1588,6 +1601,7 @@ void TargetPassConfig::addBlockPlacement() {
                                          sampleprof::FSDiscriminatorPass::Pass2,
                                          nullptr));
   }
+#endif // EJIT_TRIM_LLVM_BACKEND
   if (addPass(&MachineBlockPlacementID)) {
     // Run a separate pass to collect block placement statistics.
     if (EnableBlockPlacementStats)

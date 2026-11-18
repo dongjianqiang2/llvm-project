@@ -245,6 +245,7 @@ bool InlineAdvisorAnalysis::Result::tryCreate(
   case InliningAdvisorMode::Default:
     LLVM_DEBUG(dbgs() << "Using default inliner heuristic.\n");
     Advisor.reset(new DefaultInlineAdvisor(M, FAM, Params, IC));
+#ifndef EJIT_TRIM_LLVM_BACKEND
     // Restrict replay to default advisor, ML advisors are stateful so
     // replay will need augmentations to interleave with them correctly.
     if (!ReplaySettings.ReplayFile.empty()) {
@@ -252,6 +253,7 @@ bool InlineAdvisorAnalysis::Result::tryCreate(
                                              std::move(Advisor), ReplaySettings,
                                              /* EmitRemarks =*/true, IC);
     }
+#endif
     break;
     // Run IR2VecVocabAnalysis once per module to get the vocabulary.
     // We run it here because it is immutable and we want to avoid running it
@@ -265,10 +267,14 @@ bool InlineAdvisorAnalysis::Result::tryCreate(
 #endif
     break;
   case InliningAdvisorMode::Release:
+#ifndef EJIT_TRIM_LLVM_BACKEND
     LLVM_DEBUG(dbgs() << "Using release-mode inliner policy.\n");
     if (!InlineAdvisorAnalysis::initializeIR2VecVocabIfRequested(M, MAM))
       return false;
     Advisor = llvm::getReleaseModeAdvisor(M, MAM, GetDefaultAdvice);
+#else
+    (void)GetDefaultAdvice;
+#endif
     break;
   }
 

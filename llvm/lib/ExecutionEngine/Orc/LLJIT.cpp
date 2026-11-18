@@ -962,6 +962,13 @@ LLJIT::createObjectLinkingLayer(LLJITBuilderState &S, ExecutionSession &ES) {
   if (S.CreateObjectLinkingLayer)
     return S.CreateObjectLinkingLayer(ES);
 
+#ifdef EJIT_TRIM_LLVM_BACKEND
+  // EJIT targets always select JITLink in prepareForConstruction; the
+  // RuntimeDyld fallback is compiled out.
+  return make_error<StringError>("RuntimeDyld is unavailable in an "
+                                     "EJIT_TRIM_LLVM_BACKEND build",
+                                 inconvertibleErrorCode());
+#else
   // Otherwise default to creating an RTDyldObjectLinkingLayer that constructs
   // a new SectionMemoryManager for each object.
   auto GetMemMgr = [](const MemoryBuffer &) {
@@ -984,6 +991,7 @@ LLJIT::createObjectLinkingLayer(LLJITBuilderState &S, ExecutionSession &ES) {
   //        errors from some GCC / libstdc++ bots. Remove this conversion (i.e.
   //        just return ObjLinkingLayer) once those bots are upgraded.
   return std::unique_ptr<ObjectLayer>(std::move(Layer));
+#endif // EJIT_TRIM_LLVM_BACKEND
 }
 
 Expected<std::unique_ptr<IRCompileLayer::IRCompiler>>

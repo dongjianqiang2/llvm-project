@@ -947,12 +947,14 @@ void AArch64PassConfig::addPreEmitPass() {
 
   addPass(createAArch64A53Fix835769());
 
+#ifndef EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
   if (TM->getTargetTriple().isOSWindows()) {
     // Identify valid longjmp targets for Windows Control Flow Guard.
     addPass(createCFGuardLongjmpPass());
     // Identify valid eh continuation targets for Windows EHCont Guard.
     addPass(createEHContGuardTargetsPass());
   }
+#endif
 
   if (TM->getOptLevel() != CodeGenOptLevel::None && EnableCollectLOH &&
       TM->getTargetTriple().isOSBinFormatMachO())

@@ -1175,17 +1175,25 @@ void DebugifyEachInstrumentation::registerCallbacks(
 }
 
 char DebugifyModulePass::ID = 0;
+#ifndef EJIT_TRIM_LLVM_BACKEND
 static RegisterPass<DebugifyModulePass> DM("debugify",
                                            "Attach debug info to everything");
+#endif
 
 char CheckDebugifyModulePass::ID = 0;
+#ifndef EJIT_TRIM_LLVM_BACKEND
 static RegisterPass<CheckDebugifyModulePass>
     CDM("check-debugify", "Check debug info from -debugify");
+#endif
 
 char DebugifyFunctionPass::ID = 0;
+#ifndef EJIT_TRIM_LLVM_BACKEND
 static RegisterPass<DebugifyFunctionPass> DF("debugify-function",
                                              "Attach debug info to a function");
+#endif
 
 char CheckDebugifyFunctionPass::ID = 0;
+#ifndef EJIT_TRIM_LLVM_BACKEND
 static RegisterPass<CheckDebugifyFunctionPass>
     CDF("check-debugify-function", "Check debug info from -debugify-function");
+#endif

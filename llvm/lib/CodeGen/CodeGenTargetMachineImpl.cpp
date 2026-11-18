@@ -244,9 +244,14 @@ bool CodeGenTargetMachineImpl::addPassesToEmitFile(
     if (addAsmPrinter(PM, Out, DwoOut, FileType, MMIWP->getMMI().getContext()))
       return true;
   } else {
+#ifndef EJIT_TRIM_LLVM_BACKEND
     // MIR printing is redundant with -filetype=null.
     if (FileType != CodeGenFileType::Null)
       PM.add(createPrintMIRPass(Out));
+#else
+    report_fatal_error("MIR serialization (-stop-before/-stop-after) is "
+                       "unavailable in EJIT_TRIM_LLVM_BACKEND build");
+#endif
   }
 
   PM.add(createFreeMachineFunctionPass());

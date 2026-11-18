@@ -21,12 +21,18 @@
 MODULE_ANALYSIS("callgraph", CallGraphAnalysis())
 MODULE_ANALYSIS("collector-metadata", CollectorMetadataAnalysis())
 MODULE_ANALYSIS("ctx-prof-analysis", CtxProfAnalysis())
+// EJIT_TRIM_LLVM_BACKEND drops analyses only DirectX, DDG printing and the
+// ML inliner consume, together with their printers.
+#ifndef EJIT_TRIM_LLVM_BACKEND
 MODULE_ANALYSIS("dxil-metadata", DXILMetadataAnalysis())
 MODULE_ANALYSIS("dxil-resources", DXILResourceAnalysis())
 MODULE_ANALYSIS("dxil-resource-type", DXILResourceTypeAnalysis())
 MODULE_ANALYSIS("dxil-resource-bindings", DXILResourceBindingAnalysis())
+#endif
 MODULE_ANALYSIS("inline-advisor", InlineAdvisorAnalysis())
+#ifndef EJIT_TRIM_LLVM_BACKEND
 MODULE_ANALYSIS("ir2vec-vocab", IR2VecVocabAnalysis())
+#endif
 MODULE_ANALYSIS("ir-similarity", IRSimilarityAnalysis())
 MODULE_ANALYSIS("last-run-tracking", LastRunTrackingAnalysis())
 MODULE_ANALYSIS("lcg", LazyCallGraphAnalysis())
@@ -143,11 +149,15 @@ MODULE_PASS("print-must-be-executed-contexts",
             MustBeExecutedContextPrinterPass(errs()))
 MODULE_PASS("print-profile-summary", ProfileSummaryPrinterPass(errs()))
 MODULE_PASS("print-stack-safety", StackSafetyGlobalPrinterPass(errs()))
+#ifndef EJIT_TRIM_LLVM_BACKEND
 MODULE_PASS("print<dxil-metadata>", DXILMetadataAnalysisPrinterPass(errs()))
 MODULE_PASS("print<dxil-resources>", DXILResourcePrinterPass(errs()))
+#endif
 MODULE_PASS("print<inline-advisor>", InlineAdvisorAnalysisPrinterPass(errs()))
+#ifndef EJIT_TRIM_LLVM_BACKEND
 MODULE_PASS("print<ir2vec>", IR2VecPrinterPass(errs()))
 MODULE_PASS("print<ir2vec-vocab>", IR2VecVocabPrinterPass(errs()))
+#endif
 MODULE_PASS("print<module-debuginfo>", ModuleDebugInfoPrinterPass(errs()))
 MODULE_PASS("print<reg-usage>", PhysicalRegisterUsageInfoPrinterPass(errs()))
 MODULE_PASS("pseudo-probe", SampleProfileProbePass(TM))
@@ -354,7 +364,9 @@ FUNCTION_ANALYSIS("demanded-bits", DemandedBitsAnalysis())
 FUNCTION_ANALYSIS("domfrontier", DominanceFrontierAnalysis())
 FUNCTION_ANALYSIS("domtree", DominatorTreeAnalysis())
 FUNCTION_ANALYSIS("ephemerals", EphemeralValuesAnalysis())
+#ifndef EJIT_TRIM_LLVM_BACKEND
 FUNCTION_ANALYSIS("func-properties", FunctionPropertiesAnalysis())
+#endif
 FUNCTION_ANALYSIS("machine-function-info", MachineFunctionAnalysis(TM))
 FUNCTION_ANALYSIS("gc-function", GCFunctionAnalysis())
 FUNCTION_ANALYSIS("inliner-size-estimator", InlineSizeEstimatorAnalysis())
@@ -511,7 +523,9 @@ FUNCTION_PASS("print<delinearization>", DelinearizationPrinterPass(errs()))
 FUNCTION_PASS("print<demanded-bits>", DemandedBitsPrinterPass(errs()))
 FUNCTION_PASS("print<domfrontier>", DominanceFrontierPrinterPass(errs()))
 FUNCTION_PASS("print<domtree>", DominatorTreePrinterPass(errs()))
+#ifndef EJIT_TRIM_LLVM_BACKEND
 FUNCTION_PASS("print<func-properties>", FunctionPropertiesPrinterPass(errs()))
+#endif
 FUNCTION_PASS("print<inline-cost>", InlineCostAnnotationPrinterPass(errs()))
 FUNCTION_PASS("print<inliner-size-estimator>",
               InlineSizeEstimatorAnalysisPrinterPass(errs()))
@@ -735,7 +749,9 @@ LOOPNEST_PASS("no-op-loopnest", NoOpLoopNestPass())
 #ifndef LOOP_ANALYSIS
 #define LOOP_ANALYSIS(NAME, CREATE_PASS)
 #endif
+#ifndef EJIT_TRIM_LLVM_BACKEND
 LOOP_ANALYSIS("ddg", DDGAnalysis())
+#endif
 LOOP_ANALYSIS("iv-users", IVUsersAnalysis())
 LOOP_ANALYSIS("no-op-loop", NoOpLoopAnalysis())
 LOOP_ANALYSIS("pass-instrumentation", PassInstrumentationAnalysis(PIC))
@@ -748,7 +764,9 @@ LOOP_ANALYSIS("should-run-extra-simple-loop-unswitch",
 #define LOOP_PASS(NAME, CREATE_PASS)
 #endif
 LOOP_PASS("canon-freeze", CanonicalizeFreezeInLoopsPass())
+#ifndef EJIT_TRIM_LLVM_BACKEND
 LOOP_PASS("dot-ddg", DDGDotPrinterPass())
+#endif
 LOOP_PASS("evl-iv-simplify", EVLIndVarSimplifyPass())
 LOOP_PASS("guard-widening", GuardWideningPass())
 LOOP_PASS("extra-simple-loop-unswitch-passes",
@@ -768,7 +786,9 @@ LOOP_PASS("loop-unroll-full", LoopFullUnrollPass())
 LOOP_PASS("loop-versioning-licm", LoopVersioningLICMPass())
 LOOP_PASS("no-op-loop", NoOpLoopPass())
 LOOP_PASS("print", PrintLoopPass(errs()))
+#ifndef EJIT_TRIM_LLVM_BACKEND
 LOOP_PASS("print<ddg>", DDGAnalysisPrinterPass(errs()))
+#endif
 LOOP_PASS("print<hash-recognize>", HashRecognizePrinterPass(errs()))
 LOOP_PASS("print<iv-users>", IVUsersPrinterPass(errs()))
 LOOP_PASS("print<loop-cache-cost>", LoopCachePrinterPass(errs()))

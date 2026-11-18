@@ -147,6 +147,7 @@ CodeGenData &CodeGenData::getInstance() {
 
     if (CodeGenDataGenerate || CodeGenDataThinLTOTwoRounds)
       Instance->EmitCGData = true;
+#ifndef EJIT_TRIM_LLVM_BACKEND
     else if (!CodeGenDataUsePath.empty()) {
       // Initialize the global CGData if the input file name is given.
       // We do not error-out when failing to parse the input file.
@@ -165,6 +166,7 @@ CodeGenData &CodeGenData::getInstance() {
       if (Reader->hasStableFunctionMap())
         Instance->publishStableFunctionMap(Reader->releaseStableFunctionMap());
     }
+#endif // EJIT_TRIM_LLVM_BACKEND
   });
   return *Instance;
 }
