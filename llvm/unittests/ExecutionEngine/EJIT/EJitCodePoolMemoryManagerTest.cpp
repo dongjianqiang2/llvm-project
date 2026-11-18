@@ -123,7 +123,7 @@ TEST(EJitCodePoolMemMgr, CodeMemoryComesFromPool) {
   EJitCodePoolManager Pool(
       poolOpts(/*PoolSize=*/256 * 1024),
       [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); });
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; });
   EJitCodePoolMemoryManager MM(Pool, /*PageSize=*/4096);
 
   auto G = makeCodeGraph(64, 0x1000);
@@ -147,10 +147,10 @@ TEST(EJitCodePoolMemMgr, RoutesTemporaryTier1ToFarPool) {
   FarOpts.kind = EJitCodePoolKind::Far;
   EJitCodePoolManager Near(
       NearOpts, [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); });
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; });
   EJitCodePoolManager Far(
       FarOpts, [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); });
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; });
   EJitCodePoolMemoryManager MM(Near, Far, /*PageSize=*/4096);
 
   JITLinkDylib Tier1("spec_t1_1");
@@ -179,100 +179,6 @@ TEST(EJitCodePoolMemMgr, RoutesTemporaryTier1ToFarPool) {
   EJitCompiledCodeInfo Tier2Info;
   ASSERT_TRUE(Near.findRange(Tier2Addr, Tier2Info));
   EXPECT_EQ(Tier2Info.poolKind, EJitCodePoolKind::Near);
-
-  cantFail(MM.deallocate(std::move(FA1)));
-  cantFail(MM.deallocate(std::move(FA2)));
-}
-
-// finalize() does NOT seal: the pool stays RW so JITLink can keep writing.
-// Sealing happens out-of-band (the engine does it at lookup).
-TEST(EJitCodePoolMemMgr, FinalizeKeepsPoolWritable) {
-  MockSre M;
-  EJitCodePoolManager Pool(
-      poolOpts(256 * 1024), [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); });
-  EJitCodePoolMemoryManager MM(Pool, 4096);
-
-  auto G = makeCodeGraph(64, 0x1000);
-  auto IFA = cantFail(MM.allocate(nullptr, *G));
-  void *CodeAddr = firstBlockAddr(*G);
-  auto FA = cantFail(IFA->finalize());
-
-  // The memory manager must not have flipped permissions.
-  EXPECT_EQ(M.SealCalls, 0u);
-  EXPECT_EQ(Pool.getStats().sealedCount, 0u);
-
-  // The engine's lookup step seals the containing pool.
-  cantFail(Pool.sealPoolContaining(CodeAddr));
-  EXPECT_EQ(M.SealCalls, 1u);
-  EXPECT_EQ(Pool.getStats().sealedCount, 1u);
-
-  cantFail(MM.deallocate(std::move(FA)));
-}
-
-// Sealing the pool that backs a finalized function is idempotent: a repeated
-// seal (e.g. a second lookup of the same function) does not re-invoke
-// enable_ex.
-TEST(EJitCodePoolMemMgr, RepeatedSealNoDuplicateEnableEx) {
-  MockSre M;
-  EJitCodePoolManager Pool(
-      poolOpts(256 * 1024), [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); });
-  EJitCodePoolMemoryManager MM(Pool, 4096);
-
-  auto G = makeCodeGraph(64, 0x1000);
-  auto IFA = cantFail(MM.allocate(nullptr, *G));
-  void *CodeAddr = firstBlockAddr(*G);
-  auto FA = cantFail(IFA->finalize());
-
-  cantFail(Pool.sealPoolContaining(CodeAddr)); // first lookup
-  cantFail(Pool.sealPoolContaining(CodeAddr)); // second lookup, same pool
-  EXPECT_EQ(M.SealCalls, 1u);
-  EXPECT_EQ(Pool.getStats().sealInvocations, 1u);
-
-  cantFail(MM.deallocate(std::move(FA)));
-}
-
-// Runtime scenario: two functions are compiled and "looked up" in turn. The
-// first seals its pool; because a sealed pool is never reused, the second
-// function is allocated from a brand-new pool. Mirrors the engine flow of
-// compile -> lookup(seal) -> compile -> lookup(seal).
-TEST(EJitCodePoolMemMgr, SecondFunctionUsesNewPoolAfterSeal) {
-  constexpr size_t kPoolSize = 64 * 1024;
-  MockSre M;
-  EJitCodePoolManager Pool(
-      poolOpts(kPoolSize), [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); });
-  EJitCodePoolMemoryManager MM(Pool, 4096);
-
-  // Function 1: allocate, finalize, seal (first lookup).
-  auto G1 = makeCodeGraph(64, 0x1000);
-  auto IFA1 = cantFail(MM.allocate(nullptr, *G1));
-  void *Addr1 = firstBlockAddr(*G1);
-  auto FA1 = cantFail(IFA1->finalize());
-  cantFail(Pool.sealPoolContaining(Addr1));
-  EXPECT_EQ(M.SealCalls, 1u);
-  EXPECT_EQ(Pool.getStats().poolCount, 1u);
-
-  // Function 2: the active pool is now sealed, so this must land in a new pool
-  // even though the first pool still had free space.
-  auto G2 = makeCodeGraph(64, 0x2000);
-  auto IFA2 = cantFail(MM.allocate(nullptr, *G2));
-  void *Addr2 = firstBlockAddr(*G2);
-  auto FA2 = cantFail(IFA2->finalize());
-  cantFail(Pool.sealPoolContaining(Addr2));
-
-  auto S = Pool.getStats();
-  EXPECT_EQ(S.poolCount, 2u);
-  EXPECT_EQ(S.sealedCount, 2u);
-  EXPECT_EQ(M.SealCalls, 2u);
-
-  // The two functions live in different 64KiB pools.
-  auto poolOf = [](void *P) {
-    return reinterpret_cast<uintptr_t>(P) &
-           ~static_cast<uintptr_t>(kPoolSize - 1);
-  };
-  EXPECT_NE(poolOf(Addr1), poolOf(Addr2));
 
   cantFail(MM.deallocate(std::move(FA1)));
   cantFail(MM.deallocate(std::move(FA2)));
@@ -343,7 +249,6 @@ EJitCodePoolManager::Options fourKMemMgrOpts() {
   O.poolSize = kTwoMiB;
   O.poolAlign = kTwoMiB;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kFourKiB;
   return O;
 }
@@ -697,7 +602,7 @@ TEST(EJitCodePoolMemMgr, AllocateEnablesRwBeforeWrite) {
   O.needsEnableRw = true;
   EJitCodePoolManager Pool(
       O, [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); }, nullptr, // no split (legacy mode)
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; },
       [&M](void *V) { return M.enableRw(V); });
   EJitCodePoolMemoryManager MM(Pool, 4096);
 
@@ -709,8 +614,7 @@ TEST(EJitCodePoolMemMgr, AllocateEnablesRwBeforeWrite) {
   EXPECT_EQ(M.SealCalls, 0u);
 
   auto FA = cantFail(IFA->finalize());
-  // finalize in legacy mode does not seal either (seal is at lookup).
-  EXPECT_EQ(M.SealCalls, 0u);
+  EXPECT_EQ(M.SealCalls, 1u);
   cantFail(MM.deallocate(std::move(FA)));
 }
 
@@ -723,7 +627,7 @@ TEST(EJitCodePoolMemMgr, AllocateFailsWhenEnableRwFails) {
   O.needsEnableRw = true;
   EJitCodePoolManager Pool(
       O, [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); }, nullptr,
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; },
       [&M](void *V) { return M.enableRw(V); });
   EJitCodePoolMemoryManager MM(Pool, 4096);
 
@@ -746,7 +650,7 @@ TEST(EJitCodePoolMemMgr, AllocateRollsBackOnPartialEnableRwFailure) {
   O.needsEnableRw = true;
   EJitCodePoolManager Pool(
       O, [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); }, nullptr,
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; },
       [&M](void *V) { return M.enableRw(V); });
   EJitCodePoolMemoryManager MM(Pool, 4096);
 
@@ -764,7 +668,7 @@ TEST(EJitCodePoolMemMgr, NoEnableRwWhenNotNeeded) {
   MockSre M;
   EJitCodePoolManager Pool(
       poolOpts(256 * 1024), [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); }, nullptr,
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; },
       [&M](void *V) { return M.enableRw(V); });
   EJitCodePoolMemoryManager MM(Pool, 4096);
 

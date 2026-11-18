@@ -54,7 +54,7 @@
   EJIT_PENDING = 1,
 } ejit_status_t;
 
-typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
+typedef enum { EJIT_COMPILE_ASYNC = 1, EJIT_COMPILE_OFF = 2 } ejit_compile_mode_t;
 typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;</code></pre>
   </section>
 
@@ -63,20 +63,14 @@ typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_leve
 <pre><code class="language-c">typedef struct {
   ejit_compile_mode_t compileMode;
   ejit_opt_level_t optLevel;
-  size_t maxCodeMemory;
-  size_t maxDataMemory;
-  size_t maxCacheEntries;
-  size_t maxCacheSize;
-  bool enableLogger;
   bool forceStaticRegistry;
   const char *dumpJITDir;
 } ejit_config_t;</code></pre>
+    <p>请使用新头文件重新编译全部固件调用方；使用旧配置布局的目标文件不兼容。</p>
     <table>
       <tr><th>字段</th><th>说明</th><th>建议</th></tr>
-      <tr><td><code>compileMode</code></td><td>同步/异步编译</td><td>默认先用 <code>SYNC</code> 验证；实时敏感再用 <code>ASYNC</code></td></tr>
+      <tr><td><code>compileMode</code></td><td>初始化模式</td><td>Async 使用共享 worker；Off 只运行 AOT。传空配置默认 Async。</td></tr>
       <tr><td><code>optLevel</code></td><td>JIT 优化等级</td><td>通常 <code>L2</code>；代码体积敏感用 <code>L1</code></td></tr>
-      <tr><td><code>maxCodeMemory</code></td><td>JIT 代码内存上限</td><td>按目标平台 RAM 设置</td></tr>
-      <tr><td><code>maxCacheEntries</code>/<code>maxCacheSize</code></td><td>cache 条目/总大小</td><td>根据维度组合数设置</td></tr>
       <tr><td><code>forceStaticRegistry</code></td><td>强制静态注册表路径</td><td>bare-metal/无构造函数环境开启</td></tr>
       <tr><td><code>dumpJITDir</code></td><td>输出优化后 IR</td><td>排障和确认分支折叠时开启</td></tr>
     </table>
@@ -121,14 +115,12 @@ typedef struct {
   uint64_t evictions;
 } ejit_stats_t;
 
-ejit_status_t ejit_get_stats(ejit_stats_t *stats);
-const ejit_error_t *ejit_get_last_error(void);</code></pre>
+ejit_status_t ejit_get_stats(ejit_stats_t *stats);</code></pre>
   </section>
 
   <section>
     <h2>8. 内部 wrapper API</h2>
-<pre><code class="language-c">void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn);</code></pre>
-    <div class="note">普通用户不直接调用该接口。AOT wrapper 会预先计算 <code>cacheKey = funcIdx(32b) | dim[3] | dim[2] | dim[1] | dim[0]</code> 并调用它。返回 NULL 时 wrapper 自动 fallback 到原函数体。</div>
+    <p>wrapper 未命中时调用下一节的共享任务池接口。没有可执行的特化版本时继续执行 AOT 函数体；业务代码不需要手动派发。</p>
   </section>
 
   <section>
@@ -145,7 +137,7 @@ void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
 void ejit_taskpool_release_read(uint32_t bucketIndex);
 unsigned ejit_taskpool_pending_count(void);
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);</code></pre>
-    <div class="warn">这些接口用于 <code>EJIT_SRE_TASKPOOL</code> 构建，普通 host/legacy cache 路径通常不需要直接使用。</div>
+    <div class="warn">host 与 freestanding 构建均通过这些接口访问共享任务池。</div>
   </section>
 
   <section>

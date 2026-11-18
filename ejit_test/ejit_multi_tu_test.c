@@ -104,7 +104,6 @@ int main(int argc, char **argv)
 
   // The key multi-TU assertion: BOTH TUs' bitcode got registered and JIT'd.
   ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp1; memset(&tp1, 0, sizeof(tp1));
   ejit_taskpool_get_stats(&tp1);
   printf("  stats: ready=%u hits=%llu compiles=%llu\n",
@@ -115,16 +114,6 @@ int main(int argc, char **argv)
   VERIFY(tp1.asyncCompiles >= 2,
          "JIT compiles >= 2 (both first calls, actual %llu)",
          (unsigned long long)tp1.asyncCompiles);
-#else
-  ejit_stats_t s1;
-  ejit_get_stats(&s1);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
-         s1.entryCount, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
-  VERIFY(s1.entryCount >= 2, "JIT entries >= 2 (both TUs compiled, actual %zu)",
-         s1.entryCount);
-  VERIFY(s1.misses >= 2, "JIT misses >= 2 (both first calls, actual %llu)",
-         (unsigned long long)s1.misses);
-#endif
 
   //=== Second calls hit the cache (specialized code was stored) ===
   printf("\n--- 二次调用应命中缓存 ---\n");
@@ -134,7 +123,6 @@ int main(int argc, char **argv)
   VERIFY(ra2 == 100, "jit_a(%u) 2nd = %u", ia, ra2);
   VERIFY(rb2 == 200, "jit_b(%u) 2nd = %u", ib, rb2);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp2; memset(&tp2, 0, sizeof(tp2));
   ejit_taskpool_get_stats(&tp2);
   printf("  stats: ready=%u hits=%llu compiles=%llu\n",
@@ -142,14 +130,6 @@ int main(int argc, char **argv)
          (unsigned long long)tp2.asyncCompiles);
   VERIFY(tp2.cacheHits >= 2, "Cache hits >= 2 (both 2nd calls, actual %llu)",
          (unsigned long long)tp2.cacheHits);
-#else
-  ejit_stats_t s2;
-  ejit_get_stats(&s2);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
-         s2.entryCount, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
-  VERIFY(s2.hits >= 2, "Cache hits >= 2 (both 2nd calls, actual %llu)",
-         (unsigned long long)s2.hits);
-#endif
 
   ejit_shutdown();
 

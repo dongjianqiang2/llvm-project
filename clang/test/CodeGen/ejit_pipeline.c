@@ -8,13 +8,12 @@
 // CHECK: @.ejit.registry.bitcode = {{.*}} section ".ejit_bitcode"
 // CHECK: @llvm.global_ctors = appending global {{.*}} ptr @ejit_auto_register
 
-// PASS3: Wrapper generation in process_cell
+// CHECK-LABEL: define {{.*}} @process_cell(
 // CHECK: jit_entry:
-// CHECK: call {{.*}} @ejit_taskpool_compile_or_get_
-// CHECK: jit_fallback:
-// CHECK: jit_dispatch:
+// CHECK: musttail call void %ejit_ic_fn(
 
 // PASS4: Lifecycle handler in lc_handler - deactivate at entry, activate at exit
+// CHECK-LABEL: define {{.*}} @lc_handler(
 // CHECK: call {{.*}} @ejit_deactivate(
 // CHECK: call {{.*}} @ejit_activate(
 
@@ -22,11 +21,11 @@
 // CHECK-DAG: call {{.*}} @ejit_register_bitcode(
 // CHECK-DAG: call {{.*}} @ejit_register_period_array({{.*}} @cell_data, i64 16)
 
-// External runtime declarations
-// CHECK-DAG: declare {{.*}} @ejit_register_bitcode
-// CHECK-DAG: declare {{.*}} @ejit_taskpool_compile_or_get_
-// CHECK-DAG: declare {{.*}} @ejit_deactivate
-// CHECK-DAG: declare {{.*}} @ejit_activate
+// The sentinel miss helper calls the generic ABI and releases its read token.
+// CHECK-LABEL: define internal void @process_cell_miss(
+// CHECK: call {{.*}} @ejit_taskpool_compile_or_get(
+// CHECK: miss_dispatch:
+// CHECK: call void @ejit_taskpool_release_read(
 
 int cell_data[16] __attribute__((ejit_period_arr("cell")));
 

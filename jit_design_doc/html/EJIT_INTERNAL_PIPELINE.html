@@ -24,7 +24,7 @@ AOT PASS1: bitcode 提取和嵌入
 AOT PASS2-4: period 注册 / wrapper / lifecycle
 AOT PASS5: 协调器
   ↓
-运行时 wrapper 调用 ejit_compile_or_get
+wrapper 未命中时查询共享任务池
   ↓
 JIT pipeline: 参数替换 → InstCombine → Inline → PASS6 → L1/L2/L3 → ORC/JITLink
   ↓
@@ -71,6 +71,7 @@ Code Cache / fallback AOT</div>
 
   <section>
     <h2>5. Wrapper 模型</h2>
+    <p>以下是已退役的 packed-key wrapper。当前 wrapper 使用携带维度对的共享任务池接口，见 API Reference。</p>
 <pre><code class="language-c">void process_cell(uint8_t cellIdx, int value) {
     uint64_t key = ((uint64_t)funcIdx &lt;&lt; 32) | cellIdx;
     PFN_process_cell pfn = (PFN_process_cell)ejit_compile_or_get(key, NULL);

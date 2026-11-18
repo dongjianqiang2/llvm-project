@@ -28,20 +28,9 @@ enum class EJitCodePoolPlacement { NearFixed, FarDynamic };
 
 /// Construct an EJitCodePoolManager wired to the SRE platform: raw memory from
 /// SRE_MemDbgAlloc (partition EJIT_SRE_CODE_POOL_PTNO) and sealing via
-/// enable_ex. On a host without real SRE symbols, weak fallbacks make this a
-/// link-safe no-op-seal / aligned-host-alloc manager (see EJitSrePlatform.cpp).
+/// enable_ex. SRE bindings must be supplied by the platform.
 std::unique_ptr<EJitCodePoolManager> makeSreCodePoolManager(
     EJitCodePoolPlacement Placement = EJitCodePoolPlacement::NearFixed);
-
-/// Install execute permission for the legacy 2MiB code pool containing
-/// \p FnPtr in the calling core's translation context. This is intentionally a
-/// per-core operation: another core sealing the same VA does not imply that
-/// this core's stage-1 mapping is executable.
-///
-/// Returns false when execute permission is unavailable or when 4K page-seal
-/// mode is selected (a bare function pointer does not carry the full code
-/// extent needed to seal every covered 4K page).
-bool prepareSreCodeForCurrentCore(const void *FnPtr);
 
 /// 4K page-seal mode, per-core: split the 2MiB-aligned pool
 /// [PoolBase, PoolBase + PoolSize) into 4KiB mappings in the CALLING core's

@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 ; RUN: opt -passes=ejit-aot-module,lower-expect -S %s -o /dev/null
 ; RUN: opt -passes='default<O2>' -S %s -o /dev/null
 

@@ -28,7 +28,6 @@ bool EJitSreTask::create(EJitSreTask &out, EntryFn entry, void *ctx,
   }
   EJIT_DIAG("host task create begin name=%s entry=%p ctx=%p",
             name ? name : "<null>", reinterpret_cast<void *>(entry), ctx);
-  out.stopFlag_.storeRelease(0);
   out.entry_ = entry;
   out.ctx_ = ctx;
   auto *H = new (std::nothrow) HostTaskHandle(std::thread([&out]() {
@@ -50,7 +49,6 @@ void EJitSreTask::destroy(EJitSreTask &task) {
     return;
   }
   EJIT_DIAG("host task destroy begin handle=%p", task.handle_);
-  task.stopFlag_.storeRelease(1);
   auto *H = static_cast<HostTaskHandle *>(task.handle_);
   if (H->th.joinable())
     H->th.join();

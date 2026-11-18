@@ -18,10 +18,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if defined(EJIT_FIXED_CODE_POOL) && !defined(EJIT_SRE_SHARED_TASKPOOL)
-#error "EJIT_FIXED_CODE_POOL requires the shared taskpool"
-#endif
-
 #ifdef EJIT_SRE_CODE_POOL
 
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
@@ -39,17 +35,15 @@
 #define EJIT_SRE_CODE_POOL_PTNO 8
 #endif
 
-// Memory module id passed to SRE_MemDbgAlloc. Not architecturally significant
-// for the pool; overridable if a deployment needs a specific id.
-#ifndef EJIT_SRE_CODE_POOL_MID
-#define EJIT_SRE_CODE_POOL_MID 0
-#endif
-
 namespace {
 constexpr unsigned long long kSrePoolSize = EJIT_SRE_CODE_POOL_SIZE;
 constexpr unsigned char kSrePtNo =
     static_cast<unsigned char>(EJIT_SRE_CODE_POOL_PTNO);
-constexpr unsigned kSreMid = static_cast<unsigned>(EJIT_SRE_CODE_POOL_MID);
+constexpr unsigned kSreMid = 0;
+#ifdef EJIT_SRE_CODE_POOL_MID
+static_assert(EJIT_SRE_CODE_POOL_MID == kSreMid,
+              "EJIT_SRE_CODE_POOL_MID is retired; only module ID 0 is supported");
+#endif
 constexpr size_t k2MiB = static_cast<size_t>(2) * 1024 * 1024;
 constexpr size_t k4KiB = static_cast<size_t>(4) * 1024;
 } // namespace
@@ -201,12 +195,7 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
       "makeSreCodePoolManager: kind=%s poolSize=%llu poolAlign=%zu batched=%u",
       Placement == EJitCodePoolPlacement::NearFixed ? "near" : "far",
       kSrePoolSize, k2MiB, static_cast<unsigned>(Opts.batchedPageSeal));
-#ifdef EJIT_CODE_POOL_4K_SEAL
-  // Adapt to the platform's 4K execute-permission interface: the 2MiB pool is
-  // split into 4K mappings at creation and sealed one 4KiB page at a time.
-  Opts.fourKSeal = true;
   Opts.sealPageSize = k4KiB;
-#endif
 
 #ifdef EJIT_FIXED_CODE_POOL
   // The linker script reserves [.text.ejit] = [__ejit_code_start, __ejit_code_end)
@@ -272,15 +261,7 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
 
   auto Seal = [](void *Va) -> unsigned {
 #ifdef EJIT_SRE_ENABLE_EX
-  // In 4K seal mode Va is a single 4KiB page; in legacy mode it is the 2MiB
-  // pool base. sealAndSyncCache syncs caches for the written range then makes
-  // the page executable (enable_ex does not sync caches).
-#ifdef EJIT_CODE_POOL_4K_SEAL
     return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va), k4KiB);
-#else
-    return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va),
-                            static_cast<size_t>(kSrePoolSize));
-#endif
 #else
     // Code-pool routing without permission flips (bring-up / measurement).
     (void)Va;
@@ -289,14 +270,8 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
   };
 
   auto Split = [](void *Base, size_t Size) -> unsigned {
-#ifdef EJIT_CODE_POOL_4K_SEAL
     return ejit_sre_split_2m_to_4k(reinterpret_cast<unsigned long long>(Base),
                                    static_cast<unsigned long long>(Size));
-#else
-    (void)Base;
-    (void)Size;
-    return 0;
-#endif
   };
 
   auto EnableRw = [](void *Va) -> unsigned {
@@ -322,32 +297,9 @@ llvm::ejit::makeSreCodePoolManager(EJitCodePoolPlacement Placement) {
                                                EnableRw);
 }
 
-bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {
-#if !defined(EJIT_SRE_ENABLE_EX) || defined(EJIT_CODE_POOL_4K_SEAL)
-  EJIT_DIAG("prepareSreCode: unsupported config (FnPtr=%p), clean fallback",
-            FnPtr);
-  (void)FnPtr;
-  return false;
-#else
-  if (!FnPtr) {
-    EJIT_DIAG("prepareSreCode: null FnPtr, reject");
-    return false;
-  }
-  const auto Address = reinterpret_cast<uintptr_t>(FnPtr);
-  const auto PoolBase = Address & ~(static_cast<uintptr_t>(k2MiB) - 1);
-  unsigned Rc = sealAndSyncCache(PoolBase, static_cast<size_t>(kSrePoolSize));
-  if (Rc != 0) {
-    EJIT_DIAG("prepareSreCode FAIL: enable_ex poolBase=0x%llx rc=%u",
-              static_cast<unsigned long long>(PoolBase), Rc);
-    return false;
-  }
-  return true;
-#endif
-}
-
 bool llvm::ejit::ejitSreSplitPoolForCurrentCore(uintptr_t PoolBase,
                                                 uint64_t PoolSize) {
-#if defined(EJIT_SRE_ENABLE_EX) && defined(EJIT_CODE_POOL_4K_SEAL)
+#ifdef EJIT_SRE_ENABLE_EX
   if (PoolBase == 0 || PoolSize == 0) {
     EJIT_DIAG("splitPoolForCurrentCore reject: poolBase=0x%llx size=%llu",
               static_cast<unsigned long long>(PoolBase),
@@ -403,7 +355,7 @@ bool llvm::ejit::ejitSreSealPageForCurrentCore(uintptr_t PageVA) {
 }
 
 bool llvm::ejit::ejitSreEnableRwPageForCurrentCore(uintptr_t PageVA) {
-#if defined(EJIT_FIXED_CODE_POOL) && defined(EJIT_CODE_POOL_4K_SEAL)
+#ifdef EJIT_FIXED_CODE_POOL
   if (PageVA == 0) {
     EJIT_DIAG("enableRwPageForCurrentCore reject: null PageVA");
     return false;

@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-//  Platform seam for the cross-core SHARED taskpool (EJIT_SRE_SHARED_TASKPOOL).
+//  Platform seam for the cross-core shared taskpool.
 //
 //  Two host-overridable / platform-injected primitives live here so the rest of
 //  the shared taskpool never names a platform symbol directly:
@@ -56,58 +56,18 @@ namespace ejit {
 /// value so a partially-zeroed or foreign blob is rejected.
 constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 
-/// ABI version of the shared state layout. Bump on any field/layout change.
-/// v2: EJitCompileRequest carries a generation field and the flat dedup slot
-/// stores the owning generation (0 = free) instead of a 1-bit flag.
-/// v3: the shared state carries an owner registration fingerprint (peers
-/// validate their funcIndex/dimType mapping against the owner before use).
-/// v4: each cache slot carries a per-core executable-permission ready mask.
-/// v5: each cache slot carries the real executable code range
-/// (codeStart/codeSize/poolBase/poolSize/poolId) and the shared state gains a
-/// per-core, per-pool 4K split-readiness table, so a non-owner core in 4K-seal
-/// mode can split its pool once and seal exactly the pages the code covers.
-/// v6: dump slots carry dynamic IR/ASM payload pointers instead of fixed text
-/// buffers, and each cache bucket carries a monotonic publishSeq word used by
-/// the optional EJIT_SRE_TASKPOOL_NO_RECLAIM seqlock reader.
-/// v7: full IR/ASM payloads are worker-local again; shared dump state contains
-/// only a bounded filter and latest-capture metadata. publishSeq is unchanged.
-/// v8: the SwitchController line gains icacheDrainSeq, bumped by every
-/// inline-cache drain so a resolve that raced the drain drops its fill rather
-/// than refilling a cell the drain just cleared.
-/// v9 adds the shared inline-cache gates and diagnostics needed by every core.
-/// v10: each cache slot carries PGO fields (hitCount + profcAddr + profdAddr)
-/// for online PGO hotspot detection and Tier-1 counter capture (§6/§7.1).
-/// The shared counters struct gains tier1Compiles/tier2Compiles/
-/// profileMergeFails. PGO behavior is opt-in (Config::enablePgo); the fields
-/// exist in every build for a stable layout and are 0 when PGO is off.
-/// Online-PGO enable/threshold control also lives in the shared blob so
-/// every producer core observes the owner's configuration.
-/// v11: each cache slot carries a bounded set of runtime-writable code ranges
-/// (writableCount + writableRanges[]) — the pages the JIT body writes at
-/// runtime, e.g. the Tier-1 __profc_ counters — plus a requiresPeerEnableRw
-/// flag. A non-owner core running from a fixed RX .text.ejit code segment
-/// (requiresPeerEnableRw=1) must enable_rw exactly these in its own translation
-/// context before executing, or the first counter atomicrmw faults with a
-/// write-permission abort. For a dynamic SRE_MemDbgAlloc pool
-/// (requiresPeerEnableRw=0) the backing memory is already RW, so the ranges are
-/// diagnostic only and a peer executes without enable_rw. The ranges are
-/// page-disjoint from the executable extent, so a peer never makes a code page
-/// writable (no RWX).
-/// v12: staged PGO admission has a configurable fixed-capacity slot table, so
-/// one or more functions may profile concurrently with independent progress;
-/// the shared blob also records completed-function and deferred-miss counts.
-/// v13: non-owner cores can post a may_const-ranking diagnostic request to the
-/// owner worker and wait for its completion without sharing optimizer objects.
-/// v14: EJitCompileRequest introduced the old inline bound-pointer payload.
-/// v15: each cache slot records whether its published JIT pointer was resolved
-/// by a later taskpool lookup, diagnosing compiled versions with no reuse.
-/// v16: code ranges identify near/far placement and the shared code-pool
-/// diagnostic mirror publishes aggregate plus placement-specific statistics.
-/// v17: cache slots can remain Pending while compact code waits for an explicit
-/// owner-worker batch publish request.
-/// v18: the old inline payload is replaced by a fixed table of borrowed
-/// raw bound-pointer descriptors; no pointee bytes or ownership cross the
-/// shared queue.
+/// ABI v18. Bump on any layout change; peers must match the owner's ABI,
+/// generation and registration fingerprint before resolving an entry.
+///
+/// Published code and counters use separate page ranges. On a fixed RX
+/// pool, each core prepares executable pages and makes only the counter
+/// pages writable. NO_RECLAIM readers validate publication with publishSeq;
+/// an inline-cache drain invalidates fills that raced it. PGO control and
+/// admission are shared even when a particular build doesn't enable PGO.
+///
+/// Dump payloads stay on the worker; only capture metadata is shared. The
+/// v18 queue borrows bound-pointer descriptors, never pointee bytes or
+/// ownership. Earlier layouts are recorded in the history of this header.
 constexpr uint32_t kEJitSharedAbiVersion = 18u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.

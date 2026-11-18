@@ -18,6 +18,12 @@ DUMP_APIS = (
     "ejit_print_dumped",
     "ejit_print_dumped_module",
 )
+RETIRED_APIS = (
+    "ejit_compile_or_get",
+    "ejit_dump_all",
+    "ejit_taskpool_poll_one",
+    "ejit_taskpool_poll_budget",
+)
 
 
 def find_tool(*names):
@@ -115,9 +121,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ejit-lipo-roots-") as directory:
         root = Path(directory)
 
-        complete = build_archive(root, clang, ar, DUMP_APIS, "complete")
+        test_apis = DUMP_APIS + RETIRED_APIS
+        complete = build_archive(root, clang, ar, test_apis, "complete")
         input_symbols = defined_symbols(nm, complete)
-        if set(DUMP_APIS) - input_symbols:
+        if set(test_apis) - input_symbols:
             raise AssertionError(f"input archive symbols missing: {sorted(input_symbols)}")
         complete_gc, complete_log = gc_merge(
             lipo, root, complete, ar, nm, ld, "complete"
@@ -131,6 +138,8 @@ def main():
             )
         if "deliberately_unrooted" in complete_symbols:
             raise AssertionError("gc-merge retained an unrooted control symbol")
+        if set(RETIRED_APIS) & complete_symbols:
+            raise AssertionError("gc-merge retained a retired runtime API")
 
         minimal = build_archive(root, clang, ar, (), "minimal")
         minimal_gc, _ = gc_merge(lipo, root, minimal, ar, nm, ld, "minimal")

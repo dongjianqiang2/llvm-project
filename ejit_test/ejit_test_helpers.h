@@ -9,13 +9,8 @@
 // EJitRuntime.h (which #defines those macros) does not cause double-expansion.
 //
 // This header adds only two test conveniences on top:
-//   * ejit_default_config  — fill ejit_config_t with the canonical test
-//                            defaults (ASYNC under EJIT_SRE_SHARED_TASKPOOL,
-//                            SYNC otherwise).
-//   * ejit_drain_taskpool  — bounded spin until the async worker has published
-//                            all in-flight compiles (no-op in non-taskpool
-//                            builds; must not reference taskpool symbols there
-//                            or the sync test suite fails to link).
+//   * ejit_default_config selects async compilation.
+//   * ejit_drain_taskpool waits for in-flight shared compiles.
 //
 //===----------------------------------------------------------------------===//
 
@@ -39,13 +34,6 @@ extern "C" {
 // forever if the worker never starts (e.g. an EJIT_FREESTANDING build whose
 // SRE_TaskCreate is undefined) instead of failing the test.  The bounded form
 // lets a caller turn a timeout into a clear VERIFY failure.
-//
-// Only compiled when EJIT_SRE_SHARED_TASKPOOL is defined: the async path is the
-// only one that produces pending work.  In a sync build ejit_drain_taskpool is
-// a no-op (see below) and must NOT reference ejit_taskpool_pending_count — that
-// symbol only exists in a taskpool runtime, so referencing it unconditionally
-// breaks linking the sync test suite.
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 static inline int ejit_drain_taskpool_bounded(uint32_t maxSpins) {
   for (uint32_t i = 0; i < maxSpins; ++i) {
     if (ejit_taskpool_pending_count() == 0)
@@ -60,28 +48,12 @@ static inline int ejit_drain_taskpool_bounded(uint32_t maxSpins) {
 static inline void ejit_drain_taskpool(void) {
   (void)ejit_drain_taskpool_bounded(EJIT_DRAIN_SPIN_BUDGET);
 }
-#else
-// Sync / non-taskpool build: no async worker, nothing to drain.  Intentionally
-// references no taskpool symbols so the test links against a non-taskpool
-// runtime.
-static inline void ejit_drain_taskpool(void) {}
-#endif
 
 // Fill `cfg` with the canonical async defaults used by the integration tests.
-// compileMode is ASYNC under EJIT_SRE_SHARED_TASKPOOL (required to start the
-// single owner worker during ejit_init), SYNC otherwise.
 static inline void ejit_default_config(ejit_config_t *cfg) {
   memset(cfg, 0, sizeof(*cfg));
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   cfg->compileMode = EJIT_COMPILE_ASYNC;
-#else
-  cfg->compileMode = EJIT_COMPILE_SYNC;
-#endif
   cfg->optLevel = EJIT_OPT_L2;
-  cfg->maxCodeMemory = 512 * 1024;
-  cfg->maxDataMemory = 256 * 1024;
-  cfg->maxCacheEntries = 64;
-  cfg->maxCacheSize = 1024 * 1024;
 }
 
 #ifdef __cplusplus

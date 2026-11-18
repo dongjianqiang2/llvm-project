@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 
 ; Return-value forwarding coverage. In the single-function mixed scheme the
 ; jit_dispatch block makes an indirect call through the specialized function

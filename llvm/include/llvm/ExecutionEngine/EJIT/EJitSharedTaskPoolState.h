@@ -40,14 +40,13 @@
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h" // EJitWritableRange bound
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
-#include "llvm/ExecutionEngine/EJIT/EJitSreQueue.h" // EJitCompileRequest, EJitDimPair
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h" // EJitCompileRequest, EJitDimPair
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
 //===----------------------------------------------------------------------===//
-// Compile-time capacities (overridable by the build via -D). Defaults mirror
-// the non-shared taskpool so the two stay aligned.
+// Compile-time capacities (overridable by the build via -D).
 //===----------------------------------------------------------------------===//
 #ifndef EJIT_SRE_TASKPOOL_BUCKETS
 #define EJIT_SRE_TASKPOOL_BUCKETS 32u
@@ -66,13 +65,6 @@
 // fixed array of slots. A bucket that fills evicts its oldest-generation slot.
 #ifndef EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS
 #define EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS 16u
-#endif
-// Number of distinct 2MiB code pools whose per-core 4K split state is tracked
-// in the shared blob. Open-addressed by pool base, so this is a hard capacity:
-// once full, a peer hitting an untracked pool cleanly falls back rather than
-// risking an unbounded table or a duplicate split entry.
-#ifndef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
-#define EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS 16u
 #endif
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
@@ -104,7 +96,16 @@ constexpr uint32_t kEJitSharedCacheBuckets = EJIT_SRE_TASKPOOL_BUCKETS;
 constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
-constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
+// Number of distinct 2MiB code pools whose per-core 4K split state is tracked
+// in the shared blob. Open-addressed by pool base, so this is a hard capacity:
+// once full, a peer hitting an untracked pool cleanly falls back rather than
+// risking an unbounded table or a duplicate split entry.
+constexpr uint32_t kEJitSharedPoolSlots = 16u;
+#ifdef EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS
+static_assert(EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS == kEJitSharedPoolSlots,
+              "EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS is retired; remove the "
+              "override and rebuild all images with the same shared layout");
+#endif
 constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
 static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
                   EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES <=
@@ -251,8 +252,7 @@ struct EJitSharedCacheSlot {
 
 //===----------------------------------------------------------------------===//
 // EJitSharedCacheBucket: a fixed array of slots guarded by an embedded
-// two-word reader/writer lock (same protocol as EJitRwLock, but inline in the
-// shared blob). Buckets are cache-line aligned so a writer to one bucket never
+// two-word reader/writer lock in the shared blob. Buckets are cache-line aligned so a writer to one bucket never
 // false-shares with readers of another.
 //===----------------------------------------------------------------------===//
 struct alignas(kEJitSharedCacheLine) EJitSharedCacheBucket {
@@ -515,8 +515,8 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 pgoMaxActiveFunctions;
   EJitAtomicU32 pgoActiveFunctionCount;
   EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
-  /// Last logged progress quarter for each admission slot: 0..4.
-  EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
+  /// Reserved v18 storage. Progress is read from live T1 hit counts on demand.
+  EJitAtomicU32 reservedPgoProgress[kEJitSharedMaxConcurrentProfiles];
   EJitAtomicU64 pgoCompletedFunctions;
   EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first

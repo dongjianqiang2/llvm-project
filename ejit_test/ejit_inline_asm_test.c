@@ -76,7 +76,6 @@ int main(void) {
   check_one(0, 11);
   check_one(2, 13);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp;
   memset(&tp, 0, sizeof(tp));
   ejit_taskpool_get_stats(&tp);
@@ -87,16 +86,6 @@ int main(void) {
          (unsigned long long)tp.compileFailed);
   VERIFY(tp.compileFailed == 0, "compileFailed == 0 (actual %llu)",
          (unsigned long long)tp.compileFailed);
-#else
-  ejit_stats_t stats;
-  memset(&stats, 0, sizeof(stats));
-  ejit_get_stats(&stats);
-  printf("\n--- JIT Stats ---\n");
-  printf("  entries=%zu hits=%llu misses=%llu\n", stats.entryCount,
-         (unsigned long long)stats.hits, (unsigned long long)stats.misses);
-  VERIFY(stats.entryCount >= 1, "JIT entries >= 1 (actual %zu)",
-         stats.entryCount);
-#endif
 
   ejit_shutdown();
   printf("\n=== %s (%d failure(s)) ===\n", g_failures ? "FAILED" : "ALL PASSED",

@@ -175,7 +175,7 @@ int main(int argc, char **argv) {
 
   printf("\n--- AOT Fallback (不激活时间窗) ---\n");
 
-  // 不激活 → ejit_compile_or_get 发现 time window not active → fallback
+  // 未激活时 wrapper 继续走 AOT。
   uint64_t aot_sum = 0;
   double aot_time = 0;
   for (int w = 0; w < n_warmup; w++) {
@@ -244,7 +244,6 @@ int main(int argc, char **argv) {
   }
 
   ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
   ejit_taskpool_get_stats(&ts);
   printf("\n  JIT stats: ready=%u hits=%llu compiles=%llu\n",
@@ -252,14 +251,6 @@ int main(int argc, char **argv) {
          (unsigned long long)ts.asyncCompiles);
   if (ts.asyncCompiles == 0)
     printf("  FAIL: async path produced no compiles (silent AOT)\n");
-#else
-  ejit_stats_t s;
-  ejit_get_stats(&s);
-  printf("\n  JIT stats: entries=%zu hits=%llu misses=%llu\n",
-         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
-  if (s.entryCount == 0)
-    printf("  FAIL: no JIT entries (silent AOT)\n");
-#endif
 
   ejit_shutdown();
 

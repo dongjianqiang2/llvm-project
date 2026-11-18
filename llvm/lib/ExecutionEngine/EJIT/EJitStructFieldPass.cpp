@@ -955,17 +955,18 @@ static bool isMayConstLoad(const LoadInst *LI,
 }
 
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+template <typename ModuleT, typename OnLoad>
 std::vector<EJitMayConstLoadSite>
-EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
+EJitStructFieldPass::inventory(ModuleT &M, OnLoad Found) const {
   assert(mapsBuilt_ && "initFromModule() must precede may_const audit");
   std::vector<EJitMayConstLoadSite> Sites;
   const DataLayout &DL = M.getDataLayout();
-  for (const Function &F : M) {
+  for (auto &F : M) {
     if (F.isDeclaration())
       continue;
-    for (const BasicBlock &BB : F) {
-      for (const Instruction &I : BB) {
-        const auto *LI = dyn_cast<LoadInst>(&I);
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI ||
             !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
           continue;
@@ -991,6 +992,7 @@ EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
           Site.sourceColumn = Loc.getCol();
         }
         Sites.push_back(std::move(Site));
+        Found(LI);
       }
     }
   }
@@ -998,8 +1000,14 @@ EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
 }
 
 std::vector<EJitMayConstLoadSite>
+EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
+  return inventory(M, [](const LoadInst *) {});
+}
+
+std::vector<EJitMayConstLoadSite>
 EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
-  std::vector<EJitMayConstLoadSite> Sites = collectMayConstLoadSites(M);
+  SmallVector<LoadInst *, 16> Loads;
+  auto Sites = inventory(M, [&](LoadInst *LI) { Loads.push_back(LI); });
   if (Sites.empty())
     return Sites;
 
@@ -1011,37 +1019,22 @@ EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
       ConstantAggregateZero::get(CounterTy), MayConstCounterName);
   Counters->setAlignment(Align(8));
 
-  const DataLayout &DL = M.getDataLayout();
-  uint64_t SiteIndex = 0;
-  for (Function &F : M) {
-    if (F.isDeclaration())
-      continue;
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : BB) {
-        auto *LI = dyn_cast<LoadInst>(&I);
-        if (!LI ||
-            !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
-          continue;
+  for (auto [SiteIndex, LI] : llvm::enumerate(Loads)) {
+    const uint64_t SiteID = SiteIndex + 1;
+    LI->setMetadata(
+        MayConstAuditSiteMD,
+        MDNode::get(Ctx, ConstantAsMetadata::get(
+                             ConstantInt::get(I64, SiteID))));
+    Sites[SiteIndex].siteId = SiteID;
 
-        const uint64_t SiteID = SiteIndex + 1;
-        LI->setMetadata(
-            MayConstAuditSiteMD,
-            MDNode::get(Ctx, ConstantAsMetadata::get(
-                                 ConstantInt::get(I64, SiteID))));
-        Sites[SiteIndex].siteId = SiteID;
-
-        IRBuilder<> Builder(LI);
-        Value *Counter = Builder.CreateInBoundsGEP(
-            CounterTy, Counters,
-            {Builder.getInt32(0), Builder.getInt64(SiteIndex)});
-        Builder.CreateAtomicRMW(AtomicRMWInst::Add, Counter,
-                                Builder.getInt64(1), Align(8),
-                                AtomicOrdering::Monotonic);
-        ++SiteIndex;
-      }
-    }
+    IRBuilder<> Builder(LI);
+    Value *Counter = Builder.CreateInBoundsGEP(
+        CounterTy, Counters,
+        {Builder.getInt32(0), Builder.getInt64(SiteIndex)});
+    Builder.CreateAtomicRMW(AtomicRMWInst::Add, Counter,
+                            Builder.getInt64(1), Align(8),
+                            AtomicOrdering::Monotonic);
   }
-  assert(SiteIndex == Sites.size() && "may_const site inventory changed");
   return Sites;
 }
 

@@ -46,7 +46,7 @@ int pthread_once(int *o, void (*f)(void)){ if(!*o){*o=1;f();} return 0; }
 int pthread_sigmask(int h, const void *s, void *o) { return 0; }
 ```
 
-**注意**: 裸核工具链若**不提供 `<mutex>` 头文件**，需要启用 `-DEJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_MUTEX=ON`，CMake 会通过 `target_include_directories SYSTEM BEFORE` 注入 `BareMetal/mutex` 等 no-op 头文件。若工具链提供 `<mutex>`（hosted 模式），只需 pthread 桩函数即可。
+**注意**: 裸核工具链必须提供 LLVM 使用的 C++ 标准头文件（包括 `<mutex>`）。pthread 链接桩不能替代这些头文件。
 
 ### 3.2 OS 内存
 
@@ -172,9 +172,8 @@ aarch64-none-elf-g++ \
 | 项目 | 优先级 | 说明 |
 |---|---|---|
 | `JITLinkMemoryManager` slab 实现 | **高** | `mmap` 桩只让链接通过，运行时需静态 slab 分配器替代 |
-| `BareMetal/` 头文件验证 | 中 | 需在裸核工具链上确认 `<mutex>` 是否存在 |
+| C++ 标准头文件验证 | 中 | 需在裸核工具链上确认 `<mutex>` 是否存在 |
 | 桩函数库编译 | 低 | 60 行 C 代码，随时可写 |
-| `EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_MUTEX` 测试 | 低 | 裸核工具链到位后验证 |
 
 ---
 

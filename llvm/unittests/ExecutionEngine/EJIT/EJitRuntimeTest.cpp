@@ -16,20 +16,14 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
-#include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#endif
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
-#ifdef EJIT_SRE_TASKPOOL
-#include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
-#endif
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -47,6 +41,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Testing/Support/SupportHelpers.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -65,6 +60,7 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifdef EJIT_DUMP_SUPPORT
 TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   LLVMContext Ctx;
   Module M("dump_selective", Ctx);
@@ -92,8 +88,19 @@ TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   EXPECT_NE(Output.find("define internal"), std::string::npos) << Output;
   EXPECT_NE(Output.find("@dump_helper("), std::string::npos) << Output;
 }
+#endif
 
-TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
+TEST(EJitOrcEngine, DefaultConstructedEngineHasNoOptimizerResults) {
+  EJitOrcEngine Engine;
+  EXPECT_TRUE(Engine.getLastCounterNames().empty());
+  EXPECT_TRUE(Engine.getLastVpFunctions().empty());
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  EXPECT_TRUE(Engine.getLastMayConstLoadSites().empty());
+#endif
+  EXPECT_FALSE(Engine.printMayConstRanking());
+}
+
+TEST(EJitDump, FilteredCaptureMatchesBuildConfiguration) {
   std::string Bitcode;
   {
     LLVMContext Ctx;
@@ -121,6 +128,14 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
 
   EJitRuntimeState State;
   Config Cfg;
+  unittest::TempDir Dir("ejit-dump", /*Unique=*/true);
+  ASSERT_FALSE(Dir.path().empty());
+  Cfg.dumpJITDir = Dir.path().str();
+#ifdef EJIT_DUMP_SUPPORT
+  constexpr bool ExpectDump = true;
+#else
+  constexpr bool ExpectDump = false;
+#endif
   // Direct engine creation owns target registration just like the shared
   // worker-owner path; callers and producer-only EJit instances do not.
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
@@ -134,20 +149,27 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     SpecializationContext Ctx;
     Ctx.fnName = Name;
     Ctx.cacheKey = Key;
+    // Exercise capture after an actual final-tier materialization as well.
+    if (StringRef(Name) == "dump_c")
+      Ctx.tier = CompileTier::PGOUse;
     Engine->setActiveContext(&Ctx);
     ASSERT_FALSE(errorToBool(Engine->loadBitcodeModule(Bitcode, Key, Name)));
     auto FnOrErr = Engine->lookup(Key, Name);
     ASSERT_TRUE(static_cast<bool>(FnOrErr));
+    std::string Stem = std::string(Name) + "_" + std::to_string(Key);
+    for (const char *Suffix : {"_pre.ll", "_opt.ll"})
+      EXPECT_EQ(ExpectDump, sys::fs::exists(Dir.path(Stem + Suffix)));
   }
   Engine->setActiveContext(nullptr);
   setDumpFuncFilter("");
 
   for (const char *Name : {"dump_a", "dump_b", "dump_c"}) {
-    EXPECT_TRUE(printDumped(Name)) << Name;
-    EXPECT_TRUE(printDumpedModule(Name)) << Name;
+    EXPECT_EQ(ExpectDump, printDumped(Name)) << Name;
+    EXPECT_EQ(ExpectDump, printDumpedModule(Name)) << Name;
   }
 }
 
+#ifdef EJIT_DUMP_SUPPORT
 TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
   EXPECT_FALSE(llvm::ejit::detail::shouldCaptureDump(
       CompileTier::Instrumented, "*", "dump_temporary_tier1"));
@@ -161,6 +183,7 @@ TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
   EXPECT_FALSE(llvm::ejit::detail::shouldCaptureDump(
       CompileTier::PGOUse, "other", "dump_temporary_tier1"));
 }
+#endif
 
 static int nestedEntryWrapper(int X) { return X + 100; }
 static int wrongNestedEntryWrapper(int X) { return X + 1000; }
@@ -256,25 +279,18 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   // Isolated pass tests without a specialization supply an empty context;
   // production callers must carry the actual entry and bound-pointer views.
   void runStructFieldPass(Module &M) {
-    EJitOptimizer::runStructFieldPass(M, SpecializationContext{});
+    EJitOptimizer::runStructFieldPass(M, SpecializationContext{}, {});
   }
   void runOptimizationPipeline(Module &M, OptimizationLevel Level,
                                CompileTier Tier) {
     SpecializationContext Context;
     Context.optLevel = Level;
     Context.tier = Tier;
-    EJitOptimizer::runOptimizationPipeline(M, Context, Tier);
+    EJitOptimizer::runOptimizationPipeline(M, Context, Tier, {});
   }
 };
 } // namespace ejit
 } // namespace llvm
-
-// ejit_status_t values mirrored locally. EJitError::code is a plain int that
-// stores ejit_status_t codes (see EJitRuntime.h). The C header is not included
-// here because it conflicts with the local extern "C" test declarations further
-// down (which intentionally use a private signature for the C API).
-static constexpr int kEjitStatusOk = 0;             // EJIT_OK
-static constexpr int kEjitStatusCompileFailed = -3; // EJIT_ERR_COMPILE_FAILED
 
 //===----------------------------------------------------------------------===//
 // EJitRegistrationStore tests (T3-08)
@@ -720,71 +736,11 @@ TEST(EJitRuntimeState, ThreadSafety) {
 #endif // EJIT_FREESTANDING
 
 //===----------------------------------------------------------------------===//
-// EJitLogger tests (T3-12)
-//===----------------------------------------------------------------------===//
-
-#ifndef EJIT_FREESTANDING
-TEST(EJitLogger, LogAndGetLastError) {
-  EJitLogger logger;
-  logger.log(kEjitStatusCompileFailed, "test error", "myfunc", "mykey");
-
-  const EJitError *err = logger.getLastError();
-  ASSERT_NE(err, nullptr);
-  EXPECT_EQ(err->code, kEjitStatusCompileFailed);
-  EXPECT_EQ(err->message, "test error");
-  EXPECT_EQ(err->funcName, "myfunc");
-  EXPECT_EQ(err->cacheKey, "mykey");
-}
-
-TEST(EJitLogger, GetLastErrorEmpty) {
-  EJitLogger logger;
-  EXPECT_EQ(logger.getLastError(), nullptr);
-}
-
-TEST(EJitLogger, RingBufferWrap) {
-  EJitLogger logger;
-
-  // Write more than kMaxErrors entries
-  for (size_t i = 0; i < EJitLogger::kMaxErrors + 10; ++i) {
-    logger.log(kEjitStatusOk, "msg" + std::to_string(i));
-  }
-
-  const EJitError *last = logger.getLastError();
-  ASSERT_NE(last, nullptr);
-  EXPECT_EQ(last->message, "msg" + std::to_string(EJitLogger::kMaxErrors + 9));
-}
-
-TEST(EJitLogger, GetErrors) {
-  EJitLogger logger;
-
-  for (size_t i = 0; i < 5; ++i)
-    logger.log(kEjitStatusOk, "msg" + std::to_string(i));
-
-  auto errors = logger.getErrors(3);
-  EXPECT_EQ(errors.size(), 3u);
-  EXPECT_EQ(errors[0].message, "msg0");
-  EXPECT_EQ(errors[1].message, "msg1");
-  EXPECT_EQ(errors[2].message, "msg2");
-}
-
-TEST(EJitLogger, Clear) {
-  EJitLogger logger;
-  logger.log(kEjitStatusOk, "test");
-  logger.clear();
-  EXPECT_EQ(logger.getLastError(), nullptr);
-}
-
-#endif // EJIT_FREESTANDING
-
-//===----------------------------------------------------------------------===//
 // EJit end-to-end construction test (T3-20)
 //===----------------------------------------------------------------------===//
 
 TEST(EJit, ConstructionAndBasicOps) {
   Config config;
-  config.compileMode = CompileMode::Sync;
-  config.maxCacheEntries = 64;
-  config.maxCacheSize = 1024 * 1024;
 
   // Register the period array BEFORE construction (staged) so this works in
   // both builds — a taskpool build freezes registration after construction.
@@ -835,24 +791,6 @@ TEST(EJit, CacheOperations) {
   ejit.invalidateByPeriod("test", 0);
 }
 
-TEST(EJit, CompileMode) {
-  // Default is Async (background worker handles compilation).
-  EJit ejit(Config{});
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-
-  // Switch to sync: compile inline on calling thread.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Sync));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
-
-  // Switch to off: no JIT, always AOT fallback.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Off));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
-
-  // Back to async.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Async));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-}
 
 TEST(EJit, OptimizationLevel) {
   EJit ejit(Config{});
@@ -862,15 +800,17 @@ TEST(EJit, OptimizationLevel) {
   EXPECT_EQ(ejit.getOptimizationLevel(), llvm::ejit::OptimizationLevel::L3);
 }
 
-#ifdef EJIT_SRE_TASKPOOL
 TEST(EJitTaskpoolInit, OffModeSucceedsWithoutWorker) {
   Config config;
   config.compileMode = CompileMode::Off;
   EJit ejit(config);
   EXPECT_FALSE(ejit.initFailed());
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-  EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
+  ASSERT_NE(ejit.sharedTaskPool(), nullptr);
+  EXPECT_EQ(ejit.sharedTaskPool()->state(), nullptr);
+  EXPECT_FALSE(ejit.sharedTaskPool()->asyncServiceAvailable());
+  EXPECT_EQ(ejit.sharedTaskPool()->compileOrGet(1, nullptr, 0, nullptr).status,
+            EJitCompileOrGetStatus::OffMode);
 }
 
 TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
@@ -878,7 +818,7 @@ TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
   // ORC engine is always created; async init succeeds.
   EXPECT_FALSE(ejit.initFailed());
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-  ASSERT_NE(ejit.taskPool(), nullptr);
+  ASSERT_NE(ejit.sharedTaskPool()->state(), nullptr);
 }
 
 // Finding (二): a constructed taskpool EJit freezes registration once its
@@ -898,7 +838,6 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
   // Nothing was registered: the registry is unchanged.
   EXPECT_EQ(ejit.getRegistry().getArrays("frozen_period"), nullptr);
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // C API tests with runtime-dynamic cellIdx (T3-21)
@@ -910,18 +849,6 @@ typedef struct {
   uint32_t dimType;
   uint32_t instanceId;
 } ejit_dim_pair_test_t;
-typedef struct {
-  uint64_t count;
-  uint64_t total;
-  uint64_t min;
-  uint64_t max;
-  uint64_t wrapper_total;
-  uint64_t wrapper_min;
-  uint64_t wrapper_max;
-  uint64_t overhead_total;
-  uint64_t overhead_min;
-  uint64_t overhead_max;
-} ejit_function_body_cycles_test_t;
 extern ejit_status_test_t ejit_init(const void *config);
 extern void ejit_shutdown(void);
 extern ejit_status_test_t ejit_activate(const char *, uint32_t);
@@ -943,6 +870,10 @@ extern int ejit_taskpool_compile_or_get_bound(uint32_t,
                                               const ejit_dim_pair_test_t *,
                                               uint32_t, const void *, uint32_t,
                                               uint32_t, void **, uint32_t *);
+extern int ejit_taskpool_compile_or_get_bound_v(
+    uint32_t, const ejit_dim_pair_test_t *, uint32_t,
+    const llvm::ejit::EJitBoundPtrDescriptor *, uint32_t, void **, uint32_t *);
+extern void ejit_taskpool_release_read(uint32_t);
 extern void ejit_set_log_level(int level);
 extern int ejit_get_log_level(void);
 extern void ejit_print_registry(void);
@@ -956,30 +887,13 @@ extern void ejit_print_code_pool_stats(void);
 extern void ejit_print_mayconst_ranking(void);
 extern void ejit_print_active(void);
 extern void ejit_print_version(void);
-extern void ejit_function_body_cycles_record(const char *, uint32_t, uint64_t,
-                                             uint64_t, uint64_t, uint64_t);
-extern unsigned
-ejit_function_body_cycles_get(const char *, uint32_t,
-                              ejit_function_body_cycles_test_t *);
-extern void ejit_function_body_cycles_reset(void);
 }
 
-static constexpr uint32_t kEjitFunctionBodyAot = 0;
-static constexpr uint32_t kEjitFunctionBodyJit = 1;
-
-// The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
-// dynamic period-array registration AFTER ejit_init, then period-name activate.
-// In a taskpool build that model is intentionally replaced — registration is
-// frozen after init and activate is keyed on registered lifecycles — so these
-// tests run only in the non-taskpool build. Taskpool-mode equivalents (freeze,
-// lifecycle activate, array sync) live in the EJitCApiTaskpool section.
-#ifndef EJIT_SRE_TASKPOOL
-
 TEST(EJitCApi, ActivateWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   // Per-array activation model: register an array for the period first.
   int arr[256];
   ejit_register_period_array("dynamic", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t idx = 42;
   EXPECT_EQ(ejit_activate("dynamic", idx), EJIT_OK_C);
   EXPECT_TRUE(ejit_is_active("dynamic", idx));
@@ -989,9 +903,9 @@ TEST(EJitCApi, ActivateWithDynamicCellIdx) {
 }
 
 TEST(EJitCApi, LoopWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("loop", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   for (uint8_t i = 0; i < 10; i++)
     EXPECT_EQ(ejit_activate("loop", i), EJIT_OK_C);
   for (uint8_t i = 0; i < 10; i++)
@@ -1008,9 +922,9 @@ static uint8_t computeCellIdx(int x, int y) {
 }
 
 TEST(EJitCApi, ActivateWithComputedCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("compute", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t idx = computeCellIdx(100, 55);
   EXPECT_EQ(idx, 155);
   EXPECT_EQ(ejit_activate("compute", idx), EJIT_OK_C);
@@ -1024,9 +938,9 @@ TEST(EJitCApi, ActivateWithComputedCellIdx) {
 }
 
 TEST(EJitCApi, DynamicCellIdxBoundaries) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("bound", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   EXPECT_EQ(ejit_activate("bound", (uint8_t)0), EJIT_OK_C);
   EXPECT_TRUE(ejit_is_active("bound", (uint8_t)0));
   EXPECT_EQ(ejit_activate("bound", (uint8_t)255), EJIT_OK_C);
@@ -1049,10 +963,10 @@ TEST(EJitCApi, DynamicCellIdxBoundaries) {
 }
 
 TEST(EJitCApi, MultiPeriodDynamicIndices) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int cellArr[256], trpArr[256];
   ejit_register_period_array("cell", "cellArr", cellArr, 256);
   ejit_register_period_array("trp", "trpArr", trpArr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t indices[] = {3, 7, 15, 31, 63};
   for (size_t i = 0; i < sizeof(indices) / sizeof(indices[0]); i++) {
     EXPECT_EQ(ejit_activate("cell", indices[i]), EJIT_OK_C);
@@ -1072,9 +986,9 @@ TEST(EJitCApi, MultiPeriodDynamicIndices) {
 }
 
 TEST(EJitCApi, InvalidateWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("inv", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   for (uint8_t i = 0; i < 5; i++)
     ejit_activate("inv", i);
   for (uint8_t i = 0; i < 5; i++)
@@ -1087,9 +1001,9 @@ TEST(EJitCApi, InvalidateWithDynamicCellIdx) {
 }
 
 TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("cycle", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t workload[] = {10, 20, 30, 40, 50};
   for (size_t cycle = 0; cycle < 3; cycle++) {
     for (size_t i = 0; i < sizeof(workload) / sizeof(workload[0]); i++)
@@ -1104,9 +1018,7 @@ TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
   ejit_shutdown();
 }
 
-#endif // !EJIT_SRE_TASKPOOL
 
-#ifdef EJIT_SRE_TASKPOOL
 //===----------------------------------------------------------------------===//
 // Taskpool-mode C-API: registration freeze (finding 二) + name/array control
 // plane synced to the SwitchController (findings 一/五).
@@ -1114,51 +1026,6 @@ TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
 
 namespace {
 
-TEST(EJitFunctionBodyCyclesTest, AggregatesAotAndJitIndependently) {
-  ejit_function_body_cycles_reset();
-
-  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyAot, 90, 100,
-                                   130, 140);
-  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyAot, 180, 200,
-                                   250, 270);
-  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyJit, 290, 300,
-                                   311, 321);
-
-  ejit_function_body_cycles_test_t Aot{};
-  ASSERT_EQ(
-      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyAot, &Aot),
-      1u);
-  EXPECT_EQ(Aot.count, 2u);
-  EXPECT_EQ(Aot.total, 80u);
-  EXPECT_EQ(Aot.min, 30u);
-  EXPECT_EQ(Aot.max, 50u);
-  EXPECT_EQ(Aot.wrapper_total, 140u);
-  EXPECT_EQ(Aot.wrapper_min, 50u);
-  EXPECT_EQ(Aot.wrapper_max, 90u);
-  EXPECT_EQ(Aot.overhead_total, 60u);
-  EXPECT_EQ(Aot.overhead_min, 20u);
-  EXPECT_EQ(Aot.overhead_max, 40u);
-
-  ejit_function_body_cycles_test_t Jit{};
-  ASSERT_EQ(
-      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyJit, &Jit),
-      1u);
-  EXPECT_EQ(Jit.count, 1u);
-  EXPECT_EQ(Jit.total, 11u);
-  EXPECT_EQ(Jit.min, 11u);
-  EXPECT_EQ(Jit.max, 11u);
-  EXPECT_EQ(Jit.wrapper_total, 31u);
-  EXPECT_EQ(Jit.wrapper_min, 31u);
-  EXPECT_EQ(Jit.wrapper_max, 31u);
-  EXPECT_EQ(Jit.overhead_total, 20u);
-  EXPECT_EQ(Jit.overhead_min, 20u);
-  EXPECT_EQ(Jit.overhead_max, 20u);
-
-  ejit_function_body_cycles_reset();
-  EXPECT_EQ(
-      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyAot, &Aot),
-      0u);
-}
 // Reset process-global registration state so each taskpool test starts clean:
 // no live gEJIT, no staged data, no staged error, empty name registries. This
 // is essential because the C ABI / registries are process singletons that leak
@@ -1193,6 +1060,55 @@ TEST(EJitCApiTaskpool, SingleBoundRejectsEmptyObject) {
             -1);
   EXPECT_EQ(Fn, nullptr);
   EXPECT_EQ(Bucket, 0u);
+  ejit_shutdown();
+}
+
+TEST(EJitCApiTaskpool, OptionalOutputsAndValidationPrecedence) {
+  resetTaskpoolRegState();
+  auto resolve = ejit_taskpool_compile_or_get_bound_v;
+  void *fn = reinterpret_cast<void *>(1);
+  uint32_t bucket = 19;
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 1, &fn, nullptr), -2);
+  EXPECT_EQ(fn, nullptr);
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 1, nullptr, &bucket), -2);
+  EXPECT_EQ(bucket, 0u);
+  ejit_taskpool_release_read(0);
+
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
+  ejit_dim_pair_test_t dim{0, 0};
+  EXPECT_EQ(resolve(0, &dim, UINT32_MAX, nullptr, 0, nullptr, nullptr), -1);
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 0, nullptr, nullptr), -1);
+  EXPECT_EQ(resolve(0, nullptr, 0, nullptr, UINT32_MAX, nullptr, nullptr), -1);
+  llvm::ejit::EJitBoundPtrDescriptor b{nullptr, 4, 0};
+  EXPECT_EQ(resolve(0, nullptr, 0, &b, 1, nullptr, nullptr), -1);
+  dim.instanceId = UINT32_MAX;
+  EXPECT_EQ(resolve(0, &dim, 1, nullptr, 0, nullptr, nullptr), -1);
+  dim = {UINT32_MAX, 0};
+  EXPECT_EQ(resolve(0, &dim, 1, nullptr, 0, nullptr, nullptr), -1);
+  // Zero counts skip both lists; the otherwise invalid entries are not read.
+  EXPECT_NE(resolve(0, &dim, 0, &b, 0, &fn, &bucket), -1);
+  if (fn)
+    ejit_taskpool_release_read(bucket);
+  ejit_shutdown();
+  ejit_taskpool_release_read(0);
+  ejit_taskpool_release_read(UINT32_MAX);
+}
+
+TEST(EJitCApiTaskpool, MissingRegistrationFixupsAreSkipped) {
+  resetTaskpoolRegState();
+  auto check = [] {
+    uint32_t slot = 37;
+    ejit_register_lifecycle(nullptr, &slot);
+    ejit_register_funcindex(nullptr, &slot);
+    EXPECT_EQ(slot, 37u);
+    ejit_register_lifecycle("skipped", nullptr);
+    ejit_register_funcindex("skipped", nullptr);
+    ejit_register_icache_slot("skipped", nullptr, 0, nullptr);
+    EXPECT_FALSE(llvm::ejit::EJitRegistrationStore::instance().hasError());
+  };
+  check();
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
+  check(); // Missing inputs do not become frozen-registration errors.
   ejit_shutdown();
 }
 
@@ -1245,7 +1161,6 @@ TEST(EJitCApiTaskpool, PreInitLifecycleActivateAndArraySync) {
   ejit_shutdown();
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 // The C ABI's ejit_register_icache_slot gained a 4th argument: the sentinel
 // MissFn the branchless wrapper's cell table is DEFINED pre-filled with. The
 // registration must carry it into the slot registry, so a drain triggered
@@ -1314,7 +1229,6 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
   EXPECT_EQ(guardedCells[3], 0u)
       << "a guarded (null-missFn) slot must keep the historical 0";
 }
-#endif // EJIT_SRE_SHARED_TASKPOOL
 
 // Finding (一): name-level activate/deactivate through the PUBLIC EJit API
 // syncs the time-window state AND the taskpool SwitchController; the version
@@ -1329,45 +1243,31 @@ TEST(EJitTaskpoolArray, NameLevelSyncsSwitchController) {
   ejit_register_period_array("cell", "cellArr", cellArr, 16); // staged
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
-  EJitTaskPool *tp = ejit.taskPool();
-  ASSERT_NE(tp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
   ASSERT_NE(dt, kEJitInvalidDimType);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Shared build: deactivate/activate writes the shared pool's switch
-  // controller, which is separate from the per-instance EJitTaskPool switch.
-  // Check enabled state via the shared pool (instanceVersion is private).
-  // initSharedStorage defaults all instances to disabled — enable explicitly.
+  // The shared state starts inactive. Activate explicitly for this test.
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
   EXPECT_TRUE(sp->setInstanceEnabled(dt, 5, true));
   auto instanceEnabled = [&]() { return sp->isInstanceActive(dt, 5); };
-#else
-  EJitSwitchController &sw = tp->switchController();
-  auto instanceEnabled = [&]() { return sw.isInstanceEnabled(dt, 5); };
-  auto instanceVer = [&]() { return sw.getInstanceVersion(dt, 5); };
+  auto instanceVer = [&]() { return sp->state()->version[dt][5].loadAcquire(); };
   uint32_t v0 = instanceVer();
-#endif
 
   EXPECT_TRUE(instanceEnabled()); // defaults enabled
   // deactivate.
   EXPECT_TRUE(ejit.deactivate("cell", 5));
   EXPECT_FALSE(ejit.isActive("cell", 5));
   EXPECT_FALSE(instanceEnabled());
-#ifndef EJIT_SRE_SHARED_TASKPOOL
   EXPECT_EQ(instanceVer(), v0 + 1);
-#endif
   // activate.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_TRUE(ejit.isActive("cell", 5));
   EXPECT_TRUE(instanceEnabled());
-#ifndef EJIT_SRE_SHARED_TASKPOOL
   EXPECT_EQ(instanceVer(), v0 + 2);
   // Redundant activate: no flip.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_EQ(instanceVer(), v0 + 2);
-#endif
   resetTaskpoolRegState();
 }
 
@@ -1382,16 +1282,16 @@ TEST(EJitTaskpoolArray, UnknownPeriodCleanReject) {
   ejit_register_period_array("cell", "cellArr", cellArr, 16);
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
-  EJitTaskPool *tp = ejit.taskPool();
-  ASSERT_NE(tp, nullptr);
+  auto *sp = ejit.sharedTaskPool();
+  ASSERT_NE(sp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
-  EJitSwitchController &sw = tp->switchController();
-
-  uint32_t v0 = sw.getInstanceVersion(dt, 2);
+  ASSERT_NE(dt, kEJitInvalidDimType);
+  ASSERT_TRUE(ejit.activate("cell", 2));
+  uint32_t v0 = sp->state()->version[dt][2].loadAcquire();
   EXPECT_FALSE(ejit.activate("wrong", 2));   // unknown lifecycle -> reject
   EXPECT_FALSE(ejit.deactivate("wrong", 2));
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 2));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 2), v0);
+  EXPECT_TRUE(sp->isInstanceActive(dt, 2));
+  EXPECT_EQ(sp->state()->version[dt][2].loadAcquire(), v0);
   EXPECT_FALSE(ejit.isActive("wrong", 2));
   resetTaskpoolRegState();
 }
@@ -1420,8 +1320,8 @@ TEST(EJitTaskpoolInit, InitFailureSetsFailedAndStopsWorker) {
   const uint8_t bc[] = {1, 2, 3};
   EXPECT_FALSE(ejit.registerBitcode("x", bc, sizeof(bc)));
   // The worker was never started on a failed init.
-  if (EJitTaskPool *tp = ejit.taskPool())
-    EXPECT_FALSE(tp->isWorkerRunning());
+  ASSERT_NE(ejit.sharedTaskPool(), nullptr);
+  EXPECT_FALSE(ejit.sharedTaskPool()->asyncServiceAvailable());
   resetTaskpoolRegState();
 }
 
@@ -1442,7 +1342,6 @@ TEST(EJitCApiTaskpool, InitFailsAndDestroysOnRegistrationError) {
   ejit_shutdown();                              // safe no-op
   resetTaskpoolRegState();
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // PeriodArrayRegistry::getArrayByBaseAddr tests
@@ -2241,6 +2140,89 @@ TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
 }
 #endif
 
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) && \
+    GTEST_HAS_STREAM_REDIRECTION
+TEST(EJitOptimizer, AuditEndpointsAcrossTierExits) {
+  PeriodArrayRegistry Registry;
+  EJitOptimizer Opt(Registry);
+  SpecializationContext Spec;
+  Spec.fnName = "audit_entry";
+  std::vector<EJitMayConstLoadSite> Sampled;
+  for (unsigned Case = 0; Case != 5; ++Case) {
+    SCOPED_TRACE(Case);
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(R"(
+      target triple = "aarch64-unknown-linux-gnu"
+      define i32 @audit_entry(ptr %p, ptr %q, ptr %r) !ejit.metadata !0 {
+        %dead = load i32, ptr %p, !ejit.may_const !2
+        %excluded = load volatile i32, ptr %r, !ejit.may_const !2
+        %live = load i32, ptr %q, !ejit.may_const !2
+        ret i32 %live
+      }
+      !0 = !{!1}
+      !1 = !{!"ejit_entry"}
+      !2 = !{}
+    )", Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    Spec.tier = Case == 0 || Case == 4 ? CompileTier::Baseline
+                          : Case == 1 ? CompileTier::Instrumented
+                                      : CompileTier::PGOUse;
+    Spec.profileAuditOnly = Case == 2;
+    Spec.mayConstLoadSites = Sampled;
+    if (Case == 4) {
+      // Baseline with a supplied snapshot uses that inventory, even when the
+      // optimized module has more sites. Preserve the signed net difference.
+      Spec.mayConstLoadSites.resize(1);
+      auto &BB = M->getFunction("audit_entry")->getEntryBlock();
+      auto *Ret = cast<ReturnInst>(BB.getTerminator());
+      IRBuilder<> B(Ret);
+      Ret->setOperand(0, B.CreateAdd(&BB.front(), Ret->getReturnValue()));
+    }
+    const auto OldLevel = ejit_get_log_level();
+    ejit_set_log_level(EJIT_LOG_LVL_DEBUG);
+    testing::internal::CaptureStdout();
+    Opt.runPipeline(*M, Spec);
+    std::string Output = testing::internal::GetCapturedStdout();
+    ejit_set_log_level(OldLevel);
+    ASSERT_FALSE(verifyModule(*M, &errs()));
+    if (Case == 1) {
+      EXPECT_EQ(Output.find("mayconst-audit entry="), std::string::npos);
+      EXPECT_EQ(Output.find("mayconst-site entry="), std::string::npos);
+      EXPECT_NE(M->getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
+                nullptr);
+      auto Sites = Opt.getLastMayConstLoadSites();
+      ASSERT_EQ(Sites.size(), 2u);
+      Sampled.assign(Sites.begin(), Sites.end());
+      EXPECT_EQ(Sampled[0].siteId, 1u);
+      EXPECT_EQ(Sampled[1].siteId, 2u);
+      Sampled[0].runtimeHits = 17;
+      Sampled[1].runtimeHits = 11;
+      continue;
+    }
+    EXPECT_TRUE(Opt.getLastMayConstLoadSites().empty());
+    EXPECT_NE(Output.find("versions=1 mayconst="), std::string::npos);
+    EXPECT_EQ(M->getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
+              nullptr);
+    if (Case == 4) {
+      EXPECT_NE(Output.find("mayconst=1/na/2 removed=-1"), std::string::npos)
+          << Output;
+      continue;
+    }
+    if (Case != 0) {
+      EXPECT_NE(Output.find("offset=unknown hits=17"), std::string::npos);
+      EXPECT_NE(Output.find("offset=unknown hits=11"), std::string::npos);
+    }
+    EXPECT_NE(Output.find("mayconst=2/na/1 removed=1 direct=na pipeline=na"),
+              std::string::npos) << Output;
+    EXPECT_NE(Output.find(Case == 0
+                              ? "runtime_hits=0 hit_sites=0 removed_runtime_hits=0"
+                              : "runtime_hits=28 hit_sites=2 removed_runtime_hits=17"),
+              std::string::npos) << Output;
+  }
+}
+#endif
+
 TEST(EJitStructFieldPass, NoMayConstNoChange) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_nochange", Ctx);
@@ -2802,6 +2784,52 @@ TEST(EJitStructFieldPass, InconsistentHelperDimensionSourcesAreNotSpecialized) {
                           [](Instruction &I) { return isa<LoadInst>(I); }),
             1)
       << "all callsites must agree on the helper cell identity";
+}
+
+TEST(EJitOptimizer, ResolvesBoundPeriodAgainForEachModule) {
+  PeriodArrayRegistry Registry;
+  EJitOptimizer Opt(Registry);
+  SpecializationContext Spec;
+  Spec.fnName = "root";
+  Spec.dimensions = {{"cell", 2}, {"trp", 7}};
+  int32_t Object = 42;
+  Spec.boundPointers.push_back(
+      {reinterpret_cast<const uint8_t *>(&Object), sizeof(Object), 1});
+  for (StringRef Period : {"cell", "trp", "cell"}) {
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    // Identical symbols, argument index and context; only the module's
+    // contract changes. The call matches cell instance 2, never trp 7.
+    std::string IR = R"(
+      define i32 @root(i8 %d, ptr %p) !ejit.metadata !0 {
+        %r = call i32 @helper(i8 2, ptr %p)
+        ret i32 %r
+      }
+      define i32 @helper(i8 %d, ptr %p) noinline !ejit.metadata !0 {
+        %v = load i32, ptr %p, !ejit.may_const !5
+        ret i32 %v
+      }
+      !0 = !{!1, !2, !3}
+      !1 = !{!"ejit_entry"}
+      !2 = !{!"ejit_period_arr_ind", !")" + Period.str() + R"(", i32 0}
+      !3 = !{!"ejit_bound_ptr", !")" + Period.str() + R"(", i32 1, i64 4, !4}
+      !4 = !{i64 0, i64 4}
+      !5 = !{}
+    )";
+    auto M = parseAssemblyString(IR, Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    Opt.runPipeline(*M, Spec);
+    Function *Helper = M->getFunction("helper");
+    ASSERT_NE(Helper, nullptr);
+    auto *Ret = cast<ReturnInst>(Helper->getEntryBlock().getTerminator());
+    if (Period == "cell") {
+      auto *C = dyn_cast<ConstantInt>(Ret->getReturnValue());
+      ASSERT_NE(C, nullptr);
+      EXPECT_EQ(C->getSExtValue(), Object);
+    } else {
+      EXPECT_TRUE(isa<LoadInst>(Ret->getReturnValue()));
+    }
+  }
 }
 
 TEST(EJitStructFieldPass, BoundPointerHelperSupportsMultipleCellVersions) {

@@ -211,7 +211,7 @@
   <ul>
     <li>板级配置、制式配置、cell/trp/channel 等在一段时间内稳定的业务配置；</li>
     <li>配置字段决定大量分支路径，且同一实例会被重复调用；</li>
-    <li>可接受首次调用 JIT 编译成本，或使用异步模式先 fallback、后台编译。</li>
+    <li>首次未命中时可先执行 AOT，由 worker 在后台编译。</li>
   </ul>
 </section>
 
@@ -267,11 +267,8 @@ void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
   <h3>2.3 初始化、激活并调用</h3>
 <pre><code class="language-c">int main(void) {
     ejit_config_t cfg = {0};
-    cfg.compileMode = EJIT_COMPILE_SYNC; // 或 EJIT_COMPILE_ASYNC
+    cfg.compileMode = EJIT_COMPILE_ASYNC;
     cfg.optLevel = EJIT_OPT_L2;
-    cfg.maxCodeMemory = 2 * 1024 * 1024;
-    cfg.maxCacheEntries = 4096;
-    cfg.enableLogger = true;
 
     if (ejit_init(&amp;cfg) != EJIT_OK) {
         return 1;
@@ -283,7 +280,7 @@ void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
     // 激活 cell[3] 时间窗；之后 process_cell(3, ...) 可触发特化
     ejit_activate("cell", 3);
 
-    process_cell(3, 100); // 首次：同步模式编译；异步模式 fallback 并提交后台编译
+    process_cell(3, 100); // AOT on async miss
     process_cell(3, 101); // 后续：命中 cache 时执行特化版本
 
     // 修改配置时应通过生命周期函数，或手动 deactivate / activate
@@ -377,13 +374,8 @@ void update_both(EJIT_DIM(cell) uint8_t cellIdx,
   <p>当前 C API 的配置结构体位于 <code>llvm/include/llvm/ExecutionEngine/EJIT/EJitRuntime.h</code>：</p>
 
 <pre><code class="language-c">typedef struct {
-  ejit_compile_mode_t compileMode; // EJIT_COMPILE_SYNC / EJIT_COMPILE_ASYNC
+  ejit_compile_mode_t compileMode; // EJIT_COMPILE_ASYNC / EJIT_COMPILE_OFF
   ejit_opt_level_t optLevel;       // EJIT_OPT_L1 / L2 / L3
-  size_t maxCodeMemory;            // JIT 代码内存上限
-  size_t maxDataMemory;            // 数据内存上限
-  size_t maxCacheEntries;          // cache 条目数上限
-  size_t maxCacheSize;             // cache 总大小上限
-  bool enableLogger;               // 是否启用日志
   bool forceStaticRegistry;        // 裸核：强制使用静态注册表
   const char *dumpJITDir;          // 非空时输出优化后的 JIT IR
 } ejit_config_t;</code></pre>
@@ -393,16 +385,14 @@ void update_both(EJIT_DIM(cell) uint8_t cellIdx,
     <tbody>
       <tr><td><code>ejit_init(const ejit_config_t *config)</code></td><td>初始化 EJIT。传 <code>NULL</code> 使用默认配置。会消费构造期或静态表注册的 bitcode/period 信息。</td></tr>
       <tr><td><code>ejit_shutdown(void)</code></td><td>释放 EJIT 运行时资源。</td></tr>
-      <tr><td><code>ejit_set_compile_mode(mode)</code></td><td>运行期切换同步/异步编译模式。</td></tr>
-      <tr><td><code>ejit_get_compile_mode()</code></td><td>查询当前编译模式。</td></tr>
     </tbody>
   </table>
 
-  <h3>4.2 同步与异步模式</h3>
+  <h3>4.2 初始化模式</h3>
   <table>
     <thead><tr><th>模式</th><th>首次未命中行为</th><th>适用场景</th><th>注意事项</th></tr></thead>
     <tbody>
-      <tr><td><code>EJIT_COMPILE_SYNC</code></td><td>阻塞等待 JIT 编译完成，成功后直接执行特化版本</td><td>可接受首次延迟，希望尽快获得性能收益</td><td>首次调用延迟更明显</td></tr>
+      <tr><td><code>EJIT_COMPILE_OFF</code></td><td>始终执行 AOT，不启动 worker</td><td>AOT 基线</td><td>各核初始化时使用一致的模式。</td></tr>
       <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>提交后台编译，当前调用 fallback 到 AOT</td><td>对首次延迟敏感</td><td><code>EJIT_ENTRY</code> 副作用应幂等，避免首次 AOT 与后续 JIT 行为不一致</td></tr>
     </tbody>
   </table>
@@ -426,10 +416,9 @@ bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
 <pre><code class="language-c">void ejit_clear_cache(void);
 void ejit_invalidate(const char *periodName, uint8_t cellIdx);
 
-ejit_status_t ejit_get_stats(ejit_stats_t *stats);
-const ejit_error_t *ejit_get_last_error(void);</code></pre>
+ejit_status_t ejit_get_stats(ejit_stats_t *stats);</code></pre>
 
-  <p><code>ejit_stats_t</code> 包含条目数、代码大小、cache hit/miss、eviction 等信息。遇到 JIT 不生效时，建议先看 stats 和 last error，再打开 <code>dumpJITDir</code> 输出优化后 IR。</p>
+  <p><code>ejit_stats_t</code> 包含条目数、代码大小、cache hit/miss、eviction 等信息。遇到 JIT 不生效时，建议先看 API 返回值及 INFO 级诊断日志，再打开 <code>dumpJITDir</code> 输出优化后 IR。</p>
 
   <h3>4.5 外部符号注册</h3>
 <pre><code class="language-c">void ejit_register_symbol(const char *name, void *addr);</code></pre>
@@ -560,7 +549,7 @@ build_release_x86/bin/clang -O2 -g \
       <tr><td><code>!ejit.metadata</code></td><td>函数和全局变量包含 <code>EJIT_ENTRY</code>、<code>EJIT_IN_PERIOD</code>、<code>EJIT_IN_PERIOD_ARRAY</code> 等 metadata</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>标注字段的 load 指令带 may_const metadata</td></tr>
       <tr><td><code>@__ejit_bitcode</code></td><td>嵌入 bitcode 位于专用 section</td></tr>
-      <tr><td><code>ejit_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
+      <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
       <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>存在 JIT 分发路径和 AOT fallback 路径</td></tr>
       <tr><td><code>ejit_deactivate</code> / <code>ejit_activate</code></td><td>生命周期函数入口/出口插桩</td></tr>
     </tbody>
@@ -593,8 +582,7 @@ cd build_debug_x86
   <p>SRE code pool 用于替代常规 <code>mmap/mprotect</code> JIT 代码内存路径，适合对可执行内存权限有严格要求的平台。</p>
 
 <pre><code class="language-bash"># CMake 选项示意
--DEJIT_SRE_CODE_POOL=ON
--DEJIT_CODE_POOL_4K_SEAL=ON</code></pre>
+-DEJIT_SRE_CODE_POOL=ON</code></pre>
 
   <ul>
     <li>从 2MiB 对齐代码池分配 JIT 机器码；</li>
@@ -604,10 +592,10 @@ cd build_debug_x86
   </ul>
 
   <h3>8.3 SRE Taskpool</h3>
-  <p>SRE taskpool 是面向无 C++ thread 库环境的异步编译调度模式，默认关闭。它使用单 worker task、MPSC 队列、去重表和分桶 cache。跨核共享 taskpool 依赖共享内存映射、可执行权限、I/D cache 一致性和 owner 选举。</p>
+  <p>SRE taskpool 是面向无 C++ thread 库环境的异步编译调度器，始终编入。它使用单 worker task、MPSC 队列、去重表和分桶 cache。跨核共享 taskpool 依赖共享内存映射、可执行权限、I/D cache 一致性和 owner 选举。</p>
 
 <pre><code class="language-bash"># 构建选项示意
-./build.sh release aarch64_be --freestanding --sre-taskpool</code></pre>
+cmake -S llvm --preset ejit-minimal-aarch64_be</code></pre>
 
   <div class="warn"><strong>状态提示：</strong> SRE taskpool / shared taskpool 属于平台相关能力，host 单测可验证核心逻辑，但最终仍需在目标 SRE 多核环境验证共享 section、跨核执行、任务删除和 cache 一致性。</div>
 </section>
@@ -634,9 +622,9 @@ cd build_debug_x86
     <li>确认使用的是带 EJIT 的 Clang，而不是系统 Clang。</li>
     <li>确认 <code>ejit_init</code> 已在调用 <code>EJIT_ENTRY</code> 前执行。</li>
     <li>确认相关时间窗已经 <code>ejit_activate</code>。</li>
-    <li>确认编译产物中存在 <code>@__ejit_bitcode</code> 和 <code>ejit_compile_or_get</code>。</li>
+    <li>确认编译产物中存在 <code>@__ejit_bitcode</code> 和 <code>ejit_taskpool_compile_or_get</code>。</li>
     <li>裸核场景确认 registry section 没被链接器垃圾回收。</li>
-    <li>查看 <code>ejit_get_last_error()</code> 和 <code>ejit_get_stats()</code>。</li>
+    <li>查看 API 返回值及 INFO 级诊断日志。</li>
   </ol>
 
   <h3>9.3 JIT 触发但分支没有被折叠</h3>
@@ -703,7 +691,7 @@ cd build_debug_x86
   <ul>
     <li>所有 <code>EJIT_ENTRY</code> 均有 fallback 正确性测试。</li>
     <li>所有配置修改路径都有 <code>EJIT_PERIOD_GUARD</code> 或手动 deactivate/activate。</li>
-    <li>同步/异步模式下行为一致，异步首次 fallback 不影响业务副作用。</li>
+    <li>确认首次未命中的 AOT 结果与发布后的 JIT 结果一致。</li>
     <li>cache size、单函数 size、code memory 上限符合目标设备内存约束。</li>
     <li>裸核场景确认外部符号、registry section、代码内存权限、I/D cache 刷新路径。</li>
     <li>性能数据包含 cold compile、hot cache hit、fallback、失效重编译四类场景。</li>

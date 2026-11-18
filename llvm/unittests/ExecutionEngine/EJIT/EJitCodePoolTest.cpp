@@ -81,7 +81,7 @@ struct MockSre {
 EJitCodePoolManager makeManager(MockSre &M, EJitCodePoolManager::Options Opts) {
   return EJitCodePoolManager(
       Opts, [&M](size_t N) { return M.rawAlloc(N); },
-      [&M](void *B) { return M.seal(B); });
+      [&M](void *B) { return M.seal(B); }, [](void *, size_t) { return 0u; });
 }
 
 EJitCodePoolManager::Options smallOpts(size_t PoolSize = 256) {
@@ -89,6 +89,7 @@ EJitCodePoolManager::Options smallOpts(size_t PoolSize = 256) {
   O.poolSize = PoolSize;
   O.poolAlign = PoolSize; // keep raw allocations tiny for logic tests
   O.minCodeAlign = 64;
+  O.sealPageSize = 64;
   return O;
 }
 
@@ -133,86 +134,6 @@ TEST(EJitCodePool, BumpAllocatesWithinOneRWPool) {
   EXPECT_EQ(M.SealCalls, 0u);
 }
 
-// 3. Sealing a pool marks it executable and invokes enable_ex exactly once.
-TEST(EJitCodePool, SealMarksPoolExecutable) {
-  MockSre M;
-  auto Mgr = makeManager(M, smallOpts());
-
-  void *a = cantFail(Mgr.allocateCode(64, 64));
-  cantFail(Mgr.sealPoolContaining(a));
-
-  auto S = Mgr.getStats();
-  EXPECT_EQ(S.sealedCount, 1u);
-  EXPECT_EQ(S.activeCount, 0u);
-  EXPECT_EQ(S.sealInvocations, 1u);
-  EXPECT_EQ(M.SealCalls, 1u);
-  ASSERT_EQ(M.SealedBases.size(), 1u);
-}
-
-// 4. A sealed pool is never reused; the next allocation creates a new pool.
-TEST(EJitCodePool, SealedPoolNotReusedNewPoolCreated) {
-  MockSre M;
-  auto Mgr = makeManager(M, smallOpts());
-
-  void *a = cantFail(Mgr.allocateCode(64, 64));
-  cantFail(Mgr.sealPoolContaining(a));
-  void *b = cantFail(Mgr.allocateCode(64, 64));
-
-  auto S = Mgr.getStats();
-  EXPECT_EQ(S.poolCount, 2u);
-  EXPECT_EQ(S.sealedCount, 1u);
-  EXPECT_EQ(S.activeCount, 1u);
-  // b must not fall inside the first (sealed) pool's range.
-  EXPECT_GE(A(b) > A(a) ? A(b) - A(a) : A(a) - A(b), 64u);
-}
-
-// 5. Repeated seal of the same pool does not re-invoke enable_ex (idempotent).
-TEST(EJitCodePool, RepeatedSealNoDuplicateEnableEx) {
-  MockSre M;
-  auto Mgr = makeManager(M, smallOpts());
-
-  void *a = cantFail(Mgr.allocateCode(64, 64));
-  void *b = cantFail(Mgr.allocateCode(64, 64)); // same pool as a
-
-  cantFail(Mgr.sealPoolContaining(a));
-  EXPECT_EQ(M.SealCalls, 1u);
-  cantFail(Mgr.sealPoolContaining(b)); // already sealed → no-op success
-  EXPECT_EQ(M.SealCalls, 1u);
-  EXPECT_EQ(Mgr.getStats().sealInvocations, 1u);
-}
-
-// 6. enable_ex failure surfaces as an Error and the pool stays writable.
-TEST(EJitCodePool, EnableExFailureReturnsError) {
-  MockSre M;
-  auto Mgr = makeManager(M, smallOpts());
-
-  void *a = cantFail(Mgr.allocateCode(64, 64));
-  M.SealRc = 7; // make enable_ex fail
-
-  Error Err = Mgr.sealPoolContaining(a);
-  EXPECT_TRUE(static_cast<bool>(Err));
-  consumeError(std::move(Err));
-
-  auto S = Mgr.getStats();
-  EXPECT_EQ(S.sealedCount, 0u); // still RW, not sealed
-  EXPECT_EQ(S.sealInvocations, 0u);
-}
-
-// 6b. A seal failure during full-pool rollover propagates out of allocateCode.
-TEST(EJitCodePool, RolloverSealFailurePropagates) {
-  MockSre M;
-  auto Mgr = makeManager(M, smallOpts(/*PoolSize=*/256));
-
-  // Fill the 256-byte pool with four 64-byte blocks (offsets 0/64/128/192).
-  for (int i = 0; i < 4; ++i)
-    (void)cantFail(Mgr.allocateCode(64, 64));
-
-  M.SealRc = 9; // the rollover seal of the full pool will fail
-  auto E = Mgr.allocateCode(64, 64);
-  EXPECT_FALSE(static_cast<bool>(E));
-  consumeError(E.takeError());
-}
-
 // 7. A request larger than the pool size is rejected cleanly (no allocation).
 TEST(EJitCodePool, OversizeRequestCleanReject) {
   MockSre M;
@@ -232,39 +153,18 @@ TEST(EJitCodePool, StatsAreAccurate) {
   MockSre M;
   auto Mgr = makeManager(M, smallOpts(/*PoolSize=*/4096));
 
-  (void)cantFail(Mgr.allocateCode(100, 64));     // off 0,   used 100
-  void *b = cantFail(Mgr.allocateCode(200, 64)); // off 128, used 328
+  (void)cantFail(Mgr.allocateCode(100, 64));
+  void *b = cantFail(Mgr.allocateCode(200, 64));
 
   auto S = Mgr.getStats();
   EXPECT_EQ(S.poolCount, 1u);
   EXPECT_EQ(S.reservedBytes, 4096u);
-  EXPECT_EQ(S.usedBytes, 328u);
+  EXPECT_EQ(S.usedBytes, 384u);
   EXPECT_EQ(S.sealedCount, 0u);
   EXPECT_EQ(S.wastedBytes, 0u); // active pool tail is not counted as wasted
 
-  cantFail(Mgr.sealPoolContaining(b));
-  S = Mgr.getStats();
-  EXPECT_EQ(S.sealedCount, 1u);
-  EXPECT_EQ(S.wastedBytes, 4096u - 328u); // sealed tail is wasted
-}
-
-// Strategy case 3: a full active pool is sealed automatically before a new
-// pool is created on the next allocation.
-TEST(EJitCodePool, FullPoolSealedOnRollover) {
-  MockSre M;
-  auto Mgr = makeManager(M, smallOpts(/*PoolSize=*/256));
-
-  for (int i = 0; i < 4; ++i)
-    (void)cantFail(Mgr.allocateCode(64, 64)); // fills the pool exactly
-
-  EXPECT_EQ(M.SealCalls, 0u);
-  void *e = cantFail(Mgr.allocateCode(64, 64)); // triggers seal + new pool
-  EXPECT_TRUE(Mgr.contains(e));
-
-  auto S = Mgr.getStats();
-  EXPECT_EQ(S.poolCount, 2u);
-  EXPECT_EQ(S.sealedCount, 1u);
-  EXPECT_EQ(M.SealCalls, 1u);
+  cantFail(Mgr.sealCodeRange(b, 200));
+  EXPECT_EQ(Mgr.getStats().sealInvocations, 4u);
 }
 
 // Larger alignment requests are honored.
@@ -277,29 +177,12 @@ TEST(EJitCodePool, RespectsLargerAlignment) {
   EXPECT_EQ(A(b) % 256u, 0u);
 }
 
-// sealAllWritablePools seals every still-writable pool.
-TEST(EJitCodePool, SealAllWritablePools) {
-  MockSre M;
-  auto Mgr = makeManager(M, smallOpts());
-
-  void *a = cantFail(Mgr.allocateCode(64, 64));
-  cantFail(Mgr.sealPoolContaining(a));      // pool 1 sealed
-  (void)cantFail(Mgr.allocateCode(64, 64)); // pool 2 active
-
-  cantFail(Mgr.sealAllWritablePools());
-  auto S = Mgr.getStats();
-  EXPECT_EQ(S.poolCount, 2u);
-  EXPECT_EQ(S.sealedCount, 2u);
-  EXPECT_EQ(S.activeCount, 0u);
-  EXPECT_EQ(M.SealCalls, 2u); // pool 1 not re-sealed
-}
-
 // An address not owned by any pool cannot be sealed.
 TEST(EJitCodePool, SealUnknownAddressFails) {
   MockSre M;
   auto Mgr = makeManager(M, smallOpts());
   int OnStack = 0;
-  Error Err = Mgr.sealPoolContaining(&OnStack);
+  Error Err = Mgr.sealCodeRange(&OnStack, 1);
   EXPECT_TRUE(static_cast<bool>(Err));
   consumeError(std::move(Err));
 }
@@ -385,7 +268,6 @@ EJitCodePoolManager::Options fourKOpts() {
   O.poolSize = kTwoMiB;
   O.poolAlign = kTwoMiB;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kFourKiB;
   return O;
 }
@@ -529,38 +411,6 @@ TEST(EJitCodePool4K, RolloverCreatesNewPoolAndSplitsAgain) {
   EXPECT_EQ(S.splitInvocations, 2u); // one split per pool
   EXPECT_EQ(M.SealCalls, 0u);        // no whole-pool seal on rollover
   EXPECT_EQ(S.sealedCount, 0u);
-}
-
-// In 4K mode the whole-pool seal entry point sealPoolContaining is unsupported
-// (a bare pointer has no size); it must return an Error and never enable_ex.
-TEST(EJitCodePool4K, SealPoolContainingReturnsErrorIn4KMode) {
-  MockSre4K M;
-  auto Mgr = makeManager4K(M, fourKOpts());
-
-  void *P = cantFail(Mgr.allocateCode(100, 64));
-  Error Err = Mgr.sealPoolContaining(P);
-  EXPECT_TRUE(static_cast<bool>(Err));
-  consumeError(std::move(Err));
-
-  // No enable_ex was invoked and the pool was not marked sealed.
-  EXPECT_EQ(M.SealCalls, 0u);
-  EXPECT_EQ(Mgr.getStats().sealInvocations, 0u);
-  EXPECT_EQ(Mgr.getStats().sealedCount, 0u);
-}
-
-// In 4K mode sealAllWritablePools (whole-pool sealing) is unsupported and must
-// return an Error rather than silently sealing or no-op succeeding.
-TEST(EJitCodePool4K, SealAllWritablePoolsReturnsErrorIn4KMode) {
-  MockSre4K M;
-  auto Mgr = makeManager4K(M, fourKOpts());
-
-  (void)cantFail(Mgr.allocateCode(100, 64));
-  Error Err = Mgr.sealAllWritablePools();
-  EXPECT_TRUE(static_cast<bool>(Err));
-  consumeError(std::move(Err));
-
-  EXPECT_EQ(M.SealCalls, 0u);
-  EXPECT_EQ(Mgr.getStats().sealedCount, 0u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -732,6 +582,7 @@ TEST(EJitCodePoolFixed, CarvesAlignedPoolsWithoutAlloc) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
+  O.sealPageSize = kAlign;
   O.fixedBase = reinterpret_cast<uintptr_t>(Region);
   O.fixedSize = kRegion;
 
@@ -767,6 +618,7 @@ TEST(EJitCodePoolFixed, ExhaustsCleanly) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
+  O.sealPageSize = kAlign;
   O.fixedBase = reinterpret_cast<uintptr_t>(Region);
   O.fixedSize = kRegion;
 
@@ -797,7 +649,6 @@ TEST(EJitCodePoolFixed, StillSplitsAndSealsIn4KMode) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kPage;
   O.fixedBase = reinterpret_cast<uintptr_t>(Region);
   O.fixedSize = kRegion;
@@ -840,6 +691,7 @@ TEST(EJitCodePoolFixed, AlignsMisalignedBase) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
+  O.sealPageSize = kAlign;
   O.fixedBase = MisalignedBase;
   O.fixedSize = 1024;
 
@@ -874,7 +726,6 @@ TEST(EJitCodePoolFixed, EnableRwRangeFlipsCoveredPages) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kPage;
   O.fixedBase = reinterpret_cast<uintptr_t>(Region);
   O.fixedSize = kRegion;
@@ -887,6 +738,7 @@ TEST(EJitCodePoolFixed, EnableRwRangeFlipsCoveredPages) {
   void *P = cantFail(Mgr.allocateCode(384, 64));
   cantFail(Mgr.enableRwRange(P, 384));
   EXPECT_EQ(M.RwEnableCalls, 2u);
+  EXPECT_EQ(Mgr.getStats().rwEnableInvocations, 2u);
   ASSERT_EQ(M.RwEnabledPages.size(), 2u);
   EXPECT_EQ(M.RwEnabledPages[0], A(P));
   EXPECT_EQ(M.RwEnabledPages[1], A(P) + kPage);
@@ -907,7 +759,6 @@ TEST(EJitCodePoolFixed, EnableRwRangeNoOpWhenNotNeeded) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kPage;
   O.fixedBase = reinterpret_cast<uintptr_t>(Region);
   O.fixedSize = kRegion;
@@ -919,6 +770,7 @@ TEST(EJitCodePoolFixed, EnableRwRangeNoOpWhenNotNeeded) {
   void *P = cantFail(Mgr.allocateCode(128, 64));
   cantFail(Mgr.enableRwRange(P, 128));
   EXPECT_EQ(M.RwEnableCalls, 0u);
+  EXPECT_EQ(Mgr.getStats().rwEnableInvocations, 0u);
   EXPECT_TRUE(M.RwEnabledPages.empty());
 }
 
@@ -937,7 +789,6 @@ TEST(EJitCodePoolFixed, EnableRwRangeFailsOnRc) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kPage;
   O.fixedBase = reinterpret_cast<uintptr_t>(Region);
   O.fixedSize = kRegion;
@@ -951,6 +802,7 @@ TEST(EJitCodePoolFixed, EnableRwRangeFailsOnRc) {
   Error E = Mgr.enableRwRange(P, 128);
   EXPECT_TRUE(bool(E)) << "enable_rw failure must propagate as an Error";
   consumeError(std::move(E));
+  EXPECT_EQ(Mgr.getStats().rwEnableInvocations, 0u);
 }
 
 // A range whose first byte is owned but whose end crosses the pool boundary
@@ -967,7 +819,6 @@ TEST(EJitCodePoolFixed, PermissionRangeCannotCrossPoolBoundary) {
   O.poolSize = kPool;
   O.poolAlign = kAlign;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kAlign;
   O.fixedBase = reinterpret_cast<uintptr_t>(Region);
   O.fixedSize = kRegion;
@@ -986,6 +837,37 @@ TEST(EJitCodePoolFixed, PermissionRangeCannotCrossPoolBoundary) {
   EXPECT_TRUE(bool(SealErr));
   consumeError(std::move(SealErr));
   EXPECT_EQ(M.SealCalls, 0u);
+}
+
+TEST(EJitCodePool4K, RestoreAttemptsRemainingPagesAfterFailure) {
+  MockSre4K M;
+  auto O = fourKOpts();
+  O.needsEnableRw = true;
+  auto Mgr = makeManager4K(M, O);
+  auto *P = static_cast<char *>(cantFail(Mgr.allocateCode(3 * kFourKiB, 64)));
+  M.FailSealOnCall = 2;
+  Error Err = Mgr.restoreRxRange(P + 1, 2 * kFourKiB);
+  ASSERT_TRUE(static_cast<bool>(Err));
+  consumeError(std::move(Err));
+  EXPECT_EQ(M.SealCalls, 3u);
+  EXPECT_EQ(M.SealedPages, (std::vector<uintptr_t>{A(P), A(P) + 2 * kFourKiB}));
+}
+
+TEST(EJitCodePoolBatch, RejectsOverflowBeforeRecordingOrSealing) {
+  MockSre4K M;
+  auto O = fourKOpts();
+  O.batchedPageSeal = true;
+  auto Mgr = makeManager4K(M, O);
+  void *P = cantFail(Mgr.allocateCode(64, 16));
+  EJitWritableRange W{A(P), 1};
+  EXPECT_FALSE(Mgr.recordPendingRange(P, 64, &W, kEJitMaxWritableRanges + 1));
+  EXPECT_FALSE(Mgr.recordPendingRange(P, SIZE_MAX));
+  EXPECT_FALSE(Mgr.recordPendingRange(P, O.poolSize + 1));
+  EXPECT_EQ(Mgr.pendingRangeCount(), 0u);
+  cantFail(Mgr.flushPendingRanges());
+  EXPECT_EQ(M.SealCalls, 0u);
+  EJitCompiledCodeInfo Info{};
+  EXPECT_FALSE(Mgr.findRange(P, Info));
 }
 
 TEST(EJitCodePoolBatch, PacksRangesAndStartsFreshPageAfterFlush) {

@@ -5,7 +5,7 @@
  *   1. PGO enabled, init in Async mode (starts background std::thread worker).
  *   2. Activate period instance, call ejit_entry function (cache miss).
  *   3. Tier-1 (Instrumented) compiles with __profc_/__profd_ counters.
- *   4. Hit the function to cross the PGO threshold (default=3).
+ *   4. Sample half of the default quota, inspect it, then reach the full quota.
  *      The background worker's pollOne() processes the deferred Tier-2
  *      request inside its PGO handler.
  *   5. Wait for the worker, then verify Tier-2 happened (asyncCompiles >= 2).
@@ -43,18 +43,17 @@ int main(int argc, char **argv) {
   ejit_default_config(&cfg);
   printf("PGO enabled, mode=%d\n", (int)cfg.compileMode);
 
-  // Online PGO is opted in through the dedicated, ABI-stable ejit_init_pgo()
-  // entry point (ejit_config_t keeps its original layout — no enablePgo tail
-  // field). Plain ejit_init() would run with PGO off.
+  // PGO is selected by the entry point, not by a config field.
   int rc = (int)ejit_init_pgo(&cfg);
   if (rc != EJIT_OK) {
     printf("FAIL: ejit_init_pgo=%d\n", rc);
     return 1;
   }
 
-  ejit_activate("cell", ci);
+  if (ci >= 4) return 1;
   g_cells[ci].cellType = 0xFF;
   g_cells[ci].data = 42;
+  ejit_activate("cell", ci);
 
   // Tier-1: cache miss -> Instrumented compile.
   uint32_t r = pgo_branch(ci);
@@ -70,11 +69,13 @@ int main(int argc, char **argv) {
     printf("Tier-1 OK (compiles=%lu)\n", ts.asyncCompiles);
   }
 
-  // Hit the function to cross the PGO threshold (default=3).
-  // The background worker will process the deferred Tier-2 request.
-  for (int i = 0; i < 5; ++i) {
+  // Inspect live progress once without participating in sampling.
+  enum { DefaultQuota = 64 };
+  for (int i = 0; i < DefaultQuota; ++i) {
     r = pgo_branch(ci);
     if (r != 142) { printf("FAIL: hit %d -> %u\n", i + 1, r); return 1; }
+    if (i + 1 == DefaultQuota / 2)
+      ejit_taskpool_print_compiled();
   }
 
   // Wait for the worker to process Tier-2.

@@ -1,12 +1,10 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
-
-; A bound pointer uses the generic bound slow-path API even when fixed-dim
-; entries are enabled. The ordinary icache hit path remains outside this call.
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
+;
+; A bound-pointer miss passes its descriptor to the bound lookup API.
 
 ; CHECK-LABEL: define i32 @bound_entry(i32 %cell, ptr %cfg, i32 %input)
 ; CHECK: jit_call:
 ; CHECK: call i32 @ejit_taskpool_compile_or_get_bound(i32 {{.*}}, ptr {{.*}}, i32 1, ptr %cfg, i32 12, i32 1, ptr {{.*}}, ptr {{.*}})
-; CHECK-NOT: call i32 @ejit_taskpool_compile_or_get_1d
 
 define i32 @bound_entry(i32 %cell, ptr %cfg, i32 %input) !ejit.metadata !0 {
 entry:

@@ -7,10 +7,17 @@
 //===----------------------------------------------------------------------===//
 //
 // Global constant array entry type for bare-metal auto-registration.
-// PASS1/PASS2 emit per-translation-unit arrays of these entries into the
-// ".ejit_bitcode" / ".ejit_period" sections; the linker concatenates them and
-// a linker script brackets the sections with __start_/__stop_ symbols that
-// ejit_init() walks when constructor-based registration is unavailable.
+// Each translation unit emits private arrays, avoiding duplicate external
+// definitions when several units contain ejit_entry functions. The linker
+// concatenates their entries into two ranges, with no terminator needed:
+//   .ejit_bitcode: PASS1 embedded bitcode and symbol registrations
+//   .ejit_period:  PASS2 period arrays and static variables; PASS3 lifecycle,
+//                  dense function index, and inline cache slot fixups
+// Static registration walks [__start_ejit_bitcode, __stop_ejit_bitcode) and
+// [__start_ejit_period, __stop_ejit_period). Dotted section names are not C
+// identifiers, so a linker script must supply these boundaries. Hosted builds
+// use weak references so missing ranges are empty; freestanding builds use
+// strong references to avoid a GOT relocation and require the linker script.
 //
 //===----------------------------------------------------------------------===//
 

@@ -118,6 +118,11 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
 private:
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
+  template <typename ModuleT, typename OnLoad>
+  std::vector<EJitMayConstLoadSite> inventory(ModuleT &M, OnLoad Found) const;
+#endif
+
   PeriodArrayRegistry &registry_;
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;
   std::string boundRootFunction_;

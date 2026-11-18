@@ -277,7 +277,6 @@ int main(int argc, char **argv) {
 
   // Verify the async path actually compiled (not silent AOT fallback).
   ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   {
     ejit_taskpool_stats_t ts;
     memset(&ts, 0, sizeof(ts));
@@ -287,7 +286,6 @@ int main(int argc, char **argv) {
       g_failures++;
     }
   }
-#endif
 
   // Shutdown
   ejit_shutdown();

@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-aot-module -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-aot-module -S %s | FileCheck %s
 
 ; Test: Full AOT pipeline on a comprehensive module.
 
@@ -22,12 +22,12 @@
 ; CHECK: jit_call:
 ; CHECK: load i32, ptr @__ejit_dimtype_cell
 ; CHECK: load i32, ptr @__ejit_dimtype_trp
-; CHECK: call i32 @ejit_taskpool_compile_or_get_2d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 2, ptr {{.*}}, ptr {{.*}})
 
 ; CHECK: define{{.*}}@process_static
 ; CHECK: jit_entry:
 ; CHECK: load i32, ptr @__ejit_funcidx_process_static
-; CHECK: call i32 @ejit_taskpool_compile_or_get_0d(i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr null, i32 0, ptr {{.*}}, ptr {{.*}})
 
 ; CHECK: define{{.*}}@update_config
 ; CHECK: call void @ejit_deactivate

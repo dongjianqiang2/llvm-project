@@ -81,12 +81,10 @@ int main(int argc, char **argv) {
   //===-- 1. ejit_is_active: 未激活时返回 false -----------------------------===//
   printf("--- 1. is_active (未激活, ci=%u ci2=%u) ---\n", ci, ci2);
   ejit_init(0);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // The shared taskpool auto-activates all registered periods on init; reset to
   // a known-clean state before testing per-index activation semantics.
   ejit_deactivate_all("cell");
   ejit_deactivate_all("single");
-#endif
   T(!ejit_is_active("cell", ci),  "cell[%u] NOT active before activate", ci);
   T(!ejit_is_active("cell", ci2), "cell[%u] NOT active before activate", ci2);
   T(!ejit_is_active("trp",  ci),  "unknown period returns false");
@@ -177,19 +175,12 @@ int main(int argc, char **argv) {
   //===-- 8. 边界测试 ---------------------------------------------------------===//
   printf("\n--- 8. 边界测试 ---\n");
 
-#ifdef EJIT_SRE_TASKPOOL
   // A taskpool build cleanly rejects an unknown period name (neither a registered
   // lifecycle nor a registered period array); the legacy build silently succeeds.
   rc = ejit_activate("unknown_period", ci);
   T(rc != 0, "activate(unknown, %u) rejected rc=%d (unknown period)", ci, rc);
   rc = ejit_deactivate("unknown_period", ci);
   T(rc != 0, "deactivate(unknown, %u) rejected rc=%d (unknown period)", ci, rc);
-#else
-  rc = ejit_activate("unknown_period", ci);
-  T(rc == 0, "activate(unknown, %u) returns %d (safe)", ci, rc);
-  rc = ejit_deactivate("unknown_period", ci);
-  T(rc == 0, "deactivate(unknown, %u) returns %d (safe)", ci, rc);
-#endif
   T(!ejit_is_active("never_active", ci), "unknown period not active");
 
   ejit_shutdown();

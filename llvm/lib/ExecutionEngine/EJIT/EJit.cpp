@@ -1,13 +1,13 @@
 //===-- EJit.cpp - EmbeddedJIT Main C++ API -------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
+#include "EJitCodePoolCounters.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h" // SECT_EJIT_* section names
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
-#include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
@@ -58,26 +58,15 @@ extern const ejit_reg_entry_t __stop_ejit_period[];
 }
 
 EJit::EJit(const Config &config) : config_(config) {
-  EJIT_DIAG_VERBOSE("constructing: mode=%d opt=%d maxCache=%zu maxEntries=%u",
-                    (int)config.compileMode, (int)config.optLevel,
-                    config.maxCacheSize, (unsigned)config.maxCacheEntries);
+  EJIT_DIAG_VERBOSE("constructing: mode=%d opt=%d", (int)config.compileMode,
+                    (int)config.optLevel);
 
   // Create all runtime components
   runtimeState_ = std::make_unique<EJitRuntimeState>();
   moduleLoader_ = std::make_unique<EJitModuleLoader>();
 
-#ifndef EJIT_FREESTANDING
-  if (config.enableLogger)
-    logger_ = std::make_unique<EJitLogger>();
-#endif
-
-#ifndef EJIT_FREESTANDING
-  EJitLogger *logger = logger_.get();
-#else
-  EJitLogger *logger = nullptr;
-#endif
   compileDriver_ = std::make_unique<EJitCompileDriver>(
-      config_, *runtimeState_, *moduleLoader_, logger);
+      config_, *runtimeState_, *moduleLoader_);
 
   // Consume registration data from the staging store (constructor path).
   StoredData data = EJitRegistrationStore::instance().consume();
@@ -286,47 +275,12 @@ EJit::EJit(const Config &config) : config_(config) {
       reinterpret_cast<void *>(&ejit_vp_record_scalar));
 #endif
 
-  // Build the ORC engine. On the shared-taskpool async path this is DEFERRED to
-  // the core that wins the owner election: only the owner's worker ever invokes
-  // the compile callback, so every other core would construct an LLJIT
-  // (ExecutionSession, object/IR layers, LLVMContext, memory manager) and never
-  // use it. The driver's owner-elected hook, armed for the pool's lifetime, is
-  // what lets the engine follow whoever wins, whenever they win.
-  //
-  // Sync mode compiles on the CALLING core, so there every core genuinely needs
-  // its own engine; only the async shared path funnels all compiles through the
-  // elected owner. Anything else builds it eagerly, exactly as before.
-  bool deferEngineToOwner = false;
-#if defined(EJIT_SRE_TASKPOOL) && defined(EJIT_SRE_SHARED_TASKPOOL)
-  deferEngineToOwner = (config_.compileMode == CompileMode::Async);
-#endif
-  bool engineReady =
-      deferEngineToOwner ? false : compileDriver_->ensureJitEngine();
-
-#ifdef EJIT_SRE_TASKPOOL
-  // Deferred worker start (spec §3.4 single async worker): the taskpool worker
-  // is created stopped (autoStartWorker=false) and only starts HERE, after all
-  // registration data is consumed, the funcIndex/lifecycle fixup is done, and
-  // there is no init failure. Registration is frozen first so the running
-  // worker never races a lock-free registry write. Sync maps to taskpool Off
-  // and does not need a worker. Async requires both a ready engine and a
-  // successfully started worker; otherwise init fails instead of accepting
-  // requests that can never be consumed.
+  // Freeze registration before starting the shared worker. Off neither attaches
+  // to the shared state nor constructs an ORC engine.
   if (!initFailed_) {
     regPhase_ = RegistrationPhase::Frozen;
     if (config_.compileMode == CompileMode::Async) {
-      EJIT_DIAG_VERBOSE("taskpool async init: engineReady=%u deferred=%u",
-                        static_cast<unsigned>(engineReady),
-                        static_cast<unsigned>(deferEngineToOwner));
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-      // Cross-core shared taskpool: run owner election and (if elected) build
-      // the engine and start the ONE shared worker. engineReady is still false
-      // on EVERY core here -- the engine is created inside init() by the
-      // driver's owner-elected hook, and only on the winner. A clean failure
-      // (engine build / worker start / ABI mismatch) fails init rather than
-      // accepting requests no worker consumes.
       bool poolOk = compileDriver_->startSharedTaskPool();
-      engineReady = compileDriver_->hasJitEngine();
       if (!poolOk) {
         // Distinguish "the engine failed to build on the winner" from a genuine
         // election/ABI failure -- the pool records which in lastInitError, and
@@ -353,53 +307,31 @@ EJit::EJit(const Config &config) : config_(config) {
                 "(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)";
 #endif
         recordInitError(EJIT_ERR_COMPILE_FAILED, msg, "");
-      } else if (!engineReady) {
+      } else if (!compileDriver_->hasJitEngine()) {
         // Attached as a peer: no engine here by design. Stated explicitly so
         // the absence of "OrcJIT engine created" in a log is a recorded fact
         // rather than something to infer.
         EJIT_DIAG("ORC engine skipped: not the compile owner");
-      }
-#else
-      if (!engineReady)
-        recordInitError(EJIT_ERR_COMPILE_FAILED,
-                        "Async mode requires a ready ORC engine", "");
-      else if (!compileDriver_->startTaskPoolWorker())
-        recordInitError(EJIT_ERR_COMPILE_FAILED,
-                        "taskpool worker failed to start", "");
-#endif
-      else {
+      } else {
         EJIT_DIAG("taskpool async init complete: worker running");
         // PGO and the default-off profile audit share the temporary
         // Instrumented-tier hit window. Audit-only mode publishes ordinary
         // Baseline code after collecting the window.
         if (config_.enablePgo || config_.enableProfileAudit) {
           constexpr uint32_t kDefaultPgoThreshold = 64;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
           compileDriver_->sharedTaskPool()->setPgoEnabled(
               true, kDefaultPgoThreshold);
-#else
-          compileDriver_->taskPool()->setPgoEnabled(true, kDefaultPgoThreshold);
-#endif
         }
       }
     } else {
-      EJIT_DIAG_VERBOSE("taskpool sync init complete: worker remains stopped");
+      EJIT_DIAG_VERBOSE("taskpool off: AOT only");
     }
   }
-#else
-  (void)engineReady;
-#endif
 }
 
 EJit::~EJit() {
-  // Destroy in reverse order (compile driver holds references to other
-  // components)
+  // Stop and join the worker before tearing down anything it borrows.
   compileDriver_.reset();
-  moduleLoader_.reset();
-#ifndef EJIT_FREESTANDING
-  logger_.reset();
-#endif
-  runtimeState_.reset();
 }
 
 void EJit::recordInitError(int code, const std::string &message,
@@ -422,7 +354,6 @@ void EJit::recordInitError(int code, const std::string &message,
 bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
   if (cellIdx >= kEJitMaxInstances)
     return false;
-#ifdef EJIT_SRE_TASKPOOL
   // Taskpool build: a registered lifecycle updates the time-window activation
   // state AND the SwitchController (kept consistent; setEnabled bumps the
   // version only when the enabled bit actually flips). A name that is a
@@ -431,7 +362,6 @@ bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
   // no state change.
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     // Cross-core: activation is a SHARED fact. Write the shared enabled/version
     // (visible to the owner worker, which compiles on a different core). The
     // owner-private runtimeState_ is NOT the JIT gate's source of truth here.
@@ -440,13 +370,7 @@ bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
     // period instance. setEnabled(true) flips 0->1 + bumps version on first
     // activate; it is a no-op while already active, until a deactivate flips
     // the bit back.
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setInstanceEnabled(dt, cellIdx, /*enabled=*/true);
-#else
-    runtimeState_->activate(periodName, cellIdx);
-    if (EJitTaskPool *tp = taskPool())
-      tp->switchController().setEnabled(dt, cellIdx, /*wantOn=*/true);
-#endif
+    sharedTaskPool()->setInstanceEnabled(dt, cellIdx, /*enabled=*/true);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -456,32 +380,20 @@ bool EJit::activate(const std::string &periodName, uint32_t cellIdx) {
   }
   runtimeState_->activate(periodName, cellIdx);
   return true;
-#else
-  runtimeState_->activate(periodName, cellIdx);
-  return true;
-#endif
 }
 
 bool EJit::deactivate(const std::string &periodName, uint32_t cellIdx) {
   if (cellIdx >= kEJitMaxInstances)
     return false;
-#ifdef EJIT_SRE_TASKPOOL
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     // Cross-core: deactivation writes the shared enabled/version. The version
     // bump drives the three-layer lazy invalidation (producer early-reject,
     // worker checkpoint discard, cache-lookup version-mismatch miss) — see
     // shared compileOrGet / runCompile / cacheLookup. invalidateByPeriod below
     // still drains the per-instance LRU; the shared POD cache is invalidated by
     // version alone.
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setInstanceEnabled(dt, cellIdx, /*enabled=*/false);
-#else
-    runtimeState_->deactivate(periodName, cellIdx);
-    if (EJitTaskPool *tp = taskPool())
-      tp->switchController().setEnabled(dt, cellIdx, /*wantOn=*/false);
-#endif
+    sharedTaskPool()->setInstanceEnabled(dt, cellIdx, /*enabled=*/false);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -491,27 +403,14 @@ bool EJit::deactivate(const std::string &periodName, uint32_t cellIdx) {
   }
   runtimeState_->deactivate(periodName, cellIdx);
   return true;
-#else
-  runtimeState_->deactivate(periodName, cellIdx);
-  return true;
-#endif
 }
 
 bool EJit::activateAll(const std::string &periodName) {
-#ifdef EJIT_SRE_TASKPOOL
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     // One batched call: the per-instance entry point drains the whole cell
     // table each time, so looping it here cost MAX_INSTANCES full drains.
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setAllInstancesEnabled(dt, /*enabled=*/true);
-#else
-    runtimeState_->activateAll(periodName);
-    if (EJitTaskPool *tp = taskPool())
-      for (uint32_t i = 0; i < EJitSwitchController::MAX_INSTANCES; ++i)
-        tp->switchController().setEnabled(dt, i, /*wantOn=*/true);
-#endif
+    sharedTaskPool()->setAllInstancesEnabled(dt, /*enabled=*/true);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -520,25 +419,12 @@ bool EJit::activateAll(const std::string &periodName) {
   }
   runtimeState_->activateAll(periodName);
   return true;
-#else
-  runtimeState_->activateAll(periodName);
-  return true;
-#endif
 }
 
 bool EJit::deactivateAll(const std::string &periodName) {
-#ifdef EJIT_SRE_TASKPOOL
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
   if (dt != kEJitInvalidDimType) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-    if (EJitSharedTaskPool *sp = sharedTaskPool())
-      sp->setAllInstancesEnabled(dt, /*enabled=*/false);
-#else
-    runtimeState_->deactivateAll(periodName);
-    if (EJitTaskPool *tp = taskPool())
-      for (uint32_t i = 0; i < EJitSwitchController::MAX_INSTANCES; ++i)
-        tp->switchController().setEnabled(dt, i, /*wantOn=*/false);
-#endif
+    sharedTaskPool()->setAllInstancesEnabled(dt, /*enabled=*/false);
     return true;
   }
   if (!runtimeState_->getRegistry().getArrays(periodName)) {
@@ -547,10 +433,6 @@ bool EJit::deactivateAll(const std::string &periodName) {
   }
   runtimeState_->deactivateAll(periodName);
   return true;
-#else
-  runtimeState_->deactivateAll(periodName);
-  return true;
-#endif
 }
 
 bool EJit::isActive(const std::string &periodName, uint32_t cellIdx) const {
@@ -558,18 +440,14 @@ bool EJit::isActive(const std::string &periodName, uint32_t cellIdx) const {
   // cellIdx, and a truncated 256 would silently read instance 0.
   if (cellIdx >= kEJitMaxInstances)
     return false;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // Cross-core: a registered lifecycle's activation lives in the shared
   // enabled bit (the producer's ejit_activate writes it). Query that, not the
   // owner-private runtimeState_, so ejit_is_active returns the same fact the
   // producer sees and the worker gates on. A non-lifecycle period name (a
   // plain period array without a dimType) still consults the private state.
   uint32_t dt = EJitLifecycleRegistry::instance().lookup(periodName);
-  if (dt != kEJitInvalidDimType) {
-    if (const EJitSharedTaskPool *sp = sharedTaskPool())
-      return sp->isInstanceActive(dt, cellIdx);
-  }
-#endif
+  if (dt != kEJitInvalidDimType)
+    return sharedTaskPool()->isInstanceActive(dt, cellIdx);
   // Cell-index range already validated above; the private state still takes a
   // uint8_t (its tables are sized kEJitMaxInstances, keyed by the validated
   // index), so the narrowing here is provably safe.
@@ -593,8 +471,7 @@ void EJit::invalidateAllByPeriod(const std::string &periodName) {
 }
 
 void EJit::registerSymbol(const std::string &name, void *addr) {
-  if (compileDriver_)
-    compileDriver_->registerSymbol(name, addr);
+  compileDriver_->registerSymbol(name, addr);
 }
 
 bool EJit::registerBitcode(const std::string &funcName, const uint8_t *data,
@@ -602,11 +479,6 @@ bool EJit::registerBitcode(const std::string &funcName, const uint8_t *data,
   // Post-init runtime registration. The bool propagates to the caller (the C
   // ABI records a failure into the registration-error sink); construction-time
   // registration validates separately in the constructor (recordInitError).
-  if (!moduleLoader_) {
-    EJIT_DIAG("registerBitcode reject func=%s: no module loader", funcName.c_str());
-    return false;
-  }
-#ifdef EJIT_SRE_TASKPOOL
   // Frozen after init: the worker reads the loader/registries lock-free, so no
   // runtime registration is allowed (nothing is mutated on rejection).
   if (registrationFrozen()) {
@@ -614,153 +486,30 @@ bool EJit::registerBitcode(const std::string &funcName, const uint8_t *data,
               funcName.c_str());
     return false;
   }
-#endif
   return moduleLoader_->registerBitcode(funcName, data, size);
 }
 
 bool EJit::registerPeriodArray(const std::string &periodName,
                                const std::string &varName, void *baseAddr,
                                uint64_t arraySize) {
-  if (!runtimeState_) {
-    EJIT_DIAG("registerPeriodArray reject period=%s: no runtime state",
-              periodName.c_str());
-    return false;
-  }
-#ifdef EJIT_SRE_TASKPOOL
   if (registrationFrozen()) {
     EJIT_DIAG("registerPeriodArray reject period=%s: registration frozen",
               periodName.c_str());
     return false;
   }
-#endif
   runtimeState_->getRegistry().registerArray(periodName, varName, baseAddr,
                                              arraySize);
   return true;
 }
 
 bool EJit::registerStaticVar(const std::string &varName, void *varAddr) {
-  if (!runtimeState_) {
-    EJIT_DIAG("registerStaticVar reject var=%s: no runtime state",
-              varName.c_str());
-    return false;
-  }
-#ifdef EJIT_SRE_TASKPOOL
   if (registrationFrozen()) {
     EJIT_DIAG("registerStaticVar reject var=%s: registration frozen",
               varName.c_str());
     return false;
   }
-#endif
   runtimeState_->getRegistry().registerStaticVar(varName, varAddr);
   return true;
-}
-
-bool EJit::setCompileMode(CompileMode mode) {
-  EJitTaskPool *tp = taskPool();
-  if (!tp)
-    return false;
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // The generation asyncServiceAvailable() validated, so the publish below can
-  // only commit against the same one.
-  uint32_t serviceGen = 0;
-#endif
-
-  if (mode == CompileMode::Async) {
-    // Do not expose Async until a compiler and a consumer exist. Failure
-    // preserves the old mode, so callers cannot enqueue permanent pending work
-    // into a taskpool nothing drains.
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-    // A peer has NO local engine by design -- the elected owner compiles for
-    // every core -- so gating on the private engine would make Async
-    // unreachable on every non-owner core, including an idempotent
-    // setCompileMode(Async) and any switch back after a flip to Sync. A Ready
-    // blob with an elected owner running the single worker is exactly the
-    // condition under which a request enqueued from here gets compiled.
-    if (!compileDriver_->sharedTaskPool()->asyncServiceAvailable(&serviceGen)) {
-      EJIT_DIAG("compile mode switch rejected: shared pool cannot service "
-                "async (not Ready / no owner / no worker)");
-      return false;
-    }
-#else
-    if (!compileDriver_->hasJitEngine()) {
-      EJIT_DIAG("compile mode switch rejected: async without engine");
-      return false;
-    }
-    // Private taskpool: the worker is local to this instance, so a runtime
-    // switch to Async must start it here. In a shared build the single worker
-    // is cross-core and owner-controlled (started by owner election during
-    // init), so a mode flip must NOT start a per-instance worker.
-    if (!tp->isWorkerRunning() && !compileDriver_->startTaskPoolWorker()) {
-      EJIT_DIAG("compile mode switch rejected: worker start failed");
-      return false;
-    }
-#endif
-    tp->switchController().setMode(EJitCompileMode::Async);
-    EJIT_DIAG("compile mode switched to async");
-  } else if (mode == CompileMode::Off) {
-    tp->switchController().setMode(EJitCompileMode::Off);
-    EJIT_DIAG("compile mode switched to off (no JIT)");
-  } else {
-    tp->switchController().setMode(EJitCompileMode::Sync);
-#ifndef EJIT_SRE_SHARED_TASKPOOL
-    // Private taskpool: stop this instance's local worker. In a shared build
-    // the single worker is owner-controlled and shared across cores, so a mode
-    // flip is a control flag only and must NOT stop the shared worker.
-    compileDriver_->stopTaskPoolWorker();
-    EJIT_DIAG("compile mode switched to sync; taskpool worker stopped");
-#else
-    EJIT_DIAG("compile mode switched to sync");
-#endif
-  }
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Compile mode is CROSS-CORE SHARED runtime state. Publish it to the shared
-  // blob with release semantics so every core's compileOrGet() observes the new
-  // mode; engine/worker ownership stays owner-controlled (a mode flip never
-  // starts/stops the shared worker or re-runs owner election).
-  //
-  // Async commits only against the generation the availability check ran on: an
-  // ownerShutdown landing in between bumps it, and the switch reports failure
-  // rather than leaving Async live over a stopped worker. Sync/Off need no
-  // gate -- neither asks the worker for anything.
-  if (EJitSharedTaskPool *sp = sharedTaskPool()) {
-    const EJitCompileMode shared =
-        mode == CompileMode::Async  ? EJitCompileMode::Async
-        : mode == CompileMode::Sync ? EJitCompileMode::Sync
-                                    : EJitCompileMode::Off;
-    if (mode == CompileMode::Async) {
-      if (!sp->publishSharedMode(shared, serviceGen)) {
-        EJIT_DIAG("compile mode switch rejected: owner shut down during the "
-                  "switch (generation moved)");
-        tp->switchController().setMode(
-            config_.compileMode == CompileMode::Async ? EJitCompileMode::Async
-            : config_.compileMode == CompileMode::Sync
-                ? EJitCompileMode::Sync
-                : EJitCompileMode::Off);
-        return false;
-      }
-    } else {
-      sp->setSharedMode(shared);
-    }
-  }
-#endif
-  config_.compileMode = mode;
-  return true;
-}
-
-CompileMode EJit::getCompileMode() const {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // In a shared build the cross-core shared state is the source of truth for the
-  // runtime compile mode, so a peer/other core observes the owner's last switch
-  // rather than this instance's stale local config_.
-  if (compileDriver_) {
-    EJitSharedTaskPool *sp = compileDriver_->sharedTaskPool();
-    EJitCompileMode m = sp->getSharedMode();
-    return m == EJitCompileMode::Async ? CompileMode::Async
-         : m == EJitCompileMode::Sync ? CompileMode::Sync
-                                      : CompileMode::Off;
-  }
-#endif
-  return config_.compileMode;
 }
 
 void EJit::setOptimizationLevel(OptimizationLevel level) {
@@ -771,35 +520,12 @@ OptimizationLevel EJit::getOptimizationLevel() const {
   return config_.optLevel;
 }
 
-const EJitError *EJit::getLastError() const {
-#ifdef EJIT_FREESTANDING
-  return nullptr;
-#else
-  if (!logger_)
-    return nullptr;
-  // Copy into stable storage so the caller gets a snapshot that won't be
-  // overwritten by concurrent log() calls on other threads.
-  static thread_local EJitError lastErr;
-  if (logger_->copyLastError(lastErr))
-    return &lastErr;
-  return nullptr;
-#endif
-}
-
-#ifdef EJIT_SRE_TASKPOOL
-EJitTaskPool *EJit::taskPool() {
-  return compileDriver_ ? compileDriver_->taskPool() : nullptr;
-}
-#endif
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 EJitSharedTaskPool *EJit::sharedTaskPool() {
-  return compileDriver_ ? compileDriver_->sharedTaskPool() : nullptr;
+  return compileDriver_->sharedTaskPool();
 }
 const EJitSharedTaskPool *EJit::sharedTaskPool() const {
-  return compileDriver_ ? compileDriver_->sharedTaskPool() : nullptr;
+  return compileDriver_->sharedTaskPool();
 }
-#endif
 
 void EJit::printRegistry() const {
   const PeriodArrayRegistry &reg = runtimeState_->getRegistry();
@@ -921,35 +647,7 @@ bool EJit::getCodePoolStats(ejit_code_pool_stats_t *out) const {
 bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
   if (!out)
     return false;
-#if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_SRE_CODE_POOL)
-  auto CopyShared = [](ejit_code_pool_stats_t &Dst,
-                       const EJitCodePoolStatsOut::Detail &Src) {
-    Dst.poolCount = Src.poolCount;
-    Dst.sealedCount = Src.sealedCount;
-    Dst.activeCount = Src.activeCount;
-    Dst.usedBytes = Src.usedBytes;
-    Dst.reservedBytes = Src.reservedBytes;
-    Dst.wastedBytes = Src.wastedBytes;
-    Dst.sealInvocations = Src.sealInvocations;
-    Dst.splitInvocations = Src.splitInvocations;
-    Dst.finalizedRangeCount = Src.finalizedRangeCount;
-  };
-#endif
 #ifdef EJIT_SRE_CODE_POOL
-  auto CopyManager = [](ejit_code_pool_stats_t &Dst,
-                        const EJitCodePoolManager::Stats &Src) {
-    Dst.poolCount = Src.poolCount;
-    Dst.sealedCount = Src.sealedCount;
-    Dst.activeCount = Src.activeCount;
-    Dst.usedBytes = Src.usedBytes;
-    Dst.reservedBytes = Src.reservedBytes;
-    Dst.wastedBytes = Src.wastedBytes;
-    Dst.sealInvocations = Src.sealInvocations;
-    Dst.splitInvocations = Src.splitInvocations;
-    Dst.finalizedRangeCount = Src.finalizedRangeCount;
-  };
-#endif
-#if defined(EJIT_SRE_SHARED_TASKPOOL) && defined(EJIT_SRE_CODE_POOL)
   // Shared build: read the owner-published mirror so every core (owner and
   // non-owner) sees the SAME code-pool stats. The real pools are owner-private,
   // so a non-owner's per-core manager is empty (pools=0) — the mirror is the
@@ -957,33 +655,21 @@ bool EJit::getCodePoolStatsV2(ejit_code_pool_stats_v2_t *out) const {
   if (const EJitSharedTaskPool *sp = sharedTaskPool()) {
     EJitCodePoolStatsOut s{};
     if (sp->readCodePoolStats(&s)) {
-      EJitCodePoolStatsOut::Detail Total;
-      Total.poolCount = s.poolCount;
-      Total.sealedCount = s.sealedCount;
-      Total.activeCount = s.activeCount;
-      Total.usedBytes = s.usedBytes;
-      Total.reservedBytes = s.reservedBytes;
-      Total.wastedBytes = s.wastedBytes;
-      Total.sealInvocations = s.sealInvocations;
-      Total.splitInvocations = s.splitInvocations;
-      Total.finalizedRangeCount = s.finalizedRangeCount;
-      CopyShared(out->total, Total);
-      CopyShared(out->near, s.near);
-      CopyShared(out->far, s.far);
+      copyPoolCounters(out->total, s);
+      copyPoolCounters(out->near, s.near);
+      copyPoolCounters(out->far, s.far);
       return true;
     }
   }
-#endif
-#ifdef EJIT_SRE_CODE_POOL
   if (!compileDriver_)
     return false;
   EJitOrcEngine *engine = compileDriver_->getJitEngine();
   if (!engine)
     return false;
   EJitTieredCodePoolStats s = engine->getTieredCodePoolStats();
-  CopyManager(out->total, s.total);
-  CopyManager(out->near, s.near);
-  CopyManager(out->far, s.far);
+  copyPoolCounters(out->total, s.total);
+  copyPoolCounters(out->near, s.near);
+  copyPoolCounters(out->far, s.far);
   return true;
 #else
   return false;
@@ -1025,18 +711,9 @@ void EJit::printCodePoolStats() const {
 }
 
 bool EJit::printMayConstRanking() {
-  if (!compileDriver_) {
-    EJIT_DIAG_RAW("mayconst-ranking: no compile driver");
-    return false;
-  }
   if (EJitOrcEngine *Engine = compileDriver_->getJitEngine())
     return Engine->printMayConstRanking();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (EJitSharedTaskPool *Pool = compileDriver_->sharedTaskPool())
-    return Pool->requestMayConstRanking();
-#endif
-  EJIT_DIAG_RAW("mayconst-ranking: no local or shared compiler");
-  return false;
+  return sharedTaskPool()->requestMayConstRanking();
 }
 
 void EJit::printActive() const {

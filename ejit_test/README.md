@@ -80,7 +80,7 @@ After compilation, check these LLVM IR features:
 | Wrapper jit_entry block | `jit_entry:` | One per ejit_entry function |
 | jit_fallback block | `jit_fallback:` | Original function body moved here |
 | jit_dispatch block | `jit_dispatch:` | JIT-compiled function call |
-| ejit_compile_or_get call | `ejit_compile_or_get` | In jit_entry block |
+| Taskpool dispatch | `ejit_taskpool_compile_or_get` | In the wrapper miss path (generic or bound variant) |
 | may_const metadata | `ejit.may_const` | On marked field load instructions |
 | Function/global metadata | `ejit.metadata` | `!"ejit_entry"` / `!"ejit_period"` / ... |
 | Bitcode embedding | `ejit.bitcode` | `@__ejit_bitcode` in dedicated section |

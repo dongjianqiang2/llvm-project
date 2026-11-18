@@ -79,7 +79,6 @@ int main(int argc, char **argv) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = true;
   // Native ELF links use the existing constructor registration path; the
   // companion SRE demo uses the SDK's static-registry linker bounds.
   cfg.forceStaticRegistry = false;

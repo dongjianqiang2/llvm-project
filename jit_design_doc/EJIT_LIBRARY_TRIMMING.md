@@ -1,5 +1,8 @@
 # EmbeddedJIT 运行时库裁剪设计文档
 
+> spec5 实现说明：§3.4 的精简分析注册器是历史方案。当前优化器使用
+> LLVM 的 `PassBuilder`，不能据此裁掉它的链接依赖。
+
 **版本**: 3.2
 **日期**: 2026-06-02
 **关联**: SPEC4.md, PASS7_EJitRuntime_OrcJITLink.md, EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL_STUBS.md
@@ -64,7 +67,6 @@
 |---|---|
 | ~~`EJitAsyncCompiler.cpp/.h`~~ | （已移除，由 taskpool worker 取代） |
 | `EJitSyncCompiler.cpp/.h` | 只被 Async 调用，一并排除 |
-| `EJitLogger.cpp` | no-op 桩 |
 | ~~`EJitCache.cpp`~~ | （已移除，LRU 缓存由 taskpool 缓存取代） |
 | `EJitRegistrationStore.cpp` | std::mutex → BareMetalMutex |
 | `EJitRuntimeState.cpp` | std::mutex → BareMetalMutex |

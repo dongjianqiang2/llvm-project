@@ -478,7 +478,7 @@ code pool 与 taskpool 关键路径埋了**默认空展开**的 trace 宏，便�
 可用，~7 个池）。区域耗尽是干净的 `Error`，**不回退动态分配**（特化回退 AOT），保住固定
 地址保证。
 
-该模式强制要求 `EJIT_SRE_SHARED_TASKPOOL=ON`。固定区域是进程级唯一资源，而 bump
+该模式由共享池的唯一 owner 管理。固定区域是进程级唯一资源，而 bump
 游标 `FixedUsed_` 属于单个 `EJitCodePoolManager`；只有 shared taskpool 选出的唯一
 owner 会创建 ORC/manager 并执行编译。多个独立 manager 会各自从 offset 0 开始切同一
 段内存并覆盖仍在使用的 JIT 代码，因此 CMake 拒绝这种配置。

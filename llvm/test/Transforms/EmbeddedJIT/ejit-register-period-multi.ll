@@ -4,6 +4,9 @@
 ; Verify only period/metadata-annotated globals are registered.
 
 ; CHECK: @llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @ejit_auto_register, ptr null }]
+; CHECK: c"split_period\00"
+; CHECK: @.ejit.registry.period = private constant
+; CHECK-SAME: ptr @split_fields, i64 11
 ; CHECK: declare void @ejit_register_period_array(ptr, ptr, ptr, i64)
 ; CHECK: declare void @ejit_register_static_var(ptr, ptr)
 ; CHECK: define internal void @ejit_auto_register()
@@ -13,6 +16,8 @@
 ; CHECK: call void @ejit_register_period_array(ptr {{.*}}, ptr {{.*}}, ptr @trps, i64 16)
 ; CHECK: call void @ejit_register_period_array(ptr {{.*}}, ptr {{.*}}, ptr @slices, i64 4)
 ; CHECK: call void @ejit_register_period_array(ptr {{.*}}, ptr {{.*}}, ptr @carriers, i64 32)
+
+; CHECK: call void @ejit_register_period_array(ptr {{.*}}, ptr {{.*}}, ptr @split_fields, i64 11)
 
 ; Each static var should get a registration call
 ; CHECK: call void @ejit_register_static_var(ptr {{.*}}, ptr @board_cfg)
@@ -27,6 +32,7 @@
 @carriers = global [32 x i8] zeroinitializer, !ejit.metadata !13
 @board_cfg = global i32 1, !ejit.metadata !14
 @sys_param = global i32 314, !ejit.metadata !15
+@split_fields = global [11 x i8] zeroinitializer, !ejit.metadata !16
 @plain_data = global [100 x i32] zeroinitializer
 
 define void @dummy() {
@@ -39,3 +45,8 @@ define void @dummy() {
 !13 = distinct !{!{!"ejit_period_arr", !"carrier", i32 32}}
 !14 = distinct !{!{!"ejit_period", !"static"}}
 !15 = distinct !{!{!"ejit_period", !"static"}}
+
+; Presence, name and size are independent: each field uses its first
+; well-typed operand, even if the two fields come from different subnodes.
+!16 = !{!{!"ejit_period_arr"}, !{!"ejit_period_arr", i32 0, i32 11},
+        !{!"ejit_period_arr", !"split_period", i32 99}}

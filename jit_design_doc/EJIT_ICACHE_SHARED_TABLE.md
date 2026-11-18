@@ -193,7 +193,7 @@ probe requires, so the gate was closed in every build the cache was allowed in.
 **P2 — placement must match the deployment.** `EJIT_ICACHE_SECTION` must name an
 inter-core shared section. This is a link-time contract with no runtime check: the
 symbol resolves to the same address either way, so the mistake is undetectable
-from code. CMake warns when `EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING` is
+from code. CMake warns when `EJIT_FREESTANDING` is
 configured with an empty section. See §8.
 
 **P3 — `ejit_dim` values stay in `[0, D)`.** The accepted ranges never agreed: the
@@ -304,13 +304,11 @@ objdump -d image.elf --disassemble=<entry> | head -8   # adrp/add/ldr/cbz/br, no
 The linked-address check is the one the code cannot do for you: land outside the
 shared window and the cache silently degrades to per-core.
 
-At run time, `-mllvm -ejit-wrapper-timing` prints one line per 100000 icache hits
-(`status=254` is the hit sentinel); or watch `ejit_print_stats` — once warm,
-`cacheHits` stops growing while the application keeps calling.
+Use the board profiler for hit-path cost. Runtime lookup counters do not count direct wrapper hits.
 
 To prove it is *shared* rather than merely warm (a per-core table hits too):
 warm a cell on core A, toggle `ejit_deactivate`/`ejit_activate` on **core B only**,
-then re-read core A's cell — it must be 0, and core A must take exactly one extra
+then re-read the cell: guarded tables return to null, sentinel tables to the miss function.
 miss. Comparing `&__ejit_icache_fn_foo` across cores proves nothing: per-core
 `.bss` at the same virtual address gives equal pointers to different storage.
 

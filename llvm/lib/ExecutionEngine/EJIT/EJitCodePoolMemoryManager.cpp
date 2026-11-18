@@ -58,14 +58,9 @@ public:
     // applied before finalize() runs. Deliberately DO NOT apply any per-segment
     // memory protection here (no mprotect): the pool stays RW.
     //
-    // In 4K seal mode, seal ONLY the executable segments' 4KiB pages now
-    // that all writes/relocations are complete, before the function pointer can
-    // be looked up. If any page fails to seal we must not hand back a callable
-    // allocation. (Legacy whole-pool seal is driven later, at lookup, by the
-    // engine.) We do not invalidate the instruction cache here either \u2014
-    // the SRE seal callback does it (sealAndSyncCache: make page executable +
-    // sync caches).
-    if (Pool->usesPageSeal() && !Pool->usesBatchedPageSeal()) {
+    // Seal only executable pages, after all writes and before publication.
+    // Batched allocations remain RW/NX until the explicit flush.
+    if (!Pool->usesBatchedPageSeal()) {
       for (const ExecSegRange &R : ExecRanges)
         if (auto Err = Pool->sealCodeRange(reinterpret_cast<void *>(R.Addr),
                                            static_cast<size_t>(R.Size))) {

@@ -14,18 +14,11 @@
 ; a scalar cell (no GEP). Default (OFF): the original 4-block wrapper, no
 ; icache. Idempotent: running the pass twice does not duplicate the probe.
 
-; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -S %s | FileCheck %s --check-prefix=ICACHE
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s --check-prefix=NOICACHE
+; RUN: opt -passes=ejit-wrapper-gen -ejit-icache-section= -S %s | FileCheck %s --check-prefix=ICACHE
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache=false -S %s | FileCheck %s --check-prefix=NOICACHE
 ; RUN: opt -passes=ejit-wrapper-gen,ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -S %s | FileCheck %s --check-prefix=IDEM
 ; --- -ejit-inline-cache + -ejit-dispatcher-cluster + -ejit-missfn-cold ---
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-dispatcher-cluster -ejit-missfn-cold -S %s | FileCheck %s --check-prefix=OPT
-; --- -ejit-wrapper-timing + -ejit-inline-cache: the hit path emits trace calls
-;     AFTER the specialization call, so it must NOT be musttail (musttail must
-;     immediately precede a ret). Verify the module is valid (opt verifies by
-;     default) and the hit path is a plain call. Regression for the broken-IR
-;     boot crash where codegen silently dropped the ejit_entry function. ---
-; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-wrapper-timing -disable-output %s
-; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -ejit-wrapper-timing -S %s | FileCheck %s --check-prefix=TIMING
 ; --- -ejit-icache-section: the cell table goes into the inter-core SHARED
 ;     section, which is what lets a deactivate on one core zero the cells every
 ;     other core probes. Nothing else about the wrapper changes. ---
@@ -57,7 +50,9 @@
 ; ICACHE-NOT: section
 ; ICACHE-NOT: ejit_icache_try
 ; ICACHE-NOT: br
-; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
+; ICACHE: icmp ult i32 %idx1, 16
+; ICACHE: getelementptr {{.*}}ptr @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
+; ICACHE: select i1 {{.*}}, ptr %ejit_ic_slot, ptr @one_dim_entry.icache_miss
 ; ICACHE: load atomic ptr, ptr {{.*}} monotonic, align 8
 ; ICACHE-NOT: call void @ejit_taskpool_release_read
 ; ICACHE-NOT: br
@@ -67,7 +62,7 @@
 ; --- 2D entry: [16 x [16 x ptr]] slot, 2-subscript GEP, branchless. ---
 ; ICACHE-LABEL: define i32 @two_dim_entry(
 ; ICACHE-NOT: section
-; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_two_dim_entry, i32 0, i32 {{.*}}, i32 {{.*}}
+; ICACHE: getelementptr {{.*}}ptr @__ejit_icache_fn_two_dim_entry, i32 0, i32 {{.*}}, i32 {{.*}}
 ; ICACHE: load atomic ptr, ptr {{.*}} monotonic, align 8
 ; ICACHE: musttail call {{.*}} %ejit_ic_fn
 
@@ -106,28 +101,17 @@
 ; SECTION: load atomic ptr, ptr {{.*}} monotonic, align 8
 ; SECTION: musttail call {{.*}} %ejit_ic_fn
 
-; --- Default (flag OFF): no icache anywhere; original compile_or_get path. ---
+; --- Explicit opt-out: no icache anywhere; original compile_or_get path. ---
 ; NOICACHE-LABEL: define i32 @one_dim_entry(
 ; NOICACHE-NOT: __ejit_icache_fn
 ; NOICACHE-NOT: ejit_register_icache_slot
-; NOICACHE: call i32 @ejit_taskpool_compile_or_get_1d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; NOICACHE: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 1, ptr {{.*}}, ptr {{.*}})
 
 ; --- Idempotent: two passes emit each probe exactly once, and the sentinel
 ;     registration (with its MissFn argument) is not duplicated either. ---
 ; IDEM-LABEL: define i32 @one_dim_entry(
 ; IDEM-COUNT-1: getelementptr {{.*}} @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
 ; IDEM-COUNT-1: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1, ptr @one_dim_entry_miss)
-
-; --- timing hit path: plain call (NOT musttail) + trace + ret. The miss path
-;     stays musttail (no trailing calls), so we only forbid musttail within the
-;     hit block. ---
-; TIMING-LABEL: define i32 @zero_dim_entry(
-; TIMING-LABEL: jit_icache_dispatch:
-; TIMING-NOT: musttail
-; TIMING: call i32 %ejit_ic_fn
-; TIMING: call i64 @ejit_taskpool_trace_now
-; TIMING: call void @ejit_taskpool_trace_wrapper
-; TIMING: ret
 
 define i32 @zero_dim_entry(i32 %x) !ejit.metadata !0 {
 entry:

@@ -180,7 +180,6 @@ int main(int argc, char **argv)
   // JIT 编译确实发生 (修复前根本无法编译到这里)
   printf("\n--- JIT Stats ---\n");
   ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp; memset(&tp, 0, sizeof(tp));
   ejit_taskpool_get_stats(&tp);
   printf("  ready=%u  hits=%llu  compiles=%llu\n",
@@ -188,13 +187,6 @@ int main(int argc, char **argv)
          (unsigned long long)tp.asyncCompiles);
   VERIFY(tp.asyncCompiles >= 1, "JIT compiles >= 1 (actual %llu)",
          (unsigned long long)tp.asyncCompiles);
-#else
-  ejit_stats_t s;
-  ejit_get_stats(&s);
-  printf("  entries=%zu  hits=%llu  misses=%llu\n",
-         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
-  VERIFY(s.entryCount >= 1, "JIT entries >= 1 (actual %zu)", s.entryCount);
-#endif
 
   ejit_shutdown();
   printf("\n=== %s (%d failure(s)) ===\n",

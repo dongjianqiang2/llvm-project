@@ -24,7 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "ejit_test_helpers.h"
 #include "zstd.h"
 
 //===--- EJIT-annotated compression parameters ----------------------------===//
@@ -144,7 +144,7 @@ int main(int argc, char **argv) {
   // Init EJIT
   ejit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-  cfg.compileMode = EJIT_COMPILE_SYNC;
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
 
   ejit_status_t st = ejit_init(&cfg);
@@ -184,6 +184,8 @@ int main(int argc, char **argv) {
       double t2 = now_ms();
       double jit_time = t2 - t1;
 
+      CHECK(ejit_drain_taskpool_bounded(EJIT_DRAIN_SPIN_BUDGET),
+            "async compile drained before measuring warm call");
       // --- EJIT path: second call should hit the JIT cache ---
       double t3 = now_ms();
       size_t r2 = compress_specialized(src, srcSize, dst_jit, dstCap);

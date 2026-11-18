@@ -99,7 +99,6 @@ EJitCodePoolManager::Options fixedRxPoolOpts() {
   O.poolSize = kTwoMiB;
   O.poolAlign = kTwoMiB;
   O.minCodeAlign = 64;
-  O.fourKSeal = true;
   O.sealPageSize = kFourKiB;
   O.needsEnableRw = true; // fixed RX code-segment placement
   return O;

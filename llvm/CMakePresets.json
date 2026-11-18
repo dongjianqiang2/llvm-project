@@ -34,6 +34,7 @@
         "CMAKE_EXE_LINKER_FLAGS": "-Wl,--gc-sections -Wl,--strip-all",
         "CMAKE_SHARED_LINKER_FLAGS": "-Wl,--gc-sections -Wl,--strip-all",
         "CMAKE_STATIC_LINKER_FLAGS": "",
+        "EJIT_DUMP_SUPPORT": "ON",
         "EJIT_DEFAULT_TARGET_TRIPLE": ""
       }
     },
@@ -63,8 +64,8 @@
         "LLVM_ENABLE_ZLIB": "OFF",
         "LLVM_ENABLE_ZSTD": "OFF",
         "LLVM_ENABLE_LIBXML2": "OFF",
-        "CMAKE_C_FLAGS": "-fno-PIC -ffunction-sections -fdata-sections -fno-omit-frame-pointer -fno-exceptions -DLLVM_ENABLE_EH=OFF -DLLVM_ENABLE_RTTI=OFF -mno-outline-atomics -fno-threadsafe-statics -mllvm -enable-ejit-global-ctors=false -fstack-protector-strong -DEJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES=262144",
-        "CMAKE_CXX_FLAGS": "-fno-PIC -ffunction-sections -fdata-sections -fno-omit-frame-pointer -fno-exceptions -DLLVM_ENABLE_EH=OFF -DLLVM_ENABLE_RTTI=OFF -mno-outline-atomics -fno-threadsafe-statics -mllvm -enable-ejit-global-ctors=false -fstack-protector-strong -DEJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES=262144",
+        "CMAKE_C_FLAGS": "-fno-PIC -ffunction-sections -fdata-sections -fno-omit-frame-pointer -fno-exceptions -DLLVM_ENABLE_EH=OFF -DLLVM_ENABLE_RTTI=OFF -mno-outline-atomics -fno-threadsafe-statics -fstack-protector-strong",
+        "CMAKE_CXX_FLAGS": "-fno-PIC -ffunction-sections -fdata-sections -fno-omit-frame-pointer -fno-exceptions -DLLVM_ENABLE_EH=OFF -DLLVM_ENABLE_RTTI=OFF -mno-outline-atomics -fno-threadsafe-statics -fstack-protector-strong",
         "CMAKE_C_FLAGS_RELEASE": "-Os -DNDEBUG",
         "CMAKE_CXX_FLAGS_RELEASE": "-Os -DNDEBUG",
         "CMAKE_EXE_LINKER_FLAGS": "-Wl,--gc-sections -Wl,--strip-all",
@@ -75,13 +76,10 @@
         "EJIT_TRIM_LLVM_BACKEND": "ON",
         "EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL": "ON",
         "EJIT_FREESTANDING": "ON",
-        "EJIT_CODE_POOL_4K_SEAL": "ON",
         "EJIT_CODE_POOL_BATCHED_PUBLISH": "ON",
         "EJIT_SRE_CODE_POOL": "ON",
         "EJIT_SRE_CODE_POOL_PTNO": "8",
         "EJIT_FIXED_CODE_POOL": "ON",
-        "EJIT_SRE_TASKPOOL": "ON",
-        "EJIT_SRE_SHARED_TASKPOOL": "ON",
         "EJIT_SRE_TASKPOOL_NO_RECLAIM": "ON",
         "EJIT_SRE_SHARED_CODE_POINTERS": "ON",
         "EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE": "6",
@@ -93,6 +91,7 @@
         "EJIT_DIAG_ENABLE": "ON",
         "EJIT_DIAG_PRINT_THROTTLE_TICKS": "50",
         "EJIT_SRE_DIAG": "ON",
+        "EJIT_DUMP_SUPPORT": "ON",
         "EJIT_DUMP_ASM": "ON",
         "EJIT_STATS_ENABLE": "ON",
         "EJIT_ICACHE_DIM_SIZE": "16"
@@ -107,6 +106,7 @@
       "cacheVariables": {
         "CMAKE_C_COMPILER": "aarch64-linux-gnu-gcc",
         "CMAKE_CXX_COMPILER": "aarch64-linux-gnu-g++",
+        "EJIT_DUMP_SUPPORT": "ON",
         "CMAKE_CROSSCOMPILING": "ON",
         "LLVM_HOST_TRIPLE": "aarch64-linux-gnu",
         "LLVM_DEFAULT_TARGET_TRIPLE": "aarch64-linux-gnu",

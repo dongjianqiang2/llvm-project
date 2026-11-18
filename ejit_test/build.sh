@@ -127,25 +127,16 @@ _set_min_libs() {
   esac
 }
 
-# Detect EJIT taskpool build flags from CMakeCache and propagate them to test
-# compilation.  The wrapper now always uses the unified taskpool ABI
-# (ejit_taskpool_compile_or_get) — the former -ejit-wrapper-async option has
-# been retired.  Sync vs Async is runtime-configurable and needs no AOT flag.
+# Test-side value-profile checks must match the runtime build.
 EJIT_SRE_CFLAGS=""
 if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
-  if grep -q "^EJIT_SRE_TASKPOOL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
-    EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_TASKPOOL"
-  fi
-  if grep -q "^EJIT_SRE_SHARED_TASKPOOL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
-    EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_SHARED_TASKPOOL"
-  fi
   # Value profiling: the multicore value-profile test gates its stats checks
   # on this macro, which must match the runtime library's build.
   if grep -q "^EJIT_SRE_PGO_VALUE_PROFILE:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
     EJIT_SRE_CFLAGS="${EJIT_SRE_CFLAGS} -DEJIT_SRE_PGO_VALUE_PROFILE"
   fi
 fi
-[[ -n "${EJIT_SRE_CFLAGS}" ]] && echo "Taskpool flags: ${EJIT_SRE_CFLAGS}"
+[[ -n "${EJIT_SRE_CFLAGS}" ]] && echo "EJIT flags: ${EJIT_SRE_CFLAGS}"
 
 if [[ -n "${LIPO_FILE}" ]]; then
   # Lipo mode: use single pre-built .o/.a instead of individual .a files.
@@ -199,8 +190,6 @@ ALL_TESTS=(
   ejit_multi_tu_test
   ejit_baremetal_link_test
   ejit_new_attr_test
-  ejit_sync_mode_test
-  ejit_fixed_dim_test
   ejit_perf_bench
   ejit_ptr_period_test
   ejit_pointer_period_bounds_test
@@ -220,7 +209,6 @@ COMPILE_FLAGS[ejit_manual_register_test]="-mllvm -enable-ejit-global-ctors=false
 # Bare-metal link test: no global ctors -> registration must use the static
 # registry tables walked via linker-script-provided __start_/__stop_ symbols.
 COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
-COMPILE_FLAGS[ejit_fixed_dim_test]=""
 # Sentinel-wrapper smoke: icache ON so the wrapper takes the branchless
 # (NumDims <= 2, cell table defined pre-filled with &MissFn) form.
 COMPILE_FLAGS[ejit_sentinel_smoke_test]="-mllvm -ejit-inline-cache"
@@ -241,6 +229,8 @@ PRIMARY_SRC[ejit_baremetal_link_test]="ejit_multi_tu_test.c"
 declare -A LINKER_SCRIPT
 LINKER_SCRIPT[ejit_baremetal_link_test]="ejit_baremetal.ld"
 LINKER_SCRIPT[ejit_manual_register_test]="ejit_baremetal.ld"
+# Global constructors only run once; re-init needs the static tables.
+LINKER_SCRIPT[ejit_l0_dispatch_test]="ejit_baremetal.ld"
 
 # Extra translation units linked alongside <test>.c (space-separated, with .c).
 # Used by multi-TU tests that exercise cross-TU linking.
@@ -273,9 +263,7 @@ TEST_ARGS[ejit_dump_test]="0 3"
 TEST_ARGS[ejit_ptr_period_test]="0 1 3"
 TEST_ARGS[ejit_multi_tu_test]="0 3"
 TEST_ARGS[ejit_baremetal_link_test]="0 3"
-TEST_ARGS[ejit_sync_mode_test]="0"
 TEST_ARGS[ejit_new_attr_test]="0"
-TEST_ARGS[ejit_fixed_dim_test]="0 1"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")

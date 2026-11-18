@@ -77,17 +77,8 @@ int main(int argc, char **argv) {
   // 显式选择 L3 — 仅 L3 引入循环 pass (LoopSimplify/Unroll/IndVarSimplify/...)
   ejit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Async mode so the shared taskpool worker starts during ejit_init.
-  cfg.compileMode     = EJIT_COMPILE_ASYNC;
-#else
-  cfg.compileMode     = EJIT_COMPILE_SYNC;
-#endif
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel        = EJIT_OPT_L3;
-  cfg.maxCodeMemory   = 512 * 1024;
-  cfg.maxDataMemory   = 256 * 1024;
-  cfg.maxCacheEntries = 64;
-  cfg.maxCacheSize    = 1024 * 1024;
 
   T(ejit_init(&cfg) == EJIT_OK, "ejit_init(L3)");
   ejit_activate("loopfold", ci);
@@ -98,7 +89,6 @@ int main(int argc, char **argv) {
   T(r == EXPECTED, "fold_loop(%u) = %llu (expected %llu)",
     ci, (unsigned long long)r, (unsigned long long)EXPECTED);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_drain_taskpool();
   ejit_taskpool_stats_t tp; memset(&tp, 0, sizeof(tp));
   ejit_taskpool_get_stats(&tp);
@@ -117,12 +107,6 @@ int main(int argc, char **argv) {
   T(tp2.cacheHits > tp.cacheHits,
     "2nd call served from JIT cache (cacheHits %llu -> %llu)",
     (unsigned long long)tp.cacheHits, (unsigned long long)tp2.cacheHits);
-#else
-  ejit_stats_t s;
-  memset(&s, 0, sizeof(s));
-  ejit_get_stats(&s);
-  T(s.entryCount > 0, "JIT active (entries=%zu)", s.entryCount);
-#endif
 
   ejit_shutdown();
 

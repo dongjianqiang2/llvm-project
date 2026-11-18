@@ -14,7 +14,6 @@ Example object command, with paths supplied by the existing SDK build:
 ```sh
 $EJIT_CLANG -target aarch64_be-none-elf -O2 -ffreestanding \
   -mno-outline-atomics -I$LLVM_SOURCE/llvm/include \
-  -DEJIT_SRE_TASKPOOL -DEJIT_SRE_SHARED_TASKPOOL \
   -DEJIT_SRE_PGO_BRANCH_AUDIT -DEJIT_DIAG_ENABLE \
   -c ejit_local_free_dim_sre_test.c -o ejit_local_free_dim_sre_test.o
 ```

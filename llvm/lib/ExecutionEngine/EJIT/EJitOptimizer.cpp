@@ -78,9 +78,9 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
     : registry_(reg) {
-  // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
-  // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
-  // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
+  // The function-simplification pipeline queries more than the analyses
+  // referenced directly by EJIT. Register the full LLVM analysis set and
+  // wire its proxies before constructing the per-tier pass managers.
   PassBuilder PB(TM);
   PB.registerFunctionAnalyses(FAM_);
   PB.registerLoopAnalyses(LAM_);
@@ -144,6 +144,39 @@ void EJitOptimizer::clearAnalyses() {
   MAM_.clear();
 }
 
+// Only cache the entry's resolved runtime views. The pass must rediscover
+// arguments, calls, globals and local witnesses in each new IR snapshot.
+static SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers>
+resolveBoundViews(const Module &M, const SpecializationContext &ctx) {
+  auto Views = ctx.boundPointers;
+  if (Views.empty())
+    return Views;
+  const Function *Root = M.getFunction(ctx.fnName);
+  if (!Root)
+    return Views;
+  DenseMap<uint64_t, StringRef> Periods;
+  if (MDNode *MD = Root->getMetadata(MD_EJIT_METADATA))
+    for (const MDOperand &Op : MD->operands()) {
+      auto *Sub = dyn_cast<MDNode>(Op.get());
+      if (!Sub || Sub->getNumOperands() < 3)
+        continue;
+      auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+      auto *Period = dyn_cast<MDString>(Sub->getOperand(1));
+      auto *Index = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+      if (Tag && Period && Index && Tag->getString() == TAG_EJIT_BOUND_PTR)
+        Periods.try_emplace(Index->getZExtValue(), Period->getString());
+    }
+  for (auto &View : Views) {
+    StringRef Period = Periods.lookup(View.argIndex);
+    for (const auto &Dim : ctx.dimensions)
+      if (Dim.periodName == Period) {
+        View.periodInstance = Dim.cellIdx;
+        break;
+      }
+  }
+  return Views;
+}
+
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   // All tier exits, including temporary PGO Gen and audit-only Baseline, must
   // return executable IR with real runtime inputs and no private marker.
@@ -184,9 +217,6 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   lastMayConstLoadSites_.clear();
-#endif
-
-#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   std::vector<EJitMayConstLoadSite> AuditInputSites;
   uint64_t AuditSampledEntries = 0;
   if (ctx.tier == CompileTier::Instrumented ||
@@ -209,6 +239,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 
   // Phase 1 - specialize (common to all tiers): turn the period index and
   // every may_const field into a compile-time constant.
+  const auto BoundViews = resolveBoundViews(M, ctx);
   applyBoundPointerFacts(M, ctx);
   preReplacePeriodIndices(M, ctx);
   runInstCombine(M);
@@ -218,7 +249,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   // callee bodies in the embedded bitcode, so their may_const GEP chains are
   // already traceable to the global.
   //   (c) Replace the may_const loads with their runtime constant values.
-  runStructFieldPass(M, ctx);
+  runStructFieldPass(M, ctx, BoundViews);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
   //   (d) Push the constants across call edges. Wherever the AOT inliner kept
   //       a call, the callee still re-derives cell addressing and re-tests
@@ -232,15 +263,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   //       loads they root, so phases 2-4 exploit the constants in every
   //       function, not just the entry.
   runInstCombine(M);
-  runStructFieldPass(M, ctx);
+  runStructFieldPass(M, ctx, BoundViews);
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
-
-#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  const uint64_t AuditSpecializedMayConstLoads =
-      ctx.tier != CompileTier::Instrumented
-          ? collectMayConstSites(M, registry_).size()
-          : 0;
-#endif
 
   if (ctx.tier == CompileTier::Instrumented) {
     // The counter increment lowers to `atomicrmw add i64` (§5, InstrProfOpts
@@ -384,11 +408,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx, CompileTier::Baseline, BoundViews);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
-      recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
-                            FinalSites, AuditSampledEntries);
+      recordMayConstBenefit(ctx, AuditInputSites, FinalSites,
+                            AuditSampledEntries);
 #endif
       EJIT_DIAG_VERBOSE("pipeline done (audit-only Baseline) func=%s "
                         "key=0x%016lx",
@@ -443,11 +467,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx, ctx.tier);
+    runOptimizationPipeline(M, ctx, ctx.tier, BoundViews);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
-    recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
-                          FinalSites, AuditSampledEntries);
+    recordMayConstBenefit(ctx, AuditInputSites, FinalSites,
+                          AuditSampledEntries);
 #endif
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
@@ -455,11 +479,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx, ctx.tier);
+  runOptimizationPipeline(M, ctx, ctx.tier, BoundViews);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
-  recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
-                        FinalSites, AuditSampledEntries);
+  recordMayConstBenefit(ctx, AuditInputSites, FinalSites,
+                        AuditSampledEntries);
 #endif
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
@@ -468,7 +492,6 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 void EJitOptimizer::recordMayConstBenefit(
     const SpecializationContext &ctx, ArrayRef<EJitMayConstLoadSite> InputSites,
-    uint64_t SpecializedMayConstLoads,
     ArrayRef<EJitMayConstLoadSite> FinalSites, uint64_t SampledEntries) {
   const uint64_t InputMayConstLoads = InputSites.size();
   const uint64_t FinalMayConstLoads = FinalSites.size();
@@ -509,7 +532,6 @@ void EJitOptimizer::recordMayConstBenefit(
   EJitMayConstBenefitSample Sample;
   Sample.cacheKey = ctx.cacheKey;
   Sample.inputMayConstLoads = InputMayConstLoads;
-  Sample.specializedMayConstLoads = SpecializedMayConstLoads;
   Sample.finalMayConstLoads = FinalMayConstLoads;
   Sample.runtimeHits = RuntimeHits;
   Sample.hitSites = HitSites;
@@ -532,12 +554,8 @@ void EJitOptimizer::recordMayConstBenefit(
   EJitMayConstBenefitSummary Aggregate = summarizeMayConstBenefits(Samples);
   const int64_t Removed = static_cast<int64_t>(InputMayConstLoads) -
                           static_cast<int64_t>(FinalMayConstLoads);
-  const int64_t Direct = static_cast<int64_t>(InputMayConstLoads) -
-                         static_cast<int64_t>(SpecializedMayConstLoads);
-  const int64_t Pipeline = static_cast<int64_t>(SpecializedMayConstLoads) -
-                           static_cast<int64_t>(FinalMayConstLoads);
   EJIT_DIAG("mayconst-audit entry=%s key=0x%016llx tier=%u versions=%llu "
-            "mayconst=%llu/%llu/%llu removed=%lld direct=%lld pipeline=%lld "
+            "mayconst=%llu/na/%llu removed=%lld direct=na pipeline=na "
             "runtime_hits=%llu hit_sites=%llu removed_runtime_hits=%llu "
             "removed_hit_sites=%llu sampled_entries=%llu sample_cycles=%llu "
             "avg_removed=%lld "
@@ -546,10 +564,8 @@ void EJitOptimizer::recordMayConstBenefit(
             static_cast<unsigned>(ctx.tier),
             static_cast<unsigned long long>(Aggregate.versions),
             static_cast<unsigned long long>(InputMayConstLoads),
-            static_cast<unsigned long long>(SpecializedMayConstLoads),
             static_cast<unsigned long long>(FinalMayConstLoads),
-            static_cast<long long>(Removed), static_cast<long long>(Direct),
-            static_cast<long long>(Pipeline),
+            static_cast<long long>(Removed),
             static_cast<unsigned long long>(RuntimeHits),
             static_cast<unsigned long long>(HitSites),
             static_cast<unsigned long long>(RemovedRuntimeHits),
@@ -898,39 +914,9 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
   MPM.run(M, MAM_);
 }
 
-void EJitOptimizer::runStructFieldPass(Module &M,
-                                       const SpecializationContext &ctx) {
-  SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> BoundPointers =
-      ctx.boundPointers;
-  if (!BoundPointers.empty()) {
-    Function *Root = M.getFunction(ctx.fnName);
-    if (Root) {
-      for (EJitBoundPointerView &View : BoundPointers) {
-        MDNode *MD = Root->getMetadata(MD_EJIT_METADATA);
-        StringRef BoundPeriodName;
-        if (MD)
-          for (const MDOperand &Op : MD->operands()) {
-            auto *Sub = dyn_cast<MDNode>(Op.get());
-            if (!Sub || Sub->getNumOperands() < 3)
-              continue;
-            auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-            auto *Period = dyn_cast<MDString>(Sub->getOperand(1));
-            auto *Index = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
-            if (Tag && Period && Index &&
-                Tag->getString() == TAG_EJIT_BOUND_PTR &&
-                Index->getZExtValue() == View.argIndex) {
-              BoundPeriodName = Period->getString();
-              break;
-            }
-          }
-        for (const auto &Dim : ctx.dimensions)
-          if (Dim.periodName == BoundPeriodName) {
-            View.periodInstance = Dim.cellIdx;
-            break;
-          }
-      }
-    }
-  }
+void EJitOptimizer::runStructFieldPass(
+    Module &M, const SpecializationContext &ctx,
+    ArrayRef<EJitBoundPointerView> BoundPointers) {
   SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
   for (const auto &Dim : ctx.dimensions)
     LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
@@ -959,9 +945,9 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
   }
 }
 
-void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            const SpecializationContext &ctx,
-                                            CompileTier tier) {
+void EJitOptimizer::runOptimizationPipeline(
+    Module &M, const SpecializationContext &ctx, CompileTier tier,
+    ArrayRef<EJitBoundPointerView> BoundViews) {
   const auto level = ctx.optLevel;
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
@@ -983,7 +969,7 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M, ctx);
+  runStructFieldPass(M, ctx, BoundViews);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
       cleanupFPM_.run(F, FAM_);

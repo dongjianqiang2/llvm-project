@@ -65,7 +65,7 @@ EJIT tests are spread across four directories. Commands use `$BUILD` as a placeh
 |------------|-----------|------|-------------|
 | AOT Pass lit | `llvm/test/Transforms/EmbeddedJIT/` | lit (opt + FileCheck) | `cd $BUILD && ./bin/llvm-lit -v ../llvm/test/Transforms/EmbeddedJIT/` |
 | Clang lit | `clang/test/CodeGen/ejit_*.c` `clang/test/Sema/ejit_*.cpp` `clang/test/Sema/ext_attr_ejit.cpp` | lit (%clang_cc1 + FileCheck) | `cd $BUILD && ./bin/llvm-lit -v ../clang/test/CodeGen/ejit_* ../clang/test/Sema/ejit_*` |
-| Runtime gtest | `llvm/unittests/ExecutionEngine/EJIT/` | gtest (C++ unit tests) | `ninja -C $BUILD EJITTests EJITCodePoolTests EJITTaskPoolTests EJITSharedTaskPoolTests` |
+| Runtime gtest | `llvm/unittests/ExecutionEngine/EJIT/` | gtest (C++ unit tests) | `ninja -C $BUILD EJITTests EJITCodePoolTests EJITSharedTaskPoolTests` |
 | Integration | `ejit_test/` | C programs + runtime | `EJIT_CLANG=$BUILD/bin/clang cd ejit_test && ./build.sh` |
 
 **Build prerequisites**:

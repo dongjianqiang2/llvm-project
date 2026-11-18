@@ -79,11 +79,8 @@ void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
     <h2>4. 初始化 EJIT 并激活时间窗</h2>
 <pre><code class="language-c">int main(void) {
     ejit_config_t cfg = {0};
-    cfg.compileMode = EJIT_COMPILE_SYNC;
+    cfg.compileMode = EJIT_COMPILE_ASYNC;
     cfg.optLevel = EJIT_OPT_L2;
-    cfg.maxCodeMemory = 2 * 1024 * 1024;
-    cfg.maxCacheEntries = 4096;
-    cfg.enableLogger = true;
 
     if (ejit_init(&amp;cfg) != EJIT_OK)
         return 1;
@@ -120,7 +117,7 @@ void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
     <table>
       <tr><th>检查点</th><th>期望</th></tr>
       <tr><td>编译 IR</td><td>存在 <code>!ejit.metadata</code>、<code>!ejit.may_const</code>、<code>@__ejit_bitcode</code></td></tr>
-      <tr><td>wrapper</td><td>入口调用 <code>ejit_compile_or_get</code>，有 <code>jit_dispatch</code>/<code>jit_fallback</code> 路径</td></tr>
+      <tr><td>wrapper</td><td>入口调用 <code>ejit_taskpool_compile_or_get</code>，有 <code>jit_dispatch</code>/<code>jit_fallback</code> 路径</td></tr>
       <tr><td>运行时 stats</td><td>首次 miss 后 cache entries 增加，后续 hits 增加</td></tr>
       <tr><td>dumpJITDir</td><td>优化后 IR 中配置字段 load 被常量替换，分支被折叠</td></tr>
     </table>

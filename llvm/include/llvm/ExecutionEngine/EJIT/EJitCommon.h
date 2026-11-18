@@ -121,34 +121,7 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND =
     "ejit_taskpool_compile_or_get_bound";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND_V =
     "ejit_taskpool_compile_or_get_bound_v";
-// Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper
-// when -ejit-wrapper-fixed-dim-entry is enabled and the entry has <= 4 dims.
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_0D =
-    "ejit_taskpool_compile_or_get_0d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_1D =
-    "ejit_taskpool_compile_or_get_1d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_2D =
-    "ejit_taskpool_compile_or_get_2d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
-    "ejit_taskpool_compile_or_get_3d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
-    "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
-constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
-constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
-    "ejit_taskpool_trace_wrapper";
-constexpr const char *FN_FUNCTION_BODY_CYCLES_RECORD =
-    "ejit_function_body_cycles_record";
-constexpr uint32_t kEJitFunctionBodyPathAOT = 0u;
-constexpr uint32_t kEJitFunctionBodyPathJIT = 1u;
-// Wrapper-timing sentinel status passed to ejit_taskpool_trace_wrapper for
-// icache-hit samples so they aggregate as their own report line (get_fn_avg =
-// probe cost, release_avg = 0), separate from the slow-path compile_or_get
-// samples. The value is RESERVED in the ejit_status_t enum itself
-// (EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE in EJitRuntime.h): a future real
-// status assigned 0xFE is a duplicate-enumerator compile error, and a
-// static_assert in EJitRuntime.cpp locks this constant to that enumerator.
-constexpr uint32_t kEJitIcacheHitTimingStatus = 0xFEu;
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
 // PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
 // array-pointer dimension in the active-state hot path.

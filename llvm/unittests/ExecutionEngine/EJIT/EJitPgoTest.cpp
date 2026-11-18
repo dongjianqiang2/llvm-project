@@ -76,7 +76,7 @@ static void markEJitEntry(Function &F) {
   F.setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
 }
 
-#ifdef EJIT_SRE_CODE_POOL
+#if defined(EJIT_SRE_CODE_POOL) && defined(EJIT_CODE_POOL_BATCHED_PUBLISH)
 namespace {
 constexpr uint32_t RealCompileStressFunctions = 20;
 
@@ -309,9 +309,9 @@ TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
 }
 #else
 TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
-  GTEST_SKIP() << "requires the SRE code-pool readiness/flush interface";
+  GTEST_SKIP() << "requires a code pool with explicit batched publication";
 }
-#endif // EJIT_SRE_CODE_POOL
+#endif
 
 static std::string findCapturedPgoName(const EJitOptimizer &Opt,
                                        StringRef FunctionName) {

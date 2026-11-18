@@ -107,8 +107,7 @@ int main(int argc, char **argv)
   g_cellCfg[ci].trafficLoad = 0;
   g_trpCfg[ti].trpType = 1;
 
-  // Init EJIT (ejit_default_config picks ASYNC under EJIT_SRE_SHARED_TASKPOOL,
-  // SYNC otherwise — matching the canonical ejit_config_t ABI).
+  // Start the shared worker.
   ejit_config_t cfg;
   ejit_default_config(&cfg);
   int rc = ejit_init(&cfg);
@@ -124,7 +123,6 @@ int main(int argc, char **argv)
   uint32_t r1 = jit_cell_check(ci);
   VERIFY(r1 == 1000, "jit_cell_check(%u) = %u (expected 1000, cellType=0xFD)", ci, r1);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_drain_taskpool();
   ejit_taskpool_stats_t s1; memset(&s1, 0, sizeof(s1));
   ejit_taskpool_get_stats(&s1);
@@ -133,13 +131,6 @@ int main(int argc, char **argv)
          (unsigned long long)s1.asyncCompiles);
   VERIFY(s1.asyncCompiles >= 1, "JIT compiles >= 1 (actual %llu)",
          (unsigned long long)s1.asyncCompiles);
-#else
-  ejit_stats_t s1;
-  ejit_get_stats(&s1);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n", s1.entryCount, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
-  VERIFY(s1.entryCount >= 1, "JIT entries >= 1 (actual %zu)", s1.entryCount);
-  VERIFY(s1.misses >= 1, "JIT misses >= 1 (actual %llu)", (unsigned long long)s1.misses);
-#endif
 
   //=== 验证 2: 同参数第二次调用应命中缓存 ===
 
@@ -148,7 +139,6 @@ int main(int argc, char **argv)
   uint32_t r2 = jit_cell_check(ci);
   VERIFY(r2 == 1000, "jit_cell_check(%u) 2nd call = %u", ci, r2);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t s2; memset(&s2, 0, sizeof(s2));
   ejit_taskpool_get_stats(&s2);
   printf("  stats: ready=%u hits=%llu compiles=%llu\n",
@@ -156,12 +146,6 @@ int main(int argc, char **argv)
          (unsigned long long)s2.asyncCompiles);
   VERIFY(s2.cacheHits >= 1, "Cache hits >= 1 (actual %llu)",
          (unsigned long long)s2.cacheHits);
-#else
-  ejit_stats_t s2;
-  ejit_get_stats(&s2);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n", s2.entryCount, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
-  VERIFY(s2.hits >= 1, "Cache hits >= 1 (actual %llu)", (unsigned long long)s2.hits);
-#endif
 
   //=== 验证 3: 多维函数首次调用触发独立 JIT entry ===
 
@@ -170,7 +154,6 @@ int main(int argc, char **argv)
   uint32_t r3 = jit_cell_trp_check(ci, ti);
   VERIFY(r3 == 777, "jit_cell_trp(%u,%u) = %u (expected 777, FD+1)", ci, ti, r3);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_drain_taskpool();
   ejit_taskpool_stats_t s3; memset(&s3, 0, sizeof(s3));
   ejit_taskpool_get_stats(&s3);
@@ -179,12 +162,6 @@ int main(int argc, char **argv)
          (unsigned long long)s3.asyncCompiles);
   VERIFY(s3.asyncCompiles >= 2, "JIT compiles >= 2 (2 functions, actual %llu)",
          (unsigned long long)s3.asyncCompiles);
-#else
-  ejit_stats_t s3;
-  ejit_get_stats(&s3);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n", s3.entryCount, (unsigned long long)s3.hits, (unsigned long long)s3.misses);
-  VERIFY(s3.entryCount >= 2, "JIT entries >= 2 (2 functions, actual %zu)", s3.entryCount);
-#endif
 
   //=== 验证 4: 不同 cellIdx 产生不同 specialization ===
 
@@ -200,7 +177,6 @@ int main(int argc, char **argv)
     uint32_t r4 = jit_cell_check(ci2);
     VERIFY(r4 == 999, "jit_cell_check(%u) = %u (expected 999, cellType=0xEC)", ci2, r4);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     ejit_drain_taskpool();
     ejit_taskpool_stats_t s4; memset(&s4, 0, sizeof(s4));
     ejit_taskpool_get_stats(&s4);
@@ -209,13 +185,6 @@ int main(int argc, char **argv)
            (unsigned long long)s4.asyncCompiles);
     VERIFY(s4.asyncCompiles >= 3, "JIT compiles increased (>=3, actual %llu)",
            (unsigned long long)s4.asyncCompiles);
-#else
-    ejit_stats_t s4;
-    ejit_get_stats(&s4);
-    printf("  stats: entries=%zu hits=%llu misses=%llu\n", s4.entryCount, (unsigned long long)s4.hits, (unsigned long long)s4.misses);
-    VERIFY(s4.entryCount >= 3, "JIT entries increased (>=3, actual %zu)", s4.entryCount);
-    VERIFY(s4.misses >= 3, "JIT misses increased (>=3, actual %llu)", (unsigned long long)s4.misses);
-#endif
   }
 
   //=== 验证 5: Deactivate 后不同 cellType 触发重新编译 ===
@@ -226,7 +195,6 @@ int main(int argc, char **argv)
   g_cellCfg[ci].cellType = 0xEC;  // 改成 0xEC
   ejit_activate("cell", ci);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t s5a; memset(&s5a, 0, sizeof(s5a));
   ejit_taskpool_get_stats(&s5a);
   unsigned long long compiles_before = s5a.asyncCompiles;
@@ -241,20 +209,6 @@ int main(int argc, char **argv)
          compiles_before, (unsigned long long)s5.asyncCompiles);
   VERIFY(s5.asyncCompiles > compiles_before,
          "New compile after deactivate/re-activate (compiles increased)");
-#else
-  ejit_stats_t s5a;
-  ejit_get_stats(&s5a);
-  uint64_t misses_before = s5a.misses;
-
-  uint32_t r5 = jit_cell_check(ci);
-  // 现在 cellType=0xEC, 应该走 else 分支返回 999
-  VERIFY(r5 == 999, "jit_cell_check(%u) after type change = %u (expected 999)", ci, r5);
-
-  ejit_stats_t s5;
-  ejit_get_stats(&s5);
-  printf("  stats: misses %llu -> %llu\n", (unsigned long long)misses_before, (unsigned long long)s5.misses);
-  VERIFY(s5.misses > misses_before, "New miss after deactivate/re-activate (misses increased)");
-#endif
 
   //=== 总结 ===
 

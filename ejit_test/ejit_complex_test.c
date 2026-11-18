@@ -428,7 +428,6 @@ int main(int argc, char **argv)
     ejit_drain_taskpool();
     {
         printf("--- JIT Stats ---\n");
-#ifdef EJIT_SRE_SHARED_TASKPOOL
         ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
         ejit_taskpool_get_stats(&ts);
         printf("  ready: %u  hits: %llu  compiles: %llu\n",
@@ -438,18 +437,6 @@ int main(int argc, char **argv)
         if (ts.asyncCompiles == 0) {
             printf("  FAIL: async path produced no compiles (silent AOT)\n");
         }
-#else
-        ejit_stats_t s;
-        ejit_get_stats(&s);
-        printf("  entries: %zu  codeSize: %zu\n", s.entryCount, s.totalCodeSize);
-        printf("  hits: %llu  misses: %llu  evictions: %llu\n",
-               (unsigned long long)s.hits, (unsigned long long)s.misses,
-               (unsigned long long)s.evictions);
-        printf("  JIT: %s\n", s.entryCount > 0 ? "ACTIVE" : "AOT-FALLBACK-ONLY");
-        if (s.entryCount == 0) {
-            printf("  FAIL: no JIT entries (silent AOT)\n");
-        }
-#endif
     }
 
     ejit_shutdown();

@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-aot-module -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-aot-module -S %s | FileCheck %s
 
 ; Global constructor must come first (appears at top of module)
 ; CHECK: @llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @ejit_auto_register, ptr null }]

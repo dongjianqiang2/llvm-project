@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 
 ; Multiple bound objects use the fixed raw-pointer descriptor table. The
 ; descriptor array is a slow-path alloca; no pointee payload is copied.

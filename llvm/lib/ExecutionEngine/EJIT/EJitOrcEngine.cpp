@@ -1,6 +1,7 @@
 //===-- EJitOrcEngine.cpp - OrcJIT Engine Wrapper -------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
+#include "EJitCodePoolCounters.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Config/Targets.h"
@@ -45,9 +46,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #endif
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
-#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -101,6 +100,7 @@ void initializeEJitTargets() {
 
 } // namespace
 
+#ifdef EJIT_DIAG_ENABLE
 static const GlobalVariable *rootGlobal(Value *V) {
   while (V) {
     V = V->stripPointerCasts();
@@ -135,6 +135,8 @@ static void collectReferencedExternalDecls(
     }
   }
 }
+
+#endif
 
 static void isolateSpecializationEntry(Module &M, StringRef EntryName) {
   for (Function &F : M.functions()) {
@@ -179,20 +181,22 @@ struct EJitOrcEngine::Impl {
   /// User-registered symbols (functions + globals) for bare-metal.
   /// Populated via ejit_register_symbol() / addUserSymbol().
   std::map<std::string, void *> userSymbols;
+  // Target-aware optimization needs this machine even when dumps are disabled.
+  std::unique_ptr<TargetMachine> optimizerTM;
+#ifdef EJIT_DUMP_SUPPORT
   /// If non-empty, dump JIT-optimized IR to this directory.
   std::string dumpJITDir;
-  /// Persistent optimizer — analysis managers are registered once and reused.
-  /// TargetMachine used for the name-filtered ASM diagnostic dump (created
-  /// once from the same JITTargetMachineBuilder the JIT compiles with, so the
-  /// emitted assembly matches the real JIT output). Null if creation failed.
-  std::unique_ptr<TargetMachine> dumpFunctionTM;
+#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
   std::unique_ptr<TargetMachine> dumpModuleTM;
+#endif
+#endif
   std::unique_ptr<EJitOptimizer> optimizer;
 };
 
 namespace llvm {
 namespace ejit {
 
+#ifdef EJIT_DUMP_SUPPORT
 // Mutex type for the dump store. On SRE/freestanding std::mutex is
 // unavailable and BareMetalMutex is a no-op, so use a real CAS spinlock (built
 // on the __atomic wrappers in EJitAtomic.h). The dump store is per-core (each
@@ -235,9 +239,7 @@ static std::string &dumpFuncFilter() {
   return Filter;
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 EJitSharedTaskPoolState *gDumpSharedState = nullptr;
-#endif
 
 void setDumpFuncFilter(const std::string &name) {
   std::string &Filter = dumpFuncFilter();
@@ -247,7 +249,6 @@ void setDumpFuncFilter(const std::string &name) {
     EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
                     Filter.empty() ? "(off)" : Filter.c_str(), (void *)&Filter);
   }
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (gDumpSharedState) {
     EJitSharedDumpState &D = gDumpSharedState->dump;
     uint32_t expected = 0;
@@ -276,10 +277,8 @@ void setDumpFuncFilter(const std::string &name) {
     EJIT_DIAG_DEBUG("set_dump_filter shared enabled=%u len=%u &shared=%p",
                     len ? 1u : 0u, len, (void *)gDumpSharedState);
   }
-#endif
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 void setDumpSharedState(EJitSharedTaskPoolState *state) {
   gDumpSharedState = state;
   EJIT_DIAG_DEBUG("set_dump_shared_state state=%p", (void *)state);
@@ -320,15 +319,10 @@ static bool getSharedDumpFilter(std::string &out) {
   sharedDumpUnlock(D);
   return enabled;
 }
-#else
-void setDumpSharedState(EJitSharedTaskPoolState * /*state*/) {}
-#endif
 
 static bool getActiveDumpFilter(std::string &out) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   if (getSharedDumpFilter(out))
     return true;
-#endif
   std::lock_guard<DumpMutexType> lock(dumpMutex());
   std::string &Filter = dumpFuncFilter();
   if (Filter.empty())
@@ -397,7 +391,6 @@ static void dumpLinesSafe(const char *label, const std::string &s) {
   dumpBytesSafe(label, s.data(), s.size());
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 static uint32_t copyDumpBytes(char *dst, uint32_t cap, const char *src,
                               size_t size, bool &truncated) {
   if (cap == 0)
@@ -489,7 +482,6 @@ static bool printSharedDumpHint(const char *name) {
                   stored, workerCore, stored, irSize, asmSize, keyHi, keyLo);
   return true;
 }
-#endif
 
 /// Called from the IR transform layer when the filter matches: save the
 /// post-optimization IR and emitted ASM for later selective printing.
@@ -509,12 +501,10 @@ static void captureDump(const std::string &fnName, uint64_t cacheKey,
       DumpEntry{cacheKey, tier, std::move(FunctionIR), std::move(FunctionASM),
                 std::move(ModuleIR), std::move(ModuleASM)};
   EJIT_DIAG_DEBUG("capture store_size after=%u", (unsigned)Store.size());
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // Publish only small metadata. Full text remains in the worker-local map.
   const DumpEntry &E = Store[fnName];
   captureSharedDumpMetadata(fnName, cacheKey, E.FunctionIR.size(),
                             E.FunctionASM.size());
-#endif
 }
 
 /// Render only the requested entry definition. A specialization module may
@@ -545,6 +535,7 @@ bool detail::shouldCaptureDump(CompileTier tier, StringRef filter,
          (filter == "*" || filter == fnName);
 }
 
+#if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
 /// Clone a diagnostic codegen module with only the requested function body.
 /// Other function definitions become declarations, preserving the target
 /// function's calls while avoiding a second codegen of its whole closure.
@@ -571,6 +562,7 @@ static bool renderDumpAssembly(TargetMachine &TM, std::unique_ptr<Module> M,
   out.assign(AsmBuf.begin(), AsmBuf.end());
   return true;
 }
+#endif
 
 /// Print one stored entry: header (name, key hi/lo, IR/ASM sizes) followed by
 /// the IR and ASM bodies. SRE-safe: no Twine, no lambda, no temporary label.
@@ -645,12 +637,10 @@ bool printDumped(const char *name) {
       return true;
     }
   }
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // A non-worker core cannot read the worker-private payload. Shared state
   // carries only enough metadata to direct the caller to the owning core.
   if (printSharedDumpHint(name))
     return true;
-#endif
   if (hasName)
     EJIT_DIAG_DEBUG("print_dumped miss name=%s store_size=%u", name,
                     (unsigned)Store.size());
@@ -685,6 +675,13 @@ bool printDumpedModule(const char *name) {
   return true;
 }
 
+#else
+void setDumpFuncFilter(const std::string &) {}
+void setDumpSharedState(EJitSharedTaskPoolState *) {}
+bool printDumped(const char *) { return false; }
+bool printDumpedModule(const char *) { return false; }
+#endif // EJIT_DUMP_SUPPORT
+
 } // namespace ejit
 } // namespace llvm
 
@@ -704,7 +701,9 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   auto engine = std::unique_ptr<EJitOrcEngine>(new EJitOrcEngine());
   engine->P->periodReg = &periodReg;
   engine->P->runtimeState = &runtimeState;
+#ifdef EJIT_DUMP_SUPPORT
   engine->P->dumpJITDir = config.dumpJITDir;
+#endif
 
   // Bare-metal / cross-compiled: use compile-time target triple.
   // Native host: auto-detect via detectHost().
@@ -736,17 +735,20 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
   JTMBOrErr->setCodeModel(CodeModel::Small);
 
-  // Build a TargetMachine (same options the JIT compiles with) for the
-  // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
-  // simply unavailable.
-  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
-    engine->P->dumpFunctionTM = std::move(*TMOrErr);
-  else
-    consumeError(TMOrErr.takeError());
-  if (auto TMOrErr = JTMBOrErr->createTargetMachine())
-    engine->P->dumpModuleTM = std::move(*TMOrErr);
-  else
-    consumeError(TMOrErr.takeError());
+  auto createTM = [&]() -> std::unique_ptr<TargetMachine> {
+    auto TM = JTMBOrErr->createTargetMachine();
+    if (TM)
+      return std::move(*TM);
+    consumeError(TM.takeError());
+    return nullptr;
+  };
+  engine->P->optimizerTM = createTM();
+#if defined(EJIT_DUMP_SUPPORT) && \
+    (!defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM))
+  // AArch64 caches subtargets and resets per-function FP options on the TM.
+  // Module emission must not change that state on the function-dump machine.
+  engine->P->dumpModuleTM = createTM();
+#endif
 
   orc::LLJITBuilder Builder;
   Builder.setJITTargetMachineBuilder(*JTMBOrErr);
@@ -824,7 +826,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
   engine->P->optimizer = std::make_unique<EJitOptimizer>(
-      periodReg, engine->P->dumpFunctionTM.get());
+      periodReg, engine->P->optimizerTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -862,10 +864,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           if (!ctx)
             return;
 
-          // Clear stale analysis results from previous compilations
-          // (each compilation uses a fresh Module with new IR unit pointers).
-          engine->P->optimizer->clearAnalyses();
-
+#ifdef EJIT_DUMP_SUPPORT
           // Dump pre-optimization IR (before the JIT pipeline runs).
           if (!engine->P->dumpJITDir.empty()) {
             std::string prePath = engine->P->dumpJITDir + "/" + ctx->fnName +
@@ -876,9 +875,11 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
             if (!EC)
               M.print(preOS, nullptr);
           }
+#endif
 
           engine->P->optimizer->runPipeline(M, *ctx);
 
+#ifdef EJIT_DUMP_SUPPORT
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
             std::string path = engine->P->dumpJITDir + "/" + ctx->fnName + "_" +
@@ -943,10 +944,10 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
           // path of the emit does not call errs(), so once the path is
           // compiled in it is SRE-safe.
 #if !defined(EJIT_TRIM_LLVM_BACKEND) || defined(EJIT_DUMP_ASM)
-              if (engine->P->dumpFunctionTM && engine->P->dumpModuleTM) {
+              if (engine->P->optimizerTM && engine->P->dumpModuleTM) {
                 EJIT_DIAG_DEBUG("dump asm begin fn=%s", ctx->fnName.c_str());
                 bool FunctionOK = renderDumpAssembly(
-                    *engine->P->dumpFunctionTM,
+                    *engine->P->optimizerTM,
                     cloneDumpFunctionModule(M, ctx->fnName), FunctionAsm);
                 bool ModuleOK = renderDumpAssembly(*engine->P->dumpModuleTM,
                                                    CloneModule(M), ModuleAsm);
@@ -969,6 +970,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
                           std::move(ModuleIR), std::move(ModuleAsm));
             }
           }
+#endif // EJIT_DUMP_SUPPORT
         });
         // PGO: claim transform-generated __profc_*/__profd_* (Instrumented).
         // Gen creates them inside runPipeline (after addIRModule), so the
@@ -1119,17 +1121,6 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
 
   // Resolve undefined function symbols from user-registered table.
   // Required for bare-metal where dynamic lookup (dlsym) is unavailable.
-  // Throttle diagnostics: tally unresolved externals and emit a single
-  // summary line per load (below) instead of one line per symbol; the
-  // individual names are listed at DEBUG for regression triage.
-  size_t unresolvedFuncs = 0;
-  size_t unresolvedGlobals = 0;
-  SmallVector<std::string, 16> unresolvedNames;
-  static constexpr size_t kMaxUnresolvedNames = 32;
-  SmallPtrSet<const Function *, 16> ReferencedExternalFuncs;
-  SmallPtrSet<const GlobalVariable *, 16> ReferencedExternalGlobals;
-  collectReferencedExternalDecls(**ModuleOrErr, ReferencedExternalFuncs,
-                                 ReferencedExternalGlobals);
   for (Function &F : (*ModuleOrErr)->functions()) {
     if (!F.isDeclaration() || F.getName().empty() ||
         isEJitLocalFreeDimFunction(F))
@@ -1138,14 +1129,8 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     if (globalSymbols.count(P->J->mangleAndIntern(name)))
       continue;
     auto it = P->userSymbols.find(name);
-    if (it == P->userSymbols.end()) {
-      if (!F.isIntrinsic() && ReferencedExternalFuncs.contains(&F)) {
-        ++unresolvedFuncs;
-        if (unresolvedNames.size() < kMaxUnresolvedNames)
-          unresolvedNames.push_back("f:" + name);
-      }
+    if (it == P->userSymbols.end())
       continue;
-    }
     globalSymbols[P->J->mangleAndIntern(name)] = orc::ExecutorSymbolDef(
         orc::ExecutorAddr::fromPtr(it->second), JITSymbolFlags::Exported);
   }
@@ -1156,26 +1141,41 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
     if (globalSymbols.count(P->J->mangleAndIntern(name)))
       continue;
     auto it = P->userSymbols.find(name);
-    if (it == P->userSymbols.end()) {
-      if (ReferencedExternalGlobals.contains(&GV)) {
-        ++unresolvedGlobals;
-        if (unresolvedNames.size() < kMaxUnresolvedNames)
-          unresolvedNames.push_back("g:" + name);
-      }
+    if (it == P->userSymbols.end())
       continue;
-    }
     globalSymbols[P->J->mangleAndIntern(name)] = orc::ExecutorSymbolDef(
         orc::ExecutorAddr::fromPtr(it->second), JITSymbolFlags::Exported);
   }
-  if (unresolvedFuncs || unresolvedGlobals)
-    EJIT_DIAG("loadBitcode: %zu unresolved external(s) not registered "
-              "(%zu funcs, %zu globals)",
-              unresolvedFuncs + unresolvedGlobals, unresolvedFuncs,
-              unresolvedGlobals);
-  EJIT_DIAG_DEBUG("loadBitcode: %zu unresolved name(s) listed (of %zu total):",
-                  unresolvedNames.size(), unresolvedFuncs + unresolvedGlobals);
-  for (const std::string &n : unresolvedNames)
-    EJIT_DIAG_DEBUG("  %s", n.c_str());
+#ifdef EJIT_DIAG_ENABLE
+  if (gEJitDiagLevel >= EJIT_LOG_LVL_DEBUG) {
+    SmallPtrSet<const Function *, 16> Funcs;
+    SmallPtrSet<const GlobalVariable *, 16> Globals;
+    collectReferencedExternalDecls(**ModuleOrErr, Funcs, Globals);
+    SmallVector<std::string, 16> Names;
+    size_t NF = 0, NG = 0;
+    auto tally = [&](const GlobalValue &GV, StringRef Prefix, size_t &Count) {
+      if (globalSymbols.count(P->J->mangleAndIntern(GV.getName())))
+        return;
+      ++Count;
+      if (Names.size() < 32)
+        Names.push_back((Prefix + GV.getName()).str());
+    };
+    for (const Function &F : (*ModuleOrErr)->functions())
+      if (Funcs.contains(&F) && !F.getName().empty() &&
+          !isEJitLocalFreeDimFunction(F))
+        tally(F, "f:", NF);
+    for (const GlobalVariable &GV : (*ModuleOrErr)->globals())
+      if (Globals.contains(&GV))
+        tally(GV, "g:", NG);
+    if (NF || NG)
+      EJIT_DIAG("loadBitcode: %zu unresolved external(s) not registered "
+                "(%zu funcs, %zu globals)", NF + NG, NF, NG);
+    EJIT_DIAG_DEBUG("loadBitcode: %zu unresolved name(s) listed (of %zu total):",
+                    Names.size(), NF + NG);
+    for (const std::string &N : Names)
+      EJIT_DIAG_DEBUG("  %s", N.c_str());
+  }
+#endif
 
   // Provide codegen-synthesized runtime symbols (memset/memcpy/memmove/memcmp
   // and the stack-protector guard/fail) that the AOT symbol collector cannot
@@ -1232,31 +1232,6 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
   }
   void *Ptr = reinterpret_cast<void *>(addr->getValue());
 
-#ifdef EJIT_SRE_CODE_POOL
-  // Legacy whole-pool seal: flip the 2MiB pool that contains the resolved
-  // function to RX before it is handed back. This is the only point a JIT pool
-  // transitions RW->RX in whole-pool mode. Idempotent: a pool already sealed
-  // (e.g. on allocation rollover) is not re-flipped, so repeated lookups of the
-  // same function do not re-invoke enable_ex. Only pool-backed code is sealed;
-  // an address resolved outside the pools (e.g. a process/absolute symbol) is
-  // left untouched. If sealing fails we must not return a callable pointer.
-  //
-  // In 4K page-seal mode the seal already happened per-page at finalize (in the
-  // code-pool memory manager), so nothing is done here.
-  EJitCodePoolManager *OwningPool = nullptr;
-  if (P->nearCodePool && P->nearCodePool->contains(Ptr))
-    OwningPool = P->nearCodePool.get();
-  else if (P->farCodePool && P->farCodePool->contains(Ptr))
-    OwningPool = P->farCodePool.get();
-  if (OwningPool && !OwningPool->usesPageSeal()) {
-    if (auto Err = OwningPool->sealPoolContaining(Ptr)) {
-      EJIT_DIAG("lookup FAIL key=0x%016lx ptr=%p: seal pool error", cacheKey,
-                Ptr);
-      return std::move(Err);
-    }
-  }
-#endif
-
   EJIT_DIAG_VERBOSE("lookup OK key=0x%016lx name=%s ptr=%p", cacheKey,
                     name.c_str(), Ptr);
   return Ptr;
@@ -1299,28 +1274,15 @@ void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {
 }
 
 #ifdef EJIT_SRE_CODE_POOL
-EJitCodePoolManager::Stats EJitOrcEngine::getCodePoolStats() const {
-  return getTieredCodePoolStats().total;
-}
-
 EJitTieredCodePoolStats EJitOrcEngine::getTieredCodePoolStats() const {
   EJitTieredCodePoolStats Out;
   if (P->nearCodePool)
     Out.near = P->nearCodePool->getStats();
   if (P->farCodePool)
     Out.far = P->farCodePool->getStats();
-#define EJIT_SUM_STAT(Field) Out.total.Field = Out.near.Field + Out.far.Field
-  EJIT_SUM_STAT(poolCount);
-  EJIT_SUM_STAT(sealedCount);
-  EJIT_SUM_STAT(activeCount);
-  EJIT_SUM_STAT(usedBytes);
-  EJIT_SUM_STAT(reservedBytes);
-  EJIT_SUM_STAT(wastedBytes);
-  EJIT_SUM_STAT(sealInvocations);
-  EJIT_SUM_STAT(splitInvocations);
-  EJIT_SUM_STAT(rwEnableInvocations);
-  EJIT_SUM_STAT(finalizedRangeCount);
-#undef EJIT_SUM_STAT
+  sumPoolCounters(Out.total, Out.near, Out.far);
+  Out.total.rwEnableInvocations =
+      Out.near.rwEnableInvocations + Out.far.rwEnableInvocations;
   return Out;
 }
 

@@ -20,7 +20,6 @@
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
-typedef unsigned long size_t;
 typedef _Bool bool;
 
 #define true 1
@@ -43,7 +42,7 @@ typedef enum {
 } ejit_status_t;
 
 typedef enum {
-  EJIT_COMPILE_SYNC = 0,
+  EJIT_COMPILE_OFF = 2,
   EJIT_COMPILE_ASYNC = 1,
 } ejit_compile_mode_t;
 
@@ -56,14 +55,17 @@ typedef enum {
 typedef struct {
   ejit_compile_mode_t compileMode;
   ejit_opt_level_t optLevel;
-  size_t maxCodeMemory;
-  size_t maxDataMemory;
-  size_t maxCacheEntries;
-  size_t maxCacheSize;
-  bool enableLogger;
   bool forceStaticRegistry;
   const char *dumpJITDir;
 } ejit_config_t;
+
+// Keep this standalone board declaration in step with EJitRuntime.h.
+_Static_assert(sizeof(ejit_config_t) == 24 &&
+               __builtin_offsetof(ejit_config_t, compileMode) == 0 &&
+               __builtin_offsetof(ejit_config_t, optLevel) == 4 &&
+               __builtin_offsetof(ejit_config_t, forceStaticRegistry) == 8 &&
+               __builtin_offsetof(ejit_config_t, dumpJITDir) == 16,
+               "EJIT config ABI mismatch");
 
 typedef struct {
   uint64_t cacheHits;
@@ -346,7 +348,6 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = true;
   cfg.forceStaticRegistry = true;
 
   ejit_status_t rc = ejit_init(&cfg);

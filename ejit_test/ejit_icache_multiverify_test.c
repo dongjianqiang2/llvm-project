@@ -8,17 +8,9 @@
 //      (the v2 monomorphic-scalar bug -- one slot served the first identity for
 //      all calls -- is caught: warming identity A then calling identity B must
 //      return B's result, not A's).
-//   2. Per-dimension hit overhead: built with -ejit-wrapper-timing, the wrapper
-//      auto-prints (via EJIT_DIAG -> SRE_printf on the board) one
-//      `wrapper_timing_agg func=<N> status=254 ... get_fn_avg=... fn_call_avg=...
-//      total_avg=...` report per 100000 icache hits. `get_fn_avg` is the pure
-//      pointer-fetch cost (GEP + ldar), independent of the specialization body
-//      and growing with N; `total_avg` is wrapper + specialization body. The
-//      test only generates hits -- no manual timing/statistics.
 //
 // Build (add to ejit_test/build.sh by the integrator; NOT done here):
-//   COMPILE_FLAGS[ejit_icache_multiverify_test]="-mllvm -ejit-inline-cache \
-//       -mllvm -ejit-wrapper-timing -mllvm -enable-ejit-global-ctors=false"
+//   COMPILE_FLAGS[ejit_icache_multiverify_test]="-mllvm -enable-ejit-global-ctors=false"
 //   LINKER_SCRIPT[ejit_icache_multiverify_test]=ejit_baremetal.ld
 // Requires the aarch64_be preset (async + shared pool + cross-code-ptrs +
 // EJIT_DIAG_ENABLE + EJIT_SRE_DIAG) and the multi-version icache runtime.
@@ -26,9 +18,7 @@
 // Entry: int test_ejit_icache_multiverify(uint8_t,uint8_t,uint8_t,uint8_t)
 // (args ignored), called by the RTOS on EVERY core. The first core to reach
 // ejit_init is elected the compile worker and spins idle; every other core
-// (non-worker) runs the correctness checks + the hit loop. Each non-worker
-// core owns its private icache and its private wrapper-timing slots, so each
-// prints its own per-f_N report.
+// (non-worker) runs the correctness checks.
 //
 //===----------------------------------------------------------------------===//
 
@@ -58,7 +48,6 @@ extern uint8_t g_ucLocalCoreID;
 #define COMPILE_WAIT_ROUNDS 200u
 #define COMPILE_WAIT_TICKS 10u
 #define IDLE_DELAY_TICKS 40000u
-#define WRAPPER_TIMING_HITS 100000u /* = EJIT_WRAPPER_TIMING_REPORT_EVERY */
 
 //===-- Helpers -----------------------------------------------------------===//
 
@@ -192,7 +181,6 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
   ejit_config_t cfg = {.compileMode = EJIT_COMPILE_ASYNC,
                        .optLevel = EJIT_OPT_L2,
-                       .enableLogger = false,
                        .forceStaticRegistry = true};
   ejit_status_t rc = ejit_init(&cfg);
   uint32_t worker = ejit_taskpool_get_worker_core();
@@ -204,7 +192,7 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   if (core == worker)
     idle_forever(core, "worker");
 
-  /*--- Non-worker core: set up shared data, activate, verify, measure. ---*/
+  /* Non-worker core: set up shared data, activate and verify. */
   init_data();
   ejit_activate("p0", 0);
   ejit_activate("p0", 1);
@@ -217,10 +205,6 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
   /*=== f_0: 0-dim monomorphic baseline (no A/B) ===*/
   WARM(core, "f_0 warm==1", f_0(), 1u);
-  SRE_printf("[ICACHE][core=%u] f_0 hit loop (%u hits)\n", core,
-             WRAPPER_TIMING_HITS);
-  for (uint32_t k = 0; k < WRAPPER_TIMING_HITS; ++k)
-    (void)f_0();
 
   /*=== f_1: 1-dim. A=(0)->1, B=(1)->0. warm(B)==0 is the v2-bug catcher. ===*/
   WARM(core, "f_1 warm(A)==1", f_1(0), 1u);
@@ -231,10 +215,6 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     uint32_t rB = f_1(1);
     VERIFY(core, "f_1 hit(B)==0", rB == 0u, "got=%u", rB);
   }
-  SRE_printf("[ICACHE][core=%u] f_1 hit loop (%u hits)\n", core,
-             WRAPPER_TIMING_HITS);
-  for (uint32_t k = 0; k < WRAPPER_TIMING_HITS; ++k)
-    (void)f_1(0);
 
   /*=== f_2: 2-dim. A=(0,0)->3, B=(1,1)->0. ===*/
   WARM(core, "f_2 warm(A)==3", f_2(0, 0), 3u);
@@ -245,10 +225,6 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     uint32_t rB = f_2(1, 1);
     VERIFY(core, "f_2 hit(B)==0", rB == 0u, "got=%u", rB);
   }
-  SRE_printf("[ICACHE][core=%u] f_2 hit loop (%u hits)\n", core,
-             WRAPPER_TIMING_HITS);
-  for (uint32_t k = 0; k < WRAPPER_TIMING_HITS; ++k)
-    (void)f_2(0, 0);
 
   /*=== f_3: 3-dim. A=(0,0,0)->7, B=(1,1,1)->0. ===*/
   WARM(core, "f_3 warm(A)==7", f_3(0, 0, 0), 7u);
@@ -259,10 +235,6 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     uint32_t rB = f_3(1, 1, 1);
     VERIFY(core, "f_3 hit(B)==0", rB == 0u, "got=%u", rB);
   }
-  SRE_printf("[ICACHE][core=%u] f_3 hit loop (%u hits)\n", core,
-             WRAPPER_TIMING_HITS);
-  for (uint32_t k = 0; k < WRAPPER_TIMING_HITS; ++k)
-    (void)f_3(0, 0, 0);
 
   /*=== f_4: 4-dim. A=(0,0,0,0)->15, B=(1,1,1,1)->0. ===*/
   WARM(core, "f_4 warm(A)==15", f_4(0, 0, 0, 0), 15u);
@@ -273,10 +245,6 @@ int test_ejit_icache_multiverify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     uint32_t rB = f_4(1, 1, 1, 1);
     VERIFY(core, "f_4 hit(B)==0", rB == 0u, "got=%u", rB);
   }
-  SRE_printf("[ICACHE][core=%u] f_4 hit loop (%u hits)\n", core,
-             WRAPPER_TIMING_HITS);
-  for (uint32_t k = 0; k < WRAPPER_TIMING_HITS; ++k)
-    (void)f_4(0, 0, 0, 0);
 
   /*=== stats ===*/
   ejit_taskpool_stats_t st;

@@ -45,8 +45,8 @@
 #define EJIT_LOG_LVL_VERBOSE 2
 #define EJIT_LOG_LVL_DEBUG 3
 
-// Process-wide runtime log level. Defined in EJitLogger.cpp (always compiled,
-// hosted and freestanding). Default INFO. Set via ejit_set_log_level().
+// Process-wide log level, also available when diagnostics are compiled out.
+// Default INFO. Set via ejit_set_log_level().
 extern int gEJitDiagLevel;
 
 //===-- Diagnostic dump print delay -----------------------------------------===//

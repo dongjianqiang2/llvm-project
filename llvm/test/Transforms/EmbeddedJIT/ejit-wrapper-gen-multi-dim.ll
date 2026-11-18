@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 
 ; CHECK: @__ejit_funcidx_multi_dim_entry = internal global i32 -1
 ; CHECK: define i32 @multi_dim_entry(i32 %idx1, i32 %idx2)

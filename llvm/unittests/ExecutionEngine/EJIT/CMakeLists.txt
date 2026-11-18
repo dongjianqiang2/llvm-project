@@ -29,6 +29,10 @@ add_llvm_unittest(EJITTests
   PARTIAL_SOURCES_INTENDED
   )
 
+if(EJIT_DUMP_SUPPORT)
+  target_compile_definitions(EJITTests PRIVATE EJIT_DUMP_SUPPORT)
+endif()
+
 # The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
 # matching the LLVMEJIT build; without these definitions they compile to empty
 # translation units.
@@ -78,52 +82,6 @@ add_custom_target(check-ejit-code-pool
   USES_TERMINAL
   )
 
-# SRE taskpool tests: compile the taskpool sources directly with the taskpool
-# macros so they build and run independently of LLVMEJIT / EJITTests and need
-# no real SRE platform symbols (mock compiler + mock ring queue). Only LLVMSupport
-# is linked (for the gtest harness), so this target never pulls in OrcJIT/EJIT.
-set(EJIT_TASKPOOL_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
-set(LLVM_LINK_COMPONENTS Support)
-add_llvm_unittest(EJITTaskPoolTests
-  EJitTaskPoolTest.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitTaskPool.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreQueue.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitWorker.cpp
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
-  # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
-  # sources above). Required since "Raise diagnostic print throttle" (2b1aab7)
-  # added EJIT_DIAG* calls to EJitTaskPool.cpp: without it this target fails to
-  # link, since it deliberately links only LLVMSupport and never the full
-  # LLVMEJIT (which carries EJitLogger.cpp) - same pattern as
-  # EJITSharedTaskPoolTests below.
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
-
-  PARTIAL_SOURCES_INTENDED
-  )
-set(LLVM_LINK_COMPONENTS "${EJIT_TASKPOOL_LINK_COMPONENTS_SAVED}")
-
-# Numeric geometry must come from the CMake cache vars (not literals), so the
-# test TU compiles the shared sources with the SAME values as production
-# LLVMEJIT — a tuned cache var silently stopping being tested is exactly the
-# config-desync class this whole file guards against.
-target_compile_definitions(EJITTaskPoolTests PRIVATE
-  EJIT_SRE_TASKPOOL
-  EJIT_SRE_TASKPOOL_TESTING
-  EJIT_STATS_ENABLE
-  EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
-  EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
-  EJIT_TASKPOOL_SOURCE_DIR="${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT"
-  EJIT_TASKPOOL_INCLUDE_DIR="${LLVM_MAIN_SRC_DIR}/include/llvm/ExecutionEngine/EJIT"
-  )
-
-# Convenience target: build + run only the SRE taskpool unit tests.
-add_custom_target(check-ejit-taskpool
-  COMMAND $<TARGET_FILE:EJITTaskPoolTests>
-  DEPENDS EJITTaskPoolTests
-  COMMENT "Running EmbeddedJIT SRE taskpool unit tests"
-  USES_TERMINAL
-  )
-
 # Cross-core SHARED taskpool tests: compile the shared sources directly with the
 # shared-taskpool macros so they build and run independently of LLVMEJIT and need
 # no real SRE platform symbols. Many cores are simulated in one host process via
@@ -133,13 +91,11 @@ set(EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
 set(LLVM_LINK_COMPONENTS Support)
 add_llvm_unittest(EJITSharedTaskPoolTests
   EJitSharedTaskPoolTest.cpp
+  EJitTaskPoolTypesTest.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
-  # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
-  # two sources above). Needed when the global EJIT_DIAG_ENABLE is ON: without
-  # it the test binary fails to link, since this target deliberately links only
-  # LLVMSupport and never the full LLVMEJIT (which carries EJitLogger.cpp).
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  # This standalone target does not link LLVMEJIT.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitDiag.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
@@ -151,8 +107,6 @@ set(LLVM_LINK_COMPONENTS "${EJIT_SHARED_TASKPOOL_LINK_COMPONENTS_SAVED}")
 # fallbacks exist only for non-CMake builds and the static_asserts would fire
 # (or silently test different geometry) if they diverged.
 target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
-  EJIT_SRE_TASKPOOL
-  EJIT_SRE_SHARED_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
   EJIT_STATS_ENABLE
   EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
@@ -168,24 +122,14 @@ target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
   EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
   )
 if(EJIT_CODE_POOL_BATCHED_PUBLISH)
+  target_compile_definitions(EJITTests PRIVATE EJIT_CODE_POOL_BATCHED_PUBLISH)
   target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
     EJIT_CODE_POOL_BATCHED_PUBLISH)
 endif()
 
-# Forward the production code-sharing capability from the cache so the test
-# binary compiles EJitSharedTaskPool.cpp with the SAME compile-time fnPtr gate
-# as the LLVMEJIT this suite validates (the peer-path tests - FourK seal, peer
-# prepare, shared fnPtr - exercise the macro-ON gate; the code-sharing-OFF
-# tests are #ifndef-guarded in the test source). The global
-# add_definitions(-DEJIT_SRE_SHARED_CODE_POINTERS) was removed from
-# llvm/CMakeLists.txt precisely because it leaked into this target and pinned
-# the gate ON while the cache said otherwise; the forwarding below restores
-# the intended coupling in both directions. EJIT_TEST_NO_RECLAIM below also
-# turns it on unconditionally for that opt-in configuration. Mirrors the
-# LLVMEJIT-side condition (shared taskpool AND code pointers) so a
-# TASKPOOL=OFF + CODE_POINTERS=ON corner config cannot leave the test binary
-# gated while the library is not.
-if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+# Match the production peer-pointer gate; shared scheduling alone does not
+# make published code executable on another core.
+if(EJIT_SRE_SHARED_CODE_POINTERS)
   target_compile_definitions(EJITSharedTaskPoolTests PRIVATE
     EJIT_SRE_SHARED_CODE_POINTERS)
 endif()
@@ -244,21 +188,14 @@ add_llvm_unittest(EJITTier1WritableIntegrationTests
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitCodePoolMemoryManager.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
-  # Defines gEJitDiagLevel (the level gate behind every EJIT_DIAG* call in the
-  # sources above). Required since "Harden shared online PGO" (ea80ca36) made
-  # EJitCodePool.cpp emit EJIT_DIAG* calls: without it this target fails to
-  # link, since it deliberately links only JITLink/OrcShared and never the
-  # full LLVMEJIT (which carries EJitLogger.cpp) - same pattern as
-  # EJITSharedTaskPoolTests above.
-  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+  # This standalone target does not link LLVMEJIT.
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitDiag.cpp
 
   PARTIAL_SOURCES_INTENDED
   )
 set(LLVM_LINK_COMPONENTS "${EJIT_TIER1_LINK_COMPONENTS_SAVED}")
 
 target_compile_definitions(EJITTier1WritableIntegrationTests PRIVATE
-  EJIT_SRE_TASKPOOL
-  EJIT_SRE_SHARED_TASKPOOL
   EJIT_SRE_TASKPOOL_TESTING
   EJIT_SRE_SHARED_CODE_POINTERS
   EJIT_STATS_ENABLE
@@ -283,6 +220,7 @@ set(EJIT_VP_LINK_COMPONENTS_SAVED "${LLVM_LINK_COMPONENTS}")
 set(LLVM_LINK_COMPONENTS Support)
 add_llvm_unittest(EJITValueProfileTests
   EJitVpCollectorTest.cpp
+  ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitDiag.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitVpCollector.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
   ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSreTask_host.cpp
@@ -340,13 +278,11 @@ if(EJIT_BUILD_CACHE_QUERY_BENCH)
     EJitSharedCacheQueryBench.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedTaskPool.cpp
     ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitSharedPlatform.cpp
-    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitLogger.cpp
+    ${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT/EJitDiag.cpp
 
     PARTIAL_SOURCES_INTENDED
     )
   target_compile_definitions(EJITSharedCacheQueryBench PRIVATE
-    EJIT_SRE_TASKPOOL
-    EJIT_SRE_SHARED_TASKPOOL
     EJIT_SRE_TASKPOOL_TESTING
     EJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
     EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}

@@ -83,6 +83,11 @@ struct PgoScalarSite {
   uint64_t total = 0;
 };
 
+inline bool belowScalarThreshold(const PgoScalarSite &Site) {
+  return Site.topCount < EJIT_SRE_VP_MIN_SAMPLES ||
+         Site.topCount * 100 < Site.total * EJIT_SRE_VP_MIN_CONF_PERCENT;
+}
+
 /// Per-function value-site inventory used to probe the collector snapshot by
 /// re-computed site keys. Every value kind uses the function-unique IR-PGO
 /// NameRef hash; FuncHash remains the CFG hash required by InstrProf.

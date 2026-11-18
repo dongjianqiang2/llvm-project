@@ -280,8 +280,10 @@ struct BatchTimelineIdleCtx {
 };
 
 void mockBatchTimelineIdle(void *ctx, uint32_t ticks) {
+  if (ticks == 1u)
+    return;
   auto *T = static_cast<BatchTimelineIdleCtx *>(ctx);
-  if (ticks != 1u && T->batch->recordTimeline)
+  if (T->batch->recordTimeline)
     T->batch->timeline.push_back('D');
   // Stop the real worker loop after the post-publish throttle has run.
   if (!T->batch->timeline.empty() && T->batch->timeline.back() == 'D' &&
@@ -467,6 +469,24 @@ protected:
     EJitCoreId::resetForTest();
   }
 
+  void checkAndReleaseHit(EJitSharedTaskPool &pool,
+                          const EJitSharedTaskPool::CompileOrGetResult &hit) {
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+    EXPECT_FALSE(hit.hasReadToken);
+    ASSERT_EQ(hit.bucketIndex, kEJitSharedCacheBuckets);
+    for (const auto &bucket : state_->buckets)
+      EXPECT_EQ(bucket.readers.loadAcquire(), 0u);
+    pool.releaseRead(hit.bucketIndex); // sentinel: wrapper release is a no-op
+#else
+    ASSERT_TRUE(hit.hasReadToken);
+    ASSERT_LT(hit.bucketIndex, kEJitSharedCacheBuckets);
+    EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+    pool.releaseRead(hit.bucketIndex);
+    EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+#endif
+  }
+
   // Register a test-local stand-in for the wrapper's @__ejit_icache_fn_<name>
   // cell table. \p missFn non-null models a SENTINEL-form slot (NumDims <= 2,
   // timing off): the table is defined pre-filled with &MissFn and the runtime
@@ -596,11 +616,23 @@ TEST_F(SharedTaskPoolTest, PeerRequestsMayConstRankingFromOwnerWorker) {
   EJitCoreId::setCurrentForTest(1);
   ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
 
-  EXPECT_TRUE(peer.requestMayConstRanking());
-  EXPECT_EQ(log.calls, 1u);
+  // Keep a request outstanding across every ranking ticket. An idle-only
+  // service policy would drain the queue (or starve under continuous load).
+  for (unsigned i = 0; i != 32; ++i) {
+    ASSERT_EQ(peer.compileOrGet(i, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(peer.requestMayConstRanking());
+    EXPECT_EQ(state_->dequeuePos.loadAcquire(), i);
+    driveOwnerOnRequesterIdle(&drive, 1);
+  }
+  EXPECT_EQ(owner.workerConsumeLoops(), 64u);
+  EXPECT_EQ(owner.workerIdleYields(), 0u);
+  EXPECT_EQ(peer.workerIdleYields(), 32u);
+  EXPECT_EQ(state_->dequeuePos.loadAcquire(), 32u);
+  EXPECT_EQ(log.calls, 32u);
   EXPECT_EQ(log.callbackCore, 0u);
-  EXPECT_EQ(state_->mayConstRankingRequest.loadAcquire(), 1u);
-  EXPECT_EQ(state_->mayConstRankingComplete.loadAcquire(), 1u);
+  EXPECT_EQ(state_->mayConstRankingRequest.loadAcquire(), 32u);
+  EXPECT_EQ(state_->mayConstRankingComplete.loadAcquire(), 32u);
   EXPECT_EQ(state_->mayConstRankingResult.loadAcquire(), 1u);
 }
 
@@ -780,19 +812,8 @@ TEST_F(SharedTaskPoolTest, FixedWorkerCoreOnlyDesignatedCoreReelects) {
 
 #endif // EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
 
-//===----------------------------------------------------------------------===//
-// 3b/ Compile mode is CROSS-CORE SHARED runtime state.
-//
-// Regression test for the shared compile-mode bug: setMode()/configuredMode_
-// only seeds the mode at init time; a runtime mode switch must be published to
-// the shared state_->mode (the field compileOrGet reads with an acquire load)
-// so EVERY core — including a peer/other-core object, not just the owner —
-// observes it. A mode flip is a pure control flag: it must NOT reset the queue,
-// dedup, cache, owner election, or the single worker.
-//===----------------------------------------------------------------------===//
-TEST_F(SharedTaskPoolTest, SharedCompileModeIsCrossCoreRuntimeState) {
+TEST_F(SharedTaskPoolTest, InitOffIsVisibleToOwnerAndPeer) {
   const uint32_t kOff = static_cast<uint32_t>(EJitCompileMode::Off);
-  const uint32_t kAsync = static_cast<uint32_t>(EJitCompileMode::Async);
 
   // Owner comes up with the configured mode = Off; the shared state must start
   // in exactly that configured mode.
@@ -818,51 +839,15 @@ TEST_F(SharedTaskPoolTest, SharedCompileModeIsCrossCoreRuntimeState) {
   EXPECT_EQ(owner.compileOrGet(10, nullptr, 0, codeFor(10)).status,
             EJitCompileOrGetStatus::OffMode);
 
-  // Runtime switch to Async: the shared state_->mode must become Async with
-  // release semantics (this is the field compileOrGet reads). Before the fix
-  // this stayed Off and the producer kept taking OffMode forever.
-  owner.setSharedMode(EJitCompileMode::Async);
-  EXPECT_EQ(state_->mode.loadAcquire(), kAsync);
-  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Async);
-
-  // compileOrGet no longer takes OffMode solely due to a stale shared mode: a
-  // fresh request now enqueues async work.
-  EXPECT_EQ(owner.compileOrGet(11, nullptr, 0, codeFor(11)).status,
-            EJitCompileOrGetStatus::EnqueuedPending);
-
-  // The switch is visible from the OTHER core's object, not only the owner.
   EJitCoreId::setCurrentForTest(1);
-  EXPECT_EQ(peer.getSharedMode(), EJitCompileMode::Async);
-  EXPECT_EQ(peer.compileOrGet(12, nullptr, 0, codeFor(12)).status,
-            EJitCompileOrGetStatus::EnqueuedPending);
-
-  // A mode flip is a pure control flag: the queued work is NOT reset. The two
-  // distinct funcIndexes (11, 12) are still pending and the owner can drain it.
-  EJitCoreId::setCurrentForTest(0);
-  EJitSharedDiagnostics d;
-  owner.getDiagnostics(d);
-  EXPECT_EQ(d.queueDepth, 2u);
-  EXPECT_EQ(d.pendingCount, 2u);
-
-  // Switch back to Sync/Off: shared state_->mode becomes Off and compileOrGet
-  // returns OffMode/fallback again — visible from both the owner and the peer.
-  owner.setSharedMode(EJitCompileMode::Off);
-  EXPECT_EQ(state_->mode.loadAcquire(), kOff);
-  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Off);
-  auto offOwner = owner.compileOrGet(13, nullptr, 0, codeFor(13));
-  EXPECT_EQ(offOwner.status, EJitCompileOrGetStatus::OffMode);
-  EXPECT_EQ(offOwner.fnPtr, codeFor(13));
-
-  EJitCoreId::setCurrentForTest(1);
-  EXPECT_EQ(peer.getSharedMode(), EJitCompileMode::Off);
   auto offPeer = peer.compileOrGet(14, nullptr, 0, codeFor(14));
   EXPECT_EQ(offPeer.status, EJitCompileOrGetStatus::OffMode);
   EXPECT_EQ(offPeer.fnPtr, codeFor(14));
 
-  // The earlier async work survived the mode flips (control flag, not reinit).
+  EJitSharedDiagnostics d;
   EJitCoreId::setCurrentForTest(0);
   owner.getDiagnostics(d);
-  EXPECT_EQ(d.queueDepth, 2u);
+  EXPECT_EQ(d.queueDepth, 0u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -976,6 +961,51 @@ TEST_F(SharedTaskPoolTest, BoundPointerDescriptorsAreFixedAndValidated) {
   EXPECT_EQ(
       owner.compileOrGet(105, nullptr, 0, codeFor(105), &Invalid, 1).status,
       EJitCompileOrGetStatus::InvalidParam);
+}
+
+TEST_F(SharedTaskPoolTest, MalformedRequestNeverReachesCompiler) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.setPgoEnabled(true, 2, /*maxConcurrentProfiles=*/1);
+  unsigned calls = 0;
+  pool.setCompiler(
+      [](void *ctx, const EJitCompileRequest &req, void **out) {
+        ++*static_cast<unsigned *>(ctx);
+        *out = codeFor(req.funcIndex);
+        return true;
+      },
+      &calls);
+
+  EJitDimPair dim{};
+  EXPECT_EQ(pool.tryCacheHit(1, &dim, UINT32_MAX).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  EXPECT_EQ(pool.compileOrGet(1, nullptr, 1, nullptr).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  for (unsigned i = 0; i < 4; ++i) {
+    ASSERT_EQ(pool.compileOrGet(i, nullptr, 0, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    // No worker thread in this fixture. Corrupt the published record, not
+    // the producer's input, to exercise the independent dequeue boundary.
+    auto &req =
+        state_->ring[state_->dequeuePos.loadAcquire() % kEJitSharedQueueSlots]
+            .data;
+    if (i == 0)
+      req.numDims = UINT32_MAX;
+    else if (i == 1)
+      req.boundCount = UINT32_MAX;
+    else {
+      req.numDims = 1;
+      req.dims[0] = i == 2 ? EJitDimPair{kEJitSharedDimTypes, 0}
+                           : EJitDimPair{0, kEJitSharedInstances};
+    }
+    ASSERT_TRUE(pool.pollOne());
+    EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  }
+  ASSERT_EQ(pool.compileOrGet(4, nullptr, 0, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(calls, 1u);
 }
 
 TEST_F(SharedTaskPoolTest, PgoBoundPointerIsReadOnlyDuringCompile) {
@@ -1387,21 +1417,35 @@ TEST_F(SharedTaskPoolTest, ExplicitPublishFourTier2CompilesRetainThrottle) {
   Batch.activeCompiles = 0;
   Batch.maxActiveCompiles = 0;
   Batch.recordTimeline = true;
-  BatchTimelineIdleCtx Idle{&Batch, state_.get()};
-  Owner.setWorkerIdleHook(&mockBatchTimelineIdle, &Idle);
+  Owner.setWorkerIdleHook(
+      [](void *Ctx, uint32_t Ticks) {
+        if (Ticks != 1u)
+          static_cast<BatchPublishCtx *>(Ctx)->timeline.push_back('D');
+      },
+      &Batch);
 
-  std::atomic<int> PublishResult{-1};
-  std::thread Caller([&] {
-    PublishResult.store(Owner.requestCodeBatchFlushAndWait() ? 1 : 0,
-                        std::memory_order_release);
-  });
-  while (state_->codeBatchRequestState.loadAcquire() !=
-         static_cast<uint32_t>(EJitCodeBatchRequestState::Requested))
-    std::this_thread::yield();
-  EXPECT_EQ(Owner.workerPollOnce(), EJitWorkerStep::Consumed);
-  Caller.join();
-
-  EXPECT_EQ(PublishResult.load(std::memory_order_acquire), 1);
+  // Schedule the owner at the requester's first wait. Separate facades let
+  // requester waits and worker throttles use different hooks; neither needs
+  // to stop the pool or depend on host thread scheduling.
+  EJitSharedTaskPool Caller;
+  Caller.bind(state_.get());
+  EJitSharedTaskPool *NextWorker = &Owner;
+  Caller.setWorkerIdleHook(
+      [](void *Ctx, uint32_t Ticks) {
+        auto &Next = *static_cast<EJitSharedTaskPool **>(Ctx);
+        if (auto *Worker = std::exchange(Next, nullptr)) {
+          EXPECT_EQ(Ticks, 1u);
+          EXPECT_EQ(
+              Worker->state()->codeBatchRequestState.loadAcquire(),
+              static_cast<uint32_t>(EJitCodeBatchRequestState::Requested));
+          EXPECT_EQ(Worker->workerPollOnce(), EJitWorkerStep::Consumed);
+        }
+      },
+      &NextWorker);
+  EXPECT_TRUE(Caller.requestCodeBatchFlushAndWait());
+  EXPECT_EQ(NextWorker, nullptr);
+  EXPECT_EQ(state_->codeBatchRequestState.loadAcquire(),
+            static_cast<uint32_t>(EJitCodeBatchRequestState::Idle));
   EXPECT_EQ(Batch.timeline, "CDCDCDCDF");
   EXPECT_EQ(Batch.maxActiveCompiles, 1u);
   EXPECT_EQ(Batch.flushCalls, 1u);
@@ -1642,6 +1686,48 @@ TEST_F(SharedTaskPoolTest, DeactivateDuringCompileBlocksPublish) {
   EXPECT_FALSE(observer.lastPublished);
 }
 
+TEST_F(SharedTaskPoolTest, PeerReadsNearFarCountersAndLegacyTotals) {
+  EJitSharedTaskPool owner, peer;
+  bringUpOwner(owner);
+  owner.setCodePoolStatsProvider(
+      [](void *, EJitCodePoolStatsOut *s) {
+        s->near = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+        s->far = {10, 20, 30, 40, UINT64_C(1) << 33, 60, 70, 80, 90};
+        s->poolCount = 11;
+        s->sealedCount = 22;
+        s->activeCount = 33;
+        s->usedBytes = 44;
+        s->reservedBytes = (UINT64_C(1) << 33) + 5;
+        s->wastedBytes = 66;
+        s->sealInvocations = 77;
+        s->splitInvocations = 88;
+        s->finalizedRangeCount = 99;
+        return true;
+      }, nullptr);
+  peer.bind(state_.get());
+  EJitCodePoolStatsOut s{};
+  ASSERT_TRUE(peer.readCodePoolStats(&s));
+  EXPECT_EQ(s.reservedBytes, 0u);
+  publish(owner, 10);
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_TRUE(peer.readCodePoolStats(&s));
+  EXPECT_EQ(s.near.poolCount, 1u);
+  EXPECT_EQ(s.far.poolCount, 10u);
+  EXPECT_EQ(s.near.reservedBytes, 5u);
+  EXPECT_EQ(s.far.reservedBytes, UINT64_C(1) << 33);
+  EXPECT_EQ(s.poolCount, 11u);
+  EXPECT_EQ(s.sealedCount, 22u);
+  EXPECT_EQ(s.activeCount, 33u);
+  EXPECT_EQ(s.usedBytes, 44u);
+  EXPECT_EQ(s.reservedBytes, (UINT64_C(1) << 33) + 5);
+  EXPECT_EQ(s.wastedBytes, 66u);
+  EXPECT_EQ(s.sealInvocations, 77u);
+  EXPECT_EQ(s.splitInvocations, 88u);
+  EXPECT_EQ(s.finalizedRangeCount, 99u);
+  EXPECT_EQ(state_->codePoolStats.reservedBytes.loadRelaxed(), s.reservedBytes);
+  EXPECT_EQ(state_->codePoolStats.finalizedRangeCount.loadRelaxed(), 99u);
+}
+
 TEST_F(SharedTaskPoolTest, PublishCallbackRunsAfterCommit) {
   EJitSharedTaskPool owner;
   PublishObserver observer;
@@ -1668,11 +1754,7 @@ TEST_F(SharedTaskPoolTest, PublishLookupAndReadTokenRelease) {
   auto hit = owner.compileOrGet(11, d0, 1, codeFor(11));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(11));
-  EXPECT_TRUE(hit.hasReadToken);
-  // A held read token keeps readers > 0.
-  EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
-  owner.releaseRead(hit.bucketIndex);
-  EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
+  checkAndReleaseHit(owner, hit);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2263,8 +2345,7 @@ TEST_F(SharedTaskPoolTest, CodeSharingOffRejectsPeerWithoutReenqueue) {
 }
 #endif
 
-// 七.6 — code sharing ON: a non-owner core gets the SAME fnPtr + read token,
-// and the owner can read its own pointer too.
+// With shared code enabled, peers resolve the same executable pointer.
 TEST_F(SharedTaskPoolTest, CodeSharingOnReturnsSamePointerToPeer) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
@@ -2285,8 +2366,7 @@ TEST_F(SharedTaskPoolTest, CodeSharingOnReturnsSamePointerToPeer) {
   auto peerHit = peer.compileOrGet(61, nullptr, 0, codeFor(61));
   ASSERT_EQ(peerHit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(peerHit.fnPtr, codeFor(61)); // same pointer cross-core
-  EXPECT_TRUE(peerHit.hasReadToken);
-  peer.releaseRead(peerHit.bucketIndex);
+  checkAndReleaseHit(peer, peerHit);
 }
 
 // 七.7 — a request whose generation has been superseded is dropped at the
@@ -2466,8 +2546,7 @@ TEST_F(SharedTaskPoolTest, FourKPeerSplitsOnceSealsSinglePage) {
   auto hit = owner.compileOrGet(1, nullptr, 0, codeFor(1));
   ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(1));
-  EXPECT_TRUE(hit.hasReadToken);
-  owner.releaseRead(hit.bucketIndex);
+  checkAndReleaseHit(owner, hit);
 
   ASSERT_EQ(fourK.splits.size(), 1u);
   EXPECT_EQ(fourK.splits[0].first, range.poolBase);
@@ -3362,8 +3441,7 @@ TEST_F(SharedTaskPoolTest, FourKReinitForcesPeerToReSplit) {
 // semantic (ordering, counters, read tokens) while NEVER enqueuing/deduping.
 //===----------------------------------------------------------------------===//
 
-// 1/ A cache hit is served entirely on the fast path: fnPtr + bucket + a held
-//    read token, fastPathTerminal set, and NO enqueue/dedup side effects.
+// A fast hit returns the callable without enqueue/dedup side effects.
 TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EJitSharedTaskPool owner;
   bringUpOwner(owner, /*codeSharing=*/true);
@@ -3377,11 +3455,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_TRUE(fast.fastPathTerminal);
   EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(fast.fnPtr, codeFor(1));
-  EXPECT_TRUE(fast.hasReadToken);
   EXPECT_FALSE(fast.readyButNotShareable);
-  // A held read token keeps readers > 0 (same ownership contract as
-  // compileOrGet — the caller must release through releaseRead).
-  EXPECT_GT(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
 
   EJitSharedDiagnostics after;
   owner.getDiagnostics(after);
@@ -3390,8 +3464,7 @@ TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
   EXPECT_EQ(after.queueDepth, 0u);                      // no dedup slot
   EXPECT_EQ(after.pendingCount, 0u);
 
-  owner.releaseRead(fast.bucketIndex);
-  EXPECT_EQ(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+  checkAndReleaseHit(owner, fast);
 }
 
 // 2/ A true miss is NOT terminal on the fast path (no enqueue), and the slow
@@ -3419,6 +3492,36 @@ TEST_F(SharedTaskPoolTest, TryCacheHitMissFallsThroughToCompileOrGet) {
   EXPECT_EQ(d.asyncEnqueues, 1u);
   EXPECT_EQ(d.queueDepth, 1u);
   EXPECT_EQ(d.pendingCount, 1u);
+}
+
+TEST_F(SharedTaskPoolTest, DispatchRechecksPublicationAfterFastMiss) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  const EJitDimPair d = dim(1, 4);
+  owner.setInstanceEnabled(1, 4, true);
+  ASSERT_FALSE(owner.tryCacheHit(5, &d, 1).fastPathTerminal);
+
+  // A competing producer wins while the first caller is entering dispatch.
+  EJitCoreId::setCurrentForTest(1);
+  ASSERT_EQ(owner.compileOrGet(5, &d, 1, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EJitCoreId::setCurrentForTest(0);
+  EXPECT_EQ(owner.compileOrGet(5, &d, 1, nullptr).status,
+            EJitCompileOrGetStatus::AlreadyPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  // Invalid descriptors cannot bypass validation even on a now-ready hit.
+  EJitBoundPtrDescriptor invalid{};
+  EXPECT_EQ(owner.compileOrGet(5, &d, 1, nullptr, &invalid, 1).status,
+            EJitCompileOrGetStatus::InvalidParam);
+  auto hit = owner.compileOrGet(5, &d, 1, nullptr);
+  ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+  if (hit.hasReadToken)
+    owner.releaseRead(hit.bucketIndex);
+  owner.setInstanceEnabled(1, 4, false);
+  EXPECT_EQ(owner.compileOrGet(5, &d, 1, nullptr).status,
+            EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_FALSE(owner.pollOne());
 }
 
 // 3/ A disabled instance returns InstanceDisabled on the fast path and NEVER
@@ -3492,30 +3595,8 @@ TEST_F(SharedTaskPoolTest, TryCacheHitReadyButNotShareableCleanFallback) {
 }
 #endif
 
-// 5/ Mode Off still returns an existing cache hit on the fast path — the cache
-//    lookup is ordered ahead of the Off check, matching compileOrGet.
-TEST_F(SharedTaskPoolTest, TryCacheHitServesHitEvenWhenModeOff) {
-  EJitSharedTaskPool owner;
-  bringUpOwner(owner, /*codeSharing=*/true); // comes up Async
-  publish(owner, 30);
-
-  // Flip the cross-core mode to Off after the entry is Ready.
-  owner.setSharedMode(EJitCompileMode::Off);
-  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Off);
-
-  EJitCoreId::setCurrentForTest(0);
-  auto fast = owner.tryCacheHit(30, nullptr, 0);
-  EXPECT_TRUE(fast.fastPathTerminal);
-  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_EQ(fast.fnPtr, codeFor(30));
-  EXPECT_TRUE(fast.hasReadToken);
-  owner.releaseRead(fast.bucketIndex);
-}
-
 //===----------------------------------------------------------------------===//
-// Fixed-dimension fast cache-hit entries (tryCacheHit0D..4D): the unrolled
-// front-halves the C ABI ejit_taskpool_compile_or_get_Nd entries drive. Each
-// must match the generic tryCacheHit() semantics for the matching numDims.
+// Internal 0D..4D cache helpers agree with the generic lookup.
 //===----------------------------------------------------------------------===//
 
 // 0D/1D/2D/3D/4D cache hit: fnPtr + bucket + read token, no enqueue/dedup.
@@ -3540,9 +3621,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   EXPECT_TRUE(h0.fastPathTerminal);
   EXPECT_EQ(h0.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h0.fnPtr, codeFor(1));
-  EXPECT_TRUE(h0.hasReadToken);
-  EXPECT_GT(state_->buckets[h0.bucketIndex].readers.loadAcquire(), 0u);
-  owner.releaseRead(h0.bucketIndex);
+  checkAndReleaseHit(owner, h0);
 
   // 1D
   EJitDimPair d1[1] = {dim(0, 1)};
@@ -3550,8 +3629,7 @@ TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
   auto h1 = owner.tryCacheHit1D(2, 0, 1);
   ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(h1.fnPtr, codeFor(2));
-  EXPECT_TRUE(h1.hasReadToken);
-  owner.releaseRead(h1.bucketIndex);
+  checkAndReleaseHit(owner, h1);
 
   // 2D
   EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
@@ -3655,21 +3733,6 @@ TEST_F(SharedTaskPoolTest, FixedDimMissFallsThrough) {
             EJitCompileOrGetStatus::EnqueuedPending);
   owner.getDiagnostics(d);
   EXPECT_EQ(d.queueDepth, 1u);
-}
-
-// Mode Off still serves an existing cache hit via a fixed entry.
-TEST_F(SharedTaskPoolTest, FixedDimServesHitEvenWhenModeOff) {
-  EJitSharedTaskPool owner;
-  bringUpOwner(owner, /*codeSharing=*/true);
-  publish(owner, 40);
-  owner.setSharedMode(EJitCompileMode::Off);
-  EJitCoreId::setCurrentForTest(0);
-  auto fast = owner.tryCacheHit0D(40);
-  EXPECT_TRUE(fast.fastPathTerminal);
-  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
-  EXPECT_EQ(fast.fnPtr, codeFor(40));
-  EXPECT_TRUE(fast.hasReadToken);
-  owner.releaseRead(fast.bucketIndex);
 }
 
 // readyButNotShareable: a peer core that may not read the pointer gets a clean
@@ -3805,20 +3868,7 @@ TEST_F(SharedTaskPoolTest, HitTokenDisciplineAndVersionInvalidation) {
   ASSERT_TRUE(hit.fastPathTerminal);
   EXPECT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
   EXPECT_EQ(hit.fnPtr, codeFor(9)); // correct specialization pointer
-#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
-  EXPECT_FALSE(hit.hasReadToken);
-  EXPECT_EQ(hit.bucketIndex, kEJitSharedCacheBuckets); // sentinel
-  // No token was taken: readers stay 0 across the whole hit.
-  for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b)
-    EXPECT_EQ(state_->buckets[b].readers.loadAcquire(), 0u);
-  owner.releaseRead(hit.bucketIndex); // sentinel -> safe no-op
-#else
-  EXPECT_TRUE(hit.hasReadToken);
-  EXPECT_LT(hit.bucketIndex, kEJitSharedCacheBuckets);
-  EXPECT_GT(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
-  owner.releaseRead(hit.bucketIndex);
-  EXPECT_EQ(state_->buckets[hit.bucketIndex].readers.loadAcquire(), 0u);
-#endif
+  checkAndReleaseHit(owner, hit);
 
   // Deactivate → re-activate bumps the instance version: the stale-version slot
   // must NOT be served; the fast path cleanly reports it (disabled or miss) so
@@ -4215,6 +4265,21 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
 // is exactly what makes "core A's drain clears core B's cell" testable in a
 // single-process simulation.
 //===----------------------------------------------------------------------===//
+#ifndef EJIT_SRE_SHARED_CODE_POINTERS
+TEST_F(SharedTaskPoolTest, PrivateCodeNeverPopulatesDirectWrapperSlots) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  const EJitDimPair dims[] = {dim(0, 1)};
+  uintptr_t slots[EJIT_ICACHE_DIM_SIZE] = {};
+  uintptr_t scalar = reinterpret_cast<uintptr_t>(codeFor(10));
+  registerSlot(3, slots, 1);
+  registerSlot(4, &scalar, 0, codeFor(10));
+  pool.icacheFill(3, codeFor(3), dims, 1, pool.icacheBeginResolve());
+  pool.icacheFill(4, codeFor(4), nullptr, 0, pool.icacheBeginResolve());
+  EXPECT_EQ(slots[1], 0u);
+  EXPECT_EQ(scalar, reinterpret_cast<uintptr_t>(codeFor(10)));
+}
+#else
 TEST_F(SharedTaskPoolTest, InlineCacheFillAndServe) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool); // core 0 owner, Ready, code sharing off (owner-only).
@@ -4479,6 +4544,8 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainsOnOwnerShutdown) {
   EXPECT_EQ(slot, 0u);
 }
 
+#endif // EJIT_SRE_SHARED_CODE_POINTERS
+
 // numDims sizes the [D]^numDims array the drain walks, so an over-cap value
 // would make the drain write far past the end of the wrapper's global. Reject
 // the registration instead: the cell stays null and the taskpool serves every
@@ -4505,6 +4572,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheRegistrationRejectsAnOverCapShape) {
   EXPECT_EQ(ejitIcacheRegisterSlot(3, &cells[0], 1), EJitIcacheRegResult::Ok);
 }
 
+#ifdef EJIT_SRE_SHARED_CODE_POINTERS
 // Cross-core executability gate. A shared cell publishes the pointer to every
 // core the instant it is written, so it may only be filled where a resolved
 // fnPtr is callable on every core with no per-core work. Wiring per-core
@@ -5009,7 +5077,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
 //===----------------------------------------------------------------------===//
 // Sentinel-form slots: the branchless wrapper.
 //
-// For NumDims <= 2 (no -ejit-wrapper-timing) the AOT DEFINES the cell table
+// For NumDims <= 2 the AOT pass defines the cell table
 // pre-filled with &MissFn and the wrapper is load + musttail BLR with no null
 // guard, so a cell holding 0 is a crash, not a miss. The runtime's side of
 // that contract: whatever path empties a cell writes the slot's registered
@@ -5220,6 +5288,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheClearAllDropsTheSentinelRegistration) {
   ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
   EXPECT_EQ(slot, 0u) << "clearAll must drop the missFn, not leak it";
 }
+#endif // EJIT_SRE_SHARED_CODE_POINTERS
 
 //===----------------------------------------------------------------------===//
 // Per-core L0 dispatch cache
@@ -5534,6 +5603,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoDisablesL0Fill) {
   EXPECT_FALSE(pool.l0Try(5, nullptr, 0, &out));
 }
 
+#ifdef EJIT_SRE_SHARED_CODE_POINTERS
 TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheWaitsForTier2) {
   ejitIcacheClearAll();
   EJitSharedTaskPool pool;
@@ -5609,6 +5679,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheRequiresExactTier2Identity) {
     pool.releaseRead(tier2.bucketIndex);
   ejitIcacheClearAll();
 }
+#endif // EJIT_SRE_SHARED_CODE_POINTERS
 
 // Shared equivalent of EJitTaskPoolTest::PgoHitThresholdArmsTier2Recompile.
 // Set PGO threshold=3, publish Tier-1, hit it twice (below threshold), then
@@ -5737,7 +5808,7 @@ TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
     if (hit.hasReadToken)
       pool.releaseRead(hit.bucketIndex);
   }
-  EXPECT_EQ(state_->pgoProgressQuarters[0].loadAcquire(), 4u);
+  EXPECT_EQ(tier1->hitCount.loadAcquire(), 2u);
   EXPECT_EQ(pool.pendingCount(), 1u);
 
   // Tier-2 completion releases admission. The next called function can then
@@ -5966,10 +6037,13 @@ TEST_F(SharedTaskPoolTest,
   EXPECT_EQ(owner.pendingCount(), 2u);
   uint32_t profilesAtThreshold = 0;
   for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
-    if (state_->pgoActiveFunctions[i].loadAcquire() == 0)
+    const uint32_t encoded = state_->pgoActiveFunctions[i].loadAcquire();
+    if (!encoded)
       continue;
     ++profilesAtThreshold;
-    EXPECT_EQ(state_->pgoProgressQuarters[i].loadAcquire(), 4u);
+    const auto *slot = findReadySlot(encoded - 1);
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(slot->hitCount.loadAcquire(), 2u);
   }
   EXPECT_EQ(profilesAtThreshold, 2u);
   EJitCoreId::setCurrentForTest(kOwnerCore);
@@ -6913,9 +6987,7 @@ TEST_F(SharedTaskPoolTest, ReElectionReleasesTheOldEngineAndBuildsTheNew) {
 }
 #endif // !EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE
 
-// A peer with no engine of its own can still flip the shared mode in both
-// directions, because the elected owner compiles for every core.
-TEST_F(SharedTaskPoolTest, PeerSwitchesSharedModeBothWays) {
+TEST_F(SharedTaskPoolTest, ShutdownStopsAsyncServiceForPeer) {
   WorkerHooks hooks;
   EJitSharedTaskPool owner, peer;
   for (auto *pool : {&owner, &peer}) {
@@ -6930,48 +7002,13 @@ TEST_F(SharedTaskPoolTest, PeerSwitchesSharedModeBothWays) {
   EJitCoreId::setCurrentForTest(1);
   ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
 
-  uint32_t gen = 0;
-  ASSERT_TRUE(peer.asyncServiceAvailable(&gen));
-  peer.setSharedMode(EJitCompileMode::Sync);
-  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Sync)
-      << "the owner never saw the peer's flip";
+  ASSERT_TRUE(peer.asyncServiceAvailable());
 
-  ASSERT_TRUE(peer.asyncServiceAvailable(&gen));
-  EXPECT_TRUE(peer.publishSharedMode(EJitCompileMode::Async, gen))
-      << "Sync -> Async is unreachable for a peer";
-  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Async);
-}
-
-// The shutdown race: a peer that validated the pool, then had the owner shut
-// down underneath it, must NOT commit Async against a stopped worker.
-TEST_F(SharedTaskPoolTest, ShutdownDuringModeSwitchRejectsTheAsyncPublish) {
-  WorkerHooks hooks;
-  EJitSharedTaskPool owner, peer;
-  for (auto *pool : {&owner, &peer}) {
-    pool->bind(state_.get());
-    pool->setCompiler(&mockCompile, nullptr);
-    pool->setMode(EJitCompileMode::Sync);
-  }
-  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
-
-  EJitCoreId::setCurrentForTest(0);
-  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
-  EJitCoreId::setCurrentForTest(1);
-  ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
-
-  // The peer checks and is told yes.
-  uint32_t gen = 0;
-  EJitCoreId::setCurrentForTest(1);
-  ASSERT_TRUE(peer.asyncServiceAvailable(&gen));
-
-  // The owner shuts down before the peer gets to publish.
   EJitCoreId::setCurrentForTest(0);
   owner.ownerShutdown();
   ASSERT_EQ(hooks.stops, 1);
 
   EJitCoreId::setCurrentForTest(1);
-  EXPECT_FALSE(peer.publishSharedMode(EJitCompileMode::Async, gen))
-      << "published Async over a stopped worker";
   EXPECT_FALSE(peer.asyncServiceAvailable())
       << "still claims the pool can service async";
   // And nothing can be enqueued anyway: every producer path gates on Ready.

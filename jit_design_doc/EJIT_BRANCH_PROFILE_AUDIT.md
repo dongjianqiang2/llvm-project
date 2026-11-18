@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`EJIT_SRE_PGO_BRANCH_AUDIT` is an experimental, default-off diagnostic for
+`EJIT_SRE_PGO_BRANCH_AUDIT` is enabled in the product build. It is a diagnostic for
 finding EJIT annotations whose extracted modules show little branch-profile
 optimization opportunity. It reuses the normal online-PGO Tier-1 edge counters
 and adds a build-option-gated per-may_const-site counter array to that same
@@ -43,15 +43,20 @@ unique-cache-key aggregate for that entry:
 
 ```text
 [EJIT] mayconst-audit entry=FuncA key=0x1234 tier=2 versions=30 \
-  mayconst=42/3/0 removed=42 direct=39 pipeline=3 runtime_hits=99872 \
+  mayconst=42/na/0 removed=42 direct=na pipeline=na runtime_hits=99872 \
   hit_sites=17 removed_runtime_hits=95000 removed_hit_sites=16 \
   sampled_entries=67 sample_cycles=1900000 avg_removed=40 \
   weighted_permille=952 min=36 max=42
 ```
 
-`mayconst=input/specialized/final` counts only may-const loads. Negative removal is
-preserved rather than clamped, because it identifies specializations where
-optimization introduced more may-const loads than it removed. Recompiling the
+`mayconst=input/na/final` counts recognized loads at the two endpoints.
+Input uses the sampled inventory when supplied; final uses the optimized
+publish module (not the audit-only profile clone). The temporary Tier-1
+compile captures the input sites but does not publish a final summary.
+The midpoint is not measured: `na` means unavailable, not zero. The signed
+`removed=input-final` can be negative when optimization introduces more
+loads than it removes. It does not attribute a change to specialization or
+to a later optimization, hence `direct=na pipeline=na`. Recompiling the
 same cache key replaces its prior sample and does not inflate the version
 average.
 
@@ -71,7 +76,6 @@ function inlining and cloning.
 
 ```sh
 ./build.sh release aarch64_be \
-  --sre-taskpool --sre-shared-taskpool \
   --sre-taskpool-no-reclaim --sre-shared-code-pointers \
   --sre-pgo-branch-audit \
   --sre-pgo-max-concurrent-profiles=4 --stats
@@ -81,8 +85,8 @@ Start the worker as usual, call every workload path whose annotations must be
 audited, and wait for the final publication. Use `ejit_init()` for audit-only
 Baseline output or `ejit_init_pgo()` to apply PGO as well. Set the EJIT
 diagnostic level to DEBUG when per-function and per-may_const-site lines are
-needed. Audit sampling requires Async mode; Sync and Off keep their normal
-Baseline/off behavior because there is no later hit-triggered publication.
+needed. Audit sampling requires Async mode. Off is AOT-only: it does not
+compile a JIT version or start an audit window. There is no Sync mode.
 
 After the sampling windows and final compilations have completed, explicitly
 print the per-`ejit_entry` ranking from any attached core:

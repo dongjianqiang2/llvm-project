@@ -9,7 +9,6 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITERROR_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITERROR_H
 
-#include <cstdint>
 #include <string>
 
 namespace llvm {
@@ -19,9 +18,6 @@ struct EJitError {
   int code;
   std::string message;
   std::string funcName;
-  std::string cacheKey;
-  uint64_t timestamp;
-  size_t attemptedMemUsage;
 };
 
 } // namespace ejit

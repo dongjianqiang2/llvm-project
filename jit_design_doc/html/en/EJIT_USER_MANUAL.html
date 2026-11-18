@@ -214,7 +214,7 @@ runtime activates the time window → calls EJIT_ENTRY → on a cache hit runs s
   <ul>
     <li>Board-level config, mode config, and business config such as cell/trp/channel that stays stable for a period of time;</li>
     <li>Config fields that drive many branch paths, where the same instance is called repeatedly;</li>
-    <li>You can accept the JIT compile cost on the first call, or use async mode to fall back first and compile in the background.</li>
+    <li>A first miss can run AOT while compilation proceeds on the worker.</li>
   </ul>
 </section>
 
@@ -270,11 +270,8 @@ void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
   <h3>2.3 Initialize, activate, and call</h3>
 <pre><code class="language-c">int main(void) {
     ejit_config_t cfg = {0};
-    cfg.compileMode = EJIT_COMPILE_SYNC; // or EJIT_COMPILE_ASYNC
+    cfg.compileMode = EJIT_COMPILE_ASYNC;
     cfg.optLevel = EJIT_OPT_L2;
-    cfg.maxCodeMemory = 2 * 1024 * 1024;
-    cfg.maxCacheEntries = 4096;
-    cfg.enableLogger = true;
 
     if (ejit_init(&amp;cfg) != EJIT_OK) {
         return 1;
@@ -286,7 +283,7 @@ void update_cell_cfg(EJIT_DIM(cell) uint8_t cellIdx,
     // activate the cell[3] time window; afterwards process_cell(3, ...) can trigger specialization
     ejit_activate("cell", 3);
 
-    process_cell(3, 100); // first call: compiles in sync mode; falls back and submits a background compile in async mode
+    process_cell(3, 100); // AOT on async miss
     process_cell(3, 101); // subsequent: runs the specialized version on a cache hit
 
     // when modifying config, use a lifecycle function, or manually deactivate / activate
@@ -380,13 +377,8 @@ void update_both(EJIT_DIM(cell) uint8_t cellIdx,
   <p>The current C API config struct lives in <code>llvm/include/llvm/ExecutionEngine/EJIT/EJitRuntime.h</code>:</p>
 
 <pre><code class="language-c">typedef struct {
-  ejit_compile_mode_t compileMode; // EJIT_COMPILE_SYNC / EJIT_COMPILE_ASYNC
+  ejit_compile_mode_t compileMode; // EJIT_COMPILE_ASYNC / EJIT_COMPILE_OFF
   ejit_opt_level_t optLevel;       // EJIT_OPT_L1 / L2 / L3
-  size_t maxCodeMemory;            // JIT code memory cap
-  size_t maxDataMemory;            // data memory cap
-  size_t maxCacheEntries;          // cache entry count cap
-  size_t maxCacheSize;             // cache total size cap
-  bool enableLogger;               // whether to enable logging
   bool forceStaticRegistry;        // bare-metal: force the static registry
   const char *dumpJITDir;          // when non-null, dump the optimized JIT IR
 } ejit_config_t;</code></pre>
@@ -396,16 +388,14 @@ void update_both(EJIT_DIM(cell) uint8_t cellIdx,
     <tbody>
       <tr><td><code>ejit_init(const ejit_config_t *config)</code></td><td>Initialize EJIT. Pass <code>NULL</code> for default config. Consumes bitcode/period info registered at construction time or via the static table.</td></tr>
       <tr><td><code>ejit_shutdown(void)</code></td><td>Release EJIT runtime resources.</td></tr>
-      <tr><td><code>ejit_set_compile_mode(mode)</code></td><td>Switch sync/async compile mode at runtime.</td></tr>
-      <tr><td><code>ejit_get_compile_mode()</code></td><td>Query the current compile mode.</td></tr>
     </tbody>
   </table>
 
-  <h3>4.2 Sync and async modes</h3>
+  <h3>4.2 Initialization modes</h3>
   <table>
     <thead><tr><th>Mode</th><th>First-miss behavior</th><th>Suitable scenarios</th><th>Caveats</th></tr></thead>
     <tbody>
-      <tr><td><code>EJIT_COMPILE_SYNC</code></td><td>Blocks until JIT compilation finishes, then directly runs the specialized version on success</td><td>You can accept first-call latency and want performance gains as early as possible</td><td>First-call latency is more noticeable</td></tr>
+      <tr><td><code>EJIT_COMPILE_OFF</code></td><td>Always use AOT</td><td>AOT baseline</td><td>Select at initialization, consistently across cores.</td></tr>
       <tr><td><code>EJIT_COMPILE_ASYNC</code></td><td>Submits a background compile; the current call falls back to AOT</td><td>Sensitive to first-call latency</td><td><code>EJIT_ENTRY</code> side effects should be idempotent, to avoid inconsistency between the first AOT and later JIT behavior</td></tr>
     </tbody>
   </table>
@@ -429,10 +419,9 @@ bool ejit_is_active(const char *periodName, uint8_t cellIdx);</code></pre>
 <pre><code class="language-c">void ejit_clear_cache(void);
 void ejit_invalidate(const char *periodName, uint8_t cellIdx);
 
-ejit_status_t ejit_get_stats(ejit_stats_t *stats);
-const ejit_error_t *ejit_get_last_error(void);</code></pre>
+ejit_status_t ejit_get_stats(ejit_stats_t *stats);</code></pre>
 
-  <p><code>ejit_stats_t</code> includes entry count, code size, cache hit/miss, and eviction info. When JIT does not take effect, first check stats and last error, then enable <code>dumpJITDir</code> to dump the optimized IR.</p>
+  <p><code>ejit_stats_t</code> includes entry count, code size, cache hit/miss, and eviction info. When JIT does not take effect, first check the API return status and INFO diagnostics, then enable <code>dumpJITDir</code> to dump the optimized IR.</p>
 
   <h3>4.5 External symbol registration</h3>
 <pre><code class="language-c">void ejit_register_symbol(const char *name, void *addr);</code></pre>
@@ -563,7 +552,7 @@ build_release_x86/bin/clang -O2 -g \
       <tr><td><code>!ejit.metadata</code></td><td>Functions and globals carry <code>EJIT_ENTRY</code>, <code>EJIT_IN_PERIOD</code>, <code>EJIT_IN_PERIOD_ARRAY</code>, etc. metadata</td></tr>
       <tr><td><code>!ejit.may_const</code></td><td>Loads of annotated fields carry may_const metadata</td></tr>
       <tr><td><code>@__ejit_bitcode</code></td><td>The embedded bitcode is in a dedicated section</td></tr>
-      <tr><td><code>ejit_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
+      <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
       <tr><td><code>jit_dispatch</code> / <code>jit_fallback</code></td><td>A JIT dispatch path and an AOT fallback path exist</td></tr>
       <tr><td><code>ejit_deactivate</code> / <code>ejit_activate</code></td><td>Lifecycle-function entry/exit instrumentation</td></tr>
     </tbody>
@@ -596,8 +585,7 @@ cd build_debug_x86
   <p>The SRE code pool replaces the usual <code>mmap/mprotect</code> JIT code-memory path and suits platforms with strict requirements on executable-memory permissions.</p>
 
 <pre><code class="language-bash"># CMake option example
--DEJIT_SRE_CODE_POOL=ON
--DEJIT_CODE_POOL_4K_SEAL=ON</code></pre>
+-DEJIT_SRE_CODE_POOL=ON</code></pre>
 
   <ul>
     <li>Allocates JIT machine code from a 2MiB-aligned code pool;</li>
@@ -607,10 +595,10 @@ cd build_debug_x86
   </ul>
 
   <h3>8.3 SRE Taskpool</h3>
-  <p>The SRE taskpool is an async compile-scheduling mode for environments without a C++ thread library; it is off by default. It uses a single worker task, an MPSC queue, a dedup table, and a bucketed cache. Cross-core sharing of a taskpool depends on shared-memory mapping, execute permission, I/D cache coherence, and owner election.</p>
+  <p>The SRE taskpool is an async compile-scheduling mode for environments without a C++ thread library; it is always built. It uses a single worker task, an MPSC queue, a dedup table, and a bucketed cache. Cross-core sharing of a taskpool depends on shared-memory mapping, execute permission, I/D cache coherence, and owner election.</p>
 
 <pre><code class="language-bash"># build option example
-./build.sh release aarch64_be --freestanding --sre-taskpool</code></pre>
+cmake -S llvm --preset ejit-minimal-aarch64_be</code></pre>
 
   <div class="warn"><strong>Status note:</strong> SRE taskpool / shared taskpool is a platform-dependent capability; host unit tests can validate the core logic, but shared sections, cross-core execution, task deletion, and cache coherence must ultimately be verified on the target SRE multi-core environment.</div>
 </section>
@@ -637,9 +625,9 @@ cd build_debug_x86
     <li>Confirm you are using an EJIT-enabled Clang, not a system Clang.</li>
     <li>Confirm <code>ejit_init</code> ran before calling <code>EJIT_ENTRY</code>.</li>
     <li>Confirm the relevant time window has been <code>ejit_activate</code>-d.</li>
-    <li>Confirm the build output contains <code>@__ejit_bitcode</code> and <code>ejit_compile_or_get</code>.</li>
+    <li>Confirm the build output contains <code>@__ejit_bitcode</code> and <code>ejit_taskpool_compile_or_get</code>.</li>
     <li>On bare-metal, confirm the registry section was not garbage-collected by the linker.</li>
-    <li>Check <code>ejit_get_last_error()</code> and <code>ejit_get_stats()</code>.</li>
+    <li>Check the API return status and INFO diagnostics.</li>
   </ol>
 
   <h3>9.3 JIT triggered but branches were not folded</h3>
@@ -706,7 +694,7 @@ cd build_debug_x86
   <ul>
     <li>All <code>EJIT_ENTRY</code> functions have fallback-correctness tests.</li>
     <li>All config-modification paths use <code>EJIT_PERIOD_GUARD</code> or manual deactivate/activate.</li>
-    <li>Behavior is consistent across sync/async; the async first-call fallback does not affect business side effects.</li>
+    <li>Check AOT results on the first miss and JIT results after publication.</li>
     <li>Cache size, single-function size, and code-memory caps fit the target device's memory constraints.</li>
     <li>On bare-metal, confirm external symbols, the registry section, code-memory permissions, and the I/D cache flush path.</li>
     <li>Performance data covers four scenarios: cold compile, hot cache hit, fallback, and invalidation recompile.</li>

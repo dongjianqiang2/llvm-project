@@ -54,30 +54,6 @@ if(EJIT_SRE_PGO_BRANCH_AUDIT)
   message(STATUS "EmbeddedJIT: online-PGO branch audit enabled")
 endif()
 
-option(EJIT_FREESTANDING_MUTEX
-  "Inject no-op <mutex>/<shared_mutex>/<condition_variable> headers \
-(for freestanding toolchains that lack these C++ standard headers). \
-Enable this only when the toolchain does NOT provide <mutex>." OFF)
-if(EJIT_FREESTANDING_MUTEX)
-  set(BAREMETAL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/BareMetal")
-  message(STATUS "EmbeddedJIT: injecting bare-metal mutex stubs from ${BAREMETAL_INCLUDE}")
-  # Inject into LLVM libraries that use std::mutex (OrcJIT, Support, JITLink, etc.)
-  # but NOT into clang (which uses std::thread and needs the real <mutex>).
-  # Targets are created before this CMakeLists.txt runs, so they exist.
-  foreach(_tgt LLVMOrcJIT LLVMJITLink LLVMSupport LLVMCodeGen LLVMCore
-              LLVMAnalysis LLVMTransformUtils LLVMInstCombine LLVMScalarOpts
-              LLVMipo LLVMObject LLVMMC LLVMMCParser LLVMTarget
-              LLVMSelectionDAG LLVMGlobalISel LLVMAsmPrinter LLVMPasses
-              LLVMExecutionEngine LLVMOrcShared LLVMRuntimeDyld LLVMOrcTargetProcess
-              # Target-specific libs (only exist when built for that arch)
-              LLVMX86CodeGen LLVMX86Desc LLVMX86Info
-              LLVMAArch64CodeGen LLVMAArch64Desc LLVMAArch64Info LLVMAArch64Utils)
-    if(TARGET ${_tgt})
-      target_include_directories(${_tgt} SYSTEM BEFORE PRIVATE ${BAREMETAL_INCLUDE})
-    endif()
-  endforeach()
-endif()
-
 # Build target component list from LLVM_TARGETS_TO_BUILD.
 # Each target needs CodeGen, Desc, and Info for native target initialization.
 # AsmPrinter init lives in CodeGen, so no separate AsmPrinter component needed.
@@ -99,7 +75,7 @@ endforeach()
 set(EJIT_SOURCES
   EJit.cpp
   EJitRuntime.cpp
-  EJitRegistryTable.c
+  EJitDiag.cpp
   EJitOrcEngine.cpp
   EJitLinkDiagPlugin.cpp
   EJitLinkOptimizationPlugin.cpp
@@ -110,39 +86,26 @@ set(EJIT_SOURCES
   EJitRegistrationStore.cpp
   EJitStructFieldPass.cpp
   EJitOptimizer.cpp
-  EJitPassBuilder.cpp
   EJitProfileMerge.cpp
   EJitCodePool.cpp
   EJitCodePoolMemoryManager.cpp
   EJitSrePlatform.cpp
 )
 
-# EJitLogger has its own #ifndef EJIT_FREESTANDING no-op stubs, so always include it.
-list(APPEND EJIT_SOURCES
-  EJitLogger.cpp
-)
-
-# SRE taskpool compile scheduler — always compiled (PASS3 unconditionally
-# generates ejit_taskpool_compile_or_get calls). It uses no C++ threading
-# facilities, so it is compatible with EJIT_FREESTANDING.
-list(APPEND EJIT_SOURCES
-  EJitTaskPool.cpp
-  EJitSreQueue.cpp
-  EJitWorker.cpp
-)
+# PASS3 always emits the shared taskpool C ABI.
+list(APPEND EJIT_SOURCES EJitSharedTaskPool.cpp EJitSharedPlatform.cpp)
 if(EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
+  set(EJIT_SRE_TASK_PRIORITY "20" CACHE STRING
+    "Priority passed to SRE_TaskCreate (decimal 0-65535; use a platform-supported priority)")
+  if(NOT EJIT_SRE_TASK_PRIORITY MATCHES "^(0|[1-9][0-9]*)$" OR
+     EJIT_SRE_TASK_PRIORITY GREATER 65535)
+    message(FATAL_ERROR "EJIT_SRE_TASK_PRIORITY must be a decimal integer from 0 to 65535 (no leading zeros)")
+  endif()
+  set_property(SOURCE EJitSreTask_sre.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+    EJIT_SRE_TASK_PRIORITY=${EJIT_SRE_TASK_PRIORITY})
 else()
   list(APPEND EJIT_SOURCES EJitSreTask_host.cpp)
-endif()
-# Cross-core shared taskpool (single shared worker owner) — optional.
-# POD shared state + injectable core-id seam; no C++ threading facilities, so
-# it is compatible with EJIT_FREESTANDING.
-if(EJIT_SRE_SHARED_TASKPOOL)
-  list(APPEND EJIT_SOURCES
-    EJitSharedTaskPool.cpp
-    EJitSharedPlatform.cpp
-  )
 endif()
 
 # Online-PGO value profiling (default OFF): per-core collector + the runtime
@@ -160,12 +123,6 @@ endif()
 
 if(EJIT_SRE_PGO_BRANCH_AUDIT)
   list(APPEND EJIT_SOURCES EJitBranchProfile.cpp)
-endif()
-
-# Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
-if(NOT EJIT_FREESTANDING)
-  list(APPEND EJIT_SOURCES
-  )
 endif()
 
 add_llvm_component_library(LLVMEJIT
@@ -227,16 +184,12 @@ if(EJIT_SRE_PGO_VALUE_PROFILE)
   )
 endif()
 
-if(EJIT_SRE_PGO_BRANCH_AUDIT)
-  target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
+if(EJIT_DUMP_SUPPORT)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_DUMP_SUPPORT)
 endif()
 
-# 4K-granular code-pool sealing. The only user of this macro is the SRE adapter
-# (EJitSrePlatform.cpp), so scope it to LLVMEJIT instead of a global
-# add_definitions — toggling it then does not recompile the whole LLVM tree.
-# Effective only when the SRE code pool itself is enabled.
-if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
-  target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
+if(EJIT_SRE_PGO_BRANCH_AUDIT)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_PGO_BRANCH_AUDIT)
 endif()
 
 if(EJIT_CODE_POOL_BATCHED_PUBLISH)
@@ -246,8 +199,7 @@ endif()
 # Pin the JIT code pool to a fixed linker-script region [__ejit_code_start,
 # __ejit_code_end) in the RX code segment (enable_rw write / enable_ex seal)
 # instead of dynamic SRE_MemDbgAlloc. The only user of this macro is the SRE
-# adapter (EJitSrePlatform.cpp), so scope it to LLVMEJIT like
-# EJIT_CODE_POOL_4K_SEAL above. Effective only when the SRE code pool is on.
+# adapter, so scope it to LLVMEJIT.
 if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
 endif()
@@ -255,22 +207,19 @@ endif()
 # EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
 # Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
 # the AOT -mllvm -print-ejit-icache-dim-size value (both from the top-level CMake
-# var). Scoped to LLVMEJIT (the icache runtime lives here); gated on the shared
-# taskpool, which is the only build the icache is compiled under.
-if(EJIT_SRE_SHARED_TASKPOOL)
-  target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE})
-  target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
-endif()
+# var). Scoped to LLVMEJIT, where the runtime icache lives.
+target_compile_definitions(LLVMEJIT PRIVATE
+  EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE}
+  EJIT_ICACHE_FUNC_SLOTS=${EJIT_ICACHE_FUNC_SLOTS})
 
 # Fixed worker core: close the shared taskpool's owner election to the
 # designated core (empty = open CAS election, the default). The consumers are
 # EJitSharedTaskPool.cpp (the election gate) and EJit.cpp (the init-failure
 # message), both inside LLVMEJIT, so scope the definition to this target like
-# EJIT_CODE_POOL_4K_SEAL above - toggling it does not recompile the tree.
+# other target-local options above.
 # Non-empty test, not truthiness: "0" is a valid core id (CMake if() treats
 # the string "0" as FALSE - see the trap note in llvm/CMakeLists.txt).
-if(EJIT_SRE_SHARED_TASKPOOL AND
-   NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
+if(NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
   target_compile_definitions(LLVMEJIT PRIVATE
     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE})
 endif()
@@ -279,13 +228,13 @@ endif()
 # only meaningful with the shared taskpool). The consumers are
 # EJitSharedTaskPool.cpp (the peer pointer gate) and EJitCompileDriver.cpp
 # (the resolve path), both inside LLVMEJIT, so scope it to this target like
-# EJIT_CODE_POOL_4K_SEAL above - never a global add_definitions: the
+# other target-local options above - never a global add_definitions: the
 # EJITSharedTaskPoolTests target compiles EJitSharedTaskPool.cpp directly and
 # deliberately tests the code-sharing-OFF peer rejection, so a leaked
 # -DEJIT_SRE_SHARED_CODE_POINTERS makes the gate always-true and fails 5
 # tests. EJITTier1WritableIntegrationTests / EJITSharedCacheQueryBench define
 # it themselves when they want the sharing path.
-if(EJIT_SRE_SHARED_TASKPOOL AND EJIT_SRE_SHARED_CODE_POINTERS)
+if(EJIT_SRE_SHARED_CODE_POINTERS)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_SHARED_CODE_POINTERS)
 endif()
 
@@ -393,4 +342,3 @@ add_custom_target(check-ejit-size
 add_library(ejit_baremetal STATIC
   BareMetal/ejit_baremetal_stubs.c)
 target_compile_options(ejit_baremetal PRIVATE -ffunction-sections -fdata-sections)
-target_include_directories(ejit_baremetal PUBLIC BareMetal)

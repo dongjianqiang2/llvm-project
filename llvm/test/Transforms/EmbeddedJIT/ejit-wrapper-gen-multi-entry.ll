@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 
 ; Selection coverage in a mixed module. PASS3 must wrap every defined
 ; ejit_entry function, leave non-entry functions completely untouched, and

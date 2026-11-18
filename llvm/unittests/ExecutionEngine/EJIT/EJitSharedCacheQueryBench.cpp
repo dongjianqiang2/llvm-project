@@ -217,6 +217,38 @@ uint64_t bench2D(uint64_t iters, double *nsPerHit) {
   return hits;
 }
 
+template <unsigned N, bool Miss = false, bool Generic = false>
+void benchQuery(uint64_t iters) {
+  Bench B;
+  B.bringUpOwner(false);
+  const EJitDimPair dims[] = {{0, 1}, {1, 2}, {2, 3}, {3, 4}};
+  for (unsigned i = 0; i < N; ++i)
+    B.pool.setInstanceEnabled(dims[i].dimType, dims[i].instanceId, true);
+  if (!Miss) {
+    B.pool.compileOrGet(9, dims, N, codeFor(9));
+    B.pool.pollOne();
+  }
+  uint64_t correct = 0, start = nowNs();
+  for (uint64_t i = 0; i < iters; ++i) {
+    EJitSharedTaskPool::CompileOrGetResult r;
+    if constexpr (Miss || Generic)
+      r = B.pool.tryCacheHit(9, dims, N);
+    else if constexpr (N == 3)
+      r = B.pool.tryCacheHit3D(9, 0, 1, 1, 2, 2, 3);
+    else
+      r = B.pool.tryCacheHit4D(9, 0, 1, 1, 2, 2, 3, 3, 4);
+    correct += Miss ? !r.fastPathTerminal : r.fnPtr == codeFor(9);
+    if (r.hasReadToken)
+      B.pool.releaseRead(r.bucketIndex);
+  }
+  const char *kind = Miss ? "miss" : (Generic ? "generic" : "owner");
+  std::printf("%s%uD,%u,0,0,%.3f,%llu/%llu\n", kind,
+              N, N, double(nowNs() - start) / iters,
+              (unsigned long long)correct, (unsigned long long)iters);
+  if (correct != iters)
+    std::exit(1);
+}
+
 void runTable(uint64_t iters) {
   std::printf("# config,dim,slotDepth,core,nsPerHit,hits/iters\n");
   double ns;
@@ -239,6 +271,15 @@ void runTable(uint64_t iters) {
   h = bench2D(iters, &ns);
   std::printf("owner2D,2,0,0,%.3f,%llu/%llu\n", ns, (unsigned long long)h,
               (unsigned long long)iters);
+  benchQuery<3>(iters);
+  benchQuery<4>(iters);
+  benchQuery<0, false, true>(iters);
+  benchQuery<1, false, true>(iters);
+  benchQuery<2, false, true>(iters);
+  benchQuery<3, false, true>(iters);
+  benchQuery<4, false, true>(iters);
+  benchQuery<0, true>(iters);
+  benchQuery<4, true>(iters);
 }
 
 } // namespace

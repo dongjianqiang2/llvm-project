@@ -32,6 +32,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
+#include "EJitAutoRegister.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <limits>
 #include <map>
@@ -56,26 +57,6 @@ using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
 
-// Emit fixed-dimension taskpool fast-path C ABI calls
-// (ejit_taskpool_compile_or_get_Nd, N = dim count) for entries with <= 2 dims
-// (0-2 dims fit in 8 integer arg registers, no stack spill). Entries with > 2
-// dims use the generic ejit_taskpool_compile_or_get.
-static cl::opt<bool> EJitWrapperFixedDimEntry(
-    "ejit-wrapper-fixed-dim-entry", cl::init(true), cl::Hidden,
-    cl::desc("Emit fixed-dimension taskpool fast-path calls "
-             "(ejit_taskpool_compile_or_get_Nd) for ejit_entry functions with "
-             "<= 4 dims instead of the generic ejit_taskpool_compile_or_get"));
-
-static cl::opt<bool> EJitWrapperTiming(
-    "ejit-wrapper-timing", cl::init(false), cl::Hidden,
-    cl::desc("Emit diagnostic timing probes around taskpool lookup, indirect "
-             "JIT call, and read-token release in ejit_entry wrappers"));
-
-static cl::opt<bool> EJitFunctionBodyTiming(
-    "ejit-function-body-timing", cl::init(false), cl::Hidden,
-    cl::desc("Measure the selected AOT/JIT function body and its enclosing "
-             "wrapper overhead using the SRE cycle counter"));
-
 // Emit a per-function inline-cache probe DIRECTLY in the ejit_entry wrapper
 // (not a call). On a hit the wrapper loads its cell out of the per-function
 // @__ejit_icache_fn_<name> table (one load), null-checks it, and tail-calls the
@@ -85,14 +66,9 @@ static cl::opt<bool> EJitFunctionBodyTiming(
 // fills the cell on success (icacheFill). The probe carries NO freshness check:
 // the table is SHARED across cores (EJitIcacheSection), so an activate or
 // deactivate zeroes the cells directly and the next probe on any core misses.
-// Default off. Requires the runtime to be built
-// with EJIT_SRE_SHARED_CODE_POINTERS (production preset): the inline probe has
-// no per-call cross-core gate, so it is only safe when a cached pointer is
-// callable on any core. When combined with -ejit-wrapper-timing the icache hit
-// path is instrumented too (its own sentinel-status report line) so the wrapper
-// log still shows the fast path's ejit/fn overhead.
+// Enabled by default; -ejit-inline-cache=false retains the generic wrapper.
 static cl::opt<bool> EJitInlineCache(
-    "ejit-inline-cache", cl::init(false), cl::Hidden,
+    "ejit-inline-cache", cl::init(true), cl::Hidden,
     cl::desc("Emit a per-function inline-cache probe (a direct load of the "
              "cached specialization pointer) before the taskpool "
              "compile_or_get call in ejit_entry wrappers"));
@@ -154,49 +130,36 @@ struct BoundPtrInfo {
   uint64_t PointeeSize;
 };
 
-static SmallVector<BoundPtrInfo, 8> getBoundPtrInfos(const Function &F) {
-  SmallVector<BoundPtrInfo, 8> Result;
-  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-  if (!MD)
-    return Result;
-  for (const MDOperand &Op : MD->operands()) {
-    auto *Sub = dyn_cast<MDNode>(Op.get());
-    if (!Sub || Sub->getNumOperands() < 4)
-      continue;
-    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-    auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
-    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
-    auto *Size = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(3));
-    if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && PN && Idx && Size)
-      Result.push_back(BoundPtrInfo{PN->getString().str(),
-                                    static_cast<unsigned>(Idx->getZExtValue()),
-                                    Size->getZExtValue()});
-  }
-  return Result;
-}
+struct EntryInfo {
+  Function *F;
+  SmallVector<PeriodArrIndInfo, 4> PeriodInds;
+  SmallVector<BoundPtrInfo, 8> BoundPtrs;
+};
 
-static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
-  SmallVector<PeriodArrIndInfo, 4> Result;
-  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-  if (!MD)
-    return Result;
-
-  for (const MDOperand &Op : MD->operands()) {
+static EntryInfo parseEntryInfo(Function &F, const MDNode &MD) {
+  EntryInfo Info{&F, {}, {}};
+  for (const MDOperand &Op : MD.operands()) {
     auto *Sub = dyn_cast<MDNode>(Op.get());
     if (!Sub || Sub->getNumOperands() < 3)
       continue;
-    if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
-      if (Tag->getString() == TAG_EJIT_PERIOD_ARR_IND) {
-        auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
-        auto *IdxC = dyn_cast<ConstantAsMetadata>(Sub->getOperand(2));
-        if (PN && IdxC)
-          if (auto *CI = dyn_cast<ConstantInt>(IdxC->getValue()))
-            Result.push_back({PN->getString().str(),
-                              static_cast<unsigned>(CI->getZExtValue()), 0});
-      }
-    }
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    if (!Tag || (Tag->getString() != TAG_EJIT_PERIOD_ARR_IND &&
+                 Tag->getString() != TAG_EJIT_BOUND_PTR))
+      continue;
+    auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (!PN || !Idx)
+      continue;
+    if (Tag->getString() == TAG_EJIT_PERIOD_ARR_IND)
+      Info.PeriodInds.push_back({PN->getString().str(),
+                                 static_cast<unsigned>(Idx->getZExtValue()), 0});
+    else if (Sub->getNumOperands() >= 4)
+      if (auto *Size = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(3)))
+        Info.BoundPtrs.push_back({PN->getString().str(),
+                                  static_cast<unsigned>(Idx->getZExtValue()),
+                                  Size->getZExtValue()});
   }
-  return Result;
+  return Info;
 }
 
 // Per-lifecycle i32 global holding the dimType slot. Internal linkage so the
@@ -234,16 +197,7 @@ emitLifecycleRegistration(Module &M,
       FN_REGISTER_LIFECYCLE,
       FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy}, false));
 
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  bool CreatedAutoReg = false;
-  if (!AutoReg) {
-    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-    CreatedAutoReg = true;
-  }
+  auto [AutoReg, CreatedAutoReg] = getOrCreateAutoRegister(M);
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
   FunctionCallee FnRegLc = M.getFunction(FN_REGISTER_LIFECYCLE);
   for (auto &KV : LCs) {
@@ -280,8 +234,6 @@ emitLifecycleRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
   }
-  if (Entries.empty())
-    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
@@ -397,16 +349,7 @@ emitFuncIndexRegistration(Module &M,
       FN_REGISTER_FUNCINDEX,
       FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy}, false));
 
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  bool CreatedAutoReg = false;
-  if (!AutoReg) {
-    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-    CreatedAutoReg = true;
-  }
+  auto [AutoReg, CreatedAutoReg] = getOrCreateAutoRegister(M);
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
   FunctionCallee FnReg = M.getFunction(FN_REGISTER_FUNCINDEX);
   for (auto &KV : Fns) {
@@ -441,8 +384,6 @@ emitFuncIndexRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second, PtrTy),
                   ConstantInt::get(I64Ty, 0)}));
   }
-  if (Entries.empty())
-    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
@@ -495,16 +436,7 @@ emitIcacheSlotRegistration(Module &M,
     return (Elem && !Elem->isNullValue()) ? Elem : nullptr;
   };
 
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  bool CreatedAutoReg = false;
-  if (!AutoReg) {
-    auto *AutoRegTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    AutoReg = Function::Create(AutoRegTy, GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-    CreatedAutoReg = true;
-  }
+  auto [AutoReg, CreatedAutoReg] = getOrCreateAutoRegister(M);
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
   FunctionCallee FnReg = M.getFunction(FN_REGISTER_ICACHE_SLOT);
   for (auto &KV : Fns) {
@@ -547,8 +479,6 @@ emitIcacheSlotRegistration(Module &M,
                   ConstantExpr::getBitCast(KV.second.GV, PtrTy),
                   ConstantInt::get(I64Ty, KV.second.NumDims)}));
   }
-  if (Entries.empty())
-    return;
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
@@ -565,11 +495,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   LLVMContext &Ctx = M.getContext();
   auto *PtrTy = PointerType::getUnqual(Ctx);
 
-  SmallVector<Function *, 4> EntryFuncs;
+  SmallVector<EntryInfo, 4> EntryFuncs;
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-    if (hasMDStringEntry(MD, TAG_EJIT_ENTRY) && !F.isDeclaration())
-      EntryFuncs.push_back(&F);
+    if (hasMDStringEntry(MD, TAG_EJIT_ENTRY) && !F.isDeclaration() &&
+        !F.isVarArg())
+      EntryFuncs.push_back(parseEntryInfo(F, *MD));
   }
 
   if (EntryFuncs.empty()) {
@@ -587,8 +518,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   M.getOrInsertFunction(
       FN_TASKPOOL_COMPILE_OR_GET,
       FunctionType::get(I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy, PtrTy}, false));
-  bool HasBoundPtr = llvm::any_of(EntryFuncs, [](const Function *F) {
-    return !getBoundPtrInfos(*F).empty();
+  bool HasBoundPtr = llvm::any_of(EntryFuncs, [](const EntryInfo &E) {
+    return !E.BoundPtrs.empty();
   });
   if (HasBoundPtr)
     M.getOrInsertFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND,
@@ -636,7 +567,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // — and re-emitting the module-level lifecycle registration would duplicate
   // it.
   if (llvm::all_of(EntryFuncs,
-                   [&](Function *F) { return isAlreadyWrapped(*F); }))
+                   [&](const EntryInfo &E) { return isAlreadyWrapped(*E.F); }))
     return PreservedAnalyses::all();
 
   // Cross-module-stable dimType: gather the distinct lifecycle (period) names
@@ -648,8 +579,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // different lifecycles never collide (EJitLifecycleRegistry.h). funcIndex is
   // assigned the same way by the process-global EJitFuncRegistry (below).
   std::map<std::string, GlobalVariable *> DimTypeGlobals;
-  for (Function *F : EntryFuncs)
-    for (auto &PI : getPeriodArrIndInfo(*F))
+  for (const EntryInfo &E : EntryFuncs)
+    for (const auto &PI : E.PeriodInds)
       if (!PI.PeriodName.empty())
         DimTypeGlobals.emplace(PI.PeriodName, nullptr);
   if (DimTypeGlobals.size() > kEJitMaxDimTypes) {
@@ -671,27 +602,30 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // exhausted). The loader keys its table by the SAME registry index, so no two
   // functions can alias one slot (EJitFuncRegistry.h).
   std::map<std::string, GlobalVariable *> FuncIndexGlobals;
-  for (Function *F : EntryFuncs)
-    FuncIndexGlobals.emplace(F->getName().str(),
-                             getOrCreateFuncIndexGlobal(M, F->getName()));
+  for (const EntryInfo &E : EntryFuncs)
+    FuncIndexGlobals.emplace(E.F->getName().str(),
+                             getOrCreateFuncIndexGlobal(M, E.F->getName()));
   emitFuncIndexRegistration(M, FuncIndexGlobals);
 
   // Per-function inline-cache slot globals (@__ejit_icache_fn_<name>), created
   // and registered only when -ejit-inline-cache is on. The wrapper reads its
   // slot directly (one atomic load + null-check + indirect call) on the hit
   // path; the runtime writes the frozen specialization pointer through it on
-  // resolve. Requires the runtime to be built with EJIT_SRE_SHARED_CODE_POINTERS
-  // (production preset) - the inline probe has no per-call cross-core gate, so
-  // it is only safe when a cached pointer is callable on any core.
+  // resolve. A runtime built without shared code pointers leaves every direct
+  // slot at its initial miss value; it may still serve the generic lookup.
   std::map<std::string, IcacheSlotInfo> IcacheFnGlobals;
   if (EJitInlineCache) {
-    for (Function *F : EntryFuncs) {
-      unsigned NumDims = getPeriodArrIndInfo(*F).size();
+    for (const EntryInfo &E : EntryFuncs) {
+      Function *F = E.F;
+      unsigned NumDims = E.PeriodInds.size();
       // Skip functions exceeding the cache dimensionality cap from the icache
-      // map. They are still wrapped (taskpool path) but without an icache probe;
-      // the per-function DimCount > EJIT_ICACHE_MAX_DIMS check below emits the
-      // compile error, so this just avoids emitting a wasteful [D]^N global.
-      if (NumDims > EJIT_ICACHE_MAX_DIMS)
+      // map. They are still wrapped (taskpool path) but without an icache
+      // probe; the per-function DimCount > EJIT_ICACHE_MAX_DIMS check below
+      // emits the compile error, so this just avoids emitting a wasteful [D]^N
+      // global. The miss helper must be noinline and cannot own another
+      // function's EH pads.
+      if (NumDims > EJIT_ICACHE_MAX_DIMS || F->hasPersonalityFn() ||
+          F->hasFnAttribute(Attribute::AlwaysInline))
         continue;
       IcacheSlotInfo Info;
       Info.GV = getOrCreateIcacheFnGlobal(M, F->getName(), NumDims);
@@ -706,7 +640,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: " << EntryFuncs.size()
                     << " entry function(s)\n");
   bool Changed = false;
-  for (Function *F : EntryFuncs) {
+  for (const EntryInfo &E : EntryFuncs) {
+    Function *F = E.F;
+    const auto &PeriodInds = E.PeriodInds;
+    const auto &BoundPtrs = E.BoundPtrs;
     LLVM_DEBUG(dbgs() << "ejit-wrapper-gen: wrapping " << F->getName() << "\n");
     // Idempotency guard: skip functions already wrapped by an earlier pass run.
     // PASS3 may be invoked multiple times via EJitAotModulePass (e.g. O1+O2
@@ -717,7 +654,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
     // Prevent the CGSCC inliner from inlining the wrapped function into
     // callers. Each call site would duplicate the JIT dispatch logic
-    // (cacheKey computation, ejit_compile_or_get call, indirect call) and
+    // (cache probe, taskpool lookup, indirect call) and
     // the inliner may produce inconsistent AOT fallback code depending on
     // call-site context. This is unconditional: the entry must stay
     // out-of-line for LTO correctness. Sema rejects always_inline on
@@ -726,8 +663,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (!F->hasFnAttribute(Attribute::AlwaysInline))
       F->addFnAttr(Attribute::NoInline);
 
-    auto PeriodInds = getPeriodArrIndInfo(*F);
-    SmallVector<BoundPtrInfo, 8> BoundPtrs = getBoundPtrInfos(*F);
     unsigned DimCount = PeriodInds.size();
 
     if (BoundPtrs.size() > MAX_BOUND_PTR_PARAMS) {
@@ -756,8 +691,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     SmallVector<StringRef, 4> SeenNames;
     unsigned ArgCount = F->arg_size();
     for (unsigned I = 0; I < DimCount; ++I) {
-      auto GIt = DimTypeGlobals.find(PeriodInds[I].PeriodName);
-      if (PeriodInds[I].PeriodName.empty() || GIt == DimTypeGlobals.end()) {
+      if (PeriodInds[I].PeriodName.empty()) {
         F->getContext().emitError("ejit-wrapper-gen: invalid period name in "
                                   "ejit_period_arr_ind: " +
                                   PeriodInds[I].PeriodName);
@@ -819,123 +753,34 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     bool EmitIcacheProbe =
         EJitInlineCache && IcacheIt != IcacheFnGlobals.end();
 
+    auto forwardCall = [&](IRBuilder<> &B, Value *Target, Function &Caller) {
+      SmallVector<Value *, 8> Args;
+      for (Argument &Arg : Caller.args())
+        Args.push_back(&Arg);
+      CallInst *Call = B.CreateCall(Caller.getFunctionType(), Target, Args);
+      Call->setCallingConv(Caller.getCallingConv());
+      for (unsigned I = 0; I < Caller.arg_size(); ++I)
+        Call->addParamAttrs(
+            I, AttrBuilder(Ctx, Caller.getAttributes().getParamAttrs(I)));
+      Call->addRetAttrs(AttrBuilder(Ctx, Caller.getAttributes().getRetAttrs()));
+      return Call;
+    };
+
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
-    auto *I64Ty = Type::getInt64Ty(Ctx);
-    bool UseFixed =
-        EJitWrapperFixedDimEntry && DimCount <= 2 && BoundPtrs.empty();
-
-    SmallVector<ReturnInst *, 8> OriginalReturns;
-    for (BasicBlock &BB : *F)
-      if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
-        OriginalReturns.push_back(RI);
-    bool HasMustTailAotExit = false;
-    for (BasicBlock &BB : *F) {
-      for (Instruction &I : BB) {
-        auto *CI = dyn_cast<CallInst>(&I);
-        if (CI && CI->isMustTailCall()) {
-          HasMustTailAotExit = true;
-          break;
-        }
-      }
-      if (HasMustTailAotExit)
-        break;
-    }
-
-    // Timing callees (shared by hit and slow paths).
-    FunctionCallee TraceNow{};
-    FunctionCallee TraceWrapper{};
-    FunctionCallee TraceFunctionBody{};
-    Constant *FunctionName = nullptr;
-    if (EJitWrapperTiming || EJitFunctionBodyTiming) {
-      TraceNow = M.getOrInsertFunction(FN_TASKPOOL_TRACE_NOW,
-                                       FunctionType::get(I64Ty, false));
-    }
-    if (EJitWrapperTiming) {
-      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
-                                         I64Ty, I64Ty, I64Ty, I64Ty};
-      TraceWrapper = M.getOrInsertFunction(
-          FN_TASKPOOL_TRACE_WRAPPER,
-          FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
-    }
-    if (EJitFunctionBodyTiming) {
-      TraceFunctionBody = M.getOrInsertFunction(
-          FN_FUNCTION_BODY_CYCLES_RECORD,
-          FunctionType::get(Type::getVoidTy(Ctx),
-                            {PtrTy, I32Ty, I64Ty, I64Ty, I64Ty, I64Ty}, false));
-      IRBuilder<> NameBuilder(Ctx);
-      FunctionName = NameBuilder.CreateGlobalString(
-          F->getName(), ".ejit.function_body_name", 0, &M);
-    }
-
-    auto emitFunctionBodyRecord = [&](IRBuilder<> &B, uint32_t Path,
-                                      Value *WrapperBegin, Value *BodyBegin,
-                                      Value *BodyEnd, Value *WrapperEnd) {
-      if (!EJitFunctionBodyTiming)
-        return;
-      B.CreateCall(TraceFunctionBody,
-                   {FunctionName, ConstantInt::get(I32Ty, Path), WrapperBegin,
-                    BodyBegin, BodyEnd, WrapperEnd});
-    };
-
-    auto instrumentAotBody = [&](BasicBlock *FallbackEntry,
-                                 Value *WrapperBegin) {
-      if (!EJitFunctionBodyTiming)
-        return;
-
-      SmallPtrSet<BasicBlock *, 16> Reachable;
-      SmallVector<BasicBlock *, 16> Worklist{FallbackEntry};
-      while (!Worklist.empty()) {
-        BasicBlock *BB = Worklist.pop_back_val();
-        if (!Reachable.insert(BB).second)
-          continue;
-        llvm::append_range(Worklist, successors(BB));
-      }
-
-      SmallVector<ReturnInst *, 8> TimedReturns;
-      for (ReturnInst *RI : OriginalReturns) {
-        if (!Reachable.contains(RI->getParent()))
-          continue;
-        // A musttail call must remain immediately adjacent to its return. Keep
-        // such an uncommon AOT exit valid rather than changing its ABI/stack
-        // behaviour for a diagnostic option.
-        if (auto *CI = dyn_cast_or_null<CallInst>(RI->getPrevNode());
-            CI && CI->isMustTailCall())
-          continue;
-        TimedReturns.push_back(RI);
-      }
-      if (TimedReturns.empty())
-        return;
-
-      IRBuilder<> StartBuilder(&*FallbackEntry->getFirstInsertionPt());
-      Value *Begin =
-          StartBuilder.CreateCall(TraceNow, {}, "ejit_aot_body_begin");
-      for (ReturnInst *RI : TimedReturns) {
-        IRBuilder<> EndBuilder(RI);
-        Value *BodyEnd =
-            EndBuilder.CreateCall(TraceNow, {}, "ejit_aot_body_end");
-        Value *WrapperEnd =
-            EndBuilder.CreateCall(TraceNow, {}, "ejit_wrapper_end");
-        emitFunctionBodyRecord(EndBuilder, kEJitFunctionBodyPathAOT,
-                               WrapperBegin, Begin, BodyEnd, WrapperEnd);
-      }
-    };
-
     // emitSlowPath: emit the funcIndex guard (EntryBB) + compile_or_get
     // (CallBB) + dispatch (DispatchBB) into Fn, using Fn's args. FallbackBB
     // already holds the spliced original body (with its own ret). Shared by
     // icache-off (in F) and icache-on (in MissFn).
     auto emitSlowPath = [&](Function &Fn, BasicBlock *EntryBB,
                             BasicBlock *CallBB, BasicBlock *DispatchBB,
-                            BasicBlock *FallbackBB,
-                            Value *WrapperBegin) -> Value * {
+                            BasicBlock *FallbackBB) {
       IRBuilder<> B(EntryBB);
       // Allocas live in the entry block so they dominate the call/dispatch
       // blocks (and match the original layout: allocas precede the funcidx
       // guard).
-      Value *DimsAlloca = UseFixed
-                              ? nullptr
-                              : B.CreateAlloca(ArrayType::get(DimPairTy, 4),
-                                               nullptr, "ejit_dims");
+      auto *DimsTy = ArrayType::get(DimPairTy, DimCount);
+      Value *DimsAlloca =
+          DimCount ? B.CreateAlloca(DimsTy, nullptr, "ejit_dims") : nullptr;
       Value *OutFnAlloca = B.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
       Value *OutBucketAlloca =
           B.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
@@ -949,8 +794,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         BoundDescAlloca =
             B.CreateAlloca(BoundDescArrayTy, nullptr, "ejit_bound_ptrs");
       }
-      if (EJitFunctionBodyTiming && !WrapperBegin)
-        WrapperBegin = B.CreateCall(TraceNow, {}, "ejit_wrapper_begin");
       Value *FuncIdx = B.CreateLoad(I32Ty, FuncIndexGlobals[F->getName().str()],
                                     "ejit_funcidx");
       Value *IdxValid = B.CreateICmpNE(
@@ -966,147 +809,82 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       auto emitInstanceVal = [&](unsigned I) -> Value * {
         Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
         unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-        if (BW > 32)
-          return B.CreateTrunc(ArgVal, I32Ty);
+        if (BW > 32) {
+          Value *Fits = B.CreateICmpULE(
+              ArgVal, ConstantInt::get(ArgVal->getType(), UINT32_MAX));
+          return B.CreateSelect(Fits, B.CreateTrunc(ArgVal, I32Ty),
+                                B.getInt32(UINT32_MAX));
+        }
         if (BW < 32)
           return B.CreateZExt(ArgVal, I32Ty);
         return ArgVal;
       };
-      Value *TBeforeLookup = nullptr, *TAfterLookup = nullptr;
-      if (EJitWrapperTiming)
-        TBeforeLookup = B.CreateCall(TraceNow, {}, "ejit_t_before_lookup");
       Value *Status = nullptr;
-      if (UseFixed) {
-        static const char *const FixedNames[] = {
-            FN_TASKPOOL_COMPILE_OR_GET_0D, FN_TASKPOOL_COMPILE_OR_GET_1D,
-            FN_TASKPOOL_COMPILE_OR_GET_2D, FN_TASKPOOL_COMPILE_OR_GET_3D,
-            FN_TASKPOOL_COMPILE_OR_GET_4D};
-        SmallVector<Type *, 12> ParamTys;
-        SmallVector<Value *, 12> Args;
-        ParamTys.push_back(I32Ty);
-        Args.push_back(FuncIdx);
-        for (unsigned I = 0; I < DimCount; ++I) {
-          ParamTys.push_back(I32Ty);
-          ParamTys.push_back(I32Ty);
-          Args.push_back(emitDimTypeVal(I));
-          Args.push_back(emitInstanceVal(I));
-        }
-        ParamTys.push_back(PtrTy);
-        ParamTys.push_back(PtrTy);
-        Args.push_back(OutFnArg);
-        Args.push_back(OutBucketArg);
-        FunctionCallee FixedFn = M.getOrInsertFunction(
-            FixedNames[DimCount], FunctionType::get(I32Ty, ParamTys, false));
-        Status = B.CreateCall(FixedFn, Args);
-      } else {
-        for (unsigned I = 0; I < DimCount; ++I) {
+      for (unsigned I = 0; I < DimCount; ++I) {
+        Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
+                         ConstantInt::get(I32Ty, I)};
+        Value *PairPtr = B.CreateInBoundsGEP(DimsTy, DimsAlloca, Idxs);
+        B.CreateStore(emitDimTypeVal(I),
+                      B.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr"));
+        B.CreateStore(emitInstanceVal(I),
+                      B.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr"));
+      }
+      Value *DimsPtr = DimCount > 0 ? B.CreatePointerCast(DimsAlloca, PtrTy)
+                                    : ConstantPointerNull::get(PtrTy);
+      if (BoundPtrs.size() == 1) {
+        const BoundPtrInfo &BoundPtr = BoundPtrs.front();
+        Value *RawPtr = Fn.getArg(BoundPtr.ArgIndex);
+        if (RawPtr->getType() != PtrTy)
+          RawPtr = B.CreatePointerCast(RawPtr, PtrTy);
+        Status =
+            B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND),
+                         {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
+                          RawPtr, ConstantInt::get(I32Ty, BoundPtr.PointeeSize),
+                          ConstantInt::get(I32Ty, BoundPtr.ArgIndex), OutFnArg,
+                          OutBucketArg});
+      } else if (BoundPtrs.size() > 1) {
+        auto *BoundDescTy =
+            cast<StructType>(BoundDescArrayTy->getElementType());
+        for (unsigned I = 0; I < BoundPtrs.size(); ++I) {
+          const BoundPtrInfo &BoundPtr = BoundPtrs[I];
           Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
                            ConstantInt::get(I32Ty, I)};
-          Value *PairPtr = B.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
-                                               DimsAlloca, Idxs);
-          B.CreateStore(
-              emitDimTypeVal(I),
-              B.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr"));
-          B.CreateStore(
-              emitInstanceVal(I),
-              B.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr"));
-        }
-        Value *DimsPtr = DimCount > 0 ? B.CreatePointerCast(DimsAlloca, PtrTy)
-                                      : ConstantPointerNull::get(PtrTy);
-        if (BoundPtrs.size() == 1) {
-          const BoundPtrInfo &BoundPtr = BoundPtrs.front();
+          Value *DescPtr =
+              B.CreateInBoundsGEP(BoundDescArrayTy, BoundDescAlloca, Idxs);
           Value *RawPtr = Fn.getArg(BoundPtr.ArgIndex);
           if (RawPtr->getType() != PtrTy)
             RawPtr = B.CreatePointerCast(RawPtr, PtrTy);
-          Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND),
-                                {FuncIdx, DimsPtr,
-                                 ConstantInt::get(I32Ty, DimCount), RawPtr,
-                                 ConstantInt::get(I32Ty, BoundPtr.PointeeSize),
-                                 ConstantInt::get(I32Ty, BoundPtr.ArgIndex),
-                                 OutFnArg, OutBucketArg});
-        } else if (BoundPtrs.size() > 1) {
-          auto *BoundDescTy =
-              cast<StructType>(BoundDescArrayTy->getElementType());
-          for (unsigned I = 0; I < BoundPtrs.size(); ++I) {
-            const BoundPtrInfo &BoundPtr = BoundPtrs[I];
-            Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
-                             ConstantInt::get(I32Ty, I)};
-            Value *DescPtr =
-                B.CreateInBoundsGEP(BoundDescArrayTy, BoundDescAlloca, Idxs);
-            Value *RawPtr = Fn.getArg(BoundPtr.ArgIndex);
-            if (RawPtr->getType() != PtrTy)
-              RawPtr = B.CreatePointerCast(RawPtr, PtrTy);
-            B.CreateStore(RawPtr, B.CreateStructGEP(BoundDescTy, DescPtr, 0));
-            B.CreateStore(ConstantInt::get(I32Ty, BoundPtr.PointeeSize),
-                          B.CreateStructGEP(BoundDescTy, DescPtr, 1));
-            B.CreateStore(ConstantInt::get(I32Ty, BoundPtr.ArgIndex),
-                          B.CreateStructGEP(BoundDescTy, DescPtr, 2));
-          }
-          Status =
-              B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND_V),
-                           {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
-                            B.CreatePointerCast(BoundDescAlloca, PtrTy),
-                            ConstantInt::get(I32Ty, BoundPtrs.size()), OutFnArg,
-                            OutBucketArg});
-        } else {
-          Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
-                                {FuncIdx, DimsPtr,
-                                 ConstantInt::get(I32Ty, DimCount), OutFnArg,
-                                 OutBucketArg});
+          B.CreateStore(RawPtr, B.CreateStructGEP(BoundDescTy, DescPtr, 0));
+          B.CreateStore(ConstantInt::get(I32Ty, BoundPtr.PointeeSize),
+                        B.CreateStructGEP(BoundDescTy, DescPtr, 1));
+          B.CreateStore(ConstantInt::get(I32Ty, BoundPtr.ArgIndex),
+                        B.CreateStructGEP(BoundDescTy, DescPtr, 2));
         }
+        Status =
+            B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET_BOUND_V),
+                         {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
+                          B.CreatePointerCast(BoundDescAlloca, PtrTy),
+                          ConstantInt::get(I32Ty, BoundPtrs.size()), OutFnArg,
+                          OutBucketArg});
+      } else {
+        Status =
+            B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
+                         {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
+                          OutFnArg, OutBucketArg});
       }
-      if (EJitWrapperTiming)
-        TAfterLookup = B.CreateCall(TraceNow, {}, "ejit_t_after_lookup");
       Value *OutFn = B.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
       Value *HitStatus = B.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
       B.CreateCondBr(B.CreateAnd(HitStatus, B.CreateIsNotNull(OutFn)),
                      DispatchBB, FallbackBB);
 
       B.SetInsertPoint(DispatchBB);
-      SmallVector<Value *, 8> Args;
-      for (unsigned I = 0; I < F->arg_size(); ++I)
-        Args.push_back(Fn.getArg(I));
-      Value *BodyBegin = nullptr;
-      if (EJitFunctionBodyTiming)
-        BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
-      auto releaseAndTrace = [&]() {
-        Value *BodyEnd = nullptr;
-        if (EJitFunctionBodyTiming)
-          BodyEnd = B.CreateCall(TraceNow, {}, "ejit_jit_body_end");
-        Value *TAfterFn = nullptr;
-        if (EJitWrapperTiming) {
-          TAfterFn =
-              BodyEnd ? BodyEnd : B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-          Value *Bucket = B.CreateLoad(I32Ty, OutBucketAlloca);
-          B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
-          Value *TAfterRelease =
-              B.CreateCall(TraceNow, {}, "ejit_t_after_release");
-          B.CreateCall(TraceWrapper,
-                       {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
-                        TAfterLookup, TAfterFn, TAfterRelease});
-          if (EJitFunctionBodyTiming)
-            emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
-                                   BodyBegin, BodyEnd, TAfterRelease);
-        } else {
-          Value *Bucket = B.CreateLoad(I32Ty, OutBucketAlloca);
-          B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
-          if (EJitFunctionBodyTiming) {
-            Value *WrapperEnd = B.CreateCall(TraceNow, {}, "ejit_wrapper_end");
-            emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
-                                   BodyBegin, BodyEnd, WrapperEnd);
-          }
-        }
-      };
-      if (F->getReturnType()->isVoidTy()) {
-        B.CreateCall(F->getFunctionType(), OutFn, Args);
-        releaseAndTrace();
+      CallInst *Call = forwardCall(B, OutFn, Fn);
+      B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ),
+                   {B.CreateLoad(I32Ty, OutBucketAlloca)});
+      if (Fn.getReturnType()->isVoidTy())
         B.CreateRetVoid();
-      } else {
-        Value *RetVal = B.CreateCall(F->getFunctionType(), OutFn, Args);
-        releaseAndTrace();
-        B.CreateRet(RetVal);
-      }
-      return WrapperBegin;
+      else
+        B.CreateRet(Call);
     };
 
     // Helper: splice the original body into Dst, fixing PHI/uses, then erase
@@ -1124,21 +902,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // MissFn on miss) -- no allocas, no calls, no frame. MissFn holds the
       // funcidx guard + compile_or_get + dispatch + the AOT fallback (original
       // body), with its own frame. Miss is rare, so the call overhead is fine.
-      // Moving a musttail AOT exit into a function with one extra fixed
-      // parameter would invalidate its caller/callee ABI match. Such entries
-      // keep an ABI-identical MissFn; their slow JIT path starts timing locally
-      // and their AOT fallback is deliberately left uninstrumented.
-      const bool ThreadWrapperBegin =
-          EJitFunctionBodyTiming && !HasMustTailAotExit;
-      FunctionType *MissFnTy = F->getFunctionType();
-      if (ThreadWrapperBegin) {
-        SmallVector<Type *, 8> MissParamTys(F->getFunctionType()->params());
-        MissParamTys.push_back(I64Ty);
-        MissFnTy =
-            FunctionType::get(F->getReturnType(), MissParamTys, F->isVarArg());
-      }
-      Function *MissFn = Function::Create(
-          MissFnTy, GlobalValue::InternalLinkage, F->getName() + "_miss", &M);
+      Function *MissFn =
+          Function::Create(F->getFunctionType(), GlobalValue::InternalLinkage,
+                           F->getName() + "_miss", &M);
+      MissFn->setCallingConv(F->getCallingConv());
       // Function::Create only inherits module-default uwtable/frame-pointer
       // from the context, NOT F's target-cpu/target-features/tune-cpu. Without
       // those, TTI::areInlineCompatible(Caller=MissFn, Callee=helper) fails the
@@ -1179,61 +946,40 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
           BasicBlock::Create(Ctx, "miss_entry", MissFn, MissFallback);
       auto *MissCall = BasicBlock::Create(Ctx, "miss_call", MissFn);
       auto *MissDispatch = BasicBlock::Create(Ctx, "miss_dispatch", MissFn);
-      if (!MissFallback->getTerminator()) {
-        IRBuilder<> B(MissFallback);
-        if (F->getReturnType()->isVoidTy())
-          B.CreateRetVoid();
-        else
-          B.CreateRet(PoisonValue::get(F->getReturnType()));
-      }
-      Value *MissWrapperBegin =
-          ThreadWrapperBegin ? MissFn->getArg(F->arg_size()) : nullptr;
-      emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback,
-                   MissWrapperBegin);
-      if (!HasMustTailAotExit)
-        instrumentAotBody(MissFallback, MissWrapperBegin);
+      emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback);
 
       // Wrapper (F): frame-less probe + tail calls. Sentinel-form tables
-      // (NumDims <= 2, timing off) are defined pre-filled with &MissFn, so
+      // (NumDims <= 2) are defined pre-filled with &MissFn, so
       // their wrapper is ONE block - probe + musttail BLR, no guard; the
       // dispatch/miss blocks below exist only for the guarded shapes.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
       BasicBlock *JitIcacheDispatch = nullptr;
       BasicBlock *JitMiss = nullptr;
       IRBuilder<> B(JitEntry);
-      Value *WrapperBegin = nullptr;
-      if (EJitFunctionBodyTiming)
-        WrapperBegin = B.CreateCall(TraceNow, {}, "ejit_wrapper_begin");
-      Value *TBeforeIcache = nullptr, *FuncIdxForTiming = nullptr;
-      if (EJitWrapperTiming) {
-        TBeforeIcache =
-            WrapperBegin ? WrapperBegin
-                         : B.CreateCall(TraceNow, {}, "ejit_t_before_icache");
-        FuncIdxForTiming = B.CreateLoad(
-            I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx_t");
-      }
       GlobalVariable *IcacheSlot = IcacheIt->second.GV;
       unsigned NumDims = IcacheIt->second.NumDims;
       // The sentinel initializer is a [D]^NumDims splat of &MissFn: at D=16
       // that is 1/16/256 relocations for 0/1/2 dims, but 4096 and 65536 for
       // 3 and 4 - so 3D/4D keep the zero-init table and the null guard.
-      // Function-body timing is also excluded: it threads an extra wrapper-
-      // begin argument into MissFn (changing its signature away from F's) and
-      // emits trace calls around the specialization call, neither of which
-      // survives a single-block musttail BLR.
-      const bool Sentinelize = !EJitWrapperTiming && !EJitFunctionBodyTiming &&
-                               NumDims <= 2;
+      const bool Sentinelize = NumDims <= 2;
       if (!Sentinelize) {
         JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
         JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
       }
       Value *SlotPtr = IcacheSlot;
       if (NumDims > 0) {
+        Value *InRange = B.getTrue();
         SmallVector<Value *, 5> Indices;
         Indices.push_back(ConstantInt::get(I32Ty, 0));
         for (unsigned I = 0; I < NumDims; ++I) {
           Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
           unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
+          // Test the original value before narrowing a wide argument for GEP.
+          if (BW >= Log2_64(EJIT_ICACHE_DIM_SIZE) + 1)
+            InRange = B.CreateAnd(
+                InRange, B.CreateICmpULT(
+                             ArgVal, ConstantInt::get(ArgVal->getType(),
+                                                      EJIT_ICACHE_DIM_SIZE)));
           Value *Idx = ArgVal;
           if (BW > 32)
             Idx = B.CreateTrunc(ArgVal, I32Ty);
@@ -1241,8 +987,15 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
             Idx = B.CreateZExt(ArgVal, I32Ty);
           Indices.push_back(Idx);
         }
-        SlotPtr = B.CreateInBoundsGEP(IcacheSlot->getValueType(), IcacheSlot,
-                                      Indices, "ejit_ic_slot");
+        SlotPtr = B.CreateGEP(IcacheSlot->getValueType(), IcacheSlot, Indices,
+                              "ejit_ic_slot");
+        // Out-of-domain identities have no cell. Probe an immutable miss
+        // sentinel instead; never read a neighbour or alias a valid identity.
+        auto *MissSlot =
+            new GlobalVariable(M, PtrTy, true, GlobalValue::PrivateLinkage,
+                               MissFn, F->getName() + ".icache_miss");
+        MissSlot->setAlignment(Align(8));
+        SlotPtr = B.CreateSelect(InRange, SlotPtr, MissSlot);
       }
       LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
       ICSlotLoad->setAlignment(Align(8));
@@ -1254,9 +1007,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // acquire would buy nothing and cost an LDAR per hit. Lowers to the same
       // LDR on AArch64.
       ICSlotLoad->setAtomic(AtomicOrdering::Monotonic);
-      Value *TAfterIcache = nullptr;
-      if (EJitWrapperTiming)
-        TAfterIcache = B.CreateCall(TraceNow, {}, "ejit_t_after_icache");
+      auto emitTailReturn = [&](Value *Target) {
+        CallInst *Call = forwardCall(B, Target, *F);
+        Call->setTailCallKind(CallInst::TCK_MustTail);
+        if (F->getReturnType()->isVoidTy())
+          B.CreateRetVoid();
+        else
+          B.CreateRet(Call);
+      };
       if (Sentinelize) {
         // Definition-time sentinel: every cell of the table is DEFINED as
         // &MissFn, so the loaded value is always a callable pointer - the
@@ -1268,91 +1026,17 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         // per-slot bookkeeping is needed here.
         IcacheSlot->setInitializer(buildIcacheSentinelInit(
             IcacheSlot->getValueType(), MissFn, NumDims));
-        SmallVector<Value *, 8> ICArgs;
-        for (auto &A : F->args())
-          ICArgs.push_back(&A);
-        CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-        if (F->getReturnType()->isVoidTy())
-          B.CreateRetVoid();
-        else
-          B.CreateRet(CI);
+        emitTailReturn(ICSlotLoad);
       } else {
         Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
         IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
                                  {IHit, ConstantInt::getTrue(Ctx)});
         B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
 
-        // Hit: tail-call the cached specialization directly (no release_read).
-        // With -ejit-wrapper-timing the wrapper is NOT frame-less (JitEntry emits
-        // bl @ejit_taskpool_trace_now), so the hit path cannot be a musttail tail
-        // call: emitHitTiming() inserts calls BETWEEN the call and the ret, which
-        // would violate the musttail rule ("musttail call must precede a ret")
-        // and yield broken IR -> codegen silently drops the function -> boot
-        // translation fault. Use a plain (framed) call + trace + ret instead; the
-        // frame-less musttail fast path is reserved for the no-timing case.
         B.SetInsertPoint(JitIcacheDispatch);
-        SmallVector<Value *, 8> ICArgs;
-        for (auto &A : F->args())
-          ICArgs.push_back(&A);
-        Value *BodyBegin = nullptr;
-        if (EJitFunctionBodyTiming)
-          BodyBegin = B.CreateCall(TraceNow, {}, "ejit_jit_body_begin");
-        auto emitHitTiming = [&]() {
-          Value *BodyEnd = nullptr;
-          if (EJitFunctionBodyTiming)
-            BodyEnd = B.CreateCall(TraceNow, {}, "ejit_jit_body_end");
-          Value *WrapperEnd = nullptr;
-          if (EJitFunctionBodyTiming)
-            WrapperEnd = B.CreateCall(TraceNow, {}, "ejit_wrapper_end");
-          if (EJitWrapperTiming) {
-            Value *TAfterFn =
-                BodyEnd ? BodyEnd : B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-            B.CreateCall(TraceWrapper,
-                         {FuncIdxForTiming,
-                          ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
-                          ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
-                          TAfterIcache, TAfterFn, TAfterFn});
-          }
-          if (EJitFunctionBodyTiming) {
-            emitFunctionBodyRecord(B, kEJitFunctionBodyPathJIT, WrapperBegin,
-                                   BodyBegin, BodyEnd, WrapperEnd);
-          }
-        };
-        if (F->getReturnType()->isVoidTy()) {
-          CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-          if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
-            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-          emitHitTiming();
-          B.CreateRetVoid();
-        } else {
-          CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-          if (!EJitWrapperTiming && !EJitFunctionBodyTiming)
-            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-          emitHitTiming();
-          B.CreateRet(CI);
-        }
-
-        // Miss: tail-call MissFn (which does compile_or_get + dispatch/fallback).
+        emitTailReturn(ICSlotLoad);
         B.SetInsertPoint(JitMiss);
-        SmallVector<Value *, 8> MissArgs;
-        for (auto &A : F->args())
-          MissArgs.push_back(&A);
-        if (ThreadWrapperBegin)
-          MissArgs.push_back(WrapperBegin);
-        if (F->getReturnType()->isVoidTy()) {
-          CallInst *CI =
-              B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-          if (!EJitFunctionBodyTiming)
-            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-          B.CreateRetVoid();
-        } else {
-          CallInst *CI =
-              B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-          if (!EJitFunctionBodyTiming)
-            CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
-          B.CreateRet(CI);
-      }
+        emitTailReturn(MissFn);
       }
 
       // Cluster all frame-less dispatchers into a dedicated section so they
@@ -1369,16 +1053,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       auto *JitFallback = BasicBlock::Create(Ctx, "jit_fallback", F);
       auto *JitDispatch = BasicBlock::Create(Ctx, "jit_dispatch", F);
       spliceOriginalBody(JitFallback);
-      if (!JitFallback->getTerminator()) {
-        IRBuilder<> B(JitFallback);
-        if (F->getReturnType()->isVoidTy())
-          B.CreateRetVoid();
-        else
-          B.CreateRet(PoisonValue::get(F->getReturnType()));
-      }
-      Value *WrapperBegin = emitSlowPath(*F, JitEntry, JitCall, JitDispatch,
-                                         JitFallback, nullptr);
-      instrumentAotBody(JitFallback, WrapperBegin);
+      emitSlowPath(*F, JitEntry, JitCall, JitDispatch, JitFallback);
     }
 
     Changed = true;

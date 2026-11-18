@@ -242,7 +242,7 @@ Against specializing on the slot axis instead:
 - **One clone, not twenty.** Warm-up drops by the same factor — the in-flight dedup table
   is keyed by `funcIndex` only, so clones are gained one per compile-duration and other
   requests are dropped rather than queued.
-- **No `maxCodeMemory` multiplication** (2 MB default).
+- **Less code-pool memory:** slots share a single compiled clone.
 - **The `D = 16` cliff never applies.** `EJIT_ICACHE_DIM_SIZE` is 16; with 20 slot values,
   a slot axis would leave slots 16–19 with no inline-cache cell at all, calling into the
   runtime every TTI. With no slot axis there is nothing to overflow.

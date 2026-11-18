@@ -22,7 +22,6 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
-#include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
 #include "llvm/IR/Module.h"
 
 namespace llvm {
@@ -115,7 +114,8 @@ private:
   void runInstCombine(Module &M);
 
   /// Run EJitStructFieldPass on all functions.
-  void runStructFieldPass(Module &M, const SpecializationContext &ctx);
+  void runStructFieldPass(Module &M, const SpecializationContext &ctx,
+                          ArrayRef<EJitBoundPointerView> BoundViews);
 
   /// Push the specialized constants across call edges. The AOT inliner keeps a
   /// call edge wherever it chose not to inline, so after phase 1 every call
@@ -146,12 +146,12 @@ private:
   /// constant-index GEPs, then does a final cleanup and vectorization at
   /// L2/L3 for AArch64.
   void runOptimizationPipeline(Module &M, const SpecializationContext &ctx,
-                               CompileTier tier);
+                               CompileTier tier,
+                               ArrayRef<EJitBoundPointerView> BoundViews);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   void recordMayConstBenefit(const SpecializationContext &ctx,
                              ArrayRef<EJitMayConstLoadSite> inputSites,
-                             uint64_t specializedMayConstLoads,
                              ArrayRef<EJitMayConstLoadSite> finalSites,
                              uint64_t sampledEntries);
 #endif

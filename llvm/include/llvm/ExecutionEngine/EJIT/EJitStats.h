@@ -19,8 +19,7 @@
 // unchanged; only the increments are compiled out).  Default OFF for
 // production; bring-up builds pass --stats / -DEJIT_STATS_ENABLE=ON.
 //
-// Note: this gates only the per-call taskpool counters (EJitSharedCounters /
-// EJitTaskPoolCounters).  The code-pool stats (EJitSharedCodePoolStats /
+// Note: this gates only the per-call taskpool counters (EJitSharedCounters).  The code-pool stats (EJitSharedCodePoolStats /
 // EJitCodePoolManager::Stats) are a separate, cold-path diagnostic and are
 // always compiled.
 //

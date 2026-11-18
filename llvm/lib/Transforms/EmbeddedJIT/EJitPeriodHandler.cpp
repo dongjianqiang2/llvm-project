@@ -35,16 +35,12 @@ namespace {
 struct LifecycleInfo {
   std::string PeriodName;
   unsigned ArgIndex;
-  GlobalVariable *ArrayGV;
   bool HasArrInd = false; // true if matched by ejit_period_arr_ind
 };
 
 static SmallVector<LifecycleInfo, 4>
-collectLifecycleInfo(Module &M, Function &F) {
+collectLifecycleInfo(MDNode *MD) {
   SmallVector<LifecycleInfo, 4> Result;
-  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
-  if (!MD)
-    return Result;
 
   // Collect period names from ejit_period_lc entries
   for (const MDOperand &Op : MD->operands()) {
@@ -55,7 +51,7 @@ collectLifecycleInfo(Module &M, Function &F) {
       if (Tag->getString() == TAG_EJIT_PERIOD_LC) {
         auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
         if (PN)
-          Result.push_back({PN->getString().str(), 0, nullptr});
+          Result.push_back({PN->getString().str(), 0});
       }
     }
   }
@@ -79,27 +75,6 @@ collectLifecycleInfo(Module &M, Function &F) {
     }
   }
 
-  // Find matching global array for each period
-  for (GlobalVariable &GV : M.globals()) {
-    MDNode *GMD = GV.getMetadata(MD_EJIT_METADATA);
-    if (!GMD)
-      continue;
-    for (auto &LC : Result) {
-      for (const MDOperand &Op : GMD->operands()) {
-        auto *Sub = dyn_cast<MDNode>(Op.get());
-        if (!Sub || Sub->getNumOperands() < 2)
-          continue;
-        if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
-          if (Tag->getString() == TAG_EJIT_PERIOD_ARR) {
-            auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
-            if (PN && PN->getString() == LC.PeriodName)
-              LC.ArrayGV = &GV;
-          }
-        }
-      }
-    }
-  }
-
   return Result;
 }
 
@@ -108,11 +83,11 @@ collectLifecycleInfo(Module &M, Function &F) {
 PreservedAnalyses
 EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
   bool Changed = false;
-  SmallVector<Function *, 4> LcFuncs;
+  SmallVector<std::pair<Function *, MDNode *>, 4> LcFuncs;
   for (Function &F : M.functions()) {
     MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
     if (hasMDStringEntry(MD, TAG_EJIT_PERIOD_LC) && !F.isDeclaration())
-      LcFuncs.push_back(&F);
+      LcFuncs.emplace_back(&F, MD);
   }
 
   if (LcFuncs.empty()) {
@@ -135,8 +110,8 @@ EJitPeriodHandlerPass::run(Module &M, ModuleAnalysisManager &AM) {
   M.getOrInsertFunction(FN_ACTIVATE,
       FunctionType::get(VoidTy, {PtrTy, I32Ty}, false));
 
-  for (Function *F : LcFuncs) {
-    auto LcInfos = collectLifecycleInfo(M, *F);
+  for (auto [F, MD] : LcFuncs) {
+    auto LcInfos = collectLifecycleInfo(MD);
     if (LcInfos.empty())
       continue;
 

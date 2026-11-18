@@ -47,7 +47,6 @@ struct EJitMayConstLoadSite {
 struct EJitMayConstBenefitSample {
   uint64_t cacheKey = 0;
   uint64_t inputMayConstLoads = 0;
-  uint64_t specializedMayConstLoads = 0;
   uint64_t finalMayConstLoads = 0;
   uint64_t runtimeHits = 0;
   uint64_t hitSites = 0;
@@ -60,11 +59,8 @@ struct EJitMayConstBenefitSample {
 struct EJitMayConstBenefitSummary {
   uint64_t versions = 0;
   uint64_t inputMayConstLoads = 0;
-  uint64_t specializedMayConstLoads = 0;
   uint64_t finalMayConstLoads = 0;
   int64_t totalRemoved = 0;
-  int64_t directRemoved = 0;
-  int64_t pipelineRemoved = 0;
   int64_t averageRemoved = 0;
   int64_t weightedRemovedPermille = 0;
   int64_t minimumRemoved = 0;

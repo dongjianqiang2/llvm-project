@@ -33,8 +33,7 @@ namespace {
 #endif
 
 // Worker task stack size: the SINGLE source of truth is the CMake option
-// EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE (default 1 MiB, defined whenever
-// EJIT_SRE_TASKPOOL is ON). The LLVM optimize/codegen/ORC/JITLink pipeline runs
+// EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE (default 1 MiB). The LLVM pipeline runs
 // on THIS stack, so 64 KiB is not enough. The fallback below exists ONLY for a
 // non-CMake compile; CMake builds always pass -D so it is never used there.
 #ifndef EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE
@@ -98,7 +97,6 @@ bool EJitSreTask::create(EJitSreTask &out, EntryFn entry, void *ctx,
   EJIT_DIAG("platform task stack size=%u bytes",
             static_cast<unsigned>(init.uwStackSize));
 
-  out.stopFlag_.storeRelease(0);
   out.entry_ = entry;
   out.ctx_ = ctx;
 
@@ -124,7 +122,6 @@ void EJitSreTask::destroy(EJitSreTask &task) {
   uint32_t taskPid = decodeTaskPid(task.handle_);
   EJIT_DIAG("platform task destroy begin pid=%u handle=%p", taskPid,
             task.handle_);
-  task.stopFlag_.storeRelease(1);
   // Contract (spec §11): SRE_TaskDelete MUST block until the worker task has
   // actually exited (a real join), so the owner can safely destroy its private
   // ORC/driver afterwards. The worker loop also exits on its own when it sees

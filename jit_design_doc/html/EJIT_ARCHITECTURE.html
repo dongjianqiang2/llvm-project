@@ -410,7 +410,7 @@ compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 
 
   <section id="sync-compile">
     <h2>4. 同步编译模式</h2>
-    <p><code>EJIT_COMPILE_SYNC</code> 适合验证、调试和可接受首次调用延迟的场景。cache miss 后，当前业务线程直接完成 JIT 编译；编译成功则本次调用就执行特化代码。</p>
+    <p>下图仅保留为历史设计。同步编译已退役，当前初始化仅支持 Async 或 Off（纯 AOT）。</p>
     <div class="diagram-wrap">
       <svg width="1260" height="520" viewBox="0 0 1260 520" role="img" aria-label="EJIT 同步编译流程图">
         <defs>
@@ -526,7 +526,7 @@ compileMode == ASYNC → 提交后台编译任务 → 当前调用 fallback → 
         <text x="890" y="428" class="svg-small">atomic publish</text>
 
         <rect x="340" y="500" width="585" height="50" rx="10" fill="#f8fafc" stroke="#d9dee6" />
-        <text x="365" y="531" class="svg-note">失败或任务被禁用：记录 last_error / stats，cache 不发布；业务调用仍由 AOT fallback 保证正确性。</text>
+        <text x="365" y="531" class="svg-note">失败或任务被禁用：记录 诊断日志 / stats，cache 不发布；业务调用仍由 AOT fallback 保证正确性。</text>
 
         <line x1="280" y1="140" x2="350" y2="140" stroke="#6b46c1" stroke-width="3" marker-end="url(#asyncArrow)" />
         <line x1="585" y1="140" x2="660" y2="140" stroke="#dd6b20" stroke-width="3" marker-end="url(#asyncOrange)" />
@@ -635,7 +635,7 @@ ORC LLJIT / JITLink：目标代码生成 + 符号解析 + code memory finalize</
         <tr><td>CompileDriver</td><td>加载 bitcode，运行 JIT pipeline，调用 ORC/JITLink</td><td>失败直接返回 NULL 给 wrapper</td><td>失败记录到 task 状态，不能影响业务线程</td></tr>
         <tr><td>TaskQueue / Dedup</td><td>异步模式的任务队列和去重表</td><td>通常不使用</td><td>防止同一 cacheKey 重复排队，处理 queue full</td></tr>
         <tr><td>CodePool / MemoryMgr</td><td>分配、写入、finalize 可执行代码内存</td><td>编译结束后立即可执行</td><td>发布前必须 finalize 完成，SRE 下还需 I/D cache 同步</td></tr>
-        <tr><td>Error / Stats</td><td>记录 last_error、hits、misses、pending、evictions</td><td>用于确认是否本次调用执行 JIT</td><td>用于观察 pending 数、worker 成功率和 fallback 频率</td></tr>
+        <tr><td>Error / Stats</td><td>记录 诊断日志、hits、misses、pending、evictions</td><td>用于确认是否本次调用执行 JIT</td><td>用于观察 pending 数、worker 成功率和 fallback 频率</td></tr>
       </tbody>
     </table>
   </section>

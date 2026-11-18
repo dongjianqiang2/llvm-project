@@ -23,7 +23,7 @@ AOT PASS1: bitcode extraction and embedding
 AOT PASS2-4: period registration / wrapper / lifecycle
 AOT PASS5: coordinator
   ↓
-Runtime wrapper calls ejit_compile_or_get
+Wrapper miss calls the shared taskpool
   ↓
 JIT pipeline: param substitution → InstCombine → Inline → PASS6 → L1/L2/L3 → ORC/JITLink
   ↓
@@ -70,6 +70,7 @@ Code Cache / fallback AOT</div>
 
   <section>
     <h2>5. Wrapper model</h2>
+    <p>Historical packed-key wrapper (retired). Current wrappers use the dimension-pair taskpool API; see the API Reference.</p>
 <pre><code class="language-c">void process_cell(uint8_t cellIdx, int value) {
     uint64_t key = ((uint64_t)funcIdx &lt;&lt; 32) | cellIdx;
     PFN_process_cell pfn = (PFN_process_cell)ejit_compile_or_get(key, NULL);

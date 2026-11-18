@@ -115,7 +115,6 @@ int main(int argc, char **argv) {
   // 每个不同的 cellIdx 应该产生一个独立的 cache entry
   int n_unique = argc - 1;
   ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp1; memset(&tp1, 0, sizeof(tp1));
   ejit_taskpool_get_stats(&tp1);
   check("entries == n_unique", (int)tp1.readyEntries == n_unique,
@@ -126,17 +125,6 @@ int main(int argc, char **argv) {
   printf("  stats: ready=%u hits=%llu compiles=%llu\n",
          tp1.readyEntries, (unsigned long long)tp1.cacheHits,
          (unsigned long long)tp1.asyncCompiles);
-#else
-  ejit_stats_t s1;
-  ejit_get_stats(&s1);
-  check("entries == n_unique", (int)s1.entryCount == n_unique,
-        "entries=%zu expected=%d", s1.entryCount, n_unique);
-  check("misses >= n_unique", s1.misses >= (uint64_t)n_unique,
-        "misses=%llu expected>=%d",
-        (unsigned long long)s1.misses, n_unique);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
-         s1.entryCount, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
-#endif
 
   // --- 第二轮: 再次调用相同 cellIdx (全部应该 hit) ---
   printf("\n--- 第二轮: 再次调用相同 cellIdx (全部 hit) ---\n");
@@ -151,7 +139,6 @@ int main(int argc, char **argv) {
     ejit_drain_taskpool();
   }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp2; memset(&tp2, 0, sizeof(tp2));
   ejit_taskpool_get_stats(&tp2);
   check("entries unchanged", (int)tp2.readyEntries == n_unique,
@@ -166,21 +153,6 @@ int main(int argc, char **argv) {
   printf("  stats: ready=%u hits=%llu compiles=%llu\n",
          tp2.readyEntries, (unsigned long long)tp2.cacheHits,
          (unsigned long long)tp2.asyncCompiles);
-#else
-  ejit_stats_t s2;
-  ejit_get_stats(&s2);
-  // entries 不变，hits 增加
-  check("entries unchanged", (int)s2.entryCount == n_unique,
-        "entries=%zu (was %zu)", s2.entryCount, s1.entryCount);
-  check("hits increased", s2.hits >= s1.hits + (uint64_t)n_unique,
-        "hits=%llu (was %llu)",
-        (unsigned long long)s2.hits, (unsigned long long)s1.hits);
-  check("misses unchanged", (int)s2.misses == (int)s1.misses,
-        "misses=%llu (was %llu)",
-        (unsigned long long)s2.misses, (unsigned long long)s1.misses);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
-         s2.entryCount, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
-#endif
 
   // --- 第三轮: 修改某个 cellIdx 的数据，deactivate → 重新 JIT ---
   if (argc >= 3) {
@@ -188,13 +160,8 @@ int main(int argc, char **argv) {
     printf("\n--- 第三轮: deactivate(%u) → 改值 → activate → 重新 JIT ---\n", ci0);
 
     ejit_deactivate("cell", ci0);
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     unsigned long long tp_compiles_before = tp2.asyncCompiles;
     unsigned tp_entries_before = tp2.readyEntries;
-#else
-    uint64_t misses_before = s2.misses;
-    size_t entries_before = s2.entryCount;
-#endif
 
     // 把 cellType 改成 0xEC (原来可能是 0xFD)
     g_cells[ci0].cellType = 0xEC;
@@ -205,7 +172,6 @@ int main(int argc, char **argv) {
           "classify(%u)=%u (expected 200, now cellType=0xEC)", ci0, r);
 
     ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     ejit_taskpool_stats_t tp3; memset(&tp3, 0, sizeof(tp3));
     ejit_taskpool_get_stats(&tp3);
     check("new compile triggered", tp3.asyncCompiles > tp_compiles_before,
@@ -216,16 +182,6 @@ int main(int argc, char **argv) {
           (int)tp3.readyEntries == (int)tp_entries_before,
           "readyEntries=%u (was %u: old evicted, new added)",
           tp3.readyEntries, tp_entries_before);
-#else
-    ejit_stats_t s3;
-    ejit_get_stats(&s3);
-    check("new miss triggered", s3.misses > misses_before,
-          "misses %llu -> %llu",
-          (unsigned long long)misses_before, (unsigned long long)s3.misses);
-    check("entries stable after recompile", s3.entryCount == entries_before,
-          "entries=%zu (was %zu: old evicted, new added)",
-          s3.entryCount, entries_before);
-#endif
   }
 
   ejit_shutdown();

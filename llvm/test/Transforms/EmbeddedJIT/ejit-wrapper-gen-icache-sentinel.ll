@@ -1,4 +1,4 @@
-; Sentinel-form selection: NumDims <= 2 (and no -ejit-wrapper-timing) gets the
+; Sentinel-form selection: NumDims <= 2 gets the
 ; branchless wrapper whose cell table is DEFINED pre-filled with &MissFn;
 ; 3D/4D keep the historical guarded shape - a [D]^N splat initializer costs
 ; 4096/65536 relocations per table at D=16, so their tables stay zero-init and

@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -emit-llvm -o - %s 2>&1 | FileCheck %s
+// RUN: %clang_cc1 -disable-llvm-passes -emit-llvm -o - %s 2>&1 | FileCheck %s
 // New attribute spellings: verify metadata is emitted correctly.
 
 struct CellConfig {

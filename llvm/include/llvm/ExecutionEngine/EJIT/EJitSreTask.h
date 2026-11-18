@@ -9,7 +9,6 @@
 #ifndef LLVM_EXECUTIONENGINE_EJIT_EJITSRETASK_H
 #define LLVM_EXECUTIONENGINE_EJIT_EJITSRETASK_H
 
-#include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include <cstdint>
 
 namespace llvm {
@@ -36,14 +35,10 @@ public:
   /// yield repeatedly; freestanding builds delay for \p ticks scheduler ticks.
   static void delay(uint32_t ticks);
 
-  bool stopRequested() const { return stopFlag_.loadAcquire() != 0; }
-
 private:
-  friend class EJitWorker;
   void *handle_ = nullptr;
   EntryFn entry_ = nullptr;
   void *ctx_ = nullptr;
-  EJitAtomicU32 stopFlag_{0};
 };
 
 } // namespace ejit

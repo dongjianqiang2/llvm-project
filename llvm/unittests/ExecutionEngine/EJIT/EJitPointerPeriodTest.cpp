@@ -1468,9 +1468,6 @@ TEST(EJitPointerPeriod,
 
 static void runOnlinePgoLifecycle(bool Lightweight,
                                   unsigned WitnessElement = 0) {
-#ifndef EJIT_SRE_SHARED_TASKPOOL
-  GTEST_SKIP() << "requires the shared taskpool runtime";
-#else
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
   PointerFixture Fixture(10);
@@ -1571,7 +1568,6 @@ static void runOnlinePgoLifecycle(bool Lightweight,
     EXPECT_EQ(Fixture.Data[Element * Fixture.Stride + 8 + I * 4 + 1], 2U);
     EXPECT_EQ(Fixture.Data[(1 - Element) * Fixture.Stride + 8 + I * 4], 0U);
   }
-#endif
 }
 
 TEST(EJitPointerPeriod, OnlinePgoRecompilesAfterLifecycleUpdate) {

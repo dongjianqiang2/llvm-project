@@ -55,8 +55,6 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
   for (const EJitMayConstBenefitSample &Sample : Samples) {
     Summary.inputMayConstLoads =
         saturatingAdd(Summary.inputMayConstLoads, Sample.inputMayConstLoads);
-    Summary.specializedMayConstLoads = saturatingAdd(
-        Summary.specializedMayConstLoads, Sample.specializedMayConstLoads);
     Summary.finalMayConstLoads =
         saturatingAdd(Summary.finalMayConstLoads, Sample.finalMayConstLoads);
     Summary.runtimeHits = saturatingAdd(Summary.runtimeHits, Sample.runtimeHits);
@@ -83,12 +81,6 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
 
   Summary.totalRemoved = static_cast<int64_t>(Summary.inputMayConstLoads) -
                          static_cast<int64_t>(Summary.finalMayConstLoads);
-  Summary.directRemoved =
-      static_cast<int64_t>(Summary.inputMayConstLoads) -
-      static_cast<int64_t>(Summary.specializedMayConstLoads);
-  Summary.pipelineRemoved =
-      static_cast<int64_t>(Summary.specializedMayConstLoads) -
-      static_cast<int64_t>(Summary.finalMayConstLoads);
   Summary.averageRemoved =
       Summary.totalRemoved / static_cast<int64_t>(Summary.versions);
   Summary.averageActiveSitesPermille =

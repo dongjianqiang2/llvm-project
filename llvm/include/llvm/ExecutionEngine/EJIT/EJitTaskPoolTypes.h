@@ -1,39 +1,17 @@
-//===-- EJitSreQueue.h - Queue abstraction for the SRE taskpool -----------===//
+//===-- EJitTaskPoolTypes.h - Shared taskpool protocol types -------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
-//  Queue abstraction for the EmbeddedJIT SRE taskpool.
-//
-//  Per spec §3.3.2 the SRE platform provides no queue primitive, so EJitQueue
-//  is a self-implemented lock-free bounded MPSC ring buffer (Vyukov style),
-//  shared by host and SRE builds. It needs no mutex, is single-thread testable,
-//  and references no external platform queue symbol.
-//
-//  This header also owns the fixed-layout request record carried by the queue,
-//  EJitCompileRequest. It lives here (the lowest-level taskpool header) so the
-//  queue can store it by value without a circular include against
-//  EJitTaskPool.h. EJitTaskPool.h re-exports it via this include.
-//
-//===----------------------------------------------------------------------===//
 
-#ifndef LLVM_EXECUTIONENGINE_EJIT_EJITSREQUEUE_H
-#define LLVM_EXECUTIONENGINE_EJIT_EJITSREQUEUE_H
+#ifndef LLVM_EXECUTIONENGINE_EJIT_EJITTASKPOOLTYPES_H
+#define LLVM_EXECUTIONENGINE_EJIT_EJITTASKPOOLTYPES_H
 
-#include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include <cstdint>
 
-//===----------------------------------------------------------------------===//
-// Compile-time configuration (overridable by the build via -D). Sensible
-// defaults keep the headers self-contained when included standalone.
-//===----------------------------------------------------------------------===//
-#ifndef EJIT_SRE_TASKPOOL_QUEUE_CAPACITY
-#define EJIT_SRE_TASKPOOL_QUEUE_CAPACITY 1024u
-#endif
 namespace llvm {
 namespace ejit {
 
@@ -61,7 +39,7 @@ struct EJitCompileRequest {
   // Shared-taskpool owner generation captured at enqueue time. A worker drops a
   // request whose generation no longer equals the shared state's generation
   // (owner re-init), so a stale request can never pollute a new generation's
-  // cache. Unused (left 0) by the non-shared taskpool. Endianness: a plain
+  // cache. Endianness: a plain
   // fixed-width scalar accessed by value, never byte-parsed.
   uint32_t generation;
   // Borrowed bound objects. The queue copies only these descriptors; it never
@@ -115,56 +93,37 @@ inline uint32_t stripReqTier(uint32_t funcIndex) {
   return funcIndex & ~kEJitTierMask;
 }
 
-//===----------------------------------------------------------------------===//
-// EJitQueue
-//
-// Bounded multi-producer / single-consumer queue of EJitCompileRequest. The
-// default backing is a Vyukov-style lock-free ring (no mutex, no condition
-// variable). capacity() is rounded up to a power of two at construction.
-//===----------------------------------------------------------------------===//
-class EJitQueue {
-public:
-  /// \p capacity is rounded up to the next power of two (min 2).
-  explicit EJitQueue(uint32_t capacity = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY);
-  ~EJitQueue();
+enum class EJitCompileMode : uint32_t {
+  Off = 0,
+  Async = 1,
+};
 
-  EJitQueue(const EJitQueue &) = delete;
-  EJitQueue &operator=(const EJitQueue &) = delete;
+enum class EJitCompileOrGetStatus : uint32_t {
+  CacheHit = 0,
+  OffMode,
+  InstanceDisabled,
+  EnqueuedPending,
+  AlreadyPending,
+  PgoAdmissionDeferred,
+  QueueFullFallback,
+  CompileFailed,
+  InvalidParam,
+};
 
-  /// Enqueue a request. Returns false when the queue is full (producer side
-  /// must then roll back any dedup reservation it made).
-  bool push(const EJitCompileRequest &req);
+enum class EJitDedupResult : uint32_t {
+  Claimed = 0,      ///< Caller now owns the in-flight bit; must clear() later.
+  AlreadyPending,   ///< Same funcIndex already in flight.
+  InvalidFuncIndex, ///< funcIndex >= kCapacity: rejected, not folded.
+};
 
-  /// Dequeue a request into \p out. Returns false when the queue is empty.
-  bool pop(EJitCompileRequest &out);
-
-  /// Fixed power-of-two capacity.
-  uint32_t capacity() const { return capacity_; }
-
-  /// Best-effort element count (may be stale under concurrency).
-  uint32_t approximateSize() const;
-
-private:
-  struct Cell {
-    EJitAtomicU32 sequence;
-    EJitCompileRequest data;
-  };
-
-  // The ring storage is sized at compile time from the queue-capacity macro so
-  // it is a single fixed allocation (no std::vector). A capacity argument
-  // smaller than the macro simply masks down into this storage.
-  static constexpr uint32_t kRingSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
-  static_assert((kRingSlots & (kRingSlots - 1)) == 0 && kRingSlots >= 2,
-                "EJIT_SRE_TASKPOOL_QUEUE_CAPACITY must be a power of two >= 2");
-
-  Cell buffer_[kRingSlots];
-  uint32_t capacity_;
-  uint32_t mask_;
-  EJitAtomicU32 enqueuePos_;
-  EJitAtomicU32 dequeuePos_;
+enum class EJitPublishStatus : uint32_t {
+  Published = 0,   ///< Entry written/overwritten with the request's versions.
+  VersionMismatch, ///< A version changed before/at publish: nothing written.
+  InvalidParam,    ///< Null fn or numDims > 4.
+  Failed,          ///< No slot available.
 };
 
 } // namespace ejit
 } // namespace llvm
 
-#endif // LLVM_EXECUTIONENGINE_EJIT_EJITSREQUEUE_H
+#endif // LLVM_EXECUTIONENGINE_EJIT_EJITTASKPOOLTYPES_H

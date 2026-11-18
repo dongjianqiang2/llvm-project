@@ -345,8 +345,7 @@ PreservedAnalyses EJitScalarValueSpecPass::run(Function &F,
       }
       // Defense in depth: the driver already filtered below-threshold sites;
       // re-check here so the pass never specializes on weak evidence.
-      if (Site->topCount < EJIT_SRE_VP_MIN_SAMPLES ||
-          Site->topCount * 100 < Site->total * EJIT_SRE_VP_MIN_CONF_PERCENT) {
+      if (belowScalarThreshold(*Site)) {
         LLVM_DEBUG(dbgs() << "ejit-value-profile: below threshold func="
                           << F.getName() << " site=" << siteIdx
                           << " top=" << Site->topCount

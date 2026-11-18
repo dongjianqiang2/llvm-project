@@ -4,11 +4,9 @@
  * A missed invalidation shows up as a plausible number rather than an obvious
  * failure, so each phase checks WHICH specialization ran.
  *
- * SCOPE: end-to-end smoke test, not per-hook coverage. It cannot isolate which
- * retire hook did the work -- any path producing a new specialization also
- * republishes, and cachePublish() retires every entry on its own. Removing the
- * ejit_invalidate() or version-bump hook individually was verified NOT to fail
- * this test. Per-hook invariants live in EJitSharedTaskPoolTest.cpp.
+ * Dispatch-cache retirement does not change a period version. Mutations of
+ * specialized data belong between deactivate and activate. Per-hook cache
+ * retirement invariants live in EJitSharedTaskPoolTest.cpp.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -46,8 +44,10 @@ static void expect(uint32_t got, uint32_t want, const char *what) {
 
 /* Resolve the specialization and fill the L0 for this identity. */
 static void warm(uint8_t ci) {
-  for (int i = 0; i < 64; i++)
-    (void)l0_probe(ci, 0);
+  (void)l0_probe(ci, 0);
+  if (!ejit_drain_taskpool_bounded(EJIT_DRAIN_SPIN_BUDGET))
+    ++failures;
+  (void)l0_probe(ci, 0);
 }
 
 int main(int argc, char **argv) {
@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
   }
 
   memset(&cfg, 0, sizeof(cfg));
-  cfg.compileMode = EJIT_COMPILE_SYNC;
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
   if (ejit_init(&cfg) != EJIT_OK) {
     printf("  FAIL: ejit_init\n");
@@ -74,39 +74,25 @@ int main(int argc, char **argv) {
   warm(ci);
   expect(l0_probe(ci, 7), 1007, "repeat dispatch after warm-up");
 
-  /* 2. ejit_invalidate() drops the cached specialization. It does not go
-   *    through cachePublish(), so the L0 is only retired if the runtime hooks
-   *    it explicitly -- this phase is what catches a missing hook. */
-  g_cfg[ci].mode = 2;
+  /* Dispatch flushes keep the active generation and its valid code. */
   ejit_invalidate("cell", ci);
-  /* Checked on the FIRST call after the flush, before anything republishes.
-   * A republish bumps the epoch on its own, so warming up first would retire a
-   * stale entry for the wrong reason and the missing hook would go unnoticed. */
-  expect(l0_probe(ci, 7), 2007, "first call after ejit_invalidate");
-  warm(ci);
-  expect(l0_probe(ci, 7), 2007, "value after ejit_invalidate + recompile");
-
-  /* 3. Same for ejit_clear_cache(), which flushes everything at once. */
-  g_cfg[ci].mode = 3;
+  expect(l0_probe(ci, 7), 1007, "first call after ejit_invalidate");
   ejit_clear_cache();
-  expect(l0_probe(ci, 7), 3007, "first call after ejit_clear_cache");
-  warm(ci);
-  expect(l0_probe(ci, 7), 3007, "value after ejit_clear_cache + recompile");
+  expect(l0_probe(ci, 7), 1007, "first call after ejit_clear_cache");
 
   /* 4. deactivate/activate bumps the instance version: a stale entry would run
    *    a specialization built from the old constants. */
-  g_cfg[ci].mode = 4;
   ejit_deactivate("cell", ci);
+  g_cfg[ci].mode = 4;
   ejit_activate("cell", ci);
   expect(l0_probe(ci, 7), 4007, "first call after deactivate/activate");
   warm(ci);
   expect(l0_probe(ci, 7), 4007, "value after deactivate/activate + recompile");
 
   /* 5. While deactivated the call must fall back to the AOT body. */
-  g_cfg[ci].mode = 5;
   ejit_deactivate("cell", ci);
+  g_cfg[ci].mode = 5;
   expect(l0_probe(ci, 7), 5007, "value while the instance is deactivated");
-  ejit_activate("cell", ci);
 
   /* 6. Two live instances must not share an entry -- what the per-function
    *    inline cache cannot express. */
@@ -114,6 +100,7 @@ int main(int argc, char **argv) {
     const uint8_t other = (uint8_t)((ci + 1) % N);
     g_cfg[ci].mode = 6;
     g_cfg[other].mode = 9;
+    ejit_activate("cell", ci);
     ejit_activate("cell", other);
     warm(ci);
     warm(other);
@@ -147,16 +134,19 @@ int main(int argc, char **argv) {
    *    that invalidates every pointer they hold. */
   ejit_shutdown();
   memset(&cfg, 0, sizeof(cfg));
-  cfg.compileMode = EJIT_COMPILE_SYNC;
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
   if (ejit_init(&cfg) != EJIT_OK) {
     printf("  FAIL: ejit_init after shutdown\n");
     return 1;
   }
-  ejit_activate("cell", ci);
   g_cfg[ci].mode = 8;
+  ejit_activate("cell", ci);
   warm(ci);
   expect(l0_probe(ci, 7), 8007, "value after shutdown + re-init");
+  ejit_taskpool_stats_t stats = {0};
+  expect(ejit_taskpool_get_stats(&stats) == EJIT_OK && stats.readyEntries > 0,
+         1, "re-init publishes real code, not just the AOT result");
 
   ejit_shutdown();
 

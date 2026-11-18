@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 ;
 ; ejit_free_dim is metadata for PASS6 only. The wrapper must key one logical
 ; specialization by the retained cell dimension, while forwarding the live slot
@@ -6,8 +6,7 @@
 ;
 ; CHECK-LABEL: define i32 @free_dim_entry(i8 %cell, i32 %slot, i32 %live)
 ; CHECK: zext i8 %cell to i32
-; CHECK-NOT: call i32 @ejit_taskpool_compile_or_get_2d
-; CHECK: call i32 @ejit_taskpool_compile_or_get_1d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 1, ptr {{.*}}, ptr {{.*}})
 ; CHECK: jit_fallback:
 ; CHECK: urem i32 %slot, 5
 ; CHECK: add i32 {{.*}}, %live

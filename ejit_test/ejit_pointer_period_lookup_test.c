@@ -34,16 +34,12 @@ ejit_entry unsigned probe_automatic(ejit_period_arr_ind(cell) unsigned char cell
 }
 
 static int wait_for_compilation(void) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   for (unsigned attempt = 0; attempt < 5000; ++attempt) {
     if (!ejit_taskpool_pending_count())
       return 1;
     usleep(1000);
   }
   return 0;
-#else
-  return 1;
-#endif
 }
 
 int main(void) {
@@ -87,13 +83,11 @@ int main(void) {
     printf("FAIL: allocator lookup was never queried\n");
     return 1;
   }
-#ifdef EJIT_SRE_TASKPOOL
   ejit_taskpool_stats_t stats;
   memset(&stats, 0, sizeof(stats));
   ejit_taskpool_get_stats(&stats);
   if (stats.readyEntries < 2)
     return 1;
-#endif
   ejit_shutdown();
   free(automatic_cells);
   printf("PASS: automatic pointer-period bounds and live slot stores\n");

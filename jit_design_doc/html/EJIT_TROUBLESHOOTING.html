@@ -23,9 +23,9 @@
 <pre><code>1. 编译期是否识别属性？
    └─ 看 Clang Sema/CodeGen 是否有 EJIT 诊断或 metadata
 2. AOT pass 是否生效？
-   └─ 看 @__ejit_bitcode、ejit_compile_or_get、jit_dispatch/jit_fallback
+   └─ 看 @__ejit_bitcode、ejit_taskpool_compile_or_get、jit_dispatch/jit_fallback
 3. 运行时是否初始化和注册？
-   └─ ejit_init 返回值、last_error、registry/static table
+   └─ ejit_init 返回值、诊断日志、registry/static table
 4. 时间窗是否 active？
    └─ ejit_is_active(period, idx)
 5. cache 是否命中或编译成功？
@@ -49,7 +49,7 @@
       <h3>检查 3：IR/二进制里是否有 wrapper 特征</h3>
       <table>
         <tr><th>关键词</th><th>含义</th></tr>
-        <tr><td><code>ejit_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
+        <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>wrapper 入口调用运行时</td></tr>
         <tr><td><code>jit_dispatch</code></td><td>JIT 成功路径</td></tr>
         <tr><td><code>jit_fallback</code></td><td>AOT fallback 路径</td></tr>
         <tr><td><code>@__ejit_bitcode</code></td><td>嵌入 bitcode</td></tr>
@@ -72,8 +72,8 @@ assert(ejit_is_active("cell", idx));</code></pre>
       <thead><tr><th>可能原因</th><th>确认方式</th><th>处理</th></tr></thead>
       <tbody>
         <tr><td>异步模式首次调用</td><td>首次 miss，stats misses 增加但 entryCount 未立即增加</td><td>多调用一次；或切换 SYNC 验证</td></tr>
-        <tr><td>时间窗未 active</td><td><code>ejit_is_active</code> false / last_error NOT_ACTIVE</td><td>调用 <code>ejit_activate</code></td></tr>
-        <tr><td>bitcode 未注册</td><td>last_error BITCODE_NOT_FOUND</td><td>检查 PASS1、registry、section 保留</td></tr>
+        <tr><td>时间窗未 active</td><td><code>ejit_is_active</code> false / 诊断日志：period 未激活</td><td>调用 <code>ejit_activate</code></td></tr>
+        <tr><td>bitcode 未注册</td><td>诊断日志：找不到 bitcode</td><td>检查 PASS1、registry、section 保留</td></tr>
         <tr><td>外部符号缺失</td><td>JITLink/ORC 符号解析失败</td><td>自动或手动 <code>ejit_register_symbol</code></td></tr>
         <tr><td>目标后端缺失</td><td>JIT 编译报 target/backend 错误</td><td>确认构建包含目标架构</td></tr>
         <tr><td>代码内存不足</td><td>MEMORY/CACHE_FULL/code size 错误</td><td>调大上限或降低 opt level</td></tr>

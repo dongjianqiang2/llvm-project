@@ -1,5 +1,5 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
-; RUN: opt -passes='default<O2>' -S %s -o /dev/null
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes='default<O2>' -S %s -o /dev/null
 
 ; PHI-incoming-block regression coverage with a multi-successor terminator.
 ; The original fix used replaceSuccessorsPhiUsesWith, which must walk EVERY
@@ -34,7 +34,7 @@ def:
 ; CHECK: %pb = phi i32 [ 20, %jit_fallback ]
 ; CHECK: %r = phi i32 [ 0, %jit_fallback ], [ %pa, %a ], [ %pb, %b ]
 ; CHECK: jit_call:
-; CHECK: call i32 @ejit_taskpool_compile_or_get_0d(i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr null, i32 0, ptr {{.*}}, ptr {{.*}})
 ; CHECK: jit_fallback:
 ; CHECK: switch i32 %sel
 ; CHECK: jit_dispatch:

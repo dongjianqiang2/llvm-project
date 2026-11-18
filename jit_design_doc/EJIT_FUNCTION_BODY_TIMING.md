@@ -1,5 +1,7 @@
 # EJIT function-body and wrapper cycle timing
 
+> Historical design only. These compiler flags and recorder APIs were removed in #268. Rebuild old instrumented objects; the online PGO audit is separate.
+
 This diagnostic mode compares executed AOT and JIT bodies and reports the
 enclosing wrapper cost from the same invocation. The body interval excludes
 taskpool lookup, inline-cache probing, dispatch, read-token release, and timing

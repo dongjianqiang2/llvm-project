@@ -614,6 +614,8 @@ if(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
 endif()
 
+option(EJIT_DUMP_SUPPORT "Capture JIT IR and available assembly for diagnostic dumps" ON)
+
 # Re-enable textual assembly (.s) emission for the JIT IR/ASM diagnostic dump
 # (ejit_dump_func / ejit_print_dumped) even in an EJIT_TRIM_LLVM_BACKEND build.
 # The trim normally #ifdef's out the AssemblyFile codegen path
@@ -696,24 +698,9 @@ if(EJIT_SRE_CODE_POOL)
                  "(size=${EJIT_SRE_CODE_POOL_SIZE}, ptNo=${EJIT_SRE_CODE_POOL_PTNO})")
 endif()
 
-# 4K-granular execute-permission sealing for the code pool. The target's large
-# page is still 2MiB (pools stay 2MiB-aligned), but the platform exposes
-# split_2m_to_4k() to break a 2MiB window into 4K mappings and enable_ex() then
-# flips execute permission per 4KiB page. With this ON the pool seals only the
-# 4K pages a finalized function actually covers (instead of a whole 2MiB pool),
-# which is much more memory efficient. Single boolean — no extra numeric knobs;
-# the 2MiB / 4KiB values are baked-in platform constants. Effective only when
-# EJIT_SRE_CODE_POOL is ON; default ON because the code pool targets the SRE
-# platform whose execute-permission interface is now 4K-granular.
-#
-# The -DEJIT_CODE_POOL_4K_SEAL definition is applied narrowly to the LLVMEJIT
-# target (its only user is the SRE adapter EJitSrePlatform.cpp), in
-# llvm/lib/ExecutionEngine/EJIT/CMakeLists.txt, rather than globally — so
-# toggling it does not recompile the whole tree.
-option(EJIT_CODE_POOL_4K_SEAL
-  "Seal JIT code execute permission per 4KiB page (split_2m_to_4k + enable_ex) instead of per 2MiB pool" ON)
-if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
-  message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
+# A pool is split into 4KiB mappings before any code is written.
+if(EJIT_SRE_CODE_POOL AND DEFINED EJIT_CODE_POOL_4K_SEAL AND NOT EJIT_CODE_POOL_4K_SEAL)
+  message(FATAL_ERROR "Whole-pool sealing has been retired; remove EJIT_CODE_POOL_4K_SEAL=OFF")
 endif()
 
 # Experimental near-code-pool packing. Ordinary EJIT code and online-PGO Tier-2
@@ -725,9 +712,9 @@ endif()
 option(EJIT_CODE_POOL_BATCHED_PUBLISH
   "Pack pure JIT code at 16-byte alignment for explicit RX batch publication" OFF)
 if(EJIT_CODE_POOL_BATCHED_PUBLISH)
-  if(NOT EJIT_SRE_CODE_POOL OR NOT EJIT_CODE_POOL_4K_SEAL)
+  if(NOT EJIT_SRE_CODE_POOL)
     message(FATAL_ERROR
-      "EJIT_CODE_POOL_BATCHED_PUBLISH requires EJIT_SRE_CODE_POOL=ON and EJIT_CODE_POOL_4K_SEAL=ON")
+      "EJIT_CODE_POOL_BATCHED_PUBLISH requires EJIT_SRE_CODE_POOL=ON")
   endif()
   message(STATUS
     "EmbeddedJIT: 16-byte compact code + manual batched publish enabled")
@@ -822,17 +809,6 @@ set(EJIT_ICACHE_SECTION ".mc_shared" CACHE STRING
 message(STATUS "EmbeddedJIT: inline-cache cell table section=${EJIT_ICACHE_SECTION}")
 
 #===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
-# Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
-# instead of calling the synchronous compile driver directly. Sync and async
-# share the same cache/dedup pipeline; async means "producer + explicit poll
-# worker", never an EJIT-owned thread (the target aarch64_be SRE platform has
-# no C++ thread library). Default OFF: upstream default behavior is unchanged.
-option(EJIT_SRE_TASKPOOL
-  "Enable the EmbeddedJIT SRE taskpool compile scheduler" ON)
-if(EJIT_SRE_TASKPOOL)
-  add_definitions(-DEJIT_SRE_TASKPOOL)
-endif()
-
 # Number of dedup/cache buckets (bucket = funcIndex % N). 32 spreads contention
 # instead of degenerating to a single funcIndex%32 flag.
 set(EJIT_SRE_TASKPOOL_BUCKETS "32" CACHE STRING
@@ -871,22 +847,14 @@ endif()
 # else any funcIndex >= EJIT_ICACHE_FUNC_SLOTS has its icacheFill silently dropped
 # and the wrapper's inline probe misses forever - every call falls through to
 # MissFn -> tryCacheHit -> cacheHits++, defeating the inline cache. Default 4096
-# matches kEJitMaxFuncIndex so the two never desynchronize. Scoped to LLVMEJIT
-# (the icache runtime lives here), gated on the shared taskpool - same pattern
-# as EJIT_ICACHE_DIM_SIZE propagation below.
+# matches kEJitMaxFuncIndex so the two never desynchronize.
 set(EJIT_ICACHE_FUNC_SLOTS "4096" CACHE STRING
   "EmbeddedJIT inline-cache slot table capacity (>= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)")
-# NOTE: the FUNC_SLOTS >= MAX_FUNC_INDEX hard check runs inside the
-# if(EJIT_SRE_SHARED_TASKPOOL) block below, because the icache is only
-# compiled under that option — a non-shared build must not be blocked by an
-# irrelevant slot-table limit. (The static_assert in EJitSharedTaskPool.cpp is
-# the compile-time backstop for non-CMake builds.)
 message(STATUS "EmbeddedJIT: inline-cache slot capacity=${EJIT_ICACHE_FUNC_SLOTS}")
 set(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES "1" CACHE STRING
   "EmbeddedJIT concurrent functions collecting online PGO profiles (1-16)")
-# Single source of truth for the worker task stack size (bytes). The worker —
-# shared OR per-instance — runs LLVM optimize/codegen/ORC/JITLink on its OWN
-# stack via EJitSreTask, so this drives the platform SRE_TaskCreate stack too
+# Worker task stack size (bytes). The shared worker runs LLVM code generation
+# on its own stack via EJitSreTask, so this drives SRE_TaskCreate as well
 # (EJitSreTask_sre.cpp consumes the SAME macro). 1 MiB is only a DEFAULT; every
 # platform MUST measure the worker stack peak and tune it.
 set(EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE "1048576" CACHE STRING
@@ -910,32 +878,23 @@ if(EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT LESS 0 OR
   message(FATAL_ERROR
     "EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT/DELAY_TICKS must be >= 0 (0 disables).")
 endif()
-if(EJIT_SRE_TASKPOOL)
-  add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
-  add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
-  add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
-  add_definitions(-DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES})
-  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
-  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT})
-  add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})
-  message(STATUS "EmbeddedJIT: SRE taskpool enabled "
-                 "(buckets=${EJIT_SRE_TASKPOOL_BUCKETS}, "
-                 "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
-                 "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
-                 "pgoConcurrentProfiles=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}, "
-                 "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
-                 "throttleMult=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT}, "
-                 "throttleDelayTicks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})")
-endif()
+add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
+add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
+add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
+add_definitions(-DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES})
+add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
+add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT})
+add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})
+message(STATUS "EmbeddedJIT: SRE taskpool enabled "
+               "(buckets=${EJIT_SRE_TASKPOOL_BUCKETS}, "
+               "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
+               "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
+               "pgoConcurrentProfiles=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}, "
+               "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
+               "throttleMult=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT}, "
+               "throttleDelayTicks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})")
 
 #===-- EmbeddedJIT cross-core SHARED taskpool -----------------------------===#
-# Layer a single, cross-core-shared taskpool state + single worker owner on top
-# of EJIT_SRE_TASKPOOL: many cores produce into one shared queue/dedup/cache and
-# exactly one core (elected by CAS) runs the JIT worker. Default OFF, so the
-# default and the plain EJIT_SRE_TASKPOOL builds are byte-for-byte unchanged. It
-# requires EJIT_SRE_TASKPOOL (it reuses the request/identity model and macros).
-option(EJIT_SRE_SHARED_TASKPOOL
-  "Enable the EmbeddedJIT cross-core shared taskpool (single shared worker owner)" ON)
 option(EJIT_SRE_TASKPOOL_NO_RECLAIM
   "Use load-only shared-cache reads when published JIT code is never reclaimed" OFF)
 # Fixed cache slots per bucket in the shared POD cache (no std::unordered_map can
@@ -985,103 +944,69 @@ endif()
 #   -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(\".ejit_shared\")))
 set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
   "Attribute placing the shared taskpool state into inter-core shared memory")
-if(EJIT_SRE_SHARED_TASKPOOL)
-  if(NOT EJIT_SRE_TASKPOOL)
-    message(FATAL_ERROR "EJIT_SRE_SHARED_TASKPOOL requires EJIT_SRE_TASKPOOL=ON")
-  endif()
-  # FUNC_SLOTS is the gIcacheSlots[] capacity; any funcIndex >= FUNC_SLOTS has
-  # its icacheFill silently dropped and the wrapper's inline probe misses
-  # forever (every call falls through to MissFn -> tryCacheHit -> cacheHits++).
-  # It must cover the full dense funcIndex space.
-  ejit_require_numeric(EJIT_ICACHE_FUNC_SLOTS)
-  if(EJIT_ICACHE_FUNC_SLOTS LESS EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)
-    message(FATAL_ERROR
-      "EJIT_ICACHE_FUNC_SLOTS (${EJIT_ICACHE_FUNC_SLOTS}) must be >= "
-      "EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX (${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}); "
-      "otherwise funcIndex >= EJIT_ICACHE_FUNC_SLOTS silently drops icacheFill "
-      "and the wrapper's inline probe misses forever.")
-  endif()
-  add_definitions(-DEJIT_SRE_SHARED_TASKPOOL)
-  add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS})
-  if(EJIT_SHARED_SECTION_ATTR)
-    add_definitions("-DEJIT_SHARED_SECTION=${EJIT_SHARED_SECTION_ATTR}")
-    set(_ejit_shared_section "${EJIT_SHARED_SECTION_ATTR}")
-  else()
-    set(_ejit_shared_section "<empty: ordinary .bss, NOT inter-core shared>")
-    # On a real freestanding/multi-core target an empty section attribute means
-    # the state lands in ordinary per-image .bss, so cores do NOT actually share
-    # one blob — defeating the whole design. Refuse to let that pass silently.
-    if(EJIT_FREESTANDING)
-      message(FATAL_ERROR
-        "EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING requires a non-empty "
-        "EJIT_SHARED_SECTION_ATTR placing the shared state into inter-core "
-        "shared memory (e.g. "
-        "-DEJIT_SHARED_SECTION_ATTR=__attribute__\\(\\(section\\(\\\".ejit_shared\\\"\\)\\)\\) ). "
-        "Without it the shared state is NOT cross-core shared.")
-    endif()
-  endif()
-  # Real cross-core platform path: bind EJitCoreId::current() to the declared-
-  # only platform symbol ejit_sre_current_core_id (NO weak fallback — a missing
-  # strong definition is a link error). Host/unit-test builds (not freestanding)
-  # keep the settable simulated core id.
+# FUNC_SLOTS is the gIcacheSlots[] capacity; any funcIndex >= FUNC_SLOTS has
+# its icacheFill silently dropped and the wrapper's inline probe misses
+# forever (every call falls through to MissFn -> tryCacheHit -> cacheHits++).
+# It must cover the full dense funcIndex space.
+ejit_require_numeric(EJIT_ICACHE_FUNC_SLOTS)
+if(EJIT_ICACHE_FUNC_SLOTS LESS EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX)
+  message(FATAL_ERROR
+    "EJIT_ICACHE_FUNC_SLOTS (${EJIT_ICACHE_FUNC_SLOTS}) must be >= "
+    "EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX (${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}); "
+    "otherwise funcIndex >= EJIT_ICACHE_FUNC_SLOTS silently drops icacheFill "
+    "and the wrapper's inline probe misses forever.")
+endif()
+add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS})
+if(EJIT_SHARED_SECTION_ATTR)
+  add_definitions("-DEJIT_SHARED_SECTION=${EJIT_SHARED_SECTION_ATTR}")
+  set(_ejit_shared_section "${EJIT_SHARED_SECTION_ATTR}")
+else()
+  set(_ejit_shared_section "<empty: ordinary .bss, NOT inter-core shared>")
+  # On a real freestanding/multi-core target an empty section attribute means
+  # the state lands in ordinary per-image .bss, so cores do NOT actually share
+  # one blob — defeating the whole design. Refuse to let that pass silently.
   if(EJIT_FREESTANDING)
-    add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_PLATFORM)
+    message(FATAL_ERROR
+      "EJIT_FREESTANDING requires a non-empty "
+      "EJIT_SHARED_SECTION_ATTR placing the shared state into inter-core "
+      "shared memory (e.g. "
+      "-DEJIT_SHARED_SECTION_ATTR=__attribute__\\(\\(section\\(\\\".ejit_shared\\\"\\)\\)\\) ). "
+      "Without it the shared state is NOT cross-core shared.")
   endif()
-  # Cross-core fnPtr sharing capability (only meaningful with the shared pool).
-  # NOT a global add_definitions: the macro's users are EJitSharedTaskPool.cpp
-  # and EJitCompileDriver.cpp, both inside LLVMEJIT, so it is scoped to that
-  # target (see llvm/lib/ExecutionEngine/EJIT/CMakeLists.txt). A global
-  # definition here leaked into EJITSharedTaskPoolTests, which compiles
-  # EJitSharedTaskPool.cpp directly and deliberately tests the
-  # code-sharing-OFF peer rejection: in a
-  # -DEJIT_SRE_SHARED_CODE_POINTERS=ON build dir the peer pointer gate became
-  # always-true and 5 tests failed.
-  # An empty EJIT_ICACHE_SECTION puts the inline-cache cells in per-core .bss,
-  # where a period toggle on one core cannot drain another's. Warn rather than
-  # fail: -ejit-inline-cache is opt-in per application TU.
-  if(EJIT_FREESTANDING AND NOT EJIT_ICACHE_SECTION)
-    message(WARNING
-      "EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING with an empty "
-      "EJIT_ICACHE_SECTION: TUs built with -ejit-inline-cache get a PER-CORE "
-      "cell table, which a period toggle on another core cannot drain.")
-  endif()
-  message(STATUS "EmbeddedJIT: cross-core shared taskpool enabled "
-                 "(cacheSlots=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}, "
-                 "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
-                 "workerCore=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}, "
-                 "platformCoreId=${EJIT_FREESTANDING}, "
-                 "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
-                 "sharedSection=${_ejit_shared_section}, "
-                 "icacheSection=${EJIT_ICACHE_SECTION})")
 endif()
-
-if(EJIT_CODE_POOL_BATCHED_PUBLISH AND NOT EJIT_SRE_SHARED_TASKPOOL)
-  message(FATAL_ERROR
-    "EJIT_CODE_POOL_BATCHED_PUBLISH requires EJIT_SRE_SHARED_TASKPOOL=ON for owner-worker publication")
+# Real cross-core platform path: bind EJitCoreId::current() to the declared-
+# only platform symbol ejit_sre_current_core_id (NO weak fallback — a missing
+# strong definition is a link error). Host/unit-test builds (not freestanding)
+# keep the settable simulated core id.
+if(EJIT_FREESTANDING)
+  add_definitions(-DEJIT_SRE_SHARED_TASKPOOL_PLATFORM)
 endif()
-
-if(EJIT_SRE_TASKPOOL_NO_RECLAIM AND NOT EJIT_SRE_SHARED_TASKPOOL)
-  message(FATAL_ERROR
-    "EJIT_SRE_TASKPOOL_NO_RECLAIM requires EJIT_SRE_SHARED_TASKPOOL=ON")
+# Cross-core fnPtr sharing capability (only meaningful with the shared pool).
+# NOT a global add_definitions: the macro's users are EJitSharedTaskPool.cpp
+# and EJitCompileDriver.cpp, both inside LLVMEJIT, so it is scoped to that
+# target (see llvm/lib/ExecutionEngine/EJIT/CMakeLists.txt). A global
+# definition here leaked into EJITSharedTaskPoolTests, which compiles
+# EJitSharedTaskPool.cpp directly and deliberately tests the
+# code-sharing-OFF peer rejection: in a
+# -DEJIT_SRE_SHARED_CODE_POINTERS=ON build dir the peer pointer gate became
+# always-true and 5 tests failed.
+# An empty EJIT_ICACHE_SECTION puts the inline-cache cells in per-core .bss,
+# where a period toggle on one core cannot drain another's. Warn rather than
+# fail: -ejit-inline-cache is opt-in per application TU.
+if(EJIT_FREESTANDING AND NOT EJIT_ICACHE_SECTION)
+  message(WARNING
+    "EJIT_FREESTANDING with an empty "
+    "EJIT_ICACHE_SECTION: TUs built with -ejit-inline-cache get a PER-CORE "
+    "cell table, which a period toggle on another core cannot drain.")
 endif()
-
-# The fixed worker core closes the shared taskpool's owner election to one
-# designated core, so it is meaningless without the shared taskpool. Non-empty
-# test, not truthiness: "0" is a valid core id (see the trap note above).
-if(NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL "") AND
-   NOT EJIT_SRE_SHARED_TASKPOOL)
-  message(FATAL_ERROR
-    "EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE requires EJIT_SRE_SHARED_TASKPOOL=ON")
-endif()
-
-# The fixed region is process-global, but its bump cursor belongs to one
-# EJitCodePoolManager. Require the shared taskpool's elected single owner so
-# independent managers cannot allocate the same fixed addresses.
-if(EJIT_FIXED_CODE_POOL AND NOT EJIT_SRE_SHARED_TASKPOOL)
-  message(FATAL_ERROR
-    "EJIT_FIXED_CODE_POOL requires EJIT_SRE_SHARED_TASKPOOL=ON so exactly one owner manages the fixed-region bump cursor")
-endif()
-
+message(STATUS "EmbeddedJIT: cross-core shared taskpool enabled "
+               "(cacheSlots=${EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS}, "
+               "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
+               "workerCore=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}, "
+               "platformCoreId=${EJIT_FREESTANDING}, "
+               "codePointers=${EJIT_SRE_SHARED_CODE_POINTERS}, "
+               "sharedSection=${_ejit_shared_section}, "
+               "icacheSection=${EJIT_ICACHE_SECTION})")
 set(LLVM_TARGETS_TO_BUILD "all"
     CACHE STRING "Semicolon-separated list of targets to build, or \"all\".")
 

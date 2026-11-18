@@ -45,6 +45,7 @@ struct EJitSharedTaskPoolState;
 struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
 enum class CompileTier : uint8_t;
 
+#ifdef EJIT_DUMP_SUPPORT
 namespace detail {
 /// Render one function definition without the rest of its specialization
 /// module. Exposed for focused dump-path testing; callers should use the
@@ -55,6 +56,7 @@ void renderDumpModuleIR(const Module &M, std::string &out);
 /// Instrumented Tier-1 is temporary and must never replace a final dump.
 bool shouldCaptureDump(CompileTier tier, StringRef filter, StringRef fnName);
 } // namespace detail
+#endif
 
 /// Set a function-name filter for JIT IR+ASM diagnostic capture. When non-
 /// empty, the engine captures (saves in memory) the post-optimization IR and
@@ -184,7 +186,6 @@ public:
   /// wasted bytes, enable_ex invocations) for diagnostics and tests. Returns a
   /// zeroed snapshot if no pool is active. Available only with
   /// EJIT_SRE_CODE_POOL.
-  EJitCodePoolManager::Stats getCodePoolStats() const;
 
   /// Snapshot aggregate and placement-specific statistics. Tier-1 uses the
   /// far dynamic pool; final Baseline/Tier-2 code uses the near fixed pool.

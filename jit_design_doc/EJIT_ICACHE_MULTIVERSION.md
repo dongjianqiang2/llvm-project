@@ -91,8 +91,7 @@ dimType globals (dimType is the taskpool's key, not the icache's; for a given
 function the dimTypes are fixed by the signature, so `(i0,i1,…)` alone identifies
 the specialization).
 
-`-ejit-inline-cache` (default off) emits the probe; otherwise the wrapper goes
-straight to the funcidx guard / `compile_or_get` (no icache).
+The probe is enabled by default. Use `-mllvm -ejit-inline-cache=false` for the generic wrapper. Out-of-table identities use the slow path; runtimes without shared code pointers never populate a direct probe.
 
 ### Lever B: frame-less wrapper + noinline MissFn
 
@@ -103,11 +102,8 @@ touches `sp`. The slow path (funcidx guard + `compile_or_get` + dispatch + AOT
 fallback) is extracted into a per-function `noinline MissFn` (`<name>_miss`),
 which has its own frame. Miss is rare, so the tail-call overhead is irrelevant.
 
-The two tail calls are `musttail` (so they lower to `br` and the wrapper needs
-no frame) **only when `!EJitWrapperTiming`**; under `-ejit-wrapper-timing` the
-hit path inserts `trace_now`/`trace_wrapper` between the call and `ret`, which
-violates the musttail rule, so it becomes a framed plain call + trace + ret
-(the miss path stays musttail). MissFn must inherit F's target attributes
+The dispatcher tail-calls its target without wrapper timing instrumentation.
+MissFn must inherit the entry target attributes
 (`target-cpu`/`target-features`/`tune-cpu`) via `setAttributes(F->getAttributes())`
 -- `Function::Create` only inherits module-default `uwtable`/`frame-pointer`,
 and a bare MissFn fails `TTI::areInlineCompatible`, so the CGSCC InlinerPass
@@ -303,13 +299,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
 6. **Idempotency** (`isAlreadyWrapped`): recognizes a `LoadInst` OR
    `GetElementPtrInst` of `@__ejit_icache_fn_<name>` (multi-version GEP)
    in the entry block, in addition to `@__ejit_funcidx_`.
-7. **Wrapper timing** (`-ejit-wrapper-timing`): the hit path keeps its
-   sentinel (`0xFE`) report; the slow path (in MissFn or F) keeps the
-   `trace_now` + `trace_wrapper` sequence. Because trace calls are inserted
-   between the call and `ret`, the hit path can no longer be `musttail` and
-   demotes from frame-less to a framed plain call + trace + ret (the miss
-   path stays musttail). The frame-less cycle figures in §11 assume
-   `!EJitWrapperTiming`.
+7. Out-of-range identities and an unregistered entry reach the normal miss path.
 
 ## 9. Runtime changes
 
@@ -374,9 +364,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
 - **Cold**: O(1) per miss (Horner linearize + one `str`). No scan. Miss
   tail-calls `MissFn` (1 `b` instruction).
 
-> 注：本节 frame-less / cycle 数据前提是 `!EJitWrapperTiming`（见 §8 item 7）。
-> 开启 `-ejit-wrapper-timing` 时 hit 路径退化为带帧 plain call + trace + ret，
-> cycle 不适用。
+> Historical cycle estimates, not measurements of the current bounds-checked wrapper.
 
 ### 逐维度命中路径汇编（`-Os`，入口 -> `br spec`）
 

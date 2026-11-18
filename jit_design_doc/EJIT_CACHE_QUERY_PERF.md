@@ -15,7 +15,7 @@ Reproduce with the benchmark added in Commit 1:
 
 ```
 clang++ -std=c++17 -O2 -Illvm/include \
-  -DEJIT_SRE_TASKPOOL -DEJIT_SRE_SHARED_TASKPOOL -DEJIT_SRE_TASKPOOL_TESTING \
+  -DEJIT_SRE_TASKPOOL_TESTING \
   -DEJIT_SRE_TASKPOOL_BUCKETS=32 -DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024 \
   [-DEJIT_SRE_SHARED_CODE_POINTERS] [-DEJIT_SRE_TASKPOOL_NO_RECLAIM] \
   llvm/unittests/ExecutionEngine/EJIT/EJitSharedCacheQueryBench.cpp \
@@ -27,8 +27,7 @@ perf stat -e instructions,cycles ./bench single0d 15 100000000
 Or via CMake: configure with `-DEJIT_BUILD_CACHE_QUERY_BENCH=ON` (and
 `-DEJIT_TEST_NO_RECLAIM=ON` for a benchmark-only seqlock + code-sharing
 variant), then build `EJITSharedCacheQueryBench`. Production builds enable the
-same implementation with `-DEJIT_SRE_TASKPOOL_NO_RECLAIM=ON`; this requires
-`EJIT_SRE_SHARED_TASKPOOL=ON` and is safe only while published JIT code is never
+same implementation with `-DEJIT_SRE_TASKPOOL_NO_RECLAIM=ON`; this is safe only while published JIT code is never
 physically reclaimed. The `ejit-minimal-aarch64_be` preset enables it.
 
 ---

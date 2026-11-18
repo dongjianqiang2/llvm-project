@@ -18,18 +18,17 @@
 #   --static        debug build with static libs (for ejit_test with assertions)
 #   --no-ccache     disable ccache
 #   --trim-llvm-backend-experimental    build with EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=ON (backend: trim non-ELF formats)
-#   --freestanding  build with EJIT_FREESTANDING=ON (runtime: no OS threads/I/O)
+#   --freestanding  build without OS threads/I/O; set EJIT_SHARED_SECTION_ATTR
+#                   to the platform shared-section attribute for a fresh build
 #   --target-triple=<triple>  set EJIT_DEFAULT_TARGET_TRIPLE
 #   --sre-code-pool / --no-sre-code-pool  force EmbeddedJIT SRE code pool on/off
 #   --sre-code-pool-ptno=<n>  set SRE code pool partition number (default: 8)
-#   --sre-taskpool / --no-sre-taskpool  enable/disable SRE taskpool scheduler (default OFF)
 #   --sre-taskpool-buckets=<n>  taskpool dedup/cache bucket count (default: 32)
 #   --sre-taskpool-queue-capacity=<n>  taskpool async queue capacity, pow2 (default: 1024)
-#   --sre-shared-taskpool / --no-sre-shared-taskpool  cross-core shared taskpool, single shared worker (default OFF; needs --sre-taskpool)
 #   --sre-taskpool-no-reclaim / --no-sre-taskpool-no-reclaim  load-only cache-hit path (default OFF; requires shared taskpool and no physical code reclamation)
 #   --sre-taskpool-worker-stack-size=<bytes>  shared worker task stack size (default: 1048576)
 #   --sre-shared-code-pointers / --no-sre-shared-code-pointers  allow non-owner cores to read shared cache fnPtrs (default OFF; needs platform same-VA + cache coherence)
-#   --sre-shared-worker-core=<n>  pin the shared taskpool worker to core <n>; only that core may win the owner election (default: empty = open CAS election; needs --sre-shared-taskpool)
+#   --sre-shared-worker-core=<n>  pin the shared taskpool worker to core <n>; only that core may win the owner election (default: empty = open CAS election)
 #   --sre-pgo-value-profile / --no-sre-pgo-value-profile  enable/disable Online-PGO value profiling (default OFF)
 #   --sre-pgo-branch-audit / --no-sre-pgo-branch-audit  report per-function Tier-2 branch profile shape (default OFF)
 #   --sre-pgo-max-concurrent-profiles=<n>  simultaneous profiling admissions, 1..16 (default: 1)
@@ -111,10 +110,8 @@ do_configure() {
         -DLLVM_ENABLE_PROJECTS="clang;lld" \
         -DEJIT_SRE_CODE_POOL=${EJIT_SRE_CODE_POOL} \
         -DEJIT_SRE_CODE_POOL_PTNO=${EJIT_SRE_CODE_POOL_PTNO} \
-        -DEJIT_SRE_TASKPOOL=${EJIT_SRE_TASKPOOL} \
         -DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS} \
         -DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY} \
-        -DEJIT_SRE_SHARED_TASKPOOL=${EJIT_SRE_SHARED_TASKPOOL} \
         -DEJIT_SRE_TASKPOOL_NO_RECLAIM=${EJIT_SRE_TASKPOOL_NO_RECLAIM} \
         -DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE} \
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT} \
@@ -143,10 +140,8 @@ do_configure() {
         -DLLVM_ENABLE_PROJECTS="clang;lld" \
         -DEJIT_SRE_CODE_POOL=${EJIT_SRE_CODE_POOL} \
         -DEJIT_SRE_CODE_POOL_PTNO=${EJIT_SRE_CODE_POOL_PTNO} \
-        -DEJIT_SRE_TASKPOOL=${EJIT_SRE_TASKPOOL} \
         -DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS} \
         -DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY} \
-        -DEJIT_SRE_SHARED_TASKPOOL=${EJIT_SRE_SHARED_TASKPOOL} \
         -DEJIT_SRE_TASKPOOL_NO_RECLAIM=${EJIT_SRE_TASKPOOL_NO_RECLAIM} \
         -DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE} \
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT} \
@@ -190,10 +185,8 @@ do_configure() {
       -DLLVM_ENABLE_ZSTD=OFF
       -DLLVM_ENABLE_LIBXML2=OFF
       -DLLVM_ENABLE_TERMINFO=OFF
-      -DEJIT_SRE_TASKPOOL=${EJIT_SRE_TASKPOOL}
       -DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
       -DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
-      -DEJIT_SRE_SHARED_TASKPOOL=${EJIT_SRE_SHARED_TASKPOOL}
       -DEJIT_SRE_TASKPOOL_NO_RECLAIM=${EJIT_SRE_TASKPOOL_NO_RECLAIM}
       -DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT}
@@ -218,6 +211,7 @@ do_configure() {
       "-DCMAKE_CXX_COMPILER=${cxx}" \
       -DEJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=${EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL} \
       -DEJIT_FREESTANDING=${EJIT_FREESTANDING} \
+      ${EJIT_SHARED_SECTION_ATTR:+"-DEJIT_SHARED_SECTION_ATTR=${EJIT_SHARED_SECTION_ATTR}"} \
       -DEJIT_SRE_CODE_POOL=${EJIT_SRE_CODE_POOL} \
       -DEJIT_SRE_CODE_POOL_PTNO=${EJIT_SRE_CODE_POOL_PTNO} \
       "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
@@ -238,10 +232,8 @@ do_configure() {
       -DLLVM_ENABLE_LIBXML2=OFF
       -DLLVM_ENABLE_PIC=OFF
       -DLLVM_ENABLE_THREADS=OFF
-      -DEJIT_SRE_TASKPOOL=${EJIT_SRE_TASKPOOL}
       -DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS}
       -DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}
-      -DEJIT_SRE_SHARED_TASKPOOL=${EJIT_SRE_SHARED_TASKPOOL}
       -DEJIT_SRE_TASKPOOL_NO_RECLAIM=${EJIT_SRE_TASKPOOL_NO_RECLAIM}
       -DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT}
@@ -266,6 +258,7 @@ do_configure() {
       "-DCMAKE_CXX_COMPILER=${cxx}" \
       -DEJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=${EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL} \
       -DEJIT_FREESTANDING=${EJIT_FREESTANDING} \
+      ${EJIT_SHARED_SECTION_ATTR:+"-DEJIT_SHARED_SECTION_ATTR=${EJIT_SHARED_SECTION_ATTR}"} \
       -DEJIT_SRE_CODE_POOL=${EJIT_SRE_CODE_POOL} \
       -DEJIT_SRE_CODE_POOL_PTNO=${EJIT_SRE_CODE_POOL_PTNO} \
       "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
@@ -318,10 +311,8 @@ EJIT_FREESTANDING=OFF
 EJIT_TARGET_TRIPLE=""
 EJIT_SRE_CODE_POOL=AUTO
 EJIT_SRE_CODE_POOL_PTNO=8
-EJIT_SRE_TASKPOOL=OFF
 EJIT_SRE_TASKPOOL_BUCKETS=32
 EJIT_SRE_TASKPOOL_QUEUE_CAPACITY=1024
-EJIT_SRE_SHARED_TASKPOOL=OFF
 EJIT_SRE_TASKPOOL_NO_RECLAIM=OFF
 EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=1
@@ -353,12 +344,8 @@ while [[ $# -gt 0 ]]; do
     --sre-code-pool) EJIT_SRE_CODE_POOL=ON ;;
     --no-sre-code-pool) EJIT_SRE_CODE_POOL=OFF ;;
     --sre-code-pool-ptno=*) EJIT_SRE_CODE_POOL_PTNO="${1#--sre-code-pool-ptno=}" ;;
-    --sre-taskpool) EJIT_SRE_TASKPOOL=ON ;;
-    --no-sre-taskpool) EJIT_SRE_TASKPOOL=OFF ;;
     --sre-taskpool-buckets=*) EJIT_SRE_TASKPOOL_BUCKETS="${1#--sre-taskpool-buckets=}" ;;
     --sre-taskpool-queue-capacity=*) EJIT_SRE_TASKPOOL_QUEUE_CAPACITY="${1#--sre-taskpool-queue-capacity=}" ;;
-    --sre-shared-taskpool) EJIT_SRE_SHARED_TASKPOOL=ON ;;
-    --no-sre-shared-taskpool) EJIT_SRE_SHARED_TASKPOOL=OFF ;;
     --sre-taskpool-no-reclaim) EJIT_SRE_TASKPOOL_NO_RECLAIM=ON ;;
     --no-sre-taskpool-no-reclaim) EJIT_SRE_TASKPOOL_NO_RECLAIM=OFF ;;
     --sre-taskpool-worker-stack-size=*) EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE="${1#--sre-taskpool-worker-stack-size=}" ;;
@@ -424,8 +411,8 @@ fi
 BUILD_DIR=$(build_dir "$TYPE" "$ARCH" "$VARIANT")
 log "Type=${TYPE}  Arch=${ARCH}  Variant=${VARIANT}  ccache=$($USE_CCACHE && echo on || echo off)"
 log "EJIT: triple=${EJIT_TARGET_TRIPLE:-$(target_triple "$ARCH")}  sre-code-pool=${EJIT_SRE_CODE_POOL}  ptno=${EJIT_SRE_CODE_POOL_PTNO}"
-log "EJIT: sre-taskpool=${EJIT_SRE_TASKPOOL} buckets=${EJIT_SRE_TASKPOOL_BUCKETS} queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}"
-log "EJIT: sre-shared-taskpool=${EJIT_SRE_SHARED_TASKPOOL} no-reclaim=${EJIT_SRE_TASKPOOL_NO_RECLAIM} worker-stack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE} throttle-mult=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT} throttle-delay-ticks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} shared-code-pointers=${EJIT_SRE_SHARED_CODE_POINTERS}"
+log "EJIT: shared taskpool buckets=${EJIT_SRE_TASKPOOL_BUCKETS} queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}"
+log "EJIT: no-reclaim=${EJIT_SRE_TASKPOOL_NO_RECLAIM} worker-stack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE} throttle-mult=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT} throttle-delay-ticks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} shared-code-pointers=${EJIT_SRE_SHARED_CODE_POINTERS}"
 log "Build dir: ${BUILD_DIR}"
 
 if $DO_CONFIGURE; then

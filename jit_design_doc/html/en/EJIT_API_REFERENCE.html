@@ -53,7 +53,7 @@
   EJIT_PENDING = 1,
 } ejit_status_t;
 
-typedef enum { EJIT_COMPILE_SYNC = 0, EJIT_COMPILE_ASYNC = 1 } ejit_compile_mode_t;
+typedef enum { EJIT_COMPILE_ASYNC = 1, EJIT_COMPILE_OFF = 2 } ejit_compile_mode_t;
 typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_level_t;</code></pre>
   </section>
 
@@ -62,20 +62,14 @@ typedef enum { EJIT_OPT_L1 = 1, EJIT_OPT_L2 = 2, EJIT_OPT_L3 = 3 } ejit_opt_leve
 <pre><code class="language-c">typedef struct {
   ejit_compile_mode_t compileMode;
   ejit_opt_level_t optLevel;
-  size_t maxCodeMemory;
-  size_t maxDataMemory;
-  size_t maxCacheEntries;
-  size_t maxCacheSize;
-  bool enableLogger;
   bool forceStaticRegistry;
   const char *dumpJITDir;
 } ejit_config_t;</code></pre>
+    <p>Rebuild all firmware callers with the new header. Objects built for the old config layout are incompatible.</p>
     <table>
       <tr><th>Field</th><th>Description</th><th>Recommendation</th></tr>
-      <tr><td><code>compileMode</code></td><td>Sync/async compilation</td><td>Start with <code>SYNC</code> to validate; use <code>ASYNC</code> only for latency-sensitive paths</td></tr>
+      <tr><td><code>compileMode</code></td><td>Initialization mode</td><td>Use Async for worker compilation or Off for AOT only. A null config defaults to Async.</td></tr>
       <tr><td><code>optLevel</code></td><td>JIT optimization level</td><td>Usually <code>L2</code>; use <code>L1</code> when code size matters</td></tr>
-      <tr><td><code>maxCodeMemory</code></td><td>JIT code memory cap</td><td>Set according to the target platform's RAM</td></tr>
-      <tr><td><code>maxCacheEntries</code>/<code>maxCacheSize</code></td><td>Cache entry count / total size</td><td>Set based on the number of dimension combinations</td></tr>
       <tr><td><code>forceStaticRegistry</code></td><td>Force the static registry path</td><td>Enable on bare-metal / no-constructor environments</td></tr>
       <tr><td><code>dumpJITDir</code></td><td>Output the optimized IR</td><td>Enable when troubleshooting or confirming branch folding</td></tr>
     </table>
@@ -120,14 +114,12 @@ typedef struct {
   uint64_t evictions;
 } ejit_stats_t;
 
-ejit_status_t ejit_get_stats(ejit_stats_t *stats);
-const ejit_error_t *ejit_get_last_error(void);</code></pre>
+ejit_status_t ejit_get_stats(ejit_stats_t *stats);</code></pre>
   </section>
 
   <section>
     <h2>8. Internal wrapper API</h2>
-<pre><code class="language-c">void *ejit_compile_or_get(uint64_t cacheKey, void **out_pfn);</code></pre>
-    <div class="note">Ordinary users do not call this directly. The AOT wrapper precomputes <code>cacheKey = funcIdx(32b) | dim[3] | dim[2] | dim[1] | dim[0]</code> and calls it. When it returns NULL, the wrapper automatically falls back to the original function body.</div>
+    <p>On a miss, the wrapper uses the shared taskpool APIs in the next section. If no specialization is ready it executes the original AOT body. Application code need not dispatch manually.</p>
   </section>
 
   <section>
@@ -144,7 +136,7 @@ void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
 void ejit_taskpool_release_read(uint32_t bucketIndex);
 unsigned ejit_taskpool_pending_count(void);
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);</code></pre>
-    <div class="warn">These APIs are for the <code>EJIT_SRE_TASKPOOL</code> build; the ordinary host/legacy cache path usually does not need them directly.</div>
+    <div class="warn">These APIs operate on the shared taskpool on both hosted and freestanding builds.</div>
   </section>
 
   <section>

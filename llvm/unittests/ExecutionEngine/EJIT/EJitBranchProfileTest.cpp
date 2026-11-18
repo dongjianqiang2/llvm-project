@@ -85,17 +85,14 @@ TEST(EJitBranchProfile, ClassifiesBranchShapeWithoutChangingIR) {
 
 TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
   const EJitMayConstBenefitSample Samples[] = {
-      {1, 100, 70, 40, 1000, 10, 800, 8, 64, 1000000},
-      {2, 120, 90, 50, 2000, 20, 1500, 15, 80, 2000000},
-      {3, 80, 75, 85, 3000, 31, 0, 0, 100, 1000000}};
+      {1, 100, 40, 1000, 10, 800, 8, 64, 1000000},
+      {2, 120, 50, 2000, 20, 1500, 15, 80, 2000000},
+      {3, 80, 85, 3000, 31, 0, 0, 100, 1000000}};
   EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits(Samples);
   EXPECT_EQ(Summary.versions, 3u);
   EXPECT_EQ(Summary.inputMayConstLoads, 300u);
-  EXPECT_EQ(Summary.specializedMayConstLoads, 235u);
   EXPECT_EQ(Summary.finalMayConstLoads, 175u);
   EXPECT_EQ(Summary.totalRemoved, 125);
-  EXPECT_EQ(Summary.directRemoved, 65);
-  EXPECT_EQ(Summary.pipelineRemoved, 60);
   EXPECT_EQ(Summary.averageRemoved, 41);
   EXPECT_EQ(Summary.weightedRemovedPermille, 416);
   EXPECT_EQ(Summary.minimumRemoved, -5);

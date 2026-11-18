@@ -186,7 +186,6 @@ void          ejit_print_code_pool_stats(void);
 ejit_config_t cfg = {};
 cfg.compileMode  = EJIT_COMPILE_ASYNC;
 cfg.optLevel     = EJIT_OPT_L2;
-cfg.enableLogger = true;
 cfg.dumpJITDir   = "/tmp/ejit_ir";   // 非空即开启
 ejit_init(&cfg);
 ```
@@ -195,7 +194,6 @@ ejit_init(&cfg);
 
 ```c
 void ejit_dump_func(const char *name);  // 按名开启捕获；name="*" 捕获全部；NULL/"" 关闭后续捕获
-void ejit_dump_all(bool enable);        // 等价于 ejit_dump_func("*")（enable=true 时）
 void ejit_print_dumped(const char *name);// 打印 entry 函数视图；NULL/"" 打印本核全部
 void ejit_print_dumped_module(const char *name); // 打印完整特化模块视图
 ```
@@ -214,7 +212,7 @@ ejit_dump_func("process_cell");   // 只捕获感兴趣函数的下一次特化
 ejit_print_dumped("process_cell"); // 回读 IR+ASM
 ejit_print_dumped_module("process_cell"); // 回读该 entry 的完整特化模块
 
-ejit_dump_all(true);              // 捕获所有特化
+ejit_dump_func("*");              // 捕获所有特化
 ```
 
 ---
@@ -258,70 +256,15 @@ ejit_print_version();                 // 可在 init 前后任意时刻调用
 
 ---
 
-## 5. Wrapper 计时
+## 5. Wrapper 开销
 
-在 AOT 生成的 `ejit_entry` wrapper 中插入计时探针，测量 taskpool 查找、间接 JIT 调用、读令牌释放各段耗时，定位 wrapper 开销。运行库自动按固定间隔（默认每 100000 次调用）聚合打印一行汇总，避免日志刷屏。
-
-**启用**：计时探针需在编译你的 ejit 代码时开启：
-
-```bash
-clang -fembed-bitcode ... -mllvm -ejit-wrapper-timing process.c
-```
-
-运行时聚合 API 由插桩 wrapper 自动调用，一般无需手动调用：
-
-```c
-uint64_t ejit_taskpool_trace_now(void);   // 取当前时间戳
-void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
-                                 void *fnPtr, uint32_t bucketIndex,
-                                 uint64_t tBeforeLookup,
-                                 uint64_t tAfterLookup,
-                                 uint64_t tAfterFn,
-                                 uint64_t tAfterRelease);
-```
-
-> 仅当 wrapper 以 `-mllvm -ejit-wrapper-timing` 构建时才会产生计时；时间戳单位由平台决定。
-
-汇总行 `wrapper_timing_agg` 的字段含义：`func` 为 `funcIndex`，`status` 为本次聚合槽记录的 taskpool 返回状态，`fn` 为调用目标地址，`bucket` 为 cache bucket，`count` 为本窗口样本数；`get_fn_avg`、`fn_call_avg`、`release_avg` 和 `total_avg` 分别是查找目标、执行 JIT 函数、释放读令牌及 wrapper 总路径的平均耗时。先比较 `fn_call_avg` 与其余三段，才能区分业务函数变慢和分发框架开销。
+当前版本不再提供 wrapper / 函数体计时插桩。需要测量开销时，在相同业务输入下使用板端性能计数器，对比默认快表和显式 `-mllvm -ejit-inline-cache=false` 的构建。PGO 分支审计、采样及 taskpool 统计不受影响。
 
 ---
 
 ## 6. 错误报告
 
-```c
-typedef struct {
-  int  code;
-  char message[256];
-  char funcName[128];
-} ejit_error_t;
-
-const ejit_error_t *ejit_get_last_error(void);
-```
-
-返回最近一次错误的指针（code / message / funcName），底层为预分配环形缓冲（最多 32 条），无动态分配。
-
-| 字段 | 含义 |
-|------|------|
-| `code` | 对应附录中的 `ejit_status_t` 错误码。 |
-| `message` | 最近一次被记录错误的简短原因，不保证包含底层编译器的完整诊断。 |
-| `funcName` | 与错误关联的函数或注册项名称；错误不属于特定函数时可能为空。 |
-
-返回指针由 EJIT 内部环形缓冲持有，后续错误记录可能覆盖其内容；需要长期保留时应由调用方立即复制这三个字段。
-
-配套配置项 `enableLogger`（`ejit_config_t` 的 `bool` 字段）控制错误环形缓冲是否启用；它与 §1 的运行时日志等级是两套独立机制。注意该 C 结构体字段**无默认值**：零初始化的 `ejit_config_t` 会得到 `enableLogger = false`，需显式置 `true` 才会记录错误。freestanding 构建会强制关闭该错误记录器：
-
-```c
-ejit_config_t cfg = {};
-cfg.enableLogger = true;   // 必须显式设置；零初始化结构体为 false
-ejit_init(&cfg);
-```
-
-```c
-if (ejit_taskpool_compile_or_get(...) != EJIT_OK) {
-  const ejit_error_t *e = ejit_get_last_error();
-  if (e) printf("EJIT error %d: %s (%s)\n", e->code, e->message, e->funcName);
-}
-```
+检查返回的 `ejit_status_t`。初始化前暂存的注册错误由 `ejit_init` 或 `ejit_init_pgo` 返回，不依赖日志是否开启。启用 `EJIT_DIAG_ENABLE` 时，INFO 级日志会给出注册及编译失败的原因；编译失败时 wrapper 仍回退到 AOT。
 
 ---
 
@@ -432,7 +375,7 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 
 ### 10.3 该编译的没编译 / 编译失败
 
-1. `ejit_get_last_error()` 读失败原因（code / message / funcName）。
+1. 检查 API 的返回值，并从 INFO 日志中查找注册或编译失败的具体原因。
 2. `EJIT_LOG_VERBOSE` 看逐次 `compile_or_get` 与 taskpool 请求。
 3. `ejit_taskpool_get_stats()` 看 `compileFailed` / `publishFailed` / `queueFull` / `queueApproxSize`，判断是失败、被拒还是拥塞。
 4. `ejit_taskpool_print_compiled()` 看实际编译了哪些特化。
@@ -440,7 +383,7 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 ### 10.4 命中率低 / 性能差
 
 1. `ejit_taskpool_get_stats()` 读 `cacheHits` / `asyncCompiles` / `alreadyPending`。
-2. 若 wrapper 开销可疑，对 ejit 代码加 `-mllvm -ejit-wrapper-timing`，观察周期汇总中查找 / 调用 / 释放各段耗时。
+2. 查 wrapper 开销时，使用第 5 节的对照测量。
 3. `ejit_get_stats()` 是已退役 LRU 的兼容接口，当前恒返回零，不能用于分析 taskpool 命中率。
 
 ### 10.5 代码内存趋紧 / 耗尽

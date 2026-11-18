@@ -316,7 +316,7 @@ runOptimizationPipeline                        // 不变；O2 看到常量→Loo
 ```sh
 # 主机侧（能跑的部分）
 # 默认 maxCores=32，覆盖 demo 的 producer core 18/19/20；自定义时不得小于 21。
-../build.sh release x86 --sre-taskpool --sre-shared-taskpool \
+../build.sh release x86 \
   --sre-pgo-value-profile --sre-pgo-max-concurrent-profiles=2 --stats
 cd ejit_test && EJIT_CLANG=../build_release_x86/bin/clang ./build.sh --run ejit_vp_multicore_test
 

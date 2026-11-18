@@ -412,7 +412,7 @@ compileMode == ASYNC → submit background compile task → current call falls b
 
   <section id="sync-compile">
     <h2>4. Synchronous compile mode</h2>
-    <p><code>EJIT_COMPILE_SYNC</code> suits validation, debugging, and scenarios that can accept first-call latency. After a cache miss, the current business thread directly completes the JIT compile; on success this call runs the specialized code.</p>
+    <p>Historical diagram only. Synchronous compilation was retired; the supported modes at initialization are Async and Off (AOT).</p>
     <div class="diagram-wrap">
       <svg width="1260" height="520" viewBox="0 0 1260 520" role="img" aria-label="EJIT synchronous compile flow diagram">
         <defs>
@@ -528,7 +528,7 @@ compileMode == ASYNC → submit background compile task → current call falls b
         <text x="890" y="428" class="svg-small">atomic publish</text>
 
         <rect x="340" y="500" width="585" height="50" rx="10" fill="#f8fafc" stroke="#d9dee6" />
-        <text x="365" y="531" class="svg-note">Failure or task disabled: record last_error / stats, cache not published; business calls are still kept correct by the AOT fallback.</text>
+        <text x="365" y="531" class="svg-note">Failure or task disabled: record diagnostics / stats, cache not published; business calls are still kept correct by the AOT fallback.</text>
 
         <line x1="280" y1="140" x2="350" y2="140" stroke="#6b46c1" stroke-width="3" marker-end="url(#asyncArrow)" />
         <line x1="585" y1="140" x2="660" y2="140" stroke="#dd6b20" stroke-width="3" marker-end="url(#asyncOrange)" />
@@ -637,7 +637,7 @@ ORC LLJIT / JITLink: target codegen + symbol resolution + code memory finalize</
         <tr><td>CompileDriver</td><td>Loads bitcode, runs the JIT pipeline, calls ORC/JITLink</td><td>On failure returns NULL directly to the wrapper</td><td>On failure records to the task state; must not affect the business thread</td></tr>
         <tr><td>TaskQueue / Dedup</td><td>Task queue and dedup table for async mode</td><td>Usually unused</td><td>Prevent duplicate enqueue of the same cacheKey; handle queue full</td></tr>
         <tr><td>CodePool / MemoryMgr</td><td>Allocates, writes, and finalizes executable code memory</td><td>Immediately executable after compilation</td><td>Must finalize before publish; under SRE also needs I/D cache sync</td></tr>
-        <tr><td>Error / Stats</td><td>Records last_error, hits, misses, pending, evictions</td><td>Used to confirm whether this call ran JIT</td><td>Used to observe pending count, worker success rate, and fallback frequency</td></tr>
+        <tr><td>Error / Stats</td><td>Records diagnostics, hits, misses, pending, evictions</td><td>Used to confirm whether this call ran JIT</td><td>Used to observe pending count, worker success rate, and fallback frequency</td></tr>
       </tbody>
     </table>
   </section>

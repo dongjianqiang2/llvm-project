@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
 
   //=== 2. Fallback: wrapper + not active ===//
   // Explicit precondition: no time window has been activated yet,
-  // so ejit_compile_or_get returns NULL → wrapper falls through to AOT.
+  // so the wrapper falls through to AOT.
   printf("\n--- [2] Fallback: wrapper + not active (%llu iters/batch) ---\n",
          (unsigned long long)ITERS_LARGE);
   if (!ejit_is_active("cell", ci))

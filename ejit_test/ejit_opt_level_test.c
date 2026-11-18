@@ -128,14 +128,7 @@ int main(int argc, char **argv)
 
     // Init EJIT
     ejit_config_t c; memset(&c,0,sizeof(c));
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-    // Async mode so the shared taskpool worker starts during ejit_init.
     c.compileMode=EJIT_COMPILE_ASYNC; c.optLevel=lv;
-#else
-    c.compileMode=EJIT_COMPILE_SYNC; c.optLevel=lv;
-#endif
-    c.maxCodeMemory=512*1024; c.maxDataMemory=256*1024;
-    c.maxCacheEntries=64; c.maxCacheSize=1024*1024;
     if (ejit_init(&c)!=EJIT_OK) { printf("FAIL: ejit_init\n"); return 1; }
     ejit_activate("carrier",0);
     ejit_activate("carrier",1);
@@ -159,14 +152,9 @@ int main(int argc, char **argv)
         exp += 52 + ((ci%2==0)?6:0);
 
         ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
         ejit_taskpool_stats_t s; memset(&s,0,sizeof(s));
         ejit_taskpool_get_stats(&s);
         int isJit = (s.asyncCompiles > (size_t)t) ? 1 : 0;
-#else
-        ejit_stats_t s; memset(&s,0,sizeof(s)); ejit_get_stats(&s);
-        int isJit = (s.entryCount > (size_t)t) ? 1 : 0;
-#endif
 
         printf("[Test %d] ci=%u %s  result=%u expected=%u  ",
                t+1, ci, isJit?"[JIT]":"[AOT]", res, exp);
@@ -175,7 +163,6 @@ int main(int argc, char **argv)
     }
 
     ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     ejit_taskpool_stats_t sf; memset(&sf,0,sizeof(sf));
     ejit_taskpool_get_stats(&sf);
     printf("\nJIT: compiles=%llu hits=%llu  ",
@@ -183,13 +170,6 @@ int main(int argc, char **argv)
            (unsigned long long)sf.cacheHits);
     if (sf.asyncCompiles > 0) printf("[ACTIVE]\n");
     else { printf("[NOT ACTIVE]\n"); failures++; }
-#else
-    ejit_stats_t sf; memset(&sf,0,sizeof(sf)); ejit_get_stats(&sf);
-    printf("\nJIT: entries=%zu misses=%llu  ", sf.entryCount,
-           (unsigned long long)sf.misses);
-    if (sf.entryCount > 0) printf("[ACTIVE]\n");
-    else { printf("[NOT ACTIVE]\n"); failures++; }
-#endif
 
     ejit_shutdown();
     printf("\n=== %s: %d failures ===\n", ln, failures);

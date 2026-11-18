@@ -22,9 +22,9 @@
 <pre><code>1. Were attributes recognized at compile time?
    └─ Check Clang Sema/CodeGen for EJIT diagnostics or metadata
 2. Did the AOT pass take effect?
-   └─ Look for @__ejit_bitcode, ejit_compile_or_get, jit_dispatch/jit_fallback
+   └─ Look for @__ejit_bitcode, ejit_taskpool_compile_or_get, jit_dispatch/jit_fallback
 3. Is the runtime initialized and registered?
-   └─ ejit_init return value, last_error, registry/static table
+   └─ ejit_init return value, diagnostics, registry/static table
 4. Is the time window active?
    └─ ejit_is_active(period, idx)
 5. Did the cache hit or compile succeed?
@@ -48,7 +48,7 @@
       <h3>Check 3: Are there wrapper signatures in the IR/binary</h3>
       <table>
         <tr><th>Keyword</th><th>Meaning</th></tr>
-        <tr><td><code>ejit_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
+        <tr><td><code>ejit_taskpool_compile_or_get</code></td><td>The wrapper entry calls the runtime</td></tr>
         <tr><td><code>jit_dispatch</code></td><td>JIT success path</td></tr>
         <tr><td><code>jit_fallback</code></td><td>AOT fallback path</td></tr>
         <tr><td><code>@__ejit_bitcode</code></td><td>Embedded bitcode</td></tr>
@@ -71,8 +71,8 @@ assert(ejit_is_active("cell", idx));</code></pre>
       <thead><tr><th>Possible cause</th><th>How to confirm</th><th>Fix</th></tr></thead>
       <tbody>
         <tr><td>First call in async mode</td><td>First miss; stats misses increase but entryCount does not increase immediately</td><td>Call once more; or switch to SYNC to validate</td></tr>
-        <tr><td>Time window not active</td><td><code>ejit_is_active</code> false / last_error NOT_ACTIVE</td><td>Call <code>ejit_activate</code></td></tr>
-        <tr><td>Bitcode not registered</td><td>last_error BITCODE_NOT_FOUND</td><td>Check PASS1, registry, and section retention</td></tr>
+        <tr><td>Time window not active</td><td><code>ejit_is_active</code> false / diagnostic: period not active</td><td>Call <code>ejit_activate</code></td></tr>
+        <tr><td>Bitcode not registered</td><td>diagnostic: bitcode not found</td><td>Check PASS1, registry, and section retention</td></tr>
         <tr><td>External symbol missing</td><td>JITLink/ORC symbol resolution failed</td><td>Auto or manual <code>ejit_register_symbol</code></td></tr>
         <tr><td>Target backend missing</td><td>JIT compile reports a target/backend error</td><td>Confirm the build includes the target architecture</td></tr>
         <tr><td>Code memory insufficient</td><td>MEMORY/CACHE_FULL/code size error</td><td>Raise the cap or lower the opt level</td></tr>

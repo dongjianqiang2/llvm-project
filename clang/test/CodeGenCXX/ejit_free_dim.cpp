@@ -28,5 +28,5 @@ int Holder::method(
 // CHECK-DAG: ![[ENTRY]] = !{!"ejit_entry"}
 // CHECK-DAG: ![[DIM]] = !{!"ejit_period_arr_ind", !"cell", i32 1}
 // CHECK-DAG: ![[FREE]] = !{!"ejit_free_dim", !"", i32 3}
-// CHECK-DAG: ![[BOUND]] = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, ![[FIELD:[0-9]+]]}
+// CHECK-DAG: ![[BOUND]] = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, i64 4, ![[FIELD:[0-9]+]]}
 // CHECK-DAG: ![[FIELD]] = !{i64 0, i64 4}

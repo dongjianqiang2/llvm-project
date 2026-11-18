@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 
 ; The loop header PHIs' entry-incoming edge must name jit_fallback after the
 ; original entry block is spliced.  The wrapper uses the unified taskpool API.
@@ -32,7 +32,7 @@ done:
 
 ; Wrapper blocks follow.
 ; CHECK: jit_call:
-; CHECK: call i32 @ejit_taskpool_compile_or_get_0d(i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr null, i32 0, ptr {{.*}}, ptr {{.*}})
 ; CHECK: jit_fallback:
 ; CHECK: br label %loop
 ; CHECK: jit_dispatch:

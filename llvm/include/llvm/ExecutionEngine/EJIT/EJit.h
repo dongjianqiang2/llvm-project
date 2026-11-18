@@ -28,8 +28,6 @@ namespace llvm {
 namespace ejit {
 
 class EJitCompileDriver;
-class EJitLogger;
-class EJitTaskPool;
 class EJitSharedTaskPool;
 
 /// Main user-facing class for EmbeddedJIT. Owns all runtime components.
@@ -65,24 +63,7 @@ public:
   void invalidateAllByPeriod(const std::string &periodName);
 
   // Configuration
-  /// Change compile mode. On failure the current mode is preserved and false
-  /// is returned.
-  ///
-  /// Private taskpool: Async requires a ready ORC engine on this instance and a
-  /// successfully started worker.
-  ///
-  /// Shared taskpool: Async instead requires the SHARED pool to be serviceable
-  /// (Ready, owner elected, worker running) -- peers have no engine of their
-  /// own, the elected owner compiles for every core. The switch is rejected if
-  /// the owner shuts down while it is in flight.
-  ///
-  /// Shared SYNC compiles on the CALLING core, and only the owner has an
-  /// engine, so a non-owner core in Sync mode does not JIT: its calls resolve
-  /// to nullptr and the wrapper cleanly runs the AOT body. Sync is therefore a
-  /// single-core debugging mode under the shared taskpool, not a way for every
-  /// core to compile.
-  bool setCompileMode(CompileMode mode);
-  CompileMode getCompileMode() const;
+  CompileMode getCompileMode() const { return config_.compileMode; }
   void setOptimizationLevel(OptimizationLevel level);
   OptimizationLevel getOptimizationLevel() const;
 
@@ -109,11 +90,6 @@ public:
     return runtimeState_->getRegistry();
   }
 
-  // Statistics
-
-  // Error
-  const EJitError *getLastError() const;
-
   /// True if registration during construction failed (funcIndex/lifecycle
   /// capacity exhausted, a malformed or conflicting bitcode payload, or a null
   /// fixup pointer). ejit_init() returns failure and tears down the instance
@@ -129,18 +105,9 @@ public:
     return regPhase_ != RegistrationPhase::Open;
   }
 
-#ifdef EJIT_SRE_TASKPOOL
-  /// Access the SRE taskpool scheduler (used by the taskpool C ABI). May be
-  /// null if the compile driver was not constructed.
-  EJitTaskPool *taskPool();
-#endif
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  /// Access the cross-core shared taskpool (the taskpool C ABI binds here in a
-  /// shared build). May be null if the compile driver was not constructed.
+  /// The shared scheduler used by the taskpool C ABI; null without a driver.
   EJitSharedTaskPool *sharedTaskPool();
   const EJitSharedTaskPool *sharedTaskPool() const;
-#endif
 
   /// Access the module loader (for funcIndex → funcName resolution in
   /// diagnostics). Always constructed; valid for the lifetime of the instance.
@@ -177,9 +144,6 @@ private:
   Config config_;
   std::unique_ptr<EJitRuntimeState> runtimeState_;
   std::unique_ptr<EJitModuleLoader> moduleLoader_;
-#ifndef EJIT_FREESTANDING
-  std::unique_ptr<EJitLogger> logger_;
-#endif
   std::unique_ptr<EJitCompileDriver> compileDriver_;
 
   /// Record the first construction-time registration failure (later ones are

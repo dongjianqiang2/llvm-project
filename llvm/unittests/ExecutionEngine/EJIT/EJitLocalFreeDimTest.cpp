@@ -880,7 +880,6 @@ TEST(EJitLocalFreeDim, UnsupportedMixedSelectKeepsRealLoad) {
   EXPECT_EQ(countLoads(*M->getFunction("local_work")), 3u);
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 TEST(EJitLocalFreeDim, NormalOnlineWorkerPGOAndLifecycleRefresh) {
   LLVMContext C;
   auto Original = makeLocalModule(C);
@@ -952,9 +951,7 @@ TEST(EJitLocalFreeDim, NormalOnlineWorkerPGOAndLifecycleRefresh) {
   EXPECT_EQ(Shared->counters.asyncCompiles.loadAcquire(), 4u);
   Pool->ownerShutdown();
 }
-#endif
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 TEST(EJitLocalFreeDim, UnsupportedBoundaryVersionFailsCleanlyToFallback) {
   LLVMContext C;
   auto M = makeLocalModule(C);
@@ -978,7 +975,6 @@ TEST(EJitLocalFreeDim, UnsupportedBoundaryVersionFailsCleanlyToFallback) {
   Runtime.getRegistry().registerArray("cell", "local_cells", Data, 2);
   auto Shared = std::make_unique<EJitSharedTaskPoolState>();
   Config Cfg;
-  Cfg.compileMode = CompileMode::Sync;
   EJitCompileDriver Driver(Cfg, Runtime, Loader);
   Driver.registerSymbol("local_cells", Data);
   auto *Pool = Driver.sharedTaskPool();
@@ -988,10 +984,14 @@ TEST(EJitLocalFreeDim, UnsupportedBoundaryVersionFailsCleanlyToFallback) {
   EJitDimPair Pair{Dim, 1};
   auto Result = Pool->compileOrGet(Index, &Pair, 1, nullptr);
   EXPECT_EQ(Result.fnPtr, nullptr);
+  EXPECT_EQ(Result.status, EJitCompileOrGetStatus::EnqueuedPending);
+  const auto Deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!Shared->counters.compileFailed.loadAcquire() &&
+         std::chrono::steady_clock::now() < Deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   EXPECT_GT(Shared->counters.compileFailed.loadAcquire(), 0u);
   Pool->ownerShutdown();
 }
-#endif
 
 TEST(EJitLocalFreeDim, RealOrcExecutionCountersPGOAndGenerationRefresh) {
   LLVMContext C;

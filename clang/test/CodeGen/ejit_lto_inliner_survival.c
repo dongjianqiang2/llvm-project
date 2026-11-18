@@ -36,9 +36,11 @@ void caller(int i) { entry(i); lc(i); }
 // PASS3 wrapper survives on @entry (it was not inlined into @caller).
 // CHECK: define {{.*}} @entry(
 // CHECK: jit_entry:
-// CHECK: call {{.*}} @ejit_taskpool_compile_or_get_
+// CHECK: musttail call void %ejit_ic_fn(
 
 // PASS4 lifecycle survives on @lc (it was not inlined into @caller).
 // CHECK: define {{.*}} @lc(
 // CHECK: call {{.*}} @ejit_deactivate(
 // CHECK: call {{.*}} @ejit_activate(
+// CHECK-LABEL: define internal void @entry_miss(
+// CHECK: call {{.*}} @ejit_taskpool_compile_or_get(

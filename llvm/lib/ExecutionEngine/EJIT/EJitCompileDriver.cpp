@@ -1,15 +1,13 @@
 //===-- EJitCompileDriver.cpp - Compilation Scheduler ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#include "EJitCodePoolCounters.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include <cassert>
-#ifndef EJIT_FREESTANDING
-#include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
-#endif
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
@@ -17,45 +15,46 @@
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #endif
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
-#endif
 #ifndef EJIT_FREESTANDING
 #include <chrono>
+#endif
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+#ifdef EJIT_FREESTANDING
+extern "C" uint64_t SRE_CycleCountGet64(void);
+#endif
+static uint64_t auditClockNow() {
+#ifdef EJIT_FREESTANDING
+  return SRE_CycleCountGet64();
+#else
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+#endif
+}
 #endif
 
 using namespace llvm;
 using namespace llvm::ejit;
 
-#ifdef EJIT_SRE_TASKPOOL
-namespace {
 /// Adapter so the taskpool can call back into the driver's cold compile path
 /// through a plain function pointer (never std::function). The produced JIT
 /// pointer still comes from the OrcJIT engine (SRE code pool when enabled).
-bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
-                          void **outFn) {
+bool EJitCompileDriver::taskpoolCompileThunk(void *ctx,
+                                             const EJitCompileRequest &req,
+                                             void **outFn) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
-  void *fn = drv->compileNow(req);
+  void *fn = drv->compileNowValidated(req);
   *outFn = fn;
   return fn != nullptr;
 }
 
+namespace {
 void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
                           bool published) {
   static_cast<EJitCompileDriver *>(ctx)->notifyTaskpoolPublished(req,
                                                                  published);
-}
-
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-[[maybe_unused]] bool sharedPrepareCodeThunk(void * /*ctx*/,
-                                             const void *fnPtr) {
-#ifdef EJIT_SRE_CODE_POOL
-  return prepareSreCodeForCurrentCore(fnPtr);
-#else
-  (void)fnPtr;
-  return false;
-#endif
 }
 
 // Owner-private: resolve a freshly compiled pointer to its real, finalized
@@ -117,30 +116,9 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
   EJitOrcEngine *eng = drv->getJitEngine();
   if (eng && out) {
     EJitTieredCodePoolStats tiered = eng->getTieredCodePoolStats();
-    const EJitCodePoolManager::Stats &s = tiered.total;
-    out->poolCount = s.poolCount;
-    out->sealedCount = s.sealedCount;
-    out->activeCount = s.activeCount;
-    out->usedBytes = s.usedBytes;
-    out->reservedBytes = s.reservedBytes;
-    out->wastedBytes = s.wastedBytes;
-    out->sealInvocations = s.sealInvocations;
-    out->splitInvocations = s.splitInvocations;
-    out->finalizedRangeCount = s.finalizedRangeCount;
-    auto CopyDetail = [](EJitCodePoolStatsOut::Detail &Dst,
-                         const EJitCodePoolManager::Stats &Src) {
-      Dst.poolCount = Src.poolCount;
-      Dst.sealedCount = Src.sealedCount;
-      Dst.activeCount = Src.activeCount;
-      Dst.usedBytes = Src.usedBytes;
-      Dst.reservedBytes = Src.reservedBytes;
-      Dst.wastedBytes = Src.wastedBytes;
-      Dst.sealInvocations = Src.sealInvocations;
-      Dst.splitInvocations = Src.splitInvocations;
-      Dst.finalizedRangeCount = Src.finalizedRangeCount;
-    };
-    CopyDetail(out->near, tiered.near);
-    CopyDetail(out->far, tiered.far);
+    copyPoolCounters(*out, tiered.total);
+    copyPoolCounters(out->near, tiered.near);
+    copyPoolCounters(out->far, tiered.far);
     return true;
   }
   return false;
@@ -193,11 +171,8 @@ bool sharedMayConstRankingThunk(void *ctx) {
   return false;
 #endif
 }
-#endif
 } // namespace
-#endif
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 namespace {
 // The single process-global shared taskpool state. Placed in the cross-core
 // shared section (an empty attribute on host, where one address space already
@@ -205,39 +180,18 @@ namespace {
 // single worker owner across cores via CAS.
 EJIT_SHARED_SECTION EJitSharedTaskPoolState gEJitSharedTaskPoolState;
 } // namespace
-#endif
 
 EJitCompileDriver::EJitCompileDriver(const Config &config,
                                      EJitRuntimeState &runtimeState,
-                                     EJitModuleLoader &loader,
-                                     EJitLogger *logger)
-    : config_(config), runtimeState_(runtimeState), loader_(loader)
-#ifndef EJIT_FREESTANDING
-      ,
-      logger_(logger)
-#endif
-{
-#ifdef EJIT_SRE_TASKPOOL
-  // Build the unified scheduler with the worker STOPPED. The worker must not
-  // run until EJit has consumed all registration, completed the funcIndex/
-  // lifecycle fixup, frozen registration, and installed the ORC engine — EJit
-  // calls startTaskPoolWorker() once everything is ready (spec §3.4).
-  taskPool_ = std::make_unique<EJitTaskPool>(EJIT_SRE_TASKPOOL_QUEUE_CAPACITY,
-                                             /*autoStartWorker=*/false);
-  taskPool_->setCompiler(&taskpoolCompileThunk, this);
-  taskPool_->setPublishCallback(&taskpoolPublishThunk, this);
-  taskPool_->switchController().setMode(
-      config_.compileMode == CompileMode::Async  ? EJitCompileMode::Async
-      : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
-                                                 : EJitCompileMode::Off);
-#endif
-#ifdef EJIT_SRE_SHARED_TASKPOOL
+                                     EJitModuleLoader &loader)
+    : config_(config), runtimeState_(runtimeState), loader_(loader) {
   // Bind the cross-core shared pool to the process-global shared state and wire
   // the owner-private hooks. Election + the single worker start happen later in
   // startSharedTaskPool() (called by EJit once registration is frozen and the
   // ORC engine is installed). Cross-core fnPtr sharing is OFF by default until
   // a platform asserts same-VA, sealed, I/D-coherent code (spec §11).
-  sharedPool_.bind(&gEJitSharedTaskPoolState);
+  if (config_.compileMode == CompileMode::Async)
+    sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
@@ -256,9 +210,8 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.setOwnerReleasedCallback(&EJitCompileDriver::sharedOwnerReleased,
                                        this);
   sharedPool_.setMode(
-      config_.compileMode == CompileMode::Async  ? EJitCompileMode::Async
-      : config_.compileMode == CompileMode::Sync ? EJitCompileMode::Sync
-                                                 : EJitCompileMode::Off);
+      config_.compileMode == CompileMode::Async ? EJitCompileMode::Async
+                                                : EJitCompileMode::Off);
   // Cross-core fnPtr sharing is gated by the build capability flag
   // EJIT_SRE_SHARED_CODE_POINTERS (default OFF -> clean fallback for non-owner
   // cores). Only the platform may assert same-VA + sealed + I/D-cache-coherent
@@ -279,7 +232,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
 #endif
 #ifdef EJIT_SRE_SHARED_CODE_POINTERS
   sharedPool_.setCodeSharingEnabled(true);
-#ifdef EJIT_CODE_POOL_4K_SEAL
+#ifdef EJIT_SRE_CODE_POOL
   // 4K page seal: a non-owner core splits its 2MiB pool once and then seals
   // exactly the 4KiB pages the code covers, in its own translation context.
   sharedPool_.setSealMode(true);
@@ -289,25 +242,21 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   // counters), make those data pages writable per-core before execution.
   sharedPool_.setEnableRwPageCallback(&sharedEnableRwPageThunk, this);
 #else
-  // Legacy whole-2MiB-pool seal: align fnPtr to its pool base and enable_ex.
-  sharedPool_.setSealMode(false);
-  sharedPool_.setPrepareCodeCallback(&sharedPrepareCodeThunk, this);
+  // No SRE permission backend: never hand an unprepared pointer to a peer.
+  sharedPool_.setPrepareCodeCallback(
+      [](void *, const void *) { return false; }, nullptr);
 #endif
 #else
   sharedPool_.setCodeSharingEnabled(false);
 #endif
-#endif
 }
 
 EJitCompileDriver::~EJitCompileDriver() {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   // Stop + join the single shared worker (if this driver is the owner) BEFORE
   // owner-private ORC/driver state is destroyed — no use-after-free.
   sharedPool_.ownerShutdown();
-#endif
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 bool EJitCompileDriver::sharedWorkerStart(
     void *ctx, EJitSharedTaskPool::WorkerEntryFn entry, void *entryCtx,
     uint64_t *outTaskId) {
@@ -380,7 +329,6 @@ bool EJitCompileDriver::startSharedTaskPool() {
             static_cast<unsigned>(r));
   return false;
 }
-#endif
 
 void EJitCompileDriver::setJitEngine(std::unique_ptr<EJitOrcEngine> engine) {
   jitEngine_ = std::move(engine);
@@ -395,16 +343,12 @@ bool EJitCompileDriver::ensureJitEngine() {
   auto engine = EJitOrcEngine::Create(config_, runtimeState_.getRegistry(),
                                       runtimeState_);
   if (!engine) {
-    EJIT_DIAG("FAILED to create OrcJIT engine");
-#ifndef EJIT_FREESTANDING
-    std::string errStr;
-    llvm::handleAllErrors(
-        engine.takeError(),
-        [&](const llvm::ErrorInfoBase &E) { errStr = E.message(); });
-    if (logger_)
-      logger_->log(EJIT_ERR_COMPILE_FAILED,
-                   "Failed to create OrcJIT engine: " + errStr, "", "");
+#if defined(EJIT_DIAG_ENABLE) && !defined(EJIT_FREESTANDING)
+    handleAllErrors(engine.takeError(), [](const ErrorInfoBase &E) {
+      EJIT_DIAG("FAILED to create OrcJIT engine: %s", E.message().c_str());
+    });
 #else
+    EJIT_DIAG("FAILED to create OrcJIT engine");
     consumeError(engine.takeError());
 #endif
     return false;
@@ -459,11 +403,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (!bitcodeOrErr) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: bitcode not found", cacheKey,
               funcName.c_str());
-#ifndef EJIT_FREESTANDING
-    if (logger_)
-      logger_->log(EJIT_ERR_BITCODE_NOT_FOUND, "No bitcode for function",
-                   funcName, std::to_string(cacheKey));
-#endif
+    consumeError(bitcodeOrErr.takeError());
     return nullptr;
   }
   StringRef bitcode = *bitcodeOrErr;
@@ -475,7 +415,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 
   // Verify time-window state for each dimension.
   for (unsigned i = 0; i < dimCount; ++i) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     // Cross-core: gate on the SHARED enabled bit (the one the producer's
     // ejit_activate writes), NOT the owner-private runtimeState_. The shared
     // SwitchController defaults to INACTIVE (initSharedStorage sets enabled=0),
@@ -491,19 +430,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                 cacheKey, funcName.c_str(), periodNames[i].c_str(), dims[i]);
       return nullptr;
     }
-#else
-    if (!runtimeState_.isActive(periodNames[i], dims[i])) {
-      EJIT_DIAG("compile SKIP key=0x%016lx func=%s: period %s[%u] not active",
-                cacheKey, funcName.c_str(), periodNames[i].c_str(), dims[i]);
-#ifndef EJIT_FREESTANDING
-      if (logger_)
-        logger_->log(EJIT_ERR_NOT_ACTIVE,
-                     "Time window not active for " + periodNames[i], funcName,
-                     std::to_string(cacheKey));
-#endif
-      return nullptr;
-    }
-#endif
   }
 
   // Build specialization context
@@ -514,12 +440,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
   if (request && request->boundCount) {
-    if (!validateBoundPtrDescriptors(request->boundPointers,
-                                     request->boundCount)) {
-      EJIT_DIAG("compile FAIL key=0x%016lx func=%s: invalid bound pointer list",
-                cacheKey, funcName.c_str());
-      return nullptr;
-    }
     for (uint32_t I = 0; I < request->boundCount; ++I) {
       const EJitBoundPtrDescriptor &B = request->boundPointers[I];
       // Keep this lookup as an explicit loop. libc++ may lower generic
@@ -559,7 +479,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       auto mayConstIt = tier1MayConst_.find(cacheKey);
       if (mayConstIt != tier1MayConst_.end()) {
         ctx.mayConstLoadSites = mayConstIt->second.sites;
-        const uint64_t SampleEnd = ejit_taskpool_trace_now();
+        const uint64_t SampleEnd = auditClockNow();
         if (mayConstIt->second.sampleStart != 0)
           ctx.mayConstSampleCycles =
               SampleEnd - mayConstIt->second.sampleStart;
@@ -608,18 +528,8 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
             (void)aggregateValueSamples(samples, vpFuncs, vpIt->second.targets,
                                         valueSites, scalarSites);
             const size_t totalScalar = scalarSites.size();
-            size_t dropped = 0;
-            for (PgoScalarSite &s : scalarSites) {
-              if (s.topCount < EJIT_SRE_VP_MIN_SAMPLES ||
-                  s.topCount * 100 < s.total * EJIT_SRE_VP_MIN_CONF_PERCENT)
-                dropped++;
-            }
-            // Apply the dominance thresholds: below them a site stays on the
-            // generic fallback path.
-            llvm::erase_if(scalarSites, [](const PgoScalarSite &s) {
-              return s.topCount < EJIT_SRE_VP_MIN_SAMPLES ||
-                     s.topCount * 100 < s.total * EJIT_SRE_VP_MIN_CONF_PERCENT;
-            });
+            llvm::erase_if(scalarSites, belowScalarThreshold);
+            const size_t dropped = totalScalar - scalarSites.size();
             ctx.scalarValueSites.assign(scalarSites.begin(), scalarSites.end());
             ctx.profileData = synthesizeProfileBuffer(refs, valueSites);
             // Consume: forget this function's collected values so a later
@@ -674,11 +584,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (!jitEngine_) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: no sync engine", cacheKey,
               funcName.c_str());
-#ifndef EJIT_FREESTANDING
-    if (logger_)
-      logger_->log(EJIT_ERR_NOT_ACTIVE, "Sync engine not initialized", funcName,
-                   std::to_string(cacheKey));
-#endif
     return nullptr;
   }
 
@@ -688,11 +593,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     jitEngine_->setActiveContext(nullptr);
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: load bitcode module failed",
               cacheKey, funcName.c_str());
-#ifndef EJIT_FREESTANDING
-    if (logger_)
-      logger_->log(EJIT_ERR_COMPILE_FAILED, "Failed to load bitcode module",
-                   funcName, std::to_string(cacheKey));
-#endif
     consumeError(std::move(Err));
     return nullptr;
   }
@@ -703,12 +603,6 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (!addrOrErr) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: lookup after compile failed",
               cacheKey, funcName.c_str());
-#ifndef EJIT_FREESTANDING
-    if (logger_)
-      logger_->log(EJIT_ERR_COMPILE_FAILED,
-                   "Failed to look up compiled function", funcName,
-                   std::to_string(cacheKey));
-#endif
     consumeError(addrOrErr.takeError());
     return nullptr;
   }
@@ -824,9 +718,14 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   return funcPtr;
 }
 
-#ifdef EJIT_SRE_TASKPOOL
 void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
-  // PGO tier rides in req.funcIndex's top 2 bits (EJitSreQueue.h). Strip it to
+  if (!EJitSharedTaskPool::validCompileRequest(req))
+    return nullptr;
+  return compileNowValidated(req);
+}
+
+void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req) {
+  // PGO tier rides in req.funcIndex's top 2 bits (EJitTaskPoolTypes.h). Strip it to
   // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
   // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
   // EJIT_ONLINE_PGO.md §2). tier is passed to compileCold, gated by enablePgo.
@@ -835,34 +734,14 @@ void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
 
   EJIT_DIAG("compileNow begin func=%u dims=%u tier=%u", funcIdx, req.numDims,
             tier);
-  if (req.numDims > 4) {
-    EJIT_DIAG("compileNow reject func=%u: numDims=%u > 4", funcIdx,
-              req.numDims);
-    return nullptr;
-  }
-
-  // Validate the request: instanceIds must be encodable in the legacy 8-bit
-  // cacheKey slots, and no two dims may share a dimType (a duplicated lifecycle
-  // dimension).
-  uint32_t seenDimTypes[4] = {};
-  uint32_t seenCount = 0;
-
+  // Duplicate lifecycle dimensions cannot be packed into the cache key.
   for (uint32_t i = 0; i < req.numDims; ++i) {
-    if (req.dims[i].instanceId > 255u) {
-      EJIT_DIAG("compileNow reject func=%u: instanceId=%u > 255 (dim[%u])",
-                funcIdx, req.dims[i].instanceId, i);
-      return nullptr;
-    }
-
-    for (uint32_t j = 0; j < seenCount; ++j)
-      if (seenDimTypes[j] == req.dims[i].dimType) {
+    for (uint32_t j = 0; j < i; ++j)
+      if (req.dims[j].dimType == req.dims[i].dimType) {
         EJIT_DIAG("compileNow reject func=%u: duplicate dimType=%u (dim[%u])",
                   funcIdx, req.dims[i].dimType, i);
         return nullptr;
       }
-
-    assert(seenCount < 4 && "seenDimTypes overflow: numDims guard broken");
-    seenDimTypes[seenCount++] = req.dims[i].dimType;
   }
 
   // meta.dimTypes[i] is the explicit dimType slot the loader read back BY NAME
@@ -911,7 +790,7 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
     if (published && hasPendingTier1MayConstKey_) {
       auto It = tier1MayConst_.find(pendingTier1MayConstKey_);
       if (It != tier1MayConst_.end())
-        It->second.sampleStart = ejit_taskpool_trace_now();
+        It->second.sampleStart = auditClockNow();
     }
     pendingTier1MayConstKey_ = 0;
     hasPendingTier1MayConstKey_ = false;
@@ -928,4 +807,3 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
   (void)published;
 #endif
 }
-#endif

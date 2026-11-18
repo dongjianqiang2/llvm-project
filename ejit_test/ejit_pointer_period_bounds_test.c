@@ -21,16 +21,12 @@ ejit_entry unsigned probe_bounded(ejit_period_arr_ind(cell) unsigned char cell,
 }
 
 static int wait_for_compilation(void) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   for (unsigned attempt = 0; attempt < 5000; ++attempt) {
     if (!ejit_taskpool_pending_count())
       return 1;
     usleep(1000);
   }
   return 0;
-#else
-  return 1;
-#endif
 }
 
 int main(void) {
@@ -74,17 +70,11 @@ int main(void) {
     for (unsigned slot = 0; slot < 10; ++slot)
       if (bounded_cells[cell].slots[slot].live != (slot ? 2 : 3))
         return 1;
-#ifdef EJIT_SRE_TASKPOOL
   ejit_taskpool_stats_t stats;
   memset(&stats, 0, sizeof(stats));
   ejit_taskpool_get_stats(&stats);
   // Ready entries are measured directly, even with EJIT_STATS_ENABLE=OFF.
   if (stats.readyEntries < 2) {
-#else
-  ejit_stats_t stats;
-  ejit_get_stats(&stats);
-  if (!stats.entryCount) {
-#endif
     printf("FAIL: no specialization compiled\n");
     return 1;
   }

@@ -19,7 +19,7 @@
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 
-_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 56 &&
+_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 24 &&
                    sizeof(ejit_taskpool_stats_t) == 88,
                "Use the matching 64-bit spec5 runtime header");
 extern void SRE_printf(const char *, ...);
@@ -346,7 +346,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = cfg.forceStaticRegistry = true;
+  cfg.forceStaticRegistry = true;
   if (ejit_init_pgo(&cfg) != EJIT_OK)
     return pp_fail("online PGO init failed");
   if (ejit_taskpool_get_worker_core() != 6u)
