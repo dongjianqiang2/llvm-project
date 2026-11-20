@@ -41,6 +41,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
+#include "llvm/ExecutionEngine/EJIT/EJitGlobalValueReads.h"
 #include "llvm/Support/Path.h"
 #include <cctype>
 
@@ -48,6 +49,7 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 extern cl::opt<bool> EnableEJitGlobalCtors;
+extern cl::opt<bool> EJitFinalVersionMerge;
 extern cl::opt<std::string> EJitDumpBitcodeDir;
 extern cl::opt<bool> EJitWarnNoSpecialization;
 extern cl::opt<bool> EJitWarnUnusedDim;
@@ -793,11 +795,59 @@ runSpecializationDiagnostic(Module &Extracted,
   }
 }
 
+struct FinalDataBinding {
+  GlobalVariable *Object;
+  std::string Key;
+};
+
+// Make the independent tiers and every later merged generation use the same
+// AOT object. Only the extracting compiler knows which TU owns a local name.
+static void bindFinalData(Module &Host, Module &Clone,
+                          const SetVector<GlobalVariable *> &Globals,
+                          SmallVectorImpl<FinalDataBinding> &Bindings) {
+  SmallPtrSet<const GlobalObject *, 8> Aliased;
+  for (const GlobalAlias &A : Host.aliases())
+    Aliased.insert(A.getAliaseeObject());
+  for (GlobalVariable *G : Globals) {
+    if (G->isDeclaration() || G->isThreadLocal() ||
+        G->getAddressSpace() || G->hasComdat() || Aliased.contains(G) ||
+        !G->hasName() || G->getName().starts_with("llvm.") ||
+        (!G->hasLocalLinkage() && !G->hasExternalLinkage()))
+      continue;
+    // Ordinary public writable globals and EJIT period objects already have
+    // their own binding path. Unannotated private writable objects, unlike
+    // public symbols, must not be looked up by an unqualified C name.
+    if (!G->isConstant() &&
+        (!G->hasLocalLinkage() || G->hasMetadata(MD_EJIT_METADATA)))
+      continue;
+    if (G->isConstant() && G->hasLocalLinkage() &&
+        (G->hasGlobalUnnamedAddr() || isValueOnlyFinalTable(*G)))
+      continue;
+    std::string Key = G->hasLocalLinkage()
+                          ? "__ejit_final_data." +
+                                ejitStaticHelperKey(Host.getName(), G->getName())
+                          : G->getName().str();
+    GlobalVariable *Copy = Clone.getGlobalVariable(G->getName(), true);
+    if (!Copy || (G->hasLocalLinkage() &&
+                  (Host.getNamedValue(Key) ||
+                   Host.getNamedValue(Key + ".regkey"))))
+      continue;
+    Copy->setInitializer(nullptr);
+    Copy->setLinkage(GlobalValue::ExternalLinkage);
+    Copy->setVisibility(GlobalValue::DefaultVisibility);
+    Copy->setDSOLocal(false);
+    Copy->setSection("");
+    Copy->setName(Key);
+    Bindings.push_back({G, std::move(Key)});
+  }
+}
+
 static std::string extractAndSerialize(Module &M,
     const SetVector<Function *> &Funcs,
     const SetVector<GlobalVariable *> &Globals,
     const SmallVectorImpl<Function *> &EntryFuncs,
-    const SetVector<Function *> &ToExternalize) {
+    const SetVector<Function *> &ToExternalize,
+    SmallVectorImpl<FinalDataBinding> &Bindings) {
 
   auto Extracted = CloneModule(M);
 
@@ -841,6 +891,9 @@ static std::string extractAndSerialize(Module &M,
     GV->replaceAllUsesWith(UndefValue::get(GV->getType()));
     GV->eraseFromParent();
   }
+
+  if (EJitFinalVersionMerge)
+    bindFinalData(M, *Extracted, Globals, Bindings);
 
   // Pre-optimize the extracted bitcode to reduce JIT compilation pressure.
   // InstCombine + Mem2Reg + SimplifyCFG folds constant chains, promotes
@@ -967,7 +1020,7 @@ static void generateSymbolRegisters(
     const SetVector<Function *> &ClosureFuncs,
     const SetVector<GlobalVariable *> &ClosureGlobals,
     const SetVector<Function *> &ToExternalize,
-    Function *AutoReg) {
+    Function *AutoReg, ArrayRef<FinalDataBinding> Bindings) {
   LLVMContext &Ctx = M.getContext();
   const DataLayout &DL = M.getDataLayout();
   auto *VoidTy = Type::getVoidTy(Ctx);
@@ -977,6 +1030,9 @@ static void generateSymbolRegisters(
       FunctionType::get(VoidTy, {PtrTy, PtrTy}, false));
 
   std::set<std::string> registered;
+  // The qualified records below replace the original bare-name registrations.
+  for (const FinalDataBinding &B : Bindings)
+    registered.insert(B.Object->getName().str());
 
   auto isPeriodVar = [&](GlobalVariable &GV) -> bool {
     return GV.hasMetadata(MD_EJIT_METADATA);
@@ -1127,13 +1183,15 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
                       const SetVector<GlobalVariable *> &ClosureGlobals,
                       const SetVector<Function *> &ToExternalize,
-                      GlobalVariable *BitcodeGV);
+                      GlobalVariable *BitcodeGV,
+                      ArrayRef<FinalDataBinding> Bindings);
 
 static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
                                  const SmallVectorImpl<Function *> &EntryFuncs,
                                  const SetVector<Function *> &ClosureFuncs,
                                  const SetVector<GlobalVariable *> &ClosureGlobals,
-                                 const SetVector<Function *> &ToExternalize) {
+                                 const SetVector<Function *> &ToExternalize,
+                                 ArrayRef<FinalDataBinding> Bindings) {
   LLVMContext &Ctx = M.getContext();
   auto *VoidTy = Type::getVoidTy(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -1167,14 +1225,14 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
   // Auto-register external symbols referenced by the closure so the JIT
   // can resolve them without manual ejit_register_symbol calls.
   generateSymbolRegisters(M, EntryFuncs, ClosureFuncs, ClosureGlobals,
-                          ToExternalize, AutoReg);
+                          ToExternalize, AutoReg, Bindings);
 
   if (EnableEJitGlobalCtors)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Always build the static registry table for bare-metal / testing fallback.
   generateRegistryTable(M, EntryFuncs, ClosureFuncs, ClosureGlobals,
-                        ToExternalize, BitcodeGV);
+                        ToExternalize, BitcodeGV, Bindings);
 }
 
 /// Emit this translation unit's bitcode registry entries as a private array in
@@ -1187,7 +1245,8 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
                       const SetVector<Function *> &ClosureFuncs,
                       const SetVector<GlobalVariable *> &ClosureGlobals,
                       const SetVector<Function *> &ToExternalize,
-                      GlobalVariable *BitcodeGV) {
+                      GlobalVariable *BitcodeGV,
+                      ArrayRef<FinalDataBinding> Bindings) {
   LLVMContext &Ctx = M.getContext();
   auto *I32Ty = Type::getInt32Ty(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -1198,6 +1257,26 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
       Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
 
   SmallVector<Constant *, 16> Entries;
+
+  // Emit exactly the same name/address pair for ctor and section registration.
+  // A strong hidden key for a local object makes a TU-key collision a link
+  // error rather than resolving a private object from the wrong TU.
+  IRBuilder<> Reg(M.getFunction(FN_AUTO_REGISTER)->getEntryBlock().getTerminator());
+  for (const auto &Binding : Bindings) {
+    auto *Bytes = ConstantDataArray::getString(Ctx, Binding.Key);
+    bool Local = Binding.Object->hasLocalLinkage();
+    auto *Key = new GlobalVariable(
+        M, Bytes->getType(), true,
+        Local ? GlobalValue::ExternalLinkage : GlobalValue::PrivateLinkage,
+        Bytes, Local ? Binding.Key + ".regkey" : ".ejit.str.");
+    if (Local)
+      Key->setVisibility(GlobalValue::HiddenVisibility);
+    Reg.CreateCall(M.getFunction(FN_REGISTER_SYMBOL), {Key, Binding.Object});
+    Entries.push_back(ConstantStruct::get(
+        EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_SYMBOL), Key,
+                  ConstantPointerNull::get(PtrTy), Binding.Object,
+                  ConstantInt::get(I64Ty, 0)}));
+  }
 
   // Bitcode entries — use CreateGlobalStringPtr to avoid name clashes
   // with existing functions in the module.
@@ -1269,6 +1348,8 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   // rootGlobal so registration matches what collectReferencedGlobals kept in
   // the extracted bitcode.
   SmallPtrSet<const GlobalVariable *, 4> GVsDone;
+  for (const FinalDataBinding &B : Bindings)
+    GVsDone.insert(B.Object);
   const DataLayout &DL = M.getDataLayout();
   for (Function *F : ClosureFuncs) {
     for (const BasicBlock &BB : *F) {
@@ -1389,12 +1470,13 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
         F->getInstructionCount() >= EJitExternalizeMinInsts)
       ToExternalize.insert(F);
 
+  SmallVector<FinalDataBinding, 4> Bindings;
   std::string Bitcode =
       extractAndSerialize(M, ClosureFuncs, ClosureGlobals, EntryFuncs,
-                          ToExternalize);
+                          ToExternalize, Bindings);
   GlobalVariable *BitcodeGV = embedBitcode(M, Bitcode);
   generateRegisterCall(M, BitcodeGV, EntryFuncs, ClosureFuncs, ClosureGlobals,
-                       ToExternalize);
+                       ToExternalize, Bindings);
 
   return PreservedAnalyses::none();
 }

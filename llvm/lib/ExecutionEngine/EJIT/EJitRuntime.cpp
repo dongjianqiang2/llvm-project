@@ -357,6 +357,8 @@ static_assert(sizeof(ejit_config_t) ==
 static_assert(std::is_standard_layout<ejit_config_t>::value,
               "ejit_config_t must be standard-layout for a stable C ABI");
 
+static bool gFinalVersionMergeEnabled = false;
+
 // Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
 // the online-PGO auto-trigger on regardless of the (unversioned) config.
 static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
@@ -367,6 +369,7 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 
   Config cfg;
   parseConfig(config, cfg);
+  cfg.enableFinalVersionMerge = gFinalVersionMergeEnabled;
 #if defined(EJIT_SRE_SHARED_TASKPOOL) &&                                  \
     defined(EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
   // Fixed-worker deployments may skip EJIT constructors on producer cores.
@@ -410,6 +413,14 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 }
 
 extern "C" {
+
+ejit_status_t ejit_set_final_version_merge(int enabled) {
+  if (gEJIT)
+    return gFinalVersionMergeEnabled == (enabled != 0) ? EJIT_OK
+                                                      : EJIT_ERR_INVALID_PARAM;
+  gFinalVersionMergeEnabled = enabled != 0;
+  return EJIT_OK;
+}
 
 ejit_status_t ejit_init(const ejit_config_t *config) {
   return ejitInitImpl(config, /*forcePgo=*/false);

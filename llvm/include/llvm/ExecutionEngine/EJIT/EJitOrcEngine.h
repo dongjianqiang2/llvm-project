@@ -13,6 +13,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSwitchCase.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #endif
@@ -43,6 +44,8 @@ class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
 struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
+struct EJitFinalReplay;
+struct EJitFinalReplayCursor;
 enum class CompileTier : uint8_t;
 
 namespace detail {
@@ -116,6 +119,15 @@ struct SpecializationContext {
   /// site (min samples + confidence thresholds applied by the driver). Empty
   /// for Baseline/Instrumented and when value profiling is not built.
   std::vector<PgoScalarSite> scalarValueSites;
+  /// Tier-2 only: Tier-1's switch-case arms, to rebuild as they were.
+  EJitSwitchCaseDecision switchCaseReplay;
+  /// Worker-owned outputs, valid only during this synchronous compilation.
+  std::string *finalMergeBitcode = nullptr;
+  SmallVector<unsigned, 2> *finalMergeDimensionArgs = nullptr;
+  /// Already optimized member bodies: never specialize/profile them again.
+  bool preparedFinalMerge = false;
+  EJitFinalReplay *captureFolds = nullptr;
+  EJitFinalReplayCursor *replayFolds = nullptr;
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
   /// the compile driver before the final compile starts.
@@ -150,6 +162,11 @@ public:
   /// Look up a compiled function symbol in the specialization JITDylib
   /// identified by cacheKey.
   Expected<void *> lookup(uint64_t cacheKey, const std::string &name);
+#ifdef EJIT_SWITCH_CASE
+  Expected<std::string> rebuildFinalMember(StringRef Source,
+                                           SpecializationContext &Ctx,
+                                           const EJitFinalReplay &Recipe);
+#endif
 
   /// Set the active specialization context (used during compilation).
   void setActiveContext(const SpecializationContext *ctx);
@@ -165,6 +182,9 @@ public:
   /// EJitOptimizer::getLastVpFunctions). Empty unless the Tier-1 compile ran
   /// with EJIT_SRE_PGO_VALUE_PROFILE.
   ArrayRef<EJitVpFunctionInfo> getLastVpFunctions() const;
+
+  /// Switch-case arms of the last compile (EJitOptimizer::getLastSwitchCase).
+  EJitSwitchCaseDecision getLastSwitchCase() const;
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   ArrayRef<EJitMayConstLoadSite> getLastMayConstLoadSites() const;

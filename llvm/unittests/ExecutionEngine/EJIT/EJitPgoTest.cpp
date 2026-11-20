@@ -185,6 +185,9 @@ static uint32_t applyStressArithmetic(uint32_t Value, uint32_t Func) {
 } // namespace
 
 TEST(EJitPgo, RealOrcTwentyFunctionWorkerThrottleKeepsHeartbeatAlive) {
+#ifndef EJIT_CODE_POOL_BATCHED_PUBLISH
+  GTEST_SKIP() << "requires deferred code publication, not immediate sealing";
+#endif
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
 

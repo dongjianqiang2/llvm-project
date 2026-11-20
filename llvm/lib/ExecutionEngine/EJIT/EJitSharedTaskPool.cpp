@@ -2464,7 +2464,7 @@ void EJitSharedTaskPool::cacheDropPending(const EJitCompileRequest &req,
 EJitPublishStatus
 EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  const EJitCompiledCodeInfo *info,
-                                 bool pgoClearExclusive) {
+                                 bool pgoClearExclusive, void *expectedFinal) {
   if (!fnPtr || req.numDims > 4)
     return EJitPublishStatus::InvalidParam;
   // Over-bound writable set: REJECT the publish outright (before touching any
@@ -2517,6 +2517,21 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     if (!evict && st == static_cast<uint32_t>(EJitSharedSlotState::Ready))
       evict = &Slot; // never evict a different pending batch identity
   }
+  if (expectedFinal &&
+      (!target || target->state.loadAcquire() !=
+                      static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+       target->tier.loadRelaxed() != kEJitTierPgoUse ||
+       target->fnPtr.loadAcquire() != reinterpret_cast<uintptr_t>(expectedFinal))) {
+    bucketWriteRelease(B);
+    return EJitPublishStatus::VersionMismatch;
+  }
+  if (expectedFinal)
+    for (uint32_t I = 0; I < req.numDims; ++I)
+      if (target->versions[I] != req.versions[I] ||
+          !isInstanceActive(req.dims[I].dimType, req.dims[I].instanceId)) {
+        bucketWriteRelease(B);
+        return EJitPublishStatus::VersionMismatch;
+      }
   if (!target)
     target = firstEmpty ? firstEmpty : evict; // bucket full → evict slot 0-ish.
   if (!target) {
@@ -2603,6 +2618,52 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
   if (releaseFn_ && oldFn && oldFn != fnPtr)
     releaseFn_(releaseCtx_, oldFn);
   return EJitPublishStatus::Published;
+}
+
+bool EJitSharedTaskPool::finalVersionCurrent(const EJitCompileRequest &Req,
+                                           void *Expected) {
+  if (!state_ || !isOwner_ || !Expected || Req.numDims > 2 ||
+      decodeReqTier(Req.funcIndex) != kEJitTierPgoUse ||
+      Req.generation != state_->generation.loadAcquire() || !versionsCurrent(Req))
+    return false;
+  const uint32_t F = stripReqTier(Req.funcIndex);
+  auto &B = state_->buckets[hashIdentity(F, Req.dims, Req.numDims) %
+                            kEJitSharedCacheBuckets];
+  bucketWrite(B);
+  bool Current = false;
+  for (auto &S : B.slots)
+    if (S.state.loadAcquire() == static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+        S.generation == Req.generation && slotIdentityMatches(S, F, Req.dims, Req.numDims) &&
+        S.tier.loadRelaxed() == kEJitTierPgoUse &&
+        S.fnPtr.loadAcquire() == reinterpret_cast<uintptr_t>(Expected)) {
+      Current = true;
+      for (uint32_t I = 0; I < Req.numDims; ++I)
+        Current &= S.versions[I] == Req.versions[I] &&
+                   isInstanceActive(Req.dims[I].dimType, Req.dims[I].instanceId);
+      break;
+    }
+  bucketWriteRelease(B);
+  return Current;
+}
+
+bool EJitSharedTaskPool::replaceFinalVersion(
+    const EJitCompileRequest &Req, void *Expected, void *Replacement,
+    const EJitCompiledCodeInfo &Info) {
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  if (!state_ || !isOwner_ || releaseFn_ ||
+      state_->icacheReleasersWired.loadAcquire() || !Info.codeSize ||
+      !Expected || !Replacement || decodeReqTier(Req.funcIndex) != kEJitTierPgoUse)
+    return false;
+  if (cachePublish(Req, Replacement, &Info, false, Expected) !=
+      EJitPublishStatus::Published)
+    return false;
+  // Drain after replacement. A fill racing the update either observes the new
+  // cache pointer or is rejected by the existing drain sequence protocol.
+  icacheDrainAll("final-version-merge");
+  return true;
+#else
+  return false;
+#endif
 }
 
 void EJitSharedTaskPool::releaseRead(uint32_t bucketIndex) {
@@ -4055,6 +4116,8 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
     if (serviceCodeBatchRequest())
       return EJitWorkerStep::Consumed;
     if (serviceMayConstRankingRequest())
+      return EJitWorkerStep::Consumed;
+    if (finalMergeService_ && finalMergeService_(finalMergeServiceCtx_))
       return EJitWorkerStep::Consumed;
     if (pollOne())
       return EJitWorkerStep::Consumed;
