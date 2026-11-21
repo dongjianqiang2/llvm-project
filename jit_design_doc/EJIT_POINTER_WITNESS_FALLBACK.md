@@ -10,7 +10,7 @@ Permit a marked load such as `p[slot % 5].flag` or
 unknown and cell is already specialized. Nonzero cells are included under the
 extended deployment contract approved on 2026-11-03.
 The slot must already be an `ejit_free_dim`, and the load/field must already
-carry the existing `may_const` authorization. The compiler evaluates the
+carry the existing `period_const` authorization. The compiler evaluates the
 address with the free dimension set to zero, reads that representative field,
 and replaces only the load's result. The argument, live payload accesses and
 stores keep their real slot values.
@@ -124,7 +124,7 @@ fallback. Rejection reasons include `witness-before-pointer-base`,
 `witness-extent-overflow`,
 `legacy-witness-missing-type`, `invalid-gep-witness`,
 `layout-or-field-unauthorized`, `strict-pointer-alias` and
-`ambiguous-lightweight-registration`. Existing may-const and branch audits stay
+`ambiguous-lightweight-registration`. Existing period-const and branch audits stay
 enabled. Successful optimization does not prove the deployment contract.
 
 Tests cover typed/nested and flattened `slot % 5 / % 10` accesses, including
@@ -204,5 +204,5 @@ load and metadata remain intact. This is not a BE runtime or board execution.
 In the positive final IR, the flag load disappears and the call becomes
 `repro_sink(1, slot, selected)`. The `urem`/GEP may remain because `selected`
 must still identify the real slot. A surviving `urem` alone is not evidence
-that may_const folding failed. Product sites still require their real
+that period_const folding failed. Product sites still require their real
 metadata and rejection reason to establish the same diagnosis.

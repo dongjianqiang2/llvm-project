@@ -1761,20 +1761,20 @@ def ExperimentalOption : DiagGroup<"experimental-option">;
 
 // Warnings related to EmbeddedJIT attributes
 
-// A function definition omits ejit_entry / ejit_period_lc even though a prior
+// A function definition omits ejit_entry / ejit_guard even though a prior
 // declaration carries the attribute. On by default; part of -Wembedded-jit.
 // Silenced individually by -Wno-embedded-jit-attr-missing-on-def.
 def EmbeddedJITAttrMissingOnDef : DiagGroup<"embedded-jit-attr-missing-on-def">;
 
 def EmbeddedJIT : DiagGroup<"embedded-jit", [EmbeddedJITAttrMissingOnDef]>;
 
-// Address-of ejit_may_const without const qualifier.
-// Off by default — enable with -Wembedded-jit-addr-of-may-const.
+// Address-of ejit_period_const without const qualifier.
+// Off by default — enable with -Wembedded-jit-addr-of-period-const.
 // Not part of -Wembedded-jit, so that flag won't enable it.
-def EmbeddedJITAddrOfMayConst : DiagGroup<"embedded-jit-addr-of-may-const">;
+def EmbeddedJITAddrOfPeriodConst : DiagGroup<"embedded-jit-addr-of-period-const">;
 
-// Function references ejit_period_arr without declaring the dependency
-// via ejit_period_arr_ind. Off by default — enable with
+// Function references an indexed ejit_group without declaring the dependency
+// via ejit_dim. Off by default — enable with
 // -Wembedded-jit-undeclared-period-dep.
 // Not part of -Wembedded-jit, so that flag won't enable it.
 def EmbeddedJITUndeclaredPeriodDep

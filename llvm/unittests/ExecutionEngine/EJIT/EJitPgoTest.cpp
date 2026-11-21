@@ -497,10 +497,10 @@ static std::unique_ptr<Module> makeFreeDimPgoModule(LLVMContext &Ctx) {
   auto *Cells =
       new GlobalVariable(*M, CellsTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(CellsTy), "g_free_cells");
-  Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+  Metadata *PeriodOps[] = {MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
                            MDString::get(Ctx, "cell"),
                            ConstantAsMetadata::get(ConstantInt::get(I32, 10))};
-  Metadata *FieldOps[] = {MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+  Metadata *FieldOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_CONST_FIELD),
                           ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
   Cells->setMetadata(MD_EJIT_METADATA,
                      MDNode::get(Ctx, {MDNode::get(Ctx, PeriodOps),
@@ -531,7 +531,7 @@ static std::unique_ptr<Module> makeFreeDimPgoModule(LLVMContext &Ctx) {
   Value *FrozenPtr = B.CreateStructGEP(CellTy, Elem, 0, "frozen.ptr");
   Value *DynamicPtr = B.CreateStructGEP(CellTy, Elem, 1, "dynamic.ptr");
   auto *Frozen = B.CreateLoad(I32, FrozenPtr, "frozen");
-  Frozen->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  Frozen->setMetadata(MD_EJIT_PERIOD_CONST, MDNode::get(Ctx, {}));
   Value *Dynamic = B.CreateLoad(I32, DynamicPtr, "dynamic");
   B.CreateStore(Live, DynamicPtr);
   Value *IsOdd =
@@ -546,7 +546,7 @@ static std::unique_ptr<Module> makeFreeDimPgoModule(LLVMContext &Ctx) {
   B.SetInsertPoint(Exit);
   B.CreateRet(B.CreateAdd(Frozen, Dynamic));
 
-  Metadata *DimOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+  Metadata *DimOps[] = {MDString::get(Ctx, TAG_EJIT_DIM),
                         MDString::get(Ctx, "cell"),
                         ConstantAsMetadata::get(ConstantInt::get(I32, 0))};
   Metadata *FreeOps[] = {MDString::get(Ctx, TAG_EJIT_FREE_DIM),
@@ -583,7 +583,7 @@ static bool dependsOnArgument(const Value *V, const Argument &Arg) {
 
 // Production-shape regression: the same original module goes through Tier-1
 // PGO Gen and Tier-2 PGO Use. The retained cell is the only specialization
-// identity; the free slot authorizes a witness only for the may_const load.
+// identity; the free slot authorizes a witness only for the period_const load.
 // Dynamic memory, stores, and live call operands must still use the real slot.
 TEST(EJitPgo, FreeDimFoldsOnlyAuthorizedLoadAcrossGenUse) {
   LLVMContext Ctx;
@@ -648,7 +648,7 @@ TEST(EJitPgo, FreeDimFoldsOnlyAuthorizedLoadAcrossGenUse) {
     for (Instruction &I : BB) {
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
         ++Loads;
-        EXPECT_FALSE(LI->hasMetadata(MD_EJIT_MAY_CONST));
+        EXPECT_FALSE(LI->hasMetadata(MD_EJIT_PERIOD_CONST));
         EXPECT_TRUE(dependsOnArgument(LI->getPointerOperand(), Slot))
             << "the remaining dynamic load lost the live slot";
       }

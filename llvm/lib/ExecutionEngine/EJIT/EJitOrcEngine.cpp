@@ -985,8 +985,8 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
                 JITSymbolFlags::Exported;
           }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-          if (!engine->P->optimizer->getLastMayConstLoadSites().empty())
-            symFlags[engine->P->J->mangleAndIntern("__ejit_mayconst_hits")] =
+          if (!engine->P->optimizer->getLastPeriodConstLoadSites().empty())
+            symFlags[engine->P->J->mangleAndIntern("__ejit_period_const_hits")] =
                 JITSymbolFlags::Exported;
 #endif
           if (!symFlags.empty())
@@ -1283,15 +1283,15 @@ ArrayRef<EJitVpFunctionInfo> EJitOrcEngine::getLastVpFunctions() const {
 }
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-ArrayRef<EJitMayConstLoadSite> EJitOrcEngine::getLastMayConstLoadSites() const {
+ArrayRef<EJitPeriodConstLoadSite> EJitOrcEngine::getLastPeriodConstLoadSites() const {
   if (P->optimizer)
-    return P->optimizer->getLastMayConstLoadSites();
+    return P->optimizer->getLastPeriodConstLoadSites();
   return {};
 }
 #endif
 
-bool EJitOrcEngine::printMayConstRanking() const {
-  return P->optimizer && P->optimizer->printMayConstRanking();
+bool EJitOrcEngine::printPeriodConstRanking() const {
+  return P->optimizer && P->optimizer->printPeriodConstRanking();
 }
 
 void EJitOrcEngine::addUserSymbol(const std::string &name, void *addr) {

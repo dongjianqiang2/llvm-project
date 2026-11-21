@@ -7,7 +7,7 @@
 //   Stage 2: cross the trigger and wait for the owner worker to publish Tier-2.
 //   Stage 3: Tier-2 steady state (also exercises -ejit-inline-cache).
 //
-// The workload retains a strongly biased data-dependent branch after may_const
+// The workload retains a strongly biased data-dependent branch after period_const
 // specialization. Tier-1 records its real edge counts; Tier-2 can feed them to
 // MachineBlockPlacement. Even when the baseline layout is already favorable,
 // Tier-2 removes Tier-1 instrumentation, so Stage 3 should normally improve
@@ -72,13 +72,13 @@ extern uint8_t g_ucLocalCoreID;
 #endif
 
 struct PgoBenchCfg {
-  ejit_may_const uint32_t mode;
-  ejit_may_const uint32_t multiplier;
+  EJIT_PERIOD_CONST uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t multiplier;
   uint32_t cutoff;
   uint32_t salt;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
+EJIT_SHARED_SECTION_ATTR ejit_group(cell)
 struct PgoBenchCfg g_pgo_bench_cfg[1];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_bench_samples[SAMPLE_COUNT];
 EJIT_SHARED_SECTION_ATTR volatile uint64_t g_pgo_bench_sink;
@@ -127,7 +127,7 @@ __attribute__((noinline)) static uint32_t pgo_layout_aot(uint8_t cell,
 }
 
 ejit_entry __attribute__((noinline)) uint32_t
-pgo_layout_bench(ejit_period_arr_ind(cell) uint8_t cell, uint32_t seed) {
+pgo_layout_bench(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_BENCH_BODY(cell, seed);
 }
 

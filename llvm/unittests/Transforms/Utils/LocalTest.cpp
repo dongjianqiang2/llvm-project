@@ -28,12 +28,12 @@
 
 using namespace llvm;
 
-TEST(Local, CombineEJitMayConstMetadata) {
+TEST(Local, CombineEJitPeriodConstMetadata) {
   for (unsigned Mode = 0; Mode != 3; ++Mode)
     for (unsigned Case = 0; Case != 15; ++Case) {
       SCOPED_TRACE(::testing::Message() << "mode=" << Mode << " case=" << Case);
       LLVMContext C;
-      Module M("may-const-merge", C);
+      Module M("period-const-merge", C);
       IRBuilder<> B(C);
       auto *F = Function::Create(
           FunctionType::get(B.getVoidTy(), {B.getPtrTy(), B.getPtrTy(1)},
@@ -65,12 +65,12 @@ TEST(Local, CombineEJitMayConstMetadata) {
       auto *Empty = MDNode::get(C, {});
       auto *Payload = MDNode::get(C, MDString::get(C, "not-a-marker"));
       if (Case != 2 && Case != 3)
-        K->setMetadata("ejit.may_const", Case == 12 ? Payload : Empty);
+        K->setMetadata("ejit.period_const", Case == 12 ? Payload : Empty);
       if (Case != 1 && Case != 3)
-        J->setMetadata("ejit.may_const", Case == 13 ? Payload : Empty);
-      K->setMetadata("ejit.mayconst.audit.site",
+        J->setMetadata("ejit.period_const", Case == 13 ? Payload : Empty);
+      K->setMetadata("ejit.period_const.audit.site",
                      MDNode::get(C, ConstantAsMetadata::get(B.getInt64(1))));
-      J->setMetadata("ejit.mayconst.audit.site",
+      J->setMetadata("ejit.period_const.audit.site",
                      MDNode::get(C, ConstantAsMetadata::get(B.getInt64(2))));
       K->setMetadata("unknown.test", Empty);
       J->setMetadata("unknown.test", Empty);
@@ -81,9 +81,9 @@ TEST(Local, CombineEJitMayConstMetadata) {
         combineAAMetadata(K, J);
       else
         combineMetadataForCSE(K, J, Mode == 1);
-      EXPECT_EQ(K->hasMetadata("ejit.may_const"), Case == 0 || Case == 14);
+      EXPECT_EQ(K->hasMetadata("ejit.period_const"), Case == 0 || Case == 14);
       // Site IDs describe individual loads, not the new merged instruction.
-      EXPECT_FALSE(K->hasMetadata("ejit.mayconst.audit.site"));
+      EXPECT_FALSE(K->hasMetadata("ejit.period_const.audit.site"));
       EXPECT_FALSE(K->hasMetadata("unknown.test"));
       EXPECT_FALSE(verifyModule(M, &errs()));
     }

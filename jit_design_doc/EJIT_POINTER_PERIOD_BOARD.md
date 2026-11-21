@@ -95,7 +95,7 @@ Final acceptance also requires worker evidence: initialized `pgo=1`, six
 real `root_entries=64` audits, published IR with `function_entry_count=64`
 and PGO profile metadata. The final three entries should have no remaining
 marked mode/weight loads; slot-dependent payload loads must remain. In the
-bound-loop audit, expect `mayconst=2/1/0`: one load is removed specifically by
+bound-loop audit, expect `period_const=2/1/0`: one load is removed specifically by
 the later optimization pipeline. Functional success alone can still be AOT.
 
 The compiler can warn that the dynamic AOT loop could not fully unroll, and

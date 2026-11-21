@@ -13484,32 +13484,29 @@ def err_amdgcn_load_lds_size_invalid_value : Error<"invalid size value">;
 def note_amdgcn_load_lds_size_valid_value : Note<"size must be %select{1, 2, or 4|1, 2, 4, 12 or 16}0">;
 
 // EmbeddedJIT diagnostics
-def err_ejit_period_conflict : Error<
-  "variable %0 cannot have multiple ejit_period or ejit_period_arr attributes">;
-def err_ejit_period_not_array : Error<
-  "ejit_period attribute cannot be used on array variable %0; "
-  "use ejit_period_arr for arrays">;
-def err_ejit_period_arr_not_scalar : Error<
-  "ejit_period_arr attribute requires an array type; "
-  "%0 is not an array">;
-def err_ejit_period_arr_too_large : Error<
-  "ejit_period_arr array %0 has size %1, which exceeds the maximum of 100">;
-def err_ejit_period_arr_ind_invalid_type : Error<
-  "ejit_period_arr_ind parameter %0 must have integer type">;
-def err_ejit_period_arr_ind_too_many : Error<
-  "function %0 has %1 ejit_period_arr_ind parameters, "
+def err_ejit_group_conflict : Error<
+  "variable %0 cannot have multiple ejit_group attributes">;
+def err_ejit_group_indexed_invalid_type : Error<
+  "ejit_group attribute requires an array type or a "
+  "pointer to a struct; %0 does not qualify">;
+def err_ejit_group_indexed_too_large : Error<
+  "period group array %0 has size %1, which exceeds the maximum of 100">;
+def err_ejit_dim_invalid_type : Error<
+  "ejit_dim parameter %0 must have integer type">;
+def err_ejit_dim_too_many : Error<
+  "function %0 has %1 ejit_dim parameters, "
   "which exceeds the maximum of 4">;
 def err_ejit_free_dim_local : Error<
   "ejit_free_dim local %0 requires %1">;
 def err_ejit_free_dim_invalid_type : Error<
   "ejit_free_dim parameter %0 must have integer type">;
 def err_ejit_free_dim_kind_conflict : Error<
-  "parameter %0 cannot be both ejit_free_dim and ejit_period_arr_ind">;
+  "parameter %0 cannot be both ejit_free_dim and ejit_dim">;
 def err_ejit_free_dim_not_entry : Error<
   "ejit_free_dim parameter %0 requires function %1 to be ejit_entry">;
 def warn_ejit_free_dim_no_dimension : Warning<
-  "ejit_entry function %0 has no ejit_period_arr_ind parameter; "
-  "ejit_may_const values frozen through ejit_free_dim parameter %1 can "
+  "ejit_entry function %0 has no ejit_dim parameter; "
+  "ejit_period_const values frozen through ejit_free_dim parameter %1 can "
   "never be invalidated">,
   InGroup<EmbeddedJIT>;
 def err_ejit_bound_ptr_invalid_type : Error<
@@ -13518,26 +13515,26 @@ def err_ejit_bound_ptr_duplicate
     : Error<"ejit_bound_ptr parameter %0 must have exactly one binding">;
 def err_ejit_bound_ptr_missing_dim : Error<
   "ejit_bound_ptr(%0) requires exactly one matching "
-  "ejit_period_arr_ind(%0) parameter">;
+  "ejit_dim(%0) parameter">;
 def err_ejit_bound_ptr_too_many : Error<"function %0 has %1 ejit_bound_ptr "
                                         "parameters; at most 8 are supported">;
 def err_ejit_entry_recursive : Error<
   "ejit_entry function %0 cannot be recursive">;
-def err_ejit_period_lc_no_index : Error<
-  "ejit_period_lc(%0) requires a corresponding ejit_period_arr_ind(%0) parameter">;
+def err_ejit_guard_no_index : Error<
+  "ejit_guard(%0) requires a corresponding ejit_dim(%0) parameter">;
 def err_ejit_entry_lc_conflict : Error<
-  "'ejit_entry' and 'ejit_period_lc' cannot be combined on function %0">;
-def warn_ejit_may_const_modified_without_lc : Warning<
-  "modifying ejit_may_const field %0 of %1 without ejit_period_lc attribute">,
+  "'ejit_entry' and 'ejit_guard' cannot be combined on function %0">;
+def warn_ejit_period_const_modified_without_guard : Warning<
+  "modifying ejit_period_const field %0 of %1 without ejit_guard attribute">,
   InGroup<EmbeddedJIT>;
-def warn_ejit_may_const_addr_without_const : Warning<
-  "taking address of ejit_may_const field %0 of %1 without const qualifier; "
+def warn_ejit_period_const_addr_without_const : Warning<
+  "taking address of ejit_period_const field %0 of %1 without const qualifier; "
   "a non-const pointer allows the field to be written outside "
-  "ejit_period_lc, breaking the JIT's time-window constancy assumption">,
-  InGroup<EmbeddedJITAddrOfMayConst>, DefaultIgnore;
+  "ejit_guard, breaking the JIT's time-window constancy assumption">,
+  InGroup<EmbeddedJITAddrOfPeriodConst>, DefaultIgnore;
 def warn_ejit_undeclared_period_dep : Warning<
-  "function %0 references ejit_period_arr '%1' but does not declare "
-  "a dependency on it via ejit_period_arr_ind">,
+  "function %0 references ejit_group '%1' but does not declare "
+  "a dependency on it via ejit_dim">,
   InGroup<EmbeddedJITUndeclaredPeriodDep>, DefaultIgnore;
 def warn_ejit_always_inline_conflict : Warning<
   "'always_inline' is incompatible with %0, which must remain "
@@ -13550,8 +13547,8 @@ def warn_ejit_attr_missing_on_definition : Warning<
   InGroup<EmbeddedJITAttrMissingOnDef>;
 def note_ejit_attr_declared_here : Note<
   "'%0' declared here">;
-def note_ejit_period_arr_defined_here : Note<
-  "ejit_period_arr '%0' defined here">;
+def note_ejit_group_defined_here : Note<
+  "period group '%0' defined here">;
 def note_ejit_entry_defined_here : Note<
   "ejit_entry function %0 defined here">;
 } // end of sema component.

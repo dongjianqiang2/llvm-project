@@ -40,4 +40,4 @@ entry:
 declare void @extern_decl()
 
 !0 = distinct !{!{!"ejit_entry"}}
-!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}

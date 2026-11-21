@@ -36,20 +36,20 @@
 //===-- 结构体与全局变量 ---------------------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
-  ejit_may_const uint32_t cellId;
+  EJIT_PERIOD_CONST uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellId;
   uint32_t trafficLoad;
 };
 
 #define N_CELL 16
-ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
+ejit_group(cell) struct CellCfg g_cellCfg[N_CELL];
 
 //===-- ejit_entry 函数 (均使用 __builtin_expect) -------------------------===//
 
 // 1. 短路 && — bug 最小复现: merge block 的 PHI incoming 含入口块
 ejit_entry
 uint32_t likely_and(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   if (MC_LIKELY(ct == 0xFD && g_cellCfg[cellIdx].cellId < 1000))
@@ -60,7 +60,7 @@ uint32_t likely_and(
 // 2. 短路 || — 同样产生 merge PHI
 ejit_entry
 uint32_t likely_or(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   if (MC_LIKELY(ct == 0xFD || ct == 0xEC))
@@ -71,7 +71,7 @@ uint32_t likely_or(
 // 3. MC_UNLIKELY — expect 的第二参数为 0
 ejit_entry
 uint32_t unlikely_branch(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
   if (MC_UNLIKELY(g_cellCfg[cellIdx].cellType == 0xFF))
     return 3000;
@@ -81,10 +81,10 @@ uint32_t unlikely_branch(
 // 4. 循环条件使用 MC_LIKELY
 ejit_entry
 uint32_t likely_loop(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
   uint32_t s = 0;
-  uint32_t bound = g_cellCfg[cellIdx].cellId;   // may_const, JIT 时常量化
+  uint32_t bound = g_cellCfg[cellIdx].cellId;   // period_const, JIT 时常量化
   for (uint32_t i = 0; MC_LIKELY(i < bound); i++)
     s += 1;
   return s;
@@ -93,7 +93,7 @@ uint32_t likely_loop(
 // 5. 嵌套 MC_LIKELY — 多层短路
 ejit_entry
 uint32_t likely_nested(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   uint32_t id = g_cellCfg[cellIdx].cellId;

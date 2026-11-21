@@ -23,5 +23,5 @@ entry:
 
 !0 = distinct !{!1, !2, !3}
 !1 = !{!"ejit_entry"}
-!2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+!2 = !{!"ejit_dim", !"cell", i32 0}
 !3 = !{!"ejit_free_dim", !"", i32 1}

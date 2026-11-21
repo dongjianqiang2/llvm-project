@@ -1,6 +1,6 @@
 // RUN: %clang_cc1 -O1 -mllvm -enable-ejit-aot=false -emit-llvm -o - %s | FileCheck %s
 //
-// CodeGen must mark ejit_entry and ejit_period_lc noinline so they survive
+// CodeGen must mark ejit_entry and ejit_guard noinline so they survive
 // the LTO inliner for PASS1 (bitcode), PASS3 (wrapper) and PASS4 (lifecycle).
 // AOT passes are disabled (-enable-ejit-aot=false) so the attribute is
 // attributable to CodeGen alone - PASS3 would otherwise also add noinline to
@@ -8,16 +8,16 @@
 // noinline at -O1.
 
 struct Cfg { int t; };
-__attribute__((ejit_period_arr("cell"))) struct Cfg g_cell[16];
+__attribute__((ejit_group("cell"))) struct Cfg g_cell[16];
 extern void sink(int);
 
 __attribute__((ejit_entry))
-void entry(__attribute__((ejit_period_arr_ind("cell"))) int i) {
+void entry(__attribute__((ejit_dim("cell"))) int i) {
   sink(g_cell[i].t);
 }
 
-__attribute__((ejit_period_lc("cell")))
-void lc(__attribute__((ejit_period_arr_ind("cell"))) int i) {
+__attribute__((ejit_guard("cell")))
+void lc(__attribute__((ejit_dim("cell"))) int i) {
   g_cell[i].t = 1;
 }
 

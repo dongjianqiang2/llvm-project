@@ -2,11 +2,11 @@
 
 Status: implementation specification, first increment.
 Baseline: `ejit_dev_spec5` at `700234661017`, including PR249.
-Related design discussion: PR251, `ejit_mayconst_fix_plan.md`.
+Related design discussion: PR251, `ejit_period_const_fix_plan.md`.
 
 ## 1. Goal and boundaries
 
-Fold authorized `may_const` loads through pointer-valued period globals using
+Fold authorized `period_const` loads through pointer-valued period globals using
 PR249's existing allocation bounds, compiler layout and lifecycle contracts.
 Keep the original slot argument, stores, calls and unmarked loads dynamic.
 Do not create a specialization per slot and do not replace the slot parameter

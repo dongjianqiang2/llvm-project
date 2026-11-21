@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-period-handler -S %s | FileCheck %s
+; RUN: opt -passes=ejit-guard-handler -S %s | FileCheck %s
 
 ; Test: Period handler with multiple return statements.
 ; Verify deactivate at entry, activate before EVERY return (same order for multi-lc).
@@ -73,7 +73,7 @@ entry:
 @cells = global [10 x i32] zeroinitializer, !ejit.metadata !10
 @trps = global [10 x i32] zeroinitializer, !ejit.metadata !11
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 10}}
-!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 10}}
-!30 = distinct !{!{!"ejit_period_lc", !"cell"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!40 = distinct !{!{!"ejit_period_lc", !"cell"}, !{!"ejit_period_lc", !"trp"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 10}}
+!11 = distinct !{!{!"ejit_group_indexed", !"trp", i32 10}}
+!30 = distinct !{!{!"ejit_guard", !"cell"}, !{!"ejit_dim", !"cell", i32 0}}
+!40 = distinct !{!{!"ejit_guard", !"cell"}, !{!"ejit_guard", !"trp"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}}

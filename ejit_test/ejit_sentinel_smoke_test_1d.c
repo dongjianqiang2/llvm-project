@@ -11,15 +11,15 @@
 #include "ejit_test_helpers.h"
 
 struct Cfg {
-  ejit_may_const uint32_t kind; // 1 -> "on" branch, 0 -> "off"
+  EJIT_PERIOD_CONST uint32_t kind; // 1 -> "on" branch, 0 -> "off"
 };
 
-ejit_period_arr(p0) struct Cfg g_p0[4];
+ejit_group(p0) struct Cfg g_p0[4];
 
 void sentinel_smoke_set_p0(uint8_t i, uint32_t kind) { g_p0[i].kind = kind; }
 
 // 1-dim: [16] sentinel table. on -> 100+i, off -> 200+i.
 ejit_entry __attribute__((noinline)) uint32_t
-sentinel_1d(ejit_period_arr_ind(p0) uint8_t i0) {
+sentinel_1d(EJIT_DIM(p0) uint8_t i0) {
   return (g_p0[i0].kind == 1u) ? 100u + i0 : 200u + i0;
 }

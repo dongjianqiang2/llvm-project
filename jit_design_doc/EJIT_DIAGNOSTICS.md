@@ -231,7 +231,7 @@ void ejit_print_version(void);              // 打印运行库构建标识
 | API | 作用 |
 |-----|------|
 | `ejit_print_registry` | 列出所有已注册 bitcode（funcIdx / name / size）、period 数组（period / var / base / size）、静态变量（var / addr），以及 funcIndex / lifecycle 计数。用于验证 AOT 注册是否正确填充运行时。 |
-| `ejit_print_func_meta` | 解析并打印 `name` 的 `!ejit.metadata`：是否为 `ejit_entry`、其 `period_arr_ind` 参数槽、period 数组、`may_const` 字段偏移。用于诊断特化参数绑定与常量替换资格。 |
+| `ejit_print_func_meta` | 解析并打印 `name` 的 `!ejit.metadata`：是否为 `ejit_entry`、其 `period_arr_ind` 参数槽、period 数组、`period_const` 字段偏移。用于诊断特化参数绑定与常量替换资格。 |
 | `ejit_print_active` | 列出每个注册 period 下当前激活的 (period, cell)。静态变量视为恒激活。用于诊断“某 period 实例为何编译 / 为何没编译”。 |
 | `ejit_print_version` | 打印运行库构建标识：LLVM 发行版本号与 llvm-project 源码的 git commit + 分支。**无需初始化运行时、不受日志级别门控**，便于将现场设备行为与确切源码版本对应。 |
 
@@ -367,42 +367,42 @@ clang Sema 阶段默认启用以下告警，归入诊断组 `embedded-jit`（即
 
 | 告警 | 触发条件 | 文本 |
 |------|----------|------|
-| `warn_ejit_attr_missing_on_definition` | 函数声明带 `ejit_entry` 或 `ejit_period_lc`，但定义未重复该属性。Sema 会禁用该定义的 EmbeddedJIT 特化，并指向原声明。可单独用 `-Wno-embedded-jit-attr-missing-on-def` 关闭。 | `function %0 is declared with '%1' but defined without it; EmbeddedJIT specialization is disabled for this definition` |
-| `warn_ejit_always_inline_conflict` | 对 `ejit_entry` / `ejit_period_lc` 函数标注 `always_inline`。这些函数必须保持非内联才能在内联器中存活供 JIT 特化，用户 `always_inline` 与之冲突，Sema 告警并忽略 `always_inline`。 | `'always_inline' is incompatible with %0, which must remain out-of-line so it survives the inliner for JIT specialization; ignoring 'always_inline'`（`%0` = `ejit_entry` 或 `ejit_period_lc`） |
-| `warn_ejit_may_const_modified_without_lc` | 在**未**标注 `ejit_period_lc` 的函数中写 `ejit_may_const` 字段。`may_const` 字段只允许在时间窗切换（lifecycle）时变更，普通函数写入会破坏特化一致性。 | `modifying ejit_may_const field %0 of %1 without ejit_period_lc attribute`（`%0` = 字段名，`%1` = 持有该结构体的变量或其父记录） |
+| `warn_ejit_attr_missing_on_definition` | 函数声明带 `ejit_entry` 或 `ejit_guard`，但定义未重复该属性。Sema 会禁用该定义的 EmbeddedJIT 特化，并指向原声明。可单独用 `-Wno-embedded-jit-attr-missing-on-def` 关闭。 | `function %0 is declared with '%1' but defined without it; EmbeddedJIT specialization is disabled for this definition` |
+| `warn_ejit_always_inline_conflict` | 对 `ejit_entry` / `ejit_guard` 函数标注 `always_inline`。这些函数必须保持非内联才能在内联器中存活供 JIT 特化，用户 `always_inline` 与之冲突，Sema 告警并忽略 `always_inline`。 | `'always_inline' is incompatible with %0, which must remain out-of-line so it survives the inliner for JIT specialization; ignoring 'always_inline'`（`%0` = `ejit_entry` 或 `ejit_guard`） |
+| `warn_ejit_period_const_modified_without_guard` | 在**未**标注 `ejit_guard` 的函数中写 `ejit_period_const` 字段。`period_const` 字段只允许在时间窗切换（lifecycle）时变更，普通函数写入会破坏特化一致性。 | `modifying ejit_period_const field %0 of %1 without ejit_guard attribute`（`%0` = 字段名，`%1` = 持有该结构体的变量或其父记录） |
 
 以下 Sema 告警默认关闭，需按需显式开启：
 
 | 诊断组 | 触发条件 | 文本 |
 |--------|----------|------|
-| `-Wembedded-jit-addr-of-may-const` | 对 `ejit_may_const` 字段取地址，但所得指针不带 `const`，可能绕过 lifecycle 写入约束。 | `taking address of ejit_may_const field %0 of %1 without const qualifier; a non-const pointer allows the field to be written outside ejit_period_lc, breaking the JIT's time-window constancy assumption` |
-| `-Wembedded-jit-undeclared-period-dep` | 函数引用 `ejit_period_arr("P")`，但未通过 `ejit_period_arr_ind("P")` 声明依赖。 | `function %0 references ejit_period_arr '%1' but does not declare a dependency on it via ejit_period_arr_ind` |
+| `-Wembedded-jit-addr-of-period-const` | 对 `ejit_period_const` 字段取地址，但所得指针不带 `const`，可能绕过 lifecycle 写入约束。 | `taking address of ejit_period_const field %0 of %1 without const qualifier; a non-const pointer allows the field to be written outside ejit_guard, breaking the JIT's time-window constancy assumption` |
+| `-Wembedded-jit-undeclared-period-dep` | 函数引用 `ejit_group("P")`，但未通过 `ejit_dim("P")` 声明依赖。 | `function %0 references ejit_group '%1' but does not declare a dependency on it via ejit_dim` |
 
 ### 9.2 特化价值诊断
 
 由 EJIT 的 AOT 位码提取 pass（PASS1）在提取位码上运行 `runSpecializationDiagnostic` 发出，经 `-mllvm` 标志控制。
 
-**特化闭包**（诊断推理的范围）：`ejit_entry` 自身 + 经**直接调用**可达的全部已定义非 intrinsic 函数（不动点传播）。**外部声明调用与间接调用（函数指针）不计入**，因为 JIT 无法内联它们，其 `may_const` 读取不会进入该 entry 的特化。因此 #1 不会产生误报。
+**特化闭包**（诊断推理的范围）：`ejit_entry` 自身 + 经**直接调用**可达的全部已定义非 intrinsic 函数（不动点传播）。**外部声明调用与间接调用（函数指针）不计入**，因为 JIT 无法内联它们，其 `period_const` 读取不会进入该 entry 的特化。因此 #1 不会产生误报。
 
 | 标志 | 默认 | 类别 | 触发条件 |
 |------|------|------|----------|
-| `-mllvm -ejit-warn-no-specialization` | **on** | #1 告警 | entry 的特化闭包内**无任何** `!ejit.may_const` load（特化无收益，考虑移除 `ejit_entry`） |
-| `-mllvm -ejit-warn-unused-dim` | **on** | #2 告警 | 声明了 `ejit_period_arr_ind("P")` 但闭包**从不索引** `ejit_period_arr("P")`（死维度） |
-| `-mllvm -ejit-report-mayconst` | **off** | info 报告 | 报告每个 entry 闭包内 `may_const` 读总数 K 及其中在循环内的 J |
-| `-mllvm -ejit-warn-few-mayconst=<N>` | `0`（off） | opt-in 告警 | entry 闭包内 `may_const` 读数 **< N**，且其中**没有任何循环内读取**时告警。默认关闭 |
+| `-mllvm -ejit-warn-no-specialization` | **on** | #1 告警 | entry 的特化闭包内**无任何** `!ejit.period_const` load（特化无收益，考虑移除 `ejit_entry`） |
+| `-mllvm -ejit-warn-unused-dim` | **on** | #2 告警 | 声明了 `ejit_dim("P")` 但闭包**从不索引** `ejit_group("P")`（死维度） |
+| `-mllvm -ejit-report-period-const` | **off** | info 报告 | 报告每个 entry 闭包内 `period_const` 读总数 K 及其中在循环内的 J |
+| `-mllvm -ejit-warn-few-period-const=<N>` | `0`（off） | opt-in 告警 | entry 闭包内 `period_const` 读数 **< N**，且其中**没有任何循环内读取**时告警。默认关闭 |
 
 **输出文本**（走 `stderr`）：
 
 ```
-#1    EJit warning: ejit_entry function '<name>' reads no ejit_may_const field in its specialization closure; no JIT specialization value, consider removing ejit_entry
-#2    EJit warning: ejit_entry function '<name>' declares ejit_period_arr_ind('<P>') but its specialization closure never indexes an ejit_period_arr('<P>'); unused specialization dimension, consider removing it
-info  EJit info: ejit_entry function '<name>': <K> ejit_may_const read[s] (<J> in loops)   # K==1 时 read 无 s
-few   EJit warning: ejit_entry function '<name>' has only <K> ejit_may_const read[s] in its specialization closure (threshold: <N>); low specialization surface, consider adding more may-const fields   # K==1 时 read 无 s
+#1    EJit warning: ejit_entry function '<name>' reads no ejit_period_const field in its specialization closure; no JIT specialization value, consider removing ejit_entry
+#2    EJit warning: ejit_entry function '<name>' declares ejit_dim('<P>') but its specialization closure never indexes an ejit_group('<P>'); unused specialization dimension, consider removing it
+info  EJit info: ejit_entry function '<name>': <K> ejit_period_const read[s] (<J> in loops)   # K==1 时 read 无 s
+few   EJit warning: ejit_entry function '<name>' has only <K> ejit_period_const read[s] in its specialization closure (threshold: <N>); low specialization surface, consider adding more period-const fields   # K==1 时 read 无 s
 ```
 
 - **关闭默认 on 的告警**：`-mllvm -ejit-warn-no-specialization=false`（同理 `-ejit-warn-unused-dim=false`）。
-- **info 报告**只提供信息，不控制编译流程。`may_const` 数量并不能可靠衡量特化价值：单次读取若位于热循环中或直接控制分支，也可能带来很高收益。因此唯一不会误报的默认阈值是 0（即 #1）；N>0 时需要用户结合场景判断。
-- **`-ejit-warn-few-mayconst=N`** 是 opt-in 的个数阈值告警，默认关闭。只要闭包中存在循环内 `may_const` 读取就不会触发，避免把单个但位于热循环中的高价值读取误报为“特化面较窄”。它不与 #1 冲突：#1（零=确定无价值）是默认 sound 基线；N>0 时仍需结合这些读取控制的分支或计算人工判断。
+- **info 报告**只提供信息，不控制编译流程。`period_const` 数量并不能可靠衡量特化价值：单次读取若位于热循环中或直接控制分支，也可能带来很高收益。因此唯一不会误报的默认阈值是 0（即 #1）；N>0 时需要用户结合场景判断。
+- **`-ejit-warn-few-period-const=N`** 是 opt-in 的个数阈值告警，默认关闭。只要闭包中存在循环内 `period_const` 读取就不会触发，避免把单个但位于热循环中的高价值读取误报为“特化面较窄”。它不与 #1 冲突：#1（零=确定无价值）是默认 sound 基线；N>0 时仍需结合这些读取控制的分支或计算人工判断。
 - “引用 period 但未声明依赖”的检查现位于 Clang Sema，且默认关闭；需要时启用 §9.1 的 `-Wembedded-jit-undeclared-period-dep`。它与 #2（声明但不用）方向相反、互补。
 
 ### 9.3 提取位码转储
@@ -425,9 +425,9 @@ clang -fembed-bitcode ... -mllvm -ejit-dump-bitcode-dir=/tmp/ejit_bc process.c
 
 ### 10.2 某个 `ejit_entry` 没收益 / 没被特化
 
-1. 编译期先看 §9.2：#1 告警（闭包无 `may_const`）说明该 entry 特化无收益，应移除 `ejit_entry` 或补 `may_const` 标注；`-mllvm -ejit-report-mayconst` 看 `may_const` 读总数及循环内占比，评估收益。
+1. 编译期先看 §9.2：#1 告警（闭包无 `period_const`）说明该 entry 特化无收益，应移除 `ejit_entry` 或补 `period_const` 标注；`-mllvm -ejit-report-period-const` 看 `period_const` 读总数及循环内占比，评估收益。
 2. 若声明和定义分离，确认没有 §9.1 的 `-Wembedded-jit-attr-missing-on-def` 告警；该告警出现时定义已被禁用特化。
-3. 运行时 `ejit_print_func_meta(name)` 确认特化参数绑定与 `may_const` 资格。
+3. 运行时 `ejit_print_func_meta(name)` 确认特化参数绑定与 `period_const` 资格。
 4. `ejit_print_active()` 确认相关 period 实例是否处于激活态。
 
 ### 10.3 该编译的没编译 / 编译失败

@@ -7,17 +7,17 @@
 #include "ejit_test_helpers.h"
 
 typedef struct {
-  uint32_t ejit_may_const algorithm;
-  uint32_t ejit_may_const scale;
+  uint32_t EJIT_PERIOD_CONST algorithm;
+  uint32_t EJIT_PERIOD_CONST scale;
   uint32_t runtimeBias;
 } CellRelated;
 
-ejit_period_arr(cell) uint32_t g_cells[8];
-ejit_period_arr(trp) uint32_t g_trps[8];
+ejit_group(cell) uint32_t g_cells[8];
+ejit_group(trp) uint32_t g_trps[8];
 
-ejit_entry uint32_t bound_cell_config(ejit_period_arr_ind(cell)
+ejit_entry uint32_t bound_cell_config(EJIT_DIM(cell)
                                           uint8_t cellIndex,
-                                      ejit_period_arr_ind(trp) uint8_t trpIndex,
+                                      EJIT_DIM(trp) uint8_t trpIndex,
                                       EJIT_BOUND_PTR(cell)
                                           const CellRelated *cellRelated,
                                       uint32_t input) {
@@ -27,11 +27,11 @@ ejit_entry uint32_t bound_cell_config(ejit_period_arr_ind(cell)
   return input + cellRelated->runtimeBias;
 }
 
-/* runtimeBias is not may_const, so it stays a live load. Reading it inside a
+/* runtimeBias is not period_const, so it stays a live load. Reading it inside a
    condition inside a loop is the shape that only folds once the bound pointer
    is known nonnull, dereferenceable and aligned: without those the load cannot
    be speculated out of its guard and the loop survives. */
-ejit_entry uint32_t bound_conditional_load(ejit_period_arr_ind(cell)
+ejit_entry uint32_t bound_conditional_load(EJIT_DIM(cell)
                                                uint8_t cellIndex,
                                            EJIT_BOUND_PTR(cell)
                                                const CellRelated *cellRelated,
@@ -40,7 +40,7 @@ ejit_entry uint32_t bound_conditional_load(ejit_period_arr_ind(cell)
   for (uint32_t i = 0; i < count; ++i)
     if (enabled)
       acc += cellRelated->runtimeBias;
-  /* scale IS may_const, so it folds to a literal and this stays a real
+  /* scale IS period_const, so it folds to a literal and this stays a real
      specialization target; runtimeBias above stays a load. */
   return acc * cellRelated->scale + cellIndex;
 }

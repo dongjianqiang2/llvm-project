@@ -5,7 +5,7 @@
  *   1. f(cellIdx=A) 首次调用 → JIT miss, entries+1
  *   2. f(cellIdx=B) 首次调用 → JIT miss, entries+1 (新特化版本)
  *   3. f(cellIdx=A) 再次调用 → cache HIT (命中之前编译的版本)
- *   4. 每个版本产生正确结果 (取决于各自 cellIdx 对应的 may_const 值)
+ *   4. 每个版本产生正确结果 (取决于各自 cellIdx 对应的 period_const 值)
  *   5. 所有 cellIdx 均来自外部输入 (argv)
  *
  * 运行:
@@ -24,19 +24,19 @@
 //===-- 数据结构 -------------------------------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
-  ejit_may_const uint32_t cellId;
+  EJIT_PERIOD_CONST uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellId;
   uint32_t counter;
 };
 
 #define N 16
-ejit_period_arr(cell) struct CellCfg g_cells[N];
+ejit_group(cell) struct CellCfg g_cells[N];
 
-//===-- JIT entry: 分支依赖 may_const 字段 -----------------------------------===//
+//===-- JIT entry: 分支依赖 period_const 字段 -----------------------------------===//
 
 ejit_entry
 uint32_t classify_cell(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   uint32_t t = g_cells[ci].cellType;
 

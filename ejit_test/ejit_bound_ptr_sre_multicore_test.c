@@ -27,15 +27,12 @@ typedef _Bool bool;
 #define false 0
 
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
-#define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
+#define ejit_group(x) __attribute__((ejit_group(#x)))
 #define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
-#define EJIT_ENTRY __attribute__((ejit_entry))
+#define ejit_entry __attribute__((ejit_entry))
+#define EJIT_ENTRY ejit_entry
 
-#define ejit_may_const EJIT_PERIOD_CONST
-#define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
-#define ejit_period_arr_ind(x) EJIT_DIM(x)
-#define ejit_entry EJIT_ENTRY
 
 typedef enum {
   EJIT_OK = 0,
@@ -118,21 +115,21 @@ enum BoundPtrDemoStage {
 };
 
 struct CellRelated {
-  ejit_may_const uint32_t algorithm;
-  ejit_may_const uint32_t scale;
+  EJIT_PERIOD_CONST uint32_t algorithm;
+  EJIT_PERIOD_CONST uint32_t scale;
   uint32_t runtimeBias;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
+EJIT_SHARED_SECTION_ATTR ejit_group(cell)
 uint32_t g_bound_cells[8];
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(trp)
+EJIT_SHARED_SECTION_ATTR ejit_group(trp)
 uint32_t g_bound_trps[8];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_bound_ptr_demo_stage;
 EJIT_SHARED_SECTION_ATTR volatile uint64_t g_bound_ptr_demo_sink;
 
 ejit_entry uint32_t
-bound_cell_config_mc(ejit_period_arr_ind(cell) uint8_t cellIndex,
-                     ejit_period_arr_ind(trp) uint8_t trpIndex,
+bound_cell_config_mc(EJIT_DIM(cell) uint8_t cellIndex,
+                     EJIT_DIM(trp) uint8_t trpIndex,
                      EJIT_BOUND_PTR(cell) const struct CellRelated *cellRelated,
                      uint32_t input) {
   if (cellRelated->algorithm == 7u)

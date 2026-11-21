@@ -24,30 +24,30 @@
 //===-- EJIT 属性 -----------------------------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
-  ejit_may_const uint32_t cellId;
+  EJIT_PERIOD_CONST uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellId;
   uint32_t trafficLoad;
 };
 
 struct TrpCfg {
-  ejit_may_const uint32_t trpType;
+  EJIT_PERIOD_CONST uint32_t trpType;
   uint32_t activeBeams;
 };
 
-ejit_period(static) uint32_t g_sysVer;
+ejit_group(static) uint32_t g_sysVer;
 
 #define N_CELL 16
-ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
+ejit_group(cell) struct CellCfg g_cellCfg[N_CELL];
 
 #define M_TRP 8
-ejit_period_arr(trp) struct TrpCfg g_trpCfg[M_TRP];
+ejit_group(trp) struct TrpCfg g_trpCfg[M_TRP];
 
 //===-- JIT entry 函数 -----------------------------------------------------===//
 
-// 单维 cellIdx: 分支依赖于 may_const 字段
+// 单维 cellIdx: 分支依赖于 period_const 字段
 ejit_entry
 uint32_t jit_cell_check(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
   // JIT 应替换 cellType 为常量并折叠此分支
   if (g_cellCfg[cellIdx].cellType == 0xFD)
@@ -59,13 +59,13 @@ uint32_t jit_cell_check(
 // 多维 cellIdx + trpIdx: 复合条件
 ejit_entry
 uint32_t jit_cell_trp_check(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   uint32_t tt = g_trpCfg[trpIdx].trpType;
 
-  // JIT 应替换两个 may_const 字段并折叠此分支
+  // JIT 应替换两个 period_const 字段并折叠此分支
   if (ct == 0xFD && tt == 1)      return 777;
   else if (ct == 0xEC && tt == 2) return 888;
   return 0;

@@ -1,4 +1,4 @@
-# EJitPeriodHandlerPass 设计文档
+# EJitGuardHandlerPass 设计文档
 
 **版本**: 1.0
 **日期**: 2026-04-26
@@ -10,34 +10,34 @@
 
 ## 1. 概述
 
-EJitPeriodHandlerPass 负责处理 `ejit_period_lc` (lifecycle) 属性标记的函数。在这些函数的入口插入 `ejit_deactivate(periodName, idx)` 调用，在所有出口点插入 `ejit_activate(periodName, idx)` 调用。这确保在修改时间窗数据期间，相关时间窗处于 deactive 状态，防止其他线程读到不一致的数据或触发对旧值的 JIT 编译。
+EJitGuardHandlerPass 负责处理 `ejit_guard` (lifecycle) 属性标记的函数。在这些函数的入口插入 `ejit_deactivate(periodName, idx)` 调用，在所有出口点插入 `ejit_activate(periodName, idx)` 调用。这确保在修改时间窗数据期间，相关时间窗处于 deactive 状态，防止其他线程读到不一致的数据或触发对旧值的 JIT 编译。
 
 > **移除说明**: 早期设计在函数入口/出口插入数组级的 `ejit_deactivate_array` / `ejit_activate_array`（携带数组指针参数）。该数组级生命周期激活已被移除，因为产品不需要它；异步 / 共享 taskpool 的热路径中激活状态以 `(lifecycle, instance)` 为键，不携带数组指针维度。PASS4 现在仅发出 name 级别的 `ejit_deactivate(periodName, idx)` / `ejit_activate(periodName, idx)`。若同一 period name 关联多个数组，激活对该 period 实例整体生效。
 
 ### 1.1 核心职责
 
-- 定位所有带 `!{"ejit_period_lc", !"periodName"}` metadata 的函数
-- 识别函数参数中对应 `ejit_period_arr_ind(periodName)` 的参数
+- 定位所有带 `!{"ejit_guard", !"periodName"}` metadata 的函数
+- 识别函数参数中对应 `ejit_dim(periodName)` 的参数
 - 在函数入口（第一条指令之前）插入 `ejit_deactivate(periodName, idx)` 调用
 - 在函数所有出口点（return 指令之前）插入 `ejit_activate(periodName, idx)` 调用
-- 支持一个函数标记多个 `ejit_period_lc`（多时间窗管理）
+- 支持一个函数标记多个 `ejit_guard`（多时间窗管理）
 - 处理 early return 场景 — 所有 return 指令前都需插入
 
 ### 1.2 设计约束
 
 | 约束项 | 说明 |
 |--------|------|
-| 多时间窗 | 单函数可标记多个 `ejit_period_lc`，需按序配对激活/去激活 |
+| 多时间窗 | 单函数可标记多个 `ejit_guard`，需按序配对激活/去激活 |
 | 异常处理 | C 语言无异常，不考虑 exception handling |
 | 多出口 | C 函数可有多处 return，均需插入 activate 调用 |
-| ejit_period_lc 必须与 ejit_period_arr_ind 配对 | Sema 已检查，Pass 不做验证 |
-| static 时间窗 | `ejit_period(static)` 永远激活，不参与 activate/deactivate |
+| ejit_guard 必须与 ejit_dim 配对 | Sema 已检查，Pass 不做验证 |
+| static 时间窗 | `ejit_group(static)` 永远激活，不参与 activate/deactivate |
 
 ---
 
 ## 2. 输入 IR 格式
 
-### 2.1 ejit_period_lc 函数 Metadata
+### 2.1 ejit_guard 函数 Metadata
 
 ```llvm
 ; 单时间窗生命周期函数
@@ -45,8 +45,8 @@ define void @update_cell(i32 %cellIdx) #0 {
   ; ...
 }
 ; !ejit.metadata = distinct !{!0, !1}
-; !0 = !{!"ejit_period_lc", !"cell"}
-; !1 = !{!"ejit_period_arr_ind", !"cell", i32 0}    ; 参数 0 对应 cell 的索引
+; !0 = !{!"ejit_guard", !"cell"}
+; !1 = !{!"ejit_dim", !"cell", i32 0}    ; 参数 0 对应 cell 的索引
 ;      ← 此 metadata 由 Clang CodeGen 在函数级别附加
 
 ; 多时间窗生命周期函数
@@ -54,20 +54,20 @@ define void @update_both(i32 %cellIdx, i32 %trpIdx) #0 {
   ; ...
 }
 ; !ejit.metadata = distinct !{!0, !1, !2, !3}
-; !0 = !{!"ejit_period_lc", !"cell"}
-; !1 = !{!"ejit_period_lc", !"trp"}
-; !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-; !3 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+; !0 = !{!"ejit_guard", !"cell"}
+; !1 = !{!"ejit_guard", !"trp"}
+; !2 = !{!"ejit_dim", !"cell", i32 0}
+; !3 = !{!"ejit_dim", !"trp", i32 1}
 ```
 
 ### 2.2 Metadata 格式说明
 
-`ejit_period_arr_ind` metadata 在函数级别编码为：
+`ejit_dim` metadata 在函数级别编码为：
 ```llvm
-!{!"ejit_period_arr_ind", !"periodName", i32 argIndex}
+!{!"ejit_dim", !"periodName", i32 argIndex}
 ```
 
-此 metadata 同时服务于 `EJitWrapperGenPass` 和 `EJitPeriodHandlerPass`。
+此 metadata 同时服务于 `EJitWrapperGenPass` 和 `EJitGuardHandlerPass`。
 
 ---
 
@@ -76,11 +76,11 @@ define void @update_both(i32 %cellIdx, i32 %trpIdx) #0 {
 ### 3.1 主流程
 
 ```
-输入: Module M (含 ejit_period_lc 函数)
+输入: Module M (含 ejit_guard 函数)
 输出: Module M (函数入口 + 出口插入 activate/deactivate 调用)
 
 步骤:
-1. CollectLifecycleFunctions(M) → 收集所有 ejit_period_lc 函数及其 metadata
+1. CollectLifecycleFunctions(M) → 收集所有 ejit_guard 函数及其 metadata
 2. ForEach lifecycleFunc:
      ParseLifecycleInfo(funcMeta) → 解析 periodName → argIdx 映射
 3. InsertDeactivateAtEntry(func, lifecycleInfo) → 入口插入 deactivate
@@ -90,10 +90,10 @@ define void @update_both(i32 %cellIdx, i32 %trpIdx) #0 {
 ### 3.2 详细伪代码
 
 ```cpp
-PreservedAnalyses EJitPeriodHandlerPass::run(Module& M, ModuleAnalysisManager& AM) {
+PreservedAnalyses EJitGuardHandlerPass::run(Module& M, ModuleAnalysisManager& AM) {
     struct LifecycleInfo {
         std::string periodName;
-        unsigned argIdx;         // ejit_period_arr_ind 参数索引
+        unsigned argIdx;         // ejit_dim 参数索引
     };
     std::vector<std::pair<Function*, std::vector<LifecycleInfo>>> lcFuncs;
 
@@ -108,12 +108,12 @@ PreservedAnalyses EJitPeriodHandlerPass::run(Module& M, ModuleAnalysisManager& A
             MDNode* Entry = cast<MDNode>(Op);
             StringRef tag = cast<MDString>(Entry->getOperand(0))->getString();
 
-            if (tag == "ejit_period_lc") {
+            if (tag == "ejit_guard") {
                 isLifecycle = true;
                 std::string periodName = cast<MDString>(
                     Entry->getOperand(1))->getString().str();
 
-                // 查找对应的 ejit_period_arr_ind 参数
+                // 查找对应的 ejit_dim 参数
                 int argIdx = findPeriodArrIndArg(MD, periodName);
                 if (argIdx >= 0) {
                     lcInfo.push_back({periodName, (unsigned)argIdx});
@@ -209,7 +209,7 @@ void insertActivateAtExits(Function* F,
 
 ### 3.5 激活粒度（name + index only）
 
-激活状态仅以 periodName + cellIdx 为键，不再需要查找对应的全局数组指针。若同一 periodName 关联多个 `ejit_period_arr` 数组，`ejit_activate(periodName, idx)` 对该 period 实例整体生效（name 级别）。因此 PASS4 不再需要 `getArrayPtrForPeriod` 之类的数组指针推断。
+激活状态仅以 periodName + cellIdx 为键，不再需要查找对应的全局数组指针。若同一 periodName 关联多个 `ejit_group` 数组，`ejit_activate(periodName, idx)` 对该 period 实例整体生效（name 级别）。因此 PASS4 不再需要 `getArrayPtrForPeriod` 之类的数组指针推断。
 
 ---
 
@@ -303,8 +303,8 @@ struct LifecycleFuncInfo {
 
 // 时间窗 lc → period_arr_ind 关联
 struct PeriodAssociation {
-    std::string periodName;      // ejit_period_lc 参数
-    unsigned paramIdx;           // 对应的 ejit_period_arr_ind 参数索引
+    std::string periodName;      // ejit_guard 参数
+    unsigned paramIdx;           // 对应的 ejit_dim 参数索引
 };
 
 // 运行时 API 声明 (name + index，无数组指针维度)
@@ -318,7 +318,7 @@ struct PeriodAssociation {
 
 | 错误场景 | 处理策略 |
 |---------|---------|
-| ejit_period_lc 无对应 ejit_period_arr_ind | 跳过（Sema 已处理） |
+| ejit_guard 无对应 ejit_dim | 跳过（Sema 已处理） |
 | alloca 干扰入口点定位 | 跳过 alloca 指令，在第一条非 alloca 后插入 |
 | 无 return 指令的函数 | 不应发生（well-formed IR 至少有一个 return / unreachable） |
 | unreachable 指令 | 不插入（unreachable 不是正常出口） |
@@ -329,10 +329,10 @@ struct PeriodAssociation {
 
 ```
 EJitRegisterBitcodePass  →  提取 bitcode
-EJitRegisterPeriodPass   →  注册时间窗变量
+EJitRegisterGroupPass   →  注册时间窗变量
 EJitWrapperGenPass       →  生成 Wrapper
         ↓
-EJitPeriodHandlerPass    →  处理生命周期函数 (本 Pass - 最后一步)
+EJitGuardHandlerPass    →  处理生命周期函数 (本 Pass - 最后一步)
 ```
 
 | 依赖项 | 说明 |
@@ -349,22 +349,22 @@ EJitPeriodHandlerPass    →  处理生命周期函数 (本 Pass - 最后一步)
 
 ```llvm
 ; test_period_handler.ll
-; RUN: opt -passes=ejit-period-handler -S %s | FileCheck %s
+; RUN: opt -passes=ejit-guard-handler -S %s | FileCheck %s
 
 ; 测试场景:
-; TEST 1: 单 ejit_period_lc + 单出口
+; TEST 1: 单 ejit_guard + 单出口
 ;   CHECK: call void @ejit_deactivate
 ;   CHECK: ret void
 ;   CHECK: call void @ejit_activate
 ;
-; TEST 2: 多 ejit_period_lc (cell + trp) + 多出口
+; TEST 2: 多 ejit_guard (cell + trp) + 多出口
 ;   CHECK-DAG: call void @ejit_deactivate(ptr @".str.cell"
 ;   CHECK-DAG: call void @ejit_deactivate(ptr @".str.trp"
 ;   CHECK-DAG: call void @ejit_activate(ptr @".str.cell"
 ;   CHECK-DAG: call void @ejit_activate(ptr @".str.trp"
 ;   验证同序: activate 顺序与 deactivate 一致 (cell 先 trp 后)
 ;
-; TEST 3: 无 ejit_period_lc 函数的 Module
+; TEST 3: 无 ejit_guard 函数的 Module
 ;   CHECK-NOT: call void @ejit_deactivate
 ;
 ; TEST 4: 所有 return 前均有 activate

@@ -5,13 +5,13 @@
 #include <unistd.h>
 
 struct SlotConfig {
-  ejit_may_const unsigned char enabled;
+  EJIT_PERIOD_CONST unsigned char enabled;
   unsigned char live;
 };
 struct CellConfig {
   struct SlotConfig slots[10];
 };
-ejit_period_arr(cell) struct CellConfig *automatic_cells;
+ejit_group(cell) struct CellConfig *automatic_cells;
 
 // A synthetic allocator record. A board adapter would query its common
 // allocator's records here, without knowing any period-global names.
@@ -26,7 +26,7 @@ static uint64_t allocation_size(const void *base, void *context) {
   return base == allocation_base ? allocation_bytes : 0;
 }
 
-ejit_entry unsigned probe_automatic(ejit_period_arr_ind(cell) unsigned char cell,
+ejit_entry unsigned probe_automatic(EJIT_DIM(cell) unsigned char cell,
                                     ejit_free_dim unsigned short slot) {
   struct SlotConfig *selected = &automatic_cells[cell].slots[slot % 10];
   ++selected->live;

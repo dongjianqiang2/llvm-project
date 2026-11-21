@@ -83,16 +83,16 @@ TEST(EJitBranchProfile, ClassifiesBranchShapeWithoutChangingIR) {
   EXPECT_EQ(Missing.profiledSites, 0u);
 }
 
-TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
-  const EJitMayConstBenefitSample Samples[] = {
+TEST(EJitBranchProfile, AggregatesPeriodConstSpecializations) {
+  const EJitPeriodConstBenefitSample Samples[] = {
       {1, 100, 70, 40, 1000, 10, 800, 8, 64, 1000000},
       {2, 120, 90, 50, 2000, 20, 1500, 15, 80, 2000000},
       {3, 80, 75, 85, 3000, 31, 0, 0, 100, 1000000}};
-  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits(Samples);
+  EJitPeriodConstBenefitSummary Summary = summarizePeriodConstBenefits(Samples);
   EXPECT_EQ(Summary.versions, 3u);
-  EXPECT_EQ(Summary.inputMayConstLoads, 300u);
-  EXPECT_EQ(Summary.specializedMayConstLoads, 235u);
-  EXPECT_EQ(Summary.finalMayConstLoads, 175u);
+  EXPECT_EQ(Summary.inputPeriodConstLoads, 300u);
+  EXPECT_EQ(Summary.specializedPeriodConstLoads, 235u);
+  EXPECT_EQ(Summary.finalPeriodConstLoads, 175u);
   EXPECT_EQ(Summary.totalRemoved, 125);
   EXPECT_EQ(Summary.directRemoved, 65);
   EXPECT_EQ(Summary.pipelineRemoved, 60);
@@ -112,11 +112,11 @@ TEST(EJitBranchProfile, AggregatesMayConstSpecializations) {
 }
 
 TEST(EJitBranchProfile, BenefitScalingSaturatesWithoutOverflow) {
-  EJitMayConstBenefitSample Sample;
+  EJitPeriodConstBenefitSample Sample;
   Sample.removedRuntimeHits = std::numeric_limits<uint64_t>::max();
   Sample.sampledEntries = 1;
   Sample.sampleCycles = 1;
-  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits({Sample});
+  EJitPeriodConstBenefitSummary Summary = summarizePeriodConstBenefits({Sample});
   EXPECT_EQ(Summary.removedHitsPerEntryPermille,
             std::numeric_limits<uint64_t>::max());
   EXPECT_EQ(Summary.benefitPerMillionCyclesMilli,
@@ -124,10 +124,10 @@ TEST(EJitBranchProfile, BenefitScalingSaturatesWithoutOverflow) {
 }
 
 TEST(EJitBranchProfile, BenefitScalingRoundsToNearestFixedPoint) {
-  EJitMayConstBenefitSample Sample;
+  EJitPeriodConstBenefitSample Sample;
   Sample.removedRuntimeHits = 2;
   Sample.sampledEntries = 3;
-  EJitMayConstBenefitSummary Summary = summarizeMayConstBenefits({Sample});
+  EJitPeriodConstBenefitSummary Summary = summarizePeriodConstBenefits({Sample});
   EXPECT_EQ(Summary.removedHitsPerEntryPermille, 667u);
 }
 

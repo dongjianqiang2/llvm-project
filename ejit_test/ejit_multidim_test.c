@@ -1,8 +1,8 @@
 /**
- * EJIT 多维数组 may_const 运行时测试
+ * EJIT 多维数组 period_const 运行时测试
  *
  * 场景: 2D 周期数组，cellIdx 从 argv 外部输入。
- *       g_cells[cellIdx][subIdx].type 等 may_const 字段在 JIT 时
+ *       g_cells[cellIdx][subIdx].type 等 period_const 字段在 JIT 时
  *       被替换为常量，分支被折叠。
  *
  * 运行:
@@ -21,19 +21,19 @@
 //===-- 2D 周期数组 -----------------------------------------------------------===//
 
 struct SlotCfg {
-  ejit_may_const uint32_t slotType;
-  ejit_may_const uint32_t priority;
+  EJIT_PERIOD_CONST uint32_t slotType;
+  EJIT_PERIOD_CONST uint32_t priority;
   uint32_t usageCount;
 };
 
 #define N_ROWS  4
 #define N_COLS  8
-ejit_period_arr(cell) struct SlotCfg g_slots[N_ROWS][N_COLS];
+ejit_group(cell) struct SlotCfg g_slots[N_ROWS][N_COLS];
 
 //===-- 2D 嵌套结构体数组 -----------------------------------------------------===//
 
 struct Inner2D {
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t pad;
 };
 
@@ -42,16 +42,16 @@ struct Outer2D {
   uint32_t flags;
 };
 
-ejit_period_arr(cell) struct Outer2D g_outer2d[N_ROWS][N_COLS];
+ejit_group(cell) struct Outer2D g_outer2d[N_ROWS][N_COLS];
 
 //===-- JIT entry: 2D flat struct access ------------------------------------===//
 
 ejit_entry
 uint32_t classify_slot(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   uint32_t sum = 0;
-  // 遍历二维数组的第二维 — JIT 应把 may_const 替换为常量
+  // 遍历二维数组的第二维 — JIT 应把 period_const 替换为常量
   for (int s = 0; s < N_COLS; s++) {
     struct SlotCfg *p = &g_slots[ci][s];  // ci 外部输入，s 循环变量
     if (p->slotType == 0xFD)
@@ -67,7 +67,7 @@ uint32_t classify_slot(
 
 ejit_entry
 uint32_t check_outer2d(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   // 访问 g_outer2d[ci][3].inner.mode
   uint32_t m = g_outer2d[ci][3].inner.mode;

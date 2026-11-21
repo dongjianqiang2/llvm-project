@@ -317,7 +317,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
    uint32_t numDims}` (per-core private). `ejitIcacheRegisterSlot(funcIndex,
    base, numDims)` and `ejitIcacheClearAll` (null base pointers).
 2. **`ejit_register_icache_slot(name, base, numDims)`**: forward `numDims`
-   (carried in the `.ejit_period` entry's `size` field; the walker in
+   (carried in the `.ejit_group` entry's `size` field; the walker in
    `EJit.cpp` reads it).
 3. **`icacheFill(funcIndex, fnPtr, dims, numDims)`**: Horner-linearize and
    **plain store** the cell (no CAS, no atomic -- per-core private, §5).

@@ -33,45 +33,45 @@
 // 属性直接使用 __attribute__((...)) 写法，参数为字符串字面量
 
 struct BoardConfig {
-    ejit_may_const uint32_t boardType;
+    EJIT_PERIOD_CONST uint32_t boardType;
     uint32_t xx;
     struct {
-        ejit_may_const uint32_t chipId;
+        EJIT_PERIOD_CONST uint32_t chipId;
         uint32_t reserved;
     } inner;
 };
 
 struct CellConfig {
-    ejit_may_const uint32_t cellType;
-    ejit_may_const uint32_t cellId;
+    EJIT_PERIOD_CONST uint32_t cellType;
+    EJIT_PERIOD_CONST uint32_t cellId;
     uint32_t trafficLoad;
 };
 
 struct TrpConfig {
-    ejit_may_const uint32_t trpType;
+    EJIT_PERIOD_CONST uint32_t trpType;
     uint32_t status;
 };
 
 struct SensorConfig {
-    ejit_may_const bool     enabled;
-    ejit_may_const float    threshold;
-    ejit_may_const uint64_t sensorId;
+    EJIT_PERIOD_CONST bool     enabled;
+    EJIT_PERIOD_CONST float    threshold;
+    EJIT_PERIOD_CONST uint64_t sensorId;
     uint32_t readings;
 };
 
 //===-- 全局变量声明 ----------------------------------------------------------===//
 
 // static 时间窗: JIT 运行期不变 (SPEC4 §2.2.1)
-ejit_period(static) struct BoardConfig g_boardCfg;
+ejit_group(static) struct BoardConfig g_boardCfg;
 
 // 时间窗数组: cell (SPEC4 §2.2.2, §5 场景 2)
-ejit_period_arr(cell) struct CellConfig g_cellCfg[16];
+ejit_group(cell) struct CellConfig g_cellCfg[16];
 
 // 时间窗数组: trp (SPEC4 §2.2.2, §5 场景 3)
-ejit_period_arr(trp) struct TrpConfig g_trpCfg[8];
+ejit_group(trp) struct TrpConfig g_trpCfg[8];
 
 // static 时间窗: sensor
-ejit_period(static) struct SensorConfig g_sensorCfg;
+ejit_group(static) struct SensorConfig g_sensorCfg;
 
 //===-- 场景 1: 仅依赖 static 时间窗 (SPEC4 §5) -------------------------------===//
 
@@ -100,7 +100,7 @@ void process_sensor(void)
 
 ejit_entry
 void process_cell(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     // JIT 时 g_cellCfg[cellIdx].cellType 被视为常量
     if (g_boardCfg.boardType == 0x01) {
@@ -113,9 +113,9 @@ void process_cell(
 }
 
 // 生命周期管理: 修改 cell 时间窗数据 (SPEC4 §2.3.3)
-ejit_period_lc(cell)
+ejit_guard(cell)
 void update_cell_config(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xFD;
     g_cellCfg[cellIdx].cellId   = 42;
@@ -125,8 +125,8 @@ void update_cell_config(
 
 ejit_entry
 void process_trp_task(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
     uint32_t cell_t = g_cellCfg[cellIdx].cellType;
     uint32_t trp_t  = g_trpCfg[trpIdx].trpType;
@@ -139,46 +139,46 @@ void process_trp_task(
 }
 
 // 同时管理多个时间窗生命周期 (CLANG_ATTR_DESIGN §4.4.6 Model 1: 允许多实例)
-ejit_period_lc(cell)
-ejit_period_lc(trp)
+ejit_guard(cell)
+ejit_guard(trp)
 void update_all_config(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xEC;
     g_trpCfg[trpIdx].trpType = 2;
 }
 
 // 分别管理 (SPEC4 §5 场景 3 方式二)
-ejit_period_lc(cell)
+ejit_guard(cell)
 void change_cell_only(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xEC;
 }
 
-ejit_period_lc(trp)
+ejit_guard(trp)
 void change_trp_only(
-    ejit_period_arr_ind(trp) uint8_t trpIdx)
+    EJIT_DIM(trp) uint8_t trpIdx)
 {
     g_trpCfg[trpIdx].trpType = 1;
 }
 
-//===-- 嵌套数组 + 嵌套结构体 may_const --------------------------------------===//
+//===-- 嵌套数组 + 嵌套结构体 period_const --------------------------------------===//
 
 struct NestedCell {
-    ejit_may_const uint32_t type;
+    EJIT_PERIOD_CONST uint32_t type;
     struct {
-        ejit_may_const uint32_t subType;
+        EJIT_PERIOD_CONST uint32_t subType;
         uint32_t data;
     } sub;
 };
 
-ejit_period_arr(nested) struct NestedCell g_nestedCells[32];
+ejit_group(nested) struct NestedCell g_nestedCells[32];
 
 ejit_entry
 void process_nested(
-    ejit_period_arr_ind(nested) uint8_t idx)
+    EJIT_DIM(nested) uint8_t idx)
 {
     // JIT 时 g_nestedCells[idx].type 和 .sub.subType 均被视为常量
     if (g_nestedCells[idx].type == 1) {

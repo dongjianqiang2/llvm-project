@@ -1,4 +1,4 @@
-//===-- EJitFieldOffsetTest.cpp - ejitMayConstFieldOffset unit tests ------===//
+//===-- EJitFieldOffsetTest.cpp - ejitPeriodConstFieldOffset unit tests ------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// ejitMayConstFieldOffset decides *which field* a load names, and that answer is
-// the only gate on whether the load is treated as may_const. Getting it wrong is
+// ejitPeriodConstFieldOffset decides *which field* a load names, and that answer is
+// the only gate on whether the load is treated as period_const. Getting it wrong is
 // silent: the generated code stays correct-looking while either losing a
 // specialization (offset not matched) or folding a field that is free to change
 // (offset matched for the wrong field). Neither shows up as a test failure
@@ -88,7 +88,7 @@ protected:
       return std::nullopt;
     const GlobalVariable *GV = nullptr;
     auto Off =
-        ejitMayConstFieldOffset(LI->getPointerOperand(), M->getDataLayout(), GV);
+        ejitPeriodConstFieldOffset(LI->getPointerOperand(), M->getDataLayout(), GV);
     if (OutGV)
       *OutGV = GV;
     return Off;
@@ -101,14 +101,14 @@ protected:
     parseGlobalsOnly();
     const GlobalVariable *GV = M->getNamedGlobal(GVName);
     EXPECT_NE(GV, nullptr);
-    return ejitMayConstFieldSize(GV, Off, M->getDataLayout());
+    return ejitPeriodConstFieldSize(GV, Off, M->getDataLayout());
   }
 
   bool accessFits(StringRef GVName, uint64_t Off, uint64_t AccessSize) {
     parseGlobalsOnly();
     const GlobalVariable *GV = M->getNamedGlobal(GVName);
     EXPECT_NE(GV, nullptr);
-    return ejitAccessFitsMayConstField(GV, Off, AccessSize,
+    return ejitAccessFitsPeriodConstField(GV, Off, AccessSize,
                                        M->getDataLayout());
   }
 };
@@ -182,7 +182,7 @@ TEST_F(FieldOffsetTest, ChainedConstantByteGEPsInsideElement) {
 }
 
 TEST_F(FieldOffsetTest, NonArrayGlobalKeepsStructOffset) {
-  // A scalar `ejit_period` global: no array, so no modulo is applied.
+  // A scalar `ejit_group` global: no array, so no modulo is applied.
   auto Off = offsetOf(R"(
     %p = getelementptr %S, ptr @scalar, i32 0, i32 4
     %v = load i32, ptr %p
@@ -193,7 +193,7 @@ TEST_F(FieldOffsetTest, NonArrayGlobalKeepsStructOffset) {
 
 //===----------------------------------------------------------------------===//
 // Rejected shapes. Each of these could otherwise resolve to a plausible field
-// offset and cause a load the frontend never marked to be annotated may_const.
+// offset and cause a load the frontend never marked to be annotated period_const.
 //===----------------------------------------------------------------------===//
 
 TEST_F(FieldOffsetTest, RejectsTypedPointerDynamicIndex) {
@@ -289,7 +289,7 @@ TEST_F(FieldOffsetTest, FieldSizeIsRecoveredFromLayout) {
 
 TEST_F(FieldOffsetTest, FieldSizeDescendsIntoNestedRecord) {
   // %O = { %N, i32 } and %N = { i32, i32 }: offset 0 names %N (8 bytes) *and*
-  // its first field (4 bytes). The innermost one bounds a may_const access, so
+  // its first field (4 bytes). The innermost one bounds a period_const access, so
   // an i64 load at offset 0 must not be treated as reading one field.
   EXPECT_EQ(fieldSizeAt("outer", 0), std::optional<uint64_t>(4));
   EXPECT_EQ(fieldSizeAt("outer", 4), std::optional<uint64_t>(4));
@@ -307,16 +307,16 @@ TEST_F(FieldOffsetTest, AcceptsAccessNoWiderThanTheField) {
 }
 
 //===----------------------------------------------------------------------===//
-// Volatile / atomic. The offset list records a may_const field regardless of
+// Volatile / atomic. The offset list records a period_const field regardless of
 // volatility, so an offset match must not resurrect a marker the frontend
-// deliberately withheld. ejitMayConstFieldOffset is a pure pointer computation
+// deliberately withheld. ejitPeriodConstFieldOffset is a pure pointer computation
 // and stays width- and volatility-agnostic; the callers own that rejection, and
 // these pin the pointer arithmetic they rely on.
 //===----------------------------------------------------------------------===//
 
 TEST_F(FieldOffsetTest, OffsetIsComputedForVolatileAndAtomicLoadsToo) {
-  // The helper still resolves the field; it is reAnnotateMayConst and
-  // isMayConstLoad that must refuse to act on the result.
+  // The helper still resolves the field; it is reAnnotatePeriodConst and
+  // isPeriodConstLoad that must refuse to act on the result.
   auto VolOff = offsetOf(R"(
     %p = getelementptr [16 x %S], ptr @g, i64 0, i64 %ci, i32 4
     %v = load volatile i32, ptr %p
@@ -333,7 +333,7 @@ TEST_F(FieldOffsetTest, OffsetIsComputedForVolatileAndAtomicLoadsToo) {
 }
 
 TEST_F(FieldOffsetTest, RejectsWideLoadOverlappingAdjacentField) {
-  // The case that matters: an 8-byte access starting at a 4-byte may_const field
+  // The case that matters: an 8-byte access starting at a 4-byte period_const field
   // also covers the field beside it, which is free to change. Substituting it
   // would freeze both.
   EXPECT_FALSE(accessFits("g", 16, 8));

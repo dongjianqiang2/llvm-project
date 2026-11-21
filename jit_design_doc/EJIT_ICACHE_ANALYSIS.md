@@ -102,7 +102,7 @@ perf stat -e L1I_CACHE_REFILL,L1I_CACHE,L2D_CACHE_REFILL \
 
 JIT 特化对 D-cache 的影响更值得关注：
 
-- **收益**：`ejit_may_const` load 被替换为常量，减少全局变量 D-cache 访问
+- **收益**：`ejit_period_const` load 被替换为常量，减少全局变量 D-cache 访问
 - **风险**：循环展开等优化可能导致栈帧变大、寄存器溢出增多
 
 ### 5.3 分支预测

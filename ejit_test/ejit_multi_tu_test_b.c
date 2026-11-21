@@ -13,15 +13,15 @@
 #include "ejit_test_helpers.h"
 
 struct BCfg {
-  ejit_may_const uint32_t kind;
+  EJIT_PERIOD_CONST uint32_t kind;
   uint32_t y;
 };
 
 #define N_B 8
-ejit_period_arr(bcell) struct BCfg g_bCfg[N_B];
+ejit_group(bcell) struct BCfg g_bCfg[N_B];
 
 ejit_entry
-uint32_t jit_b(ejit_period_arr_ind(bcell) uint8_t i)
+uint32_t jit_b(EJIT_DIM(bcell) uint8_t i)
 {
   // JIT 应把 g_bCfg[i].kind 替换为常量并折叠此分支
   if (g_bCfg[i].kind == 0xBB)

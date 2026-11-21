@@ -6,8 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-//  PASS2: Scan the module for ejit_period and ejit_period_arr global
-//  variables and generate runtime registration calls in ejit_auto_register.
+//  PASS2: Scan the module for ejit_group global variables (scalar and
+//  indexed forms) and generate runtime registration calls in
+//  ejit_auto_register.
 //
 //===----------------------------------------------------------------------===//
 
@@ -40,10 +41,10 @@ generateRegistryTablePeriod(
                                      std::string, uint32_t>> &PeriodArrays,
     const SmallVectorImpl<std::pair<GlobalVariable *, std::string>> &StaticVars);
 
-#define DEBUG_TYPE "ejit-register-period"
+#define DEBUG_TYPE "ejit-register-group"
 
 PreservedAnalyses
-EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
+EJitRegisterGroupPass::run(Module &M, ModuleAnalysisManager &AM) {
   // Collect period variables
   SmallVector<std::tuple<GlobalVariable *, std::string, std::string, uint32_t>, 8>
       PeriodArrays; // {GV, periodName, varName, arraySize}
@@ -57,22 +58,22 @@ EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
 
     std::string varName = GV.getName().str();
 
-    if (hasMDStringEntry(MD, TAG_EJIT_PERIOD_ARR)) {
-      StringRef periodName = getMDStringValue(MD, TAG_EJIT_PERIOD_ARR);
-      uint32_t size = getMDIntValue(MD, TAG_EJIT_PERIOD_ARR);
+    if (hasMDStringEntry(MD, TAG_EJIT_GROUP_INDEXED)) {
+      StringRef periodName = getMDStringValue(MD, TAG_EJIT_GROUP_INDEXED);
+      uint32_t size = getMDIntValue(MD, TAG_EJIT_GROUP_INDEXED);
       PeriodArrays.push_back({&GV, periodName.str(), varName, size});
     }
 
-    if (hasMDStringEntry(MD, TAG_EJIT_PERIOD)) {
+    if (hasMDStringEntry(MD, TAG_EJIT_GROUP)) {
       StaticVars.push_back({&GV, varName});
     }
   }
 
   if (PeriodArrays.empty() && StaticVars.empty()) {
-    LLVM_DEBUG(dbgs() << "ejit-register-period: no period vars\n");
+    LLVM_DEBUG(dbgs() << "ejit-register-group: no period vars\n");
     return PreservedAnalyses::all();
   }
-  LLVM_DEBUG(dbgs() << "ejit-register-period: " << PeriodArrays.size()
+  LLVM_DEBUG(dbgs() << "ejit-register-group: " << PeriodArrays.size()
                     << " arrays, " << StaticVars.size() << " static vars\n");
 
   LLVMContext &Ctx = M.getContext();
@@ -126,9 +127,9 @@ EJitRegisterPeriodPass::run(Module &M, ModuleAnalysisManager &AM) {
 }
 
 /// Emit this translation unit's period/static registry entries as a private
-/// array in the ".ejit_period" section. The linker concatenates these across
+/// array in the ".ejit_group" section. The linker concatenates these across
 /// all TUs; a linker script brackets the section so ejit_init() can walk the
-/// [__start_ejit_period, __stop_ejit_period) range on bare-metal where global
+/// [__start_ejit_group, __stop_ejit_group) range on bare-metal where global
 /// constructors are unavailable.
 static void
 generateRegistryTablePeriod(
@@ -177,7 +178,7 @@ generateRegistryTablePeriod(
   }
 
   // No sentinel entry: the runtime iterates the linker-provided
-  // [__start_ejit_period, __stop_ejit_period) range over the dedicated
+  // [__start_ejit_group, __stop_ejit_group) range over the dedicated
   // section, so each translation unit contributes only its own entries.
   if (Entries.empty())
     return;
@@ -186,7 +187,7 @@ generateRegistryTablePeriod(
   Constant *ArrayInit = ConstantArray::get(ArrayTy, Entries);
 
   // Private linkage + a dedicated section. Every TU emits its own *local*
-  // array into ".ejit_period"; the linker concatenates them across TUs. The
+  // array into ".ejit_group"; the linker concatenates them across TUs. The
   // leading-dot name is the conventional ELF spelling but is NOT a valid C
   // identifier, so the linker does NOT auto-synthesize __start_/__stop_ — a
   // linker script must bracket the section (see ejit_registry.ld). A fixed
@@ -196,7 +197,7 @@ generateRegistryTablePeriod(
   auto *GV = new GlobalVariable(M, ArrayTy, /*isConstant=*/true,
                                 GlobalValue::PrivateLinkage, ArrayInit,
                                 ".ejit.registry.period");
-  GV->setSection(SECT_EJIT_PERIOD);
+  GV->setSection(SECT_EJIT_GROUP);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }

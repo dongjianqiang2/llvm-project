@@ -3,15 +3,15 @@
 
 struct Slot {
   unsigned char live;
-  __attribute__((ejit_may_const)) unsigned char enabled;
+  __attribute__((ejit_period_const)) unsigned char enabled;
   unsigned short payload;
 };
 struct Cell {
   unsigned long long header;
   struct Slot slots[5];
 };
-__attribute__((ejit_period_arr("cell"))) struct Cell *nested;
-__attribute__((ejit_period_arr("trp"))) struct Slot *flat;
+__attribute__((ejit_group("cell"))) struct Cell *nested;
+__attribute__((ejit_group("trp"))) struct Slot *flat;
 
 // Bounds are registered separately at runtime. The pointee layout authorizes
 // only marked fields and includes nested array elements and exact field widths.
@@ -25,12 +25,12 @@ __attribute__((ejit_period_arr("trp"))) struct Slot *flat;
 // CHECK-DAG: ![[FLAT]] = !{i64 1, i64 1}
 
 struct Exclusions {
-  __attribute__((ejit_may_const)) volatile int volatileField;
-  __attribute__((ejit_may_const)) _Atomic(int) atomicField;
-  __attribute__((ejit_may_const)) unsigned bits : 3;
+  __attribute__((ejit_period_const)) volatile int volatileField;
+  __attribute__((ejit_period_const)) _Atomic(int) atomicField;
+  __attribute__((ejit_period_const)) unsigned bits : 3;
   int live;
-  __attribute__((ejit_may_const)) int fixed;
+  __attribute__((ejit_period_const)) int fixed;
 };
-__attribute__((ejit_period_arr("cell"))) struct Exclusions *exclusions;
+__attribute__((ejit_group("cell"))) struct Exclusions *exclusions;
 // CHECK-DAG: !{!"ejit_pointer_layout", i64 20, ![[FIXED:[0-9]+]]}
 // CHECK-DAG: ![[FIXED]] = !{i64 16, i64 4}

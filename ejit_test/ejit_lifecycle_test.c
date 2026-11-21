@@ -21,39 +21,39 @@
 //===-- 两个共享相同 period name 的结构体数组 -------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t trafficLoad;
 };
 
 struct CellPhy {
-  ejit_may_const uint32_t phyCellId;
+  EJIT_PERIOD_CONST uint32_t phyCellId;
   uint32_t rssi;
 };
 
 struct SingleCfg {
-  ejit_may_const uint32_t value;
+  EJIT_PERIOD_CONST uint32_t value;
   uint32_t padding;
 };
 
 #define N 8
-ejit_period_arr(cell) struct CellCfg g_cellCfg[N];
-ejit_period_arr(cell) struct CellPhy g_cellPhy[N];
-ejit_period_arr(single) struct SingleCfg g_singleCfg[N];
+ejit_group(cell) struct CellCfg g_cellCfg[N];
+ejit_group(cell) struct CellPhy g_cellPhy[N];
+ejit_group(single) struct SingleCfg g_singleCfg[N];
 
-ejit_period(static) uint32_t g_sysVer;
+ejit_group(static) uint32_t g_sysVer;
 
-//===-- JIT entry: 访问两个数组的 may_const ---------------------------------===//
+//===-- JIT entry: 访问两个数组的 period_const ---------------------------------===//
 
 ejit_entry
 uint32_t read_both(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   return g_cellCfg[ci].cellType + g_cellPhy[ci].phyCellId;
 }
 
 ejit_entry
 uint32_t read_single(
-    ejit_period_arr_ind(single) uint8_t ci)
+    EJIT_DIM(single) uint8_t ci)
 {
   return g_singleCfg[ci].value;
 }

@@ -36,11 +36,11 @@ struct GVPeriodInfo {
 };
 
 using GVPeriodMap = DenseMap<const GlobalVariable *, GVPeriodInfo>;
-using MayConstOffsetMap =
+using PeriodConstOffsetMap =
     DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>>;
 
 /// Value boundaries the pass may assume while computing the address of a
-/// may_const load. Used for both ejit_bound_ptr roots (where the value is the
+/// period_const load. Used for both ejit_bound_ptr roots (where the value is the
 /// offset of the borrowed object) and ejit_free_dim parameters (where it is the
 /// witness the address is evaluated at). Local free-dim operation results also
 /// appear here; their initializer inputs are deliberately absent.
@@ -62,7 +62,7 @@ struct EJitLocalWitnessPeriod {
 };
 
 /// PASS6: JIT-time specialization pass. Scans the module for load instructions
-/// with !ejit.may_const metadata, reads the actual runtime values from process
+/// with !ejit.period_const metadata, reads the actual runtime values from process
 /// memory via the PeriodArrayRegistry or a borrowed bound-pointer view, and
 /// replaces the loads with LLVM constants.
 class EJitStructFieldPass : public PassInfoMixin<EJitStructFieldPass> {
@@ -98,21 +98,21 @@ public:
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Identify loads using the same metadata and field-offset fallback as the
   /// replacement pass. The returned sites are read-only audit data.
-  std::vector<EJitMayConstLoadSite>
-  collectMayConstLoadSites(const Module &M) const;
+  std::vector<EJitPeriodConstLoadSite>
+  collectPeriodConstLoadSites(const Module &M) const;
 
-  /// Add one monotonic i64 counter immediately before every may_const load.
+  /// Add one monotonic i64 counter immediately before every period_const load.
   /// The later specialization may remove the load, but the counter remains at
   /// the original control-flow site in the temporary Tier-1 code.
-  std::vector<EJitMayConstLoadSite> instrumentMayConstLoadSites(Module &M);
+  std::vector<EJitPeriodConstLoadSite> instrumentPeriodConstLoadSites(Module &M);
 
   /// Remove the temporary counter increments and backing global after profile
   /// matching, before final code optimization/publication.
-  static void removeMayConstLoadInstrumentation(Module &M);
+  static void removePeriodConstLoadInstrumentation(Module &M);
 
-  static constexpr const char *MayConstCounterName = "__ejit_mayconst_hits";
-  static constexpr const char *MayConstAuditSiteMD =
-      "ejit.mayconst.audit.site";
+  static constexpr const char *PeriodConstCounterName = "__ejit_period_const_hits";
+  static constexpr const char *PeriodConstAuditSiteMD =
+      "ejit.period_const.audit.site";
 #endif
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
@@ -126,14 +126,14 @@ private:
   struct BoundPointerState {
     EJitBoundPointerView view;
     AssumedArgMap boundArguments;
-    SmallVector<std::pair<uint64_t, uint64_t>, 4> mayConstFields;
+    SmallVector<std::pair<uint64_t, uint64_t>, 4> periodConstFields;
   };
   SmallVector<BoundPointerState, kEJitMaxBoundPointers> boundStates_;
   void initBoundArgumentPropagation(Module &M);
 
   /// ejit_free_dim parameters, mapped to the witness their addresses are
   /// evaluated at (always 0). Consulted ONLY when computing the byte offset of
-  /// a may_const load: the argument itself is never replaced, so the stores and
+  /// a period_const load: the argument itself is never replaced, so the stores and
   /// the address arithmetic the source performs keep the live parameter. See
   /// initFreeDimAssumptions().
   EJitFreeDimAssumptions freeDimAssumptions_;
@@ -141,7 +141,7 @@ private:
 
   // Cached metadata maps — built once per module, reused across functions.
   GVPeriodMap gvPeriodMap_;
-  MayConstOffsetMap mayConstFieldMap_;
+  PeriodConstOffsetMap periodConstFieldMap_;
   bool mapsBuilt_ = false;
 };
 

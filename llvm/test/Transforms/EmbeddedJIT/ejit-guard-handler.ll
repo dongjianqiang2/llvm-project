@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-period-handler -S %s | FileCheck %s
+; RUN: opt -passes=ejit-guard-handler -S %s | FileCheck %s
 
 ; CHECK: define void @lc_single(i32 %cell_idx)
 ; CHECK: call void @ejit_deactivate(ptr {{.*}}, i32 %cell_idx)
@@ -24,7 +24,7 @@ entry:
   ret void
 }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 10}}
-!12 = distinct !{!{!"ejit_period_arr", !"trp", i32 5}}
-!20 = distinct !{!{!"ejit_period_lc", !"cell"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!22 = distinct !{!{!"ejit_period_lc", !"cell"}, !{!"ejit_period_lc", !"trp"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 10}}
+!12 = distinct !{!{!"ejit_group_indexed", !"trp", i32 5}}
+!20 = distinct !{!{!"ejit_guard", !"cell"}, !{!"ejit_dim", !"cell", i32 0}}
+!22 = distinct !{!{!"ejit_guard", !"cell"}, !{!"ejit_guard", !"trp"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}}

@@ -34,8 +34,8 @@ entry:
 @data2 = global i32 0, !ejit.metadata !11
 @data3 = global i32 0, !ejit.metadata !12
 
-!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
-!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}, !{!"ejit_period_arr_ind", !"grp", i32 2}}
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
-!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 32}}
-!12 = distinct !{!{!"ejit_period_arr", !"grp", i32 48}}
+!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}}
+!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}, !{!"ejit_dim", !"grp", i32 2}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}
+!11 = distinct !{!{!"ejit_group_indexed", !"trp", i32 32}}
+!12 = distinct !{!{!"ejit_group_indexed", !"grp", i32 48}}

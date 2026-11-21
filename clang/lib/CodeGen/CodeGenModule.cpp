@@ -5475,7 +5475,7 @@ llvm::Constant *CodeGenModule::GetAddrOfGlobalVar(const VarDecl *D,
   // already has metadata (e.g. the definition was emitted first) is not
   // re-worked.
   if (auto *GV = dyn_cast<llvm::GlobalVariable>(Addr))
-    if ((D->hasAttr<EjitPeriodAttr>() || D->hasAttr<EjitPeriodArrAttr>()) &&
+    if (D->hasAttr<EjitGroupAttr>() &&
         !GV->hasMetadata(llvm::ejit::MD_EJIT_METADATA))
       emitEjitGlobalMetadata(*this, D, GV);
 
@@ -5998,8 +5998,8 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
     if (getCodeGenOpts().hasReducedDebugInfo())
       DI->EmitGlobalVariable(GV, D);
 
-  // EmbeddedJIT: emit !ejit.metadata for ejit_period/ejit_period_arr globals
-  if (D->hasAttr<EjitPeriodAttr>() || D->hasAttr<EjitPeriodArrAttr>())
+  // EmbeddedJIT: emit !ejit.metadata for ejit_group globals
+  if (D->hasAttr<EjitGroupAttr>())
     emitEjitGlobalMetadata(*this, D, GV);
 }
 
@@ -6355,8 +6355,8 @@ void CodeGenModule::EmitGlobalFunctionDefinition(GlobalDecl GD,
   if (getLangOpts().OpenMP && D->hasAttr<OMPDeclareTargetDeclAttr>())
     getOpenMPRuntime().emitDeclareTargetFunction(D, GV);
 
-  // EmbeddedJIT: emit !ejit.metadata for ejit_entry / ejit_period_lc functions
-  if (D->hasAttr<EjitEntryAttr>() || D->hasAttr<EjitPeriodLcAttr>())
+  // EmbeddedJIT: emit !ejit.metadata for ejit_entry / ejit_guard functions
+  if (D->hasAttr<EjitEntryAttr>() || D->hasAttr<EjitGuardAttr>())
     emitEjitFunctionMetadata(*this, D, Fn);
 }
 

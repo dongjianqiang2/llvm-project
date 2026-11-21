@@ -26,11 +26,11 @@ using namespace clang;
 using namespace CodeGen;
 using namespace llvm::ejit;
 
-static void collectBoundMayConstFields(
+static void collectBoundPeriodConstFields(
     ASTContext &Ctx, const RecordDecl *RD, uint64_t BaseOffset,
     SmallVectorImpl<std::pair<uint64_t, uint64_t>> &Fields);
 
-/// Emit !ejit.metadata for an ejit_entry or ejit_period_lc function.
+/// Emit !ejit.metadata for an ejit_entry or ejit_guard function.
 void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
                                               const FunctionDecl *FD,
                                               llvm::Function *F) {
@@ -52,10 +52,10 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
       F->addFnAttr(llvm::Attribute::NoInline);
   }
 
-  // ejit_period_lc
-  for (const auto *LCA : FD->specific_attrs<EjitPeriodLcAttr>()) {
+  // ejit_guard
+  for (const auto *LCA : FD->specific_attrs<EjitGuardAttr>()) {
     Entries.push_back(llvm::MDNode::get(Ctx, {
-        llvm::MDString::get(Ctx, TAG_EJIT_PERIOD_LC),
+        llvm::MDString::get(Ctx, TAG_EJIT_GUARD),
         llvm::MDString::get(Ctx, LCA->getPeriodName())
     }));
   }
@@ -67,7 +67,7 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   // Lifecycle guards are entered/left rarely, so NoInline has no real
   // perf cost. Sema rejects always_inline here too; the guard backstops
   // hand-written IR.
-  if (FD->hasAttr<EjitPeriodLcAttr>() &&
+  if (FD->hasAttr<EjitGuardAttr>() &&
       !F->hasFnAttribute(llvm::Attribute::AlwaysInline))
     F->addFnAttr(llvm::Attribute::NoInline);
 
@@ -85,17 +85,17 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
         << AttrName << PD;
   };
 
-  // ejit_period_arr_ind (on parameters)
+  // ejit_dim (on parameters)
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {
     const ParmVarDecl *PD = FD->getParamDecl(I);
-    if (const auto *IdxAttr = PD->getAttr<EjitPeriodArrIndAttr>()) {
+    if (const auto *IdxAttr = PD->getAttr<EjitDimAttr>()) {
       std::optional<unsigned> ArgNo = irArg(I);
       if (!ArgNo) {
-        diagnoseUnmappable(PD, "ejit_period_arr_ind");
+        diagnoseUnmappable(PD, "ejit_dim");
         continue;
       }
       Entries.push_back(llvm::MDNode::get(
-          Ctx, {llvm::MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+          Ctx, {llvm::MDString::get(Ctx, TAG_EJIT_DIM),
                 llvm::MDString::get(Ctx, IdxAttr->getPeriodName()),
                 llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
                     llvm::Type::getInt32Ty(Ctx), *ArgNo))}));
@@ -103,12 +103,12 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
   }
 
   // ejit_free_dim (on parameters). Same {tag, name, argIndex} shape as
-  // ejit_period_arr_ind with an empty name, so a consumer that identifies a dim
+  // ejit_dim with an empty name, so a consumer that identifies a dim
   // by operand position needs no special case. It is deliberately NOT a
-  // dimension on the wire: no consumer of TAG_EJIT_PERIOD_ARR_IND matches this
+  // dimension on the wire: no consumer of TAG_EJIT_DIM matches this
   // tag, so the wrapper registers no dim, the cache key does not grow, and the
   // parameter is never substituted into the IR. Only PASS6 reads it, to
-  // evaluate may_const addresses at a witness of 0.
+  // evaluate period_const addresses at a witness of 0.
   for (unsigned I = 0; I < FD->getNumParams(); ++I) {
     const ParmVarDecl *PD = FD->getParamDecl(I);
     if (PD->hasAttr<EjitFreeDimAttr>()) {
@@ -156,7 +156,7 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
                                      PointeeAlign))};
       if (const auto *RD = Pointee->getAsRecordDecl()) {
         SmallVector<std::pair<uint64_t, uint64_t>, 8> Fields;
-        collectBoundMayConstFields(CGM.getContext(), RD, 0, Fields);
+        collectBoundPeriodConstFields(CGM.getContext(), RD, 0, Fields);
         for (const auto &[Offset, FieldSize] : Fields)
           BoundOps.push_back(llvm::MDNode::get(
               Ctx, {llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
@@ -177,7 +177,7 @@ void clang::CodeGen::emitEjitFunctionMetadata(CodeGenModule &CGM,
 // Share the traversal for global offsets and bound-object field extents.
 // Arrays of records matter for a local witness selecting slots within a cell.
 // The budget bounds metadata growth; omitted descriptors only miss folding.
-static void collectMayConstFields(
+static void collectPeriodConstFields(
     ASTContext &Ctx, QualType Type, uint64_t BaseOffset,
     llvm::function_ref<void(uint64_t, QualType)> Emit, unsigned &Budget,
     bool ExpandArrays = true) {
@@ -195,7 +195,7 @@ static void collectMayConstFields(
          I < Count && Budget; ++I) {
       if (Stride && I > (UINT64_MAX - BaseOffset) / Stride)
         break;
-      collectMayConstFields(Ctx, Element, BaseOffset + I * Stride, Emit, Budget,
+      collectPeriodConstFields(Ctx, Element, BaseOffset + I * Stride, Emit, Budget,
                             ExpandArrays);
     }
     return;
@@ -215,18 +215,18 @@ static void collectMayConstFields(
       continue;
     const uint64_t Offset = BaseOffset + Relative;
     QualType FieldType = FD->getType();
-    if (FD->hasAttr<EjitMayConstAttr>() && !FieldType.isVolatileQualified())
+    if (FD->hasAttr<EjitPeriodConstAttr>() && !FieldType.isVolatileQualified())
       Emit(Offset, FieldType);
-    collectMayConstFields(Ctx, FieldType, Offset, Emit, Budget, ExpandArrays);
+    collectPeriodConstFields(Ctx, FieldType, Offset, Emit, Budget, ExpandArrays);
   }
 }
 
-static void collectMayConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
+static void collectPeriodConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
                                         uint64_t BaseOffset,
                                         SmallVectorImpl<uint64_t> &Offsets,
                                         bool ExpandArrays) {
   unsigned Budget = 4096;
-  collectMayConstFields(Ctx, Ctx.getRecordType(RD), BaseOffset,
+  collectPeriodConstFields(Ctx, Ctx.getRecordType(RD), BaseOffset,
                        [&](uint64_t Offset, QualType) {
                          // Preserve the existing i32 global-offset encoding.
                          if (Offset <= UINT32_MAX)
@@ -234,11 +234,11 @@ static void collectMayConstFieldOffsets(ASTContext &Ctx, const RecordDecl *RD,
                        }, Budget, ExpandArrays);
 }
 
-static void collectBoundMayConstFields(
+static void collectBoundPeriodConstFields(
     ASTContext &Ctx, const RecordDecl *RD, uint64_t BaseOffset,
     SmallVectorImpl<std::pair<uint64_t, uint64_t>> &Fields) {
   unsigned Budget = 4096;
-  collectMayConstFields(Ctx, Ctx.getRecordType(RD), BaseOffset,
+  collectPeriodConstFields(Ctx, Ctx.getRecordType(RD), BaseOffset,
                        [&](uint64_t Offset, QualType Type) {
                          Fields.push_back(
                              {Offset, Ctx.getTypeSizeInChars(Type).getQuantity()});
@@ -293,7 +293,7 @@ static bool collectPointerPeriodFields(
     if (FT->isIncompleteType() || FT->isVariablyModifiedType())
       continue;
     uint64_t Offset = Base + Layout.getFieldOffset(FD->getFieldIndex()) / 8;
-    if (FD->hasAttr<EjitMayConstAttr>())
+    if (FD->hasAttr<EjitPeriodConstAttr>())
       Fields.emplace_back(Offset, Ctx.getTypeSizeInChars(FT).getQuantity());
     if (!collectPointerPeriodFields(Ctx, FT, Offset, Fields, Budget))
       return false;
@@ -301,37 +301,40 @@ static bool collectPointerPeriodFields(
   return true;
 }
 
-/// Emit !ejit.metadata for an ejit_period or ejit_period_arr global variable.
+/// Emit !ejit.metadata for an ejit_group global variable.
 void clang::CodeGen::emitEjitGlobalMetadata(CodeGenModule &CGM,
                                             const VarDecl *VD,
                                             llvm::GlobalVariable *GV) {
   llvm::LLVMContext &Ctx = CGM.getLLVMContext();
   SmallVector<llvm::Metadata *, 4> Entries;
 
-  // ejit_period
-  if (const auto *PA = VD->getAttr<EjitPeriodAttr>()) {
-    Entries.push_back(llvm::MDNode::get(Ctx, {
-        llvm::MDString::get(Ctx, TAG_EJIT_PERIOD),
-        llvm::MDString::get(Ctx, PA->getPeriodName())
-    }));
-  }
-
-  // ejit_period_arr
-  if (const auto *PAA = VD->getAttr<EjitPeriodArrAttr>()) {
-    uint64_t Size = 0;
-    if (const auto *CAT =
-            CGM.getContext().getAsConstantArrayType(VD->getType())) {
-      Size = CAT->getSize().getZExtValue();
+  // ejit_group: scalar form emits TAG_EJIT_GROUP, indexed form (array /
+  // pointer-to-struct) emits TAG_EJIT_GROUP_INDEXED with the element count
+  // (0 for pointers, whose size is dynamic). The form is inferred from the
+  // variable type by Sema (handleEjitGroupAttr) and recorded in the fake
+  // Indexed argument.
+  if (const auto *GA = VD->getAttr<EjitGroupAttr>()) {
+    if (GA->getIndexed()) {
+      uint64_t Size = 0;
+      if (const auto *CAT =
+              CGM.getContext().getAsConstantArrayType(VD->getType())) {
+        Size = CAT->getSize().getZExtValue();
+      }
+      Entries.push_back(llvm::MDNode::get(Ctx, {
+          llvm::MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
+          llvm::MDString::get(Ctx, GA->getPeriodName()),
+          llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Size))
+      }));
+    } else {
+      Entries.push_back(llvm::MDNode::get(Ctx, {
+          llvm::MDString::get(Ctx, TAG_EJIT_GROUP),
+          llvm::MDString::get(Ctx, GA->getPeriodName())
+      }));
     }
-    Entries.push_back(llvm::MDNode::get(Ctx, {
-        llvm::MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
-        llvm::MDString::get(Ctx, PAA->getPeriodName()),
-        llvm::ConstantAsMetadata::get(
-            llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Size))
-    }));
   }
 
-  // ejit_may_const_field: encode byte offsets for PASS6 fallback
+  // ejit_period_const_field: encode byte offsets for PASS6 fallback
   QualType VT = VD->getType();
   if (const auto *AT = CGM.getContext().getAsArrayType(VT))
     VT = AT->getElementType();
@@ -345,11 +348,11 @@ void clang::CodeGen::emitEjitGlobalMetadata(CodeGenModule &CGM,
       // Preserve their legacy non-array offsets: expanding nested arrays here
       // would rescue a rejected layout with partial offset-only descriptors,
       // and could also mislabel the pointer-slot load as pointee field zero.
-      collectMayConstFieldOffsets(CGM.getContext(), RD, 0, Offsets,
+      collectPeriodConstFieldOffsets(CGM.getContext(), RD, 0, Offsets,
                                   !IsPointerRoot);
       for (uint64_t Off : Offsets) {
         Entries.push_back(llvm::MDNode::get(Ctx, {
-            llvm::MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+            llvm::MDString::get(Ctx, TAG_EJIT_PERIOD_CONST_FIELD),
             llvm::ConstantAsMetadata::get(
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Off))
         }));

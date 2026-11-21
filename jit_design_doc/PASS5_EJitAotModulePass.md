@@ -26,9 +26,9 @@ EJitAotModulePass 是 AOT 编译 Pipeline 的协调器，负责按序调度 4 �
 
 | 步骤 | Pass | 职责 |
 |------|------|------|
-| 1 | EJitRegisterPeriodPass | 时间窗变量注册 |
+| 1 | EJitRegisterGroupPass | 时间窗变量注册 |
 | 2 | EJitWrapperGenPass | Wrapper 插桩 |
-| 3 | EJitPeriodHandlerPass | 生命周期处理 |
+| 3 | EJitGuardHandlerPass | 生命周期处理 |
 
 ### 1.3 Pipeline 位置与设计决策
 
@@ -54,7 +54,7 @@ LTO 路径放在优化之后的原因：LTO 已经完成了完整的优化流程
 
 **Bitcode 提取为何不在本协调器内**：
 
-`!ejit.may_const` metadata 标注在 `load` 指令上（instruction-level metadata），标准优化（SROA、InstCombine、GVN）会丢弃它。因此 `EJitRegisterBitcodePass` 必须在优化之前独立运行，单独注册为早期 Pass。
+`!ejit.period_const` metadata 标注在 `load` 指令上（instruction-level metadata），标准优化（SROA、InstCombine、GVN）会丢弃它。因此 `EJitRegisterBitcodePass` 必须在优化之前独立运行，单独注册为早期 Pass。
 
 ---
 
@@ -64,14 +64,14 @@ LTO 路径放在优化之后的原因：LTO 已经完成了完整的优化流程
 
 - LLVM Module（非 LTO: 未优化; LTO: 经标准优化后）
 - 已嵌入 `@__ejit_bitcode` 全局变量（由早期 `EJitRegisterBitcodePass` 生成）
-- 包含 `ejit_entry` / `ejit_period_lc` 函数（可能已被内联/优化，但 `ejit.metadata` 保留）
-- 包含 `ejit_period` / `ejit_period_arr` 全局变量
+- 包含 `ejit_entry` / `ejit_guard` 函数（可能已被内联/优化，但 `ejit.metadata` 保留）
+- 包含 `ejit_group` / `ejit_group` 全局变量
 
 ### 2.2 输出
 
 - Module 含扩展的 `ejit_auto_register()` 函数（追加变量注册调用）
 - ejit_entry 函数被改写为单函数混合 Wrapper
-- ejit_period_lc 函数入口/出口添加 activate/deactivate 调用
+- ejit_guard 函数入口/出口添加 activate/deactivate 调用
 
 ---
 
@@ -93,7 +93,7 @@ public:
 
         // Step 1: 时间窗变量注册
         {
-            EJitRegisterPeriodPass P1;
+            EJitRegisterGroupPass P1;
             PreservedAnalyses PA1 = P1.run(M, AM);
             if (!PA1.areAllPreserved()) anyChange = true;
             PA.intersect(PA1);
@@ -109,7 +109,7 @@ public:
 
         // Step 3: 生命周期处理
         {
-            EJitPeriodHandlerPass P3;
+            EJitGuardHandlerPass P3;
             PreservedAnalyses PA3 = P3.run(M, AM);
             if (!PA3.areAllPreserved()) anyChange = true;
             PA.intersect(PA3);
@@ -170,7 +170,7 @@ bool hasAnyEjitMetadata(Module& M) {
 ```cpp
 void runDiagnosticCheck(Module& M) {
     // 检查 ejit_entry 函数实际引用的全局变量
-    // 是否与其声明的 ejit_period_arr_ind 一致
+    // 是否与其声明的 ejit_dim 一致
 
     for (Function& F : M.functions()) {
         MDNode* MD = F.getMetadata("ejit.metadata");
@@ -181,13 +181,13 @@ void runDiagnosticCheck(Module& M) {
         for (const MDOperand& Op : MD->operands()) {
             MDNode* Entry = cast<MDNode>(Op);
             StringRef tag = cast<MDString>(Entry->getOperand(0))->getString();
-            if (tag == "ejit_period_arr_ind") {
+            if (tag == "ejit_dim") {
                 declaredPeriods.insert(
                     cast<MDString>(Entry->getOperand(1))->getString().str());
             }
         }
 
-        // 收集函数中实际引用的 ejit_period_arr 全局变量
+        // 收集函数中实际引用的 ejit_group 全局变量
         std::set<std::string> actualPeriods;
         for (BasicBlock& BB : F) {
             for (Instruction& I : BB) {
@@ -198,7 +198,7 @@ void runDiagnosticCheck(Module& M) {
                                 MDNode* gvEntry = cast<MDNode>(gvOp);
                                 StringRef gvTag = cast<MDString>(
                                     gvEntry->getOperand(0))->getString();
-                                if (gvTag == "ejit_period_arr") {
+                                if (gvTag == "ejit_group_indexed") {
                                     actualPeriods.insert(
                                         cast<MDString>(
                                             gvEntry->getOperand(1))->getString().str());

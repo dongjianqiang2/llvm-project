@@ -196,9 +196,9 @@ EJitOrcEngine::Create(const EJitConfig& config) {
                 // 单独运行 Inline —— callee 已在 AOT 预优化
                 // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) 内联，
                 // 跨函数常量改由 IPSCCP 在调用边界传播。
-                //   1a preReplacePeriodIndices —— ejit_period_arr_ind 参数 → 常量
+                //   1a preReplacePeriodIndices —— ejit_dim 参数 → 常量
                 //   1b runInstCombine          —— 折叠常量 GEP 链
-                //   1c EJitStructFieldPass      —— may_const load → 常量
+                //   1c EJitStructFieldPass      —— period_const load → 常量
                 //   1d runInterproceduralPropagation —— 内部化非 entry 定义 + IPSCCP
                 //   1e/1f runInstCombine + EJitStructFieldPass（对 callee 再做一轮）
                 //   2-4 LowerExpect + buildFunctionSimplificationPipeline(O1/O2/O3)
@@ -682,7 +682,7 @@ void EJitAsyncCompiler::compileOne(const CompileRequest& req) {
         return;
     }
 
-    // 内存序保证：在读取 may_const 字段值之前获取同步屏障
+    // 内存序保证：在读取 period_const 字段值之前获取同步屏障
     // 确保用户线程在 activate() 中对全局变量的写入对编译线程可见
     // （与 RuntimeState::activate 中的 release 屏障配对）
     std::atomic_thread_fence(std::memory_order_acquire);
@@ -765,7 +765,7 @@ engine->J->getIRTransformLayer().setTransform(
 `preReplacePeriodIndices`、`runInstCombine`、`runInterproceduralPropagation`、`runOptimizationPipeline` 现为 `EJitOptimizer` 的成员函数（`llvm/lib/ExecutionEngine/EJIT/EJitOptimizer.cpp`，详见 §2.4.2, §2.4.3）。
 ### 2.4.2 JIT Pipeline 各阶段实现
 
-**`preReplacePeriodIndices`** — 将 `ejit_period_arr_ind` 参数替换为运行时常量值：
+**`preReplacePeriodIndices`** — 将 `ejit_dim` 参数替换为运行时常量值：
 
 ```cpp
 void preReplacePeriodIndices(Module& M, SpecializationContext* ctx) {
@@ -1368,7 +1368,7 @@ host 测试适配层可以使用 `std::thread` 模拟 worker，但 target core �
 
 ### 3.4 异步编译的内存序保证
 
-异步模式下，用户线程和编译线程共享全局变量数据（`ejit_may_const` 字段值）。必须确保以下 happens-before 关系成立：
+异步模式下，用户线程和编译线程共享全局变量数据（`ejit_period_const` 字段值）。必须确保以下 happens-before 关系成立：
 
 ```
 用户线程                          编译线程
@@ -1381,7 +1381,7 @@ ejit_activate(name, idx)
   │                                         ├─ isPeriodActive() → active
   │                                         ├─ atomic_thread_fence
   │                                         │  (memory_order_acquire)
-  │                                         └─ 读取 may_const 字段值
+  │                                         └─ 读取 period_const 字段值
   │                                            (可见 activate 前的写入)
 
 ejit_deactivate(name, idx)
@@ -1412,8 +1412,8 @@ void EJitRuntimeState::deactivate(const std::string& periodName, int cellIdx) {
 ```
 
 **关键规则**：
-- `ejit_activate` 必须在**写入** may_const 全局变量之后调用（或 activate 本身不代表写入，写入由业务代码在 activate 前完成）。若写入与 activate 并不同步，业务代码应在 activate 前自行加 barrier。
-- `compileOne` 在读取 may_const 字段值前执行 `acquire` fence，与 activate 中的 `release` fence 配对，保证字段修改可见。
+- `ejit_activate` 必须在**写入** period_const 全局变量之后调用（或 activate 本身不代表写入，写入由业务代码在 activate 前完成）。若写入与 activate 并不同步，业务代码应在 activate 前自行加 barrier。
+- `compileOne` 在读取 period_const 字段值前执行 `acquire` fence，与 activate 中的 `release` fence 配对，保证字段修改可见。
 - `isPeriodActive` 检查本身在 mutex 保护下，确保 deactivate 后提交的编译请求能看到失效状态。
 - 若 `isPeriodActive` 返回 false，`compileOne` 直接跳过，不读取任何字段值——因此不存在 "读到半修改值" 的窗口。
 
@@ -1680,7 +1680,7 @@ llvm/include/llvm/ExecutionEngine/EJIT/
 ```c
 // test_ejit_integration.c
 // 场景 1: 端到端同步编译
-//   定义 struct + ejit_may_const + ejit_period_arr
+//   定义 struct + ejit_period_const + ejit_group
 //   定义 ejit_entry 函数
 //   AOT 编译 + bitcode 嵌入
 //   运行时: init → activate → 调用 → 验证特化结果与预期一致

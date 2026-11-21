@@ -44,21 +44,21 @@ uint64_t scaledRatio(uint64_t Numerator, uint64_t Denominator,
 
 } // namespace
 
-EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
-    ArrayRef<EJitMayConstBenefitSample> Samples) {
-  EJitMayConstBenefitSummary Summary;
+EJitPeriodConstBenefitSummary llvm::ejit::summarizePeriodConstBenefits(
+    ArrayRef<EJitPeriodConstBenefitSample> Samples) {
+  EJitPeriodConstBenefitSummary Summary;
   Summary.versions = Samples.size();
   if (Samples.empty())
     return Summary;
 
   bool First = true;
-  for (const EJitMayConstBenefitSample &Sample : Samples) {
-    Summary.inputMayConstLoads =
-        saturatingAdd(Summary.inputMayConstLoads, Sample.inputMayConstLoads);
-    Summary.specializedMayConstLoads = saturatingAdd(
-        Summary.specializedMayConstLoads, Sample.specializedMayConstLoads);
-    Summary.finalMayConstLoads =
-        saturatingAdd(Summary.finalMayConstLoads, Sample.finalMayConstLoads);
+  for (const EJitPeriodConstBenefitSample &Sample : Samples) {
+    Summary.inputPeriodConstLoads =
+        saturatingAdd(Summary.inputPeriodConstLoads, Sample.inputPeriodConstLoads);
+    Summary.specializedPeriodConstLoads = saturatingAdd(
+        Summary.specializedPeriodConstLoads, Sample.specializedPeriodConstLoads);
+    Summary.finalPeriodConstLoads =
+        saturatingAdd(Summary.finalPeriodConstLoads, Sample.finalPeriodConstLoads);
     Summary.runtimeHits = saturatingAdd(Summary.runtimeHits, Sample.runtimeHits);
     Summary.hitSites = saturatingAdd(Summary.hitSites, Sample.hitSites);
     Summary.removedRuntimeHits =
@@ -69,8 +69,8 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
         saturatingAdd(Summary.sampledEntries, Sample.sampledEntries);
     Summary.sampleCycles =
         saturatingAdd(Summary.sampleCycles, Sample.sampleCycles);
-    const int64_t Removed = static_cast<int64_t>(Sample.inputMayConstLoads) -
-                            static_cast<int64_t>(Sample.finalMayConstLoads);
+    const int64_t Removed = static_cast<int64_t>(Sample.inputPeriodConstLoads) -
+                            static_cast<int64_t>(Sample.finalPeriodConstLoads);
     if (First) {
       Summary.minimumRemoved = Removed;
       Summary.maximumRemoved = Removed;
@@ -81,14 +81,14 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
     }
   }
 
-  Summary.totalRemoved = static_cast<int64_t>(Summary.inputMayConstLoads) -
-                         static_cast<int64_t>(Summary.finalMayConstLoads);
+  Summary.totalRemoved = static_cast<int64_t>(Summary.inputPeriodConstLoads) -
+                         static_cast<int64_t>(Summary.finalPeriodConstLoads);
   Summary.directRemoved =
-      static_cast<int64_t>(Summary.inputMayConstLoads) -
-      static_cast<int64_t>(Summary.specializedMayConstLoads);
+      static_cast<int64_t>(Summary.inputPeriodConstLoads) -
+      static_cast<int64_t>(Summary.specializedPeriodConstLoads);
   Summary.pipelineRemoved =
-      static_cast<int64_t>(Summary.specializedMayConstLoads) -
-      static_cast<int64_t>(Summary.finalMayConstLoads);
+      static_cast<int64_t>(Summary.specializedPeriodConstLoads) -
+      static_cast<int64_t>(Summary.finalPeriodConstLoads);
   Summary.averageRemoved =
       Summary.totalRemoved / static_cast<int64_t>(Summary.versions);
   Summary.averageActiveSitesPermille =
@@ -97,10 +97,10 @@ EJitMayConstBenefitSummary llvm::ejit::summarizeMayConstBenefits(
       scaledRatio(Summary.removedRuntimeHits, Summary.sampledEntries, 1000);
   Summary.benefitPerMillionCyclesMilli = scaledRatio(
       Summary.removedRuntimeHits, Summary.sampleCycles, 1000000000);
-  if (Summary.inputMayConstLoads != 0)
+  if (Summary.inputPeriodConstLoads != 0)
     Summary.weightedRemovedPermille =
         Summary.totalRemoved * 1000 /
-        static_cast<int64_t>(Summary.inputMayConstLoads);
+        static_cast<int64_t>(Summary.inputPeriodConstLoads);
   return Summary;
 }
 

@@ -5,15 +5,15 @@
 #include <unistd.h>
 
 struct SlotConfig {
-  ejit_may_const unsigned char enabled;
+  EJIT_PERIOD_CONST unsigned char enabled;
   unsigned char live;
 };
 struct CellConfig {
   struct SlotConfig slots[10];
 };
-ejit_period_arr(cell) struct CellConfig *bounded_cells;
+ejit_group(cell) struct CellConfig *bounded_cells;
 
-ejit_entry unsigned probe_bounded(ejit_period_arr_ind(cell) unsigned char cell,
+ejit_entry unsigned probe_bounded(EJIT_DIM(cell) unsigned char cell,
                                   ejit_free_dim unsigned short slot) {
   struct SlotConfig *selected = &bounded_cells[cell].slots[slot % 10];
   ++selected->live;

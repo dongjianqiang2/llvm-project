@@ -119,10 +119,10 @@ struct SpecializationContext {
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   /// Runtime hit snapshot from the temporary Instrumented tier. Populated by
   /// the compile driver before the final compile starts.
-  std::vector<EJitMayConstLoadSite> mayConstLoadSites;
+  std::vector<EJitPeriodConstLoadSite> periodConstLoadSites;
   /// Platform timestamp distance from Tier-1 counter capture to the Tier-2
   /// snapshot. SRE uses cycle counter ticks; hosts use steady-clock ns.
-  uint64_t mayConstSampleCycles = 0;
+  uint64_t periodConstSampleCycles = 0;
   /// True when profile data is collected for diagnostics only. The optimizer
   /// restores weights for reporting but must publish ordinary Baseline code.
   bool profileAuditOnly = false;
@@ -167,12 +167,12 @@ public:
   ArrayRef<EJitVpFunctionInfo> getLastVpFunctions() const;
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  ArrayRef<EJitMayConstLoadSite> getLastMayConstLoadSites() const;
+  ArrayRef<EJitPeriodConstLoadSite> getLastPeriodConstLoadSites() const;
 #endif
 
-  /// Print completed per-entry may_const benefit samples, sorted by average
+  /// Print completed per-entry period_const benefit samples, sorted by average
   /// runtime-active sites per specialization.
-  bool printMayConstRanking() const;
+  bool printPeriodConstRanking() const;
 
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal

@@ -1,15 +1,28 @@
 # EmbeddedJIT Clang 前端 Attribute 设计文档
 
-**版本**: 1.0
+**版本**: 1.0（含 v1.9 改名批注）
 **日期**: 2026-05-03
 **关联**: SPEC4.md §2, PLAN4.md §4.4, PLAN4.md 阶段 2
 **类型**: Clang 前端 Attribute 实现方案
 
 ---
 
+> **⚠ v1.9 拼写与 metadata 统一改名（2026-11）**: 旧拼写与旧 IR tag **已全部删除**（不再接受），本文档为历史设计记录，与现行实现的映射：
+>
+> | 旧（本文档时代） | 现行 | Attr.td def / 语义类名 |
+> |---|---|---|
+> | `ejit_may_const` | `ejit_period_const` | EjitPeriodConst / EjitPeriodConstAttr |
+> | `ejit_period` + `ejit_period_arr`（两个属性） | `ejit_group`（合并为一个属性，标量/数组形式由变量类型推断） | EjitGroup / EjitGroupAttr（+ fake BoolArgument `Indexed`） |
+> | `ejit_period_arr_ind` | `ejit_dim` | EjitDim / EjitDimAttr |
+> | `ejit_period_lc` | `ejit_guard` | EjitGuard / EjitGuardAttr |
+>
+> IR metadata 同步改名：`!ejit.may_const` → `!ejit.period_const`；tag `ejit_period`/`ejit_period_arr` → `ejit_group`/`ejit_group_indexed`；`ejit_period_arr_ind` → `ejit_dim`；`ejit_period_lc` → `ejit_guard`；`ejit_may_const_field` → `ejit_period_const_field`；注册段 `.ejit_period` → `.ejit_group`。旧版编译的二进制与新运行时不兼容（tag 字符串已改）。现行实现以 `clang/lib/Sema/SemaEJIT.cpp` 与 `clang/lib/CodeGen/CGEJIT.cpp` 为准。
+
+---
+
 ## 1. 概述
 
-为 EmbeddedJIT 系统在 Clang 前端实现 6 种属性：`ejit_may_const`、`ejit_period`、`ejit_period_arr`、`ejit_period_arr_ind`、`ejit_entry`、`ejit_period_lc`。覆盖属性 TableGen 定义、Sema 语义检查、AST 分析（防呆检测）和 LLVM IR CodeGen 全流程。
+为 EmbeddedJIT 系统在 Clang 前端实现 6 种属性：`ejit_period_const`（旧 `ejit_may_const`）、`ejit_group`（旧 `ejit_period`/`ejit_period_arr`，已合并）、`ejit_dim`（旧 `ejit_period_arr_ind`）、`ejit_entry`、`ejit_guard`（旧 `ejit_period_lc`）。覆盖属性 TableGen 定义、Sema 语义检查、AST 分析（防呆检测）和 LLVM IR CodeGen 全流程。
 
 ### 1.1 参考文档
 
@@ -24,12 +37,12 @@
 
 | 属性 | 标记对象 | 参数 | 继承性 | 说明 |
 |------|---------|------|--------|------|
-| `ejit_may_const` | FieldDecl | 无 | Inheritable | 标记结构体成员在时间窗内可视为常量 |
-| `ejit_period(name)` | VarDecl (标量) | 1 个 String | Inheritable | 标记全局变量所属时间窗 |
-| `ejit_period_arr(name)` | VarDecl (数组) | 1 个 String | Inheritable | 标记全局数组所属时间窗数组 |
-| `ejit_period_arr_ind(name)` | ParmVarDecl | 1 个 String | InheritableParam | 标记函数参数为特化维度 |
+| `ejit_period_const` | FieldDecl | 无 | Inheritable | 标记结构体成员在时间窗内可视为常量 |
+| `ejit_group(name)` | VarDecl (标量) | 1 个 String | Inheritable | 标记全局变量所属时间窗 |
+| `ejit_group(name)` | VarDecl (数组) | 1 个 String | Inheritable | 标记全局数组所属时间窗数组 |
+| `ejit_dim(name)` | ParmVarDecl | 1 个 String | InheritableParam | 标记函数参数为特化维度 |
 | `ejit_entry` | FunctionDecl | 无 | Inheritable | 标记函数为 JIT 优化入口 |
-| `ejit_period_lc(name)` | FunctionDecl | 1 个 String | Inheritable | 标记函数为时间窗生命周期管理函数 |
+| `ejit_guard(name)` | FunctionDecl | 1 个 String | Inheritable | 标记函数为时间窗生命周期管理函数 |
 
 ---
 
@@ -51,14 +64,14 @@
 
 以下定义应添加到 `clang/include/clang/Basic/Attr.td` 中，建议放在 EmbeddedJIT 相关注释块内。
 
-#### 2.2.1 ejit_may_const
+#### 2.2.1 ejit_period_const
 
 ```tablegen
 // EmbeddedJIT: 标记结构体成员在时间窗内可视为常量
-def EjitMayConst : InheritableAttr {
-  let Spellings = [Clang<"ejit_may_const">];
+def EjitPeriodConst : InheritableAttr {
+  let Spellings = [Clang<"ejit_period_const">];
   let Subjects = SubjectList<[Field]>;
-  let Documentation = [EjitMayConstDocs];
+  let Documentation = [EjitPeriodConstDocs];
   let SimpleHandler = 1;
 }
 ```
@@ -66,14 +79,14 @@ def EjitMayConst : InheritableAttr {
 **设计要点**：
 - `InheritableAttr`：保证属性在 Redeclaration 链上传递
 - `Subjects = [Field]`：限制只能标记在结构体/联合体字段上
-- `SimpleHandler = 1`：TableGen 自动生成 `handleEjitMayConstAttr`，只做 Subject 匹配检查。额外语义检查（类型、volatile）在 CodeGen 阶段做软降级
+- `SimpleHandler = 1`：TableGen 自动生成 `handleEjitPeriodConstAttr`，只做 Subject 匹配检查。额外语义检查（类型、volatile）在 CodeGen 阶段做软降级
 
-#### 2.2.2 ejit_period
+#### 2.2.2 ejit_group
 
 ```tablegen
 // EmbeddedJIT: 标记全局变量所属的时间窗
 def EjitPeriod : InheritableAttr {
-  let Spellings = [Clang<"ejit_period">];
+  let Spellings = [Clang<"ejit_group">];
   let Args = [StringArgument<"PeriodName", 1>];
   let Subjects = SubjectList<[Var]>;
   let Documentation = [EjitPeriodDocs];
@@ -86,12 +99,12 @@ def EjitPeriod : InheritableAttr {
 - `HasCustomParsing = 1`：需要自定义 Sema handler（检查是否数组、是否重复标记等）
 - `SubjectList<[Var]>`：限制标记在 VarDecl 上
 
-#### 2.2.3 ejit_period_arr
+#### 2.2.3 ejit_group
 
 ```tablegen
 // EmbeddedJIT: 标记全局数组所属的时间窗数组
 def EjitPeriodArr : InheritableAttr {
-  let Spellings = [Clang<"ejit_period_arr">];
+  let Spellings = [Clang<"ejit_group_indexed">];
   let Args = [StringArgument<"PeriodName", 1>];
   let Subjects = SubjectList<[Var]>;
   let Documentation = [EjitPeriodArrDocs];
@@ -100,15 +113,15 @@ def EjitPeriodArr : InheritableAttr {
 ```
 
 **设计要点**：
-- 与 `ejit_period` 结构一致，但 Sema handler 中检查是否为数组类型
+- 与 `ejit_group` 结构一致，但 Sema handler 中检查是否为数组类型
 - `HasCustomParsing = 1`：自定义 handler 中检查数组长度 < 100
 
-#### 2.2.4 ejit_period_arr_ind
+#### 2.2.4 ejit_dim
 
 ```tablegen
 // EmbeddedJIT: 标记 JIT 特化维度参数，关联对应时间窗数组
 def EjitPeriodArrInd : InheritableParamAttr {
-  let Spellings = [Clang<"ejit_period_arr_ind">];
+  let Spellings = [Clang<"ejit_dim">];
   let Args = [StringArgument<"PeriodName", 1>];
   let Subjects = SubjectList<[ParmVar]>;
   let Documentation = [EjitPeriodArrIndDocs];
@@ -137,12 +150,12 @@ def EjitEntry : InheritableAttr {
 - `SubjectList<[Function]>`：限制标记在函数声明上
 - `HasCustomParsing = 1`：Sema handler 检查不支持递归
 
-#### 2.2.6 ejit_period_lc
+#### 2.2.6 ejit_guard
 
 ```tablegen
 // EmbeddedJIT: 标记时间窗生命周期管理函数
 def EjitPeriodLc : InheritableAttr {
-  let Spellings = [Clang<"ejit_period_lc">];
+  let Spellings = [Clang<"ejit_guard">];
   let Args = [StringArgument<"PeriodName", 1>];
   let Subjects = SubjectList<[Function]>;
   let Documentation = [EjitPeriodLcDocs];
@@ -151,42 +164,41 @@ def EjitPeriodLc : InheritableAttr {
 ```
 
 **设计要点**：
-- `HasCustomParsing = 1`：Sema handler 检查是否有对应 `ejit_period_arr_ind` 参数
-- 支持函数标记多个 `ejit_period_lc`（同名属性可重复出现）
+- `HasCustomParsing = 1`：Sema handler 检查是否有对应 `ejit_dim` 参数
+- 支持函数标记多个 `ejit_guard`（同名属性可重复出现）
 
 ### 2.3 属性拼写生成
 
 根据以上定义，TableGen 自动生成以下 C/C++ 拼写：
 
 ```c
-// 1. ejit_may_const - 无参属性
-__attribute__((ejit_may_const))
+// 1. ejit_period_const - 无参属性
+__attribute__((ejit_period_const))
 
-// 2. ejit_period(static) - 单字符串参数
-__attribute__((ejit_period("static")))
+// 2. ejit_group(static) - 单字符串参数
+__attribute__((ejit_group("static")))
 
-// 3. ejit_period_arr(cell) - 单字符串参数
-__attribute__((ejit_period_arr("cell")))
+// 3. ejit_group(cell) - 单字符串参数
+__attribute__((ejit_group("cell")))
 
-// 4. ejit_period_arr_ind(cell) - 单字符串参数
-__attribute__((ejit_period_arr_ind("cell")))
+// 4. ejit_dim(cell) - 单字符串参数
+__attribute__((ejit_dim("cell")))
 
 // 5. ejit_entry - 无参属性
 __attribute__((ejit_entry))
 
-// 6. ejit_period_lc(cell) - 单字符串参数
-__attribute__((ejit_period_lc("cell")))
+// 6. ejit_guard(cell) - 单字符串参数
+__attribute__((ejit_guard("cell")))
 ```
 
 用户常用的宏定义封装（不在编译器实现范围内，由用户或 SDK 头文件提供）：
 
 ```c
-#define ejit_may_const          __attribute__((ejit_may_const))
-#define ejit_period(x)          __attribute__((ejit_period(#x)))
-#define ejit_period_arr(x)      __attribute__((ejit_period_arr(#x)))
-#define ejit_period_arr_ind(x)  __attribute__((ejit_period_arr_ind(#x)))
+#define ejit_period_const          __attribute__((ejit_period_const))
+#define ejit_group(x)          __attribute__((ejit_group(#x)))
+#define ejit_dim(x)  __attribute__((ejit_dim(#x)))
 #define ejit_entry              __attribute__((ejit_entry))
-#define ejit_period_lc(x)       __attribute__((ejit_period_lc(#x)))
+#define ejit_guard(x)       __attribute__((ejit_guard(#x)))
 ```
 
 ---
@@ -200,53 +212,52 @@ __attribute__((ejit_period_lc("cell")))
 
 // [错误] 全局变量归属冲突
 def err_ejit_period_conflict : Error<
-  "variable %0 cannot have multiple ejit_period or ejit_period_arr attributes">;
+  "variable %0 cannot have multiple ejit_group attributes">;
 
-// [错误] ejit_period 只能用于标量全局变量，不能用于数组
+// [错误] ejit_group 只能用于标量全局变量，不能用于数组
 def err_ejit_period_not_array : Error<
-  "ejit_period attribute cannot be used on array variable %0; "
-  "use ejit_period_arr for arrays">;
+  "ejit_group attribute requires an array type or a pointer to a struct; %0 does not qualify">;
 
-// [错误] 数组变量必须使用 ejit_period_arr，不能使用 ejit_period
-def err_ejit_period_arr_not_scalar : Error<
-  "ejit_period_arr attribute requires an array type; "
+// [错误] 数组变量必须使用 ejit_group，不能使用 ejit_group
+def err_ejit_group_not_scalar : Error<
+  "ejit_group attribute requires an array type; "
   "%0 is not an array">;
 
-// [错误] ejit_period_arr 数组大小超过限制
-def err_ejit_period_arr_too_large : Error<
-  "ejit_period_arr array %0 has size %1, which exceeds the maximum of 100">;
+// [错误] ejit_group 数组大小超过限制
+def err_ejit_group_too_large : Error<
+  "ejit_group array %0 has size %1, which exceeds the maximum of 100">;
 
-// [错误] ejit_period_arr_ind 参数类型必须为整数
-def err_ejit_period_arr_ind_invalid_type : Error<
-  "ejit_period_arr_ind parameter %0 must have integer type">;
+// [错误] ejit_dim 参数类型必须为整数
+def err_ejit_dim_invalid_type : Error<
+  "ejit_dim parameter %0 must have integer type">;
 
-// [错误] ejit_period_arr_ind 参数维度过多
-def err_ejit_period_arr_ind_too_many : Error<
-  "function %0 has %1 ejit_period_arr_ind parameters, "
+// [错误] ejit_dim 参数维度过多
+def err_ejit_dim_too_many : Error<
+  "function %0 has %1 ejit_dim parameters, "
   "which exceeds the maximum of 4">;
 
 // [错误] ejit_entry 函数不支持递归
 def err_ejit_entry_recursive : Error<
   "ejit_entry function %0 cannot be recursive">;
 
-// [错误] ejit_period_lc 缺少对应的 ejit_period_arr_ind 参数
-def err_ejit_period_lc_no_index : Error<
-  "ejit_period_lc(%0) requires a corresponding ejit_period_arr_ind(%0) parameter">;
+// [错误] ejit_guard 缺少对应的 ejit_dim 参数
+def err_ejit_guard_no_index : Error<
+  "ejit_guard(%0) requires a corresponding ejit_dim(%0) parameter">;
 
-// [警告] 修改 ejit_may_const 字段但未标记 ejit_period_lc
-def warn_ejit_may_const_modified_without_lc : Warning<
-  "modifying ejit_may_const field %0 of %1 without ejit_period_lc attribute">,
+// [警告] 修改 ejit_period_const 字段但未标记 ejit_guard
+def warn_ejit_period_const_modified_without_guard : Warning<
+  "modifying ejit_period_const field %0 of %1 without ejit_guard attribute">,
   InGroup<EmbeddedJIT>;
 
-// [警告] 函数引用 period_arr 但未通过 ejit_period_arr_ind 声明依赖
+// [警告] 函数引用 period_arr 但未通过 ejit_dim 声明依赖
 def warn_ejit_undeclared_period_dep : Warning<
-  "function %0 references ejit_period_arr '%1' but does not declare "
-  "a dependency on it via ejit_period_arr_ind">,
+  "function %0 references ejit_group '%1' but does not declare "
+  "a dependency on it via ejit_dim">,
   InGroup<EmbeddedJIT>;
 
 // [备注] period_arr 定义位置
-def note_ejit_period_arr_defined_here : Note<
-  "ejit_period_arr '%0' defined here">;
+def note_ejit_group_defined_here : Note<
+  "ejit_group '%0' defined here">;
 
 // [备注] ejit_entry 定义位置
 def note_ejit_entry_defined_here : Note<
@@ -284,17 +295,17 @@ def EmbeddedJIT : DiagGroup<"embedded-jit">;
 
 ### 4.3 Handlers 详细实现
 
-#### 4.3.1 handleEjitMayConstAttr
+#### 4.3.1 handleEjitPeriodConstAttr
 
 ```cpp
 // SemaEJIT.cpp
 
-/// handleEjitMayConstAttr - 处理 ejit_may_const 属性
+/// handleEjitPeriodConstAttr - 处理 ejit_period_const 属性
 /// 语义检查:
 ///   1. 仅可标记在 FieldDecl 上 (由 TableGen Subjects 保证)
 ///   2. 检查字段类型: 仅支持整型、布尔型、浮点型、嵌套结构体
 ///   3. volatile 字段警告 (不阻止编译，JIT 时跳过即可)
-static void handleEjitMayConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+static void handleEjitPeriodConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = cast<FieldDecl>(D);
   QualType FT = FD->getType();
 
@@ -310,18 +321,18 @@ static void handleEjitMayConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   // volatile 字段不视为常量 — 仅在 CodeGen 时做软降级（不加 metadata），
   // 此处不报错也不警告，仅在 Ewarn 级别可选的开发诊断
   if (FT.isVolatileQualified()) {
-    // 静默: volatile 字段的 load 不会带 !ejit.may_const metadata，
+    // 静默: volatile 字段的 load 不会带 !ejit.period_const metadata，
     // JIT 时自然跳过
   }
 
-  D->addAttr(::new (S.Context) EjitMayConstAttr(S.Context, AL));
+  D->addAttr(::new (S.Context) EjitPeriodConstAttr(S.Context, AL));
 }
 ```
 
 #### 4.3.2 handleEjitPeriodAttr
 
 ```cpp
-/// handleEjitPeriodAttr - 处理 ejit_period(name) 属性
+/// handleEjitPeriodAttr - 处理 ejit_group(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在 VarDecl (非数组) 上
 ///   2. 检查是否有重复的 period/period_arr 标记
@@ -336,13 +347,13 @@ static void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     return;
   }
 
-  // 检查 2: 不能是数组（数组应使用 ejit_period_arr）
+  // 检查 2: 不能是数组（数组应使用 ejit_group）
   if (VD->getType()->isArrayType()) {
     S.Diag(AL.getLoc(), diag::err_ejit_period_not_array) << VD;
     return;
   }
 
-  // 检查 3: 变量归属冲突 — 不能同时有多个 ejit_period 或 ejit_period_arr
+  // 检查 3: 变量归属冲突 — 不能同时有多个 ejit_group 或 ejit_group
   if (VD->hasAttr<EjitPeriodAttr>() || VD->hasAttr<EjitPeriodArrAttr>()) {
     S.Diag(AL.getLoc(), diag::err_ejit_period_conflict) << VD;
     return;
@@ -356,7 +367,7 @@ static void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   // 对于非 static 的自定义标量时间窗，当前版本标记为未来扩展
   // （不阻止编译，但 CodeGen 发出警告或备注）
   if (periodName != "static") {
-    // 自定义 ejit_period(name) 为未来扩展，当前仅支持 "static"
+    // 自定义 ejit_group(name) 为未来扩展，当前仅支持 "static"
     // 此处不报错，仅在后端处理时记录
   }
 
@@ -367,7 +378,7 @@ static void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 #### 4.3.3 handleEjitPeriodArrAttr
 
 ```cpp
-/// handleEjitPeriodArrAttr - 处理 ejit_period_arr(name) 属性
+/// handleEjitPeriodArrAttr - 处理 ejit_group(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在数组 VarDecl 上
 ///   2. 数组长度固定且 < 100
@@ -385,7 +396,7 @@ static void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   // 检查 2: 必须是数组类型
   const ArrayType *AT = S.Context.getAsArrayType(VD->getType());
   if (!AT) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_arr_not_scalar) << VD;
+    S.Diag(AL.getLoc(), diag::err_ejit_group_not_scalar) << VD;
     return;
   }
 
@@ -393,13 +404,13 @@ static void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   if (const ConstantArrayType *CAT = dyn_cast<ConstantArrayType>(AT)) {
     uint64_t size = CAT->getSize().getZExtValue();
     if (size > 100) {
-      S.Diag(AL.getLoc(), diag::err_ejit_period_arr_too_large)
+      S.Diag(AL.getLoc(), diag::err_ejit_group_too_large)
           << VD << (unsigned)size;
       return;
     }
   } else {
     // 非常量数组大小（VLA 等）→ 报错
-    S.Diag(AL.getLoc(), diag::err_ejit_period_arr_not_scalar) << VD;
+    S.Diag(AL.getLoc(), diag::err_ejit_group_not_scalar) << VD;
     return;
   }
 
@@ -421,22 +432,22 @@ static void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 #### 4.3.4 handleEjitPeriodArrIndAttr
 
 ```cpp
-/// handleEjitPeriodArrIndAttr - 处理 ejit_period_arr_ind(name) 属性
+/// handleEjitPeriodArrIndAttr - 处理 ejit_dim(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在 ParmVarDecl 上
 ///   2. 参数类型必须为整数类型
-///   3. 所在函数最多 4 个 ejit_period_arr_ind 参数
+///   3. 所在函数最多 4 个 ejit_dim 参数
 static void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *PVD = cast<ParmVarDecl>(D);
 
   // 检查 1: 参数类型必须为整数类型
   QualType PT = PVD->getType();
   if (!PT->isIntegerType()) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_arr_ind_invalid_type) << PVD;
+    S.Diag(AL.getLoc(), diag::err_ejit_dim_invalid_type) << PVD;
     return;
   }
 
-  // 检查 2: 所在函数最多 4 个 ejit_period_arr_ind 参数
+  // 检查 2: 所在函数最多 4 个 ejit_dim 参数
   if (auto *FD = dyn_cast<FunctionDecl>(PVD->getDeclContext())) {
     unsigned count = 0;
     for (auto *P : FD->parameters()) {
@@ -444,7 +455,7 @@ static void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
         count++;
     }
     if (count >= 4) {
-      S.Diag(AL.getLoc(), diag::err_ejit_period_arr_ind_too_many)
+      S.Diag(AL.getLoc(), diag::err_ejit_dim_too_many)
           << FD << (count + 1);
       return;
     }
@@ -466,7 +477,7 @@ static void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// 语义检查:
 ///   1. 仅可标记在 FunctionDecl 上 (由 Subjects 保证)
 ///   2. 不支持递归函数
-///   3. 不能与 ejit_period_lc 同时标记（checkEjitEntryLcConflict，与书写
+///   3. 不能与 ejit_guard 同时标记（checkEjitEntryLcConflict，与书写
 ///      顺序无关。三处检查：ActOnFunctionDeclarator 属性处理完毕后 [同一
 ///      声明上的组合]、CheckFunctionDeclaration 的 MergeFunctionDecl 之后
 ///      [跨声明的组合]、ActOnExplicitInstantiation 属性落地后 [显式实例化
@@ -492,10 +503,10 @@ static void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 #### 4.3.6 handleEjitPeriodLcAttr
 
 ```cpp
-/// handleEjitPeriodLcAttr - 处理 ejit_period_lc(name) 属性
+/// handleEjitPeriodLcAttr - 处理 ejit_guard(name) 属性
 /// 语义检查:
 ///   1. 仅可标记在 FunctionDecl 上
-///   2. 必须有对应的 ejit_period_arr_ind(name) 参数——该检查不在 handler
+///   2. 必须有对应的 ejit_dim(name) 参数——该检查不在 handler
 ///      内执行，而在 CheckFunctionDeclaration 的 MergeFunctionDecl 之后
 ///      （checkEjitPeriodLcIndex）：arr_ind 可能写在更早声明的参数上，
 ///      由参数属性传播补全后才可见；显式实例化声明由 ActOnExplicitInstantiation
@@ -503,7 +514,7 @@ static void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 ///      的参数属性会被 clang 静默丢弃，所以 arr_ind 必须写在模板 pattern
 ///      的参数上
 ///   3. 不能与 ejit_entry 同时标记（见 4.3.5 检查 3；同一函数可标记多个
-///      ejit_period_lc，这是 multi-period 入口的正常形态）
+///      ejit_guard，这是 multi-period 入口的正常形态）
 static void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = cast<FunctionDecl>(D);
 
@@ -511,7 +522,7 @@ static void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   if (!S.checkStringLiteralArgumentAttr(AL, 0, periodName))
     return;
 
-  // 检查是否有对应的 ejit_period_arr_ind(name) 参数
+  // 检查是否有对应的 ejit_dim(name) 参数
   bool hasMatchingIdx = false;
   for (auto *P : FD->parameters()) {
     if (auto *IdxAttr = P->getAttr<EjitPeriodArrIndAttr>()) {
@@ -523,7 +534,7 @@ static void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   }
 
   if (!hasMatchingIdx) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_lc_no_index) << periodName;
+    S.Diag(AL.getLoc(), diag::err_ejit_guard_no_index) << periodName;
     return;
   }
 
@@ -537,8 +548,8 @@ static void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 
 ```cpp
 // EmbeddedJIT attributes — 转发到 SemaEJIT 中的 handler
-case ParsedAttr::AT_EjitMayConst:
-  handleEjitMayConstAttr(S, D, AL);
+case ParsedAttr::AT_EjitPeriodConst:
+  handleEjitPeriodConstAttr(S, D, AL);
   break;
 case ParsedAttr::AT_EjitPeriod:
   handleEjitPeriodAttr(S, D, AL);
@@ -561,7 +572,7 @@ case ParsedAttr::AT_EjitPeriodLc:
 
 ```cpp
 // clang/lib/Sema/SemaEJIT.cpp 中的函数声明
-void handleEjitMayConstAttr(Sema &S, Decl *D, const ParsedAttr &AL);
+void handleEjitPeriodConstAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL);
@@ -573,19 +584,19 @@ void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL);
 
 归属冲突检查在 `handleEjitPeriodAttr` 和 `handleEjitPeriodArrAttr` 中内联处理。每个 handler 在添加属性前检查 `hasAttr<EjitPeriodAttr>()` 和 `hasAttr<EjitPeriodArrAttr>()`。
 
-相同变量同时被两个不同 period 标记的错误用例由 Clang 的属性唯一约束自然覆盖——同种属性不能在同一个 Decl 上出现多次（除非声明 `let Inherited = 0` 并手动允许多次数）。对 `ejit_period_lc` 需要支持多次出现（函数可管理多个时间窗）：
+相同变量同时被两个不同 period 标记的错误用例由 Clang 的属性唯一约束自然覆盖——同种属性不能在同一个 Decl 上出现多次（除非声明 `let Inherited = 0` 并手动允许多次数）。对 `ejit_guard` 需要支持多次出现（函数可管理多个时间窗）：
 
 ```tablegen
-// ejit_period_lc 允许多次标记（每标记一个时间窗名称）
+// ejit_guard 允许多次标记（每标记一个时间窗名称）
 // 可通过设置 let Inherited = 0 或在 AdditionalMembers 中特殊处理
 ```
 
 但默认情况下 `InheritableAttr` 的同种属性在 Clang 中可多次出现（例如 `annotate` 属性）。需要考虑两种模型：
 
-- **Model 1 多 attribute 实例**: 允许同一函数多次标记 `ejit_period_lc(cell)` 和 `ejit_period_lc(trp)`——两个独立的属性实例
+- **Model 1 多 attribute 实例**: 允许同一函数多次标记 `ejit_guard(cell)` 和 `ejit_guard(trp)`——两个独立的属性实例
 - **Model 2 单 attribute 实例**: 仅允许一次标记
 
-对于 `ejit_period_lc`，采用 **Model 1**（允许多实例）。Clang 的 `InheritableAttr` 默认允许同类属性多次出现在不同拼写下，对于相同拼写需要验证。若存在限制，可在 TableGen 中添加：
+对于 `ejit_guard`，采用 **Model 1**（允许多实例）。Clang 的 `InheritableAttr` 默认允许同类属性多次出现在不同拼写下，对于相同拼写需要验证。若存在限制，可在 TableGen 中添加：
 
 ```tablegen
 let Inherited = 0; // 暂不需要，Clang InheritableAttr 默认可多次出现
@@ -600,7 +611,7 @@ let Inherited = 0; // 暂不需要，Clang InheritableAttr 默认可多次出现
 新建 `clang/lib/CodeGen/CGEJIT.cpp`，包含：
 
 1. `emitEJITMetadata(Module &M)` — 在模块 emit 完成后，遍历所有已收集的 EJIT 元数据，生成 Named Metadata
-2. Load 指令的 `!ejit.may_const` metadata annotation（嵌入在 `CGExpr.cpp` 中）
+2. Load 指令的 `!ejit.period_const` metadata annotation（嵌入在 `CGExpr.cpp` 中）
 
 ### 5.2 IR Metadata 格式
 
@@ -618,7 +629,7 @@ let Inherited = 0; // 暂不需要，Clang InheritableAttr 默认可多次出现
 ; ejit_entry 函数（单 period_arr_ind 参数）
 ; !ejit.metadata = distinct !{!0, !1}
 ; !0 = !{!"ejit_entry"}
-; !1 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+; !1 = !{!"ejit_dim", !"cell", i32 0}
 
 ; ejit_entry 函数（无参数，不依赖 static 之外的时间窗）
 ; !ejit.metadata = distinct !{!0}
@@ -629,26 +640,26 @@ let Inherited = 0; // 暂不需要，Clang InheritableAttr 默认可多次出现
 
 ```llvm
 ; @g_boardCfg = ... | !ejit.metadata = distinct !{!0}
-; !0 = !{!"ejit_period", !"static"}
+; !0 = !{!"ejit_group", !"static"}
 
 ; @g_cellCfg = ... | !ejit.metadata = distinct !{!1}
-; !1 = !{!"ejit_period_arr", !"cell", i32 16}
+; !1 = !{!"ejit_group_indexed", !"cell", i32 16}
 ```
 
-#### 5.2.3 Load metadata: `!ejit.may_const`
+#### 5.2.3 Load metadata: `!ejit.period_const`
 
 ```llvm
-; 非 volatile 的 ejit_may_const 字段 load → 标注 !ejit.may_const
-%v = load i32, ptr %field, !ejit.may_const !{}
+; 非 volatile 的 ejit_period_const 字段 load → 标注 !ejit.period_const
+%v = load i32, ptr %field, !ejit.period_const !{}
 ```
 
-`!{}` 是一个空的 metadata node，仅作为标记位——PASS6 通过 `hasMetadata("ejit.may_const")` 检查。
+`!{}` 是一个空的 metadata node，仅作为标记位——PASS6 通过 `hasMetadata("ejit.period_const")` 检查。
 
 ### 5.3 CodeGenFunction 中的 Load Metadata 注入
 
 #### 5.3.1 修改 CGExpr.cpp — EmitLoadOfScalar / EmitLoadOfLValue
 
-在 `CGExpr.cpp` 中，load 指令生成位置（约第 1700–2100 行之间），对于 `ejit_may_const` 字段的 load 添加 metadata：
+在 `CGExpr.cpp` 中，load 指令生成位置（约第 1700–2100 行之间），对于 `ejit_period_const` 字段的 load 添加 metadata：
 
 ```cpp
 // 在 EmitLoadOfScalar 或同等位置
@@ -657,30 +668,30 @@ llvm::LoadInst *Load = Builder.CreateLoad(ConvertTypeForMem(E->getType()),
                                           Addr, ...);
 // 现有: MD_tbaa, MD_noundef, MD_range, MD_nonnull 等
 
-// === EmbeddedJIT: 注入 !ejit.may_const metadata ===
-if (LV.getBaseInfo() && E->getType().hasMayConstAttr()) {
-  // 仅对非 volatile 的 may_const 字段 load 加 metadata
-  llvm::MDNode *MayConstMD = llvm::MDNode::get(getLLVMContext(), {});
-  Load->setMetadata("ejit.may_const", MayConstMD);
+// === EmbeddedJIT: 注入 !ejit.period_const metadata ===
+if (LV.getBaseInfo() && E->getType().hasPeriodConstAttr()) {
+  // 仅对非 volatile 的 period_const 字段 load 加 metadata
+  llvm::MDNode *PeriodConstMD = llvm::MDNode::get(getLLVMContext(), {});
+  Load->setMetadata("ejit.period_const", PeriodConstMD);
 }
 ```
 
-**判断逻辑**：需要从 `MemberExpr` 回溯到 `FieldDecl`，检查是否有 `EjitMayConstAttr`。由于 Clang 的 `FieldDecl` 上已挂载属性，CodeGen 可通过以下方式检查。
+**判断逻辑**：需要从 `MemberExpr` 回溯到 `FieldDecl`，检查是否有 `EjitPeriodConstAttr`。由于 Clang 的 `FieldDecl` 上已挂载属性，CodeGen 可通过以下方式检查。
 
-**推荐方案**：在 `LValue` 对象中传递 may_const 标记（覆盖多层访问链场景）。
+**推荐方案**：在 `LValue` 对象中传递 period_const 标记（覆盖多层访问链场景）。
 
 ```cpp
 // clang/lib/CodeGen/LValue.h (或类似位置)
 class LValue {
   // ...
-  bool isEjitMayConst_ = false;
+  bool isEjitPeriodConst_ = false;
 public:
-  void setEjitMayConst(bool v) { isEjitMayConst_ = v; }
-  bool isEjitMayConst() const { return isEjitMayConst_; }
+  void setEjitPeriodConst(bool v) { isEjitPeriodConst_ = v; }
+  bool isEjitPeriodConst() const { return isEjitPeriodConst_; }
 };
 ```
 
-在构建 LValue 时（`EmitLValueForField` 等位置），检查 FieldDecl 是否有 `EjitMayConstAttr`，设置标记。
+在构建 LValue 时（`EmitLValueForField` 等位置），检查 FieldDecl 是否有 `EjitPeriodConstAttr`，设置标记。
 
 #### 5.3.2 修改 CodeGenModule.cpp — 函数/全局变量 metadata 生成
 
@@ -692,7 +703,7 @@ public:
 namespace clang {
 namespace CodeGen {
 
-/// 为 ejit_entry / ejit_period_lc 函数生成 !ejit.metadata
+/// 为 ejit_entry / ejit_guard 函数生成 !ejit.metadata
 void emitEjitFunctionMetadata(CodeGenModule &CGM,
                               const FunctionDecl *FD,
                               llvm::Function *F) {
@@ -707,17 +718,17 @@ void emitEjitFunctionMetadata(CodeGenModule &CGM,
 
   for (const auto *LCA : FD->specific_attrs<EjitPeriodLcAttr>()) {
     entries.push_back(llvm::MDNode::get(Ctx, {
-        llvm::MDString::get(Ctx, "ejit_period_lc"),
+        llvm::MDString::get(Ctx, "ejit_guard"),
         llvm::MDString::get(Ctx, LCA->getPeriodName())
     }));
   }
 
-  // 遍历参数，收集 ejit_period_arr_ind
+  // 遍历参数，收集 ejit_dim
   for (unsigned i = 0; i < FD->getNumParams(); ++i) {
     const ParmVarDecl *PD = FD->getParamDecl(i);
     if (const auto *IdxAttr = PD->getAttr<EjitPeriodArrIndAttr>()) {
       entries.push_back(llvm::MDNode::get(Ctx, {
-          llvm::MDString::get(Ctx, "ejit_period_arr_ind"),
+          llvm::MDString::get(Ctx, "ejit_dim"),
           llvm::MDString::get(Ctx, IdxAttr->getPeriodName()),
           llvm::ConstantAsMetadata::get(
               llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), i))
@@ -731,7 +742,7 @@ void emitEjitFunctionMetadata(CodeGenModule &CGM,
   }
 }
 
-/// 为 ejit_period / ejit_period_arr 全局变量生成 !ejit.metadata
+/// 为 ejit_group 全局变量生成 !ejit.metadata
 void emitEjitGlobalMetadata(CodeGenModule &CGM,
                             const VarDecl *VD,
                             llvm::GlobalVariable *GV) {
@@ -740,7 +751,7 @@ void emitEjitGlobalMetadata(CodeGenModule &CGM,
 
   if (const auto *PA = VD->getAttr<EjitPeriodAttr>()) {
     entries.push_back(llvm::MDNode::get(Ctx, {
-        llvm::MDString::get(Ctx, "ejit_period"),
+        llvm::MDString::get(Ctx, "ejit_group"),
         llvm::MDString::get(Ctx, PA->getPeriodName())
     }));
   }
@@ -752,7 +763,7 @@ void emitEjitGlobalMetadata(CodeGenModule &CGM,
       size = CAT->getSize().getZExtValue();
     }
     entries.push_back(llvm::MDNode::get(Ctx, {
-        llvm::MDString::get(Ctx, "ejit_period_arr"),
+        llvm::MDString::get(Ctx, "ejit_group_indexed"),
         llvm::MDString::get(Ctx, PAA->getPeriodName()),
         llvm::ConstantAsMetadata::get(
             llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), size))
@@ -791,22 +802,22 @@ if (VD->hasAttr<EjitPeriodAttr>() || VD->hasAttr<EjitPeriodArrAttr>()) {
 
 ### 5.5 外部函数声明生成
 
-`ejit_auto_register` 函数是 AOT 编译时由 Pass（PASS1/PASS2）生成的，不是 Clang CodeGen 的责任。但 CodeGen 需要确保 `ejit_period_arr_ind` metadata 被正确生成，以便晚期 AOT Pass (PASS3) 读取。
+`ejit_auto_register` 函数是 AOT 编译时由 Pass（PASS1/PASS2）生成的，不是 Clang CodeGen 的责任。但 CodeGen 需要确保 `ejit_dim` metadata 被正确生成，以便晚期 AOT Pass (PASS3) 读取。
 
 因此 Clang CodeGen 不直接生成 `ejit_auto_register` 或 `ejit_register_*` 调用。只负责：
 
 1. ✅ 生成 `!ejit.metadata`（函数级 + 全局变量级）
-2. ✅ 生成 `!ejit.may_const`（load 指令级）
+2. ✅ 生成 `!ejit.period_const`（load 指令级）
 3. ❌ 不生成 `ejit_auto_register`（PASS1/PASS2 的职责）
 4. ❌ 不生成 `@__ejit_bitcode`（PASS1 的职责）
 
 ---
 
-## 6. 防呆检测：写 may_const 字段检测
+## 6. 防呆检测：写 period_const 字段检测
 
 ### 6.1 检测目标
 
-在 Sema 阶段检测：对 `ejit_may_const` 字段的写操作是否在 `ejit_period_lc` 标记的函数中进行。
+在 Sema 阶段检测：对 `ejit_period_const` 字段的写操作是否在 `ejit_guard` 标记的函数中进行。
 
 ### 6.2 实现方案
 
@@ -815,12 +826,12 @@ if (VD->hasAttr<EjitPeriodAttr>() || VD->hasAttr<EjitPeriodArrAttr>()) {
 ```cpp
 /// SemaEJIT.cpp
 
-/// checkEjitMayConstWrite - 检查对 may_const 字段的写操作
-/// 若写入操作不在 ejit_period_lc 函数中，发出 warning
-void Sema::checkEjitMayConstWrite(Expr *LHS, SourceLocation Loc) {
+/// checkEjitPeriodConstWrite - 检查对 period_const 字段的写操作
+/// 若写入操作不在 ejit_guard 函数中，发出 warning
+void Sema::checkEjitPeriodConstWrite(Expr *LHS, SourceLocation Loc) {
   // 1. 从 LHS 解析出被写的 FieldDecl
   const FieldDecl *FD = getFieldFromExpr(LHS);
-  if (!FD || !FD->hasAttr<EjitMayConstAttr>())
+  if (!FD || !FD->hasAttr<EjitPeriodConstAttr>())
     return;
 
   // 2. 获取当前所在的函数
@@ -828,11 +839,11 @@ void Sema::checkEjitMayConstWrite(Expr *LHS, SourceLocation Loc) {
   if (!CurFn)
     return;
 
-  // 3. 检查当前函数是否标记了 ejit_period_lc
+  // 3. 检查当前函数是否标记了 ejit_guard
   bool hasLc = CurFn->hasAttr<EjitPeriodLcAttr>();
 
   if (!hasLc) {
-    Diag(Loc, diag::warn_ejit_may_const_modified_without_lc)
+    Diag(Loc, diag::warn_ejit_period_const_modified_without_guard)
         << FD << FD->getParent();
   }
 }
@@ -869,12 +880,12 @@ static const FieldDecl *getFieldFromExpr(Expr *E) {
 在 `clang/include/clang/Basic/AttrDocs.td` 中添加 6 个文档定义：
 
 ```tablegen
-def EjitMayConstDocs : Documentation {
+def EjitPeriodConstDocs : Documentation {
   let Category = DocCatVariable;
   let Content = [{
 EmbeddedJIT: 标记结构体成员在时间窗内可视为常量。
 
-当全局变量属于某个时间窗且时间窗处于激活状态时，标记了 ``ejit_may_const``
+当全局变量属于某个时间窗且时间窗处于激活状态时，标记了 ``ejit_period_const``
 的成员可被视为编译期常量，JIT 编译器会将其替换为运行时实际值并执行常量传播、
 死代码消除和分支折叠等优化。
 
@@ -883,7 +894,7 @@ EmbeddedJIT: 标记结构体成员在时间窗内可视为常量。
 .. code-block:: c
 
   struct Sample {
-      __attribute__((ejit_may_const)) uint32_t a;
+      __attribute__((ejit_period_const)) uint32_t a;
       uint32_t xx;
   };
   }];
@@ -904,7 +915,7 @@ EmbeddedJIT: 定义全局变量所属的时间窗。
 
 .. code-block:: c
 
-  __attribute__((ejit_period("static"))) struct BoardConfig g_boardCfg;
+  __attribute__((ejit_group("static"))) struct BoardConfig g_boardCfg;
   }];
 }
 
@@ -920,7 +931,7 @@ EmbeddedJIT: 定义全局数组所属的时间窗数组。
 
 .. code-block:: c
 
-  __attribute__((ejit_period_arr("cell"))) struct CellConfig g_cellCfg[16];
+  __attribute__((ejit_group("cell"))) struct CellConfig g_cellCfg[16];
   }];
 }
 
@@ -937,7 +948,7 @@ EmbeddedJIT: 标记函数参数为特化维度参数。
 .. code-block:: c
 
   __attribute__((ejit_entry))
-  void process_task(__attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx);
+  void process_task(__attribute__((ejit_dim("cell"))) uint8_t cellIdx);
   }];
 }
 
@@ -966,12 +977,12 @@ EmbeddedJIT: 标记函数为时间窗生命周期管理函数。
 标记此属性的函数表明会修改指定时间窗内的数据。编译器将在函数入口插入
 ``ejit_deactivate``、函数出口插入 ``ejit_activate``，确保数据一致性。
 
-必须与 ``ejit_period_arr_ind`` 配合使用。
+必须与 ``ejit_dim`` 配合使用。
 
 .. code-block:: c
 
-  __attribute__((ejit_period_lc("cell")))
-  void update_config(__attribute__((ejit_period_arr_ind("cell"))) uint8_t idx);
+  __attribute__((ejit_guard("cell")))
+  void update_config(__attribute__((ejit_dim("cell"))) uint8_t idx);
   }];
 }
 ```
@@ -990,7 +1001,7 @@ EmbeddedJIT: 标记函数为时间窗生命周期管理函数。
 | `clang/include/clang/Basic/DiagnosticGroups.td` | 添加 `EmbeddedJIT` 警告组 |
 | `clang/lib/Sema/SemaDeclAttr.cpp` | 在 switch-case dispatch 中添加 6 个分支 |
 | `clang/lib/Sema/CMakeLists.txt` | 添加 `SemaEJIT.cpp` |
-| `clang/lib/CodeGen/CGExpr.cpp` | 在 load 指令生成时注入 `!ejit.may_const` metadata |
+| `clang/lib/CodeGen/CGExpr.cpp` | 在 load 指令生成时注入 `!ejit.period_const` metadata |
 | `clang/lib/CodeGen/CodeGenModule.cpp` | 在函数/全局变量 emit 后调用 metadata 生成函数 |
 | `clang/lib/CodeGen/CMakeLists.txt` | 添加 `CGEJIT.cpp` |
 
@@ -998,7 +1009,7 @@ EmbeddedJIT: 标记函数为时间窗生命周期管理函数。
 
 | 文件 | 内容 |
 |------|------|
-| `clang/lib/Sema/SemaEJIT.cpp` | 6 个属性 handler + may_const 写检测 |
+| `clang/lib/Sema/SemaEJIT.cpp` | 6 个属性 handler + period_const 写检测 |
 | `clang/lib/CodeGen/CGEJIT.cpp` | metadata 生成: `emitEjitFunctionMetadata`, `emitEjitGlobalMetadata` |
 | `clang/test/Sema/ext_attr_ejit.cpp` | Sema 语义分析测试 |
 | `clang/test/CodeGen/ejit_metadata.c` | CodeGen LLVM IR 输出测试 |
@@ -1014,30 +1025,31 @@ EmbeddedJIT: 标记函数为时间窗生命周期管理函数。
 
 // 正确用法 - 应该无诊断
 struct CellConfig {
-  __attribute__((ejit_may_const)) int cellType;   // ok
+  __attribute__((ejit_period_const)) int cellType;   // ok
   int xx;                                          // ok
 };
 
-__attribute__((ejit_period("static"))) struct CellConfig g_board;  // ok
-__attribute__((ejit_period_arr("cell"))) struct CellConfig g_cells[16]; // ok
+__attribute__((ejit_group("static"))) struct CellConfig g_board;  // ok
+__attribute__((ejit_group("cell"))) struct CellConfig g_cells[16]; // ok
 
 __attribute__((ejit_entry))
-void process_task(__attribute__((ejit_period_arr_ind("cell"))) int idx);  // ok
+void process_task(__attribute__((ejit_dim("cell"))) int idx);  // ok
 
-// 错误用法 - 应有诊断
-__attribute__((ejit_period("cell"))) int g_bad_array[10];  // expected-error {{ejit_period attribute cannot be used on array variable}}
-__attribute__((ejit_period_arr("cell"))) int g_not_array;   // expected-error {{ejit_period_arr attribute requires an array type}}
+// 错误用法 - 应有诊断（历史设计：当时的 ejit_period/ejit_period_arr 二分；
+// v1.9 合并后 ejit_group 数组/标量均合法，形式由类型推断，这两条不再是错误）
+__attribute__((ejit_group("cell"))) int g_ok_array[10];
+__attribute__((ejit_group("cell"))) int g_ok_scalar;
 
 // 归属冲突
-__attribute__((ejit_period("one"))) // expected-error {{variable g_conflict cannot have multiple}}
-__attribute__((ejit_period("two"))) int g_conflict;
+__attribute__((ejit_group("one"))) // expected-error {{variable g_conflict cannot have multiple}}
+__attribute__((ejit_group("two"))) int g_conflict;
 
 // ejit_entry 递归
 __attribute__((ejit_entry)) // expected-error {{ejit_entry function 'recursive_func' cannot be recursive}}
 void recursive_func() { recursive_func(); }
 
-// ejit_period_lc 无对应 ind
-__attribute__((ejit_period_lc("cell"))) // expected-error {{requires a corresponding ejit_period_arr_ind}}
+// ejit_guard 无对应 ind
+__attribute__((ejit_guard("cell"))) // expected-error {{requires a corresponding ejit_dim}}
 void bad_lc(int x);
 ```
 
@@ -1047,31 +1059,31 @@ void bad_lc(int x);
 // RUN: %clang_cc1 -S -emit-llvm -o - %s | FileCheck %s
 
 struct CellConfig {
-  __attribute__((ejit_may_const)) int cellType;
+  __attribute__((ejit_period_const)) int cellType;
   int xx;
 };
 
-__attribute__((ejit_period("static"))) struct CellConfig g_boardCfg;
+__attribute__((ejit_group("static"))) struct CellConfig g_boardCfg;
 // CHECK: @g_boardCfg = {{.*}} !ejit.metadata ![[PERIOD_META:[0-9]+]]
 
-__attribute__((ejit_period_arr("cell"))) struct CellConfig g_cellCfg[16];
+__attribute__((ejit_group("cell"))) struct CellConfig g_cellCfg[16];
 // CHECK: @g_cellCfg = {{.*}} !ejit.metadata ![[ARR_META:[0-9]+]]
 
 __attribute__((ejit_entry))
-void jit_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx) {
+void jit_entry(__attribute__((ejit_dim("cell"))) int cellIdx) {
   // CHECK: define void @jit_entry({{.*}} !ejit.metadata ![[ENTRY_META:[0-9]+]]
   if (g_cellCfg[cellIdx].cellType == 2) {
-    // CHECK: load {{.*}} !ejit.may_const ![[MAYCONST:[0-9]+]]
+    // CHECK: load {{.*}} !ejit.period_const ![[MAYCONST:[0-9]+]]
   }
 }
 
 // CHECK-DAG: ![[PERIOD_META]] = distinct !{![[PERIOD:[0-9]+]]}
-// CHECK-DAG: ![[PERIOD]] = !{!"ejit_period", !"static"}
+// CHECK-DAG: ![[PERIOD]] = !{!"ejit_group", !"static"}
 // CHECK-DAG: ![[ARR_META]] = distinct !{![[ARR:[0-9]+]]}
-// CHECK-DAG: ![[ARR]] = !{!"ejit_period_arr", !"cell", i32 16}
+// CHECK-DAG: ![[ARR]] = !{!"ejit_group_indexed", !"cell", i32 16}
 // CHECK-DAG: ![[ENTRY_META]] = distinct !{![[ENTRY:[0-9]+]], ![[IND:[0-9]+]]}
 // CHECK-DAG: ![[ENTRY]] = !{!"ejit_entry"}
-// CHECK-DAG: ![[IND]] = !{!"ejit_period_arr_ind", !"cell", i32 0}
+// CHECK-DAG: ![[IND]] = !{!"ejit_dim", !"cell", i32 0}
 // CHECK-DAG: ![[MAYCONST]] = !{}
 ```
 
@@ -1085,7 +1097,7 @@ void jit_entry(__attribute__((ejit_period_arr_ind("cell"))) int cellIdx) {
 | 2 | 诊断消息定义 (8 diagnostics) | `DiagnosticSemaKinds.td` | 0.5d |
 | 3 | 文档定义 (6 docs) | `AttrDocs.td` | 0.5d |
 | 4 | Sema handler 实现 (6 handlers) | `SemaEJIT.cpp` + `SemaDeclAttr.cpp` | 2d |
-| 5 | 防呆检测：写 may_const 检测 | `SemaEJIT.cpp` | 0.5d |
+| 5 | 防呆检测：写 period_const 检测 | `SemaEJIT.cpp` | 0.5d |
 | 6 | CodeGen metadata 生成 | `CGEJIT.cpp` + `CodeGenModule.cpp` | 1.5d |
 | 7 | CodeGen load metadata 注入 | `CGExpr.cpp` | 0.5d |
 | 8 | CMakeLists.txt 更新 | `Sema/CMakeLists.txt` + `CodeGen/CMakeLists.txt` | 0.5d |

@@ -2,7 +2,7 @@
 // RUN: %clang_cc1 -fsyntax-only -Wno-embedded-jit-attr-missing-on-def -verify=off %s
 // RUN: %clang_cc1 -fsyntax-only -Wno-embedded-jit -verify=groupoff %s
 
-// EmbeddedJIT: the "definition omits ejit_entry / ejit_period_lc" warning is
+// EmbeddedJIT: the "definition omits ejit_entry / ejit_guard" warning is
 // default-on and has its own switch: -Wno-embedded-jit-attr-missing-on-def
 // silences just this warning; -Wno-embedded-jit silences the whole group.
 

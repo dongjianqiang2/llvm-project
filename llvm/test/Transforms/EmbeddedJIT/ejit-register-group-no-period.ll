@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-register-period -S %s | FileCheck %s
+; RUN: opt -passes=ejit-register-group -S %s | FileCheck %s
 
 ; Verify PASS2 does nothing when no period variables
 ; CHECK-NOT: ejit_register_period_array

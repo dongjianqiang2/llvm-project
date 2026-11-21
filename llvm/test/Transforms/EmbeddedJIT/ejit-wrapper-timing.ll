@@ -22,5 +22,5 @@ entry:
 
 @data = global i32 7, !ejit.metadata !10
 
-!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
+!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}

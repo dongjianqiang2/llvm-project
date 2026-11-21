@@ -15,16 +15,16 @@
 #include "ejit_test_helpers.h"
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t trafficLoad;
 };
 
-ejit_period_arr(cell)
+ejit_group(cell)
 struct CellCfg g_cellCfg[4] = {{1,100},{2,200},{3,300},{4,400}};
 
 ejit_entry
 uint32_t jit_check_cell_type(
-    ejit_period_arr_ind(cell) uint8_t cellIndex)
+    EJIT_DIM(cell) uint8_t cellIndex)
 {
   if (g_cellCfg[cellIndex].cellType == 1) return 10;
   if (g_cellCfg[cellIndex].cellType == 2) return 20;

@@ -15,12 +15,12 @@
 
 // Simple test data
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t xx;
 };
-ejit_period_arr(cell) struct CellCfg g_cells[4];
+ejit_group(cell) struct CellCfg g_cells[4];
 
-ejit_entry uint32_t check_cell(ejit_period_arr_ind(cell) uint8_t ci) {
+ejit_entry uint32_t check_cell(EJIT_DIM(cell) uint8_t ci) {
   if (g_cells[ci].cellType == 0xFF)
     return 300;
   if (g_cells[ci].cellType == 0xFD)

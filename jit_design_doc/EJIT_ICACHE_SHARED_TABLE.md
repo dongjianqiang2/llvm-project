@@ -144,7 +144,7 @@ The retire also saturates at zero.
 **P1 — cores drive disjoint dim identities.** Assumed, not enforced, and the real
 cost of this design. The cell index is the dim identity, not the core id, so
 "partitioned by core" holds only insofar as the application gives each core its
-own `ejit_period_lc` instance indices.
+own `ejit_guard` instance indices.
 
 If it holds, no core ever *reads* a cell another core filled: every pointer it
 loads is one it put there after resolving through the taskpool, which is where it
@@ -157,7 +157,7 @@ second core branches into a page it never sealed.
 Nothing in the runtime can check it: a cell carries no record of which core wrote
 it, and adding one puts a per-core gate back on the probe.
 
-> **Contract:** each core drives its own `ejit_period_lc` instance indices, and
+> **Contract:** each core drives its own `ejit_guard` instance indices, and
 > no two cores call one `ejit_entry` with the same `ejit_dim` values.
 
 **P1a — the 0-dim exception, which IS enforced.** An entry with no `ejit_dim`

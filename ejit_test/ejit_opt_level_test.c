@@ -38,25 +38,25 @@ extern void ejit_shutdown(void);
 //===-- 数据结构 -------------------------------------------------------------===//
 
 struct DevInfo {
-    ejit_may_const uint32_t type;      // 1=BBU, 2=RRU, 3=AAU
-    ejit_may_const uint32_t maxPower;
-    ejit_may_const uint32_t channels;
+    EJIT_PERIOD_CONST uint32_t type;      // 1=BBU, 2=RRU, 3=AAU
+    EJIT_PERIOD_CONST uint32_t maxPower;
+    EJIT_PERIOD_CONST uint32_t channels;
     uint32_t uptime;
 };
 
 struct CarrCfg {
-    ejit_may_const uint32_t freqBand;
-    ejit_may_const uint32_t bandwidth;
-    ejit_may_const bool     mimo;
+    EJIT_PERIOD_CONST uint32_t freqBand;
+    EJIT_PERIOD_CONST uint32_t bandwidth;
+    EJIT_PERIOD_CONST bool     mimo;
     uint32_t txPower;
 };
 
 //===-- 全局变量 -------------------------------------------------------------===//
 
-ejit_period(static) struct DevInfo g_dev;
+ejit_group(static) struct DevInfo g_dev;
 
 #define N_CARR 8
-ejit_period_arr(carrier) struct CarrCfg g_carr[N_CARR];
+ejit_group(carrier) struct CarrCfg g_carr[N_CARR];
 
 //===-- always_inline helper (L2 内敛目标) ----------------------------------===//
 
@@ -74,7 +74,7 @@ static inline uint32_t mimo_gain(uint32_t pwr, bool mimo) {
 
 ejit_entry
 uint32_t process_carr(
-    ejit_period_arr_ind(carrier) uint8_t ci)
+    EJIT_DIM(carrier) uint8_t ci)
 {
     uint32_t r = 0;
 

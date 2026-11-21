@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-register-period -S %s | FileCheck %s
+; RUN: opt -passes=ejit-register-group -S %s | FileCheck %s
 
 ; Test: Multiple period arrays + static vars + no-metadata (plain) globals.
 ; Verify only period/metadata-annotated globals are registered.
@@ -33,9 +33,9 @@ define void @dummy() {
   ret void
 }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 8}}
-!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 16}}
-!12 = distinct !{!{!"ejit_period_arr", !"slice", i32 4}}
-!13 = distinct !{!{!"ejit_period_arr", !"carrier", i32 32}}
-!14 = distinct !{!{!"ejit_period", !"static"}}
-!15 = distinct !{!{!"ejit_period", !"static"}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 8}}
+!11 = distinct !{!{!"ejit_group_indexed", !"trp", i32 16}}
+!12 = distinct !{!{!"ejit_group_indexed", !"slice", i32 4}}
+!13 = distinct !{!{!"ejit_group_indexed", !"carrier", i32 32}}
+!14 = distinct !{!{!"ejit_group", !"static"}}
+!15 = distinct !{!{!"ejit_group", !"static"}}

@@ -1,9 +1,9 @@
 ; RUN: opt -passes=ejit-register-bitcode -S %s | FileCheck %s --check-prefix=BC
-; RUN: opt -passes=ejit-register-period -S %s | FileCheck %s --check-prefix=PD
+; RUN: opt -passes=ejit-register-group -S %s | FileCheck %s --check-prefix=PD
 ;
 ; Multi-TU link safety: PASS1/PASS2 must emit their per-translation-unit
 ; registry entries as PRIVATE (local) globals placed in dedicated, C-identifier
-; named sections (".ejit_bitcode" / ".ejit_period") and kept alive via llvm.used.
+; named sections (".ejit_bitcode" / ".ejit_group") and kept alive via llvm.used.
 ; The linker concatenates these sections across all TUs and synthesizes the
 ; __start_/__stop_ bounds the runtime walks.
 ;
@@ -26,8 +26,8 @@ define void @my_entry() !ejit.metadata !0 {
 }
 
 !0 = distinct !{!{!"ejit_entry"}}
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 10}}
-!11 = distinct !{!{!"ejit_period", !"static"}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 10}}
+!11 = distinct !{!{!"ejit_group", !"static"}}
 
 ; --- PASS1: bitcode registry ---
 ; The table is private (local symbol -> no cross-TU collision), lives in the
@@ -37,6 +37,6 @@ define void @my_entry() !ejit.metadata !0 {
 ; BC-NOT: @__ejit_registry_bitcode
 
 ; --- PASS2: period registry ---
-; PD: @{{.*}} = private constant {{.*}}, section ".ejit_period"
+; PD: @{{.*}} = private constant {{.*}}, section ".ejit_group"
 ; PD: @llvm.used = appending global {{.*}} section "llvm.metadata"
 ; PD-NOT: @__ejit_registry_period

@@ -25,10 +25,10 @@
 //===-- test data ---------------------------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t traffic;
 };
-ejit_period_arr(cell) struct CellCfg g_cells[16];
+ejit_group(cell) struct CellCfg g_cells[16];
 
 //===-- helpers -----------------------------------------------------------===//
 
@@ -61,9 +61,9 @@ static uint32_t __attribute__((noinline)) st_helper_small(uint32_t x) {
   return x ^ 0x55;
 }
 
-// static + reads may_const: externalized like any other helper; its AOT
+// static + reads period_const: externalized like any other helper; its AOT
 // body reads live values, which the entry-side guard keeps consistent
-static uint32_t __attribute__((noinline)) st_helper_mayconst(uint32_t i) {
+static uint32_t __attribute__((noinline)) st_helper_period_const(uint32_t i) {
   uint32_t r = g_cells[i].cellType;
   for (uint32_t k = 0; k < 8; k++)
     r = r * 3 + g_cells[(i + k) % 16].traffic;
@@ -75,19 +75,19 @@ static inline uint32_t hint_helper(uint32_t x) { return x * 7 + 3; }
 
 //===-- entries -----------------------------------------------------------===//
 
-ejit_entry uint32_t entry1(ejit_period_arr_ind(cell) uint8_t ci) {
+ejit_entry uint32_t entry1(EJIT_DIM(cell) uint8_t ci) {
   uint32_t r = ext_helper_big(ci);
   r += st_helper_big(r);
   r += st_helper_small(r);
-  r += st_helper_mayconst(ci);
+  r += st_helper_period_const(ci);
   r = hint_helper(r);
   return r;
 }
 
-ejit_entry uint32_t entry2(ejit_period_arr_ind(cell) uint8_t ci) {
+ejit_entry uint32_t entry2(EJIT_DIM(cell) uint8_t ci) {
   uint32_t r = st_helper_big(ci);
   r = ext_helper_big(r);
-  r += st_helper_mayconst(ci);
+  r += st_helper_period_const(ci);
   r = hint_helper(r);
   return r;
 }
@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
   uint32_t e1 = ext_helper_big(ci);
   e1 += st_helper_big(e1);
   e1 += st_helper_small(e1);
-  e1 += st_helper_mayconst(ci);
+  e1 += st_helper_period_const(ci);
   e1 = hint_helper(e1);
   printf("  entry1: got=%u expected=%u [%s]\n", r1, e1,
          r1 == e1 ? "MATCH" : "MISMATCH");
@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
   uint32_t r2 = entry2(ci);
   uint32_t e2 = st_helper_big(ci);
   e2 = ext_helper_big(e2);
-  e2 += st_helper_mayconst(ci);
+  e2 += st_helper_period_const(ci);
   e2 = hint_helper(e2);
   printf("  entry2: got=%u expected=%u [%s]\n", r2, e2,
          r2 == e2 ? "MATCH" : "MISMATCH");

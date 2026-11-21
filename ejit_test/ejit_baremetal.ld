@@ -15,7 +15,7 @@
  * runtime cannot use the global-constructor registration path and MUST fall
  * back to walking the static registry tables via
  *     [__start_ejit_bitcode, __stop_ejit_bitcode)
- *     [__start_ejit_period,  __stop_ejit_period)
+ *     [__start_ejit_group,  __stop_ejit_group)
  * This script provides those four symbols by hand, exactly as a real bare-metal
  * linker script would, instead of depending on the linker's automatic
  * __start_/__stop_ synthesis.
@@ -26,10 +26,10 @@
  * a minimal loader might not understand. .data is the natural home here: each
  * ejit_reg_entry_t holds pointer fields (the period array base address, the
  * embedded bitcode pointer, ...), so the compiler emits the .ejit_bitcode /
- * .ejit_period input sections as WRITABLE (data-with-relocations, SHF_WRITE) —
+ * .ejit_group input sections as WRITABLE (data-with-relocations, SHF_WRITE) —
  * under PIE those pointers are fixed up at load time. On a real target with a
  * full SECTIONS command you would instead place `KEEP(*(.ejit_bitcode))` /
- * `KEEP(*(.ejit_period))` directly inside your existing .data { } block (or, on
+ * `KEEP(*(.ejit_group))` directly inside your existing .data { } block (or, on
  * a static non-PIE image where the pointers are resolved at link time and never
  * written at runtime, inside .rodata to keep them in flash). The INSERT form
  * here is the equivalent that works on top of the host's default linker script.
@@ -43,7 +43,7 @@
  *     .data : ALIGN(8) {
  *       *(.data .data.*)
  *       . = ALIGN(8); __start_ejit_bitcode = .; KEEP(*(.ejit_bitcode)) __stop_ejit_bitcode = .;
- *       . = ALIGN(8); __start_ejit_period  = .; KEEP(*(.ejit_period))  __stop_ejit_period  = .;
+ *       . = ALIGN(8); __start_ejit_group  = .; KEEP(*(.ejit_group))  __stop_ejit_group  = .;
  *     } > RAM AT> FLASH
  *
  * The runtime only walks [__start_, __stop_); it does not care about the
@@ -65,9 +65,9 @@ SECTIONS
     __stop_ejit_bitcode = .;
 
     . = ALIGN(8);
-    __start_ejit_period = .;
-    KEEP(*(.ejit_period))
-    __stop_ejit_period = .;
+    __start_ejit_group = .;
+    KEEP(*(.ejit_group))
+    __stop_ejit_group = .;
     . = ALIGN(8);
   }
 } INSERT AFTER .data;

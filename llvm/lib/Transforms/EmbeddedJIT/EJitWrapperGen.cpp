@@ -44,7 +44,7 @@
 // icache array stride.
 static_assert(EJIT_ICACHE_MAX_DIMS == llvm::ejit::MAX_PERIOD_ARR_IND_PARAMS,
               "EJIT_ICACHE_MAX_DIMS must equal MAX_PERIOD_ARR_IND_PARAMS "
-              "(wrapper dim cap vs Sema ejit_period_arr_ind cap).");
+              "(wrapper dim cap vs Sema ejit_dim cap).");
 static_assert((EJIT_ICACHE_DIM_SIZE & (EJIT_ICACHE_DIM_SIZE - 1)) == 0,
               "EJIT_ICACHE_DIM_SIZE must be a power of 2 "
               "([D]^numDims icache array stride).");
@@ -186,7 +186,7 @@ static SmallVector<PeriodArrIndInfo, 4> getPeriodArrIndInfo(const Function &F) {
     if (!Sub || Sub->getNumOperands() < 3)
       continue;
     if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
-      if (Tag->getString() == TAG_EJIT_PERIOD_ARR_IND) {
+      if (Tag->getString() == TAG_EJIT_DIM) {
         auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
         auto *IdxC = dyn_cast<ConstantAsMetadata>(Sub->getOperand(2));
         if (PN && IdxC)
@@ -217,7 +217,7 @@ static GlobalVariable *getOrCreateDimTypeGlobal(Module &M,
 // Emit registration that fills each per-lifecycle dimType global with the slot
 // the process-global EJitLifecycleRegistry assigns by name: ejit_register_
 // lifecycle() calls in ejit_auto_register (constructor path) plus private
-// .ejit_period section entries (bare-metal / test fallback). Mirrors the period
+// .ejit_group section entries (bare-metal / test fallback). Mirrors the period
 // pass. Idempotent: skips if the static section payload already exists.
 static void
 emitLifecycleRegistration(Module &M,
@@ -261,7 +261,7 @@ emitLifecycleRegistration(Module &M,
 
   // Static registry entries for bare-metal / testing fallback. They use the
   // same linker-concatenated section model as PASS2: private arrays in
-  // ".ejit_period", no sentinel and no fixed external symbol, so multiple TUs
+  // ".ejit_group", no sentinel and no fixed external symbol, so multiple TUs
   // can all contribute lifecycle fixups without duplicate-symbol errors.
   StructType *EntryTy = StructType::get(
       Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
@@ -286,7 +286,7 @@ emitLifecycleRegistration(Module &M,
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
       ConstantArray::get(ArrayTy, Entries), ".ejit.registry.lifecycle");
-  GV->setSection(SECT_EJIT_PERIOD);
+  GV->setSection(SECT_EJIT_GROUP);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }
@@ -379,7 +379,7 @@ static Constant *buildIcacheSentinelInit(Type *SlotTy, Function *MissFn,
 // Emit registration that fills each per-function dense-funcIndex global with
 // the index the process-global EJitFuncRegistry assigns by name: ejit_register_
 // funcindex() calls in ejit_auto_register (constructor path) plus private
-// .ejit_period section entries (bare-metal / test fallback). Mirrors the
+// .ejit_group section entries (bare-metal / test fallback). Mirrors the
 // lifecycle registration. Idempotent: skips if the static section payload
 // already exists.
 static void
@@ -422,7 +422,7 @@ emitFuncIndexRegistration(Module &M,
 
   // Static registry entries for bare-metal / testing fallback. They use the
   // same linker-concatenated section model as PASS2: private arrays in
-  // ".ejit_period", no sentinel and no fixed external symbol, so multiple TUs
+  // ".ejit_group", no sentinel and no fixed external symbol, so multiple TUs
   // can all contribute funcIndex fixups without duplicate-symbol errors.
   StructType *EntryTy = StructType::get(
       Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
@@ -447,7 +447,7 @@ emitFuncIndexRegistration(Module &M,
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
       ConstantArray::get(ArrayTy, Entries), ".ejit.registry.funcindex");
-  GV->setSection(SECT_EJIT_PERIOD);
+  GV->setSection(SECT_EJIT_GROUP);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }
@@ -455,7 +455,7 @@ emitFuncIndexRegistration(Module &M,
 // Emit registration that wires each per-function inline-cache slot global
 // (@__ejit_icache_fn_<name>) into the runtime slot-pointer table by name:
 // ejit_register_icache_slot() calls in ejit_auto_register (constructor path)
-// plus private .ejit_period section entries (bare-metal / test fallback). The
+// plus private .ejit_group section entries (bare-metal / test fallback). The
 // runtime keys the slot by the SAME registry funcIndex ejit_register_funcindex
 // assigns, then writes the frozen specialization pointer through it on resolve
 // (icacheFill); the wrapper reads it directly on the hit path. Idempotent:
@@ -522,7 +522,7 @@ emitIcacheSlotRegistration(Module &M,
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Static registry entries for bare-metal / testing fallback (same linker-
-  // concatenated .ejit_period model as funcindex above). The `size` (i64) field
+  // concatenated .ejit_group model as funcindex above). The `size` (i64) field
   // carries NumDims and the spare name2 ptr carries the sentinel MissFn; the
   // ejit_init walker forwards both to ejitIcacheRegisterSlot.
   StructType *EntryTy = StructType::get(
@@ -553,7 +553,7 @@ emitIcacheSlotRegistration(Module &M,
   auto *GV = new GlobalVariable(
       M, ArrayTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
       ConstantArray::get(ArrayTy, Entries), ".ejit.registry.icache");
-  GV->setSection(SECT_EJIT_PERIOD);
+  GV->setSection(SECT_EJIT_GROUP);
   GV->setAlignment(M.getDataLayout().getABITypeAlign(EntryTy));
   appendToUsed(M, {GV});
 }
@@ -741,7 +741,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (DimCount > EJIT_ICACHE_MAX_DIMS) {
       F->getContext().emitError("ejit-wrapper-gen: more than "
                                 + Twine(EJIT_ICACHE_MAX_DIMS) +
-                                " ejit_period_arr_ind dimensions are not "
+                                " ejit_dim dimensions are not "
                                 "supported");
       continue;
     }
@@ -759,28 +759,28 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       auto GIt = DimTypeGlobals.find(PeriodInds[I].PeriodName);
       if (PeriodInds[I].PeriodName.empty() || GIt == DimTypeGlobals.end()) {
         F->getContext().emitError("ejit-wrapper-gen: invalid period name in "
-                                  "ejit_period_arr_ind: " +
+                                  "ejit_dim: " +
                                   PeriodInds[I].PeriodName);
         Invalid = true;
         break;
       }
       if (llvm::is_contained(SeenNames, StringRef(PeriodInds[I].PeriodName))) {
         F->getContext().emitError("ejit-wrapper-gen: duplicated lifecycle "
-                                  "dimension in ejit_period_arr_ind metadata");
+                                  "dimension in ejit_dim metadata");
         Invalid = true;
         break;
       }
       SeenNames.push_back(PeriodInds[I].PeriodName);
 
       if (PeriodInds[I].ArgIndex >= ArgCount) {
-        F->getContext().emitError("ejit-wrapper-gen: ejit_period_arr_ind "
+        F->getContext().emitError("ejit-wrapper-gen: ejit_dim "
                                   "argument index out of range");
         Invalid = true;
         break;
       }
       Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
       if (!ArgVal->getType()->isIntegerTy()) {
-        F->getContext().emitError("ejit-wrapper-gen: ejit_period_arr_ind "
+        F->getContext().emitError("ejit-wrapper-gen: ejit_dim "
                                   "argument must be an integer type");
         Invalid = true;
         break;

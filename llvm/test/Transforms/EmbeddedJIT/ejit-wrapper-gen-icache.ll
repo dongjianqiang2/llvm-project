@@ -152,12 +152,12 @@ entry:
 @data2 = global i32 0, !ejit.metadata !11
 
 !0 = distinct !{!{!"ejit_entry"}}
-!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!2 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
+!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
+!2 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}}
 ; `trp` declares MORE entries than EJIT_ICACHE_DIM_SIZE (16) on purpose: the
 ; declared element count does not gate probe emission, so two_dim_entry still
 ; gets its [16 x [16 x ptr]] table and its probe. The ICACHE checks above pin
 ; that. Ids at or above the per-dim bound have no cell, and the runtime declines
 ; to fill one for them (icacheDimsInRange in icacheFill / icacheTry).
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
-!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 32}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}
+!11 = distinct !{!{!"ejit_group_indexed", !"trp", i32 32}}

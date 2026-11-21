@@ -39,9 +39,9 @@ Existing witness bounds, poison/overflow, alignment, field eligibility, object
 extent and registry/lifecycle checks remain authoritative. Unknown PHI/call
 chains safely miss folding. Marker inputs cannot authorize sibling SSA uses.
 
-EJitOptimizer keeps the boundary until its last may_const consumption:
+EJitOptimizer keeps the boundary until its last period_const consumption:
 Baseline/PGOUse after runOptimizationPipeline; Instrumented after counter
-capture and all may_const handling. Each return lowers calls to actual inputs
+capture and all period_const handling. Each return lowers calls to actual inputs
 and clears analyses. The Tier1/Tier2 common profile prefix retains matching
 marker shape; cleanup after counter capture must not alter profile CFG.
 
@@ -67,15 +67,15 @@ Before specialization:
 %source = load i64, ptr @runtime_slot
 %offset = call i64 @__ejit_local_free_dim_v1_i64(i64 %source)
 %marked = getelementptr i8, ptr %cell_base, i64 %offset
-%mode = load i32, ptr %marked, !ejit.may_const !0
+%mode = load i32, ptr %marked, !ejit.period_const !0
 %raw = getelementptr i8, ptr %cell_base, i64 %source
-%unmarked = load i32, ptr %raw, !ejit.may_const !0
+%unmarked = load i32, ptr %raw, !ejit.period_const !0
 ```
 
 After successful witness consumption and mandatory cleanup:
 ```llvm
 ; mode is replaced by the generation's baked value, e.g. 7.
-; raw/unmarked and non-may_const loads still use %source.
+; raw/unmarked and non-period_const loads still use %source.
 ; all surviving offset computations also use %source, never zero.
 ```
 
@@ -94,7 +94,7 @@ recognizable typed cell selection. Marking the cell selector itself does not
 authorize eliminating identity. The consuming function must track the actual
 period, not merely some unrelated managed period.
 
-Nested constant arrays of records contribute existing may_const field offsets
+Nested constant arrays of records contribute existing period_const field offsets
 for both global and bound objects. Traversal has a 4096-node budget; unions,
 volatile fields and oversized/unrepresentable offsets remain conservative
 misses. Bound reads require an eligible field inventory and valid object range,
@@ -133,7 +133,7 @@ O2 IR retained the boundary after that helper was inlined and locals promoted:
 %selected = getelementptr inbounds [2 x %struct.HostCell],
     ptr @local_host_cells, i64 0, i64 %cell_index
 %p = getelementptr inbounds i8, ptr %selected, i64 %offset
-%mode = load i32, ptr %p, align 4, !ejit.may_const !0
+%mode = load i32, ptr %p, align 4, !ejit.period_const !0
 %payload_ptr = getelementptr inbounds i8, ptr %p, i64 4
 %payload = load i32, ptr %payload_ptr, align 4
 ```
@@ -182,7 +182,7 @@ with a separate 10-second LLVM-parser check of the saved optimized IR.
 | LFD09 | Real online deactivate/update/reactivate and regenerated cell constant. Existing taskpool generation/publication protections unchanged; no new local-specific forced concurrent board race claimed. |
 | LFD10 | C/C++/Blocks declaration diagnostics and existing parameter regressions; const/nonconst accepted, mutation/address/reference/closure escapes rejected. |
 | LFD11 | Baseline, executed ORC Gen/Use, normal queued online PGO/refresh; unknown private-marker version fails cleanly to fallback. |
-| LFD12 | Unavailable: no may_const value verifier exists in frozen baseline; PR237 is independent. No witness-vs-itself comparison or fabricated verifier result. |
+| LFD12 | Unavailable: no period_const value verifier exists in frozen baseline; PR237 is independent. No witness-vs-itself comparison or fabricated verifier result. |
 | LFD13 | Native C source link/execution; native and genuine big-endian demo objects; BE consumer component compile/relocatable link; BE AOT-only static ELF with zero undefined symbols. Actual SDK final-package link pending. |
 | LFD14 | Demo source and compile evidence only. Real worker6/owner16 board execution/IR/ASM inspection pending. |
 

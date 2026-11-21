@@ -211,7 +211,7 @@ inline void markPostPublishSeen(EJitSharedCacheSlot &Slot) {
 // entry records the wrapper's per-function @__ejit_icache_fn_<name> global base
 // (a uintptr_t cell, or a [D]^numDims array of them for a multi-version entry)
 // plus its dimensionality, registered by name at ejit_auto_register /
-// .ejit_period time via ejit_register_icache_slot (which calls
+// .ejit_group time via ejit_register_icache_slot (which calls
 // ejitIcacheRegisterSlot). The wrapper reads the cell directly (a GEP by the
 // ejit_dim arg values + one load + null-check + indirect call) with NO
 // ejit_icache_try call and NO per-call guards. icacheFill writes the
@@ -764,7 +764,7 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   if (!reg.base || numDims != reg.numDims) {
     // Unregistered, or shape mismatch: nowhere to write. A null base means this
     // core never ran ejit_register_icache_slot for this function -- the AOT
-    // .ejit_period entry is missing, or the name did not resolve to funcIndex.
+    // .ejit_group entry is missing, or the name did not resolve to funcIndex.
     if (!gIcacheFillRejectLogged[kFillRejectUnregistered]) {
       gIcacheFillRejectLogged[kFillRejectUnregistered] = true;
       EJIT_DIAG("icacheFill DECLINE func=%u: base=%p registeredDims=%u "
@@ -2664,9 +2664,9 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
   // starting value is arbitrary, which is harmless: the L0 tables are zeroed
   // BSS and l0Key() never returns 0, so no entry can match anyway.
   st->dispatchEpoch.fetchAdd(1);
-  st->mayConstRankingRequest.storeRelaxed(0);
-  st->mayConstRankingComplete.storeRelaxed(0);
-  st->mayConstRankingResult.storeRelaxed(0);
+  st->periodConstRankingRequest.storeRelaxed(0);
+  st->periodConstRankingComplete.storeRelaxed(0);
+  st->periodConstRankingResult.storeRelaxed(0);
   st->codeBatchRequestLock.storeRelaxed(0);
   st->codeBatchRequestState.storeRelaxed(
       static_cast<uint32_t>(EJitCodeBatchRequestState::Idle));
@@ -4022,16 +4022,16 @@ bool EJitSharedTaskPool::pollOne() {
   return true;
 }
 
-bool EJitSharedTaskPool::serviceMayConstRankingRequest() {
+bool EJitSharedTaskPool::servicePeriodConstRankingRequest() {
   if (!state_ || !isOwner_)
     return false;
-  const uint32_t Request = state_->mayConstRankingRequest.loadAcquire();
-  if (Request == state_->mayConstRankingComplete.loadAcquire())
+  const uint32_t Request = state_->periodConstRankingRequest.loadAcquire();
+  if (Request == state_->periodConstRankingComplete.loadAcquire())
     return false;
 
-  const bool Ok = mayConstRankingFn_ && mayConstRankingFn_(mayConstRankingCtx_);
-  state_->mayConstRankingResult.storeRelaxed(Ok ? 1u : 0u);
-  state_->mayConstRankingComplete.storeRelease(Request);
+  const bool Ok = periodConstRankingFn_ && periodConstRankingFn_(periodConstRankingCtx_);
+  state_->periodConstRankingResult.storeRelaxed(Ok ? 1u : 0u);
+  state_->periodConstRankingComplete.storeRelease(Request);
   return true;
 }
 
@@ -4054,7 +4054,7 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
     // drains the work that predates the request before publishing it.
     if (serviceCodeBatchRequest())
       return EJitWorkerStep::Consumed;
-    if (serviceMayConstRankingRequest())
+    if (servicePeriodConstRankingRequest())
       return EJitWorkerStep::Consumed;
     if (pollOne())
       return EJitWorkerStep::Consumed;
@@ -4139,25 +4139,25 @@ uint32_t EJitSharedTaskPool::pendingCount() const {
   return pending;
 }
 
-bool EJitSharedTaskPool::requestMayConstRanking() {
+bool EJitSharedTaskPool::requestPeriodConstRanking() {
   if (!state_ || state_->initState.loadAcquire() !=
                      static_cast<uint32_t>(EJitSharedInitState::Ready)) {
-    EJIT_DIAG("mayconst-ranking request rejected: shared worker not ready");
+    EJIT_DIAG("period_const-ranking request rejected: shared worker not ready");
     return false;
   }
 
   const uint32_t Generation = state_->generation.loadAcquire();
-  const uint32_t Ticket = state_->mayConstRankingRequest.fetchAdd(1) + 1;
+  const uint32_t Ticket = state_->periodConstRankingRequest.fetchAdd(1) + 1;
   constexpr uint32_t kMaxWaitRounds = 1u << 20;
   for (uint32_t Round = 0; Round < kMaxWaitRounds; ++Round) {
     if (state_->generation.loadAcquire() != Generation)
       break;
-    const uint32_t Complete = state_->mayConstRankingComplete.loadAcquire();
+    const uint32_t Complete = state_->periodConstRankingComplete.loadAcquire();
     if (static_cast<int32_t>(Complete - Ticket) >= 0)
-      return state_->mayConstRankingResult.loadAcquire() != 0;
+      return state_->periodConstRankingResult.loadAcquire() != 0;
     workerIdle(1);
   }
-  EJIT_DIAG("mayconst-ranking request timed out ticket=%u owner=%u", Ticket,
+  EJIT_DIAG("period_const-ranking request timed out ticket=%u owner=%u", Ticket,
             state_->ownerCoreId.loadAcquire());
   return false;
 }

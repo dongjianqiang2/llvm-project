@@ -21,7 +21,7 @@ PASS1(`EJitRegisterBitcodePass`)按**传递闭包**提取:从所有 `ejit_entry`
 | 约束 | 来源 |
 |---|---|
 | JIT 管线刻意不跑 inliner,依赖 AOT 时间内联 | EJitOptimizer.cpp `runPipeline` 注释 |
-| 模块内 callee 体是特化面:StructFieldPass 折叠 may_const load、IPSCCP 跨调用边传播常量 | EJitOptimizer.cpp Phase 1c/1d |
+| 模块内 callee 体是特化面:StructFieldPass 折叠 period_const load、IPSCCP 跨调用边传播常量 | EJitOptimizer.cpp Phase 1c/1d |
 | spec JITDylib 隔离,不回退主 JD 的进程符号搜索——**所有未定义符号只能靠显式注册解析,host 上 dlsym 也兜不了底** | EJitOrcEngine.cpp:1007-1019(absoluteSymbols define 在 spec JD 上) |
 | 提取的克隆模块中,`declare` 不能带 internal 链接(opt 报 `invalid linkage for function declaration`) | 实测 |
 
@@ -75,9 +75,9 @@ PASS1(`EJitRegisterBitcodePass`)按**传递闭包**提取:从所有 `ejit_entry`
 
 inliner 的 cost 分析就是"哪些函数值得保留函数体"的决策;内联后仍带定义且有调用点存活的函数,天然是外链化候选。**不在提取前重复实现大小/热度启发式**,也不做强制内联(违背 noinline 标注意图,且重新制造 JIT/AOT 分歧)。
 
-### 4.2 无 may_const 豁免
+### 4.2 无 period_const 豁免
 
-读 may_const 全局的 helper 默认也外链化(正确性不受影响:外链 helper 读活值,entry 侧 guard 保证值与特化常量一致)。需要 helper 内部特化的场景,用户把它标成 `ejit_entry` 做独立特化——现有机制已验证支撑:
+读 period_const 全局的 helper 默认也外链化(正确性不受影响:外链 helper 读活值,entry 侧 guard 保证值与特化常量一致)。需要 helper 内部特化的场景,用户把它标成 `ejit_entry` 做独立特化——现有机制已验证支撑:
 
 - entry 不被 internalize(EJitRegisterBitcode.cpp internalize 步骤跳过 `TAG_EJIT_ENTRY`)
 - static 的 entry 也能被 JIT 强制外链(EJitOrcEngine.cpp:903-905)
@@ -113,11 +113,11 @@ spec JITDylib 隔离(见 §1)意味着**每个外链化的 helper(static 或 ext
 
 ### 4.4 诊断口径
 
-`runSpecializationDiagnostic` 保持在外链化**之前**运行(现状位置天然满足):"closure" 的 may_const 计数继续按源码级闭包统计,文案不变。
+`runSpecializationDiagnostic` 保持在外链化**之前**运行(现状位置天然满足):"closure" 的 period_const 计数继续按源码级闭包统计,文案不变。
 
 ## 5. 数据与阈值
 
-合成场景(entries 调用 static/external、大/小、读/不读 may_const、inlinehint 混合 helper),release clang dump + 真实 bitcode 字节测量(已做重组基线校正):
+合成场景(entries 调用 static/external、大/小、读/不读 period_const、inlinehint 混合 helper),release clang dump + 真实 bitcode 字节测量(已做重组基线校正):
 
 | 场景 | 模块大小 | 存活 helper | 全部外链化节省 |
 |---|---|---|---|
@@ -179,4 +179,4 @@ PASS1 已为闭包外部引用维护两套注册发射(ctor 路径 `generateSymb
 |---|---|---|
 | 阈值 | `-ejit-externalize-min-insts`(默认 16) | 已做成 cl::opt;严格盈亏平衡 ~20-25 指令(§5),16 是"Flash 优先"的偏激进取值,可按真实场景数据微调 |
 | 注册时机 | 挂在现有 AOT 注册函数(全局 ctor 路径) | 与现有 globals/period 注册一致 |
-| 未来优化 | 静态段注册(`.ejit_period` 风格 name→addr 表) | 可省去运行时 std::map 开销,进一步降低小函数外链成本 |
+| 未来优化 | 静态段注册(`.ejit_group` 风格 name→addr 表) | 可省去运行时 std::map 开销,进一步降低小函数外链成本 |

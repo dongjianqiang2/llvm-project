@@ -1,7 +1,7 @@
 /**
  * EJIT 性能基准测试 — 验证 JIT 优化后有可量化的性能收益
  *
- * 场景: 结构体中有多个 may_const 字段，循环中大量访问。
+ * 场景: 结构体中有多个 period_const 字段，循环中大量访问。
  *       JIT 将这些字段替换为常量并折叠分支，消除循环内的
  *       内存读取和条件跳转。
  *
@@ -18,35 +18,35 @@
 
 #include "ejit_test_helpers.h"
 
-//===-- 数据结构: 6 个 may_const 字段 -----------------------------------------===//
+//===-- 数据结构: 6 个 period_const 字段 -----------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;   // 分支条件
-  ejit_may_const uint32_t priority;    // 分支条件
-  ejit_may_const uint32_t maxPower;    // 阈值
-  ejit_may_const uint32_t minPower;    // 阈值
-  ejit_may_const uint32_t bandWidth;   // 乘数
-  ejit_may_const uint32_t timeSlot;    // 除数
-  uint32_t result;  // 非 may_const: 写入目标
+  EJIT_PERIOD_CONST uint32_t cellType;   // 分支条件
+  EJIT_PERIOD_CONST uint32_t priority;    // 分支条件
+  EJIT_PERIOD_CONST uint32_t maxPower;    // 阈值
+  EJIT_PERIOD_CONST uint32_t minPower;    // 阈值
+  EJIT_PERIOD_CONST uint32_t bandWidth;   // 乘数
+  EJIT_PERIOD_CONST uint32_t timeSlot;    // 除数
+  uint32_t result;  // 非 period_const: 写入目标
 };
 
 #define N 16
-ejit_period_arr(cell) struct CellCfg g_cfg[N];
+ejit_group(cell) struct CellCfg g_cfg[N];
 
-//===-- JIT entry: 循环中大量访问 may_const 字段 -----------------------------===//
+//===-- JIT entry: 循环中大量访问 period_const 字段 -----------------------------===//
 
 #define LOOP_ITERS 20000000ULL  // 20M 次迭代
 
 ejit_entry
 uint64_t compute_cell(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   uint64_t sum = 0;
   struct CellCfg *p = &g_cfg[ci];
 
   for (uint64_t i = 0; i < LOOP_ITERS; i++) {
-    // AOT: 每次迭代从内存加载 6 个 may_const 字段 + 多次分支判断
-    // JIT: 所有 may_const 替换为常量，分支被折叠，只剩简单算术
+    // AOT: 每次迭代从内存加载 6 个 period_const 字段 + 多次分支判断
+    // JIT: 所有 period_const 替换为常量，分支被折叠，只剩简单算术
     if (p->cellType == 0xFD) {
       if (p->priority > 10) {
         sum += p->maxPower * p->bandWidth / (p->timeSlot + 1);
@@ -81,12 +81,12 @@ uint64_t compute_cell_nojit(uint8_t ci)
   return sum;
 }
 
-//===-- Interprocedural: noinline 被调函数读 may_const 字段 -------------------===//
+//===-- Interprocedural: noinline 被调函数读 period_const 字段 -------------------===//
 //
 // The AOT inliner keeps this call edge (noinline), so the entry's specialized
 // cell index reaches the callee only as an ordinary argument. Without
 // interprocedural propagation (pipeline phase 1d) the callee re-loads the six
-// may_const fields and re-tests both guards on every call — the JIT run then
+// period_const fields and re-tests both guards on every call — the JIT run then
 // matches AOT. With phase 1d the callee folds to `sum + constant`.
 
 __attribute__((noinline))
@@ -105,7 +105,7 @@ static uint64_t cell_step(uint8_t ci, uint64_t sum)
 
 ejit_entry
 uint64_t compute_cell_ip(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   uint64_t sum = 0;
   for (uint64_t i = 0; i < LOOP_ITERS; i++)

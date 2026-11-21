@@ -28,7 +28,7 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 // Registry entries: each translation unit's PASS1/PASS2 output places its
-// entries into the ".ejit_bitcode" / ".ejit_period" sections as private
+// entries into the ".ejit_bitcode" / ".ejit_group" sections as private
 // symbols. The linker concatenates all such input sections across every TU.
 // The leading-dot section names are not valid C identifiers, so the linker
 // does NOT auto-synthesize the __start_/__stop_ bounds — a linker script must
@@ -47,13 +47,13 @@ extern "C" {
 #ifndef EJIT_FREESTANDING
 extern const ejit_reg_entry_t __start_ejit_bitcode[] __attribute__((weak));
 extern const ejit_reg_entry_t __stop_ejit_bitcode[] __attribute__((weak));
-extern const ejit_reg_entry_t __start_ejit_period[] __attribute__((weak));
-extern const ejit_reg_entry_t __stop_ejit_period[] __attribute__((weak));
+extern const ejit_reg_entry_t __start_ejit_group[] __attribute__((weak));
+extern const ejit_reg_entry_t __stop_ejit_group[] __attribute__((weak));
 #else
 extern const ejit_reg_entry_t __start_ejit_bitcode[];
 extern const ejit_reg_entry_t __stop_ejit_bitcode[];
-extern const ejit_reg_entry_t __start_ejit_period[];
-extern const ejit_reg_entry_t __stop_ejit_period[];
+extern const ejit_reg_entry_t __start_ejit_group[];
+extern const ejit_reg_entry_t __stop_ejit_group[];
 #endif
 }
 
@@ -221,17 +221,17 @@ EJit::EJit(const Config &config) : config_(config) {
     // AOT SECT_EJIT_* constants vs the script's KEEP patterns) silently yields
     // an empty range — exactly the silent-desync class these diagnostics exist
     // to catch. VERBOSE (not INFO): a bitcode-only app with no periods has a
-    // legitimately empty .ejit_period and must not warn at default level.
+    // legitimately empty .ejit_group and must not warn at default level.
     if (__start_ejit_bitcode == __stop_ejit_bitcode)
       EJIT_DIAG_VERBOSE("registry walk: %s range is EMPTY "
                         "(missing section or linker script mismatch)",
                         SECT_EJIT_BITCODE);
-    if (__start_ejit_period == __stop_ejit_period)
+    if (__start_ejit_group == __stop_ejit_group)
       EJIT_DIAG_VERBOSE("registry walk: %s range is EMPTY "
                         "(missing section or linker script mismatch)",
-                        SECT_EJIT_PERIOD);
+                        SECT_EJIT_GROUP);
     walkRange(__start_ejit_bitcode, __stop_ejit_bitcode);
-    walkRange(__start_ejit_period, __stop_ejit_period);
+    walkRange(__start_ejit_group, __stop_ejit_group);
     for (auto &sym : tableSymbols)
       data.userSymbols.push_back(sym);
   } else {
@@ -1024,18 +1024,18 @@ void EJit::printCodePoolStats() const {
 #endif
 }
 
-bool EJit::printMayConstRanking() {
+bool EJit::printPeriodConstRanking() {
   if (!compileDriver_) {
-    EJIT_DIAG_RAW("mayconst-ranking: no compile driver");
+    EJIT_DIAG_RAW("period_const-ranking: no compile driver");
     return false;
   }
   if (EJitOrcEngine *Engine = compileDriver_->getJitEngine())
-    return Engine->printMayConstRanking();
+    return Engine->printPeriodConstRanking();
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (EJitSharedTaskPool *Pool = compileDriver_->sharedTaskPool())
-    return Pool->requestMayConstRanking();
+    return Pool->requestPeriodConstRanking();
 #endif
-  EJIT_DIAG_RAW("mayconst-ranking: no local or shared compiler");
+  EJIT_DIAG_RAW("period_const-ranking: no local or shared compiler");
   return false;
 }
 

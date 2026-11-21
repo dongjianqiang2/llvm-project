@@ -110,14 +110,14 @@ static inline void idle_forever(uint32_t core, const char *role) {
 //===-- Data (all .mc_shared) ---------------------------------------------===//
 
 struct Cfg {
-  ejit_may_const uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellType;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(p0) struct Cfg g_p0[2];
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(p1) struct Cfg g_p1[2];
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(p2) struct Cfg g_p2[2];
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(p3) struct Cfg g_p3[2];
-EJIT_SHARED_SECTION_ATTR ejit_may_const uint32_t g_c0 = 0xFDu;
+EJIT_SHARED_SECTION_ATTR ejit_group(p0) struct Cfg g_p0[2];
+EJIT_SHARED_SECTION_ATTR ejit_group(p1) struct Cfg g_p1[2];
+EJIT_SHARED_SECTION_ATTR ejit_group(p2) struct Cfg g_p2[2];
+EJIT_SHARED_SECTION_ATTR ejit_group(p3) struct Cfg g_p3[2];
+EJIT_SHARED_SECTION_ATTR EJIT_PERIOD_CONST uint32_t g_c0 = 0xFDu;
 
 static void init_data(void) {
   /* instance 0 -> 0xFD, instance 1 -> 0xEC, for every period array. */
@@ -145,12 +145,12 @@ ejit_entry __attribute__((noinline)) uint32_t f_0(void) {
 }
 
 ejit_entry __attribute__((noinline)) uint32_t
-f_1(ejit_period_arr_ind(p0) uint8_t i0) {
+f_1(EJIT_DIM(p0) uint8_t i0) {
   return (g_p0[i0].cellType == 0xFDu) ? 1u : 0u;
 }
 
 ejit_entry __attribute__((noinline)) uint32_t
-f_2(ejit_period_arr_ind(p0) uint8_t i0, ejit_period_arr_ind(p1) uint8_t i1) {
+f_2(EJIT_DIM(p0) uint8_t i0, EJIT_DIM(p1) uint8_t i1) {
   uint32_t r = 0;
   r = (r << 1) | (g_p0[i0].cellType == 0xFDu);
   r = (r << 1) | (g_p1[i1].cellType == 0xFDu);
@@ -158,8 +158,8 @@ f_2(ejit_period_arr_ind(p0) uint8_t i0, ejit_period_arr_ind(p1) uint8_t i1) {
 }
 
 ejit_entry __attribute__((noinline)) uint32_t
-f_3(ejit_period_arr_ind(p0) uint8_t i0, ejit_period_arr_ind(p1) uint8_t i1,
-    ejit_period_arr_ind(p2) uint8_t i2) {
+f_3(EJIT_DIM(p0) uint8_t i0, EJIT_DIM(p1) uint8_t i1,
+    EJIT_DIM(p2) uint8_t i2) {
   uint32_t r = 0;
   r = (r << 1) | (g_p0[i0].cellType == 0xFDu);
   r = (r << 1) | (g_p1[i1].cellType == 0xFDu);
@@ -168,8 +168,8 @@ f_3(ejit_period_arr_ind(p0) uint8_t i0, ejit_period_arr_ind(p1) uint8_t i1,
 }
 
 ejit_entry __attribute__((noinline)) uint32_t
-f_4(ejit_period_arr_ind(p0) uint8_t i0, ejit_period_arr_ind(p1) uint8_t i1,
-    ejit_period_arr_ind(p2) uint8_t i2, ejit_period_arr_ind(p3) uint8_t i3) {
+f_4(EJIT_DIM(p0) uint8_t i0, EJIT_DIM(p1) uint8_t i1,
+    EJIT_DIM(p2) uint8_t i2, EJIT_DIM(p3) uint8_t i3) {
   uint32_t r = 0;
   r = (r << 1) | (g_p0[i0].cellType == 0xFDu);
   r = (r << 1) | (g_p1[i1].cellType == 0xFDu);

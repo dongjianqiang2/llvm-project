@@ -444,11 +444,11 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   /// this cache line's padding, so sizeof() and later offsets are unchanged.
   EJitAtomicU32 dispatchEpoch;
   /// Cross-core diagnostic rendezvous. A producer increments request; the
-  /// owner worker prints its local may_const ranking, publishes result, then
+  /// owner worker prints its local period_const ranking, publishes result, then
   /// advances complete. These fields are cold and stay in existing padding.
-  EJitAtomicU32 mayConstRankingRequest;
-  EJitAtomicU32 mayConstRankingComplete;
-  EJitAtomicU32 mayConstRankingResult;
+  EJitAtomicU32 periodConstRankingRequest;
+  EJitAtomicU32 periodConstRankingComplete;
+  EJitAtomicU32 periodConstRankingResult;
 
   //--- manual code-batch publication handshake (own cache line)
   alignas(kEJitSharedCacheLine) EJitAtomicU32 codeBatchRequestLock;

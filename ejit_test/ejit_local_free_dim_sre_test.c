@@ -14,7 +14,7 @@
 #endif
 #if !__has_attribute(ejit_entry) || !__has_attribute(ejit_dim) || \
     !__has_attribute(ejit_period_const) || \
-    !__has_attribute(ejit_in_period_array) || !__has_attribute(ejit_free_dim)
+    !__has_attribute(ejit_group) || !__has_attribute(ejit_free_dim)
 #error "Use the matching EJIT Clang; unknown attributes are not a valid demo"
 #endif
 #ifdef EJIT_DISABLE
@@ -45,11 +45,11 @@ extern uint8_t g_ucLocalCoreID;
 #define LFD_PHASES 3u
 
 struct LocalSlot {
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t payload;
 };
 struct LocalCell { struct LocalSlot slots[LFD_SLOTS]; };
-LFD_SHARED ejit_period_arr(cell) struct LocalCell g_local_free_cells[2];
+LFD_SHARED ejit_group(cell) struct LocalCell g_local_free_cells[2];
 LFD_SHARED volatile struct { uint32_t slot; } g_local_free_runtime;
 LFD_SHARED volatile uint32_t g_local_free_initializer_calls;
 
@@ -59,7 +59,7 @@ static __attribute__((always_inline)) unsigned next_local_slot(void) {
 }
 
 ejit_entry uint32_t
-local_free_work(ejit_period_arr_ind(cell) uint32_t cell) {
+local_free_work(EJIT_DIM(cell) uint32_t cell) {
   const size_t offset ejit_free_dim =
       (size_t)next_local_slot() * sizeof(struct LocalSlot);
   const struct LocalSlot *p = (const struct LocalSlot *)(

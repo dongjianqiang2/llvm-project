@@ -1,14 +1,14 @@
 # EJIT dimension-bound pointers
 
 `EJIT_BOUND_PTR(period)` associates a pointer parameter with an existing
-`EJIT_DIM(period)` parameter. It lets EJIT specialize `ejit_may_const` fields
+`EJIT_DIM(period)` parameter. It lets EJIT specialize `ejit_period_const` fields
 whose values are stable for a period instance without requiring a global array
 name.
 
 ```c
 typedef struct {
-  uint32_t ejit_may_const algorithm;
-  uint32_t ejit_may_const scale;
+  uint32_t ejit_period_const algorithm;
+  uint32_t ejit_period_const scale;
   uint32_t runtime_bias;
 } CellConfig;
 
@@ -62,7 +62,7 @@ zero-sized, overflowing, duplicate-argument, and more-than-eight descriptor
 lists are rejected and fall back cleanly to AOT. An object may be larger than
 1 KiB; request size is constant and does not grow with the object payload.
 
-Only marked `ejit_may_const` fields are read from the bound object. Other
+Only marked `ejit_period_const` fields are read from the bound object. Other
 fields remain ordinary loads through the pointer passed to each invocation.
 No nested pointer is followed.
 
@@ -71,7 +71,7 @@ No nested pointer is followed.
 The root and every direct helper own their pointer contracts independently.
 A helper that receives propagated bound facts must repeat
 `EJIT_BOUND_PTR(period)` on that pointer formal, be an `EJIT_ENTRY`, and declare
-the matching `EJIT_DIM(period)` parameter. Its bound size and `ejit_may_const`
+the matching `EJIT_DIM(period)` parameter. Its bound size and `ejit_period_const`
 field metadata must describe the same object range. Together these annotations
 give the helper an independent wrapper/cache identity for the same cell.
 

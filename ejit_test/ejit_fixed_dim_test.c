@@ -17,10 +17,10 @@
 //===-- 0-dim test data ---------------------------------------------------===//
 
 struct StaticCfg {
-  ejit_may_const uint32_t val;
+  EJIT_PERIOD_CONST uint32_t val;
   uint32_t _pad;
 };
-ejit_period(static) struct StaticCfg g_static_cfg;
+ejit_group(static) struct StaticCfg g_static_cfg;
 
 ejit_entry uint32_t static_check(void) {
   if (g_static_cfg.val == 77) return 700;
@@ -30,12 +30,12 @@ ejit_entry uint32_t static_check(void) {
 //===-- 1-dim test data ---------------------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t traffic;
 };
-ejit_period_arr(cell) struct CellCfg g_cells[8];
+ejit_group(cell) struct CellCfg g_cells[8];
 
-ejit_entry uint32_t cell_check(ejit_period_arr_ind(cell) uint8_t ci) {
+ejit_entry uint32_t cell_check(EJIT_DIM(cell) uint8_t ci) {
   if (g_cells[ci].cellType == 42) return 100;
   if (g_cells[ci].cellType == 99) return 200;
   return 0;
@@ -44,13 +44,13 @@ ejit_entry uint32_t cell_check(ejit_period_arr_ind(cell) uint8_t ci) {
 //===-- 2-dim test data ---------------------------------------------------===//
 
 struct TrpCfg {
-  ejit_may_const uint32_t trpType;
+  EJIT_PERIOD_CONST uint32_t trpType;
   uint32_t status;
 };
-ejit_period_arr(trp) struct TrpCfg g_trps[4];
+ejit_group(trp) struct TrpCfg g_trps[4];
 
-ejit_entry uint32_t cell_trp_check(ejit_period_arr_ind(cell) uint8_t ci,
-                                   ejit_period_arr_ind(trp) uint8_t ti) {
+ejit_entry uint32_t cell_trp_check(EJIT_DIM(cell) uint8_t ci,
+                                   EJIT_DIM(trp) uint8_t ti) {
   if (g_cells[ci].cellType == 42 && g_trps[ti].trpType == 3) return 999;
   return 0;
 }

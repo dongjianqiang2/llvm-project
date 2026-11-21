@@ -1,10 +1,10 @@
 /**
- * EJIT 嵌套结构体 may_const 运行时测试
+ * EJIT 嵌套结构体 period_const 运行时测试
  *
- * 验证多层嵌套结构体中的 may_const 字段能在 JIT 运行时被正确替换为常量:
+ * 验证多层嵌套结构体中的 period_const 字段能在 JIT 运行时被正确替换为常量:
  *   - 2 层嵌套: outer.mid.inner_field
  *   - 3 层嵌套: a.b.c.field
- *   - 同一结构体多个嵌套层级的 may_const
+ *   - 同一结构体多个嵌套层级的 period_const
  *   - 混合类型 (int + float)
  *
  * cellIdx 从 argv 外部输入。
@@ -25,8 +25,8 @@
 //===-- 2 层嵌套 -------------------------------------------------------------===//
 
 struct InnerCfg {
-  ejit_may_const uint32_t mode;
-  ejit_may_const uint32_t gain;
+  EJIT_PERIOD_CONST uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t gain;
   uint32_t reserved;
 };
 
@@ -36,18 +36,18 @@ struct MidCfg {
 };
 
 struct OuterCfg {
-  ejit_may_const uint32_t type;
+  EJIT_PERIOD_CONST uint32_t type;
   struct MidCfg mid;
   uint32_t extra;
 };
 
 #define N 8
-ejit_period_arr(cell) struct OuterCfg g_outer[N];
+ejit_group(cell) struct OuterCfg g_outer[N];
 
 //===-- 3 层嵌套 -------------------------------------------------------------===//
 
 struct Level3 {
-  ejit_may_const uint32_t value;
+  EJIT_PERIOD_CONST uint32_t value;
 };
 
 struct Level2 {
@@ -60,23 +60,23 @@ struct Level1 {
 };
 
 struct RootCfg {
-  ejit_may_const uint32_t root_type;
+  EJIT_PERIOD_CONST uint32_t root_type;
   struct Level1 l1;
 };
 
-ejit_period_arr(cell) struct RootCfg g_root[N];
+ejit_group(cell) struct RootCfg g_root[N];
 
-//===-- JIT entry: 2 层嵌套访问 3 个 may_const -------------------------------===//
+//===-- JIT entry: 2 层嵌套访问 3 个 period_const -------------------------------===//
 
 ejit_entry
 uint32_t check_2level(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   struct OuterCfg *p = &g_outer[ci];
 
-  // type:     字段 0 (may_const)
-  // mid.inner.mode:  嵌套在 mid[1] 内 (may_const)
-  // mid.inner.gain:  嵌套在 mid[1] 内 (may_const)
+  // type:     字段 0 (period_const)
+  // mid.inner.mode:  嵌套在 mid[1] 内 (period_const)
+  // mid.inner.gain:  嵌套在 mid[1] 内 (period_const)
   if (p->type == 0xAA && p->mid.inner.mode == 0x55)
     return p->mid.inner.gain * 2;
   else if (p->type == 0xBB)
@@ -88,12 +88,12 @@ uint32_t check_2level(
 
 ejit_entry
 uint32_t check_3level(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   struct RootCfg *p = &g_root[ci];
 
   // root_type:        字段 0
-  // l1.l2.l3.value:   3 层嵌套字段 (may_const)
+  // l1.l2.l3.value:   3 层嵌套字段 (period_const)
   uint32_t rt = p->root_type;
   uint32_t v  = p->l1.l2.l3.value;
 
@@ -117,7 +117,7 @@ static int g_fail = 0;
 int main(int argc, char **argv) {
   uint8_t ci = (argc >= 2) ? (uint8_t)atoi(argv[1]) : 0;
 
-  printf("=== EJIT Nested Struct may_const Test ===\n");
+  printf("=== EJIT Nested Struct period_const Test ===\n");
   printf("cellIdx=%u\n\n", ci);
 
   ejit_config_t cfg;

@@ -35,7 +35,7 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_external_idx_test` | External cellIdx with multi-dim arrays |
 | `ejit_inline_asm_test` | AArch64 inline asm inside an `ejit_entry` function |
 | `ejit_jit_verify_test` | JIT correctness: constant folding, dead branch elimination |
-| `ejit_lifecycle_test` | ejit_period_lc: deactivate/activate pairing |
+| `ejit_lifecycle_test` | ejit_guard: deactivate/activate pairing |
 | `ejit_multidim_test` | 2D multi-dim array with external cellIdx |
 | `ejit_multi_tu_test` | Two TUs each with ejit_entry + period globals, linked together (registry no-duplicate-symbol regression) |
 | `ejit_baremetal_link_test` | Bare-metal path: global ctors disabled + custom linker script (`ejit_baremetal.ld`) defining `__start_/__stop_` so the static registry tables drive registration |
@@ -81,13 +81,13 @@ After compilation, check these LLVM IR features:
 | jit_fallback block | `jit_fallback:` | Original function body moved here |
 | jit_dispatch block | `jit_dispatch:` | JIT-compiled function call |
 | ejit_compile_or_get call | `ejit_compile_or_get` | In jit_entry block |
-| may_const metadata | `ejit.may_const` | On marked field load instructions |
-| Function/global metadata | `ejit.metadata` | `!"ejit_entry"` / `!"ejit_period"` / ... |
+| may_const metadata | `!ejit.period_const` | On marked field load instructions |
+| Function/global metadata | `ejit.metadata` | `!"ejit_entry"` / `!"ejit_group"` / ... |
 | Bitcode embedding | `ejit.bitcode` | `@__ejit_bitcode` in dedicated section |
 | Auto-registration | `ejit_auto_register` | In `@llvm.global_ctors` |
 | Auto symbol reg | `ejit_register_symbol` | External symbols auto-registered |
-| Lifecycle deactivate | `ejit_deactivate` | At ejit_period_lc function entry |
-| Lifecycle activate | `ejit_activate` | At ejit_period_lc function exits |
+| Lifecycle deactivate | `ejit_deactivate` | At ejit_guard function entry |
+| Lifecycle activate | `ejit_activate` | At ejit_guard function exits |
 
 ## Architecture
 

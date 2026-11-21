@@ -23,7 +23,7 @@
 >
 > **v0.7 变更**:经独立检视核实并修正一批事实错误:(a)§0 价值前提--InstCombine 经 SimplifyLibCalls PGSO(`SimplifyLibCalls.cpp:1402/3457/3763`)**确消费 PSI/BFI**(v0.6 称"无 pass 消费"错),但 Baseline 无 ProfileSummary 时休眠、Tier-2 激活(小额 IR 层收益);(b)计数器全局默认 **PrivateLinkage**(P0 复测 value=8=Private;v0.4 误改 Internal 因 P0 枚举注释写反),撤回 v0.4 的 InternalLinkage 修正;(c)`InstrProfing.cpp` 文件名更正为 `InstrProfiling.cpp`;(d)P0-5 GlobalDCE cite 修正:`PassBuilderPipelines.cpp:1055` 那处条件性(CtxProfile+ThinLTOPostLink),无条件 GlobalDCE 在 :837/:1303;(e)§0 删"L1/L2/L3 固定编排";(f)§0 增"部署前提:Async 多核"(inline 是 stage 3 必做,单核 Sync 下 PGO 净负);(g)§12 阶段3 默认改"按 callee 形态自适应";(h)§13 EphemeralValues 补注(EJIT 自定义 PassBuilder 仍未注册);(i)§10 同步已实现项。
 >
-> **v0.8 变更**:阶段1 gate 实测通过--保底收益(MachineBlockPlacement 块布局)真实。用 EJitOptimizer runPipeline 产 Baseline vs Tier-2(99/1 profile)IR,llc -O2 aarch64 lower:MBP 消费 !prof **翻转块布局**,热路径从 Baseline 的"分支 taken 99%"变 Tier-2 的"fall-through"(mispredict ~99%->~1% + 热路径 icache 连续)。!prof 经 runPipeline mainFPM_ 存活到 codegen(§11.1)并被 MBP 消费。Caveat:收益条件性--Baseline 自然布局已最优(热块已 fall-through)时无改善(实测 asm 相同);EJIT may_const 特化后剩余数据相关分支自然布局未必匹配热路径,故收益可期。gate 工具 `/tmp/pgo_stage1_gate.cpp`。
+> **v0.8 变更**:阶段1 gate 实测通过--保底收益(MachineBlockPlacement 块布局)真实。用 EJitOptimizer runPipeline 产 Baseline vs Tier-2(99/1 profile)IR,llc -O2 aarch64 lower:MBP 消费 !prof **翻转块布局**,热路径从 Baseline 的"分支 taken 99%"变 Tier-2 的"fall-through"(mispredict ~99%->~1% + 热路径 icache 连续)。!prof 经 runPipeline mainFPM_ 存活到 codegen(§11.1)并被 MBP 消费。Caveat:收益条件性--Baseline 自然布局已最优(热块已 fall-through)时无改善(实测 asm 相同);EJIT period_const 特化后剩余数据相关分支自然布局未必匹配热路径,故收益可期。gate 工具 `/tmp/pgo_stage1_gate.cpp`。
 >
 > **v0.9 变更**:阶段3a 完成(JIT 侧 PGO 内联,`ModuleInlinerWrapperPass` + EJitPassBuilder 注册 EphemeralValuesAnalysis/InlineAdvisorAnalysis/LazyCallGraphAnalysis)+ 自适应默认策略实现(`EJitPgoPolicy.h::shouldUseNonPreInlinedBitcode`,非预内联 iff 闭包存在 callee instCount≥6 && callSiteCount≥2,P0-6 校准,阈值待真实闭包复核)。§12 阶段3 自适应规则具体化。注:分支切到 `ejit_online_pgo`(用户选留此)。3b(PASS1 接线,需 clang 重建)待做。
 >
@@ -70,7 +70,7 @@ Tier-1 后再动态开启 PGO 仍缺少跨核清空所有私有 wrapper cell 的
 - 因此 PGO 的**保底收益主要来自后端 `MachineBlockPlacement` 的块布局**(热路径拉直、mispredict/icache 改善);Tier-2 另激活 InstCombine PGSO(见上)带来小额 IR 层收益
 - **(v0.8 阶段1 gate 实测)**:构造 Baseline 自然布局次优的分支(冷块 fall-through、热块分支),Tier-2(99/1 profile)经 runPipeline 后 llc -O2:`MachineBlockPlacement` 消费 !prof **翻转布局**,热路径变 fall-through(分支 taken 99%->1%,mispredict 大降 + 热路径 icache 连续)。收益条件性:Baseline 自然布局已最优时无改善。,该 pass 在 `CodeGenOptLevel::Default` 下运行(`TargetPassConfig.cpp:1224`,EJIT 未降级)。
 - IR 层的 profile 消费(内联/unroll/memop)**需要额外补 Pass**(§12 阶段 2/3),不是现成可得。
-- may_const 特化已消除大量分支,PGO 真正发力的是"剩余数据相关分支"--收益真实但非数量级提升,阶段 1 后应实测决定是否推进到阶段 3。
+- period_const 特化已消除大量分支,PGO 真正发力的是"剩余数据相关分支"--收益真实但非数量级提升,阶段 1 后应实测决定是否推进到阶段 3。
 
 **真实闭包校准(v0.13)**:测了 12 个真实 EJIT 测试程序的闭包(ejit_complex/perf_bench/zstd_bench 等),AOT 预内联后**全部 0 剩余 callee**(ejit_entry 37-87 insts,自包含)。故 **JIT PGO 内联(Stage 3)对真实 EJIT 闭包是 no-op**--无 callee 可内联。PGO 在真实 EJIT 的价值 = **MBP 块布局(Stage 1)only**。§0 原称"PGO 最大收益在内联"对真实 EJIT 不成立(无 callee);内联仅在未来出现大闭包(medium/large callee AOT 未内联)时才相关。Stage 2(LoopUnroll)对真实小闭包边际。**PGO go/no-go:hinge on MBP 收益(Stage 1 gate v0.8 已证机制)是否 justify +640KB 运行时 + Tier-1 插桩 + Tier-2 重编译开销**。
 
@@ -139,7 +139,7 @@ miss ──► compileCold(tier=1)
 
 ### 3.2 与现有特化正确性的关系
 
-Tier-1 与 Tier-2 消费**相同特化常量**(period index、may_const 值),且**起点 IR 形态一致**(同 bitcode + 同 preReplacePeriodIndices + 同 InstCombine),故 CFG hash 一致,PGOUse 能匹配。profile 来自 Tier-1 对同一特化的采样,分支概率对 Tier-2 有效。若 instance 被 toggle(version bump),三层检查丢弃 Tier-2,下次 miss 重 Tier-1。
+Tier-1 与 Tier-2 消费**相同特化常量**(period index、period_const 值),且**起点 IR 形态一致**(同 bitcode + 同 preReplacePeriodIndices + 同 InstCombine),故 CFG hash 一致,PGOUse 能匹配。profile 来自 Tier-1 对同一特化的采样,分支概率对 Tier-2 有效。若 instance 被 toggle(version bump),三层检查丢弃 Tier-2,下次 miss 重 Tier-1。
 
 ---
 
@@ -165,7 +165,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   runInstCombine(M);
 
   if (ctx.tier == CompileTier::Instrumented) {
-    // 特化 pass 1(entry 函数自身 may_const,可不经 inline 追溯到全局)
+    // 特化 pass 1(entry 函数自身 period_const,可不经 inline 追溯到全局)
     runStructFieldPass(M);
     runLightOptPipeline(M);                 // InstCombine + SimplifyCFG(折叠特化暴露的分支)
     // ===== Gen 点 ===== 须与 Tier-2 PGOUse 点完全一致(同 preReplace+InstCombine
@@ -175,9 +175,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     GenMPM.addPass(InstrProfilingLoweringPass());  // intrinsic -> __profc_*/__profd_*
     GenMPM.run(M, MAM_);
     captureCounterGlobals(M);               // 强制 ExternalLinkage + 记录 {name,hash,counters}
-    // [阶段3 激进] Tier-1 heuristic inline(默认开,Gen 之后):保留 callee may_const 特化与
-    //   运行性能;Gen 仍 pre-inline 保 hash 匹配。可关以减编译时间(代价:callee may_const 不特化、运行变慢)
-    // runHeuristicInline(M); runStructFieldPass(M);   // pass2:callee 内 may_const
+    // [阶段3 激进] Tier-1 heuristic inline(默认开,Gen 之后):保留 callee period_const 特化与
+    //   运行性能;Gen 仍 pre-inline 保 hash 匹配。可关以减编译时间(代价:callee period_const 不特化、运行变慢)
+    // runHeuristicInline(M); runStructFieldPass(M);   // pass2:callee 内 period_const
     return;                                 // 交 codegen,计数器落 data 段(RW)
   }
 
@@ -196,7 +196,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     UseMPM.run(M, MAM_);                    // 标注 !prof + setProfileSummary
     // [阶段3 激进,默认开] PGO-guided 内联(需 CGSCC + EphemeralValuesAnalysis)
     runPgoInline(M);                        // ModuleInlinerWrapperPass,吃 callee profile 决策
-    runStructFieldPass(M);                  // 特化 pass 2(内联后 callee 内 may_const GEP 链展开)
+    runStructFieldPass(M);                  // 特化 pass 2(内联后 callee 内 period_const GEP 链展开)
     // [阶段2] mainFPM_ 用 LoopUnrollPass 替 LoopFullUnrollPass(profile-aware)
     runOptimizationPipeline(M, ctx.optLevel);
     // [阶段2 可选] PGOMemOPSizeOpt;[阶段4 可选] HotColdSplittingPass
@@ -212,7 +212,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 **Pass 顺序要点**:
 - **Gen/Use 点对齐(hash 匹配,正确性关键)**:`PGOInstrumentationUse` 按 (函数名, CFG hash) 匹配 profile 记录。Tier-1 Gen 与 Tier-2 PGOUse 前必须执行**完全相同**的前缀(`preReplace+InstCombine+StructFieldPass1+lightOpt`,且均 pre-inline),保证 CFG 一致。内联在 Gen/Use 之后。
 - **PGOUse 在内联/优化之前**:标注 `!prof`+`setProfileSummary`(`PGOInstrumentation.cpp:2211`),后续 inline/mainFPM/codegen 经 BFI/BPI/MBFI 消费。
-- **StructFieldPass 两次**:pass1(pre-inline,Gen/Use 前)处理 entry 自身 may_const(指针直接来自全局);pass2(内联后)处理 callee 内 may_const(内联展开 GEP 链才可追溯)。
+- **StructFieldPass 两次**:pass1(pre-inline,Gen/Use 前)处理 entry 自身 period_const(指针直接来自全局);pass2(内联后)处理 callee 内 period_const(内联展开 GEP 链才可追溯)。
 - **PGOGen + Lowering 在 StructFieldPass1+lightOpt 之后**:插桩已特化、已折叠 IR。
 - **`captureCounterGlobals` 在 lowering 之后**:`__profc_*`/`__profd_*` 已生成;遍历 `M.globals()` 强制 ExternalLinkage,记录映射。
 - FAM 复用语义不变:每次编译前 `clearAnalyses()`(`EJitOrcEngine.cpp:713`)。
@@ -402,8 +402,8 @@ fnPtr 永不释放,seqlock 读(`EJitSharedTaskPool.cpp:56-61`),Tier-2 publish �
 6. **Sync 模式 Tier-2**:单核 Sync 部署只能内联重编译(阻塞)或不升级;默认建议不升级。
 7. **阶段3 CGSCC 改造**:EJitOptimizer 现无 CGSCC 通道,加内联是结构性改造,工作量与风险最大,放最后。
 8. **tier 与 LTO 路径**:LTO 下 bitcode 形态不同,插桩点需复核。
-9. **激进内联拖累 Baseline**:[v0.10] PASS1 去 ModuleInliner **已放弃**(保留预内联),此风险 moot。原方案 PASS1 去掉 ModuleInliner 会使现有 Baseline 路径(callee 内 may_const 无法追溯)退化。须以 PGO opt-in 模式隔离:PGO 开才改 PASS1 + JIT 内联,关则维持现状。
-10. **CFG hash 匹配**:Tier-1 Gen 与 Tier-2 PGOUse 前缀须完全一致,否则 profile 不匹配(该函数无 PGO 收益,不崩溃)。须保证两 tier 预处理确定性一致(may_const 值相同 + 同 pass 序列)。
+9. **激进内联拖累 Baseline**:[v0.10] PASS1 去 ModuleInliner **已放弃**(保留预内联),此风险 moot。原方案 PASS1 去掉 ModuleInliner 会使现有 Baseline 路径(callee 内 period_const 无法追溯)退化。须以 PGO opt-in 模式隔离:PGO 开才改 PASS1 + JIT 内联,关则维持现状。
+10. **CFG hash 匹配**:Tier-1 Gen 与 Tier-2 PGOUse 前缀须完全一致,否则 profile 不匹配(该函数无 PGO 收益,不崩溃)。须保证两 tier 预处理确定性一致(period_const 值相同 + 同 pass 序列)。
 11. **激进内联 Flash 代价(P0-6 实测)**:[v0.10] 保留预内联后此代价**不触发**(non-pre 路线已放弃,见 §12)。原 PASS1 去 `buildModuleInlinerPipeline` 后,嵌入 bitcode 对小/可折叠 callee **变大** +14%~22%(B>A),非 v0.3/v0.4 假设的"常 ≤"。两成因:(a) A 的 `GlobalDCE` 整删 callee 定义,B 保留一份(结构地板,随 callee 数线性增长,不随模块体积摊薄);(b) A 的 InstCombine 跨 callee 折叠,B 不透明 call 挡掉(转嫁为 JIT 时重内联+重折叠的 RAM/编译时间)。仅中等 callee 多调用点场景 B<A(−5.8%)。**影响**:SRE Flash 预算紧,激进版对小 callee 闭包(EJIT 常见)净增 Flash;须由 Tier-2 PGO 内联收益 justify,否则按 §12 阶段3 降级路径退保守(预内联 + JIT 仅补热点 callee)。 mitigations:按闭包 callee 体积/调用点数自适应选策略;Flash 预算达阈时局部回退预内联;实测时用真实 ejit_entry 闭包(非小模块样例)重测以校准百分比。
 12. **PGO 运行时体积代价(P0-1 实测)**:PGO 须把 `LLVMInstrumentation`+`LLVMProfileData` 加进 `ejit_minimal` 的 `EJIT_LLVM_LIBS`(裁剪设计现整体排除 `libLLVMInstrumentation.a`,见 `EJIT_LIBRARY_TRIMMING.md` §4.7)。独立 probe 实测(`-Os` + `--gc-sections` + `strip --strip-all`,只留 PGO 可达对象,sanitizer/coverage 被 gc 裁掉;probe 两版同链同档,base 版也跑 PassBuilder 隔离 PGO 专属对象):**stripped 增量 ≈ 640 KB**(655,560 B;unstripped ≈ 1.0 MB),主体是 InstrProf 写/读 + OnDisk 索引格式(272 符号)+ BFI/BPI + ProfileSummary。约占 12 MB 运行时二进制的 5%、`check-ejit-size` 10 MB fat-archive 预算的 6.4%。**影响**:SRE Flash/RAM 紧,640 KB 非可忽略,但远小于 fat-archive 上界(整体 Instrumentation.a 含 sanitizer 达数 MB)。mitigations:(a) 务必走 lipo `ld -r --gc-sections --entry=ejit_init` 管线而非直链 fat archive--天然裁 sanitizer,只留 PGO 对象;(b) 阶段3 若不上 CGSCC 内联,可只保留 Gen/Lowering/Use 必需对象进一步瘦身;(c) `check-ejit-size` 10 MB 预算须重估,640 KB 须计入;(d) caveat:probe 用上游 PassBuilder,runtime 用裁剪版 `EJitPassBuilder`,PGO 对象闭包一致故 delta 代表性强,但精确字节数实测期须在真实 runtime 上复测。
 ---
@@ -422,7 +422,7 @@ fnPtr 永不释放,seqlock 读(`EJitSharedTaskPool.cpp:56-61`),Tier-2 publish �
 
 ### 阶段 2:IR 层 profile 消费(中收益,低风险)
 FPM/MPM pass,无结构改动:
-- **`LoopUnrollPass`** 替 `LoopFullUnrollPass`(`mainFPM_`,`EJitOptimizer.cpp:67`)。已验证 profile-aware(`LoopUnrollPass.cpp:1612-1614,231`)。对 may_const 特化后剩余非定常循环做 partial unroll/peel。
+- **`LoopUnrollPass`** 替 `LoopFullUnrollPass`(`mainFPM_`,`EJitOptimizer.cpp:67`)。已验证 profile-aware(`LoopUnrollPass.cpp:1612-1614,231`)。对 period_const 特化后剩余非定常循环做 partial unroll/peel。
 - **`PGOMemOPSizeOpt`**(FunctionPass,`PGOInstrumentation.h:104`):mem-intrinsic size 特化。
 - (可选)**`PGOIndirectCallPromotion`**(ModulePass,`h:92`):SPEC4 暂不特化函数指针,收益有限。
 
@@ -434,21 +434,21 @@ Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inl
 
 **PASS1 改动(已核实 `EJitRegisterBitcode.cpp`)**:
 - `computeTransitiveClosure`(`:82-100`)已收集全部内部 callee(有函数体、非 intrinsic);`extractAndSerialize`(`:311-334`)`CloneModule` 后仅删非闭包函数,callee 作为**独立函数定义**保留。故"保留 callee"无需新增收集,只需不合并。
-- `preOptimizeBitcode`(`:189-240`,仅 Release/NDEBUG)step 1 = `AlwaysInlinerPass` + `buildModuleInlinerPipeline(O2)`(`:202-208`)是合并 callee 的根因。**改动:PGO 模式下 drop `buildModuleInlinerPipeline`(cost-based 那行),保留 `AlwaysInlinerPass`(mandatory,无 profile 决策);保留 steps 2-5(Mem2Reg/EarlyCSE/InstCombine/SimplifyCFG/reAnnotateMayConst,均 per-function,不跨函数合并)**。即删一行 + 加 mode 判断。
-- `reAnnotateMayConst`(step 5)在非内联 bitcode 上仍生效,`!ejit.may_const` 被重建 -> JIT StructFieldPass 可用。✓
+- `preOptimizeBitcode`(`:189-240`,仅 Release/NDEBUG)step 1 = `AlwaysInlinerPass` + `buildModuleInlinerPipeline(O2)`(`:202-208`)是合并 callee 的根因。**改动:PGO 模式下 drop `buildModuleInlinerPipeline`(cost-based 那行),保留 `AlwaysInlinerPass`(mandatory,无 profile 决策);保留 steps 2-5(Mem2Reg/EarlyCSE/InstCombine/SimplifyCFG/reAnnotatePeriodConst,均 per-function,不跨函数合并)**。即删一行 + 加 mode 判断。
+- `reAnnotatePeriodConst`(step 5)在非内联 bitcode 上仍生效,`!ejit.period_const` 被重建 -> JIT StructFieldPass 可用。✓
 - `buildModuleInlinerPipeline` **含 GlobalDCE**(P0-5 已确认;`PassBuilderPipelines.cpp:1055` 那处条件性,无条件 GlobalDCE 在 `:837`/`:1303`),当前预内联后把 callee **整定义删掉**(非"保留一份")。激进版 callee 保持 live。**体积 delta 经 P0-6 实测并非"callsite 复制 vs 独立一份"那么简单**:小/可折叠 callee 场景 B>A(+14%~22%,A 还白赚跨 callee 折叠);中等 callee 多调用点场景 B<A(−5.8%,callsite 复制才占上风)。两版 `.bc` 用 `/tmp/pgo_p0_6_test.cpp` 量得(复制 `extractAndSerialize` + externalize + `WriteBitcodeToFile`,delta 隔离内联决策)。
 - Debug 构建 `preOptimizeBitcode` 是 no-op(`:242`),本就非内联(但也不 reAnnotate);Release 才是部署目标。
 - 符号注册(`generateSymbolRegisters`/`generateRegistryTable`)遍历原 Module M 的闭包,与提取模块是否内联无关,不受影响。✓
 
-**PGO opt-in 模式(隔离 Baseline)**:去掉 ModuleInliner 会拖累现有 Baseline 路径(JIT 不内联时,callee 内 may_const 无法追溯)。故 PGO 须 opt-in:PGO 开启时 PASS1 产非预内联 bitcode + JIT 各 tier 内联;PGO 关闭时维持现状(预内联 + JIT 不内联)。两套 bitcode/管线由 AOT flag + 运行时配置切换。
+**PGO opt-in 模式(隔离 Baseline)**:去掉 ModuleInliner 会拖累现有 Baseline 路径(JIT 不内联时,callee 内 period_const 无法追溯)。故 PGO 须 opt-in:PGO 开启时 PASS1 产非预内联 bitcode + JIT 各 tier 内联;PGO 关闭时维持现状(预内联 + JIT 不内联)。两套 bitcode/管线由 AOT flag + 运行时配置切换。
 
 **CFG hash 匹配约束(正确性关键)**:Tier-1 Gen 点与 Tier-2 PGOUse 点必须产出相同 CFG(否则该函数 profile 不匹配,无 PGO 收益,不崩溃)。两 tier 在 Gen/Use 前执行完全相同前缀:`preReplacePeriodIndices -> InstCombine -> StructFieldPass(pass1) -> lightOpt`,且均 **pre-inline**。内联在 Gen/Use 之后。
 
 **StructFieldPass 两次**:
-- pass 1(pre-inline,Gen/Use 前):entry 函数自身 may_const(指针直接来自全局)。
-- pass 2(post-inline):callee 内 may_const 的 GEP 链内联展开后可追溯,再特化。
+- pass 1(pre-inline,Gen/Use 前):entry 函数自身 period_const(指针直接来自全局)。
+- pass 2(post-inline):callee 内 period_const 的 GEP 链内联展开后可追溯,再特化。
 
-**Tier-1 heuristic inline(v0.10 后 moot)**:此段原为 v0.9 non-pre 设计。v0.10 pivot 保留预内联后:AOT `buildModuleInliner` 已内联小/便宜 callee(其 may_const 已特化);Tier-1 heuristic inline(同 cost 阈值,无 profile)对 AOT 未内联的 medium/large 是 no-op(太大);热 medium/large 的跨函数 may_const 特化由 **Tier-2 PGO 内联 + StructFieldPass2** 负责。故 Tier-1 heuristic inline 不再需要(Tier-1 期间 medium/large 的 call 开销是临时的,Tier-2 到阈值即替换)。
+**Tier-1 heuristic inline(v0.10 后 moot)**:此段原为 v0.9 non-pre 设计。v0.10 pivot 保留预内联后:AOT `buildModuleInliner` 已内联小/便宜 callee(其 period_const 已特化);Tier-1 heuristic inline(同 cost 阈值,无 profile)对 AOT 未内联的 medium/large 是 no-op(太大);热 medium/large 的跨函数 period_const 特化由 **Tier-2 PGO 内联 + StructFieldPass2** 负责。故 Tier-1 heuristic inline 不再需要(Tier-1 期间 medium/large 的 call 开销是临时的,Tier-2 到阈值即替换)。
 
 **(v0.13 真实闭包校准)**:12 个真实 EJIT 测试闭包 AOT 预内联后**全部 0 剩余 callee** -> JIT PGO 内联(Stage 3a)对真实 EJIT 是 **no-op**。Stage 3 仅在未来大闭包(medium/large callee AOT 未内联)时才产生收益。当前 EJIT 闭包以小/自包含为主,PGO 价值 = Stage 1 MBP。若要 Tier-1 期间也快,可加"比 AOT 更激进"的 Tier-1 inline(降阈值),但 cost-based 无 profile,粗糙+膨胀,收益窗口短,暂不做。
 
@@ -470,11 +470,11 @@ Tier-2 内联:`ModuleInlinerWrapperPass` + `InlinerPass`(CGSCC),用 PSI+BFI(`Inl
 
 ```
 preReplacePeriodIndices -> InstCombine
--> StructFieldPass(pass1)                       // entry 自身 may_const(pre-inline)
+-> StructFieldPass(pass1)                       // entry 自身 period_const(pre-inline)
 -> lightOpt                                     // 折叠特化暴露的分支(= Tier-1 Gen 点)
 -> PGOInstrumentationUse(InMemoryFS)            // [前提] 标注 !prof + summary
 -> [阶段3] ModuleInlinerWrapperPass             // PGO 内联(默认激进,需 CGSCC + EphemeralValuesAnalysis)
--> StructFieldPass(pass2)                       // callee 内 may_const(内联后追溯)
+-> StructFieldPass(pass2)                       // callee 内 period_const(内联后追溯)
 -> mainFPM_: InstCombine, SCCP, SimplifyCFG, ADCE,
             LoopSimplify, LoopUnrollPass(profile-aware),   // [阶段2] 替 LoopFullUnroll
             IndVarSimplify, LoopDeletion, Promote

@@ -3,7 +3,7 @@
 //
 // FullLTO hazard: in buildLTODefaultPipeline the inliner runs BEFORE
 // EJitAotModulePass (PASS2-4 run last, after all LTO optimization). A small,
-// otherwise-inlineable ejit_entry / ejit_period_lc would be merged into its
+// otherwise-inlineable ejit_entry / ejit_guard would be merged into its
 // caller before PASS3/PASS4 can wrap/instrument it, silently dropping the
 // JIT wrapper and the lifecycle activate/deactivate.
 //
@@ -18,7 +18,7 @@
 // ejit_deactivate/ejit_activate calls.
 
 struct Cfg { int t; };
-__attribute__((ejit_period_arr("cell"))) struct Cfg g_cell[16];
+__attribute__((ejit_group("cell"))) struct Cfg g_cell[16];
 extern void sink(int);
 
 // Small, otherwise-inlineable entry. @caller calls it; the functions are
@@ -26,10 +26,10 @@ extern void sink(int);
 // @caller and GlobalDCE would drop them - leaving PASS3/PASS4 nothing to
 // wrap/instrument. With the CodeGen noinline they survive for PASS3/PASS4.
 __attribute__((ejit_entry))
-static void entry(__attribute__((ejit_period_arr_ind("cell"))) int i) { sink(g_cell[i].t); }
+static void entry(__attribute__((ejit_dim("cell"))) int i) { sink(g_cell[i].t); }
 
-__attribute__((ejit_period_lc("cell")))
-static void lc(__attribute__((ejit_period_arr_ind("cell"))) int i) { g_cell[i].t = 1; }
+__attribute__((ejit_guard("cell")))
+static void lc(__attribute__((ejit_dim("cell"))) int i) { g_cell[i].t = 1; }
 
 void caller(int i) { entry(i); lc(i); }
 

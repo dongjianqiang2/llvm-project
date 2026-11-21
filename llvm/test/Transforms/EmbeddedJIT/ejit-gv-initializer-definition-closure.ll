@@ -173,7 +173,7 @@ define i32 @entry(i32 %cell, i32 %which, i32 %value) !ejit.metadata !0 {
   ret i32 %with_bias
 }
 
-!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
 
 ;--- externalize.ll
 source_filename = "externalize.c"

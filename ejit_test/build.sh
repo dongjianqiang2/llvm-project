@@ -232,7 +232,7 @@ PRIMARY_SRC[ejit_baremetal_link_test]="ejit_multi_tu_test.c"
 
 # Custom linker script (-Wl,-T) for a test, relative to this dir.
 # Both ctors-disabled tests need it: the static registry tables live in the
-# dot-named .ejit_bitcode/.ejit_period sections, for which the linker does NOT
+# dot-named .ejit_bitcode/.ejit_group sections, for which the linker does NOT
 # auto-synthesize __start_/__stop_ bound symbols (dot is not a C identifier).
 # Without the script those weak bounds stay NULL, the static walk registers
 # nothing, and the funcIndex globals are never backfilled — so the async wrapper

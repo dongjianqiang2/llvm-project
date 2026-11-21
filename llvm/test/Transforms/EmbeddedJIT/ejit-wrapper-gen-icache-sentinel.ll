@@ -8,7 +8,7 @@
 
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-section= -S %s | FileCheck %s
 
-; --- Cell tables + static .ejit_period registry entries (globals section):
+; --- Cell tables + static .ejit_group registry entries (globals section):
 ;     the 0D table is defined pre-filled with its MissFn sentinel and its
 ;     registry entry carries the same pointer in name2 (3rd field); the 3D
 ;     table stays zero-init and its entry passes null. ---
@@ -56,7 +56,7 @@ entry:
 @data3 = global i32 0, !ejit.metadata !12
 
 !0 = distinct !{!{!"ejit_entry"}}
-!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"p1", i32 0}, !{!"ejit_period_arr_ind", !"p2", i32 1}, !{!"ejit_period_arr_ind", !"p3", i32 2}}
-!10 = distinct !{!{!"ejit_period_arr", !"p1", i32 16}}
-!11 = distinct !{!{!"ejit_period_arr", !"p2", i32 16}}
-!12 = distinct !{!{!"ejit_period_arr", !"p3", i32 16}}
+!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"p1", i32 0}, !{!"ejit_dim", !"p2", i32 1}, !{!"ejit_dim", !"p3", i32 2}}
+!10 = distinct !{!{!"ejit_group_indexed", !"p1", i32 16}}
+!11 = distinct !{!{!"ejit_group_indexed", !"p2", i32 16}}
+!12 = distinct !{!{!"ejit_group_indexed", !"p3", i32 16}}

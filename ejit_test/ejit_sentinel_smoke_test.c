@@ -12,7 +12,7 @@
 //      lands in MissFn -> taskpool resolve (async compile enqueued, AOT
 //      fallback answers). ejit_drain_taskpool() lets the worker publish; the
 //      NEXT resolve is a taskpool cache hit which icacheFill's the cell.
-//   2. Frozen: mutating the may_const source WITHOUT invalidating keeps the
+//   2. Frozen: mutating the period_const source WITHOUT invalidating keeps the
 //      old (compile-time) answer -- the BLR served the cached
 //      specialization; an AOT fallback execution would answer the new value.
 //   3. Re-resolve: a period toggle drains the cells -- to the &MissFn
@@ -26,7 +26,7 @@
 //
 // The 0-dim entry runs a REDUCED lifecycle: its specialization key has no
 // dims, so no lifecycle event can retire its taskpool entry -- once
-// compiled it is frozen by design (a static may_const source has no time
+// compiled it is frozen by design (a static period_const source has no time
 // window in which it may change; give the entry a dim if it must
 // re-specialize). ejit_clear_cache() still drains the scalar cell back to
 // &MissFn, so the observable contract there is: the next call re-enters
@@ -42,8 +42,8 @@
 // AOT data, any leftover AOT-global reference is unrepresentable in a
 // rip-relative Delta32). One entry shape per TU is also the embedded
 // deployment shape. The 0-dim source is a plain (non-period) struct, not a
-// bare scalar: ejit_may_const applies to struct FIELDS only - Sema drops
-// it on a VarDecl - and ejit_period(static) registers the struct so the
+// bare scalar: EJIT_PERIOD_CONST applies to struct FIELDS only - Sema drops
+// it on a VarDecl - and ejit_group(static) registers the struct so the
 // JIT can resolve its address when freezing the field.
 //
 //===----------------------------------------------------------------------===//
@@ -61,7 +61,7 @@ extern void ejit_clear_cache(void);
 // dim attributes, and their icache cells live with the defining TUs).
 extern uint32_t sentinel_1d(uint8_t i0);
 extern uint32_t guarded_3d(uint8_t i1, uint8_t i2, uint8_t i3);
-// may_const setters exported by the sibling TUs (the period arrays are
+// period_const setters exported by the sibling TUs (the period arrays are
 // private to their TUs; the harness mutates them through these).
 extern void sentinel_smoke_set_p0(uint8_t i, uint32_t kind);
 extern void sentinel_smoke_set_3d(uint8_t i, uint32_t kind);
@@ -69,9 +69,9 @@ extern void sentinel_smoke_set_3d(uint8_t i, uint32_t kind);
 //===-- Data ---------------------------------------------------------------===//
 
 struct ScalarCfg {
-  ejit_may_const uint32_t kind; // 1 -> "on" branch, 0 -> "off"
+  EJIT_PERIOD_CONST uint32_t kind; // 1 -> "on" branch, 0 -> "off"
 };
-ejit_period(static) struct ScalarCfg g_scalar = {1};
+ejit_group(static) struct ScalarCfg g_scalar = {1};
 
 //===-- Entry (0-dim) -------------------------------------------------------===//
 // noinline keeps the wrapper dispatch out of the callers.

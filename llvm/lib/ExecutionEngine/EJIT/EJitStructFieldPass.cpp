@@ -51,7 +51,7 @@ void EJitStructFieldPass::initFromModule(Module &M) {
       if (!Tag)
         continue;
 
-      if (Tag->getString() == TAG_EJIT_PERIOD_ARR) {
+      if (Tag->getString() == TAG_EJIT_GROUP_INDEXED) {
         auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
         size_t sz = 0;
         if (Sub->getNumOperands() >= 3)
@@ -59,28 +59,28 @@ void EJitStructFieldPass::initFromModule(Module &M) {
             sz = CI->getZExtValue();
         if (PN)
           gvPeriodMap_[&GV] = {PN->getString().str(), true, sz};
-      } else if (Tag->getString() == TAG_EJIT_PERIOD) {
+      } else if (Tag->getString() == TAG_EJIT_GROUP) {
         auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
         std::string pn = PN ? PN->getString().str() : "";
         gvPeriodMap_[&GV] = {pn, false, 0};
       }
     }
 
-    // Build may_const field offset map (v1.7 fallback for when
-    // optimization passes drop per-load !ejit.may_const metadata).
+    // Build period_const field offset map (v1.7 fallback for when
+    // optimization passes drop per-load !ejit.period_const metadata).
     SmallVector<uint64_t, 4> offsets;
     for (const MDOperand &Op : MD->operands()) {
       auto *Sub = dyn_cast<MDNode>(Op.get());
       if (!Sub || Sub->getNumOperands() < 2)
         continue;
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_MAY_CONST_FIELD)
+      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_CONST_FIELD)
         continue;
       if (auto *CI = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(1)))
         offsets.push_back(CI->getZExtValue());
     }
     if (!offsets.empty())
-      mayConstFieldMap_[&GV] = std::move(offsets);
+      periodConstFieldMap_[&GV] = std::move(offsets);
   }
 
   initBoundArgumentPropagation(M);
@@ -88,9 +88,9 @@ void EJitStructFieldPass::initFromModule(Module &M) {
   mapsBuilt_ = true;
 #ifdef EJIT_DIAG_ENABLE
   EJIT_DIAG_DEBUG("struct-field initFromModule module=%s globals=%zu "
-                  "gvPeriod=%zu mayConstField=%zu",
+                  "gvPeriod=%zu periodConstField=%zu",
                   M.getName().str().c_str(), M.global_size(), gvPeriodMap_.size(),
-                  mayConstFieldMap_.size());
+                  periodConstFieldMap_.size());
 #endif
 }
 
@@ -578,7 +578,7 @@ getMatchingBoundEntryDimensionArg(const Function &F,
     auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
     auto *Period = dyn_cast<MDString>(Sub->getOperand(1));
     auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
-    if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND || !Period ||
+    if (!Tag || Tag->getString() != TAG_EJIT_DIM || !Period ||
         Period->getString() != BoundPeriodName)
       continue;
     uint64_t ArgIndex = Idx ? Idx->getZExtValue() : 0;
@@ -653,7 +653,7 @@ callUsesSameBoundDimension(const CallBase &CB, StringRef BoundPeriodName,
 /// each to the witness its addresses are evaluated at.
 ///
 /// The witness is 0, unconditionally. It is not a tuning knob: the attribute
-/// asserts the may_const data does not vary with the parameter, so every legal
+/// asserts the period_const data does not vary with the parameter, so every legal
 /// value reads the same field values. The caller also guarantees that the fixed
 /// witness 0 names a valid address. Reading through element 0 is what "drop
 /// the `+ slotNo % 5` term" means once the address is actually computed.
@@ -709,7 +709,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
   // valid for the value being read at one address, so it must not be used to
   // prove an argument relationship: two calls whose offsets differ in the free
   // parameter would map one formal to one of them. Address computation for a
-  // may_const LOAD does use the assumption — see run().
+  // period_const LOAD does use the assumption — see run().
   const EJitFreeDimAssumptions NoAssumed;
   const DataLayout &DL = M.getDataLayout();
   SmallVector<CallBase *, 32> DirectCalls;
@@ -773,7 +773,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
         auto *Offset = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
         auto *Size = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
         if (Offset && Size)
-          State.mayConstFields.push_back(
+          State.periodConstFields.push_back(
               {Offset->getZExtValue(), Size->getZExtValue()});
       }
     }
@@ -808,7 +808,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
               continue;
             if (!hasMatchingBoundArgumentContract(
                     *Callee, ArgIndex, BoundPeriodName, *Offset, View.size,
-                    State.mayConstFields))
+                    State.periodConstFields))
               continue;
             Changed |= State.boundArguments.try_emplace(Formal, *Offset).second;
           }
@@ -836,7 +836,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
           if (!CalleeDimension ||
               !hasMatchingBoundArgumentContract(
                   *Callee, Formal->getArgNo(), BoundPeriodName, ExpectedOffset,
-                  View.size, State.mayConstFields)) {
+                  View.size, State.periodConstFields)) {
             Invalid.push_back(Formal);
             continue;
           }
@@ -881,8 +881,8 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
 }
 
 static bool
-isBoundMayConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
-                    ArrayRef<std::pair<uint64_t, uint64_t>> MayConstFields,
+isBoundPeriodConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
+                    ArrayRef<std::pair<uint64_t, uint64_t>> PeriodConstFields,
                     const DataLayout &DL,
                     const EJitFreeDimAssumptions &Assumed) {
   if (LI->isVolatile() || LI->isAtomic())
@@ -891,14 +891,14 @@ isBoundMayConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
                                       DL, Assumed);
   if (!Offset)
     return false;
-  if (LI->hasMetadata(MD_EJIT_MAY_CONST) &&
+  if (LI->hasMetadata(MD_EJIT_PERIOD_CONST) &&
       !usesLocalFreeDim(LI->getPointerOperand(), Assumed))
     return true;
 
   TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
   if (AccessSize.isScalable())
     return false;
-  for (const auto &[Begin, Size] : MayConstFields)
+  for (const auto &[Begin, Size] : PeriodConstFields)
     if (*Offset >= Begin && *Offset - Begin <= Size &&
         AccessSize.getFixedValue() <= Size - (*Offset - Begin))
       return true;
@@ -908,18 +908,18 @@ isBoundMayConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
 static bool offsetFitsInObject(const GlobalVariable *GV, uint64_t ByteOffset,
                                 Type *LoadTy, const DataLayout &DL);
 
-/// Check whether a load is (or can be treated as) a may_const access.
-static bool isMayConstLoad(const LoadInst *LI,
-                           const MayConstOffsetMap &mayConstFieldMap,
+/// Check whether a load is (or can be treated as) a period_const access.
+static bool isPeriodConstLoad(const LoadInst *LI,
+                           const PeriodConstOffsetMap &periodConstFieldMap,
                            const DataLayout &DL,
                            const EJitFreeDimAssumptions &Assumed) {
   // Never substituted. Checked ahead of the metadata, not just ahead of the
-  // fallback, so that a pass which copies !ejit.may_const onto a volatile or
+  // fallback, so that a pass which copies !ejit.period_const onto a volatile or
   // atomic load cannot defeat the frontend's exclusion.
   if (LI->isVolatile() || LI->isAtomic())
     return false;
 
-  if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+  if (LI->hasMetadata(MD_EJIT_PERIOD_CONST))
     return true;
 
   // v1.7 fallback for loads whose marker an earlier pass dropped. The recorded
@@ -927,7 +927,7 @@ static bool isMayConstLoad(const LoadInst *LI,
   // the total offset from the global, and require the access to fit inside the
   // field it starts at.
   const GlobalVariable *RootGV = nullptr;
-  auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
+  auto Off = ejitPeriodConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
   if (!Off && usesLocalFreeDim(LI->getPointerOperand(), Assumed)) {
     RootGV = findRootGV(LI->getPointerOperand());
     auto Witness = accumulateFullOffset(DL, LI->getPointerOperand(), Assumed);
@@ -942,11 +942,11 @@ static bool isMayConstLoad(const LoadInst *LI,
     }
   }
   if (Off && RootGV) {
-    auto It = mayConstFieldMap.find(RootGV);
-    if (It != mayConstFieldMap.end() && is_contained(It->second, *Off)) {
+    auto It = periodConstFieldMap.find(RootGV);
+    if (It != periodConstFieldMap.end() && is_contained(It->second, *Off)) {
       TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
       if (!AccessSize.isScalable() &&
-          ejitAccessFitsMayConstField(RootGV, *Off, AccessSize.getFixedValue(),
+          ejitAccessFitsPeriodConstField(RootGV, *Off, AccessSize.getFixedValue(),
                                       DL))
         return true;
     }
@@ -955,10 +955,10 @@ static bool isMayConstLoad(const LoadInst *LI,
 }
 
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
-std::vector<EJitMayConstLoadSite>
-EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
-  assert(mapsBuilt_ && "initFromModule() must precede may_const audit");
-  std::vector<EJitMayConstLoadSite> Sites;
+std::vector<EJitPeriodConstLoadSite>
+EJitStructFieldPass::collectPeriodConstLoadSites(const Module &M) const {
+  assert(mapsBuilt_ && "initFromModule() must precede period_const audit");
+  std::vector<EJitPeriodConstLoadSite> Sites;
   const DataLayout &DL = M.getDataLayout();
   for (const Function &F : M) {
     if (F.isDeclaration())
@@ -967,19 +967,19 @@ EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
       for (const Instruction &I : BB) {
         const auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI ||
-            !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
+            !isPeriodConstLoad(LI, periodConstFieldMap_, DL, freeDimAssumptions_))
           continue;
 
-        EJitMayConstLoadSite Site;
+        EJitPeriodConstLoadSite Site;
         Site.functionName = F.getName().str();
-        if (MDNode *SiteMD = LI->getMetadata(MayConstAuditSiteMD))
+        if (MDNode *SiteMD = LI->getMetadata(PeriodConstAuditSiteMD))
           if (SiteMD->getNumOperands() == 1)
             if (auto *SiteID =
                     mdconst::dyn_extract<ConstantInt>(SiteMD->getOperand(0)))
               Site.siteId = SiteID->getZExtValue();
         const GlobalVariable *RootGV = nullptr;
         if (auto Offset =
-                ejitMayConstFieldOffset(LI->getPointerOperand(), DL, RootGV)) {
+                ejitPeriodConstFieldOffset(LI->getPointerOperand(), DL, RootGV)) {
           Site.fieldOffset = *Offset;
           Site.hasFieldOffset = true;
         }
@@ -997,9 +997,9 @@ EJitStructFieldPass::collectMayConstLoadSites(const Module &M) const {
   return Sites;
 }
 
-std::vector<EJitMayConstLoadSite>
-EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
-  std::vector<EJitMayConstLoadSite> Sites = collectMayConstLoadSites(M);
+std::vector<EJitPeriodConstLoadSite>
+EJitStructFieldPass::instrumentPeriodConstLoadSites(Module &M) {
+  std::vector<EJitPeriodConstLoadSite> Sites = collectPeriodConstLoadSites(M);
   if (Sites.empty())
     return Sites;
 
@@ -1008,7 +1008,7 @@ EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
   ArrayType *CounterTy = ArrayType::get(I64, Sites.size());
   auto *Counters = new GlobalVariable(
       M, CounterTy, false, GlobalValue::ExternalLinkage,
-      ConstantAggregateZero::get(CounterTy), MayConstCounterName);
+      ConstantAggregateZero::get(CounterTy), PeriodConstCounterName);
   Counters->setAlignment(Align(8));
 
   const DataLayout &DL = M.getDataLayout();
@@ -1020,12 +1020,12 @@ EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
       for (Instruction &I : BB) {
         auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI ||
-            !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
+            !isPeriodConstLoad(LI, periodConstFieldMap_, DL, freeDimAssumptions_))
           continue;
 
         const uint64_t SiteID = SiteIndex + 1;
         LI->setMetadata(
-            MayConstAuditSiteMD,
+            PeriodConstAuditSiteMD,
             MDNode::get(Ctx, ConstantAsMetadata::get(
                                  ConstantInt::get(I64, SiteID))));
         Sites[SiteIndex].siteId = SiteID;
@@ -1041,12 +1041,12 @@ EJitStructFieldPass::instrumentMayConstLoadSites(Module &M) {
       }
     }
   }
-  assert(SiteIndex == Sites.size() && "may_const site inventory changed");
+  assert(SiteIndex == Sites.size() && "period_const site inventory changed");
   return Sites;
 }
 
-void EJitStructFieldPass::removeMayConstLoadInstrumentation(Module &M) {
-  GlobalVariable *Counters = M.getGlobalVariable(MayConstCounterName);
+void EJitStructFieldPass::removePeriodConstLoadInstrumentation(Module &M) {
+  GlobalVariable *Counters = M.getGlobalVariable(PeriodConstCounterName);
   if (!Counters)
     return;
 
@@ -1067,7 +1067,7 @@ void EJitStructFieldPass::removeMayConstLoadInstrumentation(Module &M) {
   // Nonzero site addresses may be uniqued ConstantExpr GEPs, not Instructions.
   // Removing the atomic users does not itself destroy those dead constants.
   Counters->removeDeadConstantUsers();
-  assert(Counters->use_empty() && "may_const counter still has users");
+  assert(Counters->use_empty() && "period_const counter still has users");
   Counters->eraseFromParent();
 }
 #endif
@@ -1143,15 +1143,15 @@ static Constant *createConstantFromMemory(const void *addr, Type *Ty,
 }
 
 /// Replace a load of a pointer-valued period global with the registered
-/// pointee address. Pointer-form ejit_period/ejit_period_arr globals are
+/// pointee address. Pointer-form ejit_group globals are
 /// registered by the address of their pointer slot, so resolveBase() returns
 /// the slot and createConstantFromMemory() performs the required dereference.
 ///
-/// This load is intentionally not required to carry !ejit.may_const: the
+/// This load is intentionally not required to carry !ejit.period_const: the
 /// pointer is the address root of the period object, while the annotation
 /// belongs to fields inside that object. Materializing the root lets IPSCCP
 /// propagate it through a non-inlined helper, after which the normal
-/// may_const-field replacement can resolve the field load.
+/// period_const-field replacement can resolve the field load.
 static Constant *
 tryReplacePeriodPointerBase(LoadInst *LI, const GVPeriodMap &gvMap,
                             PeriodArrayRegistry &reg, const DataLayout &DL) {
@@ -1530,10 +1530,10 @@ static bool absoluteGEPChainFitsObject(const Value *Ptr, const DataLayout &DL,
 
 static bool absoluteFieldAuthorized(
     const GlobalVariable *GV, const GVPeriodInfo &Info,
-    const MayConstOffsetMap &MayConstFieldMap, uint64_t Relative,
+    const PeriodConstOffsetMap &PeriodConstFieldMap, uint64_t Relative,
     uint64_t AccessSize, const DataLayout &DL) {
-  auto FieldIt = MayConstFieldMap.find(GV);
-  if (FieldIt == MayConstFieldMap.end())
+  auto FieldIt = PeriodConstFieldMap.find(GV);
+  if (FieldIt == PeriodConstFieldMap.end())
     return false;
   uint64_t FieldOffset = Relative;
   if (Info.isArray) {
@@ -1546,7 +1546,7 @@ static bool absoluteFieldAuthorized(
     FieldOffset %= ElementSize.getFixedValue();
   }
   return llvm::is_contained(FieldIt->second, FieldOffset) &&
-         ejitAccessFitsMayConstField(GV, FieldOffset, AccessSize, DL);
+         ejitAccessFitsPeriodConstField(GV, FieldOffset, AccessSize, DL);
 }
 
 struct PointerFieldLayout {
@@ -1661,7 +1661,7 @@ static bool hasConstantWitnessElement(const AbsoluteGEPChain &Chain,
 // This trusted minimum extent is never registered or used by strict checking.
 static const char *checkLightweightPointerWitness(
     const GlobalVariable &GV, LoadInst *LI, uintptr_t Base, uintptr_t Target,
-    uint64_t AccessSize, const MayConstOffsetMap &Fields, const DataLayout &DL,
+    uint64_t AccessSize, const PeriodConstOffsetMap &Fields, const DataLayout &DL,
     const EJitFreeDimAssumptions &Assumed) {
   if (!Base)
     return "null-pointer-base";
@@ -1694,7 +1694,7 @@ static const char *checkLightweightPointerWitness(
     Stride = RootSize.getFixedValue();
     const uint64_t FieldOffset = Relative % Stride;
     auto It = Fields.find(&GV);
-    auto FieldSize = ejitMayConstFieldSizeInType(RootTy, FieldOffset, DL);
+    auto FieldSize = ejitPeriodConstFieldSizeInType(RootTy, FieldOffset, DL);
     if (It == Fields.end() || !llvm::is_contained(It->second, FieldOffset) ||
         !FieldSize || AccessSize > *FieldSize)
       return "layout-or-field-unauthorized";
@@ -1722,7 +1722,7 @@ static const char *checkLightweightPointerWitness(
   return nullptr;
 }
 
-/// Resolve a may_const load after IPSCCP/InstCombine has propagated a period
+/// Resolve a period_const load after IPSCCP/InstCombine has propagated a period
 /// pointer into a callee and folded its GEP into an absolute address. For a
 /// non-pointer registered object, accept only a unique, bounded and authorized
 /// field whose complete root-to-leaf GEP witness is valid. Pointer-form objects
@@ -1732,7 +1732,7 @@ static const char *checkLightweightPointerWitness(
 /// Allocator-discovered bounds add strict folds only after legacy matching.
 static Constant *tryReplacePeriodAbsoluteAddress(
     LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
-    const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
+    const PeriodConstOffsetMap &periodConstFieldMap, PeriodArrayRegistry &reg,
     const DataLayout &DL, const EJitFreeDimAssumptions &Assumed) {
   if (LI->isVolatile() || LI->isAtomic())
     return nullptr;
@@ -1783,8 +1783,8 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       if (!Explicit && !UsedAssumption && PointeeBase &&
           Target >= PointeeBase) {
         const uint64_t FieldOffset = Target - PointeeBase;
-        auto FieldIt = mayConstFieldMap.find(GV);
-        if (FieldIt != mayConstFieldMap.end() &&
+        auto FieldIt = periodConstFieldMap.find(GV);
+        if (FieldIt != periodConstFieldMap.end() &&
             llvm::is_contained(FieldIt->second, FieldOffset) &&
             AccessSize <= std::numeric_limits<uintptr_t>::max() - Target) {
           Candidate = reinterpret_cast<const uint8_t *>(Target);
@@ -1806,7 +1806,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       const char *Rejection = nullptr;
       if (!Bounds && !Explicit && UsedAssumption) {
         Rejection = checkLightweightPointerWitness(*GV, LI, PointeeBase, Target,
-                                                   AccessSize, mayConstFieldMap,
+                                                   AccessSize, periodConstFieldMap,
                                                    DL, Assumed);
         if (!Rejection) {
           LightweightBases.push_back(PointeeBase);
@@ -1861,7 +1861,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
                                Relative) ||
         !absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed,
                                     ObjectBase, Object->size) ||
-        !absoluteFieldAuthorized(GV, Info, mayConstFieldMap, Relative,
+        !absoluteFieldAuthorized(GV, Info, periodConstFieldMap, Relative,
                                  AccessSize, DL))
       continue;
     Candidate = reinterpret_cast<const uint8_t *>(Target);
@@ -1976,7 +1976,7 @@ tryReplaceDirectGV(LoadInst *LI, const GlobalVariable *GV,
 // be valid too, even when the final address happens to be inside the object.
 static Constant *tryReplaceLocalWitnessGEP(
     LoadInst *LI, const Value *Ptr, const GlobalVariable *GV,
-    const GVPeriodInfo &Info, const MayConstOffsetMap &Fields,
+    const GVPeriodInfo &Info, const PeriodConstOffsetMap &Fields,
     PeriodArrayRegistry &Registry, const DataLayout &DL,
     const EJitFreeDimAssumptions &Assumed, std::optional<uint8_t> KnownCell) {
   auto Fail = [&](const char *Reason) -> Constant * {
@@ -2066,7 +2066,7 @@ static Constant *tryReplaceLocalWitnessGEP(
 /// e.g. @g_cellCfg → GEP 0, idx → GEP 0, fieldIdx → load
 static Constant *
 tryReplaceDirectGEP(LoadInst *LI, const Value *PtrOp, const GVPeriodMap &gvMap,
-                    const MayConstOffsetMap &Fields, PeriodArrayRegistry &reg,
+                    const PeriodConstOffsetMap &Fields, PeriodArrayRegistry &reg,
                     const DataLayout &DL, const EJitFreeDimAssumptions &Assumed,
                     const StringMap<uint8_t> *LocalPeriods) {
   const GlobalVariable *GV = findRootGV(PtrOp);
@@ -2127,7 +2127,7 @@ struct IndirectAddress {
 ///
 /// The first pointer read out of the period global needs no marker: for a
 /// pointer-form period that slot is the period object itself. Every read past
-/// it must be a may_const load, since only a may_const pointer is promised not
+/// it must be a period_const load, since only a period_const pointer is promised not
 /// to change within the period. A null pointer ends the walk.
 static std::optional<IndirectAddress>
 resolveIndirectAddress(const Value *Ptr, const GVPeriodMap &gvMap,
@@ -2169,7 +2169,7 @@ resolveIndirectAddress(const Value *Ptr, const GVPeriodMap &gvMap,
     return std::nullopt;
   auto Slot = resolveIndirectAddress(Load->getPointerOperand(), gvMap, reg, DL,
                                      Depth + 1);
-  if (!Slot || (Slot->reads && !Load->hasMetadata(MD_EJIT_MAY_CONST)))
+  if (!Slot || (Slot->reads && !Load->hasMetadata(MD_EJIT_PERIOD_CONST)))
     return std::nullopt;
   void *Pointee = nullptr;
   std::memcpy(&Pointee, Slot->addr, sizeof(Pointee));
@@ -2180,10 +2180,10 @@ resolveIndirectAddress(const Value *Ptr, const GVPeriodMap &gvMap,
 }
 
 /// Pattern 3: load through one or more pointers — a pointer read from a GV,
-/// optionally followed by may_const pointer fields, then a GEP into the
+/// optionally followed by period_const pointer fields, then a GEP into the
 /// pointed-to data.
-/// e.g. %p = load ptr, ptr @g_pCfg → %q = load ptr, (GEP %p), !ejit.may_const
-///      → load (GEP %q), !ejit.may_const
+/// e.g. %p = load ptr, ptr @g_pCfg → %q = load ptr, (GEP %p), !ejit.period_const
+///      → load (GEP %q), !ejit.period_const
 static Constant *
 tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
                    const GVPeriodMap &gvMap, PeriodArrayRegistry &reg,
@@ -2244,7 +2244,7 @@ static bool collectPhiWitnesses(
 }
 
 static Constant *tryReplacePhiWitness(
-    LoadInst *LI, const GVPeriodMap &Globals, const MayConstOffsetMap &Fields,
+    LoadInst *LI, const GVPeriodMap &Globals, const PeriodConstOffsetMap &Fields,
     PeriodArrayRegistry &Registry, const DataLayout &DL,
     const EJitFreeDimAssumptions &Assumed,
     const StringMap<uint8_t> *LocalPeriods) {
@@ -2301,7 +2301,7 @@ static Constant *tryReplacePhiWitness(
 //===----------------------------------------------------------------------===//
 
 #ifdef EJIT_DIAG_ENABLE
-/// Classify why a may_const load was NOT replaced by any pattern, for
+/// Classify why a period_const load was NOT replaced by any pattern, for
 /// diagnostics. One EJIT_DIAG line per failed load. Reasons:
 ///   no-root-gv        — pointer not rooted at a GlobalVariable
 ///   (opaque/indirect) gv-not-in-map     — root GV has no ejit.metadata (not a
@@ -2317,24 +2317,24 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
   Value *Ptr = LI->getPointerOperand();
   const GlobalVariable *GV = findRootGV(Ptr);
   if (!GV) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: no-root-gv");
+    EJIT_DIAG_VERBOSE("  period_const load NOT replaced: no-root-gv");
     return;
   }
   auto it = gvMap.find(GV);
   if (it == gvMap.end()) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: gv-not-in-map gv=%s",
+    EJIT_DIAG_VERBOSE("  period_const load NOT replaced: gv-not-in-map gv=%s",
                       GV->getName().str().c_str());
     return;
   }
   if (!resolveBase(GV, it->second, reg)) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: base-unresolved gv=%s",
+    EJIT_DIAG_VERBOSE("  period_const load NOT replaced: base-unresolved gv=%s",
                       GV->getName().str().c_str());
     return;
   }
   bool UsedAssumption = false;
   auto Off = accumulateFullOffset(DL, Ptr, Assumed, &UsedAssumption);
   if (!Off) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: non-const-offset gv=%s",
+    EJIT_DIAG_VERBOSE("  period_const load NOT replaced: non-const-offset gv=%s",
                       GV->getName().str().c_str());
     return;
   }
@@ -2344,13 +2344,13 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
   // reported as unsupported-type and send a reader looking at the load's type
   // instead of at the ejit_free_dim annotation that caused it.
   if (UsedAssumption && !offsetFitsInObject(GV, *Off, LI->getType(), DL)) {
-    EJIT_DIAG_VERBOSE("  may_const load NOT replaced: witness-out-of-bounds "
+    EJIT_DIAG_VERBOSE("  period_const load NOT replaced: witness-out-of-bounds "
                       "gv=%s off=%llu",
                       GV->getName().str().c_str(),
                       static_cast<unsigned long long>(*Off));
     return;
   }
-  EJIT_DIAG_VERBOSE("  may_const load NOT replaced: unsupported-type gv=%s",
+  EJIT_DIAG_VERBOSE("  period_const load NOT replaced: unsupported-type gv=%s",
                     GV->getName().str().c_str());
 }
 #endif
@@ -2378,10 +2378,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
 #ifdef EJIT_DIAG_ENABLE
-  size_t totalLoads = 0, mayConstLoads = 0;
-  // Only the ejit_entry function (or any function that actually has may_const
+  size_t totalLoads = 0, periodConstLoads = 0;
+  // Only the ejit_entry function (or any function that actually has period_const
   // activity / replacements) is worth a per-function diagnostic block. Silent
-  // for the common case of an auxiliary callee with no may_const loads, which
+  // for the common case of an auxiliary callee with no period_const loads, which
   // is the dominant source of struct-field log noise on a specialization
   // module that contains many non-entry callees.
   bool isEjitEntry =
@@ -2403,23 +2403,23 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
 
-      bool BoundMayConst = false;
+      bool BoundPeriodConst = false;
       for (const BoundPointerState &State : boundStates_)
-        BoundMayConst |=
-            isBoundMayConstLoad(LI, State.boundArguments, State.mayConstFields,
+        BoundPeriodConst |=
+            isBoundPeriodConstLoad(LI, State.boundArguments, State.periodConstFields,
                                 DL, freeDimAssumptions_);
-      if (!BoundMayConst &&
-          !isMayConstLoad(LI, mayConstFieldMap_, DL, freeDimAssumptions_))
+      if (!BoundPeriodConst &&
+          !isPeriodConstLoad(LI, periodConstFieldMap_, DL, freeDimAssumptions_))
         continue;
 #ifdef EJIT_DIAG_ENABLE
-      ++mayConstLoads;
+      ++periodConstLoads;
 #endif
 
       Value *PtrOp = LI->getPointerOperand();
 
       // Try each access pattern in order.
       Constant *C = tryReplacePeriodAbsoluteAddress(
-          LI, F, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
+          LI, F, gvPeriodMap_, periodConstFieldMap_, registry_, DL,
           freeDimAssumptions_);
 
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
@@ -2443,14 +2443,14 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       // Pattern 2: GEP-based access (array or struct field).
       if (!C)
-        C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, mayConstFieldMap_,
+        C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, periodConstFieldMap_,
                                 registry_, DL, freeDimAssumptions_,
                                 F.getName() == boundRootFunction_
                                     ? &localWitnessPeriods_
                                     : nullptr);
 
       // Pattern 3: indirect pointer access (pointer-type period variable,
-      // then any number of may_const pointer fields).
+      // then any number of period_const pointer fields).
       if (!C)
         C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
 
@@ -2469,11 +2469,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   for (LoadInst *LI : PendingFields) {
     Constant *C = Roots.empty() ? nullptr
                                 : tryReplacePeriodAbsoluteAddress(
-                                      LI, F, gvPeriodMap_, mayConstFieldMap_,
+                                      LI, F, gvPeriodMap_, periodConstFieldMap_,
                                       registry_, DL, freeDimAssumptions_);
     if (!C)
       C = tryReplacePhiWitness(
-          LI, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
+          LI, gvPeriodMap_, periodConstFieldMap_, registry_, DL,
           freeDimAssumptions_,
           F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr);
     if (C)
@@ -2497,16 +2497,16 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 #ifdef EJIT_DIAG_ENABLE
   // Gate the per-function block: emit for the ejit_entry function (always
   // interesting — it is the specialization target) or for any function where a
-  // may_const load was seen or a replacement actually happened. Auxiliary
-  // callees with no may_const activity stay silent, eliminating the bulk of
+  // period_const load was seen or a replacement actually happened. Auxiliary
+  // callees with no period_const activity stay silent, eliminating the bulk of
   // the struct-field log volume while preserving locatability for the
   // functions that matter. Raise the log level to VERBOSE to see this detail.
-  if (isEjitEntry || mayConstLoads > 0 || changed) {
+  if (isEjitEntry || periodConstLoads > 0 || changed) {
     EJIT_DIAG_VERBOSE("struct-field run func=%s entry=%d replaced=%zu",
                       F.getName().str().c_str(), isEjitEntry ? 1 : 0,
                       Roots.size() + replacements.size());
-    EJIT_DIAG_VERBOSE("  loads total=%zu may_const=%zu replaced=%zu",
-                      totalLoads, mayConstLoads,
+    EJIT_DIAG_VERBOSE("  loads total=%zu period_const=%zu replaced=%zu",
+                      totalLoads, periodConstLoads,
                       Roots.size() + replacements.size());
   }
 #endif

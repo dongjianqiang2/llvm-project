@@ -193,16 +193,16 @@ private:
   };
   std::unordered_map<uint64_t, std::vector<Tier1CounterInfo>> tier1Counters_;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  struct Tier1MayConstState {
+  struct Tier1PeriodConstState {
     uintptr_t counterBase = 0;
     uint64_t sampleStart = 0;
-    std::vector<EJitMayConstLoadSite> sites;
+    std::vector<EJitPeriodConstLoadSite> sites;
   };
-  std::unordered_map<uint64_t, Tier1MayConstState> tier1MayConst_;
+  std::unordered_map<uint64_t, Tier1PeriodConstState> tier1PeriodConst_;
   /// The owner worker compiles and publishes serially, so the publish callback
   /// can use this key to timestamp the Tier-1 sample window exactly at publish.
-  uint64_t pendingTier1MayConstKey_ = 0;
-  bool hasPendingTier1MayConstKey_ = false;
+  uint64_t pendingTier1PeriodConstKey_ = 0;
+  bool hasPendingTier1PeriodConstKey_ = false;
 #endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
   /// Value-profile capture per cacheKey (EJIT_VALUE_PROFILE.md §5.1): the

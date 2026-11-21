@@ -53,11 +53,11 @@ public:
 
 } // anonymous namespace
 
-/// handleEjitMayConstAttr - Process the ejit_may_const attribute.
+/// handleEjitPeriodConstAttr - Process the ejit_period_const attribute.
 /// Checks:
 ///   1. Applies only to FieldDecl
 ///   2. Field type must be integer, boolean, floating-point, struct, or array
-void handleEjitMayConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+void handleEjitPeriodConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = dyn_cast<FieldDecl>(D);
   if (!FD) {
     S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
@@ -78,18 +78,18 @@ void handleEjitMayConstAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   }
 
   // volatile fields are silently skipped — their loads won't get
-  // !ejit.may_const metadata, so the JIT naturally ignores them.
+  // !ejit.period_const metadata, so the JIT naturally ignores them.
 
-  D->addAttr(::new (S.Context) EjitMayConstAttr(S.Context, AL));
+  D->addAttr(::new (S.Context) EjitPeriodConstAttr(S.Context, AL));
 }
 
-/// handleEjitPeriodAttr - Process the ejit_period(name) attribute.
+/// handleEjitGroupAttr - Process the ejit_group(name) attribute.
 /// Checks:
-///   1. Applies only to VarDecl
-///   2. Must have global storage
-///   3. Cannot be an array (use ejit_period_arr)
-///   4. No duplicate period/period_arr attributes
-void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+///   1. Applies only to VarDecl with global storage
+///   2. Form: indexed (array with constant size < 100, or pointer-to-struct)
+///      is inferred from the variable type; any other type is the scalar form
+///   3. No duplicate group attributes
+void handleEjitGroupAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *VD = dyn_cast<VarDecl>(D);
   if (!VD) {
     S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
@@ -104,79 +104,46 @@ void handleEjitPeriodAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     return;
   }
 
-  // Cannot be an array — use ejit_period_arr for arrays
-  if (VD->getType()->isArrayType()) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_not_array) << VD;
-    return;
-  }
-
-  // Check for duplicate period/period_arr attributes
-  if (VD->hasAttr<EjitPeriodAttr>() || VD->hasAttr<EjitPeriodArrAttr>()) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_conflict) << VD;
-    return;
-  }
-
-  // Extract period name
-  StringRef PeriodName;
-  if (!S.checkStringLiteralArgumentAttr(AL, 0, PeriodName))
-    return;
-
-  VD->addAttr(::new (S.Context) EjitPeriodAttr(S.Context, AL, PeriodName));
-}
-
-/// handleEjitPeriodArrAttr - Process the ejit_period_arr(name) attribute.
-/// Checks:
-///   1. Applies only to VarDecl
-///   2. Must have global storage
-///   3. Must be an array type (constant size < 100) OR pointer-to-struct
-///   4. No duplicate period/period_arr attributes
-void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
-  auto *VD = dyn_cast<VarDecl>(D);
-  if (!VD) {
-    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
-        << AL << AL.isRegularKeywordAttribute() << "variable declarations";
-    return;
-  }
-
-  // Must be a global variable
-  if (!VD->hasGlobalStorage()) {
-    S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
-        << AL << AL.isRegularKeywordAttribute() << "global variables";
-    return;
-  }
-
-  // Check type: array (with constant size < 100) or pointer-to-struct
   QualType VT = VD->getType();
-  if (const ArrayType *AT = S.Context.getAsArrayType(VT)) {
-    if (const auto *CAT = dyn_cast<ConstantArrayType>(AT)) {
-      uint64_t Size = CAT->getSize().getZExtValue();
-      if (Size > MAX_PERIOD_ARR_SIZE) {
-        S.Diag(AL.getLoc(), diag::err_ejit_period_arr_too_large)
-            << VD << static_cast<unsigned>(Size);
+
+  // Form selection: array or pointer-to-struct variables are indexed groups.
+  bool Indexed = VT->isArrayType() || VT->isPointerType();
+
+  if (Indexed) {
+    // Check type: array (with constant size < 100) or pointer-to-struct
+    if (const ArrayType *AT = S.Context.getAsArrayType(VT)) {
+      if (const auto *CAT = dyn_cast<ConstantArrayType>(AT)) {
+        uint64_t Size = CAT->getSize().getZExtValue();
+        if (Size > MAX_PERIOD_ARR_SIZE) {
+          S.Diag(AL.getLoc(), diag::err_ejit_group_indexed_too_large)
+              << VD << static_cast<unsigned>(Size);
+          return;
+        }
+      } else {
+        // Non-constant array size (VLA, etc.) — error
+        S.Diag(AL.getLoc(), diag::err_ejit_group_indexed_invalid_type) << VD;
+        return;
+      }
+    } else if (VT->isPointerType()) {
+      // Pointer type — must point to a structure/class type.
+      // Array size is dynamic (user guarantees correctness); Size=0 in
+      // metadata.
+      QualType Pointee = VT->getPointeeType();
+      if (!Pointee->isStructureOrClassType()) {
+        S.Diag(AL.getLoc(), diag::err_ejit_group_indexed_invalid_type) << VD;
         return;
       }
     } else {
-      // Non-constant array size (VLA, etc.) — error
-      S.Diag(AL.getLoc(), diag::err_ejit_period_arr_not_scalar) << VD;
+      // Indexed form on a non-array, non-pointer type — unreachable via
+      // type inference; kept for defensive completeness.
+      S.Diag(AL.getLoc(), diag::err_ejit_group_indexed_invalid_type) << VD;
       return;
     }
-  } else if (VT->isPointerType()) {
-    // Pointer type — must point to a structure/class type.
-    // Array size is dynamic (user guarantees correctness); Size=0 in metadata.
-    QualType Pointee = VT->getPointeeType();
-    if (!Pointee->isStructureOrClassType()) {
-      S.Diag(AL.getLoc(), diag::err_ejit_period_arr_not_scalar) << VD;
-      return;
-    }
-    // No size validation for pointer types.
-  } else {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_arr_not_scalar) << VD;
-    return;
   }
 
-  // Check for duplicate period/period_arr attributes
-  if (VD->hasAttr<EjitPeriodAttr>() || VD->hasAttr<EjitPeriodArrAttr>()) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_conflict) << VD;
+  // Check for duplicate group attributes
+  if (VD->hasAttr<EjitGroupAttr>()) {
+    S.Diag(AL.getLoc(), diag::err_ejit_group_conflict) << VD;
     return;
   }
 
@@ -185,15 +152,16 @@ void handleEjitPeriodArrAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   if (!S.checkStringLiteralArgumentAttr(AL, 0, PeriodName))
     return;
 
-  VD->addAttr(::new (S.Context) EjitPeriodArrAttr(S.Context, AL, PeriodName));
+  VD->addAttr(::new (S.Context)
+      EjitGroupAttr(S.Context, AL, PeriodName, Indexed));
 }
 
-/// handleEjitPeriodArrIndAttr - Process the ejit_period_arr_ind(name) attribute.
+/// handleEjitDimAttr - Process the ejit_dim(name) attribute.
 /// Checks:
 ///   1. Applies only to ParmVarDecl
 ///   2. Parameter type must be integer
 ///   3. At most 4 such parameters per function
-void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+void handleEjitDimAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *PVD = dyn_cast<ParmVarDecl>(D);
   if (!PVD) {
     S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
@@ -204,12 +172,12 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   // Parameter type must be integer
   QualType PT = PVD->getType();
   if (!PT->isIntegerType()) {
-    S.Diag(AL.getLoc(), diag::err_ejit_period_arr_ind_invalid_type) << PVD;
+    S.Diag(AL.getLoc(), diag::err_ejit_dim_invalid_type) << PVD;
     return;
   }
 
   // Max count check (4 per function) is deferred to
-  // checkEjitPeriodArrIndLimit() in ActOnFunctionDeclarator because the
+  // checkEjitDimLimit() in ActOnFunctionDeclarator because the
   // FunctionDecl is not yet set as ParmVarDecl DeclContext during parsing.
 
   // Extract period name
@@ -218,7 +186,7 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     return;
 
   PVD->addAttr(::new (S.Context)
-      EjitPeriodArrIndAttr(S.Context, AL, PeriodName));
+      EjitDimAttr(S.Context, AL, PeriodName));
 }
 
 /// handleEjitFreeDimAttr - Process the ejit_free_dim attribute.
@@ -232,7 +200,7 @@ void handleEjitPeriodArrIndAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 /// through. The only value the JIT ever substitutes is the witness 0.
 ///
 /// The "enclosing function must be ejit_entry" and "must not also be
-/// ejit_period_arr_ind / ejit_bound_ptr" checks are NOT here. At handler time
+/// ejit_dim / ejit_bound_ptr" checks are NOT here. At handler time
 /// the ParmVarDecl's DeclContext is not yet the FunctionDecl, and a conflicting
 /// parameter attribute written AFTER this one has not been processed yet. Both
 /// run once the merged declaration is complete -- see checkEjitFreeDim.
@@ -316,16 +284,16 @@ void handleEjitEntryAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   D->addAttr(::new (S.Context) EjitEntryAttr(S.Context, AL));
 }
 
-/// handleEjitPeriodLcAttr - Process the ejit_period_lc(name) attribute.
+/// handleEjitGuardAttr - Process the ejit_guard(name) attribute.
 /// Checks:
 ///   1. Applies only to FunctionDecl
 ///
-/// The "must have a matching ejit_period_arr_ind(name) parameter" check is
+/// The "must have a matching ejit_dim(name) parameter" check is
 /// NOT here: at handler time only the CURRENT declaration's parameters exist,
 /// and the arr_ind may legitimately live on an earlier declaration's
 /// parameter (propagated by mergeParamDeclAttributes during the merge). The
-/// check runs after the merge instead -- see checkEjitPeriodLcIndex.
-void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+/// check runs after the merge instead -- see checkEjitGuardIndex.
+void handleEjitGuardAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   auto *FD = dyn_cast<FunctionDecl>(D);
   if (!FD) {
     S.Diag(AL.getLoc(), diag::warn_attribute_wrong_decl_type_str)
@@ -338,20 +306,20 @@ void handleEjitPeriodLcAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   if (!S.checkStringLiteralArgumentAttr(AL, 0, PeriodName))
     return;
 
-  D->addAttr(::new (S.Context) EjitPeriodLcAttr(S.Context, AL, PeriodName));
+  D->addAttr(::new (S.Context) EjitGuardAttr(S.Context, AL, PeriodName));
 }
 
-/// checkEjitPeriodArrIndLimit - Enforce the limit of at most 4
-/// ejit_period_arr_ind parameters per function. Called from
+/// checkEjitDimLimit - Enforce the limit of at most 4
+/// ejit_dim parameters per function. Called from
 /// ActOnFunctionDeclarator after all parameter attributes have been processed.
-void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
+void checkEjitDimLimit(Sema &S, const FunctionDecl *FD) {
   if (!FD)
     return;
 
   unsigned Count = 0;
   const ParmVarDecl *OverflowPVD = nullptr;
   for (const ParmVarDecl *P : FD->parameters()) {
-    if (P->hasAttr<EjitPeriodArrIndAttr>()) {
+    if (P->hasAttr<EjitDimAttr>()) {
       Count++;
       if (Count > MAX_PERIOD_ARR_IND_PARAMS)
         OverflowPVD = P;
@@ -360,8 +328,8 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
 
   if (Count > MAX_PERIOD_ARR_IND_PARAMS && OverflowPVD) {
     // Get the attribute location from the overflow parameter
-    if (auto *A = OverflowPVD->getAttr<EjitPeriodArrIndAttr>()) {
-      S.Diag(A->getLocation(), diag::err_ejit_period_arr_ind_too_many)
+    if (auto *A = OverflowPVD->getAttr<EjitDimAttr>()) {
+      S.Diag(A->getLocation(), diag::err_ejit_dim_too_many)
           << FD << Count;
     }
   }
@@ -375,17 +343,17 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
 ///   1. A free dim only means something on an ejit_entry: the assertion it
 ///      makes is consumed by the JIT specializer, and nothing specializes a
 ///      function that is not an entry.
-///   2. It cannot share a parameter with ejit_period_arr_ind. That puts the
+///   2. It cannot share a parameter with ejit_dim. That puts the
 ///      parameter on the specialization identity; a free dim asserts the data
 ///      does not vary with it. Honouring both would compile one clone per value
 ///      of a parameter whose values were declared interchangeable.
 ///      (ejit_bound_ptr needs no check: it requires a pointer and a free dim
 ///      requires an integer, so no parameter can carry both.)
-///   3. A free dim freezes may_const values but adds no dimension of its own,
-///      so an entry with no ejit_period_arr_ind has nothing that can ever
+///   3. A free dim freezes period_const values but adds no dimension of its own,
+///      so an entry with no ejit_dim has nothing that can ever
 ///      invalidate them: no ejit_deactivate reaches it and the cached
 ///      specialization is re-served for the life of the process. Warn rather
-///      than reject -- an entry that reads no may_const field through the free
+///      than reject -- an entry that reads no period_const field through the free
 ///      parameter is unaffected, and the compiler cannot tell the two apart.
 void checkEjitFreeDim(Sema &S, const FunctionDecl *FD) {
   if (!FD)
@@ -401,7 +369,7 @@ void checkEjitFreeDim(Sema &S, const FunctionDecl *FD) {
       FirstFree = Free;
       FirstFreeParm = P;
     }
-    if (P->hasAttr<EjitPeriodArrIndAttr>())
+    if (P->hasAttr<EjitDimAttr>())
       S.Diag(Free->getLocation(), diag::err_ejit_free_dim_kind_conflict) << P;
   }
 
@@ -415,7 +383,7 @@ void checkEjitFreeDim(Sema &S, const FunctionDecl *FD) {
   }
 
   if (!llvm::any_of(FD->parameters(), [](const ParmVarDecl *P) {
-        return P->hasAttr<EjitPeriodArrIndAttr>();
+        return P->hasAttr<EjitDimAttr>();
       }))
     S.Diag(FirstFree->getLocation(), diag::warn_ejit_free_dim_no_dimension)
         << FD << FirstFreeParm;
@@ -441,7 +409,7 @@ public:
     if (!VD->hasInit())
       reject(VD, VD->getLocation(), "an initializer at its declaration");
     else if (!llvm::any_of(FD.parameters(), [](const ParmVarDecl *P) {
-               return P->hasAttr<EjitPeriodArrIndAttr>();
+               return P->hasAttr<EjitDimAttr>();
              }))
       reject(VD, VD->getLocation(), "a managed ejit_dim lifecycle");
     return true;
@@ -542,7 +510,7 @@ void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
       continue;
     unsigned MatchingDims = 0;
     for (const ParmVarDecl *DimP : FD->parameters())
-      if (const auto *D = DimP->getAttr<EjitPeriodArrIndAttr>())
+      if (const auto *D = DimP->getAttr<EjitDimAttr>())
         if (D->getPeriodName() == Bound->getPeriodName())
           ++MatchingDims;
     if (MatchingDims != 1)
@@ -551,7 +519,7 @@ void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
   }
 }
 
-/// checkEjitEntryLcConflict - ejit_entry and ejit_period_lc are mutually
+/// checkEjitEntryGuardConflict - ejit_entry and ejit_guard are mutually
 /// exclusive on one function. PASS3 (EJitWrapperGen) replaces an entry's body
 /// with a single-function dispatch wrapper, and PASS4 (EJitPeriodHandler)
 /// inserts lifecycle guards at a lifecycle function's entry and returns; the
@@ -569,23 +537,23 @@ void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD) {
 ///    declaration: if both were written on this declarator the first call
 ///    already diagnosed the pair, and if both are inherited some earlier
 ///    declaration already was the first to carry both.
-/// reportEjitEntryLcConflict - Emit the conflict diagnostic: the error at
+/// reportEjitEntryGuardConflict - Emit the conflict diagnostic: the error at
 /// \p ErrorLoc, the "conflicting attribute is here" note at \p NoteLoc.
-/// Split out of checkEjitEntryLcConflict because the explicit-instantiation
+/// Split out of checkEjitEntryGuardConflict because the explicit-instantiation
 /// site (ActOnExplicitInstantiation) knows which attribute ITS declarator
 /// wrote and anchors the error there.
-void reportEjitEntryLcConflict(Sema &S, const FunctionDecl *FD,
+void reportEjitEntryGuardConflict(Sema &S, const FunctionDecl *FD,
                                SourceLocation ErrorLoc,
                                SourceLocation NoteLoc) {
   S.Diag(ErrorLoc, diag::err_ejit_entry_lc_conflict) << FD;
   S.Diag(NoteLoc, diag::note_conflicting_attribute);
 }
 
-void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge) {
+void checkEjitEntryGuardConflict(Sema &S, FunctionDecl *FD, bool AfterMerge) {
   if (!FD)
     return;
   const EjitEntryAttr *EA = FD->getAttr<EjitEntryAttr>();
-  const EjitPeriodLcAttr *LA = FD->getAttr<EjitPeriodLcAttr>();
+  const EjitGuardAttr *LA = FD->getAttr<EjitGuardAttr>();
   if (!EA || !LA)
     return;
   if (AfterMerge) {
@@ -598,7 +566,7 @@ void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge) {
     // this merge).
     const FunctionDecl *Prev = FD->getPreviousDecl();
     if (Prev && Prev->hasAttr<EjitEntryAttr>() &&
-        Prev->hasAttr<EjitPeriodLcAttr>())
+        Prev->hasAttr<EjitGuardAttr>())
       return;
     // Instantiations reproduce the pattern's attribute pair; the pattern
     // declaration was diagnosed already.
@@ -608,31 +576,31 @@ void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge) {
     // error at the attribute written on THIS declaration and the note at
     // the inherited one, not the other way around.
     if (EA->isInherited()) {
-      reportEjitEntryLcConflict(S, FD, LA->getLocation(), EA->getLocation());
+      reportEjitEntryGuardConflict(S, FD, LA->getLocation(), EA->getLocation());
       return;
     }
-    reportEjitEntryLcConflict(S, FD, EA->getLocation(), LA->getLocation());
+    reportEjitEntryGuardConflict(S, FD, EA->getLocation(), LA->getLocation());
     return;
   }
-  reportEjitEntryLcConflict(S, FD, LA->getLocation(), EA->getLocation());
+  reportEjitEntryGuardConflict(S, FD, LA->getLocation(), EA->getLocation());
 }
 
 /// One attribute's no-index check: does the (merged) parameter list carry an
-/// ejit_period_arr_ind with the same period name? Diagnose at \p LA if not.
-static void checkEjitPeriodLcIndexForAttr(Sema &S, const FunctionDecl *FD,
-                                          const EjitPeriodLcAttr *LA) {
+/// ejit_dim with the same period name? Diagnose at \p LA if not.
+static void checkEjitGuardIndexForAttr(Sema &S, const FunctionDecl *FD,
+                                          const EjitGuardAttr *LA) {
   StringRef PeriodName = LA->getPeriodName();
   for (const ParmVarDecl *P : FD->parameters()) {
-    if (auto *IdxAttr = P->getAttr<EjitPeriodArrIndAttr>())
+    if (auto *IdxAttr = P->getAttr<EjitDimAttr>())
       if (IdxAttr->getPeriodName() == PeriodName)
         return;
   }
-  S.Diag(LA->getLocation(), diag::err_ejit_period_lc_no_index) << PeriodName;
+  S.Diag(LA->getLocation(), diag::err_ejit_guard_no_index) << PeriodName;
 }
 
-/// checkEjitPeriodLcIndex - Every written (non-inherited) ejit_period_lc must
+/// checkEjitGuardIndex - Every written (non-inherited) ejit_guard must
 /// name a period that a parameter of the MERGED function carries
-/// ejit_period_arr_ind for. Called from CheckFunctionDeclaration after
+/// ejit_dim for. Called from CheckFunctionDeclaration after
 /// MergeFunctionDecl: at attribute-handling time only the current
 /// declaration's parameters exist, and an arr_ind written on an earlier
 /// declaration's parameter is only propagated to this declaration's
@@ -644,34 +612,34 @@ static void checkEjitPeriodLcIndexForAttr(Sema &S, const FunctionDecl *FD,
 /// The arr_ind must therefore be visible at or BEFORE the declaration that
 /// writes the lc: parameter attributes propagate forward only, so an arr_ind
 /// on a LATER declaration never reaches the declaration carrying the lc.
-void checkEjitPeriodLcIndex(Sema &S, const FunctionDecl *FD) {
+void checkEjitGuardIndex(Sema &S, const FunctionDecl *FD) {
   if (!FD || FD->isTemplateInstantiation())
     return;
-  for (const EjitPeriodLcAttr *LA : FD->specific_attrs<EjitPeriodLcAttr>()) {
+  for (const EjitGuardAttr *LA : FD->specific_attrs<EjitGuardAttr>()) {
     if (LA->isInherited())
       continue;
-    checkEjitPeriodLcIndexForAttr(S, FD, LA);
+    checkEjitGuardIndexForAttr(S, FD, LA);
   }
 }
 
-/// checkEjitPeriodLcIndexNewAttrs - Variant for ActOnExplicitInstantiation:
+/// checkEjitGuardIndexNewAttrs - Variant for ActOnExplicitInstantiation:
 /// only the lc attributes the declarator wrote (those not in
 /// \p PreExisting) are checked against the specialization's parameters.
 /// Attributes copied from the pattern are skipped here -- the pattern's own
-/// declarations were checked by checkEjitPeriodLcIndex.
-void checkEjitPeriodLcIndexNewAttrs(
+/// declarations were checked by checkEjitGuardIndex.
+void checkEjitGuardIndexNewAttrs(
     Sema &S, const FunctionDecl *FD,
-    ArrayRef<const EjitPeriodLcAttr *> PreExisting) {
+    ArrayRef<const EjitGuardAttr *> PreExisting) {
   if (!FD)
     return;
-  for (const EjitPeriodLcAttr *LA : FD->specific_attrs<EjitPeriodLcAttr>()) {
+  for (const EjitGuardAttr *LA : FD->specific_attrs<EjitGuardAttr>()) {
     if (llvm::is_contained(PreExisting, LA))
       continue;
-    checkEjitPeriodLcIndexForAttr(S, FD, LA);
+    checkEjitGuardIndexForAttr(S, FD, LA);
   }
 }
 
-/// checkEjitAlwaysInlineConflict - An ejit_entry / ejit_period_lc function
+/// checkEjitAlwaysInlineConflict - An ejit_entry / ejit_guard function
 /// must stay out-of-line: CodeGen and PASS3 mark it noinline so it survives
 /// the LTO inliner for PASS1 (bitcode extraction), PASS3 (wrapper), and
 /// PASS4 (lifecycle). A user-written always_inline would produce illegal IR
@@ -683,21 +651,21 @@ void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD) {
   if (!FD)
     return;
   bool IsEntry = FD->hasAttr<EjitEntryAttr>();
-  bool IsLc = FD->hasAttr<EjitPeriodLcAttr>();
+  bool IsLc = FD->hasAttr<EjitGuardAttr>();
   if (!IsEntry && !IsLc)
     return;
   if (AlwaysInlineAttr *AI = FD->getAttr<AlwaysInlineAttr>()) {
     S.Diag(AI->getLocation(), diag::warn_ejit_always_inline_conflict)
-        << (IsEntry ? "ejit_entry" : "ejit_period_lc");
+        << (IsEntry ? "ejit_entry" : "ejit_guard");
     S.Diag(IsEntry ? FD->getAttr<EjitEntryAttr>()->getLocation()
-                   : FD->getAttr<EjitPeriodLcAttr>()->getLocation(),
+                   : FD->getAttr<EjitGuardAttr>()->getLocation(),
            diag::note_conflicting_attribute);
     FD->dropAttr<AlwaysInlineAttr>();
   }
 }
 
 /// checkEjitAttrMissingOnDefinition - A definition that inherits ejit_entry /
-/// ejit_period_lc from a prior declaration (e.g. a header prototype) but does
+/// ejit_guard from a prior declaration (e.g. a header prototype) but does
 /// not repeat the attribute itself is NOT JIT-specialized: warn and drop the
 /// inherited attribute so CodeGen emits no !ejit.metadata and the
 /// AOT/runtime pipelines skip the function. An attribute written on the
@@ -724,26 +692,26 @@ void checkEjitAttrMissingOnDefinition(Sema &S, FunctionDecl *FD) {
     }
   }
 
-  for (const EjitPeriodLcAttr *LA : FD->specific_attrs<EjitPeriodLcAttr>()) {
+  for (const EjitGuardAttr *LA : FD->specific_attrs<EjitGuardAttr>()) {
     if (LA->isInherited()) {
       if (Warn) {
         S.Diag(FD->getLocation(), diag::warn_ejit_attr_missing_on_definition)
-            << FD << "ejit_period_lc";
+            << FD << "ejit_guard";
         S.Diag(LA->getLocation(), diag::note_ejit_attr_declared_here)
-            << "ejit_period_lc";
+            << "ejit_guard";
       }
-      FD->dropAttrs<EjitPeriodLcAttr>();
+      FD->dropAttrs<EjitGuardAttr>();
       break;
     }
   }
 }
 
-/// If \p E is an lvalue that writes an ejit_may_const field, return that field
+/// If \p E is an lvalue that writes an ejit_period_const field, return that field
 /// and set \p BaseVar to the underlying variable (if any). Strips parentheses
 /// and implicit casts, and walks through array-subscript / member chains to
 /// find the innermost variable (e.g. g_cells[i].a -> g_cells, p->a -> p,
 /// s.inner.a -> s).
-static const FieldDecl *findMayConstWriteTarget(Expr *E,
+static const FieldDecl *findPeriodConstWriteTarget(Expr *E,
                                                 const VarDecl *&BaseVar) {
   BaseVar = nullptr;
   if (!E)
@@ -755,7 +723,7 @@ static const FieldDecl *findMayConstWriteTarget(Expr *E,
     return nullptr;
 
   auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
-  if (!FD || !FD->hasAttr<EjitMayConstAttr>())
+  if (!FD || !FD->hasAttr<EjitPeriodConstAttr>())
     return nullptr;
 
   // Walk the base of the MemberExpr to find the underlying variable.
@@ -773,7 +741,7 @@ static const FieldDecl *findMayConstWriteTarget(Expr *E,
     if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
       BaseVar = VD;
 
-  // The EjitMayConstAttr lives on the FieldDecl and applies to every struct
+  // The EjitPeriodConstAttr lives on the FieldDecl and applies to every struct
   // instance.  Suppress the warning when the base is a value type
   // (not pointer/reference) that has a visible definition in this TU and no
   // period annotation: such objects are local copies or plain globals that
@@ -783,8 +751,7 @@ static const FieldDecl *findMayConstWriteTarget(Expr *E,
   // in another TU may carry the attribute.  (getDefinition covers real
   // definitions, getActingDefinition covers C tentative definitions.)
   if (BaseVar &&
-      !BaseVar->hasAttr<EjitPeriodArrAttr>() &&
-      !BaseVar->hasAttr<EjitPeriodAttr>() &&
+      !BaseVar->hasAttr<EjitGroupAttr>() &&
       !BaseVar->getType()->isPointerType() &&
       !BaseVar->getType()->isReferenceType() &&
       (BaseVar->getDefinition() || BaseVar->getActingDefinition()))
@@ -795,23 +762,23 @@ static const FieldDecl *findMayConstWriteTarget(Expr *E,
 
 namespace {
 
-/// Visitor that locates writes to ejit_may_const fields within a function body
+/// Visitor that locates writes to ejit_period_const fields within a function body
 /// and non-const pointers/references escaping to them.
-class EjitMayConstWriteVisitor
-    : public RecursiveASTVisitor<EjitMayConstWriteVisitor> {
+class EjitPeriodConstWriteVisitor
+    : public RecursiveASTVisitor<EjitPeriodConstWriteVisitor> {
   Sema &S;
   /// Return type of the innermost function whose body is being traversed.
   /// Starts as the checked function's return type and is updated when
   /// descending into lambda bodies, so a return inside a lambda is checked
   /// against the lambda's return type, not the enclosing function's.
   QualType CurReturnType;
-  /// Whether warn_ejit_may_const_addr_without_const is enabled for this
+  /// Whether warn_ejit_period_const_addr_without_const is enabled for this
   /// function. The address-of checks below are skipped when it is off
   /// (its default) to avoid wasted traversal work.
   bool AddrOfEnabled;
 
 public:
-  EjitMayConstWriteVisitor(Sema &S, const FunctionDecl *CurFD,
+  EjitPeriodConstWriteVisitor(Sema &S, const FunctionDecl *CurFD,
                            bool AddrOfEnabled)
       : S(S), CurReturnType(CurFD->getReturnType()),
         AddrOfEnabled(AddrOfEnabled) {}
@@ -821,7 +788,7 @@ public:
     if (const auto *CallOp = LE->getCallOperator())
       CurReturnType = CallOp->getReturnType();
     bool Result =
-        RecursiveASTVisitor<EjitMayConstWriteVisitor>::TraverseLambdaExpr(LE);
+        RecursiveASTVisitor<EjitPeriodConstWriteVisitor>::TraverseLambdaExpr(LE);
     CurReturnType = Saved;
     return Result;
   }
@@ -832,7 +799,7 @@ public:
     QualType Saved = CurReturnType;
     CurReturnType = Nested->getReturnType();
     bool Result =
-        RecursiveASTVisitor<EjitMayConstWriteVisitor>::TraverseFunctionDecl(
+        RecursiveASTVisitor<EjitPeriodConstWriteVisitor>::TraverseFunctionDecl(
             Nested);
     CurReturnType = Saved;
     return Result;
@@ -841,7 +808,7 @@ public:
   bool VisitBinaryOperator(BinaryOperator *BO) {
     if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp()) {
       checkWrite(BO->getLHS(), BO->getOperatorLoc());
-      // Also check RHS for &may_const_field assigned to non-const pointer.
+      // Also check RHS for &period_const_field assigned to non-const pointer.
       if (AddrOfEnabled && BO->getOpcode() == BO_Assign)
         checkAddrOfExpr(BO->getRHS(), BO->getLHS()->getType(),
                         BO->getOperatorLoc());
@@ -866,12 +833,12 @@ public:
       return true;
     // A call argument bound to a non-const pointer/reference parameter is an
     // escape of the same kind as an assignment: the callee can write through
-    // it.  Calls into ejit_period_lc functions are skipped: those are
+    // it.  Calls into ejit_guard functions are skipped: those are
     // sanctioned to touch period data.  Variadic arguments have no parameter
     // type and are not checked.
     const FunctionDecl *Callee =
         dyn_cast_or_null<FunctionDecl>(CE->getCalleeDecl());
-    if (Callee && Callee->hasAttr<EjitPeriodLcAttr>())
+    if (Callee && Callee->hasAttr<EjitGuardAttr>())
       return true;
     const auto *FPT = CE->getCallee()->getType()->getAs<FunctionProtoType>();
     if (!FPT && Callee)
@@ -900,21 +867,21 @@ public:
   }
 
 private:
-  /// If \p Target designates an ejit_may_const field, emit the warning.
+  /// If \p Target designates an ejit_period_const field, emit the warning.
   void checkWrite(Expr *Target, SourceLocation Loc) {
     const VarDecl *BaseVar = nullptr;
-    const FieldDecl *MayConstField = findMayConstWriteTarget(Target, BaseVar);
-    if (!MayConstField)
+    const FieldDecl *PeriodConstField = findPeriodConstWriteTarget(Target, BaseVar);
+    if (!PeriodConstField)
       return;
-    emitMayConstFieldDiag(diag::warn_ejit_may_const_modified_without_lc,
-                          MayConstField, BaseVar, Loc);
+    emitPeriodConstFieldDiag(diag::warn_ejit_period_const_modified_without_guard,
+                          PeriodConstField, BaseVar, Loc);
   }
 
   /// Emit a may-const-field diagnostic for \p FD.
-  /// %0 = the may_const field; %1 = the variable that holds the struct
+  /// %0 = the period_const field; %1 = the variable that holds the struct
   /// (falls back to the field's parent record when no base variable is
   /// identifiable, e.g. writes through unusual rvalue bases).
-  void emitMayConstFieldDiag(unsigned DiagID, const FieldDecl *FD,
+  void emitPeriodConstFieldDiag(unsigned DiagID, const FieldDecl *FD,
                              const VarDecl *BaseVar, SourceLocation Loc) {
     if (BaseVar)
       S.Diag(Loc, DiagID) << FD << BaseVar;
@@ -922,7 +889,7 @@ private:
       S.Diag(Loc, DiagID) << FD << FD->getParent();
   }
 
-  /// Check if \p E escapes a may_const field as a non-const pointer or
+  /// Check if \p E escapes a period_const field as a non-const pointer or
   /// reference.  Checked at consumer sites: VarDecl initializers,
   /// plain-assignment RHS, call arguments, and return values.
   /// \p DestType is the type of the destination (VarDecl type, LHS of
@@ -955,7 +922,7 @@ private:
     if (DestType->isReferenceType()) {
       // A reference binding has no address-of node in the AST: the
       // initializer is the referent itself, with the & implicit.  A
-      // non-const reference to a may_const field is the same escape as a
+      // non-const reference to a period_const field is the same escape as a
       // non-const pointer.
       Target = Inner;
     } else {
@@ -966,28 +933,28 @@ private:
     }
 
     const VarDecl *BaseVar = nullptr;
-    const FieldDecl *FD = findMayConstWriteTarget(Target, BaseVar);
+    const FieldDecl *FD = findPeriodConstWriteTarget(Target, BaseVar);
     if (!FD)
       return;
 
-    emitMayConstFieldDiag(diag::warn_ejit_may_const_addr_without_const, FD,
+    emitPeriodConstFieldDiag(diag::warn_ejit_period_const_addr_without_const, FD,
                           BaseVar, Loc);
   }
 };
 
 } // anonymous namespace
 
-/// checkEjitMayConstWrites - Warn when a function that is NOT marked
-/// ejit_period_lc writes to an ejit_may_const field. Called from
+/// checkEjitPeriodConstWrites - Warn when a function that is NOT marked
+/// ejit_guard writes to an ejit_period_const field. Called from
 /// ActOnFinishFunctionBody after the function body is parsed.
-void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body) {
+void checkEjitPeriodConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body) {
   if (!FD || !Body || FD->isInvalidDecl() || FD->isDependentContext())
     return;
 
-  // ejit_period_lc functions are sanctioned to modify time-window data: the
+  // ejit_guard functions are sanctioned to modify time-window data: the
   // compiler inserts ejit_deactivate/activate around them, so writes there are
   // safe and must not be flagged.
-  if (FD->hasAttr<EjitPeriodLcAttr>())
+  if (FD->hasAttr<EjitGuardAttr>())
     return;
 
   // Methods of local classes (including lambda call operators) are checked
@@ -1004,29 +971,31 @@ void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body) {
   // default-on, so the visitor normally runs; the addr-of checks inside
   // it are gated separately on AddrOfEnabled.
   bool AddrOfEnabled = !S.getDiagnostics().isIgnored(
-      diag::warn_ejit_may_const_addr_without_const, FD->getLocation());
+      diag::warn_ejit_period_const_addr_without_const, FD->getLocation());
   if (S.getDiagnostics().isIgnored(
-          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()) &&
+          diag::warn_ejit_period_const_modified_without_guard, FD->getLocation()) &&
       !AddrOfEnabled)
     return;
 
-  EjitMayConstWriteVisitor Visitor(S, FD, AddrOfEnabled);
+  EjitPeriodConstWriteVisitor Visitor(S, FD, AddrOfEnabled);
   Visitor.TraverseStmt(Body);
 }
 
 namespace {
 
-/// Visitor that collects DeclRefExprs to ejit_period_arr globals within a
-/// function body.
-class EjitPeriodArrRefVisitor
-    : public RecursiveASTVisitor<EjitPeriodArrRefVisitor> {
+/// Visitor that collects DeclRefExprs to indexed period group globals
+/// (arrays / pointers, the forms an ejit_dim indexes into) within a function
+/// body.
+class EjitIndexedGroupRefVisitor
+    : public RecursiveASTVisitor<EjitIndexedGroupRefVisitor> {
   SmallVector<const DeclRefExpr *, 4> Refs;
 
 public:
   bool VisitDeclRefExpr(DeclRefExpr *DRE) {
     if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
-      if (VD->hasAttr<EjitPeriodArrAttr>())
-        Refs.push_back(DRE);
+      if (const auto *GA = VD->getAttr<EjitGroupAttr>())
+        if (GA->getIndexed())
+          Refs.push_back(DRE);
     return true;
   }
 
@@ -1059,7 +1028,7 @@ public:
   bool TraverseCXXTypeidExpr(CXXTypeidExpr *E) {
     if (!E->isPotentiallyEvaluated())
       return true;
-    return RecursiveASTVisitor<EjitPeriodArrRefVisitor>::TraverseCXXTypeidExpr(
+    return RecursiveASTVisitor<EjitIndexedGroupRefVisitor>::TraverseCXXTypeidExpr(
         E);
   }
 
@@ -1073,7 +1042,7 @@ public:
 
 /// checkEjitUndeclaredPeriodDeps - Warn when an ejit_entry function references
 /// an ejit_period_arr global that is not declared as a dependency via an
-/// ejit_period_arr_ind parameter. Called from ActOnFinishFunctionBody after
+/// ejit_dim parameter. Called from ActOnFinishFunctionBody after
 /// the function body is parsed.
 ///
 /// Replaces the former AOT-pass check (EJitAotModulePass) that printed the
@@ -1101,13 +1070,13 @@ void checkEjitUndeclaredPeriodDeps(Sema &S, const FunctionDecl *FD,
                                    FD->getLocation()))
     return;
 
-  // Collect declared period names from ejit_period_arr_ind parameters.
+  // Collect declared period names from ejit_dim parameters.
   SmallVector<StringRef, 4> Declared;
   for (const ParmVarDecl *P : FD->parameters())
-    if (auto *IdxAttr = P->getAttr<EjitPeriodArrIndAttr>())
+    if (auto *IdxAttr = P->getAttr<EjitDimAttr>())
       Declared.push_back(IdxAttr->getPeriodName());
 
-  EjitPeriodArrRefVisitor Visitor;
+  EjitIndexedGroupRefVisitor Visitor;
   Visitor.TraverseStmt(Body);
 
   // Warn once per undeclared period, at the first reference site, with a
@@ -1115,7 +1084,7 @@ void checkEjitUndeclaredPeriodDeps(Sema &S, const FunctionDecl *FD,
   llvm::SmallSet<StringRef, 4> Warned;
   for (const DeclRefExpr *Ref : Visitor.getRefs()) {
     const auto *VD = cast<VarDecl>(Ref->getDecl());
-    StringRef PeriodName = VD->getAttr<EjitPeriodArrAttr>()->getPeriodName();
+    StringRef PeriodName = VD->getAttr<EjitGroupAttr>()->getPeriodName();
     if (is_contained(Declared, PeriodName) || !Warned.insert(PeriodName).second)
       continue;
     S.Diag(Ref->getLocation(), diag::warn_ejit_undeclared_period_dep)
@@ -1124,7 +1093,7 @@ void checkEjitUndeclaredPeriodDeps(Sema &S, const FunctionDecl *FD,
     // declaration-only extern is not "defined here".
     const VarDecl *DefVD = VD->getDefinition();
     S.Diag(DefVD ? DefVD->getLocation() : VD->getLocation(),
-           diag::note_ejit_period_arr_defined_here)
+           diag::note_ejit_group_defined_here)
         << PeriodName;
   }
 }

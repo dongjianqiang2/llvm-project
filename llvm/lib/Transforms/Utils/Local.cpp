@@ -3283,7 +3283,7 @@ bool llvm::removeUnreachableBlocks(Function &F, DomTreeUpdater *DTU,
   return Changed;
 }
 
-static bool canPreserveEJitMayConst(const Instruction *K, const Instruction *J,
+static bool canPreserveEJitPeriodConst(const Instruction *K, const Instruction *J,
                                    const MDNode *KMD, const MDNode *JMD) {
   const auto *KL = dyn_cast<LoadInst>(K);
   const auto *JL = dyn_cast<LoadInst>(J);
@@ -3311,8 +3311,8 @@ static void combineMetadata(Instruction *K, const Instruction *J,
     // TODO: Assert that this switch is exhaustive for fixed MD kinds.
     switch (Kind) {
       default:
-        if (Kind == K->getContext().getMDKindID("ejit.may_const") &&
-            canPreserveEJitMayConst(K, J, KMD, JMD))
+        if (Kind == K->getContext().getMDKindID("ejit.period_const") &&
+            canPreserveEJitPeriodConst(K, J, KMD, JMD))
           break;
         K->setMetadata(Kind, nullptr); // Remove unknown metadata
         break;
@@ -3494,7 +3494,7 @@ void llvm::copyMetadataForLoad(LoadInst &Dest, const LoadInst &Source) {
     case LLVMContext::MD_access_group:
     case LLVMContext::MD_noundef:
     case LLVMContext::MD_noalias_addrspace:
-    case LLVMContext::MD_ejit_may_const:
+    case LLVMContext::MD_ejit_period_const:
       // All of these directly apply.
       Dest.setMetadata(ID, N);
       break;

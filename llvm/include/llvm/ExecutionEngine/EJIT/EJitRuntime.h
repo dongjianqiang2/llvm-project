@@ -23,49 +23,42 @@
 //
 // Example:
 //   typedef struct {
-//     int ejit_may_const threshold;
+//     int EJIT_PERIOD_CONST threshold;
 //   } Config;
-//   ejit_period(static) Config g_config;
-//   ejit_entry void process(ejit_period_arr_ind(cell) uint8_t idx) { ... }
+//   ejit_group(static) Config g_config;
+//   ejit_entry void process(EJIT_DIM(cell) uint8_t idx) { ... }
 //===----------------------------------------------------------------------===//
 
 #ifdef EJIT_DISABLE
 #define EJIT_PERIOD_CONST
-#define ejit_may_const
-#define EJIT_IN_PERIOD(x)
-#define ejit_period(x)
-#define EJIT_IN_PERIOD_ARRAY(x)
-#define ejit_period_arr(x)
+#define ejit_group(x)
 #define EJIT_DIM(x)
 #define EJIT_BOUND_PTR(x)
 #define ejit_free_dim
-#define ejit_period_arr_ind(x)
 #define EJIT_ENTRY
 #define ejit_entry
-#define EJIT_PERIOD_GUARD(x)
-#define ejit_period_lc(x)
+#define ejit_guard(x)
 #else
 // New names (preferred)
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
-#define EJIT_IN_PERIOD(x) __attribute__((ejit_in_period(#x)))
-#define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
 #define EJIT_DIM(x)             __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
-#define EJIT_ENTRY              __attribute__((ejit_entry))
-#define EJIT_PERIOD_GUARD(x)    __attribute__((ejit_period_guard(#x)))
-// Self-referential on purpose, and deliberately WITHOUT an EJIT_FREE_DIM twin:
-// the macro name matches the attribute spelling, so the expansion is stopped by
+// Self-referential on purpose, and deliberately WITHOUT EJIT_FREE_DIM /
+// EJIT_GROUP / EJIT_GUARD twins that expand to a raw __attribute__: the
+// macro name matches the attribute spelling, so the expansion is stopped by
 // the "macro is not replaced inside its own expansion" rule. A second macro
-// expanding to the same __attribute__ would not be protected — it would rewrite
-// the inner ejit_free_dim token and emit __attribute__((__attribute__(...))).
+// expanding to the same __attribute__ would not be protected — its inner
+// token is not painted when it arrives from a different macro's expansion,
+// so EJIT_GROUP(cell) would expand to __attribute__((EJIT_GROUP("cell")))
+// (verified by preprocessing). The workaround for names that need BOTH
+// forms (currently EJIT_ENTRY): the spelling-colliding name is the
+// self-referential base, and the other name aliases INTO it — that
+// direction is safe in both directions of use.
 #define ejit_free_dim __attribute__((ejit_free_dim))
-// Old names (aliases — use new macros to avoid double expansion)
-#define ejit_may_const EJIT_PERIOD_CONST
-#define ejit_period(x) EJIT_IN_PERIOD(x)
-#define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
-#define ejit_period_arr_ind(x) EJIT_DIM(x)
-#define ejit_entry EJIT_ENTRY
-#define ejit_period_lc(x) EJIT_PERIOD_GUARD(x)
+#define ejit_group(x) __attribute__((ejit_group(#x)))
+#define ejit_guard(x) __attribute__((ejit_guard(#x)))
+#define ejit_entry __attribute__((ejit_entry))
+#define EJIT_ENTRY ejit_entry
 #endif
 
 #ifdef __cplusplus
@@ -494,7 +487,7 @@ void ejit_print_registry(void);
 
 /// Print the !ejit.metadata of \p funcName (parsed from its registered
 /// bitcode): whether it is an ejit_entry, its period_arr_ind parameter slots,
-/// period arrays, and may_const field offsets. For diagnosing specialization
+/// period arrays, and period_const field offsets. For diagnosing specialization
 /// parameter binding and constant-substitution eligibility.
 void ejit_print_func_meta(const char *funcName);
 
@@ -514,12 +507,12 @@ ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out);
 void ejit_print_code_pool_stats(void);
 
 /// Print a ranking for every sampled ejit_entry function. The ranking is
-/// ordered by dynamically removed may_const load executions per million
+/// ordered by dynamically removed period_const load executions per million
 /// platform timestamp units (removed work per entry times entry frequency).
 /// Call this explicitly after the audit sampling windows have completed. In a
 /// shared-taskpool build, a non-owner core forwards the request to the
 /// compile-owner worker and waits for printing to finish.
-void ejit_print_mayconst_ranking(void);
+void ejit_print_period_const_ranking(void);
 
 /// Print the currently-active time-window instances through the platform log:
 /// for each registered period, every active (period, cell) is listed. Works

@@ -32,15 +32,15 @@
 //===-- 场景 A: 单维 cellIdx 外部输入，分支折叠 -----------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
-  ejit_may_const uint32_t cellId;
+  EJIT_PERIOD_CONST uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellId;
   uint32_t trafficLoad;
 };
 
-ejit_period(static) uint32_t g_sysVer;
+ejit_group(static) uint32_t g_sysVer;
 
 #define N_CELL 8
-ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
+ejit_group(cell) struct CellCfg g_cellCfg[N_CELL];
 
 //===-- 场景 A: 分支折叠验证 ------------------------------------------------===//
 // 调用: process_cell_a(cellIdx)
@@ -49,7 +49,7 @@ ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
 
 ejit_entry
 void process_cell_a(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
   if (g_cellCfg[cellIdx].cellType == 0xFD) {         // 253
     g_cellCfg[cellIdx].trafficLoad += 100;
@@ -61,25 +61,25 @@ void process_cell_a(
 //===-- 场景 B: 多维 cellIdx + trpIdx 外部输入 -----------------------------===//
 
 struct TrpCfg {
-  ejit_may_const uint32_t trpType;
+  EJIT_PERIOD_CONST uint32_t trpType;
   uint32_t activeBeams;
 };
 
 #define M_TRP 8
-ejit_period_arr(trp) struct TrpCfg g_trpCfg[M_TRP];
+ejit_group(trp) struct TrpCfg g_trpCfg[M_TRP];
 
 // 调用: process_cell_trp(cellIdx, trpIdx)
-// 验证: 两个 may_const 字段都被替换，复合条件被折叠
+// 验证: 两个 period_const 字段都被替换，复合条件被折叠
 
 ejit_entry
 uint32_t process_cell_trp(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
   uint32_t ct = g_cellCfg[cellIdx].cellType;
   uint32_t tt = g_trpCfg[trpIdx].trpType;
 
-  // 复合条件: 两个 may_const 字段同时决定分支
+  // 复合条件: 两个 period_const 字段同时决定分支
   if (ct == 0xFD && tt == 1) {
     return 1000;
   } else if (ct == 0xEC && tt == 2) {
@@ -90,28 +90,28 @@ uint32_t process_cell_trp(
   return 0;
 }
 
-//===-- 场景 C: 嵌套结构体 may_const 字段 -----------------------------------===//
+//===-- 场景 C: 嵌套结构体 period_const 字段 -----------------------------------===//
 
 struct InnerCfg {
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t reserved;
 };
 
 struct OuterCfg {
-  ejit_may_const uint32_t type;
+  EJIT_PERIOD_CONST uint32_t type;
   struct InnerCfg inner;
   uint32_t extra;
 };
 
 #define N_OUTER 4
-ejit_period_arr(outer) struct OuterCfg g_outerCfg[N_OUTER];
+ejit_group(outer) struct OuterCfg g_outerCfg[N_OUTER];
 
 // 调用: process_outer(cellIdx)
-// 验证: 外层和内层 may_const 字段都能被正确替换
+// 验证: 外层和内层 period_const 字段都能被正确替换
 
 ejit_entry
 uint32_t process_outer(
-    ejit_period_arr_ind(outer) uint8_t idx)
+    EJIT_DIM(outer) uint8_t idx)
 {
   uint32_t t = g_outerCfg[idx].type;
   uint32_t m = g_outerCfg[idx].inner.mode;
@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
   CHECK_EQ(after - before, 100u, "A: trafficLoad delta (then branch)");
 
   // 修改 cellType 为非 0xFD，测试 else 分支
-  // 注：修改 may_const 字段需要通过 ejit_deactivate + 重新激活
+  // 注：修改 period_const 字段需要通过 ejit_deactivate + 重新激活
   ejit_deactivate("cell", ci);
   g_cellCfg[ci].cellType = 0xA5;  // 不是 0xFD
   ejit_activate("cell", ci);
@@ -266,7 +266,7 @@ int main(int argc, char **argv) {
 
   printf("\n=== 场景 C: process_outer(idx=%u) ===\n", (unsigned)(ci % N_OUTER));
   uint32_t result_c = process_outer(ci % N_OUTER);
-  CHECK_EQ(result_c, 777u, "C: outer/inner may_const both match");
+  CHECK_EQ(result_c, 777u, "C: outer/inner period_const both match");
 
   // Verify the async path actually compiled (not silent AOT fallback).
   ejit_drain_taskpool();

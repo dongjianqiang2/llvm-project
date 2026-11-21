@@ -30,15 +30,15 @@
 //===-- TU-A 的 EJIT 数据与入口 --------------------------------------------===//
 
 struct ACfg {
-  ejit_may_const uint32_t kind;
+  EJIT_PERIOD_CONST uint32_t kind;
   uint32_t x;
 };
 
 #define N_A 8
-ejit_period_arr(acell) struct ACfg g_aCfg[N_A];
+ejit_group(acell) struct ACfg g_aCfg[N_A];
 
 ejit_entry
-uint32_t jit_a(ejit_period_arr_ind(acell) uint8_t i)
+uint32_t jit_a(EJIT_DIM(acell) uint8_t i)
 {
   // JIT 应把 g_aCfg[i].kind 替换为常量并折叠此分支
   if (g_aCfg[i].kind == 0xAA)

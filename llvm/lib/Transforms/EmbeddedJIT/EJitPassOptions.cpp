@@ -25,37 +25,37 @@ cl::opt<std::string> EJitDumpBitcodeDir(
 // warning so users can silence them independently via -mllvm.
 cl::opt<bool> EJitWarnNoSpecialization(
     "ejit-warn-no-specialization", cl::init(true), cl::Hidden,
-    cl::desc("Warn when an ejit_entry function reads no ejit_may_const field "
+    cl::desc("Warn when an ejit_entry function reads no ejit_period_const field "
              "in its specialization closure (no JIT specialization value)."));
 
 cl::opt<bool> EJitWarnUnusedDim(
     "ejit-warn-unused-dim", cl::init(true), cl::Hidden,
-    cl::desc("Warn when an ejit_entry declares ejit_period_arr_ind(P) but its "
-             "specialization closure never indexes an ejit_period_arr(P) "
+    cl::desc("Warn when an ejit_entry declares ejit_dim(P) but its "
+             "specialization closure never indexes an ejit_group(P) "
              "(unused specialization dimension)."));
 
 // Optional info-level report (not a warning): per ejit_entry, count the
-// ejit_may_const reads in its specialization closure and how many sit inside
+// ejit_period_const reads in its specialization closure and how many sit inside
 // loops. A raw count is a poor specialization-value metric on its own (a
 // single read in a hot loop or feeding a branch is high value), so this only
 // reports the numbers for the user to judge - it does not gate or warn.
-cl::opt<bool> EJitReportMayConst(
-    "ejit-report-mayconst", cl::init(false), cl::Hidden,
-    cl::desc("Report per-ejit_entry ejit_may_const read counts (total and "
+cl::opt<bool> EJitReportPeriodConst(
+    "ejit-report-period-const", cl::init(false), cl::Hidden,
+    cl::desc("Report per-ejit_entry ejit_period_const read counts (total and "
              "in-loop) in the specialization closure, for manual "
              "specialization-value assessment."));
 
 // Optional warning (off by default): warn when an ejit_entry's specialization
-// closure has fewer than N ejit_may_const reads. N=0 disables the check,
+// closure has fewer than N ejit_period_const reads. N=0 disables the check,
 // N>0 enables it with that threshold. A low load count means the JIT has
 // little to specialize against, but the significance depends on whether those
 // few loads gate branches or sit in hot loops — this warning flags low counts
 // for manual review rather than asserting a defect.
-cl::opt<unsigned> EJitWarnFewMayConst(
-    "ejit-warn-few-mayconst", cl::init(0), cl::Hidden,
+cl::opt<unsigned> EJitWarnFewPeriodConst(
+    "ejit-warn-few-period-const", cl::init(0), cl::Hidden,
     cl::desc("Warn when an ejit_entry's specialization closure has fewer than "
-             "N ejit_may_const reads (0 = off). Example: "
-             "-ejit-warn-few-mayconst=4 warns on 0..3 may-const reads."));
+             "N ejit_period_const reads (0 = off). Example: "
+             "-ejit-warn-few-period-const=4 warns on 0..3 period-const reads."));
 
 // Closure-slimming threshold (PASS1): non-entry closure helpers with at
 // least this many raw-IR instructions are externalized from the extracted

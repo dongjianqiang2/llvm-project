@@ -96,7 +96,7 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// v12: staged PGO admission has a configurable fixed-capacity slot table, so
 /// one or more functions may profile concurrently with independent progress;
 /// the shared blob also records completed-function and deferred-miss counts.
-/// v13: non-owner cores can post a may_const-ranking diagnostic request to the
+/// v13: non-owner cores can post a period_const-ranking diagnostic request to the
 /// owner worker and wait for its completion without sharing optimizer objects.
 /// v14: EJitCompileRequest introduced the old inline bound-pointer payload.
 /// v15: each cache slot records whether its published JIT pointer was resolved

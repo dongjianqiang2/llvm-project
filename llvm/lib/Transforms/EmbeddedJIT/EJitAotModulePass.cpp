@@ -68,9 +68,9 @@ EJitAotModulePass::run(Module &M, ModuleAnalysisManager &AM) {
   // (PASS1 is an independent early pass, not part of this pipeline)
   PreservedAnalyses PA = PreservedAnalyses::all();
 
-  PA.intersect(EJitRegisterPeriodPass().run(M, AM));
+  PA.intersect(EJitRegisterGroupPass().run(M, AM));
   PA.intersect(EJitWrapperGenPass().run(M, AM));
-  PA.intersect(EJitPeriodHandlerPass().run(M, AM));
+  PA.intersect(EJitGuardHandlerPass().run(M, AM));
 
   return PA;
 }

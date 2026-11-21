@@ -27,10 +27,10 @@ struct EJitBranchProfileSummary {
   bool isRoot = false;
 };
 
-/// Stable description of one source may_const load. Tier-1 records the same
+/// Stable description of one source period_const load. Tier-1 records the same
 /// deterministic module-order inventory that Tier-2 uses to correlate runtime
 /// hits with the final specialized IR.
-struct EJitMayConstLoadSite {
+struct EJitPeriodConstLoadSite {
   std::string functionName;
   std::string globalName;
   std::string sourceFile;
@@ -44,11 +44,11 @@ struct EJitMayConstLoadSite {
   bool hasFieldOffset = false;
 };
 
-struct EJitMayConstBenefitSample {
+struct EJitPeriodConstBenefitSample {
   uint64_t cacheKey = 0;
-  uint64_t inputMayConstLoads = 0;
-  uint64_t specializedMayConstLoads = 0;
-  uint64_t finalMayConstLoads = 0;
+  uint64_t inputPeriodConstLoads = 0;
+  uint64_t specializedPeriodConstLoads = 0;
+  uint64_t finalPeriodConstLoads = 0;
   uint64_t runtimeHits = 0;
   uint64_t hitSites = 0;
   uint64_t removedRuntimeHits = 0;
@@ -57,11 +57,11 @@ struct EJitMayConstBenefitSample {
   uint64_t sampleCycles = 0;
 };
 
-struct EJitMayConstBenefitSummary {
+struct EJitPeriodConstBenefitSummary {
   uint64_t versions = 0;
-  uint64_t inputMayConstLoads = 0;
-  uint64_t specializedMayConstLoads = 0;
-  uint64_t finalMayConstLoads = 0;
+  uint64_t inputPeriodConstLoads = 0;
+  uint64_t specializedPeriodConstLoads = 0;
+  uint64_t finalPeriodConstLoads = 0;
   int64_t totalRemoved = 0;
   int64_t directRemoved = 0;
   int64_t pipelineRemoved = 0;
@@ -75,7 +75,7 @@ struct EJitMayConstBenefitSummary {
   uint64_t removedHitSites = 0;
   uint64_t sampledEntries = 0;
   uint64_t sampleCycles = 0;
-  /// Average dynamically-reached may_const sites per unique JIT version,
+  /// Average dynamically-reached period_const sites per unique JIT version,
   /// scaled by 1000 so freestanding diagnostics need no floating point.
   uint64_t averageActiveSitesPermille = 0;
   /// Removed dynamic load executions per sampled root entry, scaled by 1000.
@@ -91,8 +91,8 @@ std::vector<EJitBranchProfileSummary>
 analyzeBranchProfiles(const Module &M, const std::string &rootName);
 
 /// Aggregate unique specialization samples for one EJIT entry.
-EJitMayConstBenefitSummary
-summarizeMayConstBenefits(ArrayRef<EJitMayConstBenefitSample> Samples);
+EJitPeriodConstBenefitSummary
+summarizePeriodConstBenefits(ArrayRef<EJitPeriodConstBenefitSample> Samples);
 
 } // namespace ejit
 } // namespace llvm

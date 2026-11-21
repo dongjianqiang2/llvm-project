@@ -6,8 +6,8 @@
 // a system library on virtually every platform — no extra dependencies.
 //
 // Design:
-//   - Compression level (1-9) and strategy are ejit_may_const fields in
-//     a global struct marked ejit_period(static).
+//   - Compression level (1-9) and strategy are EJIT_PERIOD_CONST fields in
+//     a global struct marked ejit_group(static).
 //   - The compress() function is ejit_entry — JIT specializes it for the
 //     current parameters.
 //   - After JIT compilation, constant-parameter branches are eliminated.
@@ -26,13 +26,13 @@
 //===--- EJIT-annotated compression parameters ----------------------------===//
 
 typedef struct {
-  int ejit_may_const level;         // 1..9
-  int ejit_may_const strategy;      // Z_DEFAULT_STRATEGY, Z_FILTERED, etc.
-  int ejit_may_const memLevel;      // 1..9
-  int ejit_may_const windowBits;    // 9..15
+  int EJIT_PERIOD_CONST level;         // 1..9
+  int EJIT_PERIOD_CONST strategy;      // Z_DEFAULT_STRATEGY, Z_FILTERED, etc.
+  int EJIT_PERIOD_CONST memLevel;      // 1..9
+  int EJIT_PERIOD_CONST windowBits;    // 9..15
 } CompressCfg;
 
-ejit_period(static) CompressCfg g_cfg;
+ejit_group(static) CompressCfg g_cfg;
 
 //===--- EJIT entry: compress with specialized parameters -----------------===//
 

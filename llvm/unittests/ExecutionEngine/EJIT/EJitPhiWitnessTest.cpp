@@ -106,7 +106,7 @@ static void checkPhi(Field Fld, RootKind Root, Scenario Case, bool BigEndian,
         IR << ", !" << 100 + I;
   }
   IR << "}\n!1 = !{!\""
-     << (Root == SymbolicStatic ? "ejit_period" : "ejit_period_arr")
+     << (Root == SymbolicStatic ? "ejit_group" : "ejit_group_indexed")
      << "\", !\"" << (Root == SymbolicStatic ? "static" : "cell") << "\"";
   if (Root != SymbolicStatic)
     IR << ", i32 " << (PointerRoot ? 0 : 18);
@@ -117,11 +117,11 @@ static void checkPhi(Field Fld, RootKind Root, Scenario Case, bool BigEndian,
   if (Case != MissingContract)
     IR << "!6, !7";
   IR << "}\n!6 = !{!\"ejit_entry\"}\n"
-        "!7 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n";
+        "!7 = !{!\"ejit_dim\", !\"cell\", i32 0}\n";
   for (unsigned I = 0; I < Count; ++I) {
     IR << "!" << 100 + I << " = !{";
     if (!PointerRoot)
-      IR << "!\"ejit_may_const_field\", ";
+      IR << "!\"ejit_period_const_field\", ";
     IR << "i64 " << I * RecordSize + Fld.Offset;
     if (PointerRoot)
       IR << ", i64 " << Fld.Bits / 8;
@@ -212,7 +212,7 @@ static void checkPhi(Field Fld, RootKind Root, Scenario Case, bool BigEndian,
   }
   auto *Load =
       B.CreateAlignedLoad(B.getIntNTy(Fld.Bits), Ptr, Align(Fld.Align));
-  Load->setMetadata("ejit.may_const", MDNode::get(C, {}));
+  Load->setMetadata("ejit.period_const", MDNode::get(C, {}));
   if (Case == Volatile)
     Load->setVolatile(true);
   if (Case == Atomic)

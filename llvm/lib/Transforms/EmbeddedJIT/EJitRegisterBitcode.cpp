@@ -51,8 +51,8 @@ extern cl::opt<bool> EnableEJitGlobalCtors;
 extern cl::opt<std::string> EJitDumpBitcodeDir;
 extern cl::opt<bool> EJitWarnNoSpecialization;
 extern cl::opt<bool> EJitWarnUnusedDim;
-extern cl::opt<bool> EJitReportMayConst;
-extern cl::opt<unsigned> EJitWarnFewMayConst;
+extern cl::opt<bool> EJitReportPeriodConst;
+extern cl::opt<unsigned> EJitWarnFewPeriodConst;
 extern cl::opt<unsigned> EJitExternalizeMinInsts;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
@@ -122,7 +122,7 @@ static GlobalVariable *rootGlobal(Value *V, const DataLayout &DL) {
 
 /// Resolve the global that roots an entry-reachable operand, including aliases
 /// used as whole-table names. This is deliberately separate from rootGlobal:
-/// may-const offsets and symbol registration retain their existing alias-free
+/// period-const offsets and symbol registration retain their existing alias-free
 /// semantics. Constant GEP handling matches findRootGV, and the alias set
 /// prevents malformed alias cycles from making closure discovery unbounded.
 static GlobalVariable *closureRootGlobal(Value *V, const DataLayout &DL) {
@@ -323,16 +323,16 @@ static const GlobalVariable *findRootGV(const Value *V, APInt &Offset,
   return nullptr;
 }
 
-/// Re-annotate loads with !ejit.may_const using GV-level offset metadata.
+/// Re-annotate loads with !ejit.period_const using GV-level offset metadata.
 /// Optimization passes may drop per-load metadata; this restores it from
-/// the !ejit.may_const_field entries on the GV's !ejit.metadata.
-static void reAnnotateMayConst(Module &M) {
+/// the !ejit.period_const_field entries on the GV's !ejit.metadata.
+static void reAnnotatePeriodConst(Module &M) {
   const DataLayout &DL = M.getDataLayout();
   LLVMContext &Ctx = M.getContext();
-  auto MayConstKind = Ctx.getMDKindID(MD_EJIT_MAY_CONST);
+  auto PeriodConstKind = Ctx.getMDKindID(MD_EJIT_PERIOD_CONST);
 
   // Build offset map from GV metadata
-  DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>> mayConstMap;
+  DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>> periodConstMap;
   for (GlobalVariable &GV : M.globals()) {
     MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -343,15 +343,15 @@ static void reAnnotateMayConst(Module &M) {
       if (!Sub || Sub->getNumOperands() < 2)
         continue;
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_MAY_CONST_FIELD)
+      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_CONST_FIELD)
         continue;
       if (auto *CI = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(1)))
         offsets.push_back(CI->getZExtValue());
     }
     if (!offsets.empty())
-      mayConstMap[&GV] = std::move(offsets);
+      periodConstMap[&GV] = std::move(offsets);
   }
-  if (mayConstMap.empty())
+  if (periodConstMap.empty())
     return;
 
   // Re-annotate matching loads
@@ -362,7 +362,7 @@ static void reAnnotateMayConst(Module &M) {
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         auto *LI = dyn_cast<LoadInst>(&I);
-        if (!LI || LI->hasMetadata(MayConstKind))
+        if (!LI || LI->hasMetadata(PeriodConstKind))
           continue;
         // Never folded, so never re-annotated.
         if (LI->isVolatile() || LI->isAtomic())
@@ -370,11 +370,11 @@ static void reAnnotateMayConst(Module &M) {
         // The recorded offsets are element-relative, so match on the field
         // coordinate rather than the total offset from the global.
         const GlobalVariable *GV = nullptr;
-        auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, GV);
+        auto Off = ejitPeriodConstFieldOffset(LI->getPointerOperand(), DL, GV);
         if (!Off || !GV)
           continue;
-        auto it = mayConstMap.find(GV);
-        if (it == mayConstMap.end())
+        auto it = periodConstMap.find(GV);
+        if (it == periodConstMap.end())
           continue;
         if (!is_contained(it->second, *Off))
           continue;
@@ -382,16 +382,16 @@ static void reAnnotateMayConst(Module &M) {
         // next field, which is free to change.
         TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
         if (AccessSize.isScalable() ||
-            !ejitAccessFitsMayConstField(GV, *Off, AccessSize.getFixedValue(),
+            !ejitAccessFitsPeriodConstField(GV, *Off, AccessSize.getFixedValue(),
                                          DL))
           continue;
-        LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
+        LI->setMetadata(PeriodConstKind, MDNode::get(Ctx, {}));
         count++;
       }
     }
   }
   LLVM_DEBUG(dbgs() << "ejit-register-bitcode: re-annotated " << count
-                    << " may_const load(s)\n");
+                    << " period_const load(s)\n");
 }
 
 /// Run pre-optimization on the extracted bitcode at AOT time to reduce
@@ -468,8 +468,8 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 6. Restore !ejit.may_const metadata that passes may have dropped
-  reAnnotateMayConst(M);
+  // 6. Restore !ejit.period_const metadata that passes may have dropped
+  reAnnotatePeriodConst(M);
 }
 #else
 static void preOptimizeBitcode(Module &) {}
@@ -510,14 +510,14 @@ static void dumpExtractedBitcode(const Module &M, StringRef Dir) {
 }
 
 /// Diagnostic: count globals carrying !ejit.metadata, and within that the
-/// period_arr / may_const_field tags. Gated on EJitDumpBitcodeDir so it only
+/// period_arr / period_const_field tags. Gated on EJitDumpBitcodeDir so it only
 /// runs when the dump is enabled. Used to pinpoint where the struct-field
 /// pass's GV metadata is lost during extraction (clone → preOptimize →
 /// externalization).
 static void logEJitGlobalMeta(const char *label, const Module &M) {
   if (EJitDumpBitcodeDir.empty())
     return;
-  unsigned withMeta = 0, periodArr = 0, mayConstField = 0;
+  unsigned withMeta = 0, periodArr = 0, periodConstField = 0;
   for (const GlobalVariable &GV : M.globals()) {
     MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -528,16 +528,16 @@ static void logEJitGlobalMeta(const char *label, const Module &M) {
       if (!Sub || Sub->getNumOperands() < 2)
         continue;
       if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
-        if (Tag->getString() == TAG_EJIT_PERIOD_ARR)
+        if (Tag->getString() == TAG_EJIT_GROUP_INDEXED)
           ++periodArr;
-        else if (Tag->getString() == TAG_EJIT_MAY_CONST_FIELD)
-          ++mayConstField;
+        else if (Tag->getString() == TAG_EJIT_PERIOD_CONST_FIELD)
+          ++periodConstField;
       }
     }
   }
   errs() << "ejit-register-bitcode: " << label
          << " globals=" << M.global_size() << " withMeta=" << withMeta
-         << " periodArr=" << periodArr << " mayConstField=" << mayConstField
+         << " periodArr=" << periodArr << " periodConstField=" << periodConstField
          << "\n";
 }
 
@@ -545,9 +545,9 @@ namespace {
 
 /// Per-function direct info used by the specialization diagnostic.
 struct EjitFuncDiagInfo {
-  bool HasMayConstLoad = false;
-  unsigned MayConstCount = 0;        // # of !ejit.may_const loads (direct)
-  unsigned MayConstInLoopCount = 0;  // subset sitting inside a loop
+  bool HasPeriodConstLoad = false;
+  unsigned PeriodConstCount = 0;        // # of !ejit.period_const loads (direct)
+  unsigned PeriodConstInLoopCount = 0;  // subset sitting inside a loop
   SetVector<StringRef> RefsPeriodArr; // deduped period names referenced
   SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
 };
@@ -592,9 +592,9 @@ static void computeLoopBBs(Function &F,
 }
 
 /// Compute direct (pre-propagation) diagnostic info for \p F. \p LoopBBs is
-/// optional (non-null only when the may_const count report is enabled).
+/// optional (non-null only when the period_const count report is enabled).
 static void
-computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind,
+computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned PeriodConstKind,
                         const SmallPtrSetImpl<const BasicBlock *> *LoopBBs) {
   const DataLayout &DL = F.getParent()->getDataLayout();
   SetVector<GlobalVariable *> GVs;
@@ -602,11 +602,11 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
     const bool InLoop = LoopBBs && LoopBBs->count(&BB);
     for (Instruction &I : BB) {
       if (auto *Ld = dyn_cast<LoadInst>(&I))
-        if (Ld->hasMetadata(MayConstKind)) {
-          Info.HasMayConstLoad = true;
-          ++Info.MayConstCount;
+        if (Ld->hasMetadata(PeriodConstKind)) {
+          Info.HasPeriodConstLoad = true;
+          ++Info.PeriodConstCount;
           if (InLoop)
-            ++Info.MayConstInLoopCount;
+            ++Info.PeriodConstInLoopCount;
         }
       if (auto *CB = dyn_cast<CallBase>(&I))
         if (Function *Callee = CB->getCalledFunction())
@@ -628,7 +628,7 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
       if (!Sub || Sub->getNumOperands() < 2)
         continue;
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR)
+      if (!Tag || Tag->getString() != TAG_EJIT_GROUP_INDEXED)
         continue;
       if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
         Info.RefsPeriodArr.insert(PN->getString());
@@ -638,18 +638,18 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
 
 /// AOT specialization diagnostics on the extracted bitcode (post-preOptimize),
 /// which is exactly what the JIT will specialize.
-///   #1: ejit_entry whose specialization closure reads no ejit_may_const field.
-///   #2: ejit_entry that declares ejit_period_arr_ind(P) but its closure never
-///       indexes an ejit_period_arr(P).
+///   #1: ejit_entry whose specialization closure reads no ejit_period_const field.
+///   #2: ejit_entry that declares ejit_dim(P) but its closure never
+///       indexes an ejit_group(P).
 /// The closure is the direct-call reachability within the extracted module.
 /// External calls (declarations) and indirect calls (function pointers) do NOT
-/// count: the JIT cannot inline them, so their may_const reads never enter this
+/// count: the JIT cannot inline them, so their period_const reads never enter this
 /// entry's specialization. This keeps #1 sound (no false positives).
 static void
 runSpecializationDiagnostic(Module &Extracted,
                             const SmallVectorImpl<Function *> &EntryFuncs) {
-  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportMayConst &&
-      !EJitWarnFewMayConst)
+  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportPeriodConst &&
+      !EJitWarnFewPeriodConst)
     return;
 
   SmallVector<EjitEntryDiag, 4> Entries;
@@ -662,7 +662,7 @@ runSpecializationDiagnostic(Module &Extracted,
         if (!Sub || Sub->getNumOperands() < 2)
           continue;
         auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-        if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+        if (!Tag || Tag->getString() != TAG_EJIT_DIM)
           continue;
         if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
           ED.DeclaredDims.push_back(PN->getString().str());
@@ -670,30 +670,30 @@ runSpecializationDiagnostic(Module &Extracted,
     Entries.push_back(std::move(ED));
   }
 
-  unsigned MayConstKind = Extracted.getContext().getMDKindID(MD_EJIT_MAY_CONST);
+  unsigned PeriodConstKind = Extracted.getContext().getMDKindID(MD_EJIT_PERIOD_CONST);
 
   // Direct info per defined function in the extracted module. Loop membership
-  // (for the may_const count report) uses a lightweight CFG-cycle test so the
+  // (for the period_const count report) uses a lightweight CFG-cycle test so the
   // report does not pull LoopInfo / PassBuilder into LLVMEmbeddedJIT.
   DenseMap<const Function *, EjitFuncDiagInfo> Info;
   for (Function &F : Extracted) {
     if (F.isDeclaration())
       continue;
     SmallPtrSet<const BasicBlock *, 16> LoopBBs;
-    bool NeedLoops = EJitReportMayConst || EJitWarnFewMayConst > 0;
+    bool NeedLoops = EJitReportPeriodConst || EJitWarnFewPeriodConst > 0;
     if (NeedLoops)
       computeLoopBBs(F, LoopBBs);
-    computeEjitFuncDiagInfo(F, Info[&F], MayConstKind,
+    computeEjitFuncDiagInfo(F, Info[&F], PeriodConstKind,
                             NeedLoops ? &LoopBBs : nullptr);
   }
 
-  // Fixpoint: propagate HasMayConstLoad and RefsPeriodArr up the call graph.
+  // Fixpoint: propagate HasPeriodConstLoad and RefsPeriodArr up the call graph.
   // The extracted module holds only the closure, so every function is reachable
   // from some entry; the monotonic fixpoint converges quickly.
   DenseMap<const Function *, bool> ClosureMC;
   DenseMap<const Function *, SetVector<StringRef>> ClosureRefs;
   for (auto &KV : Info) {
-    ClosureMC[KV.first] = KV.second.HasMayConstLoad;
+    ClosureMC[KV.first] = KV.second.HasPeriodConstLoad;
     ClosureRefs[KV.first] = KV.second.RefsPeriodArr;
   }
   bool Changed = true;
@@ -725,10 +725,10 @@ runSpecializationDiagnostic(Module &Extracted,
     if (MCIt == ClosureMC.end() || RefIt == ClosureRefs.end())
       continue;
 
-    // #1: no ejit_may_const read in the specialization closure.
+    // #1: no ejit_period_const read in the specialization closure.
     if (EJitWarnNoSpecialization && !MCIt->second)
       errs() << "EJit warning: ejit_entry function '" << EF->getName()
-             << "' reads no ejit_may_const field in its specialization "
+             << "' reads no ejit_period_const field in its specialization "
                 "closure; no JIT specialization value, consider removing "
                 "ejit_entry\n";
 
@@ -737,17 +737,17 @@ runSpecializationDiagnostic(Module &Extracted,
       for (const std::string &P : ED.DeclaredDims)
         if (RefIt->second.count(P) == 0)
           errs() << "EJit warning: ejit_entry function '" << EF->getName()
-                 << "' declares ejit_period_arr_ind('" << P
+                 << "' declares ejit_dim('" << P
                  << "') but its specialization closure never indexes an "
-                    "ejit_period_arr('"
+                    "ejit_group('"
                  << P << "'); unused specialization dimension, consider "
                         "removing it\n";
   }
 
-  // Per-entry may_const read counts over the specialization closure (BFS).
-  // Used by the info report and the few-may-const warning; both share the
+  // Per-entry period_const read counts over the specialization closure (BFS).
+  // Used by the info report and the few-period-const warning; both share the
   // same closure walk so they share one gated loop.
-  if (EJitReportMayConst || EJitWarnFewMayConst > 0) {
+  if (EJitReportPeriodConst || EJitWarnFewPeriodConst > 0) {
     for (const EjitEntryDiag &ED : Entries) {
       const Function *EF = Extracted.getFunction(ED.Name);
       if (!EF || EF->isDeclaration())
@@ -763,32 +763,32 @@ runSpecializationDiagnostic(Module &Extracted,
         auto It = Info.find(F);
         if (It == Info.end())
           continue;
-        K += It->second.MayConstCount;
-        J += It->second.MayConstInLoopCount;
+        K += It->second.PeriodConstCount;
+        J += It->second.PeriodConstInLoopCount;
         for (const Function *Callee : It->second.Callees)
           WL.push_back(Callee);
       }
 
-      // Info report (not a warning): summary of all may-const reads.
-      if (EJitReportMayConst)
+      // Info report (not a warning): summary of all period-const reads.
+      if (EJitReportPeriodConst)
         errs() << "EJit info: ejit_entry function '" << EF->getName() << "': "
-               << K << " ejit_may_const read" << (K == 1 ? "" : "s") << " ("
+               << K << " ejit_period_const read" << (K == 1 ? "" : "s") << " ("
                << J << " in loops)\n";
 
-      // Warning #3: too few may-const reads for meaningful specialization.
+      // Warning #3: too few period-const reads for meaningful specialization.
       // A low count means the JIT has little to fold, but doesn't mean the
       // entry is misconfigured — the significance depends on what those loads
       // gate.  This only flags the count for manual review.
       // A load inside a loop is high specialization value regardless of
       // count — a single loop load executes thousands of times.  Only
       // warn when there are no loop loads AND the total is below threshold.
-      if (EJitWarnFewMayConst > 0 && K < EJitWarnFewMayConst && J == 0)
+      if (EJitWarnFewPeriodConst > 0 && K < EJitWarnFewPeriodConst && J == 0)
         errs() << "EJit warning: ejit_entry function '" << EF->getName()
-               << "' has only " << K << " ejit_may_const read"
+               << "' has only " << K << " ejit_period_const read"
                << (K == 1 ? "" : "s") << " in its specialization closure"
-               << " (threshold: " << EJitWarnFewMayConst
+               << " (threshold: " << EJitWarnFewPeriodConst
                << "); low specialization surface, consider adding more"
-                  " may-const fields\n";
+                  " period-const fields\n";
     }
   }
 }

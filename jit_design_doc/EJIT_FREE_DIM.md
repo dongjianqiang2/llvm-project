@@ -8,7 +8,7 @@
 
 ## 1. Problem
 
-A parameter EJIT cannot fold blocks every `may_const` field reached through it,
+A parameter EJIT cannot fold blocks every `period_const` field reached through it,
 including the ones that never depended on it.
 
 ```c
@@ -17,7 +17,7 @@ void init_unit_params(uint32_t ejit_dim("unit") unitIdx,
                       uint32_t                 slotNo)
 {
     UnitParams *p = &g_unitParams[unitIdx * 5 + slotNo % 5];
-    // ~30 may_const fields. None can be specialized today.
+    // ~30 period_const fields. None can be specialized today.
 }
 ```
 
@@ -46,7 +46,7 @@ unlike a specialization dimension, a free dim never reaches the runtime ABI, so
 there is no narrowing through which two values could alias. The only value ever
 substituted is the witness.
 
-**Asserts**, for every `ejit_may_const` field whose address depends on this parameter:
+**Asserts**, for every `ejit_period_const` field whose address depends on this parameter:
 
 1. **Value invariance** — the field holds the same value for every value the parameter
    takes. The data is *free of* this dimension; hence the name.
@@ -80,7 +80,7 @@ Substituting `slotNo → 0` in the IR would send all twenty TTIs' stores into el
 `unit*5 + 0`, and elements 1–4 would never be updated again. Silent memory corruption, not
 a missed optimization.
 
-So the witness authorises **replacing a `may_const` load's result** and nothing else. The
+So the witness authorises **replacing a `period_const` load's result** and nothing else. The
 GEP, the stores, and every other use keep the live parameter. A second reason to hold this
 line: if the GEP were rewritten and PASS6 then failed to fold the load — unregistered
 global, unsupported type — the result would be a runtime load from the wrong element.
@@ -116,7 +116,7 @@ size. The application supplies it before `ejit_init` in one of two ways.
 **Explicit bounds** name each global:
 
 ```c
-ejit_period_arr(cell) CellConfig *configs;
+ejit_group(cell) CellConfig *configs;
 
 configs = calloc(cellCount, sizeof(*configs));
 ejit_register_pointer_period_bounds("configs", configs,
@@ -206,9 +206,9 @@ clone is retired exactly as today.
 |---|---|
 | `Attr.td` | `EjitFreeDim : InheritableParamAttr`, spelling `ejit_free_dim`, no args |
 | Sema | `handleEjitFreeDimAttr` checks the parameter is an integer. `checkEjitFreeDim`, after `MergeFunctionDecl`, checks the function is `ejit_entry` and that no parameter carries both this and `ejit_dim` — post-merge so it is order-independent and sees an `ejit_entry` written on an earlier declaration. It also warns when the entry has no lifecycle dim, since nothing could then invalidate the frozen values. No `ejit_bound_ptr` conflict check: that requires a pointer and this requires an integer, so no parameter can carry both |
-| CodeGen | emit `!{!"ejit_free_dim", !"", i32 argIndex}` in its own parameter-ordered loop, as `ejit_bound_ptr` already does. Ordering is free here precisely because the tag is not a wire dim — nothing packs these positionally. The index is an **LLVM IR argument** number, obtained from `getEjitIRArgIndex` (CGCall.cpp), not a source parameter number. Getting there takes two steps. First, the parameter's position within `CGFunctionInfo`'s argument list: two things move it, in opposite directions, so neither can be recovered from the total — a *prefix* of implicit arguments the source list lacks (`this`), and arguments *interleaved after* a parameter, since `appendParameterTypes` pushes a size argument immediately after each `pass_object_size` parameter and shifts every later one. The helper counts the interleaved arguments, recovers the prefix from the remainder, and walks to the parameter. Second, that position becomes an IR argument number through `ClangToLLVMArgMapping`, which separately accounts for an sret pointer, padding arguments, inalloca and aggregate expansion — sret never appears in `arg_size()`, so it shifts the IR index without affecting the walk. Between them: on x86-64 `f(int, struct{long,long}, int slot)` puts `slot` at IR argument 3 for source index 2, while `f(int dim, int slot, int live, const char *p __attribute__((pass_object_size(0))))` leaves both annotations where they are. A type cross-check on the chosen slot backstops an unmodelled insertion that lands a differently-typed argument there, but is blind to a shift among same-typed parameters, so the walk is what has to be right. A parameter that does not lower to exactly one directly-passed IR argument — a `_BitInt(256)` passed `byval`, say — is dropped with `-Wembedded-jit` rather than annotated at a guessed index: a missing dim costs an optimization, a wrong one specializes on an argument nobody marked. That is a CodeGen diagnostic rather than a Sema one because whether it happens depends on the target. `ejit_period_arr_ind` and `ejit_bound_ptr` record indices the same way and are mapped through the same helper |
+| CodeGen | emit `!{!"ejit_free_dim", !"", i32 argIndex}` in its own parameter-ordered loop, as `ejit_bound_ptr` already does. Ordering is free here precisely because the tag is not a wire dim — nothing packs these positionally. The index is an **LLVM IR argument** number, obtained from `getEjitIRArgIndex` (CGCall.cpp), not a source parameter number. Getting there takes two steps. First, the parameter's position within `CGFunctionInfo`'s argument list: two things move it, in opposite directions, so neither can be recovered from the total — a *prefix* of implicit arguments the source list lacks (`this`), and arguments *interleaved after* a parameter, since `appendParameterTypes` pushes a size argument immediately after each `pass_object_size` parameter and shifts every later one. The helper counts the interleaved arguments, recovers the prefix from the remainder, and walks to the parameter. Second, that position becomes an IR argument number through `ClangToLLVMArgMapping`, which separately accounts for an sret pointer, padding arguments, inalloca and aggregate expansion — sret never appears in `arg_size()`, so it shifts the IR index without affecting the walk. Between them: on x86-64 `f(int, struct{long,long}, int slot)` puts `slot` at IR argument 3 for source index 2, while `f(int dim, int slot, int live, const char *p __attribute__((pass_object_size(0))))` leaves both annotations where they are. A type cross-check on the chosen slot backstops an unmodelled insertion that lands a differently-typed argument there, but is blind to a shift among same-typed parameters, so the walk is what has to be right. A parameter that does not lower to exactly one directly-passed IR argument — a `_BitInt(256)` passed `byval`, say — is dropped with `-Wembedded-jit` rather than annotated at a guessed index: a missing dim costs an optimization, a wrong one specializes on an argument nobody marked. That is a CodeGen diagnostic rather than a Sema one because whether it happens depends on the target. `ejit_dim` and `ejit_bound_ptr` record indices the same way and are mapped through the same helper |
 | AOT passes | **none.** Every dim-enumerating loop filters by tag, so an unknown tag is skipped by construction; PASS1 clones the whole `!ejit.metadata` node into the blob |
-| `EJitOptimizer` | **none functionally** — `preReplacePeriodIndices` already matches `TAG_EJIT_PERIOD_ARR_IND` only, so the tag is skipped by construction. A comment records that this must stay true: adding the tag there would redirect the stores |
+| `EJitOptimizer` | **none functionally** — `preReplacePeriodIndices` already matches `TAG_EJIT_DIM` only, so the tag is skipped by construction. A comment records that this must stay true: adding the tag there would redirect the stores |
 | `EJitStructFieldPass` | `initFreeDimAssumptions` builds an `AssumedArgMap` from the metadata; `computeGEPOffset` / `accumulateFullOffset` / `accumulateArgumentOffset` take it and fall back to a bounded evaluator when an index is non-constant. Bound-pointer *propagation* deliberately passes an empty map — it proves an argument relationship that has to hold for every call, not the value at one address |
 | Runtime | **none** |
 
@@ -282,7 +282,7 @@ are **stable in time**.
 
 - Fields written from live load metrics stay unsafe to freeze, and are unaffected by this
   attribute in either direction.
-- `may_const` freezes a whole field. A bitmap mixing a slot-invariant bit with a
+- `period_const` freezes a whole field. A bitmap mixing a slot-invariant bit with a
   load-driven bit still cannot be marked at all.
 - Annotate the **raw** parameter, never a pre-reduced one: `slotNo % 5` would merge slots
   that share a buffer element but sit at different points in the TDD pattern.

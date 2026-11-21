@@ -150,7 +150,7 @@ EJitModuleLoader::getOrCacheFuncMeta(uint32_t funcIdx) {
               static_cast<uint32_t>(ArgIndex));
         continue;
       }
-      if (Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      if (Tag->getString() != TAG_EJIT_DIM)
         continue;
       auto *PN = dyn_cast<MDString>(Sub->getOperand(1));
       if (PN && meta.dimCount < 4) {

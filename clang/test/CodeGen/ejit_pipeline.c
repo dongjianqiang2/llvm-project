@@ -28,14 +28,14 @@
 // CHECK-DAG: declare {{.*}} @ejit_deactivate
 // CHECK-DAG: declare {{.*}} @ejit_activate
 
-int cell_data[16] __attribute__((ejit_period_arr("cell")));
+int cell_data[16] __attribute__((ejit_group("cell")));
 
 __attribute__((ejit_entry))
-void process_cell(int __attribute__((ejit_period_arr_ind("cell"))) cell_idx) {
+void process_cell(int __attribute__((ejit_dim("cell"))) cell_idx) {
     cell_data[cell_idx]++;
 }
 
-__attribute__((ejit_period_lc("cell")))
-void lc_handler(int __attribute__((ejit_period_arr_ind("cell"))) cell_idx) {
+__attribute__((ejit_guard("cell")))
+void lc_handler(int __attribute__((ejit_dim("cell"))) cell_idx) {
     cell_data[cell_idx] = 0;
 }

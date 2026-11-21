@@ -8,12 +8,12 @@
 ; global instead of baking a per-module constant, so the slot is cross-module
 ; stable.
 ; CHECK: @__ejit_dimtype_cell = internal global i32 -1
-; CHECK: @{{.*}} = private constant {{.*}}{ i32 5, ptr {{.*}}, ptr null, ptr @__ejit_dimtype_cell, i64 0 }{{.*}}, section ".ejit_period"
+; CHECK: @{{.*}} = private constant {{.*}}{ i32 5, ptr {{.*}}, ptr null, ptr @__ejit_dimtype_cell, i64 0 }{{.*}}, section ".ejit_group"
 
 ; PASS3 output: per-function dense funcIndex global (filled at registration) and
 ; the funcIndex static-registry section entry (EJIT_REG_FUNCINDEX == 6).
 ; CHECK: @__ejit_funcidx_process_cell = internal global i32 -1
-; CHECK: @{{.*}} = private constant {{.*}}{ i32 6, ptr {{.*}}, ptr null, ptr @__ejit_funcidx_process_cell, i64 0 }{{.*}}, section ".ejit_period"
+; CHECK: @{{.*}} = private constant {{.*}}{ i32 6, ptr {{.*}}, ptr null, ptr @__ejit_funcidx_process_cell, i64 0 }{{.*}}, section ".ejit_group"
 
 ; PASS3 output: wrapper generation in process_cell. jit_entry LOADS the funcIndex
 ; and falls back WITHOUT entering the taskpool while it is still invalid (-1).
@@ -73,7 +73,7 @@ entry:
   ret void
 }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
-!11 = distinct !{!{!"ejit_period", !"static"}}
-!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!30 = distinct !{!{!"ejit_period_lc", !"cell"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}
+!11 = distinct !{!{!"ejit_group", !"static"}}
+!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
+!30 = distinct !{!{!"ejit_guard", !"cell"}, !{!"ejit_dim", !"cell", i32 0}}

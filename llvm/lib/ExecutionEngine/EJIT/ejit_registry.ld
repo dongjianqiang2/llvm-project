@@ -15,7 +15,7 @@
  * PASS1 (EJitRegisterBitcode) and PASS2 (EJitRegisterPeriod) emit each
  * translation unit's registry entries into INPUT sections named:
  *     .ejit_bitcode   (array of ejit_reg_entry_t: embedded bitcode + symbols)
- *     .ejit_period    (array of ejit_reg_entry_t: period arrays + static vars)
+ *     .ejit_group    (array of ejit_reg_entry_t: period arrays + static vars)
  * Each entry is `struct { i32 type; ptr; ptr; ptr; u64; }` -> 8-byte aligned,
  * 40 bytes on a 64-bit target. Every entry array is private (local) so there
  * is no cross-TU symbol collision; the entries from all TUs must simply end up
@@ -23,7 +23,7 @@
  *
  * The runtime (EJit.cpp) walks the half-open range
  *     [__start_ejit_bitcode, __stop_ejit_bitcode)
- *     [__start_ejit_period,  __stop_ejit_period)
+ *     [__start_ejit_group,  __stop_ejit_group)
  * These four symbols are declared `weak` in the runtime, so if they are left
  * undefined (no ejit_entry functions, or no script) they resolve to 0 and the
  * range is empty. The section names carry a leading dot (.ejit_bitcode), which
@@ -33,7 +33,7 @@
  *
  * What this script does
  * ---------------------
- * It folds the .ejit_bitcode / .ejit_period input sections into a STANDARD
+ * It folds the .ejit_bitcode / .ejit_group input sections into a STANDARD
  * output section (here .rodata, since the tables are const) and brackets them
  * with the four bound symbols. KEEP() prevents --gc-sections from dropping the
  * tables (they are only referenced by linker-defined symbols, never by a
@@ -77,9 +77,9 @@ SECTIONS
 
     /* --- EmbeddedJIT period registry --- */
     . = ALIGN(8);
-    __start_ejit_period = .;
-    KEEP(*(.ejit_period))
-    __stop_ejit_period = .;
+    __start_ejit_group = .;
+    KEEP(*(.ejit_group))
+    __stop_ejit_group = .;
     . = ALIGN(8);
   } > FLASH      /* or your rodata memory region; use > RAM AT> FLASH for .data */
 
@@ -146,9 +146,9 @@ SECTIONS
  *       __stop_ejit_bitcode = .;
  *
  *       . = ALIGN(8);
- *       __start_ejit_period = .;
- *       KEEP(*(.ejit_period))
- *       __stop_ejit_period = .;
+ *       __start_ejit_group = .;
+ *       KEEP(*(.ejit_group))
+ *       __stop_ejit_group = .;
  *       . = ALIGN(8);
  *     }
  *   } INSERT AFTER .rodata;

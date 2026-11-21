@@ -88,6 +88,6 @@ entry:
 
 @data = global [16 x i32] zeroinitializer, !ejit.metadata !10
 
-!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
+!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
+!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}

@@ -14,7 +14,7 @@
 
 struct Slot {
   uint8_t prefix[31];
-  ejit_may_const _Bool flag;
+  EJIT_PERIOD_CONST _Bool flag;
   uint8_t payload[96];
 };
 struct Cell {
@@ -22,11 +22,11 @@ struct Cell {
 };
 _Static_assert(sizeof(struct Slot) == 128, "expected slot stride");
 
-extern ejit_period_arr(cell) struct Cell *g_1;
+extern ejit_group(cell) struct Cell *g_1;
 extern uint8_t g_gate;
 extern void repro_sink(unsigned flag, uint16_t slot, const struct Slot *selected);
 
-#define ARGS ejit_period_arr_ind(cell) uint8_t cell, uint8_t other, \
+#define ARGS EJIT_DIM(cell) uint8_t cell, uint8_t other, \
              uint16_t frame, ejit_free_dim uint16_t slot, uint32_t mode, void *ctx
 
 ejit_entry void repro_direct(ARGS) {

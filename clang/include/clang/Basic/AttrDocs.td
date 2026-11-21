@@ -9432,15 +9432,16 @@ silence diagnostics with code like:
 // EmbeddedJIT attribute documentation
 //===----------------------------------------------------------------------===//
 
-def EjitMayConstDocs : Documentation {
+def EjitPeriodConstDocs : Documentation {
   let Category = DocCatField;
   let Content = [{
-EmbeddedJIT: marks a struct member as potentially constant within a time window.
+EmbeddedJIT: marks a struct member as constant within a time window.
 
-When a global variable belongs to a time window and the window is active, members
-marked with ``ejit_may_const`` can be treated as compile-time constants. The JIT
-compiler will substitute them with runtime values and perform constant propagation,
-dead code elimination, and branch folding optimizations.
+When a global variable belongs to a period group and the group is active,
+members marked with ``ejit_period_const`` can be treated as compile-time
+constants. The JIT compiler will substitute them with runtime values and
+perform constant propagation, dead code elimination, and branch folding
+optimizations.
 
 Supported field types: integers, booleans, floating-point, nested structs.
 ``volatile`` fields are not treated as constants.
@@ -9448,58 +9449,50 @@ Supported field types: integers, booleans, floating-point, nested structs.
 .. code-block:: c
 
   struct Sample {
-      __attribute__((ejit_may_const)) uint32_t a;
+      __attribute__((ejit_period_const)) uint32_t a;
       uint32_t xx;
   };
   }];
 }
 
-def EjitPeriodDocs : Documentation {
+def EjitGroupDocs : Documentation {
   let Category = DocCatVariable;
   let Content = [{
-EmbeddedJIT: defines the time window to which a global variable belongs.
+EmbeddedJIT: defines the period group to which a global variable belongs
+One attribute covers the scalar and indexed (array) forms; the form is
+inferred from the variable type.
 
-The built-in time window ``"static"`` indicates a global variable that does not
+The built-in group ``"static"`` indicates a global variable that does not
 change during JIT runtime, and is always in effect without needing to call
 ``ejit_activate``.
 
-Custom time window names (other than ``"static"``) are reserved for future
-extension, indicating variables that may change at runtime but are guaranteed
-to remain constant during specific business-logic time windows.
+A named group manages multiple instances of the same business concept with
+independent state, where each instance can independently control its time
+window state. Multiple different arrays can use the same name. An
+``ejit_dim`` parameter of an ``ejit_entry`` function selects the instance.
 
-Only used for non-array global variables.
-
-.. code-block:: c
-
-  __attribute__((ejit_period("static"))) struct BoardConfig g_boardCfg;
-  }];
-}
-
-def EjitPeriodArrDocs : Documentation {
-  let Category = DocCatVariable;
-  let Content = [{
-EmbeddedJIT: defines the time window array to which a global array belongs.
-
-A time window array manages multiple instances of the same business concept
-with independent state, where each instance can independently control its
-time window state. Multiple different arrays can use the same name.
-
-Constraint: the array must have a fixed size less than 100.
+With ``ejit_group`` the form follows the variable type: a scalar global is a
+single-instance group; an array (fixed size at most 100) or a
+pointer-to-struct global is an indexed group. The former ``ejit_period`` /
+``ejit_period_arr`` spellings were merged into ``ejit_group`` and removed;
+writing them now produces an unknown-attribute warning.
 
 .. code-block:: c
 
-  __attribute__((ejit_period_arr("cell"))) struct CellConfig g_cellCfg[16];
+  __attribute__((ejit_group("static"))) struct BoardConfig g_boardCfg;
+  __attribute__((ejit_group("cell"))) struct CellConfig g_cellCfg[16];
   }];
 }
 
-def EjitPeriodArrIndDocs : Documentation {
+def EjitDimDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{
-EmbeddedJIT: marks a function parameter as a specialization dimension parameter.
+EmbeddedJIT: marks a function parameter as a specialization dimension
+parameter.
 
 Parameters marked with this attribute are recognized as indices into the
-specified time window array. During JIT compilation, the actual value of this
-parameter determines which time window instance to specialize for.
+specified period group. During JIT compilation, the actual value of this
+parameter determines which group instance to specialize for.
 
 The parameter type must be an integer type. At most 4 parameters per function
 may be marked with this attribute.
@@ -9507,7 +9500,7 @@ may be marked with this attribute.
 .. code-block:: c
 
   __attribute__((ejit_entry))
-  void process_task(__attribute__((ejit_period_arr_ind("cell"))) uint8_t cellIdx);
+  void process_task(__attribute__((ejit_dim("cell"))) uint8_t cellIdx);
   }];
 }
 
@@ -9527,11 +9520,11 @@ valid and designate the same semantic field. Unsupported address chains retain
 their real loads. No source ABI, SDK symbol or cache dimension is added.
 
 
-EmbeddedJIT: marks a parameter that the ``ejit_may_const`` data behind it does
-not depend on.
+EmbeddedJIT: marks a parameter that the ``ejit_period_const`` data behind it
+does not depend on.
 
-A parameter the JIT cannot fold blocks every ``ejit_may_const`` field reached
-through it, including the fields that never varied with it. In
+A parameter the JIT cannot fold blocks every ``ejit_period_const`` field
+reached through it, including the fields that never varied with it. In
 ``g_unitParams[unitIdx * 5 + slotNo % 5]`` the JIT knows ``unitIdx`` but not
 ``slotNo``, so the sum is not constant, no address can be computed, and no field
 of that element can be specialized -- not even the ones copied unchanged from a
@@ -9539,7 +9532,7 @@ slot-independent base. Such a parameter does not make the data unstable; it
 makes the data unaddressable.
 
 Marking the parameter ``ejit_free_dim`` asserts **both** of the following, for
-every ``ejit_may_const`` field whose address depends on it:
+every ``ejit_period_const`` field whose address depends on it:
 
 * the field holds the same value for every value the parameter takes; and
 * the address the field has when the parameter is ``0`` is a valid address of
@@ -9567,21 +9560,21 @@ lifecycle retires the old specialization and compiles a fresh value.
 
 The parameter is not a specialization dimension. It is not part of the cache
 key, it adds no inline-cache axis, it consumes no dimension slot, and it does
-not count against the limit on ``ejit_period_arr_ind`` parameters: a function
+not count against the limit on ``ejit_dim`` parameters: a function
 using it has one specialization, not one per value. Its frozen values are
 invalidated through the function's other dimensions, so an ``ejit_entry`` with
-no ``ejit_period_arr_ind`` parameter has no way to refresh them and is
+no ``ejit_dim`` parameter has no way to refresh them and is
 diagnosed.
 
 The parameter must have integer type, must belong to an ``ejit_entry``
-function, and cannot also be ``ejit_period_arr_ind`` or ``ejit_bound_ptr``.
+function, and cannot also be ``ejit_dim`` or ``ejit_bound_ptr``.
 Annotate the raw parameter rather than a pre-reduced one: marking ``slotNo % 5``
 would merge slots that share a buffer element but hold different values.
 
 .. code-block:: c
 
   __attribute__((ejit_entry))
-  void init_unit(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+  void init_unit(__attribute__((ejit_dim("unit"))) unsigned unitIdx,
                  __attribute__((ejit_free_dim)) unsigned slotNo);
   }];
 }
@@ -9594,9 +9587,9 @@ EmbeddedJIT: binds a pointer parameter's pointee to a specialization dimension.
 On a JIT cache miss, the worker reads the pointee through a borrowed raw pointer
 while compiling. The caller must keep the object alive, mapped at the same
 virtual address, and unchanged until compilation finishes. Loads of
-``ejit_may_const`` fields through the parameter may then be specialized from
+``ejit_period_const`` fields through the parameter may then be specialized from
 that object. The function must also have exactly one
-``ejit_period_arr_ind`` parameter with the same period name.
+``ejit_dim`` parameter with the same period name.
 
 Only a pointer to a complete object type is accepted. The first implementation
 supports up to eight bound pointers per function. Pointers contained inside an
@@ -9607,7 +9600,7 @@ dimension, modifying the object, and reactivating the dimension.
 .. code-block:: c
 
   __attribute__((ejit_entry))
-  void process(__attribute__((ejit_period_arr_ind("cell"))) unsigned cellIdx,
+  void process(__attribute__((ejit_dim("cell"))) unsigned cellIdx,
                __attribute__((ejit_bound_ptr("cell"))) const CellConfig *cfg);
   }];
 }
@@ -9635,20 +9628,23 @@ the attribute. A definition without it is compiled as a plain AOT function
   }];
 }
 
-def EjitPeriodLcDocs : Documentation {
+def EjitGuardDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{
-EmbeddedJIT: marks a function as a time window lifecycle management function.
+EmbeddedJIT: marks a function as a period group lifecycle management function:
+the sanctioned entry point for modifying the group's ``ejit_period_const``
+data.
 
-Functions marked with this attribute indicate that they modify data within the
-specified time window. The compiler will insert ``ejit_deactivate`` at function
-entry and ``ejit_activate`` at function exit to ensure data consistency.
+The compiler will insert ``ejit_deactivate`` at function entry and
+``ejit_activate`` at function exit to ensure data consistency, so writes to
+the group's data inside such a function are safe and do not leave stale JIT
+specializations behind.
 
-Must be used together with ``ejit_period_arr_ind``.
+Must be used together with ``ejit_dim``.
 
 .. code-block:: c
 
-  __attribute__((ejit_period_lc("cell")))
-  void update_config(__attribute__((ejit_period_arr_ind("cell"))) uint8_t idx);
+  __attribute__((ejit_guard("cell")))
+  void update_config(__attribute__((ejit_dim("cell"))) uint8_t idx);
   }];
 }

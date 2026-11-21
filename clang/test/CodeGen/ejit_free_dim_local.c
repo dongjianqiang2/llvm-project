@@ -6,11 +6,11 @@
 // RUN: %clang_cc1 -O2 -emit-llvm -mllvm -enable-ejit-bitcode=false -mllvm -enable-ejit-aot=false -o - %s | FileCheck %s --check-prefix=AOT
 
 struct Slot {
-  unsigned mode __attribute__((ejit_may_const));
+  unsigned mode __attribute__((ejit_period_const));
   unsigned payload;
 };
 struct Cell { struct Slot slots[10]; };
-struct Cell config[2] __attribute__((ejit_period_arr("cell")));
+struct Cell config[2] __attribute__((ejit_group("cell")));
 extern volatile unsigned runtime_slot;
 extern struct RuntimeState { unsigned slot; } global_runtime;
 extern unsigned next_slot(void);

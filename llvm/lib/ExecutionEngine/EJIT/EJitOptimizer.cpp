@@ -53,11 +53,11 @@ using namespace llvm::ejit;
 #define DEBUG_TYPE "ejit-optimizer"
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-static std::vector<EJitMayConstLoadSite>
-collectMayConstSites(Module &M, PeriodArrayRegistry &Registry) {
+static std::vector<EJitPeriodConstLoadSite>
+collectPeriodConstSites(Module &M, PeriodArrayRegistry &Registry) {
   EJitStructFieldPass Pass(Registry);
   Pass.initFromModule(M);
-  return Pass.collectMayConstLoadSites(M);
+  return Pass.collectPeriodConstLoadSites(M);
 }
 
 static uint64_t saturatingAuditAdd(uint64_t L, uint64_t R) {
@@ -65,8 +65,8 @@ static uint64_t saturatingAuditAdd(uint64_t L, uint64_t R) {
   return R > Max - L ? Max : L + R;
 }
 
-static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
-                                    const EJitMayConstLoadSite &R) {
+static bool periodConstSitesCorrespond(const EJitPeriodConstLoadSite &L,
+                                    const EJitPeriodConstLoadSite &R) {
   if (L.hasFieldOffset && R.hasFieldOffset && !L.globalName.empty() &&
       L.globalName == R.globalName && L.fieldOffset == R.fieldOffset)
     return true;
@@ -91,7 +91,7 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
   // Pre-build the cached FunctionPassManagers, reused across compilations.
   //
   // By the time these run, runPipeline has turned the period-index argument and
-  // every may_const field into a compile-time constant. The post-specialization
+  // every period_const field into a compile-time constant. The post-specialization
   // cleanup is the real LLVM -O2 function-simplification pipeline (SROA,
   // InstCombine, SCCP, GVN, CorrelatedValuePropagation, BDCE, DSE, loop-rotate,
   // LICM, loop-unroll, ...), which exploits those constants
@@ -100,7 +100,7 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
   //
   // LowerExpectIntrinsic must run FIRST: it is NOT in
   // buildFunctionSimplificationPipeline, and the AOT IR carries llvm.expect
-  // guards (__builtin_expect / LIKELY) on top of may_const conditions. Once
+  // guards (__builtin_expect / LIKELY) on top of period_const conditions. Once
   // StructFieldPass (phase 1c) turns those conditions into constants, lowering
   // expect(x,y) -> x lets the O2 pipeline fold the branch and DCE its dead
   // half.
@@ -183,41 +183,41 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     }
   }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  lastMayConstLoadSites_.clear();
+  lastPeriodConstLoadSites_.clear();
 #endif
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  std::vector<EJitMayConstLoadSite> AuditInputSites;
+  std::vector<EJitPeriodConstLoadSite> AuditInputSites;
   uint64_t AuditSampledEntries = 0;
   if (ctx.tier == CompileTier::Instrumented ||
       ctx.tier == CompileTier::PGOUse) {
     EJitStructFieldPass AuditPass(registry_);
     AuditPass.initFromModule(M);
-    auto Sites = AuditPass.instrumentMayConstLoadSites(M);
+    auto Sites = AuditPass.instrumentPeriodConstLoadSites(M);
     if (ctx.tier == CompileTier::Instrumented)
-      lastMayConstLoadSites_.append(Sites.begin(), Sites.end());
-    else if (!ctx.mayConstLoadSites.empty())
-      AuditInputSites = ctx.mayConstLoadSites;
+      lastPeriodConstLoadSites_.append(Sites.begin(), Sites.end());
+    else if (!ctx.periodConstLoadSites.empty())
+      AuditInputSites = ctx.periodConstLoadSites;
     else
       AuditInputSites = std::move(Sites);
-  } else if (!ctx.mayConstLoadSites.empty()) {
-    AuditInputSites = ctx.mayConstLoadSites;
+  } else if (!ctx.periodConstLoadSites.empty()) {
+    AuditInputSites = ctx.periodConstLoadSites;
   } else {
-    AuditInputSites = collectMayConstSites(M, registry_);
+    AuditInputSites = collectPeriodConstSites(M, registry_);
   }
 #endif
 
   // Phase 1 - specialize (common to all tiers): turn the period index and
-  // every may_const field into a compile-time constant.
+  // every period_const field into a compile-time constant.
   applyBoundPointerFacts(M, ctx);
   preReplacePeriodIndices(M, ctx);
   runInstCombine(M);
   EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
   // Inlining is intentionally not run here: the AOT pre-optimization
   // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) already expanded
-  // callee bodies in the embedded bitcode, so their may_const GEP chains are
+  // callee bodies in the embedded bitcode, so their period_const GEP chains are
   // already traceable to the global.
-  //   (c) Replace the may_const loads with their runtime constant values.
+  //   (c) Replace the period_const loads with their runtime constant values.
   runStructFieldPass(M, ctx);
   EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
   //   (d) Push the constants across call edges. Wherever the AOT inliner kept
@@ -228,7 +228,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   runInterproceduralPropagation(M);
   EJIT_DIAG_DEBUG("pipeline phase1d done: IPSCCP");
   //   (e,f) The propagated arguments expose callee GEP chains exactly as 1a
-  //       did for the entry: fold them, then substitute the callee may_const
+  //       did for the entry: fold them, then substitute the callee period_const
   //       loads they root, so phases 2-4 exploit the constants in every
   //       function, not just the entry.
   runInstCombine(M);
@@ -236,9 +236,9 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  const uint64_t AuditSpecializedMayConstLoads =
+  const uint64_t AuditSpecializedPeriodConstLoads =
       ctx.tier != CompileTier::Instrumented
-          ? collectMayConstSites(M, registry_).size()
+          ? collectPeriodConstSites(M, registry_).size()
           : 0;
 #endif
 
@@ -376,7 +376,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 #endif
     }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-    EJitStructFieldPass::removeMayConstLoadInstrumentation(M);
+    EJitStructFieldPass::removePeriodConstLoadInstrumentation(M);
 #endif
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
     if (ctx.profileAuditOnly) {
@@ -386,8 +386,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       clearAnalyses();
       runOptimizationPipeline(M, ctx, CompileTier::Baseline);
 #if defined(EJIT_DIAG_ENABLE)
-      auto FinalSites = collectMayConstSites(M, registry_);
-      recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
+      auto FinalSites = collectPeriodConstSites(M, registry_);
+      recordPeriodConstBenefit(ctx, AuditInputSites, AuditSpecializedPeriodConstLoads,
                             FinalSites, AuditSampledEntries);
 #endif
       EJIT_DIAG_VERBOSE("pipeline done (audit-only Baseline) func=%s "
@@ -445,8 +445,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 #endif
     runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-    auto FinalSites = collectMayConstSites(M, registry_);
-    recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
+    auto FinalSites = collectPeriodConstSites(M, registry_);
+    recordPeriodConstBenefit(ctx, AuditInputSites, AuditSpecializedPeriodConstLoads,
                           FinalSites, AuditSampledEntries);
 #endif
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
@@ -457,8 +457,8 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   // Baseline (PGO off): the existing full specialization pipeline.
   runOptimizationPipeline(M, ctx, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  auto FinalSites = collectMayConstSites(M, registry_);
-  recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
+  auto FinalSites = collectPeriodConstSites(M, registry_);
+  recordPeriodConstBenefit(ctx, AuditInputSites, AuditSpecializedPeriodConstLoads,
                         FinalSites, AuditSampledEntries);
 #endif
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
@@ -466,22 +466,22 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
 }
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-void EJitOptimizer::recordMayConstBenefit(
-    const SpecializationContext &ctx, ArrayRef<EJitMayConstLoadSite> InputSites,
-    uint64_t SpecializedMayConstLoads,
-    ArrayRef<EJitMayConstLoadSite> FinalSites, uint64_t SampledEntries) {
-  const uint64_t InputMayConstLoads = InputSites.size();
-  const uint64_t FinalMayConstLoads = FinalSites.size();
+void EJitOptimizer::recordPeriodConstBenefit(
+    const SpecializationContext &ctx, ArrayRef<EJitPeriodConstLoadSite> InputSites,
+    uint64_t SpecializedPeriodConstLoads,
+    ArrayRef<EJitPeriodConstLoadSite> FinalSites, uint64_t SampledEntries) {
+  const uint64_t InputPeriodConstLoads = InputSites.size();
+  const uint64_t FinalPeriodConstLoads = FinalSites.size();
   uint64_t RuntimeHits = 0;
   uint64_t HitSites = 0;
   uint64_t RemovedRuntimeHits = 0;
   uint64_t RemovedHitSites = 0;
   DenseSet<uint64_t> SurvivingSiteIDs;
   SmallVector<bool, 16> UnknownFinalMatched(FinalSites.size(), false);
-  for (const EJitMayConstLoadSite &Site : FinalSites)
+  for (const EJitPeriodConstLoadSite &Site : FinalSites)
     if (Site.siteId != 0)
       SurvivingSiteIDs.insert(Site.siteId);
-  for (const EJitMayConstLoadSite &Site : InputSites) {
+  for (const EJitPeriodConstLoadSite &Site : InputSites) {
     RuntimeHits = saturatingAuditAdd(RuntimeHits, Site.runtimeHits);
     HitSites += Site.runtimeHits != 0;
     // A surviving clone keeps the original ID, so count a site as removed only
@@ -492,7 +492,7 @@ void EJitOptimizer::recordMayConstBenefit(
     if (!Survives) {
       for (size_t I = 0; I < FinalSites.size(); ++I) {
         if (FinalSites[I].siteId != 0 || UnknownFinalMatched[I] ||
-            !mayConstSitesCorrespond(Site, FinalSites[I]))
+            !periodConstSitesCorrespond(Site, FinalSites[I]))
           continue;
         UnknownFinalMatched[I] = true;
         Survives = true;
@@ -506,38 +506,38 @@ void EJitOptimizer::recordMayConstBenefit(
     }
   }
 
-  EJitMayConstBenefitSample Sample;
+  EJitPeriodConstBenefitSample Sample;
   Sample.cacheKey = ctx.cacheKey;
-  Sample.inputMayConstLoads = InputMayConstLoads;
-  Sample.specializedMayConstLoads = SpecializedMayConstLoads;
-  Sample.finalMayConstLoads = FinalMayConstLoads;
+  Sample.inputPeriodConstLoads = InputPeriodConstLoads;
+  Sample.specializedPeriodConstLoads = SpecializedPeriodConstLoads;
+  Sample.finalPeriodConstLoads = FinalPeriodConstLoads;
   Sample.runtimeHits = RuntimeHits;
   Sample.hitSites = HitSites;
   Sample.removedRuntimeHits = RemovedRuntimeHits;
   Sample.removedHitSites = RemovedHitSites;
   Sample.sampledEntries = SampledEntries;
-  Sample.sampleCycles = ctx.mayConstSampleCycles;
+  Sample.sampleCycles = ctx.periodConstSampleCycles;
 
   uint32_t Expected = 0;
-  while (!mayConstBenefitLock_.compareExchange(Expected, 1))
+  while (!periodConstBenefitLock_.compareExchange(Expected, 1))
     Expected = 0;
-  auto &ByKey = mayConstBenefitSamples_[ctx.fnName];
+  auto &ByKey = periodConstBenefitSamples_[ctx.fnName];
   ByKey[ctx.cacheKey] = Sample;
-  SmallVector<EJitMayConstBenefitSample, 16> Samples;
+  SmallVector<EJitPeriodConstBenefitSample, 16> Samples;
   Samples.reserve(ByKey.size());
   for (const auto &Entry : ByKey)
     Samples.push_back(Entry.second);
-  mayConstBenefitLock_.storeRelease(0);
+  periodConstBenefitLock_.storeRelease(0);
 
-  EJitMayConstBenefitSummary Aggregate = summarizeMayConstBenefits(Samples);
-  const int64_t Removed = static_cast<int64_t>(InputMayConstLoads) -
-                          static_cast<int64_t>(FinalMayConstLoads);
-  const int64_t Direct = static_cast<int64_t>(InputMayConstLoads) -
-                         static_cast<int64_t>(SpecializedMayConstLoads);
-  const int64_t Pipeline = static_cast<int64_t>(SpecializedMayConstLoads) -
-                           static_cast<int64_t>(FinalMayConstLoads);
-  EJIT_DIAG("mayconst-audit entry=%s key=0x%016llx tier=%u versions=%llu "
-            "mayconst=%llu/%llu/%llu removed=%lld direct=%lld pipeline=%lld "
+  EJitPeriodConstBenefitSummary Aggregate = summarizePeriodConstBenefits(Samples);
+  const int64_t Removed = static_cast<int64_t>(InputPeriodConstLoads) -
+                          static_cast<int64_t>(FinalPeriodConstLoads);
+  const int64_t Direct = static_cast<int64_t>(InputPeriodConstLoads) -
+                         static_cast<int64_t>(SpecializedPeriodConstLoads);
+  const int64_t Pipeline = static_cast<int64_t>(SpecializedPeriodConstLoads) -
+                           static_cast<int64_t>(FinalPeriodConstLoads);
+  EJIT_DIAG("period_const-audit entry=%s key=0x%016llx tier=%u versions=%llu "
+            "period_const=%llu/%llu/%llu removed=%lld direct=%lld pipeline=%lld "
             "runtime_hits=%llu hit_sites=%llu removed_runtime_hits=%llu "
             "removed_hit_sites=%llu sampled_entries=%llu sample_cycles=%llu "
             "avg_removed=%lld "
@@ -545,9 +545,9 @@ void EJitOptimizer::recordMayConstBenefit(
             ctx.fnName.c_str(), static_cast<unsigned long long>(ctx.cacheKey),
             static_cast<unsigned>(ctx.tier),
             static_cast<unsigned long long>(Aggregate.versions),
-            static_cast<unsigned long long>(InputMayConstLoads),
-            static_cast<unsigned long long>(SpecializedMayConstLoads),
-            static_cast<unsigned long long>(FinalMayConstLoads),
+            static_cast<unsigned long long>(InputPeriodConstLoads),
+            static_cast<unsigned long long>(SpecializedPeriodConstLoads),
+            static_cast<unsigned long long>(FinalPeriodConstLoads),
             static_cast<long long>(Removed), static_cast<long long>(Direct),
             static_cast<long long>(Pipeline),
             static_cast<unsigned long long>(RuntimeHits),
@@ -555,16 +555,16 @@ void EJitOptimizer::recordMayConstBenefit(
             static_cast<unsigned long long>(RemovedRuntimeHits),
             static_cast<unsigned long long>(RemovedHitSites),
             static_cast<unsigned long long>(SampledEntries),
-            static_cast<unsigned long long>(ctx.mayConstSampleCycles),
+            static_cast<unsigned long long>(ctx.periodConstSampleCycles),
             static_cast<long long>(Aggregate.averageRemoved),
             static_cast<long long>(Aggregate.weightedRemovedPermille),
             static_cast<long long>(Aggregate.minimumRemoved),
             static_cast<long long>(Aggregate.maximumRemoved));
 
-  for (const EJitMayConstLoadSite &Site : InputSites) {
+  for (const EJitPeriodConstLoadSite &Site : InputSites) {
     if (Site.hasFieldOffset)
       EJIT_DIAG_DEBUG(
-          "mayconst-site entry=%s fn=%s gv=%s offset=%llu hits=%llu "
+          "period_const-site entry=%s fn=%s gv=%s offset=%llu hits=%llu "
           "src=%s:%u:%u",
           ctx.fnName.c_str(), Site.functionName.c_str(),
           Site.globalName.empty() ? "<unknown>" : Site.globalName.c_str(),
@@ -574,7 +574,7 @@ void EJitOptimizer::recordMayConstBenefit(
           Site.sourceLine, Site.sourceColumn);
     else
       EJIT_DIAG_DEBUG(
-          "mayconst-site entry=%s fn=%s gv=%s offset=unknown hits=%llu "
+          "period_const-site entry=%s fn=%s gv=%s offset=unknown hits=%llu "
           "src=%s:%u:%u",
           ctx.fnName.c_str(), Site.functionName.c_str(),
           Site.globalName.empty() ? "<unknown>" : Site.globalName.c_str(),
@@ -585,29 +585,29 @@ void EJitOptimizer::recordMayConstBenefit(
 }
 #endif
 
-bool EJitOptimizer::printMayConstRanking() const {
+bool EJitOptimizer::printPeriodConstRanking() const {
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   struct RankingRow {
     std::string entry;
-    EJitMayConstBenefitSummary summary;
+    EJitPeriodConstBenefitSummary summary;
   };
   SmallVector<RankingRow, 32> Rows;
 
   uint32_t Expected = 0;
-  while (!mayConstBenefitLock_.compareExchange(Expected, 1))
+  while (!periodConstBenefitLock_.compareExchange(Expected, 1))
     Expected = 0;
-  Rows.reserve(mayConstBenefitSamples_.size());
-  for (const auto &Entry : mayConstBenefitSamples_) {
-    SmallVector<EJitMayConstBenefitSample, 16> Samples;
+  Rows.reserve(periodConstBenefitSamples_.size());
+  for (const auto &Entry : periodConstBenefitSamples_) {
+    SmallVector<EJitPeriodConstBenefitSample, 16> Samples;
     Samples.reserve(Entry.second.size());
     for (const auto &Version : Entry.second)
       Samples.push_back(Version.second);
-    Rows.push_back({Entry.first().str(), summarizeMayConstBenefits(Samples)});
+    Rows.push_back({Entry.first().str(), summarizePeriodConstBenefits(Samples)});
   }
-  mayConstBenefitLock_.storeRelease(0);
+  periodConstBenefitLock_.storeRelease(0);
 
   if (Rows.empty()) {
-    EJIT_DIAG_RAW("mayconst-ranking: no completed samples");
+    EJIT_DIAG_RAW("period_const-ranking: no completed samples");
     return false;
   }
   llvm::sort(Rows, [](const RankingRow &L, const RankingRow &R) {
@@ -630,7 +630,7 @@ bool EJitOptimizer::printMayConstRanking() const {
     return L.entry < R.entry;
   });
 
-  EJIT_DIAG_RAW("mayconst-ranking entries=%u sort=benefit_per_mcycle_desc",
+  EJIT_DIAG_RAW("period_const-ranking entries=%u sort=benefit_per_mcycle_desc",
                 static_cast<unsigned>(Rows.size()));
   for (size_t I = 0; I < Rows.size(); ++I) {
     const RankingRow &Row = Rows[I];
@@ -666,7 +666,7 @@ bool EJitOptimizer::printMayConstRanking() const {
   }
   return true;
 #else
-  EJIT_DIAG_RAW("mayconst-ranking: branch audit not enabled in this build");
+  EJIT_DIAG_RAW("period_const-ranking: branch audit not enabled in this build");
   return false;
 #endif
 }
@@ -835,13 +835,13 @@ void EJitOptimizer::preReplacePeriodIndices(Module &M,
         continue;
 
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      // Only TAG_EJIT_PERIOD_ARR_IND. TAG_EJIT_FREE_DIM has the same node shape
+      // Only TAG_EJIT_DIM. TAG_EJIT_FREE_DIM has the same node shape
       // and must NEVER be added here: a free dim's parameter is not part of the
       // specialization identity, so one clone serves every value of it, and
       // replacing the argument with the witness would redirect the STORES that
       // share its address to a single element. PASS6 consumes the tag instead,
       // where the assumed value reaches a load's offset and nothing else.
-      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+      if (!Tag || Tag->getString() != TAG_EJIT_DIM)
         continue;
 
       auto *PN = dyn_cast<MDString>(Sub->getOperand(1));

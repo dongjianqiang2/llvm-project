@@ -2116,12 +2116,12 @@ void ejit_print_code_pool_stats(void) {
   gEJIT->printCodePoolStats();
 }
 
-void ejit_print_mayconst_ranking(void) {
+void ejit_print_period_const_ranking(void) {
   if (!gEJIT) {
-    EJIT_DIAG_RAW("mayconst-ranking: not initialized");
+    EJIT_DIAG_RAW("period_const-ranking: not initialized");
     return;
   }
-  (void)gEJIT->printMayConstRanking();
+  (void)gEJIT->printPeriodConstRanking();
 }
 
 void ejit_print_active(void) {

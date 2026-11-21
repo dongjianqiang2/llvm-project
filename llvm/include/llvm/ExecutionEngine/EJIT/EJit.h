@@ -151,7 +151,7 @@ public:
   void printRegistry() const;
 
   /// Print the !ejit.metadata parsed from \p funcName's registered bitcode
-  /// (ejit_entry marker, period_arr_ind slots, period arrays, may_const field
+  /// (ejit_entry marker, period_arr_ind slots, period arrays, period_const field
   /// offsets). For ejit_print_func_meta(). Non-const: caches func metadata.
   void printFuncMeta(const std::string &funcName);
 
@@ -169,9 +169,9 @@ public:
   /// Print every active (period, cell) through EJIT_DIAG. For ejit_print_active().
   void printActive() const;
 
-  /// Print completed per-entry may_const benefit samples in descending order.
+  /// Print completed per-entry period_const benefit samples in descending order.
   /// A non-owner facade forwards the request to the compile-owner worker.
-  bool printMayConstRanking();
+  bool printPeriodConstRanking();
 
 private:
   Config config_;

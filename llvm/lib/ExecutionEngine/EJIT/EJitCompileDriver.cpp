@@ -151,10 +151,10 @@ void taskpoolPublishThunk(void *ctx, const EJitCompileRequest &req,
 #endif
 }
 
-bool sharedMayConstRankingThunk(void *ctx) {
+bool sharedPeriodConstRankingThunk(void *ctx) {
   auto *drv = static_cast<EJitCompileDriver *>(ctx);
   EJitOrcEngine *engine = drv->getJitEngine();
-  return engine && engine->printMayConstRanking();
+  return engine && engine->printPeriodConstRanking();
 }
 
 // Per-core platform primitives wrapped so the shared taskpool core never names
@@ -240,7 +240,7 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.bind(&gEJitSharedTaskPoolState);
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
-  sharedPool_.setMayConstRankingCallback(&sharedMayConstRankingThunk, this);
+  sharedPool_.setPeriodConstRankingCallback(&sharedPeriodConstRankingThunk, this);
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
   // Inject the platform yield so the worker never busy-spins while waiting for
@@ -556,20 +556,20 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       ctx.tier = CompileTier::PGOUse;
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
       ctx.profileAuditOnly = !config_.enablePgo;
-      auto mayConstIt = tier1MayConst_.find(cacheKey);
-      if (mayConstIt != tier1MayConst_.end()) {
-        ctx.mayConstLoadSites = mayConstIt->second.sites;
+      auto periodConstIt = tier1PeriodConst_.find(cacheKey);
+      if (periodConstIt != tier1PeriodConst_.end()) {
+        ctx.periodConstLoadSites = periodConstIt->second.sites;
         const uint64_t SampleEnd = ejit_taskpool_trace_now();
-        if (mayConstIt->second.sampleStart != 0)
-          ctx.mayConstSampleCycles =
-              SampleEnd - mayConstIt->second.sampleStart;
+        if (periodConstIt->second.sampleStart != 0)
+          ctx.periodConstSampleCycles =
+              SampleEnd - periodConstIt->second.sampleStart;
         const auto *Counters = reinterpret_cast<const EJitAtomicU64 *>(
-            mayConstIt->second.counterBase);
+            periodConstIt->second.counterBase);
         if (Counters) {
-          for (size_t I = 0; I < ctx.mayConstLoadSites.size(); ++I)
-            mayConstIt->second.sites[I].runtimeHits = Counters[I].loadAcquire();
-          mayConstIt->second.counterBase = 0;
-          ctx.mayConstLoadSites = mayConstIt->second.sites;
+          for (size_t I = 0; I < ctx.periodConstLoadSites.size(); ++I)
+            periodConstIt->second.sites[I].runtimeHits = Counters[I].loadAcquire();
+          periodConstIt->second.counterBase = 0;
+          ctx.periodConstLoadSites = periodConstIt->second.sites;
         }
       }
 #endif
@@ -739,21 +739,21 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
               cacheKey, counters.size());
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-    Tier1MayConstState &MayConst = tier1MayConst_[cacheKey];
-    MayConst.counterBase = 0;
-    MayConst.sampleStart = 0;
-    MayConst.sites.assign(jitEngine_->getLastMayConstLoadSites().begin(),
-                          jitEngine_->getLastMayConstLoadSites().end());
-    if (!MayConst.sites.empty()) {
-      if (auto Addr = jitEngine_->lookup(cacheKey, "__ejit_mayconst_hits"))
-        MayConst.counterBase = reinterpret_cast<uintptr_t>(*Addr);
+    Tier1PeriodConstState &PeriodConst = tier1PeriodConst_[cacheKey];
+    PeriodConst.counterBase = 0;
+    PeriodConst.sampleStart = 0;
+    PeriodConst.sites.assign(jitEngine_->getLastPeriodConstLoadSites().begin(),
+                          jitEngine_->getLastPeriodConstLoadSites().end());
+    if (!PeriodConst.sites.empty()) {
+      if (auto Addr = jitEngine_->lookup(cacheKey, "__ejit_period_const_hits"))
+        PeriodConst.counterBase = reinterpret_cast<uintptr_t>(*Addr);
       else
         consumeError(Addr.takeError());
     }
-    EJIT_DIAG("mayconst T0 published key=0x%016lx func=%s sites=%zu", cacheKey,
-              funcName.c_str(), MayConst.sites.size());
-    pendingTier1MayConstKey_ = cacheKey;
-    hasPendingTier1MayConstKey_ = true;
+    EJIT_DIAG("period_const T0 published key=0x%016lx func=%s sites=%zu", cacheKey,
+              funcName.c_str(), PeriodConst.sites.size());
+    pendingTier1PeriodConstKey_ = cacheKey;
+    hasPendingTier1PeriodConstKey_ = true;
 #endif
 
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
@@ -908,13 +908,13 @@ void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {
-    if (published && hasPendingTier1MayConstKey_) {
-      auto It = tier1MayConst_.find(pendingTier1MayConstKey_);
-      if (It != tier1MayConst_.end())
+    if (published && hasPendingTier1PeriodConstKey_) {
+      auto It = tier1PeriodConst_.find(pendingTier1PeriodConstKey_);
+      if (It != tier1PeriodConst_.end())
         It->second.sampleStart = ejit_taskpool_trace_now();
     }
-    pendingTier1MayConstKey_ = 0;
-    hasPendingTier1MayConstKey_ = false;
+    pendingTier1PeriodConstKey_ = 0;
+    hasPendingTier1PeriodConstKey_ = false;
   }
 #endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE

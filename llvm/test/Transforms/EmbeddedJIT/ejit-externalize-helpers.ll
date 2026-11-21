@@ -172,7 +172,7 @@ entry:
 define i32 @entry(i32 %idx) !ejit.metadata !20 {
 entry:
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %idx
-  %v = load i32, ptr %p, !ejit.may_const !{}
+  %v = load i32, ptr %p, !ejit.period_const !{}
   %r1 = call i32 @st_helper_big(i32 %v)
   %r2 = call i32 @st_helper_small(i32 %r1)
   %r3 = call i32 @ext_helper_big(i32 %r2)
@@ -187,7 +187,7 @@ entry:
 define internal i32 @entry_big(i32 %idx) !ejit.metadata !21 {
 entry:
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %idx
-  %v = load i32, ptr %p, !ejit.may_const !{}
+  %v = load i32, ptr %p, !ejit.period_const !{}
   %j1 = add i32 %v, 1
   %j2 = add i32 %j1, 1
   %j3 = add i32 %j2, 1
@@ -211,8 +211,8 @@ entry:
 attributes #0 = { noinline }
 attributes #1 = { inlinehint }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}, !{!"ejit_may_const_field", i32 0}}
-!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}, !{!"ejit_period_const_field", i32 0}}
+!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
 !21 = distinct !{!{!"ejit_entry"}}
 
 ; MOD side: registration records for the externalized helpers. The module

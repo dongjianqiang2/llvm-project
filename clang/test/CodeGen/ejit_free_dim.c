@@ -2,17 +2,17 @@
 // EmbeddedJIT: ejit_free_dim metadata emission.
 
 struct UnitParams {
-  __attribute__((ejit_may_const)) int laneCount;
+  __attribute__((ejit_period_const)) int laneCount;
   int dynamic;
 };
 
-__attribute__((ejit_period_arr("unit"))) struct UnitParams g_unitParams[80];
+__attribute__((ejit_group("unit"))) struct UnitParams g_unitParams[80];
 
 // The motivating shape. The free dim rides in the same !ejit.metadata node list
 // as the period dim, with an empty period name and its parameter index.
 // CHECK: define {{.*}}i32 @init_unit({{.*}} !ejit.metadata ![[ENTRY_META:[0-9]+]]
 __attribute__((ejit_entry))
-int init_unit(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+int init_unit(__attribute__((ejit_dim("unit"))) unsigned unitIdx,
               __attribute__((ejit_free_dim)) unsigned slotNo) {
   struct UnitParams *p = &g_unitParams[unitIdx * 5 + slotNo % 5];
   p->dynamic = 1;
@@ -22,7 +22,7 @@ int init_unit(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
 // Several free dims on one function, recorded by parameter index.
 // CHECK: define {{.*}}i32 @two_free({{.*}} !ejit.metadata ![[TWO_META:[0-9]+]]
 __attribute__((ejit_entry))
-int two_free(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+int two_free(__attribute__((ejit_dim("unit"))) unsigned unitIdx,
              __attribute__((ejit_free_dim)) unsigned slotNo,
              __attribute__((ejit_free_dim)) unsigned subSlot) {
   return g_unitParams[unitIdx * 5 + (slotNo + subSlot) % 5].laneCount;
@@ -30,7 +30,7 @@ int two_free(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
 
 // CHECK-DAG: ![[ENTRY_META]] = distinct !{![[ENTRY:[0-9]+]], ![[IND:[0-9]+]], ![[FREE1:[0-9]+]]}
 // CHECK-DAG: ![[ENTRY]] = !{!"ejit_entry"}
-// CHECK-DAG: ![[IND]] = !{!"ejit_period_arr_ind", !"unit", i32 0}
+// CHECK-DAG: ![[IND]] = !{!"ejit_dim", !"unit", i32 0}
 // CHECK-DAG: ![[FREE1]] = !{!"ejit_free_dim", !"", i32 1}
 // CHECK-DAG: ![[TWO_META]] = distinct !{![[ENTRY]], ![[IND]], ![[FREE1]], ![[FREE2:[0-9]+]]}
 // CHECK-DAG: ![[FREE2]] = !{!"ejit_free_dim", !"", i32 2}
@@ -38,7 +38,7 @@ int two_free(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
 // The recorded index must be an LLVM IR argument number, not a source
 // parameter number. On x86-64 a two-eightbyte struct expands to two IR
 // arguments, so `slot` at source index 2 is IR argument 3. Recording 2 would
-// name the second half of the struct and let the JIT freeze a may_const access
+// name the second half of the struct and let the JIT freeze a period_const access
 // made through it -- a substitution the user never authorised.
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -emit-llvm -o - %s \
 // RUN:   | FileCheck --check-prefix=ABI %s
@@ -46,7 +46,7 @@ struct Pair { long x, y; };
 
 // ABI: define {{.*}}i32 @expanded_arg(i32 {{[^,]*}}, i64 {{[^,]*}}, i64 {{[^,]*}}, i32 {{[^,]*}}, i32 {{.*}}!ejit.metadata ![[ABI_META:[0-9]+]]
 __attribute__((ejit_entry))
-int expanded_arg(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+int expanded_arg(__attribute__((ejit_dim("unit"))) unsigned unitIdx,
                  struct Pair pair,
                  __attribute__((ejit_free_dim)) unsigned slotNo,
                  int dynamic) {
@@ -55,7 +55,7 @@ int expanded_arg(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
 }
 // ABI-DAG: ![[ABI_META]] = distinct !{![[ABI_ENTRY:[0-9]+]], ![[ABI_IND:[0-9]+]], ![[ABI_FREE:[0-9]+]]}
 // ABI-DAG: ![[ABI_ENTRY]] = !{!"ejit_entry"}
-// ABI-DAG: ![[ABI_IND]] = !{!"ejit_period_arr_ind", !"unit", i32 0}
+// ABI-DAG: ![[ABI_IND]] = !{!"ejit_dim", !"unit", i32 0}
 // ABI-DAG: ![[ABI_FREE]] = !{!"ejit_free_dim", !"", i32 3}
 
 // pass_object_size inserts a hidden size argument AFTER its pointer parameter,
@@ -66,7 +66,7 @@ int expanded_arg(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
 // ABI-DAG: define {{.*}}i32 @interleaved_objsize(i32 {{[^,]*}}, i32 {{[^,]*}}, i32 {{[^,]*}}, ptr {{[^,]*}}, i64 {{.*}}!ejit.metadata ![[POS_META:[0-9]+]]
 __attribute__((ejit_entry))
 int interleaved_objsize(
-    __attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+    __attribute__((ejit_dim("unit"))) unsigned unitIdx,
     __attribute__((ejit_free_dim)) unsigned slotNo,
     int live,
     const char *const p __attribute__((pass_object_size(0)))) {
@@ -84,13 +84,13 @@ struct BigResult { long values[4]; };
 // ABI-DAG: define {{.*}}void @sret_mapped(ptr {{.*}}sret(%struct.BigResult){{.*}}, i32 {{[^,]*}}, i32 {{.*}}!ejit.metadata ![[SRET_META:[0-9]+]]
 __attribute__((ejit_entry))
 struct BigResult sret_mapped(
-    __attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+    __attribute__((ejit_dim("unit"))) unsigned unitIdx,
     __attribute__((ejit_free_dim)) unsigned slotNo) {
   struct BigResult result = {{unitIdx, slotNo, 0, 0}};
   return result;
 }
 // ABI-DAG: ![[SRET_META]] = distinct !{![[ABI_ENTRY]], ![[SRET_IND:[0-9]+]], ![[SRET_FREE:[0-9]+]]}
-// ABI-DAG: ![[SRET_IND]] = !{!"ejit_period_arr_ind", !"unit", i32 1}
+// ABI-DAG: ![[SRET_IND]] = !{!"ejit_dim", !"unit", i32 1}
 // ABI-DAG: ![[SRET_FREE]] = !{!"ejit_free_dim", !"", i32 2}
 
 // Aggregate expansion before all three indexed EJIT attributes must shift each
@@ -100,7 +100,7 @@ struct BigResult sret_mapped(
 __attribute__((ejit_entry))
 int all_indexed_attrs(
     struct Pair pair,
-    __attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+    __attribute__((ejit_dim("unit"))) unsigned unitIdx,
     __attribute__((ejit_bound_ptr("unit"))) struct UnitParams *cfg,
     __attribute__((ejit_free_dim)) unsigned slotNo,
     int live) {
@@ -109,7 +109,7 @@ int all_indexed_attrs(
 }
 // Metadata is emitted in tag groups: period dims, free dims, then bound ptrs.
 // ABI-DAG: ![[ALL_META]] = distinct !{![[ABI_ENTRY]], ![[ALL_IND:[0-9]+]], ![[ALL_FREE:[0-9]+]], ![[ALL_BOUND:[0-9]+]]}
-// ABI-DAG: ![[ALL_IND]] = !{!"ejit_period_arr_ind", !"unit", i32 2}
+// ABI-DAG: ![[ALL_IND]] = !{!"ejit_dim", !"unit", i32 2}
 // ABI-DAG: ![[ALL_FREE]] = !{!"ejit_free_dim", !"", i32 4}
 // ABI-DAG: ![[ALL_BOUND]] = !{!"ejit_bound_ptr", !"unit", i32 3, i64 8, i64 4, ![[ALL_FIELD:[0-9]+]]}
 // ABI-DAG: ![[ALL_FIELD]] = !{i64 0, i64 4}
@@ -124,7 +124,7 @@ int all_indexed_attrs(
 #ifdef EJIT_WIDE_PARAM
 // WIDE: define {{.*}}i32 @byval_param(i32 {{[^,]*}}, ptr {{.*}}byval{{.*}}!ejit.metadata ![[W_META:[0-9]+]]
 __attribute__((ejit_entry))
-int byval_param(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
+int byval_param(__attribute__((ejit_dim("unit"))) unsigned unitIdx,
                 __attribute__((ejit_free_dim)) _BitInt(256) slotNo) {
   // expected-warning@-1 {{ejit_free_dim on parameter 'slotNo' is ignored: the parameter is not passed as a single value, so the JIT has no argument to attribute it to}}
   return (int)g_unitParams[unitIdx].laneCount + (int)slotNo;
@@ -132,6 +132,6 @@ int byval_param(__attribute__((ejit_period_arr_ind("unit"))) unsigned unitIdx,
 // The period dim is unaffected and keeps its own index; only the free dim goes.
 // WIDE-DAG: ![[W_META]] = distinct !{![[W_ENTRY:[0-9]+]], ![[W_IND:[0-9]+]]}
 // WIDE-DAG: ![[W_ENTRY]] = !{!"ejit_entry"}
-// WIDE-DAG: ![[W_IND]] = !{!"ejit_period_arr_ind", !"unit", i32 0}
+// WIDE-DAG: ![[W_IND]] = !{!"ejit_dim", !"unit", i32 0}
 // WIDE-NOT: ejit_free_dim
 #endif

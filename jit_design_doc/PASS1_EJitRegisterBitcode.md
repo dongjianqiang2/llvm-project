@@ -40,16 +40,16 @@ PASS1 必须在 O2/O3 标准优化之前运行，原因：
 1. **Wapper 必须在 bitcode 提取前**：PASS3 (WrapperGen) 插入 `ejit_taskpool_compile_or_get` 调用和 wrapper 块。如果 PASS1 提取含 wrapper 的 bitcode，JIT 会编译 wrapper 自身导致无限递归。
 2. **提取闭包**：PASS1 需要在优化前识别完整的函数闭包（内联前），以保证所有被调用的辅助函数都包含在 bitcode 中。
 
-`!ejit.may_const` metadata 的保留通过两个机制保证：
-- **LLVM 层面**：`MD_ejit_may_const` 注册为固定 metadata kind，`copyMetadataForLoad()` 在 switch 中显式保留，覆盖 InstCombine、SROA、Mem2Reg 等所有使用该函数的 Pass。
-- **GV-level 元数据回退**：Clang CodeGen 在 GV 的 `!ejit.metadata` 中输出 `ejit_may_const_field` 字节偏移。`preOptimizeBitcode` 中 `reAnnotateMayConst` 步骤从 GV metadata 恢复被 Pass 新建 load 丢失的 per-load metadata。
+`!ejit.period_const` metadata 的保留通过两个机制保证：
+- **LLVM 层面**：`MD_ejit_period_const` 注册为固定 metadata kind，`copyMetadataForLoad()` 在 switch 中显式保留，覆盖 InstCombine、SROA、Mem2Reg 等所有使用该函数的 Pass。
+- **GV-level 元数据回退**：Clang CodeGen 在 GV 的 `!ejit.metadata` 中输出 `ejit_period_const_field` 字节偏移。`preOptimizeBitcode` 中 `reAnnotatePeriodConst` 步骤从 GV metadata 恢复被 Pass 新建 load 丢失的 per-load metadata。
 
 ### 1.4 AOT 预优化 (preOptimizeBitcode)
 
 提取 bitcode 后、序列化前，对 bitcode 模块运行轻量优化管线，减少 JIT 编译时的开销和内存压力：
 
 ```
-AlwaysInline → ModuleInliner(O2) → Mem2Reg → EarlyCSE+InstCombine → SimplifyCFG → reAnnotateMayConst
+AlwaysInline → ModuleInliner(O2) → Mem2Reg → EarlyCSE+InstCombine → SimplifyCFG → reAnnotatePeriodConst
 ```
 
 | 步骤 | 说明 |
@@ -59,7 +59,7 @@ AlwaysInline → ModuleInliner(O2) → Mem2Reg → EarlyCSE+InstCombine → Simp
 | Mem2Reg | alloca → SSA，消除内存访问 |
 | EarlyCSE + InstCombine | 公共子表达式消除 + 常量折叠 |
 | SimplifyCFG | 扁平化分支、合并基本块 |
-| reAnnotateMayConst | 从 GV metadata 恢复可能丢失的 `!ejit.may_const` |
+| reAnnotatePeriodConst | 从 GV metadata 恢复可能丢失的 `!ejit.period_const` |
 
 > **NDEBUG 守卫**：debug 构建（共享库）跳过预优化，避免 `LLVMPasses ↔ LLVMEmbeddedJIT` 循环链接依赖。同一套 Pass 在 JIT 管线中运行。
 
@@ -79,7 +79,7 @@ define void @process_task(i32 %idx) #0 {
 ; !ejit.metadata = distinct !{!0}
 ; !0 = !{!"ejit_entry"}
 
-; 含 ejit_period_arr_ind 参数的 ejit_entry 函数
+; 含 ejit_dim 参数的 ejit_entry 函数
 define void @process_multi(i32 %cellIdx, i32 %trpIdx) #0 {
   ; ...
 }
@@ -88,7 +88,7 @@ define void @process_multi(i32 %cellIdx, i32 %trpIdx) #0 {
 
 ### 2.2 从 metadata 推断依赖
 
-ejit_entry 函数本身在 IR 中不含 period 依赖的直接声明。依赖通过函数参数上的 `ejit_period_arr_ind` 属性的 debug info / metadata 推导，但 Bitcode 提取不需要此信息。Bitcode 提取阶段仅关注函数调用图。
+ejit_entry 函数本身在 IR 中不含 period 依赖的直接声明。依赖通过函数参数上的 `ejit_dim` 属性的 debug info / metadata 推导，但 Bitcode 提取不需要此信息。Bitcode 提取阶段仅关注函数调用图。
 
 ---
 
@@ -132,7 +132,7 @@ PreservedAnalyses EJitRegisterBitcodePass::run(Module& M, ModuleAnalysisManager&
     // Step 3: 提取 Module
     // 使用 ValueMapper + 过滤实现: 只保留 fullSet 中的函数和它们引用的全局变量
     // 方法: clone fullSet 中的函数到新 Module, 同时克隆:
-    //   - 被引用的全局变量 (ejit_period, ejit_period_arr)
+    //   - 被引用的全局变量 (ejit_group, ejit_group)
     //   - 被引用的结构体类型声明 (用于 JIT 阶段的类型推导)
     //   - ejit.metadata 命名元数据
     Module* bitcodeM = extractModule(M, fullSet);
@@ -210,7 +210,7 @@ Module* extractModule(Module& SrcM, const std::set<Function*>& funcSet) {
         }
     }
 
-    // 2. 收集被引用的全局变量 (ejit_period, ejit_period_arr)
+    // 2. 收集被引用的全局变量 (ejit_group, ejit_group)
     std::set<GlobalVariable*> referencedGVs;
     for (Function* F : funcSet) {
         for (BasicBlock& BB : *F) {
@@ -406,25 +406,25 @@ EJitRegisterBitcodePass  (早期: 标准优化前, 提取原始 bitcode)
         ↓
 [标准优化 Pipeline: O2/O3]
         ↓
-EJitRegisterPeriodPass   (晚期: 时间窗变量注册)
+EJitRegisterGroupPass   (晚期: 时间窗变量注册)
         ↓
 EJitWrapperGenPass       (晚期: Wrapper 生成)
         ↓
-EJitPeriodHandlerPass    (晚期: 生命周期处理)
+EJitGuardHandlerPass    (晚期: 生命周期处理)
 ```
 
 | 后续组件 | 依赖本 Pass 提供 | 说明 |
 |---------|-----------------|------|
-| EJitRegisterPeriodPass | 无直接依赖 | 独立读取 M 中的 metadata（优化后可能部分丢失，但不影响 period 变量识别） |
+| EJitRegisterGroupPass | 无直接依赖 | 独立读取 M 中的 metadata（优化后可能部分丢失，但不影响 period 变量识别） |
 | EJitWrapperGenPass | ejit.metadata 保留 | 函数级 metadata 通常不会被优化 Pass 丢弃 |
-| EJitPeriodHandlerPass | ejit.metadata 保留 | 同上 |
+| EJitGuardHandlerPass | ejit.metadata 保留 | 同上 |
 | Runtime EJIT | `@__ejit_bitcode` + `ejit_auto_register` | 运行时加载 metadata 完整的原始 bitcode |
 
 **关键点**：
 
 - `ejit.metadata`（函数/全局变量级别）是 Named Metadata，LLVM 优化 Pass 通常不会移除，因此晚期 Pass 仍可正常读取
-- `!ejit.may_const`（load 指令级别）是 instruction metadata，容易被优化 Pass 丢弃。这是本 Pass 必须提前执行的核心原因
-- `ejit_period_arr_ind` 参数信息已编码在函数级 `ejit.metadata` 中（通过 `!{!"ejit_period_arr_ind", !"periodName", i32 argIdx}`），不依赖参数上的 debug info，因此可被晚期 Pass 正常读取
+- `!ejit.period_const`（load 指令级别）是 instruction metadata，容易被优化 Pass 丢弃。这是本 Pass 必须提前执行的核心原因
+- `ejit_dim` 参数信息已编码在函数级 `ejit.metadata` 中（通过 `!{!"ejit_dim", !"periodName", i32 argIdx}`），不依赖参数上的 debug info，因此可被晚期 Pass 正常读取
 
 ---
 

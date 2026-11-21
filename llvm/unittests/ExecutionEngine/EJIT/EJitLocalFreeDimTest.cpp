@@ -64,11 +64,11 @@ std::unique_ptr<Module> makeLocalModule(LLVMContext &C, StringRef Setup = "",
         "@local_cells, i64 0, i64 %ci, i64 " +
         Index.str() + "\n";
   IR += R"(
-    %mode = load i32, ptr %chosen, align 4, !ejit.may_const !7
+    %mode = load i32, ptr %chosen, align 4, !ejit.period_const !7
     %payloadp = getelementptr %Slot, ptr %chosen, i64 0, i32 1
     %payload = load i32, ptr %payloadp, align 4
     %siblingp = getelementptr inbounds [2 x [10 x %Slot]], ptr @local_cells, i64 0, i64 %ci, i64 %raw
-    %sibling = load i32, ptr %siblingp, align 4, !ejit.may_const !7
+    %sibling = load i32, ptr %siblingp, align 4, !ejit.period_const !7
     %scaled = mul i32 %mode, 100
     %a = add i32 %scaled, %payload
     %result = add i32 %a, %sibling
@@ -76,11 +76,11 @@ std::unique_ptr<Module> makeLocalModule(LLVMContext &C, StringRef Setup = "",
     }
     attributes #0 = { nounwind willreturn memory(none) nocallback nosync "ejit.local_free_dim"="v1" }
     !0 = !{!1, !2}
-    !1 = !{!"ejit_period_arr", !"cell", i64 2}
-    !2 = !{!"ejit_may_const_field", i64 0}
+    !1 = !{!"ejit_group_indexed", !"cell", i64 2}
+    !2 = !{!"ejit_period_const_field", i64 0}
     !4 = distinct !{!5, !6}
     !5 = !{!"ejit_entry"}
-    !6 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !6 = !{!"ejit_dim", !"cell", i32 0}
     !7 = !{}
   )";
   SMDiagnostic Error;
@@ -131,7 +131,7 @@ std::string serialize(Module &M) {
 }
 } // namespace
 
-TEST(EJitLocalFreeDim, HoistedPointerFieldRetainsMayConstContract) {
+TEST(EJitLocalFreeDim, HoistedPointerFieldRetainsPeriodConstContract) {
   for (bool Local : {false, true})
     for (bool Mixed : {false, true})
       for (auto Level :
@@ -172,7 +172,7 @@ TEST(EJitLocalFreeDim, HoistedPointerFieldRetainsMayConstContract) {
               %br = urem i16 %slot, 5
               %bi = zext i16 %br to i64
               %be = getelementptr %Algo, ptr %bp, i64 %bi
-              %bv = load i64, ptr %be, align 64, !ejit.may_const !7
+              %bv = load i64, ptr %be, align 64, !ejit.period_const !7
               call void @sink_b(i64 %bv, i16 %slot, ptr %be)
               ret void
             a:
@@ -186,7 +186,7 @@ TEST(EJitLocalFreeDim, HoistedPointerFieldRetainsMayConstContract) {
               %ar = urem i16 %slot, 5
               %ai = zext i16 %ar to i64
               %ae = getelementptr %Algo, ptr %ap, i64 %ai
-              %av = load i64, ptr %ae, align 64, !ejit.may_const !7
+              %av = load i64, ptr %ae, align 64, !ejit.period_const !7
               call void @sink_a(i64 %av, i16 %slot, ptr %ae)
               ret void
             a2:
@@ -197,18 +197,18 @@ TEST(EJitLocalFreeDim, HoistedPointerFieldRetainsMayConstContract) {
               %cv = load i64, ptr %ce, align 64
           )";
           if (!Mixed)
-            IR += ", !ejit.may_const !7\n";
+            IR += ", !ejit.period_const !7\n";
           IR += R"(
               call void @sink_c(i64 %cv, i16 %slot, ptr %ce)
               ret void
             }
             attributes #0 = { nounwind willreturn memory(none) nocallback nosync "ejit.local_free_dim"="v1" }
             !0 = !{!1, !2, !8}
-            !1 = !{!"ejit_period_arr", !"trp", i32 0}
-            !2 = !{!"ejit_may_const_field", i64 0}
+            !1 = !{!"ejit_group_indexed", !"trp", i32 0}
+            !2 = !{!"ejit_period_const_field", i64 0}
             !4 = !{!5, !6}
             !5 = !{!"ejit_entry"}
-            !6 = !{!"ejit_period_arr_ind", !"trp", i32 0}
+            !6 = !{!"ejit_dim", !"trp", i32 0}
             !7 = !{}
             !8 = !{!"ejit_pointer_layout", i64 64, !9}
             !9 = !{i64 0, i64 8}
@@ -239,7 +239,7 @@ TEST(EJitLocalFreeDim, HoistedPointerFieldRetainsMayConstContract) {
             if (auto *L = dyn_cast<LoadInst>(&I))
               if (L->getType()->isIntegerTy(64)) {
                 ++Loads;
-                Marked += L->hasMetadata("ejit.may_const");
+                Marked += L->hasMetadata("ejit.period_const");
               }
           ASSERT_EQ(Loads, 2U);
           EXPECT_EQ(Marked, Mixed ? 1U : 2U);
@@ -320,24 +320,24 @@ TEST(EJitLocalFreeDim, UnknownBoundsPointerFromLoadedSlotPreservesSibling) {
                   " %selected = getelementptr inbounds %Cell, ptr %root, i64 %ci\n"
                   " %elt = getelementptr inbounds i8, ptr %selected, i64 %off\n"
                   " %field = getelementptr inbounds i8, ptr %elt, i64 14\n"
-                  " %marked = load i8, ptr %field, !ejit.may_const !6\n"
+                  " %marked = load i8, ptr %field, !ejit.period_const !6\n"
                   " %rawslot = urem i16 %raw, " << Slots << "\n"
                   " %rawoff16 = mul nuw nsw i16 %rawslot, 184\n"
                   " %rawoff = zext nneg i16 %rawoff16 to i64\n"
                   " %siblingelt = getelementptr inbounds i8, ptr %selected, i64 %rawoff\n"
                   " %siblingp = getelementptr inbounds i8, ptr %siblingelt, i64 14\n"
-                  " %sibling = load i8, ptr %siblingp, !ejit.may_const !6\n"
+                  " %sibling = load i8, ptr %siblingp, !ejit.period_const !6\n"
                   " store i8 42, ptr %elt\n"
                   " call void @consume(i8 %marked, i8 %sibling, i16 %raw, ptr %elt)\n"
                   " ret void\n}\n"
                   "attributes #0 = { nounwind willreturn memory(none) nocallback nosync \"ejit.local_free_dim\"=\"v1\" }\n"
                   "!0 = !{!1, !2}\n"
-                  "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 0}\n"
+                  "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 0}\n"
                   "!2 = !{!\"ejit_pointer_layout\", i64 " << Slots * 184;
             for (unsigned S = 0; S != Slots; ++S)
               IR << ", !" << 10 + S;
             IR << "}\n!3 = !{!4, !5}\n!4 = !{!\"ejit_entry\"}\n"
-                  "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n!6 = !{}\n";
+                  "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n!6 = !{}\n";
             for (unsigned S = 0; S != Slots; ++S)
               IR << "!" << 10 + S << " = !{i64 " << S * 184 + 14
                  << ", i64 1}\n";
@@ -382,7 +382,7 @@ TEST(EJitLocalFreeDim, UnknownBoundsPointerFromLoadedSlotPreservesSibling) {
             unsigned Calls = 0, Siblings = 0, Stores = 0;
             for (Instruction &I : instructions(M->getFunction("probe"))) {
               if (auto *L = dyn_cast<LoadInst>(&I))
-                Siblings += L->hasMetadata("ejit.may_const");
+                Siblings += L->hasMetadata("ejit.period_const");
               if (auto *S = dyn_cast<StoreInst>(&I))
                 Stores += S->getValueOperand()->getType()->isIntegerTy(8);
               auto *Call = dyn_cast<CallInst>(&I);
@@ -589,9 +589,9 @@ TEST(EJitLocalFreeDim, AuditCleanupRemovesNonzeroConstantGEPSites) {
   PeriodArrayRegistry Registry;
   EJitStructFieldPass Pass(Registry);
   Pass.initFromModule(*M);
-  EXPECT_EQ(Pass.instrumentMayConstLoadSites(*M).size(), 2u);
-  EJitStructFieldPass::removeMayConstLoadInstrumentation(*M);
-  EXPECT_EQ(M->getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
+  EXPECT_EQ(Pass.instrumentPeriodConstLoadSites(*M).size(), 2u);
+  EJitStructFieldPass::removePeriodConstLoadInstrumentation(*M);
+  EXPECT_EQ(M->getGlobalVariable(EJitStructFieldPass::PeriodConstCounterName),
             nullptr);
   EXPECT_FALSE(verifyModule(*M, &errs()));
 }
@@ -716,7 +716,7 @@ TEST(EJitLocalFreeDim, UntrackedConfigurationLifecycleKeepsLoad) {
       ConstantInt::get(F->getArg(0)->getType(), 1));
   IRBuilder<> B(C);
   auto *Entry = MDNode::get(C, {MDString::get(C, TAG_EJIT_ENTRY)});
-  auto *Other = MDNode::get(C, {MDString::get(C, TAG_EJIT_PERIOD_ARR_IND),
+  auto *Other = MDNode::get(C, {MDString::get(C, TAG_EJIT_DIM),
                                 MDString::get(C, "other"),
                                 ConstantAsMetadata::get(B.getInt32(0))});
   F->setMetadata(MD_EJIT_METADATA, MDNode::get(C, {Entry, Other}));
@@ -788,8 +788,8 @@ TEST(EJitLocalFreeDim, LocalAndParameterWitnessesCombineWithCellTrpBounds) {
       %idx = add i64 %sum, %param
       %p = getelementptr [5 x i32], ptr %cp, i64 0, i64 %idx
       %q = getelementptr [5 x i32], ptr %tp, i64 0, i64 %idx
-      %cv = load i32, ptr %p, align 4, !ejit.may_const !8
-      %tv = load i32, ptr %q, align 4, !ejit.may_const !8
+      %cv = load i32, ptr %p, align 4, !ejit.period_const !8
+      %tv = load i32, ptr %q, align 4, !ejit.period_const !8
       %frozen = add i32 %cv, %tv
       %live = trunc i64 %raw to i32
       %out = add i32 %frozen, %live
@@ -798,8 +798,8 @@ TEST(EJitLocalFreeDim, LocalAndParameterWitnessesCombineWithCellTrpBounds) {
     attributes #0 = { nounwind willreturn memory(none) nocallback nosync "ejit.local_free_dim"="v1" }
     !0 = distinct !{!1, !2, !3, !4, !5, !6}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-    !3 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
+    !3 = !{!"ejit_dim", !"trp", i32 1}
     !4 = !{!"ejit_free_dim", !"", i32 2}
     !5 = !{!"ejit_bound_ptr", !"cell", i32 4, i64 20, !7}
     !6 = !{!"ejit_bound_ptr", !"trp", i32 5, i64 20, !7}

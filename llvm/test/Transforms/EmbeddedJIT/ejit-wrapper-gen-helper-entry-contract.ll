@@ -52,10 +52,10 @@ entry:
   ret i32 %value
 }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}
 !20 = distinct !{!{!"ejit_entry"},
-                  !{!"ejit_period_arr_ind", !"cell", i32 0},
+                  !{!"ejit_dim", !"cell", i32 0},
                   !{!"ejit_bound_ptr", !"cell", i32 1, i64 4}}
 !21 = distinct !{!{!"ejit_entry"},
-                  !{!"ejit_period_arr_ind", !"cell", i32 0},
+                  !{!"ejit_dim", !"cell", i32 0},
                   !{!"ejit_bound_ptr", !"cell", i32 1, i64 4}}

@@ -74,7 +74,7 @@ using namespace sema;
 
 // Forward declaration for EmbeddedJIT deferred parameter check.
 // Defined in SemaEJIT.cpp.
-void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD);
+void checkEjitDimLimit(Sema &S, const FunctionDecl *FD);
 void checkEjitBoundPtrIndex(Sema &S, const FunctionDecl *FD);
 void checkEjitFreeDim(Sema &S, const FunctionDecl *FD);
 void checkEjitLocalFreeDims(Sema &S, const FunctionDecl *FD, Stmt *Body);
@@ -83,24 +83,24 @@ void checkEjitLocalFreeDims(Sema &S, const FunctionDecl *FD, Stmt *Body);
 // Defined in SemaEJIT.cpp.
 void checkEjitAlwaysInlineConflict(Sema &S, FunctionDecl *FD);
 
-// Forward declaration for EmbeddedJIT ejit_entry / ejit_period_lc conflict
+// Forward declaration for EmbeddedJIT ejit_entry / ejit_guard conflict
 // check. Defined in SemaEJIT.cpp.
-void checkEjitEntryLcConflict(Sema &S, FunctionDecl *FD, bool AfterMerge);
+void checkEjitEntryGuardConflict(Sema &S, FunctionDecl *FD, bool AfterMerge);
 
-// Forward declaration for EmbeddedJIT ejit_period_lc no-index check. Defined
+// Forward declaration for EmbeddedJIT ejit_guard no-index check. Defined
 // in SemaEJIT.cpp.
-void checkEjitPeriodLcIndex(Sema &S, const FunctionDecl *FD);
-void checkEjitPeriodLcIndexNewAttrs(
+void checkEjitGuardIndex(Sema &S, const FunctionDecl *FD);
+void checkEjitGuardIndexNewAttrs(
     Sema &S, const FunctionDecl *FD,
-    ArrayRef<const EjitPeriodLcAttr *> PreExisting);
+    ArrayRef<const EjitGuardAttr *> PreExisting);
 
 // Forward declaration for EmbeddedJIT missing-attribute-on-definition check.
 // Defined in SemaEJIT.cpp.
 void checkEjitAttrMissingOnDefinition(Sema &S, FunctionDecl *FD);
 
-// Forward declaration for EmbeddedJIT may_const write check.
+// Forward declaration for EmbeddedJIT period_const write check.
 // Defined in SemaEJIT.cpp.
-void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body);
+void checkEjitPeriodConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body);
 
 // Forward declaration for EmbeddedJIT undeclared period dependency check.
 // Defined in SemaEJIT.cpp.
@@ -10538,16 +10538,16 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
   // Handle attributes.
   ProcessDeclAttributes(S, NewFD, D);
 
-  // Enforce at most 4 ejit_period_arr_ind parameters per function.
-  checkEjitPeriodArrIndLimit(*this, NewFD);
+  // Enforce at most 4 ejit_dim parameters per function.
+  checkEjitDimLimit(*this, NewFD);
 
-  // An ejit_entry / ejit_period_lc function must not carry always_inline
+  // An ejit_entry / ejit_guard function must not carry always_inline
   // (it conflicts with the noinline CodeGen/PASS3 add for LTO survival).
   checkEjitAlwaysInlineConflict(*this, NewFD);
 
-  // ejit_entry and ejit_period_lc are mutually exclusive on one function:
+  // ejit_entry and ejit_guard are mutually exclusive on one function:
   // PASS3 (wrapper) and PASS4 (lifecycle guards) both rewrite its body.
-  checkEjitEntryLcConflict(*this, NewFD, /*AfterMerge=*/false);
+  checkEjitEntryGuardConflict(*this, NewFD, /*AfterMerge=*/false);
 
   const auto *NewTVA = NewFD->getAttr<TargetVersionAttr>();
   if (Context.getTargetInfo().getTriple().isAArch64() && NewTVA &&
@@ -12301,18 +12301,18 @@ bool Sema::CheckFunctionDeclaration(Scope *S, FunctionDecl *NewFD,
   }
 
   // A function redeclaration may have assembled ejit_entry on one declaration
-  // and ejit_period_lc on another; only the merged declaration shows the pair.
-  checkEjitEntryLcConflict(*this, NewFD, /*AfterMerge=*/true);
+  // and ejit_guard on another; only the merged declaration shows the pair.
+  checkEjitEntryGuardConflict(*this, NewFD, /*AfterMerge=*/true);
 
-  // Every written ejit_period_lc must find a matching ejit_period_arr_ind
+  // Every written ejit_guard must find a matching ejit_dim
   // parameter on the MERGED declaration: the arr_ind may live on an earlier
   // declaration's parameter (propagated by the merge), so this runs here
   // rather than at attribute-handling time.
-  checkEjitPeriodLcIndex(*this, NewFD);
+  checkEjitGuardIndex(*this, NewFD);
   checkEjitBoundPtrIndex(*this, NewFD);
   checkEjitFreeDim(*this, NewFD);
 
-  // A function defined without ejit_entry / ejit_period_lc even though a
+  // A function defined without ejit_entry / ejit_guard even though a
   // prior declaration carries the attribute is not JIT-specialized: warn and
   // drop the inherited attribute so CodeGen emits no !ejit.metadata.
   if (DeclIsDefn)
@@ -15998,11 +15998,11 @@ Decl *Sema::ActOnStartOfFunctionDef(Scope *FnBodyScope, Decl *D,
   FD->setWillHaveBody();
 
   // MSVC delayed template parsing reaches this point with the inherited
-  // ejit_entry / ejit_period_lc still in place (CheckFunctionDeclaration ran
+  // ejit_entry / ejit_guard still in place (CheckFunctionDeclaration ran
   // with DeclIsDefn == false). Diagnose and drop it before the body is
   // parsed; for ordinary definitions the attribute was already dropped there
   // and this is a no-op.
-  if (FD->hasAttr<EjitEntryAttr>() || FD->hasAttr<EjitPeriodLcAttr>())
+  if (FD->hasAttr<EjitEntryAttr>() || FD->hasAttr<EjitGuardAttr>())
     checkEjitAttrMissingOnDefinition(*this, FD);
 
   // If we are instantiating a generic lambda call operator, push
@@ -16687,14 +16687,14 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body,
       if (FSI->NeedsScopeChecking() && !PP.isCodeCompletionEnabled())
         DiagnoseInvalidJumps(Body);
 
-      // EmbeddedJIT: warn if a non-ejit_period_lc function writes an
-      // ejit_may_const field (would break the JIT's time-window constancy
+      // EmbeddedJIT: warn if a non-ejit_guard function writes an
+      // ejit_period_const field (would break the JIT's time-window constancy
       // assumption), and warn if an ejit_entry function references an
-      // ejit_period_arr global without declaring the dependency via an
-      // ejit_period_arr_ind parameter. Both checks no-op unless the
+      // indexed ejit_group global without declaring the dependency via an
+      // ejit_dim parameter. Both checks no-op unless the
       // respective warning is enabled.
       if (FD && !FD->isInvalidDecl()) {
-        checkEjitMayConstWrites(*this, FD, Body);
+        checkEjitPeriodConstWrites(*this, FD, Body);
         checkEjitUndeclaredPeriodDeps(*this, FD, Body);
       }
 

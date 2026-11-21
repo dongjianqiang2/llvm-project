@@ -25,30 +25,30 @@
 //===-- EJIT 属性 -----------------------------------------------------------===//
 
 struct BoardConfig {
-    ejit_may_const uint32_t boardType;
+    EJIT_PERIOD_CONST uint32_t boardType;
     uint32_t xx;
 };
 
 struct CellConfig {
-    ejit_may_const uint32_t cellType;
-    ejit_may_const uint32_t cellId;
+    EJIT_PERIOD_CONST uint32_t cellType;
+    EJIT_PERIOD_CONST uint32_t cellId;
     uint32_t trafficLoad;
 };
 
 struct TrpConfig {
-    ejit_may_const uint32_t trpType;
+    EJIT_PERIOD_CONST uint32_t trpType;
     uint32_t status;
 };
 
 //===-- 全局变量 -------------------------------------------------------------===//
 
-ejit_period(static) struct BoardConfig g_boardCfg;
+ejit_group(static) struct BoardConfig g_boardCfg;
 
 #define N_CELL 16
-ejit_period_arr(cell) struct CellConfig g_cellCfg[N_CELL];
+ejit_group(cell) struct CellConfig g_cellCfg[N_CELL];
 
 #define M_TRP 8
-ejit_period_arr(trp) struct TrpConfig g_trpCfg[M_TRP];
+ejit_group(trp) struct TrpConfig g_trpCfg[M_TRP];
 
 //===-- 场景 1: 仅 static 时间窗 ----------------------------------------------===//
 
@@ -66,7 +66,7 @@ void process_board(void)
 
 ejit_entry
 void process_cell(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     if (g_cellCfg[cellIdx].cellType == 0xFD) {
         g_cellCfg[cellIdx].trafficLoad += 5;
@@ -75,9 +75,9 @@ void process_cell(
     }
 }
 
-ejit_period_lc(cell)
+ejit_guard(cell)
 void update_cell_config(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xFD;
     g_cellCfg[cellIdx].cellId   = 42;
@@ -87,8 +87,8 @@ void update_cell_config(
 
 ejit_entry
 void process_trp_task(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
     uint32_t cell_t = g_cellCfg[cellIdx].cellType;
     uint32_t trp_t  = g_trpCfg[trpIdx].trpType;
@@ -99,11 +99,11 @@ void process_trp_task(
     }
 }
 
-ejit_period_lc(cell)
-ejit_period_lc(trp)
+ejit_guard(cell)
+ejit_guard(trp)
 void update_all_config(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xEC;
     g_trpCfg[trpIdx].trpType   = 2;

@@ -1,11 +1,11 @@
 /**
- * EJIT volatile / atomic may_const test.
+ * EJIT volatile / atomic period_const test.
  *
  * A volatile or atomic field must be read on every access, so it can never be
- * folded into a constant -- even when it also carries ejit_may_const. Clang
- * already withholds the per-load !ejit.may_const marker from such loads, but the
- * GV-level ejit_may_const_field offset list records the field regardless, so the
- * offset-matching paths (reAnnotateMayConst at AOT, isMayConstLoad's fallback at
+ * folded into a constant -- even when it also carries EJIT_PERIOD_CONST. Clang
+ * already withholds the per-load !ejit.period_const marker from such loads, but the
+ * GV-level ejit_period_const_field offset list records the field regardless, so the
+ * offset-matching paths (reAnnotatePeriodConst at AOT, isPeriodConstLoad's fallback at
  * JIT time) could hand the marker back and let the value be substituted.
  *
  * The failure is invisible in a single call: the specialization is compiled with
@@ -21,34 +21,34 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 
 struct Cfg {
-  ejit_may_const volatile uint32_t vol; /* must NOT be folded */
-  ejit_may_const uint32_t atom;         /* read atomically -> must NOT be folded */
-  ejit_may_const uint32_t norm;         /* plain -> folding is expected */
+  EJIT_PERIOD_CONST volatile uint32_t vol; /* must NOT be folded */
+  EJIT_PERIOD_CONST uint32_t atom;         /* read atomically -> must NOT be folded */
+  EJIT_PERIOD_CONST uint32_t norm;         /* plain -> folding is expected */
 };
 #define N 8
-ejit_period_arr(cell) struct Cfg g_cfg[N];
+ejit_group(cell) struct Cfg g_cfg[N];
 
-/* Union members alias, so a may_const member shares its offset with a mutable
+/* Union members alias, so a period_const member shares its offset with a mutable
    sibling. Folding a load of the mutable member would be a miscompile. */
 union Sel {
-  ejit_may_const uint32_t konst;
+  EJIT_PERIOD_CONST uint32_t konst;
   uint32_t mut;
 };
 struct UCfg { union Sel u; };
-ejit_period_arr(ucell) struct UCfg g_ucfg[N];
+ejit_group(ucell) struct UCfg g_ucfg[N];
 
 ejit_entry
-uint32_t read_vol(ejit_period_arr_ind(cell) uint8_t ci) {
+uint32_t read_vol(EJIT_DIM(cell) uint8_t ci) {
   return g_cfg[ci].vol + g_cfg[ci].norm;
 }
 
 ejit_entry
-uint32_t read_atomic(ejit_period_arr_ind(cell) uint8_t ci) {
+uint32_t read_atomic(EJIT_DIM(cell) uint8_t ci) {
   return __atomic_load_n(&g_cfg[ci].atom, __ATOMIC_RELAXED) + g_cfg[ci].norm;
 }
 
 ejit_entry
-uint32_t read_union_mut(ejit_period_arr_ind(ucell) uint8_t ci) {
+uint32_t read_union_mut(EJIT_DIM(ucell) uint8_t ci) {
   return g_ucfg[ci].u.mut; /* the MUTABLE member: must NOT be folded */
 }
 
@@ -103,7 +103,7 @@ static uint32_t jit_call(const char *what, uint32_t (*fn)(uint8_t), uint8_t ci) 
 int main(int argc, char **argv) {
   const uint8_t ci = (argc >= 2) ? (uint8_t)atoi(argv[1]) : 5;
 
-  printf("=== EJIT volatile / atomic may_const test (cellIdx=%u) ===\n", ci);
+  printf("=== EJIT volatile / atomic period_const test (cellIdx=%u) ===\n", ci);
 
   g_cfg[ci].vol = 10;
   g_cfg[ci].atom = 30;
@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
   CHECK(jit_call("atomic", read_atomic, ci) == 160,
         "atomic field is re-read after it changes (want 160)");
   CHECK(jit_call("union", read_union_mut, ci) == 9,
-        "union member aliasing a may_const member is re-read (want 9)");
+        "union member aliasing a period_const member is re-read (want 9)");
 
   ejit_shutdown();
 

@@ -196,7 +196,7 @@ entry:
 
 define i32 @entry(i32 %c) !ejit.metadata !20 {
   %p = getelementptr [16 x i32], ptr @cell_data, i32 0, i32 %c
-  %v = load i32, ptr %p, !ejit.may_const !{}
+  %v = load i32, ptr %p, !ejit.period_const !{}
   %r1 = call i32 @hint_helper(i32 %v, i32 %c)
   %r2 = call i32 @hint_helper(i32 %r1, i32 %v)
   %sum = add i32 %r1, %r2
@@ -205,14 +205,14 @@ define i32 @entry(i32 %c) !ejit.metadata !20 {
 
 attributes #0 = { inlinehint }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}, !{!"ejit_may_const_field", i32 0}}
-!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}, !{!"ejit_period_const_field", i32 0}}
+!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
 
 ; The two calls must have been inlined into the entry at AOT time: nothing
 ; between the entry's definition and its return references the helper, and
-; the may_const load must survive the whole preopt round (reAnnotateMayConst
+; the period_const load must survive the whole preopt round (reAnnotatePeriodConst
 ; is the safety net if any pass drops it).
 ; CHECK: define i32 @entry(
-; CHECK-DAG: load i32, ptr {{.*}}, align 4, !ejit.may_const
+; CHECK-DAG: load i32, ptr {{.*}}, align 4, !ejit.period_const
 ; CHECK-NOT: @hint_helper
 ; CHECK: ret i32

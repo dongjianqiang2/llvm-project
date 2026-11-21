@@ -30,9 +30,9 @@ SECTIONS
 
     /* --- EmbeddedJIT period registry --- */
     . = ALIGN(8);
-    __start_ejit_period = .;
-    KEEP(*(.ejit_period))
-    __stop_ejit_period = .;
+    __start_ejit_group = .;
+    KEEP(*(.ejit_group))
+    __stop_ejit_group = .;
   }
   .data           : { *(.data .data.* .gnu.linkonce.d.*) }
   .bss            : { *(.bss .bss.* .gnu.linkonce.b.*) }

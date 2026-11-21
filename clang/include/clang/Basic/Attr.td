@@ -5222,42 +5222,34 @@ def OpenACCRoutineDecl :InheritableAttr {
 // EmbeddedJIT Attributes
 //===----------------------------------------------------------------------===//
 
-// Marks a struct member as potentially constant within a time window
-def EjitMayConst : InheritableAttr {
-  let Spellings = [Clang<"ejit_period_const">,
-                   Clang<"ejit_may_const">];
+// Marks a struct member as constant within a time window
+def EjitPeriodConst : InheritableAttr {
+  let Spellings = [Clang<"ejit_period_const">];
   let Subjects = SubjectList<[Field]>;
-  let Documentation = [EjitMayConstDocs];
+  let Documentation = [EjitPeriodConstDocs];
 }
 
-// Marks the time window a global variable belongs to
-def EjitPeriod : InheritableAttr {
-  let Spellings = [Clang<"ejit_in_period">,
-                   Clang<"ejit_period">];
-  let Args = [StringArgument<"PeriodName">];
+// Marks the period group a global variable belongs to. One attribute covers
+// the scalar and indexed (array) forms: the form is inferred from the
+// variable type (array or pointer-to-struct -> indexed). Indexed is recorded
+// so CodeGen can emit the matching metadata tag.
+def EjitGroup : InheritableAttr {
+  let Spellings = [Clang<"ejit_group">];
+  let Args = [StringArgument<"PeriodName">,
+              BoolArgument<"Indexed", /*optional=*/0, /*fake=*/1>];
   let Subjects = SubjectList<[Var]>;
-  let Documentation = [EjitPeriodDocs];
-}
-
-// Marks the time window array a global array belongs to
-def EjitPeriodArr : InheritableAttr {
-  let Spellings = [Clang<"ejit_in_period_array">,
-                   Clang<"ejit_period_arr">];
-  let Args = [StringArgument<"PeriodName">];
-  let Subjects = SubjectList<[Var]>;
-  let Documentation = [EjitPeriodArrDocs];
+  let Documentation = [EjitGroupDocs];
 }
 
 // Marks a function parameter as a specialization dimension index
-def EjitPeriodArrInd : InheritableParamAttr {
-  let Spellings = [Clang<"ejit_dim">,
-                   Clang<"ejit_period_arr_ind">];
+def EjitDim : InheritableParamAttr {
+  let Spellings = [Clang<"ejit_dim">];
   let Args = [StringArgument<"PeriodName">];
   let Subjects = SubjectList<[ParmVar]>;
-  let Documentation = [EjitPeriodArrIndDocs];
+  let Documentation = [EjitDimDocs];
 }
 
-// Marks a function parameter whose value the may_const data behind it does not
+// Marks a function parameter whose value the period_const data behind it does not
 // depend on. Not a specialization dimension: it adds no clone and no cache axis.
 def EjitFreeDim : InheritableParamAttr {
   let Spellings = [Clang<"ejit_free_dim">];
@@ -5280,13 +5272,13 @@ def EjitEntry : InheritableAttr {
   let Documentation = [EjitEntryDocs];
 }
 
-// Marks a time window lifecycle management function
-def EjitPeriodLc : InheritableAttr {
-  let Spellings = [Clang<"ejit_period_guard">,
-                   Clang<"ejit_period_lc">];
+// Marks a period group lifecycle management function: the sanctioned entry
+// point for modifying the group's ejit_period_const data
+def EjitGuard : InheritableAttr {
+  let Spellings = [Clang<"ejit_guard">];
   let Args = [StringArgument<"PeriodName">];
   let Subjects = SubjectList<[Function]>;
-  let Documentation = [EjitPeriodLcDocs];
+  let Documentation = [EjitGuardDocs];
 }
 
 def NonString : InheritableAttr {

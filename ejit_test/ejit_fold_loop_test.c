@@ -1,7 +1,7 @@
 /**
  * EJIT L3 嵌套循环折叠测试 — fold-to-constant
  *
- * 场景: 一个嵌套 for 循环，循环上界来自 may_const 字段 (outer_n / inner_n)。
+ * 场景: 一个嵌套 for 循环，循环上界来自 period_const 字段 (outer_n / inner_n)。
  *       在 L3 下，IndVarSimplify 用 SCEV 求出累加器的闭式出口值，
  *       LoopDeletion 删除空循环，最终整个函数折叠成单个常量返回。
  *
@@ -25,18 +25,18 @@
 //===-- 周期数组配置 ---------------------------------------------------------===//
 
 struct LoopFoldCfg {
-  ejit_may_const uint32_t outer_n;
-  ejit_may_const uint32_t inner_n;
+  EJIT_PERIOD_CONST uint32_t outer_n;
+  EJIT_PERIOD_CONST uint32_t inner_n;
 };
 
 #define N 16
-ejit_period_arr(loopfold) struct LoopFoldCfg g_loopfold[N];
+ejit_group(loopfold) struct LoopFoldCfg g_loopfold[N];
 
 //===-- JIT entry: 嵌套循环，应折叠为常量 -----------------------------------===//
 
 ejit_entry
 uint64_t fold_loop(
-    ejit_period_arr_ind(loopfold) uint8_t ci)
+    EJIT_DIM(loopfold) uint8_t ci)
 {
   uint64_t sum = 0;
   for (uint32_t i = 0; i < g_loopfold[ci].outer_n; i++)

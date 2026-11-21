@@ -118,7 +118,7 @@ struct RankingLog {
   uint32_t callbackCore = kEJitInvalidCoreId;
   bool succeed = true;
 };
-bool mockMayConstRanking(void *ctx) {
+bool mockPeriodConstRanking(void *ctx) {
   auto *log = static_cast<RankingLog *>(ctx);
   ++log->calls;
   log->callbackCore = EJitCoreId::current();
@@ -582,10 +582,10 @@ TEST_F(SharedTaskPoolTest, ExactlyOneOwnerAcrossCores) {
   EXPECT_EQ(c0.init(), EJitSharedTaskPool::InitResult::AttachedReady);
 }
 
-TEST_F(SharedTaskPoolTest, PeerRequestsMayConstRankingFromOwnerWorker) {
+TEST_F(SharedTaskPoolTest, PeerRequestsPeriodConstRankingFromOwnerWorker) {
   EJitSharedTaskPool owner;
   RankingLog log;
-  owner.setMayConstRankingCallback(&mockMayConstRanking, &log);
+  owner.setPeriodConstRankingCallback(&mockPeriodConstRanking, &log);
   bringUpOwner(owner);
 
   EJitSharedTaskPool peer;
@@ -596,12 +596,12 @@ TEST_F(SharedTaskPoolTest, PeerRequestsMayConstRankingFromOwnerWorker) {
   EJitCoreId::setCurrentForTest(1);
   ASSERT_EQ(peer.init(), EJitSharedTaskPool::InitResult::AttachedReady);
 
-  EXPECT_TRUE(peer.requestMayConstRanking());
+  EXPECT_TRUE(peer.requestPeriodConstRanking());
   EXPECT_EQ(log.calls, 1u);
   EXPECT_EQ(log.callbackCore, 0u);
-  EXPECT_EQ(state_->mayConstRankingRequest.loadAcquire(), 1u);
-  EXPECT_EQ(state_->mayConstRankingComplete.loadAcquire(), 1u);
-  EXPECT_EQ(state_->mayConstRankingResult.loadAcquire(), 1u);
+  EXPECT_EQ(state_->periodConstRankingRequest.loadAcquire(), 1u);
+  EXPECT_EQ(state_->periodConstRankingComplete.loadAcquire(), 1u);
+  EXPECT_EQ(state_->periodConstRankingResult.loadAcquire(), 1u);
 }
 
 //===----------------------------------------------------------------------===//
@@ -4322,7 +4322,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainsOnPeriodToggle) {
 
 // What a per-core table cannot do. Two cores fill DISJOINT partitions of the
 // same shared table (the deployment premise: each core drives its own
-// ejit_period_lc instance indices). A toggle issued on a THIRD core zeroes both
+// ejit_guard instance indices). A toggle issued on a THIRD core zeroes both
 // partitions, so neither of the other cores keeps calling a stale
 // specialization -- and neither of them had to call into the runtime to find
 // out.

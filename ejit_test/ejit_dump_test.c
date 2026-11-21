@@ -22,18 +22,18 @@
 typedef enum { MODE_A = 0, MODE_B = 1, MODE_C = 2 } Mode_t;
 
 typedef struct {
-  Mode_t ejit_may_const mode;
-  int ejit_may_const threshold;
+  Mode_t EJIT_PERIOD_CONST mode;
+  int EJIT_PERIOD_CONST threshold;
   int gain;
 } CellCfg;
 
 //===--- Period variables --------------------------------------------------===//
 
-ejit_period_arr(cell) CellCfg g_cells[16];
+ejit_group(cell) CellCfg g_cells[16];
 
 //===--- JIT entry functions -----------------------------------------------===//
 
-ejit_entry int check_cell(ejit_period_arr_ind(cell) uint8_t idx) {
+ejit_entry int check_cell(EJIT_DIM(cell) uint8_t idx) {
   if (g_cells[idx].mode == MODE_A)
     return g_cells[idx].threshold * 10 + g_cells[idx].gain;
   else if (g_cells[idx].mode == MODE_B)
@@ -42,7 +42,7 @@ ejit_entry int check_cell(ejit_period_arr_ind(cell) uint8_t idx) {
     return g_cells[idx].threshold * 5 + g_cells[idx].gain;
 }
 
-ejit_entry int simple_return(ejit_period_arr_ind(cell) uint8_t idx) {
+ejit_entry int simple_return(EJIT_DIM(cell) uint8_t idx) {
   return g_cells[idx].threshold + g_cells[idx].gain;
 }
 
@@ -225,17 +225,17 @@ int main(int argc, char **argv) {
   }
   CHECK(recount >= after_count, "recompile adds dump files (no overwrite)");
 
-  // --- Test 5: verify pre.ll has may_const metadata ---
+  // --- Test 5: verify pre.ll has period_const metadata ---
   printf("\n--- Test 5: pre.ll contains metadata ---\n");
   snprintf(cmd, sizeof(cmd), "ls %s/check_cell_*_pre.ll 2>/dev/null | head -1", dumpDir);
   fp = popen(cmd, "r");
   if (fp && fgets(pre_path, sizeof(pre_path), fp)) {
     pre_path[strcspn(pre_path, "\n")] = 0;
-    int has_mayconst = file_contains(pre_path, "ejit.may_const");
-    int has_period = file_contains(pre_path, "ejit_period_arr") ||
-                     file_contains(pre_path, "ejit_period");
-    CHECK(has_mayconst, "pre.ll contains ejit.may_const metadata");
-    CHECK(has_period, "pre.ll contains ejit_period_arr metadata");
+    int has_period_const = file_contains(pre_path, "ejit.period_const");
+    int has_period = file_contains(pre_path, "ejit_group_indexed") ||
+                     file_contains(pre_path, "ejit_group");
+    CHECK(has_period_const, "pre.ll contains ejit.period_const metadata");
+    CHECK(has_period, "pre.ll contains ejit_group metadata");
   }
   if (fp) pclose(fp);
 

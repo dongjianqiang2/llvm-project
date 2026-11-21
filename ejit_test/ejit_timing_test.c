@@ -24,14 +24,14 @@
 //===-- EJIT 属性 -----------------------------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
-  ejit_may_const uint32_t priority;
-  ejit_may_const uint32_t maxPower;
+  EJIT_PERIOD_CONST uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t priority;
+  EJIT_PERIOD_CONST uint32_t maxPower;
   uint32_t result;
 };
 
 #define N 16
-ejit_period_arr(cell) struct CellCfg g_cfg[N];
+ejit_group(cell) struct CellCfg g_cfg[N];
 
 //===-- JIT entry (简单函数，减少自身计算对测量的干扰) ----------------------===//
 
@@ -44,7 +44,7 @@ uint32_t simple_jit(void) {
 // 场景 B: 单维度参数
 ejit_entry
 uint32_t cell_jit(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   if (g_cfg[ci].cellType == 0xFD) {
     return g_cfg[ci].maxPower * 2;
@@ -54,16 +54,16 @@ uint32_t cell_jit(
 
 // 场景 C: 双维度参数
 struct TrpCfg {
-  ejit_may_const uint32_t trpType;
+  EJIT_PERIOD_CONST uint32_t trpType;
   uint32_t status;
 };
 #define M 8
-ejit_period_arr(trp) struct TrpCfg g_trp[M];
+ejit_group(trp) struct TrpCfg g_trp[M];
 
 ejit_entry
 uint32_t multi_jit(
-    ejit_period_arr_ind(cell) uint8_t ci,
-    ejit_period_arr_ind(trp)  uint8_t ti)
+    EJIT_DIM(cell) uint8_t ci,
+    EJIT_DIM(trp)  uint8_t ti)
 {
   if (g_cfg[ci].cellType == 0xFD && g_trp[ti].trpType == 1) {
     return g_cfg[ci].maxPower * g_trp[ti].trpType;

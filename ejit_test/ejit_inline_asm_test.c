@@ -13,12 +13,12 @@
 #include "ejit_test_helpers.h"
 
 struct CellCfg {
-  ejit_may_const uint32_t base;
-  ejit_may_const uint32_t bonus;
+  EJIT_PERIOD_CONST uint32_t base;
+  EJIT_PERIOD_CONST uint32_t bonus;
   uint32_t noise;
 };
 
-ejit_period_arr(cell) struct CellCfg g_cellCfg[4] = {
+ejit_group(cell) struct CellCfg g_cellCfg[4] = {
     {10, 3, 100},
     {20, 5, 200},
     {30, 7, 300},
@@ -37,7 +37,7 @@ static int g_failures = 0;
     }                                                                          \
   } while (0)
 
-ejit_entry uint32_t inline_asm_add(ejit_period_arr_ind(cell) uint8_t cellIdx,
+ejit_entry uint32_t inline_asm_add(EJIT_DIM(cell) uint8_t cellIdx,
                                    uint32_t dynamic) {
   uint32_t base = g_cellCfg[cellIdx].base;
   uint32_t bonus = g_cellCfg[cellIdx].bonus;

@@ -27,44 +27,44 @@
 
 extern void ejit_shutdown(void);
 
-//===-- 结构体定义 (多类型 may_const) -----------------------------------------===//
+//===-- 结构体定义 (多类型 period_const) -----------------------------------------===//
 
 struct PhyConfig {
-    ejit_may_const uint32_t phyMode;   // TDD/FDD
-    ejit_may_const uint32_t carrierFreq;
-    ejit_may_const uint32_t bandwidth;
+    EJIT_PERIOD_CONST uint32_t phyMode;   // TDD/FDD
+    EJIT_PERIOD_CONST uint32_t carrierFreq;
+    EJIT_PERIOD_CONST uint32_t bandwidth;
     uint32_t rxGain;                                     // 可变
     uint32_t txPower;
 };
 
 struct CellConfig {
-    ejit_may_const uint32_t cellType;
-    ejit_may_const uint32_t cellId;
-    ejit_may_const uint32_t pci;        // Physical Cell ID
+    EJIT_PERIOD_CONST uint32_t cellType;
+    EJIT_PERIOD_CONST uint32_t cellId;
+    EJIT_PERIOD_CONST uint32_t pci;        // Physical Cell ID
     uint32_t trafficLoad;
     struct {
-        ejit_may_const uint32_t freqBand;
-        ejit_may_const uint32_t antennaPorts;
+        EJIT_PERIOD_CONST uint32_t freqBand;
+        EJIT_PERIOD_CONST uint32_t antennaPorts;
         uint32_t currentPower;
     } rf;
 };
 
 struct TrpConfig {
-    ejit_may_const uint32_t trpType;
-    ejit_may_const uint32_t beamCount;
+    EJIT_PERIOD_CONST uint32_t trpType;
+    EJIT_PERIOD_CONST uint32_t beamCount;
     uint32_t activeBeams;
 };
 
 struct SliceConfig {
-    ejit_may_const uint32_t sliceType;  // eMBB/URLLC/mMTC
-    ejit_may_const uint32_t priority;
-    ejit_may_const float    latencyTarget;
+    EJIT_PERIOD_CONST uint32_t sliceType;  // eMBB/URLLC/mMTC
+    EJIT_PERIOD_CONST uint32_t priority;
+    EJIT_PERIOD_CONST float    latencyTarget;
     uint32_t throughput;
 };
 
 //===-- 全局变量: 多数组共享同一时间窗名 -----------------------------------------===//
 
-ejit_period(static) struct PhyConfig g_phyCfg;
+ejit_group(static) struct PhyConfig g_phyCfg;
 
 #define N_CELL  16
 #define M_TRP   8
@@ -72,25 +72,25 @@ ejit_period(static) struct PhyConfig g_phyCfg;
 #define P_CARRIER 4
 
 // cell 时间窗: 两个数组共享 "cell" 名称
-ejit_period_arr(cell) struct CellConfig  g_cellCfg[N_CELL];
-ejit_period_arr(cell) struct PhyConfig   g_cellPhy[N_CELL];
+ejit_group(cell) struct CellConfig  g_cellCfg[N_CELL];
+ejit_group(cell) struct PhyConfig   g_cellPhy[N_CELL];
 
-ejit_period_arr(trp)  struct TrpConfig   g_trpCfg[M_TRP];
-ejit_period_arr(slice) struct SliceConfig g_sliceCfg[K_SLICE];
-ejit_period_arr(carrier) struct PhyConfig  g_carrierCfg[P_CARRIER];
+ejit_group(trp)  struct TrpConfig   g_trpCfg[M_TRP];
+ejit_group(slice) struct SliceConfig g_sliceCfg[K_SLICE];
+ejit_group(carrier) struct PhyConfig  g_carrierCfg[P_CARRIER];
 
 //===-- 场景 A: 4 维度 max (cell + trp + slice + carrier) ---------------------===//
 
 /**
  * 极限测试: 同时依赖 4 个时间窗数组 (SPEC4 规定的最大值)。
- * JIT 时 4 个维度参数的运行值确定，对应的 may_const 字段全部特化。
+ * JIT 时 4 个维度参数的运行值确定，对应的 period_const 字段全部特化。
  */
 ejit_entry
 int process_multi_dim(
-    ejit_period_arr_ind(cell)    uint8_t cellIdx,
-    ejit_period_arr_ind(trp)     uint8_t trpIdx,
-    ejit_period_arr_ind(slice)   uint8_t sliceIdx,
-    ejit_period_arr_ind(carrier) uint8_t carrierIdx)
+    EJIT_DIM(cell)    uint8_t cellIdx,
+    EJIT_DIM(trp)     uint8_t trpIdx,
+    EJIT_DIM(slice)   uint8_t sliceIdx,
+    EJIT_DIM(carrier) uint8_t carrierIdx)
 {
     int result = 0;
 
@@ -155,14 +155,14 @@ int process_multi_dim(
 
 ejit_entry
 uint32_t process_all_trps(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     uint32_t total = 0;
     uint32_t cellType = g_cellCfg[cellIdx].cellType;
 
     // 遍历所有 TRP (不使用 trp ind — 遍历全部)
     for (uint8_t t = 0; t < M_TRP; t++) {
-        // trp 不是 ejit_period_arr_ind，所以 trpType 不是 JIT 常量
+        // trp 不是 ejit_dim，所以 trpType 不是 JIT 常量
         // 但 cellType 是 JIT 常量 → switch 可被部分折叠
         switch (cellType) {
         case 0xFD:
@@ -186,11 +186,11 @@ uint32_t process_all_trps(
 //===-- 场景 C: 循环展开边界 (L3 Optimize) ------------------------------------===//
 
 /**
- * 小循环 + may_const 界限: JIT 在 L3 优化等级可完全展开。
+ * 小循环 + period_const 界限: JIT 在 L3 优化等级可完全展开。
  */
 ejit_entry
 uint32_t process_slice_loop(
-    ejit_period_arr_ind(slice) uint8_t sliceIdx)
+    EJIT_DIM(slice) uint8_t sliceIdx)
 {
     uint32_t sum = 0;
 
@@ -220,11 +220,11 @@ uint32_t process_slice_loop(
  * 生命周期函数有多个 return 点。
  * PASS4 必须在每个 return 前插入 activate (逆序)。
  */
-ejit_period_lc(cell)
-ejit_period_lc(trp)
+ejit_guard(cell)
+ejit_guard(trp)
 int reconfig_cell_trp(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx,
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx,
     uint32_t newCellType,
     uint32_t newTrpType)
 {
@@ -246,18 +246,18 @@ int reconfig_cell_trp(
     return 0;
 }
 
-//===-- 场景 E: 生命周期 — 仅修改非 may_const 字段 ----------------------------===//
+//===-- 场景 E: 生命周期 — 仅修改非 period_const 字段 ----------------------------===//
 
 /**
- * 即使只修改非 may_const 字段，如果标记了 ejit_period_lc，
+ * 即使只修改非 period_const 字段，如果标记了 ejit_guard，
  * 仍然触发 deactivate/activate。
  */
-ejit_period_lc(trp)
+ejit_guard(trp)
 void update_trp_power(
-    ejit_period_arr_ind(trp) uint8_t trpIdx,
+    EJIT_DIM(trp) uint8_t trpIdx,
     uint32_t power)
 {
-    g_trpCfg[trpIdx].activeBeams = power;  // 非 may_const 字段
+    g_trpCfg[trpIdx].activeBeams = power;  // 非 period_const 字段
 }
 
 //===-- 辅助函数 ------------------------------------------------------------===//
@@ -418,7 +418,7 @@ int main(int argc, char **argv)
     rc = reconfig_cell_trp(cellIdx, trpIdx, 0xFFFF, 5);
     printf("  rc = %d (expected -1)\n\n", rc);
 
-    // --- 场景 E: 生命周期 仅修改非 may_const ---
+    // --- 场景 E: 生命周期 仅修改非 period_const ---
     printf("--- 场景E: update_trp_power(trp=%u, power=32) ---\n", trpIdx);
     printf("  before: activeBeams=%u\n", g_trpCfg[trpIdx].activeBeams);
     update_trp_power(trpIdx, 32);

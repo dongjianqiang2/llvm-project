@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-register-period -S %s | FileCheck %s
+; RUN: opt -passes=ejit-register-group -S %s | FileCheck %s
 
 ; llvm.global_ctors appears before function definitions
 ; CHECK: @llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @ejit_auto_register, ptr null }]
@@ -15,5 +15,5 @@ define void @dummy() {
   ret void
 }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 10}}
-!11 = distinct !{!{!"ejit_period", !"static"}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 10}}
+!11 = distinct !{!{!"ejit_group", !"static"}}

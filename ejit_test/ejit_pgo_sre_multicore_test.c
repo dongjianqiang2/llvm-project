@@ -40,12 +40,12 @@ extern uint8_t g_ucLocalCoreID;
 static const uint32_t kProducerCores[PGO_PRODUCER_COUNT] = {18u, 19u, 20u};
 
 struct PgoMcCfg {
-  ejit_may_const uint32_t multiplier;
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t multiplier;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t salt;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
+EJIT_SHARED_SECTION_ATTR ejit_group(cell)
 struct PgoMcCfg g_pgo_mc_cfg[PGO_PRODUCER_COUNT];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_mc_ready_mask;
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_mc_done_mask;
@@ -65,17 +65,17 @@ EJIT_SHARED_SECTION_ATTR volatile uint64_t g_pgo_mc_sink;
   } while (0)
 
 ejit_entry uint32_t
-pgo_mc_func0(ejit_period_arr_ind(cell) uint8_t cell, uint32_t seed) {
+pgo_mc_func0(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x101u);
 }
 
 ejit_entry uint32_t
-pgo_mc_func1(ejit_period_arr_ind(cell) uint8_t cell, uint32_t seed) {
+pgo_mc_func1(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x202u);
 }
 
 ejit_entry uint32_t
-pgo_mc_func2(ejit_period_arr_ind(cell) uint8_t cell, uint32_t seed) {
+pgo_mc_func2(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x303u);
 }
 

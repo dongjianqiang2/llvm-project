@@ -29,7 +29,7 @@ namespace llvm {
 class TargetMachine;
 namespace ejit {
 
-struct EJitMayConstLoadSite;
+struct EJitPeriodConstLoadSite;
 
 /// One function of the last Tier-1 compile, captured for the value-profile
 /// merge: its symbol name, the MD5 hash of its IR-level PGO name (the same
@@ -53,8 +53,8 @@ public:
   /// Run the full JIT specialization pipeline:
   ///   1. Parameter substitution (ejit_period_arr_ind → constants)
   ///   2. InstCombine (fold GEP chains from substituted params)
-  ///   3. Inline (L2+: expand callee bodies so may_const GEPs are traceable)
-  ///   4. StructFieldPass (may_const loads → runtime constants)
+  ///   3. Inline (L2+: expand callee bodies so period_const GEPs are traceable)
+  ///   4. StructFieldPass (period_const loads → runtime constants)
   ///   5. Core optimization pipeline (L1/L2/L3)
   ///
   /// ctx.tier selects the PGO branch (EJIT_ONLINE_PGO.md §4): Baseline (no
@@ -84,8 +84,8 @@ public:
   }
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  ArrayRef<EJitMayConstLoadSite> getLastMayConstLoadSites() const {
-    return lastMayConstLoadSites_;
+  ArrayRef<EJitPeriodConstLoadSite> getLastPeriodConstLoadSites() const {
+    return lastPeriodConstLoadSites_;
   }
 #endif
 
@@ -96,10 +96,10 @@ public:
     scalarSiteCountsByFunc_[funcName] = count;
   }
 
-  /// Print a descending per-entry ranking of dynamically removed may_const
+  /// Print a descending per-entry ranking of dynamically removed period_const
   /// loads per million sample ticks, with per-entry and active-site context.
   /// Returns false when no completed specialization sample is available.
-  bool printMayConstRanking() const;
+  bool printPeriodConstRanking() const;
 
 private:
   /// Attach the pointer facts the ejit_bound_ptr contract already guarantees
@@ -140,7 +140,7 @@ private:
   void captureCounterGlobals(Module &M);
 
   /// Run the EJIT optimization pipeline: a single fused sequence that exploits
-  /// the just-substituted period-index / may_const constants to their fixed
+  /// the just-substituted period-index / period_const constants to their fixed
   /// point (scalar fold/propagate/simplify), folds loops whose bounds became
   /// constant, re-specializes the array accesses that unrolling turns into
   /// constant-index GEPs, then does a final cleanup and vectorization at
@@ -149,10 +149,10 @@ private:
                                CompileTier tier);
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  void recordMayConstBenefit(const SpecializationContext &ctx,
-                             ArrayRef<EJitMayConstLoadSite> inputSites,
-                             uint64_t specializedMayConstLoads,
-                             ArrayRef<EJitMayConstLoadSite> finalSites,
+  void recordPeriodConstBenefit(const SpecializationContext &ctx,
+                             ArrayRef<EJitPeriodConstLoadSite> inputSites,
+                             uint64_t specializedPeriodConstLoads,
+                             ArrayRef<EJitPeriodConstLoadSite> finalSites,
                              uint64_t sampledEntries);
 #endif
 
@@ -197,13 +197,13 @@ private:
   StringMap<uint32_t> scalarSiteCountsByFunc_;
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  SmallVector<EJitMayConstLoadSite, 16> lastMayConstLoadSites_;
+  SmallVector<EJitPeriodConstLoadSite, 16> lastPeriodConstLoadSites_;
 #endif
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
-  StringMap<DenseMap<uint64_t, EJitMayConstBenefitSample>>
-      mayConstBenefitSamples_;
-  mutable EJitAtomicU32 mayConstBenefitLock_{0};
+  StringMap<DenseMap<uint64_t, EJitPeriodConstBenefitSample>>
+      periodConstBenefitSamples_;
+  mutable EJitAtomicU32 periodConstBenefitLock_{0};
 #endif
 
   // Grant the unit-test accessor visibility into the private pipeline steps.

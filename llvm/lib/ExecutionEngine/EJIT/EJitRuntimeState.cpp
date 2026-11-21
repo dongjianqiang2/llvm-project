@@ -202,8 +202,9 @@ bool EJitRuntimeState::isActive(const std::string &periodName,
   std::lock_guard<decltype(mutex_)> lock(mutex_);
 #endif
   // The built-in "static" time window is always active (SPEC4 §2.1).
-  // static variables are registered via ejit_register_static_var, not
-  // listed in arraysByPeriod_, so getArrays("static") returns nullptr.
+  // Scalar groups are registered via ejit_register_static_var, not listed
+  // in arraysByPeriod_; pointer/array groups named "static" may be listed,
+  // but the name short-circuit below keeps them always active anyway.
   if (periodName == "static")
     return true;
 

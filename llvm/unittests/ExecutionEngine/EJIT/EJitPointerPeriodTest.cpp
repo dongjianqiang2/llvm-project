@@ -92,7 +92,7 @@ struct PointerFixture {
       IR << "%root";
     IR << ", i64 1, i32 1, i64 %idx, i32 " << Field
        << "\n"
-          "  %v = load i8, ptr %selected, !ejit.may_const !7\n"
+          "  %v = load i8, ptr %selected, !ejit.period_const !7\n"
           "  %cond = icmp eq i8 %v, 1\n"
           "  br i1 %cond, label %hot, label %cold\n"
           "hot:\n  call void @yes(i16 %slot)\n"
@@ -101,14 +101,14 @@ struct PointerFixture {
           "}\n!0 = !{!1";
     if (Layout)
       IR << ", !8";
-    IR << "}\n!1 = !{!\"ejit_period_arr\", !\"cell\", i32 0}\n"
+    IR << "}\n!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 0}\n"
           "!3 = !{!4";
     if (Lifecycle)
       IR << ", !5";
     if (FreeDim)
       IR << ", !6";
     IR << "}\n!4 = !{!\"ejit_entry\"}\n"
-          "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+          "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
           "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n!7 = !{}\n"
           "!8 = !{!\"ejit_pointer_layout\", i64 "
        << Stride;
@@ -133,7 +133,7 @@ static unsigned markedLoads(Module &M) {
   unsigned Count = 0;
   for (Instruction &I : instructions(M.getFunction("probe")))
     if (auto *LI = dyn_cast<LoadInst>(&I))
-      Count += LI->hasMetadata("ejit.may_const");
+      Count += LI->hasMetadata("ejit.period_const");
   return Count;
 }
 
@@ -191,7 +191,7 @@ static void selectElementZero(Module &M, PointerFixture &Fixture,
     for (const MDOperand &Op : GV->getMetadata("ejit.metadata")->operands())
       Tags.push_back(Op.get());
     SmallVector<Metadata *, 16> Fields{
-        MDString::get(Ctx, "ejit_may_const_field")};
+        MDString::get(Ctx, "ejit_period_const_field")};
     for (unsigned I = 0; I < Fixture.Slots; ++I)
       Fields.push_back(ConstantAsMetadata::get(
           ConstantInt::get(Type::getInt32Ty(Ctx), 8 + I * 4 + 1)));
@@ -321,7 +321,7 @@ TEST(EJitPointerPeriod, LightweightRejectsUnsafeOrUnauthorizedWitnesses) {
       for (Instruction &I :
            make_early_inc_range(instructions(M->getFunction("probe"))))
         if (auto *Load = dyn_cast<LoadInst>(&I))
-          if (Load->hasMetadata("ejit.may_const")) {
+          if (Load->hasMetadata("ejit.period_const")) {
             if (Case == 5)
               Load->setVolatile(true);
             else if (Case == 6)
@@ -330,8 +330,8 @@ TEST(EJitPointerPeriod, LightweightRejectsUnsafeOrUnauthorizedWitnesses) {
               IRBuilder<> B(Load);
               auto *Wide = B.CreateAlignedLoad(
                   B.getInt16Ty(), Load->getPointerOperand(), Align(1));
-              Wide->setMetadata("ejit.may_const",
-                                Load->getMetadata("ejit.may_const"));
+              Wide->setMetadata("ejit.period_const",
+                                Load->getMetadata("ejit.period_const"));
               Load->replaceAllUsesWith(B.CreateTrunc(Wide, B.getInt8Ty()));
               Load->eraseFromParent();
             }
@@ -517,13 +517,13 @@ TEST(EJitPointerPeriod, LightweightFoldsFlattenedModuloStride128) {
            << reinterpret_cast<uintptr_t>(Data.data()) + 31 +
                   (NonzeroElement ? 128 : 0)
            << " to ptr), i64 %bytes\n"
-              "  %v = load i8, ptr %p, !ejit.may_const !7\n"
+              "  %v = load i8, ptr %p, !ejit.period_const !7\n"
               "  ret i8 %v\n}\n"
               "!0 = !{!1, !8}\n"
-              "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 0}\n"
+              "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 0}\n"
               "!3 = !{!4, !5, !6}\n"
               "!4 = !{!\"ejit_entry\"}\n"
-              "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+              "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
               "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n"
               "!7 = !{}\n"
               "!8 = !{!\"ejit_pointer_layout\", i64 128, !9}\n"
@@ -590,14 +590,14 @@ TEST(EJitPointerPeriod, LightweightLegacyOffsetsStillRequireTypedAccessWidth) {
       for (Instruction &I :
            make_early_inc_range(instructions(M->getFunction("probe"))))
         if (auto *Load = dyn_cast<LoadInst>(&I))
-          if (Load->hasMetadata("ejit.may_const")) {
+          if (Load->hasMetadata("ejit.period_const")) {
             IRBuilder<> B(Load);
             Value *Address = Load->getPointerOperand();
             if (Case == 2)
               Address = B.CreateGEP(B.getInt16Ty(), Address, B.getInt64(0));
             auto *Wide = B.CreateAlignedLoad(B.getInt16Ty(), Address, Align(1));
-            Wide->setMetadata("ejit.may_const",
-                              Load->getMetadata("ejit.may_const"));
+            Wide->setMetadata("ejit.period_const",
+                              Load->getMetadata("ejit.period_const"));
             Load->replaceAllUsesWith(B.CreateTrunc(Wide, B.getInt8Ty()));
             Load->eraseFromParent();
           }
@@ -632,7 +632,7 @@ TEST(EJitPointerPeriod, PreservesBoundPointerContextAfterLoopUnrolling) {
           loop:
             %i = phi i64 [0, %entry], [%next, %loop]
             %p = getelementptr inbounds i8, ptr %cfg, i64 %i
-            %v = load i8, ptr %p, !ejit.may_const !7
+            %v = load i8, ptr %p, !ejit.period_const !7
             call void @observe(i8 %v, i16 %slot)
             %next = add nuw nsw i64 %i, 1
             %more = icmp ult i64 %next, 4
@@ -642,7 +642,7 @@ TEST(EJitPointerPeriod, PreservesBoundPointerContextAfterLoopUnrolling) {
           }
           !0 = !{!1, !2, !3}
           !1 = !{!"ejit_entry"}
-          !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+          !2 = !{!"ejit_dim", !"cell", i32 0}
           !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4,
                   !4, !5, !6, !10}
           !4 = !{i64 0, i64 1}
@@ -663,7 +663,9 @@ TEST(EJitPointerPeriod, PreservesBoundPointerContextAfterLoopUnrolling) {
           if (WithSnapshot)
             Context.boundPointers.push_back({Data, sizeof(Data), 2, 1});
           Context.tier = Mode ? CompileTier::PGOUse : CompileTier::Baseline;
+#ifdef EJIT_SRE_PGO_BRANCH_AUDIT
           Context.profileAuditOnly = Mode == 2;
+#endif
           Context.optLevel = Level;
           PeriodArrayRegistry Registry;
           EJitOptimizer Optimizer(Registry);
@@ -752,7 +754,7 @@ TEST(EJitPointerPeriod, FoldsStaticPointerPeriod) {
   ASSERT_NE(M, nullptr);
   MDNode *Old = M->getGlobalVariable("cfg")->getMetadata("ejit.metadata");
   auto *Static = MDNode::get(
-      Ctx, {MDString::get(Ctx, "ejit_period"), MDString::get(Ctx, "static")});
+      Ctx, {MDString::get(Ctx, "ejit_group"), MDString::get(Ctx, "static")});
   M->getGlobalVariable("cfg")->setMetadata(
       "ejit.metadata", MDNode::get(Ctx, {Static, Old->getOperand(1).get()}));
   PeriodArrayRegistry Registry;
@@ -784,12 +786,12 @@ TEST(EJitPointerPeriod, FoldsFlattenedPeriodAndSlotOffsets) {
           "  %idx = zext i16 %phase to i64\n"
           "  %field = getelementptr inbounds nuw %Slot, ptr %block, "
           "i64 %idx, i32 1\n"
-          "  %value = load i8, ptr %field, !ejit.may_const !7\n"
+          "  %value = load i8, ptr %field, !ejit.period_const !7\n"
           "  store i8 0, ptr %field\n  ret i8 %value\n}\n"
           "!0 = !{!1, !8}\n"
-          "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 0}\n"
+          "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 0}\n"
           "!3 = !{!4, !5, !6}\n!4 = !{!\"ejit_entry\"}\n"
-          "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+          "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
           "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n!7 = !{}\n"
           "!8 = !{!\"ejit_pointer_layout\", i64 4, !9}\n"
           "!9 = !{i64 1, i64 1}\n";
@@ -839,7 +841,7 @@ TEST(EJitPointerPeriod, RejectsCrossFieldAndAtomicLoads) {
     SmallVector<LoadInst *, 4> Loads;
     for (Instruction &I : instructions(M->getFunction("probe")))
       if (auto *Load = dyn_cast<LoadInst>(&I))
-        if (Load->hasMetadata("ejit.may_const"))
+        if (Load->hasMetadata("ejit.period_const"))
           Loads.push_back(Load);
     for (LoadInst *Load : Loads) {
       if (Atomic) {
@@ -848,8 +850,8 @@ TEST(EJitPointerPeriod, RejectsCrossFieldAndAtomicLoads) {
         IRBuilder<> B(Load);
         auto *Wide = B.CreateAlignedLoad(B.getInt16Ty(),
                                          Load->getPointerOperand(), Align(1));
-        Wide->setMetadata("ejit.may_const",
-                          Load->getMetadata("ejit.may_const"));
+        Wide->setMetadata("ejit.period_const",
+                          Load->getMetadata("ejit.period_const"));
         Load->replaceAllUsesWith(B.CreateTrunc(Wide, B.getInt8Ty()));
         Load->eraseFromParent();
       }
@@ -922,7 +924,7 @@ TEST(EJitPointerPeriod, RejectsInvalidWitnessAndUnauthorizedField) {
       M->getGlobalVariable("cfg")->setMetadata(
           "ejit.metadata",
           MDNode::get(
-              Ctx, {MDNode::get(Ctx, {MDString::get(Ctx, "ejit_period_arr"),
+              Ctx, {MDNode::get(Ctx, {MDString::get(Ctx, "ejit_group_indexed"),
                                       MDString::get(Ctx, "cell"),
                                       ConstantAsMetadata::get(ConstantInt::get(
                                           Type::getInt32Ty(Ctx), 0))}),
@@ -1166,11 +1168,11 @@ TEST(EJitPointerPeriod, AllocationLookupDoesNotMakeExistingFoldAmbiguous) {
         nullptr, "storage");
     auto *I32 = Type::getInt32Ty(Ctx);
     SmallVector<Metadata *, 8> StorageMD{MDNode::get(
-        Ctx, {MDString::get(Ctx, "ejit_period_arr"), MDString::get(Ctx, "cell"),
+        Ctx, {MDString::get(Ctx, "ejit_group_indexed"), MDString::get(Ctx, "cell"),
               ConstantAsMetadata::get(ConstantInt::get(I32, 2))})};
     for (unsigned I = 0; I < Fixture.Slots; ++I)
       StorageMD.push_back(MDNode::get(
-          Ctx, {MDString::get(Ctx, "ejit_may_const_field"),
+          Ctx, {MDString::get(Ctx, "ejit_period_const_field"),
                 ConstantAsMetadata::get(ConstantInt::get(I32, 8 + I * 4 + 1))}));
     Storage->setMetadata("ejit.metadata", MDNode::get(Ctx, StorageMD));
     PeriodArrayRegistry Registry;
@@ -1223,7 +1225,7 @@ TEST(EJitPointerPeriod, DiscoversFlattenedConstantElementAddress) {
     ASSERT_NE(M, nullptr);
     for (Instruction &I : instructions(M->getFunction("probe")))
       if (auto *Load = dyn_cast<LoadInst>(&I))
-        if (Load->hasMetadata("ejit.may_const")) {
+        if (Load->hasMetadata("ejit.period_const")) {
           IRBuilder<> B(Load);
           auto *Base = ConstantExpr::getIntToPtr(
               B.getInt64(reinterpret_cast<uintptr_t>(Fixture.Pointer)),
@@ -1261,7 +1263,7 @@ TEST(EJitPointerPeriod, ConstantDiscoveryRequiresStrictAuthorization) {
     SmallVector<LoadInst *, 4> Loads;
     for (Instruction &I : instructions(M->getFunction("probe")))
       if (auto *Load = dyn_cast<LoadInst>(&I))
-        if (Load->hasMetadata("ejit.may_const"))
+        if (Load->hasMetadata("ejit.period_const"))
           Loads.push_back(Load);
     for (LoadInst *Load : Loads) {
       if (Rejection == 7)
@@ -1272,8 +1274,8 @@ TEST(EJitPointerPeriod, ConstantDiscoveryRequiresStrictAuthorization) {
         IRBuilder<> B(Load);
         auto *Wide = B.CreateAlignedLoad(B.getInt16Ty(),
                                          Load->getPointerOperand(), Align(1));
-        Wide->setMetadata("ejit.may_const",
-                          Load->getMetadata("ejit.may_const"));
+        Wide->setMetadata("ejit.period_const",
+                          Load->getMetadata("ejit.period_const"));
         Load->replaceAllUsesWith(B.CreateTrunc(Wide, B.getInt8Ty()));
         Load->eraseFromParent();
       }

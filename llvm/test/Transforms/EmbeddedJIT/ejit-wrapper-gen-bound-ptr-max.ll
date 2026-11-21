@@ -14,7 +14,7 @@ entry:
 
 !0 = distinct !{!1, !2, !3, !4, !5, !6, !7, !8, !9, !10, !11}
 !1 = !{!"ejit_entry"}
-!2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+!2 = !{!"ejit_dim", !"cell", i32 0}
 !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4}
 !4 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4}
 !5 = !{!"ejit_bound_ptr", !"cell", i32 3, i64 4}

@@ -3,8 +3,8 @@
 // Validates EJIT with a real-world C library (zstd).
 //
 // Design:
-//   - Compression parameters (level, windowLog, etc.) are ejit_may_const
-//     fields in a global struct marked ejit_period(static).
+//   - Compression parameters (level, windowLog, etc.) are EJIT_PERIOD_CONST
+//     fields in a global struct marked ejit_group(static).
 //   - The compress() function is ejit_entry — JIT specializes it for the
 //     current parameter values, replacing loads with constants.
 //   - After InstCombine + Inline, the constant values propagate into
@@ -30,17 +30,17 @@
 //===--- EJIT-annotated compression parameters ----------------------------===//
 
 typedef struct {
-  int ejit_may_const compressionLevel;   // 1..22
-  int ejit_may_const windowLog;          // 10..31
-  int ejit_may_const chainLog;           // 6..30
-  int ejit_may_const hashLog;            // 6..30
-  int ejit_may_const searchLog;          // 1..10
-  int ejit_may_const minMatch;           // 3..7
-  int ejit_may_const targetLength;       // 0..large
-  int ejit_may_const strategy;           // ZSTD_fast..ZSTD_btultra2
+  int EJIT_PERIOD_CONST compressionLevel;   // 1..22
+  int EJIT_PERIOD_CONST windowLog;          // 10..31
+  int EJIT_PERIOD_CONST chainLog;           // 6..30
+  int EJIT_PERIOD_CONST hashLog;            // 6..30
+  int EJIT_PERIOD_CONST searchLog;          // 1..10
+  int EJIT_PERIOD_CONST minMatch;           // 3..7
+  int EJIT_PERIOD_CONST targetLength;       // 0..large
+  int EJIT_PERIOD_CONST strategy;           // ZSTD_fast..ZSTD_btultra2
 } CompressCfg;
 
-ejit_period(static) CompressCfg g_cfg;
+ejit_group(static) CompressCfg g_cfg;
 
 // Pre-allocated compression context (reused across calls).
 // Not annotated — this is runtime mutable state.

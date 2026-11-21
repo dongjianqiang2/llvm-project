@@ -5,10 +5,10 @@
 // RUN: cat %t.dump/*.ll | FileCheck %s --check-prefix=EMBED
 
 struct __attribute__((aligned(64))) Algo {
-  unsigned long long bits __attribute__((ejit_may_const));
+  unsigned long long bits __attribute__((ejit_period_const));
   char padding[56];
 };
-extern struct Algo *table __attribute__((ejit_period_arr("trp")));
+extern struct Algo *table __attribute__((ejit_group("trp")));
 struct Context { char padding[20]; unsigned short slot; unsigned char choice; };
 struct Flags { char padding[8]; _Bool flag; };
 extern void before_a(void);
@@ -36,10 +36,10 @@ int branch_local(unsigned char trp __attribute__((ejit_dim("trp"))),
 }
 
 // RAW-LABEL: define {{.*}} @branch_local(
-// RAW-COUNT-3: load i64, {{.*}}align 64, {{.*}}!ejit.may_const
+// RAW-COUNT-3: load i64, {{.*}}align 64, {{.*}}!ejit.period_const
 // RAW-NOT: load i64
 // AOT-NOT: @__ejit_local_free_dim
 // EMBED-LABEL: define {{.*}} @branch_local(
 // EMBED: call i16 @__ejit_local_free_dim_v1_i16
-// EMBED-COUNT-2: load i64, {{.*}}align 64, {{.*}}!ejit.may_const
+// EMBED-COUNT-2: load i64, {{.*}}align 64, {{.*}}!ejit.period_const
 // EMBED-NOT: load i64

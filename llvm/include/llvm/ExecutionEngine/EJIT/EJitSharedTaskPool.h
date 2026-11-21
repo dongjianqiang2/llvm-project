@@ -230,7 +230,7 @@ void ejitIcacheClearAll();
 // dims) on a successful resolve (icacheFill), and empties the whole array on
 // a period toggle (icacheDrainAll); the wrapper reads the cell directly.
 // Called from ejit_register_icache_slot (name->funcIndex resolution) at
-// ejit_auto_register / .ejit_period time.
+// ejit_auto_register / .ejit_group time.
 //
 // Every core registers the SAME base: with EJIT_ICACHE_SECTION set the array is
 // one shared object, which is what lets a drain on any core clear the cells
@@ -409,7 +409,7 @@ public:
   using OwnerReleasedFn = void (*)(void *ctx);
   /// Owner-private diagnostic callback. It runs only on the owner worker and
   /// may access owner-local optimizer state.
-  using MayConstRankingCallback = bool (*)(void *ctx);
+  using PeriodConstRankingCallback = bool (*)(void *ctx);
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   using TestHookFn = void (*)(void *ctx);
 #endif
@@ -513,9 +513,9 @@ public:
     publishFn_ = fn;
     publishCtx_ = ctx;
   }
-  void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
-    mayConstRankingFn_ = fn;
-    mayConstRankingCtx_ = ctx;
+  void setPeriodConstRankingCallback(PeriodConstRankingCallback fn, void *ctx) {
+    periodConstRankingFn_ = fn;
+    periodConstRankingCtx_ = ctx;
   }
   void setReleaser(ReleaseCallback fn, void *ctx) {
     const bool had = (releaseFn_ != nullptr);
@@ -1114,10 +1114,10 @@ public:
   /// core.
   bool requestCodeBatchFlushAndWait();
 
-  /// Ask the owner worker to print its owner-local may_const ranking. Any
+  /// Ask the owner worker to print its owner-local period_const ranking. Any
   /// attached core may call this; concurrent callers coalesce. The call waits
   /// for the owner to complete the diagnostic and returns its success status.
-  bool requestMayConstRanking();
+  bool requestPeriodConstRanking();
 
   /// The worker loop body: poll until the shared state leaves Ready. Public so
   /// an injected task entry can forward to it; normally reached via
@@ -1153,7 +1153,7 @@ private:
   /// normal worker loop. Batch helpers must call this between internal compile
   /// operations because they execute more than one operation per worker step.
   void workerThrottle();
-  bool serviceMayConstRankingRequest();
+  bool servicePeriodConstRankingRequest();
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
@@ -1377,8 +1377,8 @@ private:
   void *codeRangeCtx_ = nullptr;
   CodePoolStatsCallback codePoolStatsFn_ = nullptr;
   void *codePoolStatsCtx_ = nullptr;
-  MayConstRankingCallback mayConstRankingFn_ = nullptr;
-  void *mayConstRankingCtx_ = nullptr;
+  PeriodConstRankingCallback periodConstRankingFn_ = nullptr;
+  void *periodConstRankingCtx_ = nullptr;
   CodeReadyCallback codeReadyFn_ = nullptr;
   CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;
   void *codeBatchCtx_ = nullptr;

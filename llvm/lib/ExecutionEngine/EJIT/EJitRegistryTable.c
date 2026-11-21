@@ -13,13 +13,13 @@
 // placed in dedicated registry sections. The linker concatenates these input
 // sections across every TU. The leading-dot names are not valid C identifiers,
 // so the linker does not auto-synthesize __start_/__stop_; a linker script
-// defines __start_/__stop_ejit_bitcode and __start_/__stop_ejit_period and
+// defines __start_/__stop_ejit_bitcode and __start_/__stop_ejit_group and
 // brackets the sections, which the runtime (EJit.cpp) walks as [start, stop)
 // ranges.
 //
 // Current layout:
 //   .ejit_bitcode : embedded bitcode and symbol entries
-//   .ejit_period  : period/static entries plus lifecycle/funcIndex fixups
+//   .ejit_group  : period/static entries plus lifecycle/funcIndex fixups
 //
 // This avoids the "duplicate symbol" link errors that arose when more than one
 // TU defined ejit_entry functions: previously every such TU emitted a strong

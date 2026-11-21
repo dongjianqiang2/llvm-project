@@ -41,6 +41,6 @@ entry:
   ret void
 }
 
-!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
-!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 1}}
-!2 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
+!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}}
+!1 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 1}}
+!2 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}

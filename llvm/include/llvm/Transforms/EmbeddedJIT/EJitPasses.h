@@ -27,8 +27,8 @@ struct EJitRegisterBitcodePass
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
-struct EJitRegisterPeriodPass
-    : public PassInfoMixin<EJitRegisterPeriodPass> {
+struct EJitRegisterGroupPass
+    : public PassInfoMixin<EJitRegisterGroupPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
@@ -37,8 +37,8 @@ struct EJitWrapperGenPass
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
-struct EJitPeriodHandlerPass
-    : public PassInfoMixin<EJitPeriodHandlerPass> {
+struct EJitGuardHandlerPass
+    : public PassInfoMixin<EJitGuardHandlerPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
