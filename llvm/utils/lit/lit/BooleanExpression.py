@@ -30,6 +30,10 @@ class BooleanExpression:
         try:
             parser = BooleanExpression(string, set(variables))
             return parser.parseAll()
+        except re.error as e:
+            raise ValueError(
+                "invalid regex in boolean expression: %s\nin expression: %r" % (e, string)
+            )
         except ValueError as e:
             raise ValueError(str(e) + ("\nin expression: %r" % string))
 
@@ -244,6 +248,12 @@ class TestBooleanExpression(unittest.TestCase):
         self.assertTrue(BooleanExpression.evaluate("(false && false) || true", {}))
         self.assertFalse(BooleanExpression.evaluate("false && (false || true)", {}))
 
+    def test_invalid_regex_reports_expression(self):
+        with self.assertRaises(ValueError) as ctx:
+            BooleanExpression.evaluate("{{(}}", {})
+
+        self.assertIn("invalid regex in boolean expression", str(ctx.exception))
+        self.assertIn("in expression: '{{(}}'", str(ctx.exception))
     # Evaluate boolean expression `expr`.
     # Fail if it does not throw a ValueError containing the text `error`.
     def checkException(self, expr, error):
