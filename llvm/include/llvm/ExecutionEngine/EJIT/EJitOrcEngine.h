@@ -42,6 +42,7 @@ struct EJitTieredCodePoolStats {
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
+struct EJitWorkerVerifyCapture;
 struct EJitVpFunctionInfo; // defined in EJitOptimizer.h (value-profile capture)
 enum class CompileTier : uint8_t;
 
@@ -96,6 +97,9 @@ enum class CompileTier : uint8_t {
 struct SpecializationContext {
   std::string fnName;
   uint64_t cacheKey = 0;
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  EJitWorkerVerifyCapture *workerVerify = nullptr;
+#endif
   struct DimInfo {
     std::string periodName;
     uint8_t cellIdx;

@@ -2116,6 +2116,17 @@ void ejit_print_code_pool_stats(void) {
   gEJIT->printCodePoolStats();
 }
 
+ejit_status_t ejit_worker_verify_dump(void) {
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  if (gEJIT)
+    if (auto *Pool = gEJIT->sharedTaskPool())
+      return Pool->requestWorkerVerifyDump() ? EJIT_OK : EJIT_ERR_NOT_ACTIVE;
+  return EJIT_ERR_NOT_ACTIVE;
+#else
+  return EJIT_ERR_DISABLED;
+#endif
+}
+
 void ejit_print_mayconst_ranking(void) {
   if (!gEJIT) {
     EJIT_DIAG_RAW("mayconst-ranking: not initialized");

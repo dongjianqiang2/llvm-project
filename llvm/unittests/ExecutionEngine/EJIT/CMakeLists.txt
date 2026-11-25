@@ -29,6 +29,14 @@ add_llvm_unittest(EJITTests
   PARTIAL_SOURCES_INTENDED
   )
 
+if(EJIT_WORKER_VERIFY_SUBSTITUTION AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT EJIT_FREESTANDING AND NOT EJIT_CODE_POOL_BATCHED_PUBLISH AND
+   EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL "")
+  target_sources(EJITTests PRIVATE EJitWorkerVerifierTest.cpp)
+  target_include_directories(EJITTests PRIVATE
+    "${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT")
+endif()
+
 # The value-profile test sources are #ifdef EJIT_SRE_PGO_VALUE_PROFILE-gated,
 # matching the LLVMEJIT build; without these definitions they compile to empty
 # translation units.

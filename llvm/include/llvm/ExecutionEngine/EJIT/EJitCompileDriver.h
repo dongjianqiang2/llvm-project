@@ -37,6 +37,7 @@ namespace ejit {
 
 class EJitOrcEngine;
 class EJitLogger;
+class EJitWorkerVerifier;
 
 /// Unified entry point for sync and async compilation. Handles cache
 /// lookup, time-window state verification, bitcode retrieval, and
@@ -63,7 +64,7 @@ public:
   /// Cold compile path WITHOUT storing into the LRU EJitCache. Used as the
   /// taskpool's compile callback (the taskpool owns its own fixed cache).
   /// Returns the JIT function pointer or nullptr.
-  void *compileNow(const EJitCompileRequest &req);
+  void *compileNow(const EJitCompileRequest &req, bool CollectVerify = false);
 
   /// Taskpool commit notification. A value-profile round is consumed only
   /// after Tier-2 is actually published, so failed commits keep collecting.
@@ -154,6 +155,9 @@ private:
 #endif
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   EJitSharedTaskPool sharedPool_;
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  std::unique_ptr<EJitWorkerVerifier> workerVerifier_;
+#endif
   EJitSreTask sharedWorkerTask_;
   // Worker start/stop adapters bridging the shared pool to the platform task
   // abstraction (host std::thread / SRE platform task). Static so the shared
@@ -180,7 +184,8 @@ private:
   /// the request's funcIndex high bits (EJitSreQueue.h); gated by
   /// Config::enablePgo (off => Baseline regardless).
   void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru,
-                    const EJitCompileRequest *request = nullptr);
+                    const EJitCompileRequest *request = nullptr,
+                    bool CollectVerify = false);
 
   /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md
   /// §5.2). Filled after a Tier-1 compile (ORC lookup of __profc_/__profd_

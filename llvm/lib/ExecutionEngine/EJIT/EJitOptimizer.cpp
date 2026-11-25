@@ -935,6 +935,9 @@ void EJitOptimizer::runStructFieldPass(Module &M,
   for (const auto &Dim : ctx.dimensions)
     LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName, LocalPeriods);
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  structField.setWorkerVerifyCapture(ctx.workerVerify);
+#endif
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {

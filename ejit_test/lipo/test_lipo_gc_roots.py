@@ -17,6 +17,7 @@ DUMP_APIS = (
     "ejit_dump_func",
     "ejit_print_dumped",
     "ejit_print_dumped_module",
+    "ejit_worker_verify_dump",
 )
 
 
@@ -59,7 +60,8 @@ def build_archive(root, clang, ar, symbols, name):
     run(
         [
             clang,
-            "--target=x86_64-unknown-linux-gnu",
+            "--target=" + os.environ.get("EJIT_LIPO_TEST_TARGET",
+                                         "x86_64-unknown-linux-gnu"),
             "-c",
             "-ffunction-sections",
             source,

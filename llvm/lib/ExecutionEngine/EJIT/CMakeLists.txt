@@ -130,6 +130,9 @@ list(APPEND EJIT_SOURCES
   EJitSreQueue.cpp
   EJitWorker.cpp
 )
+if(EJIT_WORKER_VERIFY_SUBSTITUTION)
+  list(APPEND EJIT_SOURCES EJitWorkerVerifier.cpp)
+endif()
 if(EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
 else()
@@ -273,6 +276,11 @@ if(EJIT_SRE_SHARED_TASKPOOL AND
    NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
   target_compile_definitions(LLVMEJIT PRIVATE
     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE})
+endif()
+
+if(EJIT_WORKER_VERIFY_SUBSTITUTION)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_WORKER_VERIFY_PERIOD="${EJIT_WORKER_VERIFY_PERIOD}")
 endif()
 
 # Cross-core fnPtr sharing capability (option declared in llvm/CMakeLists.txt,

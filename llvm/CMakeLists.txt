@@ -985,6 +985,18 @@ endif()
 #   -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(\".ejit_shared\")))
 set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
   "Attribute placing the shared taskpool state into inter-core shared memory")
+option(EJIT_WORKER_VERIFY_SUBSTITUTION
+  "Check selected live may_const substitutions on the shared worker" OFF)
+set(EJIT_WORKER_VERIFY_PERIOD "" CACHE STRING
+  "Name of a shared, resident period to check on the worker")
+if(EJIT_WORKER_VERIFY_SUBSTITUTION)
+  if(NOT EJIT_SRE_SHARED_TASKPOOL OR NOT EJIT_DIAG_ENABLE OR
+     NOT EJIT_WORKER_VERIFY_PERIOD MATCHES "^[A-Za-z0-9_.-]+$")
+    message(FATAL_ERROR
+      "Worker verification requires shared taskpool, diagnostics, and a named shared EJIT_WORKER_VERIFY_PERIOD")
+  endif()
+  add_definitions(-DEJIT_WORKER_VERIFY_SUBSTITUTION)
+endif()
 if(EJIT_SRE_SHARED_TASKPOOL)
   if(NOT EJIT_SRE_TASKPOOL)
     message(FATAL_ERROR "EJIT_SRE_SHARED_TASKPOOL requires EJIT_SRE_TASKPOOL=ON")

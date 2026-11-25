@@ -999,6 +999,67 @@ bool EJitSharedTaskPool::versionsCurrent(const EJitCompileRequest &req) const {
   return true;
 }
 
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+bool EJitSharedTaskPool::requestWorkerVerifyDump() {
+  if (!asyncServiceAvailable() || !workerVerifyFn_ ||
+      state_->ownerCoreId.loadAcquire() != EJitCoreId::current())
+    return false;
+  workerVerifyDump_.storeRelease(1);
+  return true;
+}
+
+std::optional<bool>
+EJitSharedTaskPool::workerVerifyLive(const EJitCompileRequest &Req,
+                                    uintptr_t Fn) const {
+  if (!state_ || !Fn || Req.numDims > kEJitSharedMaxDims ||
+      state_->initState.loadAcquire() != kReady ||
+      state_->generation.loadAcquire() != Req.generation ||
+      !versionsCurrent(Req))
+    return false;
+  for (unsigned I = 0; I < Req.numDims; ++I)
+    if (!isInstanceActive(Req.dims[I].dimType, Req.dims[I].instanceId))
+      return false;
+  const auto Key = hashIdentity(stripReqTier(Req.funcIndex), Req.dims,
+                                Req.numDims);
+  auto &Bucket = state_->buckets[Key % kEJitSharedCacheBuckets];
+  // Another publisher may still be finishing a Sync request. Snapshot
+  // identity only; do not perform a real dispatch lookup or count a hit.
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  uint32_t Seq;
+  if (!bucketSeqBegin(Bucket, Seq))
+    return std::nullopt;
+#else
+  if (!bucketTryRead(Bucket))
+    return std::nullopt;
+#endif
+  bool Match = false;
+  for (const auto &Slot : Bucket.slots) {
+    if (Slot.state.loadAcquire() !=
+            static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
+        Slot.fnPtr.loadAcquire() != Fn || Slot.identityHash != Key ||
+        Slot.generation != Req.generation ||
+        Slot.tier.loadAcquire() != decodeReqTier(Req.funcIndex) ||
+        Slot.funcIndex != stripReqTier(Req.funcIndex) ||
+        Slot.numDims != Req.numDims)
+      continue;
+    Match = true;
+    for (unsigned I = 0; I < Req.numDims; ++I)
+      Match &= Slot.dims[I].dimType == Req.dims[I].dimType &&
+               Slot.dims[I].instanceId == Req.dims[I].instanceId &&
+               Slot.versions[I] == Req.versions[I];
+    if (Match)
+      break;
+  }
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  if (!bucketSeqStable(Bucket, Seq))
+    return std::nullopt;
+#else
+  bucketReadRelease(Bucket);
+#endif
+  return Match;
+}
+#endif
+
 //===----------------------------------------------------------------------===//
 // Dedup helpers (§3.5) over the shared flat slots. Each slot stores the OWNER
 // GENERATION that claimed it (0 = free), so cross-generation clears are
@@ -3849,7 +3910,13 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     return;
   }
   void *fn = nullptr;
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  bool ok = workerVerifyCompileFn_
+                ? workerVerifyCompileFn_(workerVerifyCtx_, req, &fn)
+                : compileFn_ && compileFn_(compileCtx_, req, &fn);
+#else
   bool ok = compileFn_ && compileFn_(compileCtx_, req, &fn);
+#endif
   if (!ok || !fn) {
     dropBatchRequestMarker();
     dedupClear(req.funcIndex, req.generation);
@@ -4060,6 +4127,11 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
       return EJitWorkerStep::Consumed;
     if (serviceAutoTier2Publish())
       return EJitWorkerStep::Consumed;
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+    if (workerVerifyFn_)
+      workerVerifyFn_(workerVerifyCtx_, workerVerifyDump_.loadRelaxed() &&
+                                           workerVerifyDump_.exchange(0));
+#endif
     return EJitWorkerStep::Idle;
   case EJitSharedInitState::Initializing:
     // The owner is still arming the pool. The SRE task may have been scheduled
