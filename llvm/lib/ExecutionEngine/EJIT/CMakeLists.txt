@@ -94,6 +94,9 @@ set(EJIT_SOURCES
 
 # PASS3 always emits the shared taskpool C ABI.
 list(APPEND EJIT_SOURCES EJitSharedTaskPool.cpp EJitSharedPlatform.cpp)
+if(EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT)
+  list(APPEND EJIT_SOURCES EJitBootstrapPool.cpp)
+endif()
 if(EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
   set(EJIT_SRE_TASK_PRIORITY "20" CACHE STRING
@@ -222,6 +225,9 @@ target_compile_definitions(LLVMEJIT PRIVATE
 if(NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
   target_compile_definitions(LLVMEJIT PRIVATE
     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE})
+endif()
+if(EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT)
 endif()
 
 # Cross-core fnPtr sharing capability (option declared in llvm/CMakeLists.txt,

@@ -233,6 +233,9 @@ struct EJitIcacheSlotReg {
   // Null for guarded slots (3D/4D, timing): their empty value stays 0.
   const void *missFn;
 };
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+EJIT_SHARED_SECTION
+#endif
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
 
 // A cell viewed as the atomic it is: EJitAtomic<uintptr_t> is a standard-layout

@@ -160,6 +160,8 @@ typedef struct ejit_code_pool_stats_v2_t {
 } ejit_code_pool_stats_v2_t;
 
 // Initialization
+// With EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT, only the fixed worker may
+// initialize. Producers use the shared taskpool directly once it is Ready.
 ejit_status_t ejit_init(const ejit_config_t *config);
 /// Initialize with online PGO enabled (Tier-1 instrumentation + lazy Tier-2
 /// PGOUse recompile). Uses the same config layout as ejit_init(config) but forces
@@ -194,9 +196,10 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 // toggle (icacheDrainAll) -- the &MissFn sentinel when \p missFn is non-null
 // (the branchless probe BLRs the cell, so the empty value must be callable),
 // 0 otherwise. Keys the slot by the SAME registry funcIndex assigned by
-// ejit_register_funcindex. Called by AOT auto-registration on EVERY core: the
-// table is one shared object, so each core records the same base and a drain
-// on any of them clears the cells all of them read. A null slot, capacity
+// ejit_register_funcindex. The table is one shared object, so a drain on any
+// core clears the cells all of them read. Normally the slot is registered on
+// each core; in worker-only mode the worker registers it once for all cores.
+// A null slot, capacity
 // exhaustion, or a numDims above the cap is recorded; the base stays null and
 // the probe misses. \p missFn has no default: this header is shared with pure
 // C translation units (default arguments are C++-only).

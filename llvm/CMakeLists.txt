@@ -944,6 +944,25 @@ endif()
 #   -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(\".ejit_shared\")))
 set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
   "Attribute placing the shared taskpool state into inter-core shared memory")
+option(EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  "Use worker-only initialization with lazy producer taskpool binding" OFF)
+if(EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT)
+  if(NOT EJIT_SRE_SHARED_CODE_POINTERS OR NOT EJIT_SRE_CODE_POOL OR
+     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL "" OR
+     EJIT_ICACHE_SECTION STREQUAL "" OR
+     (EJIT_FREESTANDING AND EJIT_SHARED_SECTION_ATTR STREQUAL ""))
+    message(FATAL_ERROR
+      "EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT requires a fixed worker core, shared "
+      "code pointers, the SRE code pool and a shared inline-cache section "
+      "(plus EJIT_SHARED_SECTION_ATTR on freestanding targets)")
+  endif()
+  set(EJIT_FIXUP_SECTION "${EJIT_ICACHE_SECTION}" CACHE STRING
+    "Initialized shared section for EJIT worker-only registry fixups")
+  if(EJIT_FIXUP_SECTION STREQUAL "")
+    message(FATAL_ERROR "Worker-only initialization requires a shared EJIT_FIXUP_SECTION")
+  endif()
+  message(STATUS "EmbeddedJIT: worker-only initialization (fixups=${EJIT_FIXUP_SECTION})")
+endif()
 # FUNC_SLOTS is the gIcacheSlots[] capacity; any funcIndex >= FUNC_SLOTS has
 # its icacheFill silently dropped and the wrapper's inline probe misses
 # forever (every call falls through to MissFn -> tryCacheHit -> cacheHits++).

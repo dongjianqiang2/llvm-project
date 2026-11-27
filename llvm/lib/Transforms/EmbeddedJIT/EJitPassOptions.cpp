@@ -10,7 +10,13 @@
 using namespace llvm;
 
 cl::opt<bool> EnableEJitGlobalCtors(
-    "enable-ejit-global-ctors", cl::init(true), cl::Hidden,
+    "enable-ejit-global-ctors",
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    cl::init(false),
+#else
+    cl::init(true),
+#endif
+    cl::Hidden,
     cl::desc("Generate llvm.global_ctors for auto-registration "
              "(disable for bare-metal / testing)"));
 

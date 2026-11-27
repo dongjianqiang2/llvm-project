@@ -1,6 +1,9 @@
 //===-- EJitCompileDriver.cpp - Compilation Scheduler ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+#include "EJitBootstrapPool.h"
+#endif
 #include "EJitCodePoolCounters.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -174,13 +177,19 @@ bool sharedPeriodConstRankingThunk(void *ctx) {
 }
 } // namespace
 
+#ifndef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
 namespace {
+#endif
 // The single process-global shared taskpool state. Placed in the cross-core
 // shared section (an empty attribute on host, where one address space already
 // exists). Every EJit instance's driver binds to THIS same blob and elects a
 // single worker owner across cores via CAS.
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+EJIT_SHARED_SECTION EJitSharedTaskPoolState llvm::ejit::gEJitSharedTaskPoolState;
+#else
 EJIT_SHARED_SECTION EJitSharedTaskPoolState gEJitSharedTaskPoolState;
 } // namespace
+#endif
 
 EJitCompileDriver::EJitCompileDriver(const Config &config,
                                      EJitRuntimeState &runtimeState,

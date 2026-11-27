@@ -18,6 +18,10 @@
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+#include "EJitBootstrapPool.h"
+#include "EJitCodePoolCounters.h"
+#endif
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
@@ -109,6 +113,53 @@ static void bindDumpSharedStateFromRuntime() {
   setDumpSharedState(gEJIT->sharedTaskPool()->state());
 }
 
+static EJitSharedTaskPool *taskpoolForApi(bool RequireReady = true) {
+  if (gEJIT)
+    return gEJIT->sharedTaskPool();
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  return getEJitBootstrapPool(RequireReady);
+#else
+  (void)RequireReady;
+  return nullptr;
+#endif
+}
+
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+static ejit_status_t changeBootstrapPeriod(const char *Name, uint32_t Instance,
+                                            bool Enabled, bool All = false) {
+  auto *Pool = getEJitBootstrapPool();
+  if (!Pool)
+    return EJIT_ERR_NOT_ACTIVE;
+  uint32_t Dim = lookupEJitBootstrapDim(Name);
+  if (Dim == kEJitInvalidDimType || (!All && Instance >= kEJitSharedInstances))
+    return EJIT_ERR_INVALID_PARAM;
+  if (All)
+    Pool->setAllInstancesEnabled(Dim, Enabled);
+  else
+    Pool->setInstanceEnabled(Dim, Instance, Enabled);
+  return EJIT_OK;
+}
+
+#ifdef EJIT_DUMP_SUPPORT
+// Debug commands may use dump storage; the first business miss must not.
+static bool bindBootstrapDumpIfNeeded() {
+  if (gEJIT)
+    return true;
+  auto *Pool = getEJitBootstrapPool();
+  if (!Pool)
+    return false;
+  static EJitAtomicU32 Bound;
+  uint32_t Expected = 0;
+  if (Bound.compareExchange(Expected, 1)) {
+    setDumpSharedState(Pool->state());
+    Bound.storeRelease(2);
+    return true;
+  }
+  return Expected == 2;
+}
+#endif
+#endif
+
 static void parseConfig(const ejit_config_t *src, Config &dst) {
   if (!src)
     return;
@@ -136,6 +187,10 @@ static_assert(std::is_standard_layout<ejit_config_t>::value,
 // Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
 // the online-PGO auto-trigger on regardless of the (unversioned) config.
 static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  if (EJitCoreId::current() != EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE)
+    return EJIT_ERR_DISABLED;
+#endif
   if (gEJIT) {
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
@@ -196,6 +251,10 @@ ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
 }
 
 void ejit_shutdown(void) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  if (!gEJIT)
+    return;
+#endif
   EJIT_DIAG("shutting down");
   setDumpSharedState(nullptr);
   delete gEJIT;
@@ -433,8 +492,12 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
 
 ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    return changeBootstrapPeriod(periodName, cellIdx, true);
+#else
     EJIT_DIAG("activate(%s,%u) failed: not initialized", periodName, cellIdx);
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   }
   // The independent C++ entry checks cellIdx before narrowing it.
   if (!periodName)
@@ -450,8 +513,12 @@ ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
 
 ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    return changeBootstrapPeriod(periodName, cellIdx, false);
+#else
     EJIT_DIAG("deactivate(%s,%u) failed: not initialized", periodName, cellIdx);
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   }
   if (!periodName)
     return EJIT_ERR_INVALID_PARAM;
@@ -465,8 +532,12 @@ ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx) {
 ejit_status_t ejit_activate_all(const char *periodName) {
   EJIT_DIAG("activate_all(%s)", periodName);
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    return changeBootstrapPeriod(periodName, 0, true, true);
+#else
     EJIT_DIAG("activate_all(%s) failed: not initialized", periodName);
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   }
   if (!periodName || !gEJIT->activateAll(periodName))
     return EJIT_ERR_INVALID_PARAM;
@@ -476,8 +547,12 @@ ejit_status_t ejit_activate_all(const char *periodName) {
 ejit_status_t ejit_deactivate_all(const char *periodName) {
   EJIT_DIAG("deactivate_all(%s)", periodName);
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    return changeBootstrapPeriod(periodName, 0, false, true);
+#else
     EJIT_DIAG("deactivate_all(%s) failed: not initialized", periodName);
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   }
   if (!periodName || !gEJIT->deactivateAll(periodName))
     return EJIT_ERR_INVALID_PARAM;
@@ -487,8 +562,14 @@ ejit_status_t ejit_deactivate_all(const char *periodName) {
 
 bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    auto *Pool = getEJitBootstrapPool();
+    return Pool && Pool->isInstanceActive(lookupEJitBootstrapDim(periodName),
+                                          cellIdx);
+#else
     EJIT_DIAG("is_active(%s,%u) failed: not initialized", periodName, cellIdx);
     return false;
+#endif
   }
   if (!periodName)
     return false;
@@ -497,15 +578,16 @@ bool ejit_is_active(const char *periodName, uint32_t cellIdx) {
 
 void ejit_clear_cache(void) {
   EJIT_DIAG("clear_cache");
-  if (!gEJIT)
-    return;
-  gEJIT->clearCache();
-  gEJIT->sharedTaskPool()->retireDispatchCache();
+  if (gEJIT)
+    gEJIT->clearCache();
+  if (auto *Pool = taskpoolForApi())
+    Pool->retireDispatchCache();
 }
 
 void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
   EJIT_DIAG("invalidate(%s,%u)", periodName, cellIdx);
-  if (!gEJIT)
+  auto *Pool = taskpoolForApi();
+  if (!Pool)
     return;
   // Reject out-of-range indices instead of truncating at the ABI boundary and
   // invalidating the wrong instance (pre-fix uint8_t signature).
@@ -517,8 +599,13 @@ void ejit_invalidate(const char *periodName, uint32_t cellIdx) {
   }
   if (!periodName)
     return;
-  gEJIT->invalidateByPeriod(periodName, cellIdx);
-  gEJIT->sharedTaskPool()->retireDispatchCache();
+  if (gEJIT)
+    gEJIT->invalidateByPeriod(periodName, cellIdx);
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  else if (lookupEJitBootstrapDim(periodName) == kEJitInvalidDimType)
+    return;
+#endif
+  Pool->retireDispatchCache();
 }
 
 ejit_status_t ejit_get_stats(ejit_stats_t *stats) {
@@ -611,9 +698,9 @@ ejit_status_t EJitRuntimeDispatch::resolve(
   // The AOT wrapper calls this on every ejit_entry invocation, so a per-call
   // "not initialized" log would noise the trace; the caller already handles
   // the status code.
-  if (!gEJIT)
+  auto *tp = taskpoolForApi();
+  if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
-  auto *tp = gEJIT->sharedTaskPool();
   if (!validateBoundPtrDescriptors(boundPointers, boundCount)) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: invalid bound pointer "
               "list count=%u",
@@ -743,40 +830,44 @@ void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled) {
   EJIT_DIAG_VERBOSE("taskpool_set_instance_enabled dim=%u inst=%u enabled=%u",
                     dimType, instanceId, enabled);
-  if (!gEJIT) {
+  auto *sp = taskpoolForApi();
+  if (!sp) {
     EJIT_DIAG("taskpool_set_instance_enabled reject: not initialized");
     return;
   }
-  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
   sp->setInstanceEnabled(dimType, instanceId, enabled != 0);
 }
 
 void ejit_taskpool_release_read(uint32_t bucketIndex) {
-  if (!gEJIT) {
+  auto *tp = taskpoolForApi(false);
+  if (!tp) {
     EJIT_DIAG("taskpool_release_read bucket=%u reject: not initialized",
               bucketIndex);
     return;
   }
-  auto *tp = gEJIT->sharedTaskPool();
   tp->releaseRead(bucketIndex);
 }
 
 unsigned ejit_taskpool_pending_count(void) {
-  if (!gEJIT) {
+  auto *tp = taskpoolForApi();
+  if (!tp) {
     EJIT_DIAG("taskpool_pending_count reject: not initialized");
     return 0;
   }
-  auto *tp = gEJIT->sharedTaskPool();
   return tp->pendingCount();
 }
 
 ejit_status_t ejit_publish_pending_code(void) {
 #ifdef EJIT_CODE_POOL_BATCHED_PUBLISH
-  if (!gEJIT) {
+  auto *sp = taskpoolForApi();
+  if (!sp) {
     EJIT_DIAG("publish_pending_code failed: not initialized");
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    return EJIT_ERR_NOT_ACTIVE;
+#else
     return EJIT_ERR_DISABLED;
+#endif
   }
-  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
   if (!sp->requestCodeBatchFlushAndWait()) {
     EJIT_DIAG("publish_pending_code failed: worker flush/enable");
     return EJIT_ERR_COMPILE_FAILED;
@@ -794,11 +885,11 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
     EJIT_DIAG("taskpool_get_stats failed: null out pointer");
     return EJIT_ERR_INVALID_PARAM;
   }
-  if (!gEJIT) {
+  auto *sp = taskpoolForApi();
+  if (!sp) {
     EJIT_DIAG("taskpool_get_stats failed: not initialized");
     return EJIT_ERR_NOT_ACTIVE;
   }
-  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
   EJitSharedDiagnostics d;
   sp->getDiagnostics(d);
   out->cacheHits = d.cacheHits;
@@ -916,7 +1007,8 @@ void ejit_taskpool_print_compiled() {
   // (the walk takes bucket read locks for no output).
   return;
 #else
-  if (!gEJIT) {
+  auto *sp = taskpoolForApi();
+  if (!sp) {
     EJIT_DIAG_RAW("print_compiled: not initialized");
     return;
   }
@@ -924,12 +1016,11 @@ void ejit_taskpool_print_compiled() {
   // read locks while printing nothing.
   if (gEJitDiagLevel < EJIT_LOG_LVL_INFO)
     return;
-  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
   if (!sp->state()) {
     EJIT_DIAG_RAW("print_compiled: no shared taskpool / state");
     return;
   }
-  EJitModuleLoader &loader = gEJIT->moduleLoader();
+  EJitModuleLoader *loader = gEJIT ? &gEJIT->moduleLoader() : nullptr;
   // Two walks so the summary line can print FIRST: a count-only pass tallies
   // the numDims spread, then a print pass emits the throttled entry lines.
   // The walk is documented best-effort (not a snapshot), so a concurrent
@@ -998,7 +1089,7 @@ void ejit_taskpool_print_compiled() {
   // Entry lines: one RAW (prefix-free) line per Ready slot, throttled after
   // each printed line.
   struct PrintCtx {
-    EJitModuleLoader &loader;
+    EJitModuleLoader *loader;
     bool reuseTrackingEnabled;
     uint32_t threshold;
   } printCtx{loader, ReuseTrackingEnabled,
@@ -1006,9 +1097,10 @@ void ejit_taskpool_print_compiled() {
   EJitSharedTaskPool::ForEachCompiledStats st2 = sp->forEachCompiled(
       [](const EJitSharedCacheSlot &slot, void *cbCtx) {
         PrintCtx &ctx = *static_cast<PrintCtx *>(cbCtx);
-        EJitModuleLoader &ld = ctx.loader;
-        const std::string &name =
-            ld.getFuncNameByFuncIdx(slot.funcIndex);
+        StringRef name;
+        if (ctx.loader)
+          name = ctx.loader->getFuncNameByFuncIdx(slot.funcIndex);
+        const char *displayName = name.empty() ? "<unknown>" : name.data();
         // Per the publish protocol: fnPtr is read with acquire only after
         // state==Ready was observed with acquire (forEachCompiled did).
         void *fn = reinterpret_cast<void *>(slot.fnPtr.loadAcquire());
@@ -1062,7 +1154,7 @@ void ejit_taskpool_print_compiled() {
                         "pool=%s pool_id=%u "
                         "gen=%u%s",
                         slot.funcIndex,
-                        name.empty() ? "<unknown>" : name.c_str(), Tier,
+                        displayName, Tier,
                         slot.numDims, dims, fn, PostPublishSeen, ver,
                         static_cast<unsigned long long>(slot.codeSize),
                         PoolKind, slot.poolId, slot.generation, samples);
@@ -1070,7 +1162,7 @@ void ejit_taskpool_print_compiled() {
           EJIT_DIAG_RAW("funcIdx=%u name=%s tier=%s numDims=%u dims=[%s] fn=%p "
                         "pool=%s post_publish_seen=%s%s",
                         slot.funcIndex,
-                        name.empty() ? "<unknown>" : name.c_str(), Tier,
+                        displayName, Tier,
                         slot.numDims, dims, fn, PoolKind, PostPublishSeen, samples);
         }
         ejitDiagPrintThrottle();
@@ -1087,6 +1179,10 @@ void ejit_taskpool_print_compiled() {
 
 void ejit_dump_func(const char *name) {
 #ifdef EJIT_DUMP_SUPPORT
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  if (!bindBootstrapDumpIfNeeded())
+    return;
+#endif
   // gDumpSharedState is bound once in ejit_init (and cleared in ejit_shutdown);
   // no per-call rebind needed here.
   std::string filter = (name && name[0]) ? std::string(name) : std::string();
@@ -1097,6 +1193,10 @@ void ejit_dump_func(const char *name) {
 
 void ejit_print_dumped(const char *name) {
 #ifdef EJIT_DUMP_SUPPORT
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  if (!bindBootstrapDumpIfNeeded())
+    return;
+#endif
   // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
   EJIT_DIAG_RAW("print_dumped name=%s", (name && name[0]) ? name : "(all)");
   (void)printDumped(name);
@@ -1105,6 +1205,10 @@ void ejit_print_dumped(const char *name) {
 
 void ejit_print_dumped_module(const char *name) {
 #ifdef EJIT_DUMP_SUPPORT
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+  if (!bindBootstrapDumpIfNeeded())
+    return;
+#endif
   EJIT_DIAG_RAW("print_dumped_module name=%s",
                 (name && name[0]) ? name : "(all)");
   (void)printDumpedModule(name);
@@ -1116,9 +1220,9 @@ void ejit_print_dumped_module(const char *name) {
 constexpr uint32_t kEJitInvalidOwnerCore = 0xFFFFFFFFu;
 
 uint32_t ejit_taskpool_get_worker_core() {
-  if (!gEJIT)
+  auto *sp = taskpoolForApi();
+  if (!sp)
     return kEJitInvalidOwnerCore;
-  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
   EJitSharedTaskPoolState *sp_state = sp->state();
   if (!sp_state)
     return kEJitInvalidOwnerCore;
@@ -1165,8 +1269,16 @@ ejit_status_t ejit_get_code_pool_stats(ejit_code_pool_stats_t *out) {
     return EJIT_ERR_INVALID_PARAM;
   }
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    ejit_code_pool_stats_v2_t Stats;
+    auto Status = ejit_get_code_pool_stats_v2(&Stats);
+    if (Status == EJIT_OK)
+      *out = Stats.total;
+    return Status;
+#else
     EJIT_DIAG("get_code_pool_stats: not initialized");
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   }
   if (!gEJIT->getCodePoolStats(out)) {
     EJIT_DIAG("get_code_pool_stats: no code pool (EJIT_SRE_CODE_POOL off or no "
@@ -1182,8 +1294,21 @@ ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out) {
     return EJIT_ERR_INVALID_PARAM;
   }
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    auto *Pool = getEJitBootstrapPool();
+    if (!Pool)
+      return EJIT_ERR_NOT_ACTIVE;
+    EJitCodePoolStatsOut Stats{};
+    if (!Pool->readCodePoolStats(&Stats))
+      return EJIT_ERR_DISABLED;
+    copyPoolCounters(out->total, Stats);
+    copyPoolCounters(out->near, Stats.near);
+    copyPoolCounters(out->far, Stats.far);
+    return EJIT_OK;
+#else
     EJIT_DIAG("get_code_pool_stats_v2: not initialized");
     return EJIT_ERR_NOT_ACTIVE;
+#endif
   }
   if (!gEJIT->getCodePoolStatsV2(out)) {
     EJIT_DIAG("get_code_pool_stats_v2: no code pool "
@@ -1195,6 +1320,16 @@ ejit_status_t ejit_get_code_pool_stats_v2(ejit_code_pool_stats_v2_t *out) {
 
 void ejit_print_code_pool_stats(void) {
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    ejit_code_pool_stats_t Stats{};
+    if (ejit_get_code_pool_stats(&Stats) == EJIT_OK) {
+      EJIT_DIAG_RAW("code pool total: pools=%llu used=%llu reserved=%llu",
+                    (unsigned long long)Stats.poolCount,
+                    (unsigned long long)Stats.usedBytes,
+                    (unsigned long long)Stats.reservedBytes);
+      return;
+    }
+#endif
     EJIT_DIAG_RAW("print_code_pool_stats: not initialized");
     return;
   }
@@ -1203,6 +1338,12 @@ void ejit_print_code_pool_stats(void) {
 
 void ejit_print_period_const_ranking(void) {
   if (!gEJIT) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    if (auto *Pool = getEJitBootstrapPool()) {
+      (void)Pool->requestPeriodConstRanking();
+      return;
+    }
+#endif
     EJIT_DIAG_RAW("period_const-ranking: not initialized");
     return;
   }

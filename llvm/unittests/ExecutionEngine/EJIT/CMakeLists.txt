@@ -171,6 +171,24 @@ add_custom_target(check-ejit-shared-taskpool
   USES_TERMINAL
   )
 
+if(EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT EJIT_FREESTANDING)
+  add_llvm_unittest(EJITZeroInitTests
+    EJitZeroInitTest.cpp
+    PARTIAL_SOURCES_INTENDED)
+  target_include_directories(EJITZeroInitTests PRIVATE
+    "${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT")
+  target_compile_definitions(EJITZeroInitTests PRIVATE
+    EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE}
+    EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE})
+  foreach(ejit_target ${LLVM_TARGETS_TO_BUILD})
+    if(TARGET LLVM${ejit_target}AsmParser)
+      target_link_libraries(EJITZeroInitTests PRIVATE LLVM${ejit_target}AsmParser)
+    endif()
+  endforeach()
+endif()
+
 # Cross-core runtime-writable (Online-PGO Tier-1) END-TO-END integration test.
 # It spans BOTH real components changed by the fix in one binary: the code-pool
 # JITLink finalize path (EJitCodePool / EJitCodePoolMemoryManager) AND the

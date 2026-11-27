@@ -92,6 +92,33 @@ static cl::opt<std::string> EJitIcacheSection(
              "table. Must name the inter-core SHARED section on a multi-core "
              "target; empty leaves the table in per-core .bss"));
 
+#ifndef EJIT_FIXUP_SECTION
+#define EJIT_FIXUP_SECTION ""
+#endif
+static cl::opt<std::string> EJitFixupSection(
+    "ejit-fixup-section", cl::init(EJIT_FIXUP_SECTION), cl::Hidden,
+    cl::desc("Initialized shared section for EJIT function and lifecycle fixups"));
+
+static GlobalVariable *makeEJitFixup(Module &M, StringRef Name,
+                                     uint32_t Initial) {
+  auto *I32Ty = Type::getInt32Ty(M.getContext());
+  auto *GV = new GlobalVariable(M, I32Ty, false, GlobalValue::InternalLinkage,
+                                ConstantInt::get(I32Ty, Initial), Name);
+  if (!EJitFixupSection.empty()) {
+    GV->setSection(EJitFixupSection);
+    GV->setAlignment(Align(4));
+  }
+  return GV;
+}
+
+static LoadInst *loadEJitFixup(IRBuilder<> &B, GlobalVariable *GV,
+                               StringRef Name) {
+  auto *Load = B.CreateLoad(GV->getValueType(), GV, Name);
+  if (!EJitFixupSection.empty())
+    Load->setAtomic(AtomicOrdering::Acquire);
+  return Load;
+}
+
 // When the inline-cache probe is enabled, put the frame-less dispatcher
 // (probe + two tail calls, ~16-48 bytes) into a dedicated
 // .text.ejit_dispatch section so all dispatchers share cache lines for
@@ -171,10 +198,7 @@ static GlobalVariable *getOrCreateDimTypeGlobal(Module &M,
   std::string GVName = ("__ejit_dimtype_" + PeriodName).str();
   if (auto *Existing = M.getGlobalVariable(GVName))
     return Existing;
-  auto *I32Ty = Type::getInt32Ty(M.getContext());
-  return new GlobalVariable(
-      M, I32Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
-      ConstantInt::get(I32Ty, kEJitInvalidDimType), GVName);
+  return makeEJitFixup(M, GVName, kEJitInvalidDimType);
 }
 
 // Emit registration that fills each per-lifecycle dimType global with the slot
@@ -253,10 +277,7 @@ static GlobalVariable *getOrCreateFuncIndexGlobal(Module &M,
   std::string GVName = ("__ejit_funcidx_" + FuncName).str();
   if (auto *Existing = M.getGlobalVariable(GVName))
     return Existing;
-  auto *I32Ty = Type::getInt32Ty(M.getContext());
-  return new GlobalVariable(
-      M, I32Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
-      ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), GVName);
+  return makeEJitFixup(M, GVName, kEJitInvalidFuncIndex);
 }
 
 // A per-function inline-cache global plus its dimensionality (number of
@@ -794,8 +815,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         BoundDescAlloca =
             B.CreateAlloca(BoundDescArrayTy, nullptr, "ejit_bound_ptrs");
       }
-      Value *FuncIdx = B.CreateLoad(I32Ty, FuncIndexGlobals[F->getName().str()],
-                                    "ejit_funcidx");
+      Value *FuncIdx = loadEJitFixup(B, FuncIndexGlobals[F->getName().str()],
+                                     "ejit_funcidx");
       Value *IdxValid = B.CreateICmpNE(
           FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex),
           "ejit_idx_ok");
@@ -803,8 +824,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       B.SetInsertPoint(CallBB);
       auto emitDimTypeVal = [&](unsigned I) {
-        return B.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
-                            "ejit_dimtype");
+        return loadEJitFixup(B, DimTypeGlobals[PeriodInds[I].PeriodName],
+                             "ejit_dimtype");
       };
       auto emitInstanceVal = [&](unsigned I) -> Value * {
         Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
@@ -961,7 +982,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // The sentinel initializer is a [D]^NumDims splat of &MissFn: at D=16
       // that is 1/16/256 relocations for 0/1/2 dims, but 4096 and 65536 for
       // 3 and 4 - so 3D/4D keep the zero-init table and the null guard.
-      const bool Sentinelize = NumDims <= 2;
+      // A worker-only image can be called before registration. Guard a zero
+      // cache cell even if a shared-section initializer was not installed.
+      const bool Sentinelize = NumDims <= 2 && EJitFixupSection.empty();
       if (!Sentinelize) {
         JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
         JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);

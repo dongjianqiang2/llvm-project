@@ -89,6 +89,37 @@ EJit::EJit(const Config &config) : config_(config) {
   if (config_.forceStaticRegistry || data.empty()) {
     if (config_.forceStaticRegistry)
       data = StoredData(); // discard any constructor data
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+    // Check the image's fixup initializers before modifying any of them.
+    // Later bring-ups reuse the tables after producers have been quiesced.
+    static bool validatedSharedFixups = false;
+    if (!validatedSharedFixups) {
+      for (auto *Entry = __start_ejit_group; Entry != __stop_ejit_group; ++Entry) {
+        if (Entry->type != EJIT_REG_LIFECYCLE && Entry->type != EJIT_REG_FUNCINDEX)
+          continue;
+        const uint32_t Initial = Entry->type == EJIT_REG_LIFECYCLE
+                                     ? kEJitInvalidDimType
+                                     : kEJitInvalidFuncIndex;
+        if (!Entry->ptr ||
+            __atomic_load_n(static_cast<const uint32_t *>(Entry->ptr),
+                            __ATOMIC_ACQUIRE) != Initial) {
+          recordInitError(EJIT_ERR_INVALID_PARAM,
+                          "shared EJIT fixup initializer missing (check initialized shared section)",
+                          Entry->name1 ? Entry->name1 : "");
+          return;
+        }
+      }
+      validatedSharedFixups = true;
+    }
+#endif
+    auto writeFixup = [](const void *Ptr, uint32_t Value) {
+      auto *Slot = const_cast<uint32_t *>(static_cast<const uint32_t *>(Ptr));
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+      __atomic_store_n(Slot, Value, __ATOMIC_RELEASE);
+#else
+      *Slot = Value;
+#endif
+    };
     SmallVector<SymbolEntry, 8> tableSymbols;
     PeriodArrayRegistry &reg = runtimeState_->getRegistry();
     // Walk the linker-provided [start, stop) ranges. Each section holds a
@@ -127,7 +158,7 @@ EJit::EJit(const Config &config) : config_(config) {
           }
           uint32_t slot =
               EJitLifecycleRegistry::instance().resolveAssign(e->name1);
-          *const_cast<uint32_t *>(static_cast<const uint32_t *>(e->ptr)) = slot;
+          writeFixup(e->ptr, slot);
           if (slot == kEJitInvalidDimType)
             recordInitError(EJIT_ERR_CACHE_FULL,
                             "lifecycle (dimType) capacity exhausted", e->name1);
@@ -144,7 +175,7 @@ EJit::EJit(const Config &config) : config_(config) {
             break;
           }
           uint32_t idx = EJitFuncRegistry::instance().resolveAssign(e->name1);
-          *const_cast<uint32_t *>(static_cast<const uint32_t *>(e->ptr)) = idx;
+          writeFixup(e->ptr, idx);
           if (idx == kEJitInvalidFuncIndex)
             recordInitError(EJIT_ERR_CACHE_FULL,
                             "funcIndex capacity exhausted for function",
@@ -280,6 +311,12 @@ EJit::EJit(const Config &config) : config_(config) {
   if (!initFailed_) {
     regPhase_ = RegistrationPhase::Frozen;
     if (config_.compileMode == CompileMode::Async) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
+      // An uninitialized producer may submit as soon as Ready is published.
+      // Stage PGO settings before owner election copies them into the blob.
+      if (config_.enablePgo || config_.enableProfileAudit)
+        compileDriver_->sharedTaskPool()->setPgoEnabled(true, 64);
+#endif
       bool poolOk = compileDriver_->startSharedTaskPool();
       if (!poolOk) {
         // Distinguish "the engine failed to build on the winner" from a genuine
@@ -314,6 +351,7 @@ EJit::EJit(const Config &config) : config_(config) {
         EJIT_DIAG("ORC engine skipped: not the compile owner");
       } else {
         EJIT_DIAG("taskpool async init complete: worker running");
+#ifndef EJIT_SRE_SHARED_TASKPOOL_ZERO_INIT
         // PGO and the default-off profile audit share the temporary
         // Instrumented-tier hit window. Audit-only mode publishes ordinary
         // Baseline code after collecting the window.
@@ -322,6 +360,7 @@ EJit::EJit(const Config &config) : config_(config) {
           compileDriver_->sharedTaskPool()->setPgoEnabled(
               true, kDefaultPgoThreshold);
         }
+#endif
       }
     } else {
       EJIT_DIAG_VERBOSE("taskpool off: AOT only");
