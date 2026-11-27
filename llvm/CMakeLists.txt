@@ -944,6 +944,75 @@ endif()
 #   -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(\".ejit_shared\")))
 set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
   "Attribute placing the shared taskpool state into inter-core shared memory")
+option(EJIT_ASAN
+  "Check live period_const substitutions on the shared worker (all periods)" OFF)
+# Scan pacing (LLVMEJIT target definitions; see EJitAsan.h). The
+# interval between two probe slices is EJIT_ASAN_IDLE_TICKS worker
+# idle rounds; each idle round already costs one platform tick (SRE_TaskDelay
+# via the injected idle hook), so the two-check interval in ticks equals this
+# value plus poll overhead. Product clock: 1 tick ~ 1 ms, so the default is
+# one probe slice every ~5 seconds.
+set(EJIT_ASAN_IDLE_TICKS "5000" CACHE STRING
+  "Verifier: run one probe slice every Nth worker idle round (>= 1)")
+set(EJIT_ASAN_STEP_BUDGET "32" CACHE STRING
+  "Verifier: max probe/retirement steps per idle slice (>= 1)")
+# Inside one slice, yield one platform tick every Nth step so a print-heavy
+# dump or a large step budget cannot starve the worker's watchdog heartbeat
+# (>= 1 keeps this on; 0 disables, host-only builds).
+set(EJIT_ASAN_YIELD_EVERY "8" CACHE STRING
+  "Verifier: yield one platform tick every Nth step inside a slice (>=1; 0 disables)")
+# Global budgets across all tracked versions (watch = one folded-load site
+# with its residue addresses). Overrun trims the NEWEST capture and counts
+# into `dropped`; the dump stats line reports watches=<n>/<cap> with a FULL
+# marker once the budget is exhausted.
+set(EJIT_ASAN_MAX_WATCHES "81920" CACHE STRING
+  "Verifier: global watch budget across all tracked versions (>= 1)")
+set(EJIT_ASAN_MAX_VERSIONS "1024" CACHE STRING
+  "Verifier: max simultaneous tracked specializations, pending+live (>= 1)")
+# Entry-instrumentation rotation (EJitAsanState.h): one rotation cell per
+# core, one function slot active per core at a time; the emitted entry stub
+# checks the fold fields while its slot holds the window. Sites are monotonic
+# in v1 (retirement does not reclaim them); a full budget drops the newest
+# capture with a discoverable log.
+set(EJIT_ASAN_ROTATION_WINDOW "128" CACHE STRING
+  "ASAN entry check: calls per function window before rotating (>= 1)")
+set(EJIT_ASAN_MAX_SLOTS "64" CACHE STRING
+  "ASAN entry check: rotation function-slot table capacity (>= 1)")
+set(EJIT_ASAN_MAX_CORES "64" CACHE STRING
+  "ASAN entry check: per-core rotation cell capacity (>= 1, <= 256)")
+set(EJIT_ASAN_MAX_SITES "512" CACHE STRING
+  "ASAN entry check: emitted-site budget, monotonic per boot (>= 1)")
+if(EJIT_ASAN)
+  if(NOT EJIT_DIAG_ENABLE)
+    message(FATAL_ERROR
+      "EJIT_ASAN requires diagnostics (EJIT_DIAG_ENABLE=ON)")
+  endif()
+  ejit_require_numeric(EJIT_ASAN_IDLE_TICKS)
+  ejit_require_numeric(EJIT_ASAN_STEP_BUDGET)
+  ejit_require_numeric(EJIT_ASAN_YIELD_EVERY)
+  ejit_require_numeric(EJIT_ASAN_MAX_WATCHES)
+  ejit_require_numeric(EJIT_ASAN_MAX_VERSIONS)
+  ejit_require_numeric(EJIT_ASAN_ROTATION_WINDOW)
+  ejit_require_numeric(EJIT_ASAN_MAX_SLOTS)
+  ejit_require_numeric(EJIT_ASAN_MAX_CORES)
+  ejit_require_numeric(EJIT_ASAN_MAX_SITES)
+  if(EJIT_ASAN_IDLE_TICKS LESS 1 OR
+     EJIT_ASAN_STEP_BUDGET LESS 1 OR
+     EJIT_ASAN_YIELD_EVERY LESS 0 OR
+     EJIT_ASAN_MAX_WATCHES LESS 1 OR
+     EJIT_ASAN_MAX_VERSIONS LESS 1 OR
+     EJIT_ASAN_ROTATION_WINDOW LESS 1 OR
+     EJIT_ASAN_MAX_SLOTS LESS 1 OR
+     EJIT_ASAN_MAX_CORES LESS 1 OR
+     EJIT_ASAN_MAX_CORES GREATER 256 OR
+     EJIT_ASAN_MAX_SITES LESS 1)
+    message(FATAL_ERROR
+      "EJIT_ASAN_IDLE_TICKS/STEP_BUDGET/MAX_WATCHES/MAX_VERSIONS/"
+      "ROTATION_WINDOW/MAX_SLOTS/MAX_SITES must be >= 1, "
+      "EJIT_ASAN_YIELD_EVERY >= 0, and EJIT_ASAN_MAX_CORES in [1, 256]")
+  endif()
+  add_definitions(-DEJIT_ASAN)
+endif()
 # FUNC_SLOTS is the gIcacheSlots[] capacity; any funcIndex >= FUNC_SLOTS has
 # its icacheFill silently dropped and the wrapper's inline probe misses
 # forever (every call falls through to MissFn -> tryCacheHit -> cacheHits++).

@@ -29,6 +29,8 @@ namespace llvm {
 class PHINode;
 namespace ejit {
 
+struct EJitAsanCapture;
+
 struct GVPeriodInfo {
   std::string periodName;
   bool isArray;
@@ -117,12 +119,21 @@ public:
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
+#ifdef EJIT_ASAN
+  void setAsanCapture(EJitAsanCapture *Capture) {
+    asanCapture_ = Capture;
+  }
+#endif
+
 private:
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
   template <typename ModuleT, typename OnLoad>
   std::vector<EJitPeriodConstLoadSite> inventory(ModuleT &M, OnLoad Found) const;
 #endif
 
+#ifdef EJIT_ASAN
+  EJitAsanCapture *asanCapture_ = nullptr;
+#endif
   PeriodArrayRegistry &registry_;
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;
   std::string boundRootFunction_;
@@ -132,6 +143,9 @@ private:
     EJitBoundPointerView view;
     AssumedArgMap boundArguments;
     SmallVector<std::pair<uint64_t, uint64_t>, 4> periodConstFields;
+    /// Period name from the ejit_bound_ptr annotation (empty when the bound
+    /// metadata carries none); used by the worker verifier's report rows.
+    std::string periodName;
   };
   SmallVector<BoundPointerState, kEJitMaxBoundPointers> boundStates_;
   void initBoundArgumentPropagation(Module &M);

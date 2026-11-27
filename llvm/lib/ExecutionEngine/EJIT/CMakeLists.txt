@@ -94,6 +94,11 @@ set(EJIT_SOURCES
 
 # PASS3 always emits the shared taskpool C ABI.
 list(APPEND EJIT_SOURCES EJitSharedTaskPool.cpp EJitSharedPlatform.cpp)
+
+# Worker-only period_const substitution verifier (diagnostic trial, PR 278).
+if(EJIT_ASAN)
+  list(APPEND EJIT_SOURCES EJitAsan.cpp)
+endif()
 if(EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES EJitSreTask_sre.cpp)
   set(EJIT_SRE_TASK_PRIORITY "20" CACHE STRING
@@ -222,6 +227,19 @@ target_compile_definitions(LLVMEJIT PRIVATE
 if(NOT (EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL ""))
   target_compile_definitions(LLVMEJIT PRIVATE
     EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE=${EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE})
+endif()
+
+if(EJIT_ASAN)
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_ASAN_IDLE_TICKS=${EJIT_ASAN_IDLE_TICKS}
+    EJIT_ASAN_STEP_BUDGET=${EJIT_ASAN_STEP_BUDGET}
+    EJIT_ASAN_YIELD_EVERY=${EJIT_ASAN_YIELD_EVERY}
+    EJIT_ASAN_MAX_WATCHES=${EJIT_ASAN_MAX_WATCHES}
+    EJIT_ASAN_MAX_VERSIONS=${EJIT_ASAN_MAX_VERSIONS}
+    EJIT_ASAN_ROTATION_WINDOW=${EJIT_ASAN_ROTATION_WINDOW}
+    EJIT_ASAN_MAX_SLOTS=${EJIT_ASAN_MAX_SLOTS}
+    EJIT_ASAN_MAX_CORES=${EJIT_ASAN_MAX_CORES}
+    EJIT_ASAN_MAX_SITES=${EJIT_ASAN_MAX_SITES})
 endif()
 
 # Cross-core fnPtr sharing capability (option declared in llvm/CMakeLists.txt,

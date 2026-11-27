@@ -415,6 +415,31 @@ void ejit_print_period_const_ranking(void);
 /// New code should use ejit_print_period_const_ranking().
 void ejit_print_mayconst_ranking(void);
 
+/// Print the EJIT-ASAN substitution report NOW, synchronously in the
+/// caller's context: one probe slice, one row per recorded mismatching
+/// location, then the stats line — each paced with fixed 20-tick yields —
+/// and only then return. EJIT_ERR_NOT_ACTIVE when called off the worker
+/// core or while another report is still printing. Builds with EJIT_ASAN
+/// only (EJIT_ERR_DISABLED otherwise).
+ejit_status_t ejit_asan_dump(void);
+
+/// Opt into EJIT-ASAN entry instrumentation BEFORE ejit_init: after this
+/// call, every worker compile of a function whose bound_ptr parameters
+/// produced period_const folds emits an entry stub that re-checks the folded
+/// fields through the actual argument pointer of each call (report-only;
+/// see EJIT_ASAN_CHECK.md). MUST be called before ejit_init — a call after
+/// init logs an error and returns EJIT_ERR_INVALID_PARAM, a call in a build
+/// without the feature returns EJIT_ERR_DISABLED. Irreversible for the boot.
+ejit_status_t ejit_enable_asan_mode(void);
+
+/// Print a snapshot of the EJIT-ASAN entry-check rotation through the
+/// platform log: the claimed function-slot table, and one line per core
+/// that has ever served a check — its current slot (with function name),
+/// window progress, completed rotations, and checks served. Read-only,
+/// callable from any core at any time; cores that never served a check
+/// stay silent. Returns EJIT_ERR_DISABLED in builds without the feature.
+ejit_status_t ejit_asan_rotation_status(void);
+
 /// Print the currently-active time-window instances through the platform log:
 /// for each registered period, every active (period, cell) is listed. Works
 /// across builds (queries the same isActive() path the JIT gate uses: the

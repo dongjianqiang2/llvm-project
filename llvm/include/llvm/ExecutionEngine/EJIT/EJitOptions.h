@@ -45,6 +45,13 @@ struct Config {
 #else
   bool enableProfileAudit = false;
 #endif
+#if defined(EJIT_ASAN)
+  /// EJIT-ASAN entry instrumentation opt-in (EJIT_ASAN_CHECK.md). Set before
+  /// ejit_init via ejit_enable_asan_mode(): every subsequent worker compile
+  /// of a function with bound_ptr folds then emits the entry-check stub.
+  /// The mode is read at compile time only; emitted stubs stay for the boot.
+  bool enableAsanEntryChecks = false;
+#endif
 };
 
 } // namespace ejit

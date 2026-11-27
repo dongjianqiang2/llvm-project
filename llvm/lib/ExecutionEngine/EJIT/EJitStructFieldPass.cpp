@@ -1,6 +1,9 @@
 //===-- EJitStructFieldPass.cpp - JIT Constant Substitution ---------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#ifdef EJIT_ASAN
+#include "EJitAsan.h"
+#endif
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -240,8 +243,11 @@ evalWithAssumed(const Value *V, const EJitFreeDimAssumptions &Assumed,
 
   // Stop at the declaration's value boundary. Never evaluate the initializer
   // or transfer witness authorization to its input SSA value.
-  if (isEJitLocalFreeDim(V) && Assumed.values.contains(V))
-    return APInt(V->getType()->getIntegerBitWidth(), 0);
+  if (isEJitLocalFreeDim(V)) {
+    auto It = Assumed.values.find(V);
+    if (It != Assumed.values.end())
+      return APInt(V->getType()->getIntegerBitWidth(), It->second);
+  }
 
   if (const auto *PN = dyn_cast<PHINode>(V)) {
     auto It = Assumed.phiInputs.find(PN);
@@ -777,6 +783,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
               {Offset->getZExtValue(), Size->getZExtValue()});
       }
     }
+    State.periodName = BoundPeriodName;
 
     if (!BoundPeriodName.empty()) {
       bool Changed;
@@ -1723,10 +1730,16 @@ static const char *checkLightweightPointerWitness(
 /// witness checks. Unbounded pointers additionally accept anchored free-dim
 /// witnesses under the deployment's readable-pointee and lifecycle contract.
 /// Allocator-discovered bounds add strict folds only after legacy matching.
+struct FoldSource {
+  const GlobalVariable *global = nullptr;
+  uintptr_t pointee = 0;
+};
+
 static Constant *tryReplacePeriodAbsoluteAddress(
     LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
     const PeriodConstOffsetMap &periodConstFieldMap, PeriodArrayRegistry &reg,
-    const DataLayout &DL, const EJitFreeDimAssumptions &Assumed) {
+    const DataLayout &DL, const EJitFreeDimAssumptions &Assumed,
+    FoldSource *Source = nullptr) {
   if (LI->isVolatile() || LI->isAtomic())
     return nullptr;
   TypeSize AccessTypeSize = DL.getTypeStoreSize(LI->getType());
@@ -1753,6 +1766,13 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   const uint8_t *DiscoveredCandidate = nullptr;
   SmallVector<uintptr_t, 4> LightweightBases;
   SmallVector<uintptr_t, 4> StrictBases;
+  FoldSource CandidateSource, DiscoveredSource, LightweightSource;
+  auto Finish = [&](const uint8_t *Address, FoldSource Selected) {
+    Constant *Result = createConstantFromMemory(Address, LI->getType(), DL);
+    if (Result && Source)
+      *Source = Selected;
+    return Result;
+  };
   for (const auto &[GV, Info] : gvMap) {
     if (GV->getValueType()->isPointerTy()) {
       // Preserve the pre-existing constant-address path for pointer-valued
@@ -1781,6 +1801,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
             llvm::is_contained(FieldIt->second, FieldOffset) &&
             AccessSize <= std::numeric_limits<uintptr_t>::max() - Target) {
           Candidate = reinterpret_cast<const uint8_t *>(Target);
+          CandidateSource = {GV, PointeeBase};
           ++Matches;
           continue;
         }
@@ -1803,6 +1824,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
                                                    DL, Assumed);
         if (!Rejection) {
           LightweightBases.push_back(PointeeBase);
+          LightweightSource = {GV, PointeeBase};
           continue;
         }
       } else if (!Bounds)
@@ -1831,9 +1853,11 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       }
       if (Explicit) {
         Candidate = reinterpret_cast<const uint8_t *>(Target);
+        CandidateSource = {GV, PointeeBase};
         ++Matches;
       } else {
         DiscoveredCandidate = reinterpret_cast<const uint8_t *>(Target);
+        DiscoveredSource = {GV, PointeeBase};
         ++DiscoveredMatches;
       }
       continue;
@@ -1858,6 +1882,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
                                  AccessSize, DL))
       continue;
     Candidate = reinterpret_cast<const uint8_t *>(Target);
+    CandidateSource = {GV, 0};
     ++Matches;
   }
 
@@ -1868,7 +1893,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   // arbitrary map entry from winning. Cross-lifecycle or otherwise eligible
   // overlap remains ambiguous.
   if (!Matches && DiscoveredMatches == 1)
-    return createConstantFromMemory(DiscoveredCandidate, LI->getType(), DL);
+    return Finish(DiscoveredCandidate, DiscoveredSource);
   // Existing strict/legacy winners keep their precedence. A second global
   // name must not rescue strict rejection of the same pointer allocation.
   if (!Matches && !DiscoveredMatches && !LightweightBases.empty()) {
@@ -1883,8 +1908,8 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       EJIT_DIAG_VERBOSE("period absolute load folded fn=%s "
                         "reason=lightweight-anchored-element-witness",
                         F.getName().str().c_str());
-      return createConstantFromMemory(reinterpret_cast<const uint8_t *>(Target),
-                                      LI->getType(), DL);
+      return Finish(reinterpret_cast<const uint8_t *>(Target),
+                    LightweightSource);
     }
     EJIT_DIAG_VERBOSE("period absolute load rejected fn=%s "
                       "reason=ambiguous-lightweight-registration matches=%zu",
@@ -1896,7 +1921,7 @@ static Constant *tryReplacePeriodAbsoluteAddress(
                       F.getName().str().c_str(), Matches, DiscoveredMatches);
   if (Matches != 1)
     return nullptr;
-  return createConstantFromMemory(Candidate, LI->getType(), DL);
+  return Finish(Candidate, CandidateSource);
 }
 
 static Constant *tryReplaceBoundPointer(LoadInst *LI, const uint8_t *Data,
@@ -2240,7 +2265,9 @@ static Constant *tryReplacePhiWitness(
     LoadInst *LI, const GVPeriodMap &Globals, const PeriodConstOffsetMap &Fields,
     PeriodArrayRegistry &Registry, const DataLayout &DL,
     const EJitFreeDimAssumptions &Assumed,
-    const StringMap<uint8_t> *LocalPeriods) {
+    const StringMap<uint8_t> *LocalPeriods,
+    FoldSource *Source = nullptr,
+    EJitFreeDimAssumptions *EffAssumed = nullptr) {
   if (!LI->isSimple() || !LI->getType()->isIntegerTy() ||
       LI->getType()->getIntegerBitWidth() > 64)
     return nullptr;
@@ -2270,12 +2297,19 @@ static Constant *tryReplacePhiWitness(
       Selected.phiInputs[PN] = PN->getIncomingValue(Choice % Count);
       Choice /= Count;
     }
+    FoldSource WitnessSource;
     Constant *C = tryReplacePeriodAbsoluteAddress(
-        LI, *LI->getFunction(), Globals, Fields, Registry, DL, Selected);
-    if (!C && GV && Global != Globals.end())
+        LI, *LI->getFunction(), Globals, Fields, Registry, DL, Selected,
+        Source ? &WitnessSource : nullptr);
+    if (C && Source)
+      *Source = WitnessSource;
+    if (!C && GV && Global != Globals.end()) {
       C = tryReplaceLocalWitnessGEP(LI, LI->getPointerOperand(), GV,
                                     Global->second, Fields, Registry, DL,
                                     Selected, Cell);
+      if (C && Source)
+        *Source = {GV, 0};
+    }
     if (!C || (Common && Common != C)) {
       EJIT_DIAG_DEBUG("phi-witness missed fn=%s reason=%s",
                       LI->getFunction()->getName().str().c_str(),
@@ -2284,6 +2318,10 @@ static Constant *tryReplacePhiWitness(
     }
     Common = C;
   }
+  // Every feasible edge agreed on Common, so the last witness's PHI binding
+  // is a valid evaluation context for the verifier's residue enumeration.
+  if (EffAssumed)
+    *EffAssumed = Selected;
   EJIT_DIAG_DEBUG("phi-witness folded fn=%s witnesses=%u",
                   LI->getFunction()->getName().str().c_str(), Witnesses);
   return Common;
@@ -2348,6 +2386,279 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
 }
 #endif
 
+#ifdef EJIT_ASAN
+namespace {
+// Widest remainder domain a watch may enumerate; the per-residue sticky
+// record arrays in EJitAsanWatch are sized to this.
+constexpr unsigned MaxAsanResidues = EJitAsanWatch::MaxResidues;
+
+// A single free dim may appear repeatedly, but only behind the same urem.
+// Do not extrapolate the zero witness into a runtime-dependent raw index.
+struct VerifyDomain {
+  const Value *slot = nullptr;
+  unsigned modulus = 1;
+  uint8_t arg = 0xFF; // driving free-dim parameter index; 0xFF = constant
+  SmallPtrSet<const Value *, 32> visited;
+
+  bool collect(const Value *V, const EJitFreeDimAssumptions &Assumed,
+               unsigned Depth = 0, bool AllowArgs = false) {
+    if (isa<Constant>(V))
+      return true;
+    if (Depth > kMaxAssumedEvalDepth || visited.size() >= 64)
+      return false;
+    if (!visited.insert(V).second)
+      return true;
+    // A PHI bound in Assumed.phiInputs stands for its bound incoming value
+    // under the witness the fold proved — the same binding evalWithAssumed
+    // resolves when evaluating trial addresses. Recurse on the binding so a
+    // phi-witness fold keeps its residue domain; an unbound PHI stays
+    // non-enumerable, like a Load or Call below.
+    if (const auto *PN = dyn_cast<PHINode>(V)) {
+      auto It = Assumed.phiInputs.find(PN);
+      return It != Assumed.phiInputs.end() &&
+             collect(It->second, Assumed, Depth + 1, AllowArgs);
+    }
+    auto *Op = dyn_cast<Operator>(V);
+    if (!Op) {
+      // Bound-pointer capture only: a bare Argument outside Assumed.values is
+      // a bound-argument leaf whose runtime value is fixed for this
+      // specialization — nothing to enumerate, so the domain stays valid.
+      return AllowArgs && isa<Argument>(V);
+    }
+    if (Assumed.values.contains(V) || isa<LoadInst, CallBase>(V))
+      return false;
+    if (Op->getOpcode() == Instruction::URem &&
+        Assumed.values.contains(Op->getOperand(0))) {
+      auto *Mod = dyn_cast<ConstantInt>(Op->getOperand(1));
+      if (!Mod || Mod->getValue().getLimitedValue() < 2 ||
+          Mod->getValue().getLimitedValue() > MaxAsanResidues)
+        return false;
+      unsigned M = Mod->getZExtValue();
+      if (slot && (slot != Op->getOperand(0) || modulus != M))
+        return false;
+      slot = Op->getOperand(0);
+      modulus = M;
+      // Report which function parameter drives the index: the free-dim value
+      // is either the argument itself or a local marker wrapping it.
+      auto *A = dyn_cast<Argument>(slot);
+      if (!A)
+        if (auto *Call = dyn_cast<CallInst>(slot))
+          if (Call->arg_size() == 1)
+            A = dyn_cast<Argument>(Call->getArgOperand(0));
+      arg = A ? static_cast<uint8_t>(A->getArgNo()) : 0xFF;
+      return true;
+    }
+    for (const Use &U : Op->operands())
+      // Propagate AllowArgs: a bound-pointer capture walks GEP chains down
+      // to the bound ARGUMENT leaf, which is only accepted as a fixed leaf
+      // under AllowArgs — dropping it here rejected every nonzero-offset
+      // bound fold's domain as unsupported.
+      if (!collect(U.get(), Assumed, Depth + 1, AllowArgs))
+        return false;
+    return true;
+  }
+};
+
+std::optional<uint64_t> verifyBits(Constant *C) {
+  if (auto *Int = dyn_cast<ConstantInt>(C))
+    return Int->getBitWidth() <= 64 ? std::optional(Int->getZExtValue())
+                                    : std::nullopt;
+  if (isa<ConstantPointerNull>(C))
+    return 0;
+  if (auto *Expr = dyn_cast<ConstantExpr>(C))
+    if (Expr->getOpcode() == Instruction::IntToPtr)
+      return verifyBits(Expr->getOperand(0));
+  return std::nullopt;
+}
+
+void captureAsan(EJitAsanCapture &Capture, LoadInst &LI,
+                         Constant *Frozen, FoldSource Source, bool Absolute,
+                         const GVPeriodMap &Periods, PeriodArrayRegistry &Reg,
+                         const DataLayout &DL,
+                         const EJitFreeDimAssumptions &Assumed) {
+  auto It = Periods.find(Source.global);
+
+  auto Uncovered = [&](const char *Reason) {
+    ++Capture.uncovered;
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] uncovered fn=%s reason=%s",
+                      LI.getFunction()->getName().str().c_str(), Reason);
+  };
+  if (It == Periods.end())
+    return Uncovered("no-shared-period-source");
+  if (Capture.watches.size() >= EJitAsanCapture::MaxWatches) {
+    ++Capture.dropped;
+    return;
+  }
+  auto Expected = verifyBits(Frozen);
+  auto *Ty = LI.getType();
+  unsigned Width = Ty->isIntegerTy() ? Ty->getIntegerBitWidth() :
+                   Ty->isPointerTy() ? DL.getPointerTypeSizeInBits(Ty) : 0;
+  if (!Expected || LI.isAtomic() || LI.isVolatile() ||
+      (Width != 1 && Width != 8 && Width != 16 && Width != 32 && Width != 64))
+    return Uncovered("unsupported-load-type");
+  const unsigned Size = (Width + 7) / 8;
+  const auto *GV = Source.global;
+  if (GV->isThreadLocal() || LI.getPointerAddressSpace() != 0)
+    return Uncovered("non-shared-address-space");
+  const auto &Info = It->second;
+  uintptr_t Base = 0;
+  uint64_t Extent = 0;
+  EJitAsanWatch Watch;
+  Watch.function = LI.getFunction()->getName().take_front(128).str();
+  Watch.object = GV->getName().take_front(128).str();
+  Watch.period = It->second.periodName;
+  Watch.width = Width;
+  Watch.littleEndian = DL.isLittleEndian();
+  Watch.expected = *Expected;
+
+  if (GV->getValueType()->isPointerTy()) {
+    uintptr_t Slot = reinterpret_cast<uintptr_t>(resolveBase(GV, Info, Reg));
+    if (!Slot || Slot % alignof(uintptr_t))
+      return Uncovered("invalid-pointer-slot");
+    if (!Absolute && LI.getPointerOperand()->stripPointerCasts() == GV &&
+        Size == sizeof(uintptr_t)) {
+      Watch.rootValue = true;
+      // The compared member is the pointer slot itself.
+      Watch.objectBase = Slot;
+      Watch.addresses.push_back(Slot);
+      Capture.watches.push_back(std::move(Watch));
+      return;
+    }
+    // A shared pointer slot alone gives neither object bounds nor lifetime.
+    // Read the pointee only if the existing registration pins an extent.
+    const auto *Bounds = Reg.getPointerPeriodBounds(GV->getName().str());
+    if (!Absolute || !Source.pointee || !Bounds ||
+        reinterpret_cast<uintptr_t>(Bounds->base) != Source.pointee)
+      return Uncovered("unknown-or-stale-pointee-extent");
+    Watch.rootSlot = Slot;
+    Watch.expectedRoot = Source.pointee;
+    Base = Source.pointee;
+    Extent = Bounds->size;
+  } else {
+    auto Object = getRegisteredNonPointerObject(GV, Info, Reg, DL);
+    if (!Object || resolveBase(GV, Info, Reg) != Object->base)
+      return Uncovered("unconfirmed-object-extent");
+    Base = reinterpret_cast<uintptr_t>(Object->base);
+    Extent = Object->size;
+  }
+
+  VerifyDomain Domain;
+  const auto *Ptr = LI.getPointerOperand();
+  if (!Domain.collect(Ptr, Assumed))
+    return Uncovered("unsupported-index-domain");
+  Watch.freeArg = Domain.arg;
+  // The report row's offset is relative to this base: the registered
+  // object/array base for value folds, the pointee base for fields behind a
+  // shared pointer (changed-root rows re-pin to the slot at print time).
+  Watch.objectBase = Base;
+  auto Trial = Assumed;
+  for (unsigned R = 0; R < Domain.modulus; ++R) {
+    if (Domain.slot)
+      Trial.values[Domain.slot] = R;
+    uintptr_t Address;
+    if (Absolute) {
+      auto Target = getAbsoluteTarget(Ptr, DL, Trial);
+      if (!Target)
+        return Uncovered("invalid-residue-address");
+      Address = static_cast<uintptr_t>(Target->getZExtValue());
+    } else {
+      auto Offset = accumulateFullOffset(DL, Ptr, Trial);
+      if (!Offset || *Offset > std::numeric_limits<uintptr_t>::max() - Base)
+        return Uncovered("invalid-residue-offset");
+      Address = Base + *Offset;
+    }
+    uint64_t Relative;
+    if (Address % Size ||
+        !absoluteRangeContains(Base, Extent, Address, Size, Relative))
+      return Uncovered("residue-out-of-bounds-or-unaligned");
+    Watch.addresses.push_back(Address);
+  }
+  Capture.watches.push_back(std::move(Watch));
+}
+// Bound-pointer capture (slice-2 extension): a fold of a borrowed
+// bound-pointer pointee. Product discipline: a bound pointee is heap memory
+// whose lifetime spans the active specialization version (a stack address
+// would be reused after return and produce false mismatches). The report row
+// pins the member with object=bound@<rawPtr> offset=<bytes> and kind=bound;
+// a runtime-borrowed buffer has no source symbol to name.
+void captureBoundAsan(EJitAsanCapture &Capture, LoadInst &LI,
+                              Constant *Frozen, const uint8_t *Data,
+                              uint32_t DataSize, StringRef PeriodName,
+                              const AssumedArgMap &BoundArguments,
+                              const DataLayout &DL,
+                              const EJitFreeDimAssumptions &Assumed) {
+  auto Uncovered = [&](const char *Reason) {
+    ++Capture.uncovered;
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] uncovered fn=%s reason=%s",
+                      LI.getFunction()->getName().str().c_str(), Reason);
+  };
+  if (Capture.watches.size() >= EJitAsanCapture::MaxWatches) {
+    ++Capture.dropped;
+    return;
+  }
+  auto Expected = verifyBits(Frozen);
+  auto *Ty = LI.getType();
+  unsigned Width = Ty->isIntegerTy() ? Ty->getIntegerBitWidth() :
+                   Ty->isPointerTy() ? DL.getPointerTypeSizeInBits(Ty) : 0;
+  if (!Expected || LI.isAtomic() || LI.isVolatile() ||
+      (Width != 1 && Width != 8 && Width != 16 && Width != 32 && Width != 64))
+    return Uncovered("unsupported-load-type");
+  const unsigned Size = (Width + 7) / 8;
+  EJitAsanWatch Watch;
+  Watch.function = LI.getFunction()->getName().take_front(128).str();
+  Watch.object = "bound";
+  Watch.period = PeriodName.empty() ? StringRef("bound") : PeriodName;
+  Watch.objectBase = reinterpret_cast<uintptr_t>(Data);
+  Watch.bound = true;
+  Watch.width = Width;
+  Watch.littleEndian = DL.isLittleEndian();
+  Watch.expected = *Expected;
+
+  VerifyDomain Domain;
+  const auto *Ptr = LI.getPointerOperand();
+  if (!Domain.collect(Ptr, Assumed, /*Depth=*/0, /*AllowArgs=*/true))
+    return Uncovered("unsupported-index-domain");
+  Watch.freeArg = Domain.arg;
+  auto Trial = Assumed;
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(Data);
+  for (unsigned R = 0; R < Domain.modulus; ++R) {
+    if (Domain.slot)
+      Trial.values[Domain.slot] = R;
+    auto Offset = getBoundPointerOffset(Ptr, BoundArguments, DL, Trial);
+    if (!Offset || *Offset > DataSize)
+      return Uncovered("invalid-residue-offset");
+    const uintptr_t Address = Base + *Offset;
+    uint64_t Relative;
+    if (Address % Size ||
+        !absoluteRangeContains(Base, DataSize, Address, Size, Relative))
+      return Uncovered("residue-out-of-bounds-or-unaligned");
+    Watch.addresses.push_back(Address);
+    // Entry-stub record for constant-offset bound folds (modulus == 1):
+    // the specialized entry can re-load this field through the CURRENT
+    // bound argument — the only place the actual family member is
+    // observable. Recorded regardless of the runtime mode; the pipeline-end
+    // emitter decides whether to emit the stub. Residue-driven folds
+    // (modulus > 1) stay worker-probe-only: the stub would have to
+    // recompute the free-dim index per call.
+    if (Domain.modulus == 1 && R == 0) {
+      if (const auto *RootArg = findRootArgument(Ptr)) {
+        EJitAsanEntryFold &EF = Capture.entryFolds.emplace_back();
+        EF.function = Watch.function;
+        EF.period = Watch.period;
+        EF.argNo = static_cast<uint32_t>(RootArg->getArgNo());
+        EF.byteOffset = static_cast<uint64_t>(*Offset);
+        EF.expected = *Expected;
+        EF.width = static_cast<uint8_t>(Width);
+        EF.align = static_cast<uint8_t>(LI.getAlign().value());
+        EF.siteId = kEJitAsanNoSite;
+      }
+    }
+  }
+  Capture.watches.push_back(std::move(Watch));
+}
+} // namespace
+#endif
+
 PreservedAnalyses
 EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   Module *M = F.getParent();
@@ -2370,6 +2681,15 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<Replacement, 8> Roots;
   SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
+#ifdef EJIT_ASAN
+  auto Capture = [&](LoadInst &LI, Constant *C, FoldSource Source, bool Absolute,
+                     const EJitFreeDimAssumptions *EffAssumed = nullptr) {
+    if (asanCapture_)
+      captureAsan(*asanCapture_, LI, C, Source, Absolute,
+                          gvPeriodMap_, registry_, DL,
+                          EffAssumed ? *EffAssumed : freeDimAssumptions_);
+  };
+#endif
 #ifdef EJIT_DIAG_ENABLE
   size_t totalLoads = 0, periodConstLoads = 0;
   // Only the ejit_entry function (or any function that actually has period_const
@@ -2392,6 +2712,9 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (Constant *C = tryReplacePeriodPointerBase(
               LI, gvPeriodMap_, registry_, DL)) {
+#ifdef EJIT_ASAN
+        Capture(*LI, C, {findRootGV(LI->getPointerOperand()), 0}, false);
+#endif
         Roots.push_back({LI, C});
         continue;
       }
@@ -2411,45 +2734,78 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       Value *PtrOp = LI->getPointerOperand();
 
       // Try each access pattern in order.
+      [[maybe_unused]] FoldSource Source;
+      FoldSource *Observed = nullptr;
+#ifdef EJIT_ASAN
+      if (asanCapture_)
+        Observed = &Source;
+#endif
       Constant *C = tryReplacePeriodAbsoluteAddress(
           LI, F, gvPeriodMap_, periodConstFieldMap_, registry_, DL,
-          freeDimAssumptions_);
+          freeDimAssumptions_, Observed);
+#ifdef EJIT_ASAN
+      const bool Absolute = C != nullptr;
+#endif
 
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
       // from the shared object; the pointer argument and all dynamic fields
       // remain live inputs to the specialization.
+      [[maybe_unused]] bool BoundFold = false;
       if (!C) {
         for (const BoundPointerState &State : boundStates_) {
           C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
                                      State.boundArguments, DL,
                                      freeDimAssumptions_);
-          if (C)
+          if (C) {
+#ifdef EJIT_ASAN
+            if (asanCapture_) {
+              captureBoundAsan(*asanCapture_, *LI, C,
+                                        State.view.rawPtr, State.view.size,
+                                        State.periodName,
+                                        State.boundArguments, DL,
+                                        freeDimAssumptions_);
+              // The generic capture below cannot describe a borrowed pointee
+              // (no source GV); skip it for this fold.
+              BoundFold = true;
+            }
+#endif
             break;
+          }
         }
       }
 
       // Pattern 1: direct GlobalVariable load (scalar static variable).
       if (!C) {
-        if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts()))
+        if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts())) {
           C = tryReplaceDirectGV(LI, GV, gvPeriodMap_, registry_, DL);
+          if (C)
+            Source = {GV, 0};
+        }
       }
 
       // Pattern 2: GEP-based access (array or struct field).
-      if (!C)
+      if (!C) {
         C = tryReplaceDirectGEP(LI, PtrOp, gvPeriodMap_, periodConstFieldMap_,
                                 registry_, DL, freeDimAssumptions_,
                                 F.getName() == boundRootFunction_
                                     ? &localWitnessPeriods_
                                     : nullptr);
+        if (C)
+          Source = {findRootGV(PtrOp), 0};
+      }
 
       // Pattern 3: indirect pointer access (pointer-type period variable,
       // then any number of period_const pointer fields).
       if (!C)
         C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
 
-      if (C)
+      if (C) {
+#ifdef EJIT_ASAN
+        if (!BoundFold)
+          Capture(*LI, C, Source, Absolute);
+#endif
         replacements.push_back({LI, C});
-      else
+      } else
         PendingFields.push_back(LI);
     }
   }
@@ -2460,17 +2816,47 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   for (auto &R : Roots)
     R.LI->replaceAllUsesWith(R.ConstVal);
   for (LoadInst *LI : PendingFields) {
+    [[maybe_unused]] FoldSource Source;
+    FoldSource *Observed = nullptr;
+#ifdef EJIT_ASAN
+    if (asanCapture_)
+      Observed = &Source;
+#endif
     Constant *C = Roots.empty() ? nullptr
                                 : tryReplacePeriodAbsoluteAddress(
                                       LI, F, gvPeriodMap_, periodConstFieldMap_,
-                                      registry_, DL, freeDimAssumptions_);
+                                      registry_, DL, freeDimAssumptions_,
+                                      Observed);
+#ifdef EJIT_ASAN
+    const bool Absolute = C != nullptr;
+    // PHI-witness exports: the fold's source and the PHI binding the
+    // residue enumeration must evaluate under (each feasible edge agrees
+    // on the folded value, so the last witness binding is a valid context).
+    FoldSource PhiSource;
+    EJitFreeDimAssumptions PhiAssumed;
+#endif
     if (!C)
       C = tryReplacePhiWitness(
           LI, gvPeriodMap_, periodConstFieldMap_, registry_, DL,
           freeDimAssumptions_,
-          F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr);
-    if (C)
+          F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr
+#ifdef EJIT_ASAN
+              ,
+              asanCapture_ ? &PhiSource : nullptr,
+              asanCapture_ ? &PhiAssumed : nullptr
+#endif
+      );
+    if (C) {
+#ifdef EJIT_ASAN
+      if (!Absolute)
+        // Folded through the witness path: Source was never filled by the
+        // absolute attempt, so use the exported witness source and binding.
+        Capture(*LI, C, PhiSource, /*Absolute=*/false, &PhiAssumed);
+      else
+        Capture(*LI, C, Source, Absolute);
+#endif
       replacements.push_back({LI, C});
+    }
 #ifdef EJIT_DIAG_ENABLE
     else
       logReplaceFailure(LI, gvPeriodMap_, registry_, DL, freeDimAssumptions_);

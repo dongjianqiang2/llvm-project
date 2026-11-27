@@ -19,6 +19,11 @@ OPTIONAL_APIS = (
     "ejit_print_dumped_module",
     "ejit_print_period_const_ranking",
     "ejit_print_mayconst_ranking",
+    "ejit_asan_dump",
+    "ejit_enable_asan_mode",
+    "ejit_asan_rotation_status",
+    "__ejit_asan_gate",
+    "__ejit_asan_mismatch",
     "ejit_vp_get_stats",
 )
 RETIRED_APIS = (

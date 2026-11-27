@@ -2,6 +2,9 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "EJitCodePoolCounters.h"
+#ifdef EJIT_ASAN
+#include "EJitAsan.h"
+#endif
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
@@ -196,6 +199,31 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setPeriodConstRankingCallback(&sharedPeriodConstRankingThunk, this);
+#ifdef EJIT_ASAN
+  sharedPool_.setAsanCallbacks(
+      [](void *Ctx, const EJitCompileRequest &Req, void **Fn) {
+        auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
+        *Fn = Driver->compileNow(Req, /*CollectAsan=*/true);
+        return *Fn != nullptr;
+      },
+      [](void *Ctx, bool Dump) {
+        auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
+        if (!Driver->asan_)
+          return;
+        // Same platform primitive as the worker loop's per-round yield, so a
+        // verifier slice feeds the watchdog exactly like the loop; report
+        // rows pace themselves with the verifier's fixed yield delay.
+        auto Delay = [](void *, uint32_t Ticks) { EJitSreTask::delay(Ticks); };
+        // The pool calls this either from its worker idle path (the periodic
+        // scan, Dump=false) or directly from ejit_asan_dump() (the
+        // synchronous report, Dump=true, in the caller's context).
+        if (Dump)
+          Driver->asan_->dumpNow(Driver->sharedPool_, Delay);
+        else
+          Driver->asan_->idle(Driver->sharedPool_, Delay);
+      },
+      this);
+#endif
   sharedPool_.setWorkerHooks(&EJitCompileDriver::sharedWorkerStart,
                              &EJitCompileDriver::sharedWorkerStop, this);
   // Inject the platform yield so the worker never busy-spins while waiting for
@@ -288,11 +316,21 @@ void EJitCompileDriver::sharedWorkerIdle(void * /*ctx*/, uint32_t ticks) {
 }
 
 bool EJitCompileDriver::sharedOwnerElected(void *ctx) {
-  return static_cast<EJitCompileDriver *>(ctx)->ensureJitEngine();
+  auto *Driver = static_cast<EJitCompileDriver *>(ctx);
+  if (!Driver->ensureJitEngine())
+    return false;
+#ifdef EJIT_ASAN
+  Driver->asan_ = std::make_unique<EJitAsan>();
+#endif
+  return true;
 }
 
 void EJitCompileDriver::sharedOwnerReleased(void *ctx) {
-  static_cast<EJitCompileDriver *>(ctx)->releaseJitEngine();
+  auto *Driver = static_cast<EJitCompileDriver *>(ctx);
+#ifdef EJIT_ASAN
+  Driver->asan_.reset();
+#endif
+  Driver->releaseJitEngine();
 }
 
 bool EJitCompileDriver::startSharedTaskPool() {
@@ -378,7 +416,8 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                                      bool storeLru,
-                                     const EJitCompileRequest *request) {
+                                     const EJitCompileRequest *request,
+                                     [[maybe_unused]] bool CollectAsan) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
   uint8_t dims[4] = {
@@ -440,6 +479,16 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
+#ifdef EJIT_ASAN
+  // All-period capture: every worker compile whose request collects verifier
+  // data records every coverable fold of every registered period; each watch
+  // carries its own source period for the dump rows.
+  EJitAsanCapture VerifyCapture;
+  if (CollectAsan && request && asan_) {
+    ctx.asanCapture = &VerifyCapture;
+  }
+  ctx.asanEntryChecks = config_.enableAsanEntryChecks;
+#endif
   if (request && request->boundCount) {
     for (uint32_t I = 0; I < request->boundCount; ++I) {
       const EJitBoundPtrDescriptor &B = request->boundPointers[I];
@@ -609,6 +658,11 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   }
 
   void *funcPtr = *addrOrErr;
+#ifdef EJIT_ASAN
+  if (ctx.asanCapture)
+    asan_->onCompiled(*request, reinterpret_cast<uintptr_t>(funcPtr),
+                                std::move(VerifyCapture));
+#endif
 
   // PGO Tier-1: capture counter addresses for a later Tier-2 synthesis (§5.2).
   // The __profc_*/__profd_* globals were forced External by
@@ -720,13 +774,15 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   return funcPtr;
 }
 
-void *EJitCompileDriver::compileNow(const EJitCompileRequest &req) {
+void *EJitCompileDriver::compileNow(const EJitCompileRequest &req,
+                                    bool CollectAsan) {
   if (!EJitSharedTaskPool::validCompileRequest(req))
     return nullptr;
-  return compileNowValidated(req);
+  return compileNowValidated(req, CollectAsan);
 }
 
-void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req) {
+void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req,
+                                             bool CollectAsan) {
   // PGO tier rides in req.funcIndex's top 2 bits (EJitTaskPoolTypes.h). Strip it to
   // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
   // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
@@ -781,11 +837,15 @@ void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req) {
   EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
             funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
-  return compileCold(cacheKey, tier, /*storeLru=*/false, &req);
+  return compileCold(cacheKey, tier, /*storeLru=*/false, &req, CollectAsan);
 }
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
+#ifdef EJIT_ASAN
+  if (asan_)
+    asan_->onPublished(req, published);
+#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);
   if (AuditTier == kEJitTierInstrumented) {

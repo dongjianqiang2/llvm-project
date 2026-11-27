@@ -385,6 +385,13 @@ def doit_gc_merge(args):
         "ejit_taskpool_print_compiled", "ejit_dump_func", "ejit_print_dumped",
         "ejit_print_dumped_module",
         "ejit_print_period_const_ranking", "ejit_print_mayconst_ranking",
+        "ejit_asan_dump",
+        "ejit_enable_asan_mode", "ejit_asan_rotation_status",
+        # EJIT-ASAN entry-stub hooks: emitted JIT code calls these through
+        # absolute symbols (same shape as the inline-cache root above — the
+        # caller lives in JIT'd code, not in the runtime, so gc-merge would
+        # discard them without an explicit root).
+        "__ejit_asan_gate", "__ejit_asan_mismatch",
         "ejit_vp_get_stats",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the

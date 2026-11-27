@@ -15,6 +15,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h" // EJitDimPair layout
+#ifdef EJIT_ASAN
+#include "EJitAsanState.h"
+#endif
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
@@ -91,6 +94,13 @@ static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
 
 static EJit *gEJIT = nullptr;
 
+#ifdef EJIT_ASAN
+// ejit_enable_asan_mode() staging: read exactly once by ejitInitImpl and
+// folded into Config; calls after init are rejected with a log line (the
+// emitted stubs of already-compiled versions would be missing otherwise).
+static bool gEJitAsanEntryChecksRequested = false;
+#endif
+
 #ifdef EJIT_DIAG_ENABLE
 EJitAtomicU64 gIcacheNullFillSkips;
 constexpr uint64_t kIcacheNullFillLogEvery = 1000;
@@ -157,6 +167,9 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 #endif
   if (forcePgo)
     cfg.enablePgo = true;
+#ifdef EJIT_ASAN
+  cfg.enableAsanEntryChecks = gEJitAsanEntryChecksRequested;
+#endif
 
   gEJIT = new (std::nothrow) EJit(cfg);
   if (!gEJIT) {
@@ -1199,6 +1212,59 @@ void ejit_print_code_pool_stats(void) {
     return;
   }
   gEJIT->printCodePoolStats();
+}
+
+ejit_status_t ejit_asan_dump(void) {
+#ifdef EJIT_ASAN
+  if (gEJIT)
+    if (auto *Pool = gEJIT->sharedTaskPool())
+      return Pool->requestAsanDump() ? EJIT_OK : EJIT_ERR_NOT_ACTIVE;
+  return EJIT_ERR_NOT_ACTIVE;
+#else
+  return EJIT_ERR_DISABLED;
+#endif
+}
+
+ejit_status_t ejit_enable_asan_mode(void) {
+#ifdef EJIT_ASAN
+  if (gEJIT) {
+    EJIT_DIAG("enable_asan_mode ignored: ejit_init already done");
+    return EJIT_ERR_INVALID_PARAM;
+  }
+  gEJitAsanEntryChecksRequested = true;
+  EJIT_DIAG("asan entry instrumentation requested: subsequent compiles "
+            "emit entry stubs");
+  return EJIT_OK;
+#else
+  return EJIT_ERR_DISABLED;
+#endif
+}
+
+ejit_status_t ejit_asan_rotation_status(void) {
+#ifdef EJIT_ASAN
+  // Read-only snapshot of the shared rotation state, callable from any core
+  // at any time (the blob is static storage; no owner or init gate). Cores
+  // that never served a check stay silent to keep the serial ring small.
+  const uint32_t UsedSlots = gEJitAsanState.slotsUsed.loadAcquire();
+  EJIT_DIAG_RAW("[EJIT-ASAN] rotation slots=%u/%d sites=%u",
+                UsedSlots, EJIT_ASAN_MAX_SLOTS,
+                gEJitAsanState.siteCounter.loadRelaxed());
+  for (uint32_t I = 0; I < EJIT_ASAN_MAX_CORES; ++I) {
+    const EJitAsanCell &C = gEJitAsanState.cells[I];
+    if (C.checks == 0 && C.cycles == 0)
+      continue;
+    const char *Name = C.slot < UsedSlots ? gEJitAsanState.slots[C.slot].name
+                                          : "";
+    EJIT_DIAG_RAW(
+        "[EJIT-ASAN] rotation core=%u slot=%u(%s) window=%u/%d cycles=%u "
+        "checks=%u",
+        I, C.slot, Name, C.countdown, EJIT_ASAN_ROTATION_WINDOW, C.cycles,
+        C.checks);
+  }
+  return EJIT_OK;
+#else
+  return EJIT_ERR_DISABLED;
+#endif
 }
 
 void ejit_print_period_const_ranking(void) {
