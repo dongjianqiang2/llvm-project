@@ -33,12 +33,12 @@
 14 运行时闭环（动画泳道）：业务核 miss→入队→worker 编译→publish→命中直跳。
 15 魔法 pass：从进程内存读真值，替换 load 为常量。软标注。
 16 剩下的交给 LLVM：真实 check_cell before/after IR。
-17 真实机器码对比：stream kernel AOT vs JIT（55 字节，8 条指令，0 配置 load，0 数据分支）。
+17 汇编对比：stream kernel AOT vs JIT（都是 AArch64 后端真实输出；JIT 循环 8 条指令，0 配置 load，0 数据分支）。
 
 ## Act3 疯狂
 18 幕间："现在，疯狂的部分。"
 19 把 LLVM 塞进固件：53 个 .a 117MB → 21MB(x86)/~12MB(aarch64 预估)；裁剪后 loadable 19.57→18.51MB；llc 1793 输入逐字节一致。
-20 W^X 代码池：2MiB 池，finalize 逐 4K 页封固；每个特化至少一页；6 字节函数独占 4096。
+20 W^X 代码池：2MiB 池，finalize 逐 4K 页封固；每个特化至少一页；12 字节函数独占 4096。
 21 没有 std::thread：EJitAtomic/Vyukov 1024 环/dedup CAS/32 桶 RwLock/read-token/version 双检查点。（环动画）
 22 跨核：共享 POD blob，CAS 选主，同 VA，executableCoreMask；"同 VA ≠ 同执行权限"。
 23 特化边界一路外推：标量/数组→指针+bounds→free_dim→local free_dim→bound_ptr→anchored witness。安全底线。
@@ -47,7 +47,7 @@
 
 ## Act4 诚实
 26 幕间："我们做的是测量，不是信仰。"
-27 47 万倍：官方 perf_bench 474,369.6×（三次 47/49/143 万）；真身是 6 字节 mov+ret。
+27 47 万倍：官方 perf_bench 474,369.6×（三次 47/49/143 万）；真身是 12 字节 mov+movk+ret。
 28 诚实的收益范围：stream 快 / interproc 慢 / tiny 更慢。发散条形图（基线 1×）。
 29 探测成本与 inline cache：~50ns 运行时查询 → 3 指令探针；aarch64 9.0/20.2ns。
 30 多小区的代价：i-cache 压力 = 小区数 × 每份代码；合一份/放得近/取得早；待上板。

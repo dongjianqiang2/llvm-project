@@ -20,6 +20,7 @@ M = dict(
     lat_first_ms=(14, 16), lat_warm_ms=(6.3, 6.7), lat_tiny_ms=(3.4, 4.0),
     # tests at HEAD
     gtest='272 + 2 skipped / 52 / 169', lit='55 / 55 · 28 / 28', it='27 过 · 2 红 · 2 未能构建',
-    # sizes
-    jit_bytes=dict(compute_cell=6, tiny=16, stream_kernel=55),
+    # sizes — whole functions, AArch64 backend (llc -O2 -mtriple=aarch64);
+    # the x86 host dumps were 6/16/55 bytes
+    jit_bytes=dict(compute_cell=12, tiny=16, stream_kernel=60),
 )

@@ -64,10 +64,17 @@ URL 的 `#12.3` 直接定位到第 12 页第 3 步。
 ninja -C build_release_x86 clang lld opt LLVMEJIT      # 先有工具链
 bench/build.sh            # 生成 bench/out/demo 与 bench/out/probe（静态链接 libLLVMEJIT.a）
 bench/out/demo            # 输出 TIME 行：micro / ip / stream / tiny / LATENCY
-bench/build.sh aot        # 只出 demo 的 AOT 汇编（第 6、17 页用的是它和 objdump 的真实输出）
+bench/build.sh aot        # demo 的 x86 AOT 汇编
+bench/build.sh aot-a64    # demo 的 AArch64 AOT 汇编：clang -O2 -emit-llvm → aarch64 llc -O2
+EJIT_DUMP_DIR=/tmp/ejd bench/out/demo    # 运行时把每个 entry 特化前后的 IR 写进 /tmp/ejd
+build_aarch64/bin/llc -O2 -mtriple=aarch64-linux-gnu /tmp/ejd/*_opt.ll   # JIT 侧汇编
 ```
 
-`./out/demo mem` 会把 dump 出来的 `jit_*.bin` 机器码写到当前目录。
+幻灯片里的汇编（第 6、17、27、29 页）全部是目标板形态的 AArch64：AOT 侧由 `clang -O2`
+产出 IR、JIT 侧用 `EJIT_DUMP_DIR` 导出特化后的 IR，统一经 AArch64 后端（`llc -O2`）编出 ——
+板子上跑的就是这套后端。耗时数字与汇编形态在页面上分开标注：前者是 x86 主机实测，后者是目标板代码。
+
+`./out/demo mem` 会把 dump 出来的 `jit_*.bin` 机器码写到当前目录（x86 主机的 dump，幻灯片不用它）。
 
 `demo.c` 里的 `TIME` 行对应 `data.py`：`stream_ms` → `stream_*_ns`，`tiny_ns` → `tiny_*_ns`，
 `ip_ms` → `ip_*_ms`，`micro_ms` → `micro_*`，`LATENCY_ms` → `lat_*`。官方 benchmark 的

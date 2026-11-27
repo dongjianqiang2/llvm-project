@@ -91,34 +91,32 @@ int64_t stream_kernel(EJIT_DIM(cell) uint8_t ci,
   }
   return acc;
 }''', 'c', 'xs', boxes={8: [('c->mode', 'amber')], 9: [('c->thresh', 'amber')], 10: [('c->gain_q', 'amber')]}, cap='C · 用户视角')
-    a = code('''.loop:                                 ; clang -O2 真实输出 · x86-64 · 标签已改名
-  movsx  r10d, WORD PTR [rsi+r8*2]     ; v = x[i]
-  movsxd r9, r10d
-  test   edi, edi                      ; ← mode == 0 ?  每个样本都判
-  jne    .else
-  cmp    DWORD PTR [rcx+0x8], r10d     ; ← thresh：每个样本都从内存读
-  jge    .below                        ; ← 依赖数据：分支预测的噩梦
-  movsxd r10, DWORD PTR [rcx+0x4]      ; ← gain_q：每个样本都从内存读
-  imul   r10, r9
-  add    rax, r10
-  jmp    .next
-.below:
-  sub    rax, r9
-  jmp    .next
-.next:
-  inc    r8
-  cmp    rdx, r8
-  jne    .loop''', 'asm', 'sm', cap='AOT · 每个样本做的事')
+    a = code('''.loop:                                 ; clang -O2 真实输出 · AArch64 · 标签已改名
+  ldrsh w12, [x19], #2                 ; v = *x++
+  cbnz  w9, .square                    ; ← mode ≠ 0 ?  每个样本都判
+  ldr   w13, [x8, #8]                  ; ← thresh：每个样本都从内存读
+  sxtw  x11, w12
+  cmp   w13, w12                       ; v > thresh ?
+  b.ge  .below                         ; ← 依赖数据：分支预测的噩梦
+  ldrsw x12, [x8, #4]                  ; ← gain_q：每个样本都从内存读
+  smaddl x0, w12, x11, x0             ; acc += gain_q × v
+  b     .check
+.below:                                ; v ≤ thresh：acc −= v
+  sub   x0, x0, x11
+  b     .check
+.check:                                ; （mode ≠ 0 的 v×v 一路也汇到这里）
+  subs  x10, x10, #1
+  b.eq  .done                          ; 没数完就直落回 .loop''', 'asm', 'sm', cap='AOT（目标板）· 每个样本做的事')
     facts = '''
 <div class="grid g3 step" data-step="1" style="margin-top:20px">
   <div class="kpi c-amber" style="padding:16px 20px"><div class="l">内存读取 / 样本</div><div class="v" style="font-size:44px">2</div><div class="n">thresh、gain_q —— 值没变，也要读</div></div>
-  <div class="kpi c-amber" style="padding:16px 20px"><div class="l">条件跳转 / 样本</div><div class="v" style="font-size:44px">3</div><div class="n">其中 <b>jge</b> 依赖数据，随机输入下几乎次次预测失败</div></div>
+  <div class="kpi c-amber" style="padding:16px 20px"><div class="l">条件跳转 / 样本</div><div class="v" style="font-size:44px">3</div><div class="n">其中 <b>b.ge</b> 依赖数据，随机输入下几乎次次预测失败</div></div>
   <div class="kpi c-amber" style="padding:16px 20px"><div class="l">每个样本的代价</div><div class="v" style="font-size:44px" data-count="{M['stream_aot_ns']:.1f}" data-dec="1" data-delay="300">0</div><div class="n">ns · x86 主机实测（见第四幕）</div></div>
 </div>'''
     body = f'<div class="grid g-42-58" style="gap:22px"><div data-anim="left">{c}</div><div data-anim="right">{a}</div></div>{facts}'
     notes = '''
-<p>左边是用户写的代码，右边是 clang -O2 真实生成的循环体。三处读配置的地方，用户一眼就懂。</p>
-<p>重点念右边的注释：mode 每个样本判一次、thresh 和 gain 每个样本各从内存读一次、还有一条依赖数据的跳转。编译器没错——它<b>不知道</b>这些值在窗口内不会变，所以只能这么写。注意 <code>mode</code> 分支是可预测的，真正贵的是那条随机的 <code>jge</code>：在乱序大核上，一次预测失败就是十几二十个周期。</p>
+<p>左边是用户写的代码，右边是这条循环在目标板（AArch64）后端的真实汇编：clang -O2 产出 IR，llc -O2 编出这一段。三处读配置的地方，用户一眼就懂。</p>
+<p>重点念右边的注释：mode 每个样本判一次、thresh 和 gain 每个样本各从内存读一次、还有一条依赖数据的跳转。编译器没错——它<b>不知道</b>这些值在窗口内不会变，所以只能这么写。注意 <code>mode</code> 分支是可预测的，真正贵的是那条随机的 <code>b.ge</code>：在乱序大核上，一次预测失败就是十几二十个周期。</p>
 <p>按 → 出现三张数字卡。第三个数字（3.9 ns/样本）先卖个关子："这个数字我们在第四幕会回头再看"。</p>
 '''
     return dict(act=ACT, name='aot', kicker='第一幕 · AOT 的困境', title='编译器不知道的事，它只能每次都问内存', body=body, steps=1, notes=notes)

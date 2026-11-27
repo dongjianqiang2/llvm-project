@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "ejit_test_helpers.h"
 
@@ -228,6 +229,9 @@ int main(int argc, char **argv) {
 
   ejit_config_t cfg;
   ejit_default_config(&cfg);
+  // EJIT_DUMP_DIR=<dir>: runtime dumps each entry's pre/opt IR there
+  const char *dumpdir = getenv("EJIT_DUMP_DIR");
+  if (dumpdir) { mkdir(dumpdir, 0700); cfg.dumpJITDir = dumpdir; }
   if (ejit_init(&cfg) != EJIT_OK) { printf("init failed\n"); return 1; }
   if (ejit_activate("cell", ci) != EJIT_OK) { printf("activate failed\n"); return 1; }
 

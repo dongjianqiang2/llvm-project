@@ -460,47 +460,44 @@ def s16_llvm_does_it():
 
 
 def s17_machine_code():
-    aot = code('''.loop:                                 ; AOT · clang -O2
-  movsx  r10d, WORD PTR [rsi+r8*2]     ; v = x[i]
-  movsxd r9, r10d
-  test   edi, edi                      ; mode == 0 ?     ← 判
-  jne    .else                         ;                 ← 跳
-  cmp    DWORD PTR [rcx+0x8], r10d     ; thresh          ← 读
-  jge    .below                        ; 依赖数据         ← 跳（预测失败）
-  movsxd r10, DWORD PTR [rcx+0x4]      ; gain_q          ← 读
-  imul   r10, r9
-  add    rax, r10
-  jmp    .next
-.below:
-  sub    rax, r9
-  jmp    .next
-.next:
-  inc    r8
-  cmp    rdx, r8
-  jne    .loop''', 'asm', 'sm', cap='每个样本：2 次配置读 · 3 条件跳转', maxw=654)
-    jit = code('''.loop:                                 ; JIT · cell = 3 · 真实机器码
-  movsx  r8, WORD PTR [rsi+rdi*2]      ; v = x[i]
-  lea    r9, [r8*8]                    ; v×8  ← thresh=100、gain=7 已折入
-  cmp    r8, 0x65                      ; v < 101 ?
-  cmovl  r9, rdx                       ;   ? 0
-  sub    r9, r8                        ; v×8 − v = v×7   或   0 − v = −v
-  add    rax, r9
-  inc    rdi
-  cmp    rcx, rdi
-  jne    .loop''', 'asm', 'sm', hl={2: 'ice', 3: 'ice', 4: 'ice', 5: 'ice'}, cap='每个样本：0 次配置读 · 0 条数据相关跳转 · 8 条指令', maxw=654)
+    aot = code('''.loop:                                 ; AOT · clang -O2 · AArch64
+  ldrsh w12, [x19], #2                 ; v = *x++
+  cbnz  w9, .square                    ; mode ≠ 0 ?      ← 判 + 跳
+  ldr   w13, [x8, #8]                  ; thresh           ← 读
+  sxtw  x11, w12
+  cmp   w13, w12                       ; v > thresh ?
+  b.ge  .below                         ; 依赖数据          ← 跳（预测失败）
+  ldrsw x12, [x8, #4]                  ; gain_q           ← 读
+  smaddl x0, w12, x11, x0             ; acc += gain_q × v
+  b     .check
+.below:                                ; v ≤ thresh：
+  sub   x0, x0, x11                    ;   acc −= v
+  b     .check
+.check:                                ; （mode ≠ 0 的 v×v 一路也汇到这里）
+  subs  x10, x10, #1
+  b.eq  .done                          ; 未完则直落回 .loop''', 'asm', 'sm', cap='每个样本：2 次配置读 · 3 条件跳转 · AArch64', maxw=654)
+    jit = code('''.loop:                                 ; JIT · cell = 3 · 特化后 IR
+  ldrsh x9, [x1], #2                   ; v = *x++
+  lsl   x10, x9, #3                    ; v×8 ← thresh=100、gain_q=7 已折入
+  cmp   w9, #100                       ; v > 100 ?
+  sub   x10, x10, x9                   ; v×8 − v = v×7
+  csneg x9, x10, x9, gt                ;   v > 100 ? v×7 : −v
+  subs  x8, x8, #1
+  add   x0, x9, x0
+  b.ne  .loop''', 'asm', 'sm', hl={3: 'ice', 4: 'ice', 5: 'ice', 6: 'ice'}, cap='每个样本：0 次配置读 · 0 条数据相关跳转 · 8 条指令 · AArch64', maxw=654)
     facts = f'''
 <div class="grid g3 step" data-step="1" style="margin-top:20px">
   <div class="kpi c-ice" style="padding:16px 20px"><div class="l">AOT → JIT · 每样本</div><div class="v" style="font-size:40px">{M['stream_aot_ns']:.1f}<small>ns</small> → {M['stream_jit_ns']:.2f}<small>ns</small></div><div class="n">x86 主机实测：随机输入 4096 样本 × 4000 轮，9 次取中位数</div></div>
-  <div class="kpi c-ice" style="padding:16px 20px"><div class="l">加速比</div><div class="v" style="font-size:52px" data-count="{M['stream_aot_ns'] / M['stream_jit_ns']:.1f}" data-dec="1" data-post="×">0</div><div class="n">几乎全部来自 <b>分支 → cmov</b>：常量已知后，LLVM 敢推测了</div></div>
+  <div class="kpi c-ice" style="padding:16px 20px"><div class="l">加速比</div><div class="v" style="font-size:52px" data-count="{M['stream_aot_ns'] / M['stream_jit_ns']:.1f}" data-dec="1" data-post="×">0</div><div class="n">几乎全部来自 <b>分支 → csneg</b>（条件反选）：常量已知后，LLVM 敢推测了</div></div>
   <div class="kpi c-amber" style="padding:16px 20px"><div class="l">但请记住</div><div class="v" style="font-size:30px;line-height:1.25;padding-top:8px">这是最有利于我们的内核</div><div class="n">数据相关分支 + 每轮读配置。第四幕看另外三种。</div></div>
 </div>'''
     body = f'<div class="grid g2" style="gap:26px"><div data-anim="left">{aot}</div><div class="step" data-step="1">{jit}</div></div>{facts}'
     notes = '''
-<p>同一段 C 代码，同一台机器。左边 AOT，右边 JIT 特化后从进程内存里 dump 出来的真实机器码。</p>
-<p>按 → 出现 JIT 版本：8 条指令，一次配置都不读，一条数据相关的跳转都没有。原本的 if-else 变成了 cmov —— 不是我们改的，是 LLVM 在常量已知之后自己敢推测了。</p>
-<p>数字：3.97 → 0.94 ns/样本，约 4.2 倍。但要马上泼冷水：这是对 EJIT 最有利的内核形态。第四幕会给你看另外三种。</p>
+<p>同一段 C 代码。左边 AOT，右边 JIT 特化后的版本。两边的汇编都出自 AArch64 后端的真实输出：AOT 侧 clang -O2 产出 IR，JIT 侧是运行时导出的特化后 IR，都用目标板的那套 llc -O2 编出来。</p>
+<p>按 → 出现 JIT 版本：8 条指令，一次配置都不读，一条数据相关的跳转都没有。原本的 if-else 变成了 csneg（条件反选）—— 不是我们改的，是 LLVM 在常量已知之后自己敢推测了。</p>
+<p>数字：3.97 → 0.94 ns/样本，约 4.2 倍 —— 这是 x86 主机上的实测耗时，与两边的代码形态分开看：形态是目标板的，量级是主机的。要马上泼冷水：这是对 EJIT 最有利的内核形态。第四幕会给你看另外三种。</p>
 '''
-    return dict(act=ACT, name='machine-code', kicker='第二幕 · 眼见为实', title='同一段 C，两份真实机器码', body=body, steps=1, notes=notes)
+    return dict(act=ACT, name='machine-code', kicker='第二幕 · 眼见为实', title='同一段 C，两份真实汇编', body=body, steps=1, notes=notes)
 
 
 def slides():

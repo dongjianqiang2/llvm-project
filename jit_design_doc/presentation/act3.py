@@ -78,20 +78,20 @@ def s20_pool():
 <div class="step" data-step="3" style="margin-bottom:14px"><div class="card pad-sm rule-ice"><div class="card-h">③ 封（RX）</div>
 <p class="small" style="color:var(--ink-2)">finalize 逐页 <code>enable_ex</code>；任一页失败，整个 finalize 失败。<code>sealAndSyncCache</code> 清 D-cache、失效 I-cache。</p></div></div>
 <div class="step" data-step="4"><div class="card pad-sm rule-red"><div class="card-h">④ 代价</div>
-<p class="small" style="color:var(--ink-2)"><code>compute_cell</code> 特化后 <b>6 字节</b>，独占 <b>4096 字节</b>。封过的池子永不复用；代码永不释放。</p></div></div>'''
-    legend = ('<div style="display:flex;gap:18px;align-items:center;font:500 13px/1 var(--mono);color:var(--ink-2);margin-bottom:10px">'
-              '<span><i class="sw" style="background:var(--ink-4)"></i>空闲</span><span><i class="sw" style="background:var(--amber-mark)"></i>RW · 正在写</span>'
-              '<span><i class="sw" style="background:var(--ice-mark)"></i>RX · 已封固</span><span><i class="sw" style="background:transparent;border:2px solid var(--red)"></i>6 B 的函数</span></div>')
+<p class="small" style="color:var(--ink-2)"><code>compute_cell</code> 特化后 <b>{M['jit_bytes']['compute_cell']} 字节</b>，独占 <b>4096 字节</b>。封过的池子永不复用；代码永不释放。</p></div></div>'''
+    legend = (f'<div style="display:flex;gap:18px;align-items:center;font:500 13px/1 var(--mono);color:var(--ink-2);margin-bottom:10px">'
+              f'<span><i class="sw" style="background:var(--ink-4)"></i>空闲</span><span><i class="sw" style="background:var(--amber-mark)"></i>RW · 正在写</span>'
+              f'<span><i class="sw" style="background:var(--ice-mark)"></i>RX · 已封固</span><span><i class="sw" style="background:transparent;border:2px solid var(--red)"></i>{M["jit_bytes"]["compute_cell"]} B 的函数</span></div>')
     right = f'''<div class="step" data-step="1">{legend}<svg class="svg" viewBox="0 0 960 416" style="width:960px;height:416px"><g class="pool-grid"></g></svg>
 <p class="small" style="color:var(--ink-3);margin-top:10px">一个 2 MiB 池 = 512 × 4 KiB（全部画出）。生产预设另有 <code>.text.ejit</code> 固定池 16 MiB（≈ 7 池）；Tier-1 插桩代码放远端动态池。</p></div>'''
     quote = '''<p class="step" data-step="4" style="font:500 17px/1.5 var(--sans);color:var(--ink-2);margin:16px 0 0;padding-left:16px;border-left:3px solid var(--red)">"<b>enable_rw 必须同时清执行位</b> —— 只翻 AP 位，会留下一个 RWX 的写窗口。"<span style="color:var(--ink-3)"> · EJIT_SRE_CODE_POOL §14.2</span></p>'''
     body = f'<div class="grid g-35-65" style="gap:30px"><div>{left}</div><div>{right}</div></div>{quote}'
-    notes = '''
+    notes = f'''
 <p>裸核上没有 mmap，没有 mprotect。可执行内存要靠平台接口一页一页地要。按 → 分四步。</p>
-<p>① 开一块 2 MiB，切成 512 个 4 KiB 页。② 写代码的时候整块是 RW —— 写入期间绝不同时可执行。③ finalize 时逐页封成 RX，同时清 D-cache、失效 I-cache。④ 代价：每个特化至少占一页。那个 6 字节的函数，独占 4096 字节。</p>
+<p>① 开一块 2 MiB，切成 512 个 4 KiB 页。② 写代码的时候整块是 RW —— 写入期间绝不同时可执行。③ finalize 时逐页封成 RX，同时清 D-cache、失效 I-cache。④ 代价：每个特化至少占一页。那个 {M['jit_bytes']['compute_cell']} 字节的函数，独占 4096 字节。</p>
 <p>最下面那句引言是血泪教训：把页改回可写时必须同时清掉执行位，否则就是一个 RWX 窗口。</p>
 '''
-    return dict(act=ACT, name='pool', kicker='第三幕 · W^X', title='写完就封：一个 6 字节的函数，独占 4096 字节', body=body, steps=4, live='pool', notes=notes)
+    return dict(act=ACT, name='pool', kicker='第三幕 · W^X', title=f'写完就封：一个 {M["jit_bytes"]["compute_cell"]} 字节的函数，独占 4096 字节', body=body, steps=4, live='pool', notes=notes)
 
 
 def s21_threads():

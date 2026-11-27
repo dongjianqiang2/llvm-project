@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the talk's microbenchmarks (demo.c / probe.c) against the release x86 toolchain.
-# usage: bench/build.sh [aot]      builds demo + probe (or only the AOT asm of demo) into bench/out/
+# usage: bench/build.sh [aot|aot-a64]   builds demo + probe (or only the AOT asm of demo) into bench/out/
 # env:  ROOT=<checkout>  D=<output dir>
 set -euo pipefail
 ROOT=${ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -36,6 +36,16 @@ if [[ "${1:-}" == "aot" ]]; then
   # AOT assembly of the same source (wrapper + fallback body), unstripped.
   $B/bin/clang -O2 $INC -S -o $D/demo_aot.s $S/demo.c
   echo "AOT asm -> $D/demo_aot.s"
+  exit 0
+fi
+if [[ "${1:-}" == "aot-a64" ]]; then
+  # AArch64 AOT asm of the same source: the x86 clang still runs the EJIT IR
+  # pipeline (wrapper + embedded bitcode), the aarch64 backend lowers the module.
+  LLC=${LLC:-$ROOT/build_aarch64/bin/llc}
+  $B/bin/clang -O2 $INC -emit-llvm -S -o $D/demo_aot.ll $S/demo.c
+  $LLC -O2 -mtriple=aarch64-unknown-linux-gnu -mattr=+neon \
+    -o $D/demo_aot_a64.s $D/demo_aot.ll
+  echo "AArch64 AOT asm -> $D/demo_aot_a64.s"
   exit 0
 fi
 for n in demo probe; do

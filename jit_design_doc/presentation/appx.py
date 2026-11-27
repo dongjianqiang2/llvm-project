@@ -43,14 +43,19 @@ clang++ -fuse-ld=ld.lld -Os -Wl,--gc-sections \\
 ./bin/EJITSharedTaskPoolTests
 ./bin/llvm-lit ../llvm/test/Transforms/EmbeddedJIT
 ./bin/llvm-lit ../clang/test/CodeGen/ejit_*.c \\
-  ../clang/test/Sema/ejit_*''', 'sh', 'xs', maxw=640, cap='怎么测的')
+  ../clang/test/Sema/ejit_*
+
+# 幻灯片里的 AArch64 汇编（目标板形态）
+bench/build.sh aot-a64              # AOT：-emit-llvm → aarch64 llc -O2
+EJIT_DUMP_DIR=/tmp/ejd bench/out/demo    # JIT：运行时导出特化后 IR
+$ROOT/build_aarch64/bin/llc -O2 -mtriple=aarch64-linux-gnu /tmp/ejd/*_opt.ll''', 'sh', 'xs', maxw=640, cap='怎么测的')
     right = '''
 <div class="card pad-lg rule-lime" style="margin-bottom:14px"><div class="card-h">口径</div>
 <ul class="ul">
   <li class="li tight">主机：Intel Xeon Gold 5120 @ 2.20 GHz，56 逻辑核，<b>共享服务器</b>（测试期间 load 4–18）</li>
   <li class="li tight">计时：<code>clock_gettime(CLOCK_MONOTONIC)</code>，9 次取中位数；3 次独立运行相差 ≤ 2%</li>
   <li class="li tight">stream 内核：4096 样本 × 4000 轮；tiny：2000 万次调用</li>
-  <li class="li tight">JIT 机器码：用 <code>ejit_taskpool_compile_or_get</code> 取到函数指针后直接 dump 进程内存</li>
+  <li class="li tight">幻灯片汇编：全部是 AArch64 后端的真实输出 —— AOT 走 <code>clang -O2</code>，JIT 走运行时导出的特化后 IR（第 6、17、27、29 页）</li>
 </ul></div>
 <div class="card pad-lg rule-red"><div class="card-h">这些数字<b>不能</b>说明什么</div>
 <ul class="ul">
@@ -96,7 +101,7 @@ def a4_sources():
         ('核心 LLVM 的"语义"改动', 'llvm/include/llvm/IR/FixedMetadataKinds.def:56（MD_ejit_period_const = 42）· llvm/lib/Transforms/Utils/Local.cpp:3497（copyMetadataForLoad）'),
         ('测试', 'llvm/unittests/ExecutionEngine/EJIT/（550 个 TEST 宏）· llvm/test/Transforms/EmbeddedJIT/（55）· clang/test/CodeGen|Sema/ejit_*（28）· ejit_test/（45 个 .c，31 个目标）'),
         ('设计文档', 'jit_design_doc/ —— SPEC4.md · PASS1–7 · EJIT_SRE_TASKPOOL.md · EJIT_SRE_CODE_POOL.md · EJIT_ONLINE_PGO.md · EJIT_CACHE_QUERY_PERF.md 等 30 余份'),
-        ('真实产物', 'IR：ejit_dump_test 的 pre / opt dump · 汇编：clang -O2 与进程内存 dump · AArch64 命中路径：llc -O2 -mtriple=aarch64'),
+        ('真实产物', 'IR：EJIT_DUMP_DIR 运行时导出的 pre / opt（第 16 页）· 汇编：AOT clang -O2、JIT 特化后 IR，统一过 AArch64 后端 llc -O2 -mtriple=aarch64（第 6、17、27、29 页）'),
     ]
     trs = ''.join(f'<tr><td style="width:20%"><b>{a}</b></td><td class="mono" style="font-size:14.5px">{b}</td></tr>' for a, b in rows)
     body = f'<table class="tbl air"><tbody>{trs}</tbody></table>'

@@ -218,9 +218,9 @@ RULES = {
         (r'//[^\n]*|;[^\n]*|#[^\d\n][^\n]*', 'c'),  # AArch64 immediates (#16) are not comments
         (r'^\s*(?:\.L\w+|[0-9a-f]+):', 'p'),
         (r'^\s*\.cfi\w+.*$', 'p'),
-        (r'\b(?:mov|movsx|movsxd|movzbl|movslq|lea|add|sub|imul|imull|mul|div|divl|idiv|inc|dec|cmp|cmpl|test|testl|and|or|xor|shl|shr|sar|sal|'
+        (r'\b(?:mov|movsx|movsxd|movz|movk|movn|movzbl|movslq|lea|add|adds|sub|subs|imul|imull|mul|div|divl|idiv|inc|dec|cmp|cmpl|test|testl|and|or|xor|shl|shr|sar|sal|lsl|lsr|asr|'
          r'jmp|je|jne|jge|jl|jle|jg|jbe|ja|jae|jb|js|jns|call|callq|ret|retq|push|pushq|pop|popq|nop|cmovl|cmovle|cmovg|cmovge|cmove|cmovne|'
-         r'cmovs|cmovns|sete|setne|cdqe|cdq|cqo|neg|not|adrp|csel|br|blr|stp|ldp|str|sxtw|uxtw)\b', 'k'),
+         r'cmovs|cmovns|sete|setne|cdqe|cdq|cqo|neg|not|adrp|csel|csneg|csinc|cset|cbz|cbnz|br|blr|stp|ldp|str|ldr|ldrsh|ldrsw|ldrb|ldrsb|smaddl|sxtw|uxtw)\b', 'k'),
         (r'\b(?:BYTE|WORD|DWORD|QWORD) PTR\b|:lo12:', 'p'),
         (r'%[a-z0-9]+|\b(?:[a-d]l|[a-d]x|[sd]i|[sb]p|sil|dil|[a-d]il|[rs][a-d]x|[rs][sd]i|[rs]bp|rsp|rip|[a-d][hx]|[sd]il|r\d+d?|'
          r'e[a-d]x|e[sd]i|e[sb]p|bpl|spl|[xw]\d+|sp|xzr|wzr)\b', 'reg'),

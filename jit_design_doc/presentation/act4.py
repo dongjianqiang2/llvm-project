@@ -35,9 +35,10 @@ cellIdx=3  iter=20000000  warmup=5
 
   JIT vs Pure AOT 加速: 474369.6x
   Interproc JIT vs Pure AOT 加速: 0.4x''', 'txt', 'sm', hl={5: 'amber', 8: 'ice', 10: 'ice', 11: 'red'}, maxw=600, cap='ejit_test/ejit_perf_bench · 真实输出')
-    fn = code('''; compute_cell · 特化后的全部 6 个字节（进程内存 dump）
-mov  eax, 0x77359400    ; 2,000,000,000
-ret''', 'asm', 'lg', hl={2: 'ice'}, maxw=620, cap='JIT 机器码 · 全文')
+    fn = code('''compute_cell:               ; 特化后 · 3 条指令 · 12 字节
+  mov  w0, #37888           ; ← 低 16 位
+  movk w0, #30517, lsl #16  ; ← 高 16 位
+  ret''', 'asm', 'lg', hl={2: 'ice', 3: 'ice'}, maxw=620, cap='JIT 机器码 · 全文（AArch64 后端）')
     html = f'''
 <div style="position:absolute;left:120px;top:60px;width:1360px">
   <div class="kicker" data-anim="up">第四幕 · 先看一个好的</div>
@@ -50,14 +51,14 @@ ret''', 'asm', 'lg', hl={2: 'ice'}, maxw=620, cap='JIT 机器码 · 全文')
     <div class="step" data-step="1">{out}</div>
     <div><div class="step" data-step="2">{fn}</div>
       <div class="card pad-lg rule-red step" data-step="3" style="margin-top:16px"><div class="card-h">它衡量的是什么</div>
-      <p class="small" style="color:var(--ink-2)">2000 万次循环，在常量已知之后被 LLVM 证明是闭式：<code>100 × 4 ÷ 4 × 20M</code>。于是整个函数变成 <b>一条 mov</b>。<br><br>这个数字衡量的是"循环消失了"，不是"EJIT 有多快"。三次运行给出 {M['official_speedup_runs']} —— 因为<b>分母是时钟分辨率的噪声</b>。</p></div>
+      <p class="small" style="color:var(--ink-2)">2000 万次循环，在常量已知之后被 LLVM 证明是闭式：<code>100 × 4 ÷ 4 × 20M</code>。于是整个函数只剩 <b>mov + movk + ret</b>（12 字节：AArch64 一条指令装不下 32 位常数）。<br><br>这个数字衡量的是"循环消失了"，不是"EJIT 有多快"。三次运行给出 {M['official_speedup_runs']} —— 因为<b>分母是时钟分辨率的噪声</b>。</p></div>
     </div>
   </div>
   <p class="step" data-step="3" style="font:600 30px/1.4 var(--sans);color:var(--ink);margin:26px 0 0">当一个加速比有六位数，该怀疑的不是编译器，<em style="font-style:normal;color:var(--red)">是 benchmark</em>。</p>
 </div>'''
     notes = '''
 <p>先给大家看一个好数字：47 万倍。官方 benchmark 自己打印的。让数字滚一会儿。</p>
-<p>按 → 看左边的原始输出和右边的"全文"。JIT 之后的函数只有 6 个字节：把 2,000,000,000 装进寄存器，返回。2000 万次循环没有了，因为常量已知之后 LLVM 证明了这个循环有闭式解。</p>
+<p>按 → 看左边的原始输出和右边的"全文"。JIT 之后的函数只有 3 条指令：mov 装进低 16 位、movk 补上高 16 位，得到 2,000,000,000，返回 —— AArch64 一条指令装不下 32 位常数，所以是两条。2000 万次循环没有了，因为常量已知之后 LLVM 证明了这个循环有闭式解。</p>
 <p>按 → 出现结论。再补一刀：同一个 benchmark 三次运行给出 47 万、49 万、143 万 —— 一个"加速比"能在三次之间差 3 倍，是因为分母是时钟分辨率。同一份输出的最后一行，才是诚实的那一个：Interproc JIT vs Pure AOT，0.4 倍。</p>
 '''
     return dict(act=ACT, name='speedup', cls='bleed', html=html, steps=3, notes=notes)
@@ -100,7 +101,7 @@ def s28_range():
   <p style="margin:0;font:400 15.5px/1.55 var(--sans);color:var(--ink-2)"><b style="color:var(--ink)">{name}</b><br>{what}<br><span class="mono" style="font-size:13.5px">{aot:g} → {jit:g} {unit}</span></p></div>''' for i, col, name, what, aot, jit, unit, r in cards)
     why = '''
 <div class="grid g3 step" data-step="4" style="margin-top:26px">
-  <div class="card pad-sm rule-ice"><div class="card-h">快的那一个</div><p class="small" style="color:var(--ink-2)">收益几乎全部来自"分支 → cmov"：常量已知后，LLVM 敢推测了。<b>对 EJIT 最有利的形态。</b></p></div>
+  <div class="card pad-sm rule-ice"><div class="card-h">快的那一个</div><p class="small" style="color:var(--ink-2)">收益几乎全部来自"分支 → csneg（条件反选）"：常量已知后，LLVM 敢推测了。<b>对 EJIT 最有利的形态。</b></p></div>
   <div class="card pad-sm rule-red"><div class="card-h">慢的那一个（一）</div><p class="small" style="color:var(--ink-2)">callee 是 noinline 的 static 函数 → bitcode 瘦身把它<b>外链化</b>了，特化止步于调用边界；调用还多过一跳 GOT 桩。benchmark 源码注释说"会折成常量"，实测没有。</p></div>
   <div class="card pad-sm rule-red"><div class="card-h">慢的那一个（二）</div><p class="small" style="color:var(--ink-2)">探针本身比函数贵。<b>别给小函数标 EJIT_ENTRY</b> —— 尤其别在窗口没开的时候调用它。</p></div>
 </div>'''
