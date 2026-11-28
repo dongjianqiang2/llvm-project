@@ -31,6 +31,7 @@ namespace llvm {
 namespace ejit {
 
 class EJitOrcEngine;
+class EJitAsan;
 
 /// Unified entry point for sync and async compilation. Handles cache
 /// lookup, time-window state verification, bitcode retrieval, and
@@ -51,7 +52,7 @@ public:
   /// Cold compile path WITHOUT storing into the LRU EJitCache. Used as the
   /// taskpool's compile callback (the taskpool owns its own fixed cache).
   /// Returns the JIT function pointer or nullptr.
-  void *compileNow(const EJitCompileRequest &req);
+  void *compileNow(const EJitCompileRequest &req, bool CollectAsan = false);
 
   /// Taskpool commit notification. A value-profile round is consumed only
   /// after Tier-2 is actually published, so failed commits keep collecting.
@@ -99,7 +100,10 @@ public:
 
 private:
   /// A dequeued request has already passed the shared-record boundary.
-  void *compileNowValidated(const EJitCompileRequest &req);
+  /// CollectAsan additionally records the asan watch capture (all periods)
+  /// when the feature is compiled in.
+  void *compileNowValidated(const EJitCompileRequest &req,
+                            bool CollectAsan = false);
   static bool taskpoolCompileThunk(void *ctx, const EJitCompileRequest &req,
                                    void **outFn);
 
@@ -112,6 +116,9 @@ private:
   /// driver ends up building (see ensureJitEngine).
   std::vector<std::pair<std::string, void *>> userSymbols_;
   EJitSharedTaskPool sharedPool_;
+#ifdef EJIT_ASAN
+  std::unique_ptr<EJitAsan> asan_;
+#endif
   EJitSreTask sharedWorkerTask_;
   // Worker start/stop adapters bridging the shared pool to the platform task
   // abstraction (host std::thread / SRE platform task). Static so the shared
@@ -137,7 +144,8 @@ private:
   /// the request's funcIndex high bits (EJitTaskPoolTypes.h); gated by
   /// Config::enablePgo (off => Baseline regardless).
   void *compileCold(uint64_t cacheKey, uint32_t tier, bool storeLru,
-                    const EJitCompileRequest *request = nullptr);
+                    const EJitCompileRequest *request = nullptr,
+                    bool CollectAsan = false);
 
   /// PGO: Tier-1 captured counter refs per cacheKey (EJIT_ONLINE_PGO.md
   /// §5.2). Filled after a Tier-1 compile (ORC lookup of __profc_/__profd_

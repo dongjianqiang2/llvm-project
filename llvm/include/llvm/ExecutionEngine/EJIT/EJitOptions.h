@@ -45,6 +45,14 @@ struct Config {
 #else
   bool enableProfileAudit = false;
 #endif
+#if defined(EJIT_ASAN)
+  /// EJIT-ASAN use gate (EJIT_ASAN_CHECK.md). The build knob compiles the
+  /// feature in; ejit_init_asan() turns it on for the boot — the worker
+  /// probe, the full-scope drift scan, and the entry stubs together. Plain
+  /// ejit_init() leaves it compiled-in but inert. The mode is read at
+  /// compile time only; emitted stubs stay for the boot.
+  bool enableAsan = false;
+#endif
 };
 
 } // namespace ejit

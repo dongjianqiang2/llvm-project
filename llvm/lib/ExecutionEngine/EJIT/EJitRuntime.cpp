@@ -15,6 +15,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h" // ejit_reg_entry_t layout
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h" // EJitDimPair layout
+#ifdef EJIT_ASAN
+#include "EJitAsanState.h"
+#endif
 // Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
 // llvm-project source tree). Lives in the LLVMEJIT build directory.
 #include "EJitVersion.h"
@@ -133,9 +136,12 @@ static_assert(sizeof(ejit_config_t) == (sizeof(void *) == 8 ? 24 : 16));
 static_assert(std::is_standard_layout<ejit_config_t>::value,
               "ejit_config_t must be standard-layout for a stable C ABI");
 
-// Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
-// the online-PGO auto-trigger on regardless of the (unversioned) config.
-static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
+// Shared init implementation for ejit_init / ejit_init_pgo / ejit_init_asan.
+// \p forcePgo forces the online-PGO auto-trigger on regardless of the
+// (unversioned) config; \p forceAsan does the same for EJIT-ASAN entry
+// instrumentation.
+static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
+                                  bool forceAsan) {
   if (gEJIT) {
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
@@ -157,6 +163,9 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 #endif
   if (forcePgo)
     cfg.enablePgo = true;
+#ifdef EJIT_ASAN
+  cfg.enableAsan = forceAsan;
+#endif
 
   gEJIT = new (std::nothrow) EJit(cfg);
   if (!gEJIT) {
@@ -188,11 +197,19 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 extern "C" {
 
 ejit_status_t ejit_init(const ejit_config_t *config) {
-  return ejitInitImpl(config, /*forcePgo=*/false);
+  return ejitInitImpl(config, /*forcePgo=*/false, /*forceAsan=*/false);
 }
 
 ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
-  return ejitInitImpl(config, /*forcePgo=*/true);
+  return ejitInitImpl(config, /*forcePgo=*/true, /*forceAsan=*/false);
+}
+
+ejit_status_t ejit_init_asan(const ejit_config_t *config) {
+#ifdef EJIT_ASAN
+  return ejitInitImpl(config, /*forcePgo=*/false, /*forceAsan=*/true);
+#else
+  return EJIT_ERR_DISABLED;
+#endif
 }
 
 void ejit_shutdown(void) {
@@ -1199,6 +1216,63 @@ void ejit_print_code_pool_stats(void) {
     return;
   }
   gEJIT->printCodePoolStats();
+}
+
+ejit_status_t ejit_asan_dump(void) {
+#ifdef EJIT_ASAN
+  if (gEJIT)
+    if (auto *Pool = gEJIT->sharedTaskPool())
+      return Pool->requestAsanDump() ? EJIT_OK : EJIT_ERR_NOT_ACTIVE;
+  return EJIT_ERR_NOT_ACTIVE;
+#else
+  return EJIT_ERR_DISABLED;
+#endif
+}
+
+ejit_status_t ejit_asan_rotation_status(void) {
+#ifdef EJIT_ASAN
+  // Read-only snapshot of the shared rotation state, callable from any core
+  // at any time (the blob is static storage; no owner or init gate). Cores
+  // that never served a check stay silent to keep the serial ring small.
+  const uint32_t UsedSlots = gEJitAsanState.slotsUsed.loadAcquire();
+  const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
+  uint32_t DriftSites = 0;
+  for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si)
+    if (gEJitAsanState.sites[Si].published.loadAcquire() &&
+        gEJitAsanState.sites[Si].kind == kEJitAsanKindDrift)
+      ++DriftSites;
+  EJIT_DIAG_RAW("[EJIT-ASAN] rotation slots=%u/%d sites=%u drift_sites=%u",
+                UsedSlots, EJIT_ASAN_MAX_SLOTS, Sites, DriftSites);
+  // Per-slot lines are audit depth: VERBOSE only.
+  for (uint32_t I = 0; I < UsedSlots && I < EJIT_ASAN_MAX_SLOTS; ++I) {
+    const EJitAsanSlot &S = gEJitAsanState.slots[I];
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] rotation slot=%u(%s) bound=%u sites=%u",
+                      I, S.name, S.boundCount.loadRelaxed(),
+                      S.activeSites.loadRelaxed());
+  }
+  for (uint32_t I = 0; I < EJIT_ASAN_MAX_CORES; ++I) {
+    const EJitAsanCell &C = gEJitAsanState.cells[I];
+    if (C.checks == 0 && C.cycles == 0)
+      continue;
+    const char *Name = C.slot < UsedSlots ? gEJitAsanState.slots[C.slot].name
+                                          : "";
+    // Sub the NEXT activated call will check: (bound*W - countdown)/W; a
+    // fully drained window reports the last sub-window served.
+    const uint32_t W = EJIT_ASAN_ROTATION_WINDOW;
+    const uint32_t Bound = C.bound ? C.bound : 1;
+    const uint32_t Total = Bound * W;
+    uint32_t Sub = (Total - C.countdown) / W;
+    if (Sub >= Bound)
+      Sub = Bound - 1;
+    EJIT_DIAG_RAW(
+        "[EJIT-ASAN] rotation core=%u slot=%u(%s) sub=%u bound=%u "
+        "window=%u/%u cycles=%u checks=%u",
+        I, C.slot, Name, Sub, Bound, C.countdown, Total, C.cycles, C.checks);
+  }
+  return EJIT_OK;
+#else
+  return EJIT_ERR_DISABLED;
+#endif
 }
 
 void ejit_print_period_const_ranking(void) {

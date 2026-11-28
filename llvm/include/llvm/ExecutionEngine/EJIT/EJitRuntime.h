@@ -167,6 +167,15 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
+/// Initialize with EJIT-ASAN in use (see EJIT_ASAN_CHECK.md): the worker
+/// probe, the full-scope drift scan, and the bound_ptr entry stubs activate
+/// together for the boot (report-only; the shared-pool parts need the Async
+/// compile mode). Uses the same config layout as ejit_init(config) and forces
+/// the feature on; PGO stays off. A call on an already-initialized runtime
+/// is a silent no-op that enables nothing (the mode is fixed at the first
+/// init). A build without the feature returns EJIT_ERR_DISABLED without
+/// initializing.
+ejit_status_t ejit_init_asan(const ejit_config_t *config);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)
@@ -414,6 +423,22 @@ void ejit_print_period_const_ranking(void);
 /// Compatibility entry point for existing board debug shells and scripts.
 /// New code should use ejit_print_period_const_ranking().
 void ejit_print_mayconst_ranking(void);
+
+/// Print the EJIT-ASAN substitution report NOW, synchronously in the
+/// caller's context: one probe slice, one row per recorded mismatching
+/// location, then the stats line — each paced with fixed 20-tick yields —
+/// and only then return. EJIT_ERR_NOT_ACTIVE when called off the worker
+/// core or while another report is still printing. Builds with EJIT_ASAN
+/// only (EJIT_ERR_DISABLED otherwise).
+ejit_status_t ejit_asan_dump(void);
+
+/// Print a snapshot of the EJIT-ASAN entry-check rotation through the
+/// platform log: the claimed function-slot table, and one line per core
+/// that has ever served a check — its current slot (with function name),
+/// window progress, completed rotations, and checks served. Read-only,
+/// callable from any core at any time; cores that never served a check
+/// stay silent. Returns EJIT_ERR_DISABLED in builds without the feature.
+ejit_status_t ejit_asan_rotation_status(void);
 
 /// Print the currently-active time-window instances through the platform log:
 /// for each registered period, every active (period, cell) is listed. Works

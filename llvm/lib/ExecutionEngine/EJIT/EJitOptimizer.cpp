@@ -1,6 +1,11 @@
 //===-- EJitOptimizer.cpp - JIT Optimization Pipeline ---------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
+
+#ifdef EJIT_ASAN
+#include "EJitAsan.h"
+#include "llvm/IR/IRBuilder.h"
+#endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
 #include "llvm/ExecutionEngine/EJIT/EJitBranchProfile.h"
 #include "llvm/ADT/DenseSet.h"
@@ -176,6 +181,160 @@ resolveBoundViews(const Module &M, const SpecializationContext &ctx) {
   }
   return Views;
 }
+
+#ifdef EJIT_ASAN
+/// Emit the EJIT-ASAN entry stub (see EJIT_ASAN_CHECK.md for the shape) at
+/// the very end of runPipeline, after the last StructFieldPass run and the
+/// audit snapshot, so no later pass can re-fold the check loads. One
+/// activated call checks exactly ONE bound argument (rank K = K-th distinct
+/// bound argument, ascending): folded fields compare their baked constant,
+/// drift fields report the observed value through the hook; everything
+/// rejoins — report-only. An out-of-range sub falls through the switch
+/// default and checks nothing.
+static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
+  EJitAsanCapture *Cap = Ctx.asanCapture;
+  if (!Cap || Cap->entryFolds.empty())
+    return;
+  Function *F = M.getFunction(Ctx.fnName);
+  if (!F || F->isDeclaration())
+    return;
+  // A fold captured from another function's formals belongs to THAT
+  // function's argument list; only the entry's own folds are emittable.
+  unsigned Foreign = 0;
+  for (const EJitAsanEntryFold &EF : Cap->entryFolds)
+    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
+      ++Foreign;
+  if (Foreign == Cap->entryFolds.size())
+    return; // Nothing emittable for this function.
+  if (Foreign)
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] entry stub skipped %u fold(s) owned by "
+                      "other module functions fn=%s",
+                      Foreign, Ctx.fnName.c_str());
+  const uint32_t Slot = ejitAsanClaimSlot(Ctx.fnName);
+  if (Slot == kEJitAsanNoSlot) {
+    EJIT_DIAG("[EJIT-ASAN] capture DROPPED: slot table full (cap=%d) fn=%s",
+              EJIT_ASAN_MAX_SLOTS, Ctx.fnName.c_str());
+    return;
+  }
+  // Rank = distinct bound arguments with at least one published site,
+  // ascending; a budget-skipped fold contributes no rank.
+  SmallVector<EJitAsanEntryFold *, 8> Published;
+  unsigned BudgetSkipped = 0;
+  for (EJitAsanEntryFold &EF : Cap->entryFolds) {
+    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
+      continue; // Counted and logged above.
+    const uint8_t Kind = EF.folded ? kEJitAsanKindFolded : kEJitAsanKindDrift;
+    const uint32_t Site =
+        ejitAsanPublishSite(Slot, Ctx.fnName, EF.period, Kind,
+                            static_cast<uint8_t>(Ctx.tier), EF.argNo,
+                            EF.width, EF.align, EF.byteOffset, EF.expected);
+    if (Site == kEJitAsanNoSite) {
+      ++BudgetSkipped;
+      continue;
+    }
+    EF.siteId = Site;
+    Published.push_back(&EF);
+  }
+  if (BudgetSkipped)
+    // One line per compile, mirroring the version-budget discipline — this
+    // capture's remaining folds stay worker-probe-only.
+    EJIT_DIAG("[EJIT-ASAN] capture DROPPED: site budget full (cap=%d) "
+              "fn=%s folds=%u",
+              EJIT_ASAN_MAX_SITES, Ctx.fnName.c_str(), BudgetSkipped);
+  SmallVector<uint32_t, 8> RankArgs;
+  for (const EJitAsanEntryFold *EF : Published)
+    if (!is_contained(RankArgs, EF->argNo))
+      RankArgs.push_back(EF->argNo);
+  sort(RankArgs);
+  // Before emission: the version goes live only after the compile, so the
+  // next arming on any core serves every bound argument it checks.
+  ejitAsanSetSlotBound(Slot, RankArgs.size());
+
+  LLVMContext &C = M.getContext();
+  auto *GateTy =
+      FunctionType::get(Type::getInt32Ty(C), {Type::getInt32Ty(C)}, false);
+  auto *HookTy = FunctionType::get(
+      Type::getVoidTy(C),
+      {Type::getInt32Ty(C), PointerType::get(C, 0), Type::getInt64Ty(C)},
+      false);
+  FunctionCallee Gate = M.getOrInsertFunction("__ejit_asan_gate", GateTy);
+  FunctionCallee Hook = M.getOrInsertFunction("__ejit_asan_mismatch", HookTy);
+
+  // Split the entry block after its PHIs (if any): the head keeps every
+  // predecessor and PHIs untouched; the rest becomes the continuation.
+  BasicBlock *Head = &F->getEntryBlock();
+  BasicBlock::iterator It = Head->begin();
+  while (isa<PHINode>(It))
+    ++It;
+  BasicBlock *Cont = Head->splitBasicBlock(It, "asan.cont");
+  Head->getTerminator()->eraseFromParent();
+  IRBuilder<> B(Head);
+  CallInst *Sub = B.CreateCall(Gate, {B.getInt32(Slot)}, "asan.sub");
+  SwitchInst *Rotate =
+      B.CreateSwitch(Sub, Cont, static_cast<unsigned>(RankArgs.size()));
+
+  for (unsigned Rank = 0; Rank < RankArgs.size(); ++Rank) {
+    BasicBlock *Check =
+        BasicBlock::Create(C, ("asan.check" + Twine(Rank)).str(), F, Cont);
+    Rotate->addCase(B.getInt32(Rank), Check);
+    B.SetInsertPoint(Check);
+    for (EJitAsanEntryFold *EF : Published) {
+      if (EF->argNo != RankArgs[Rank])
+        continue;
+      Type *LoadTy = EF->width == 1 ? Type::getInt1Ty(C)
+                                    : Type::getIntNTy(C, EF->width);
+      Argument *Arg = F->getArg(EF->argNo);
+      Value *Addr =
+          B.CreateInBoundsGEP(B.getInt8Ty(), Arg, B.getInt64(EF->byteOffset));
+      if (!EF->folded) {
+        // Drift observation: every activated call reports the field value
+        // through the hook — no comparison here; the hook protocol judges
+        // it against the last-seen baseline. Acquire when the original
+        // load was atomic.
+        LoadInst *V = B.CreateAlignedLoad(LoadTy, Addr, MaybeAlign(EF->align));
+        if (EF->atomic)
+          V->setAtomic(AtomicOrdering::Acquire);
+        B.CreateCall(Hook,
+                     {B.getInt32(EF->siteId), Arg,
+                      B.CreateZExt(V, B.getInt64Ty(), "asan.seen")});
+        continue;
+      }
+      Value *V = B.CreateAlignedLoad(LoadTy, Addr, MaybeAlign(EF->align));
+      Value *Ok =
+          B.CreateICmpEQ(V, ConstantInt::get(LoadTy, EF->expected), "asan.ok");
+      BasicBlock *Fail = BasicBlock::Create(C, "asan.fail", F, Cont);
+      BasicBlock *GoOn = BasicBlock::Create(C, "asan.next", F, Cont);
+      B.CreateCondBr(Ok, GoOn, Fail);
+      B.SetInsertPoint(Fail);
+      B.CreateCall(Hook, {B.getInt32(EF->siteId), Arg,
+                          B.CreateZExt(V, B.getInt64Ty(), "asan.bad")});
+      B.CreateBr(GoOn);
+      B.SetInsertPoint(GoOn);
+    }
+    B.CreateBr(Cont);
+  }
+}
+
+// Final-module drift walk: classify the annotated loads that survived the
+// fold patterns and enumerate registered objects' annotated fields into
+// the capture. Runs BEFORE emitAsanEntryChecks (the stub's own check
+// loads match the metadata-free bound-field fallback).
+static void captureAsanDrift(Module &M, const SpecializationContext &Ctx,
+                             PeriodArrayRegistry &Registry) {
+  if (!Ctx.asanCapture)
+    return;
+  // Same construction as the substitution pass: without the root function
+  // the bound-argument propagation falls back to unique-binder inference,
+  // which is ambiguous in multi-entry modules and loses every bound state.
+  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
+  for (const auto &Dim : Ctx.dimensions)
+    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
+  EJitStructFieldPass Pass(Registry, Ctx.boundPointers, Ctx.fnName,
+                           LocalPeriods);
+  Pass.initFromModule(M);
+  Pass.captureDriftSites(M, *Ctx.asanCapture);
+}
+#endif
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   // All tier exits, including temporary PGO Gen and audit-only Baseline, must
@@ -473,6 +632,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
     recordPeriodConstBenefit(ctx, AuditInputSites, FinalSites,
                           AuditSampledEntries);
 #endif
+#ifdef EJIT_ASAN
+    captureAsanDrift(M, ctx, registry_);
+    if (ctx.asanEntryChecks)
+      emitAsanEntryChecks(M, ctx);
+#endif
     EJIT_DIAG_VERBOSE("pipeline done (Tier-2) func=%s key=0x%016lx",
                       ctx.fnName.c_str(), ctx.cacheKey);
     return;
@@ -484,6 +648,11 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   auto FinalSites = collectPeriodConstSites(M, registry_);
   recordPeriodConstBenefit(ctx, AuditInputSites, FinalSites,
                         AuditSampledEntries);
+#endif
+#ifdef EJIT_ASAN
+  captureAsanDrift(M, ctx, registry_);
+  if (ctx.asanEntryChecks)
+    emitAsanEntryChecks(M, ctx);
 #endif
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
@@ -921,6 +1090,9 @@ void EJitOptimizer::runStructFieldPass(
   for (const auto &Dim : ctx.dimensions)
     LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName, LocalPeriods);
+#ifdef EJIT_ASAN
+  structField.setAsanCapture(ctx.asanCapture);
+#endif
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {

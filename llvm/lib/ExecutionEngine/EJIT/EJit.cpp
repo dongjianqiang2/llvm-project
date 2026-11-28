@@ -13,6 +13,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRegistryEntry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#ifdef EJIT_ASAN
+#include "EJitAsanState.h"
+#endif
 #ifdef EJIT_SRE_PGO_VALUE_PROFILE
 #include "llvm/ExecutionEngine/EJIT/EJitVpCollector.h"
 #endif
@@ -273,6 +276,17 @@ EJit::EJit(const Config &config) : config_(config) {
   compileDriver_->registerSymbol(
       "ejit_vp_record_scalar",
       reinterpret_cast<void *>(&ejit_vp_record_scalar));
+#endif
+
+#ifdef EJIT_ASAN
+  // EJIT-ASAN entry-instrumentation hooks: the emitted entry stubs inside
+  // specialized code call these from whichever core executes the function
+  // (same-image same-VA precondition as the value-profiling hooks above).
+  compileDriver_->registerSymbol(
+      "__ejit_asan_gate", reinterpret_cast<void *>(&__ejit_asan_gate));
+  compileDriver_->registerSymbol(
+      "__ejit_asan_mismatch",
+      reinterpret_cast<void *>(&__ejit_asan_mismatch));
 #endif
 
   // Freeze registration before starting the shared worker. Off neither attaches
